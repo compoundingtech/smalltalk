@@ -893,6 +893,9 @@ const ACTIONS: &[&str] = &[
     "work.release",
     "work.retry",
     "work.publish-mission",
+    "agent.create",
+    "terminal.create",
+    "terminal.end",
     "agent.queue-move",
     "lane.join",
     "lane.leave",
@@ -937,6 +940,9 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "work.fail",
     "work.release",
     "work.retry",
+    "agent.create",
+    "terminal.create",
+    "terminal.end",
     "agent.queue-move",
     "lane.join",
     "lane.leave",
@@ -1044,7 +1050,10 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
-        } else if session.allows(scope) {
+        } else if session.allows(scope)
+            && (!matches!(*action, "agent.create" | "terminal.create" | "terminal.end")
+                || require_creation_person(session).is_ok())
+        {
             "granted"
         } else {
             "ungranted"
@@ -6314,6 +6323,9 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
+    if action == "agent.create" {
+        return Some("control.runtimes");
+    }
     if action == "work.done" {
         return Some("control.attention");
     }
@@ -6681,6 +6693,258 @@ fn validate_fence(
     Ok(())
 }
 
+// Creation uses a session-scoped key in both the declaration and apply receipt. A retried
+// dispatch after a lost action receipt recovers the existing member, rather than publishing twice.
+fn creation_key(session: &ClientSession, request: &ActionRequest) -> String {
+    hex::encode(Sha256::digest(format!(
+        "{}:{}",
+        session.actor, request.idempotency_key
+    )))
+}
+fn require_creation_person(session: &ClientSession) -> Result<&str, ApiError> {
+    let person = session.authority_actor.as_str();
+    if !person.starts_with("person/") || person.matches('/').count() != 1 {
+        return Err(forbidden("creation requires the session's concrete person"));
+    }
+    Ok(person)
+}
+fn creation_string(value: &str, field: &str, max: usize) -> Result<(), ApiError> {
+    if value.trim().is_empty() || value.len() > max || value.contains('\0') {
+        return Err(validation(format!(
+            "{field} must be nonempty, without NUL, and at most {max} bytes"
+        )));
+    }
+    Ok(())
+}
+fn existing_creation(
+    state: &AppState,
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<Option<String>, ApiError> {
+    let key = creation_key(session, request);
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&request.parameters).map_err(ApiError::internal)?,
+    ));
+    for desired in state.store.desired_subjects().map_err(ApiError::internal)? {
+        if let Some(member) = &desired.member
+            && member.tags.get("st3.client.create-key") == Some(&key)
+        {
+            if member.tags.get("st3.client.create-parameters") != Some(&digest) {
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    code: "idempotency-conflict".into(),
+                    message: "creation key already used for different parameters".into(),
+                    details: Box::default(),
+                });
+            }
+            return Ok(Some(if request.action_type == "terminal.create" {
+                format!("terminal/{}", desired.subject)
+            } else {
+                desired.subject
+            }));
+        }
+    }
+    Ok(None)
+}
+async fn publish_creation(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    request: &ActionRequest,
+    kdl: String,
+    kind: &str,
+) -> Result<String, ApiError> {
+    let mut document: kdl::KdlDocument = kdl
+        .parse()
+        .map_err(|error: kdl::KdlError| validation(error.to_string()))?;
+    let node = document
+        .nodes_mut()
+        .iter_mut()
+        .find(|node| node.name().value() == kind)
+        .unwrap();
+    let tags = node
+        .children_mut()
+        .as_mut()
+        .unwrap()
+        .nodes_mut()
+        .iter_mut()
+        .find(|node| node.name().value() == "tags")
+        .unwrap();
+    tags.entries_mut().push(kdl::KdlEntry::new_prop(
+        "st3.client.create-parameters",
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&request.parameters).map_err(ApiError::internal)?,
+        )),
+    ));
+    document.autoformat();
+    let kdl = document.to_string();
+    let intent = crate::graph::parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
+    let subject = intent
+        .subjects
+        .values()
+        .find(|subject| subject.kind == kind)
+        .ok_or_else(|| validation("creation declares no member"))?
+        .subject
+        .clone();
+    let key = creation_key(session, request);
+    if let Some(existing) = state
+        .store
+        .desired_subjects()
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|member| member.subject == subject)
+    {
+        if existing
+            .member
+            .as_ref()
+            .and_then(|member| member.tags.get("st3.client.create-key"))
+            == Some(&key)
+            && existing.desired
+                == intent
+                    .subjects
+                    .values()
+                    .find(|member| member.subject == subject)
+                    .unwrap()
+                    .desired
+        {
+            return Ok(subject);
+        }
+        if kind != "agent" || existing.kind != "stop" {
+            return Err(validation(format!(
+                "{subject} already exists; use a different name or idempotency key"
+            )));
+        }
+    }
+    let mut scoped = request.clone();
+    scoped.idempotency_key = format!("client-create:{key}");
+    apply_runtime_control_intent(state, snapshot, &scoped, &session.authority_actor, kdl).await?;
+    Ok(subject)
+}
+async fn create_agent(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<Vec<String>, ApiError> {
+    require_creation_person(session)?;
+    let mut parameters: st3_client::AgentCreateParameters =
+        serde_json::from_value(request.parameters.clone())
+            .map_err(|error| validation(error.to_string()))?;
+    creation_string(&parameters.name, "name", 160)?;
+    if !crate::skill::HARNESSES.contains(&parameters.harness.as_str()) {
+        return Err(validation("unknown harness"));
+    }
+    for (field, value) in [
+        ("model", &parameters.model),
+        ("effort", &parameters.effort),
+        ("host", &parameters.host),
+        ("description", &parameters.description),
+    ] {
+        if let Some(value) = value {
+            creation_string(value, field, 4096)?;
+        }
+    }
+    if let Some(message) = &parameters.message {
+        creation_string(message, "message", 65536)?;
+    }
+    if let Some(id) = existing_creation(state, session, request)? {
+        return Ok(vec![id]);
+    }
+    let host = parameters
+        .host
+        .as_deref()
+        .unwrap_or(&state.node)
+        .trim_start_matches("host/")
+        .to_owned();
+    let host = if host == "local" {
+        state.node.clone()
+    } else {
+        host
+    };
+    creation_string(&host, "host", 160)?;
+    parameters.host = Some(host.clone());
+    let workspace = if let Some(workspace) = &parameters.workspace {
+        workspace.clone()
+    } else if host == state.node {
+        crate::config::default_agent_workspace(&parameters.name)
+            .map_err(|error| validation(error.to_string()))?
+            .display()
+            .to_string()
+    } else {
+        let relay = state
+            .client_relay
+            .as_ref()
+            .filter(|relay| relay.reaches(&client_host_id(&host)))
+            .ok_or_else(|| remote_unavailable(&client_host_id(&host)))?;
+        let value = relay
+            .read(
+                &client_host_id(&host),
+                &crate::peer::ClientReadRequest {
+                    authority_actor: session.authority_actor.clone(),
+                    relay: None,
+                    request: crate::peer::ClientReadOperation::AgentWorkspace {
+                        identity: parameters.name.clone(),
+                    },
+                },
+            )
+            .await
+            .map_err(|error| remote_read_error(&client_host_id(&host), error))?;
+        value["workspace"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("host returned no workspace"))?
+            .to_owned()
+    };
+    creation_string(&workspace, "workspace", 4096)?;
+    if !std::path::Path::new(&workspace).is_absolute() {
+        return Err(validation(
+            "workspace must be absolute on the selected host",
+        ));
+    }
+    let kdl = crate::creation::agent_document(
+        &parameters,
+        &workspace,
+        true,
+        Some(&creation_key(session, request)),
+    );
+    Ok(vec![
+        publish_creation(state, snapshot, session, request, kdl, "agent").await?,
+    ])
+}
+async fn create_terminal(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<Vec<String>, ApiError> {
+    let person = require_creation_person(session)?;
+    let parameters: st3_client::TerminalCreateParameters =
+        serde_json::from_value(request.parameters.clone())
+            .map_err(|error| validation(error.to_string()))?;
+    creation_string(&parameters.name, "name", 160)?;
+    if let Some(id) = existing_creation(state, session, request)? {
+        return Ok(vec![id]);
+    }
+    let host = parameters
+        .host
+        .as_deref()
+        .unwrap_or(&state.node)
+        .trim_start_matches("host/");
+    creation_string(host, "host", 160)?;
+    let cwd = parameters.cwd.as_deref().unwrap_or(".");
+    creation_string(cwd, "cwd", 4096)?;
+    if cwd != "." && !std::path::Path::new(cwd).is_absolute() {
+        return Err(validation("cwd must be absolute on the selected host"));
+    }
+    let key = creation_key(session, request);
+    let mut bytes: [u8; 16] = hex::decode(&key[..32]).unwrap().try_into().unwrap();
+    bytes[6] = (bytes[6] & 15) | 0x80; // UUIDv8: stable, session-scoped creation identity.
+    bytes[8] = (bytes[8] & 63) | 0x80;
+    let id = uuid::Uuid::from_bytes(bytes).to_string();
+    let kdl = crate::creation::terminal_document(person, &id, &parameters, host, cwd, &key);
+    let subject = publish_creation(state, snapshot, session, request, kdl, "pty").await?;
+    Ok(vec![format!("terminal/{subject}")])
+}
+
 async fn dispatch_action(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -6690,6 +6954,35 @@ async fn dispatch_action(
     let p = &request.parameters;
     let authority_actor = &session.authority_actor;
     match request.action_type.as_str() {
+        "agent.create" => create_agent(state, snapshot, session, request).await,
+        "terminal.create" => create_terminal(state, snapshot, session, request).await,
+        "terminal.end" => {
+            let person = require_creation_person(session)?;
+            let subject = terminal_subject(&parameter_string(p, "target_id")?);
+            if st3_schema::person_terminals::owner(&subject)
+                .map_err(|error| validation(error.message))?
+                != Some(person)
+            {
+                return Err(forbidden("only the terminal's person may end it"));
+            }
+            if state
+                .store
+                .selected_desired_token(&subject)
+                .map_err(ApiError::internal)?
+                .is_none()
+            {
+                return Err(ApiError::not_found("terminal does not exist"));
+            }
+            let kdl = format!(
+                "version 2\nstop {}\n",
+                serde_json::to_string(&subject).map_err(ApiError::internal)?
+            );
+            let mut scoped = request.clone();
+            scoped.idempotency_key =
+                format!("client-terminal-end:{}", creation_key(session, request));
+            apply_runtime_control_intent(state, snapshot, &scoped, person, kdl).await?;
+            Ok(vec![format!("terminal/{subject}")])
+        }
         decision @ ("review.approve" | "review.reject" | "review.request-changes") => {
             let target = parameter_string(p, "target_id")?;
             let result = post_review(
@@ -7540,7 +7833,10 @@ pub(super) async fn action(
     let fence_result = (|| {
         validate_fence(&state, &snapshot, &request.fence)?;
         if request.action_type.starts_with("terminal.")
-            && request.action_type != "terminal.detach"
+            && !matches!(
+                request.action_type.as_str(),
+                "terminal.detach" | "terminal.create" | "terminal.end"
+            )
             && request.fence.terminal_sequence
                 != Some(state.store.index().map_err(ApiError::internal)?)
         {
@@ -7553,7 +7849,12 @@ pub(super) async fn action(
             reconciled_attachment =
                 existing_terminal_attachment(&state, &session, &request, &request_digest)?;
         }
-        if reconciled_attachment.is_none() {
+        let recovered_creation = matches!(
+            request.action_type.as_str(),
+            "agent.create" | "terminal.create"
+        ) && require_creation_person(&session).is_ok()
+            && existing_creation(&state, &session, &request)?.is_some();
+        if reconciled_attachment.is_none() && !recovered_creation {
             return Err(error);
         }
     }
@@ -8057,6 +8358,69 @@ subscription "watch/source" {
         assert_eq!(gate("watch"), "watch");
         assert_eq!(gate("flag"), "predicate");
         assert_eq!(gate("command"), "command");
+    }
+
+    #[tokio::test]
+    async fn creation_recovers_committed_declarations_before_the_action_receipt() {
+        for kind in ["agent.create", "terminal.create"] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state_named(root.path(), "create-recovery");
+            let session = ClientSession::local(Some("person/ada")).unwrap();
+            let snapshot = new_client_snapshot(&state);
+            let parameters = if kind == "agent.create" {
+                json!({"name":"worker", "harness":"codex", "workspace":"/tmp", "message":"First"})
+            } else {
+                json!({"name":"Shell", "cwd":"/tmp"})
+            };
+            let request = ActionRequest {
+                api_version: CLIENT_API_VERSION.into(),
+                id: "action/recovery".into(),
+                action_type: kind.into(),
+                idempotency_key: "creation-recovery-001".into(),
+                fence: Fence {
+                    snapshot_id: snapshot.id.clone(),
+                    ..Default::default()
+                },
+                parameters,
+            };
+            let ids = dispatch_action(&state, &snapshot, &session, &request)
+                .await
+                .unwrap();
+            assert_eq!(
+                existing_creation(&state, &session, &request).unwrap(),
+                Some(ids[0].clone())
+            );
+            let result = action(
+                State(state.clone()),
+                Extension(snapshot.clone()),
+                Extension(session.clone()),
+                Json(request.clone()),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(result["affected_ids"], json!(ids));
+            assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
+            let mut changed = request.clone();
+            changed.parameters["name"] = json!("different");
+            assert_eq!(
+                existing_creation(&state, &session, &changed)
+                    .unwrap_err()
+                    .code,
+                "idempotency-conflict"
+            );
+            // Retry after the receipt exists recovers it despite the original stale snapshot.
+            let retry = action(
+                State(state.clone()),
+                Extension(new_client_snapshot(&state)),
+                Extension(session),
+                Json(request),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(retry["affected_ids"], result["affected_ids"]);
+        }
     }
 
     #[tokio::test]

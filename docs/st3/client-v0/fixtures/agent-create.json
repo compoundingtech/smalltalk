@@ -1,0 +1,20 @@
+{
+  "api_version": "st3.client.v0",
+  "id": "action/agent-create",
+  "type": "agent.create",
+  "idempotency_key": "fixture-agent-create-0001",
+  "fence": {
+    "snapshot_id": "snapshot/example/1/creation",
+    "subject_revisions": {}
+  },
+  "parameters": {
+    "name": "worker",
+    "harness": "codex",
+    "host": "builder",
+    "model": "model",
+    "effort": "high",
+    "workspace": "/tmp/work",
+    "description": "Test seat",
+    "message": "--First message\nSecond line"
+  }
+}

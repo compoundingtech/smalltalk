@@ -228,7 +228,10 @@ a ready revision brings it back.
 
 A mission run owns the execution state declared inside that run. A top-level `agent` is instead a
 first-class durable seat with no mission owner. Seats can receive messages and claim work from many
-finite missions over their lifetime.
+finite missions over their lifetime. A person's standalone shell is a top-level PTY named
+`pty/person/NAME/UUID`, with no mission or agent owner. Only that person may publish its
+`intent.desired` claims, including a stop; local admission and replication enforce this.
+Other top-level execution members still require a mission run.
 
 The origin of the `mission-run.created` claim advances the mission run. It also materializes the run declarations.
 
@@ -993,7 +996,22 @@ An unknown variable or a variable that is not available in the current phase is 
 
 ## Agent start
 
-A native harness starts with no prompt. A started or restarted seat takes no turn until a person types or a graph message is posted.
+A native harness starts idle by default. Its creator can supply an explicit first message:
+
+```kdl
+harness "codex" {
+  message "Inspect the failing tests." id="unique-launch-id"
+}
+```
+
+The text is limited to 64 KiB and the nonempty launch ID to 256 bytes. The driver uses the harness's
+native startup argument (OpenCode uses `--prompt`; the others use a positional argument). A durable
+`custom.agent.initial-message` receipt under `custom/agent/initial-message-HASH` records the launch
+attempt before provider invocation. Restart and driver adoption do not repeat it. A crash after the
+receipt commits but before the provider starts can consume the message without delivering it;
+changing the launch ID explicitly requests a fresh attempt. No automatic boot instruction is added.
+Pi treats an `@`-prefixed argument as a file even after `--`; such text gets a leading newline to
+keep it a literal message.
 
 A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`. Put the instruction in a step goal or send the seat a message.
 

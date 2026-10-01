@@ -688,8 +688,12 @@ two children, and no unknown structure fields are accepted.
 The daemon advertises limits: 65,536 bytes of compact UTF-8 JSON per body, 32 layout levels
 (the root is level 1), 1,024 tabs and split nodes combined across the whole tree, and 100 live
 glasses per person. Leaf group containers do not add nodes; tabs do not add layout depth.
-The previous `{name, tabs}` body is rejected. This contract changes before the glasses API's
-first deployment; no deployed-store migration is required.
+Version-1 client writes reject the previous `{name, tabs}` body. Stored version-0 bodies
+are projected as one tab group: each pane becomes a tab in its old left/top-to-right/bottom
+order, and each old tab’s title goes to its first pane. The original claims and revisions remain unchanged, including during replication
+and replay. A subsequent version-1 write stores the new body and records the old revision it
+replaced. New client writes require the version-1 shape and bounds. An empty legacy body at
+the old byte limit can project slightly above 64 KiB; the next write must fit the current limit.
 The response ceiling is
 8 MiB, allowing a complete 100-glass subscription window at these bounds.
 
@@ -717,3 +721,36 @@ Generated clients expose Rust `list_glasses`, `get_glass`, `put_glass`, `delete_
 `putGlass`, `deleteGlass`, and `glassesStream`. Each supplies typed bodies and recursive layouts.
 Mutation methods take an explicit idempotency key so a retry uses the original key and input.
 Member daemons replicate the claims; paired clients read them through a member gateway.
+
+## Agent and plain-shell creation
+
+`agent.create` takes `name`, `harness` (`claude`, `codex`, `omp`, `pi`, `opencode`), optional `host`,
+`model`, `effort`, `workspace`, `description`, and `message`. Names are stable seat identities as
+in `st agents new`. Workspace paths are absolute on the selected host; omission asks that host for
+its usual new-agent directory. The host creates missing agent workspaces. OpenCode does not accept
+`effort`. Message text is nonempty, at most 64 KiB, and uses the native harness startup argument.
+An existing active seat requires a different name; a stopped seat may be deliberately recreated.
+
+`terminal.create` takes a nonempty display `name` (up to 160 bytes), optional `host` and absolute
+`cwd`. An omitted directory uses the selected daemon's directory. It declares a standalone PTY
+at `pty/person/NAME/UUID` running `$SHELL -i` (fallback `/bin/sh`) with restart policy `never`.
+Its returned ID is `terminal/pty/person/NAME/UUID`, usable with existing screen, attach and input
+methods. `terminal.end` takes `target_id` and permanently stops this personal PTY, including before
+it has started or after its shell exits. It requires no runtime incarnation or terminal sequence.
+
+All three actions require the session's concrete person, a snapshot fence and a stable idempotency
+key. Agent creation needs `control.runtimes`; terminal creation and ending need `terminal.control`.
+Their same-named action capabilities advertise availability. Terminal declaration admission checks
+the person owner in local writes and replicated claims. Existing fleet terminal read/control grants
+continue to govern screen access and input.
+
+`affected_ids` contains the agent ID or terminal ID. A completed action means the durable declaration
+was applied; it does not promise that the harness or shell is ready. Follow the existing agent/runtime
+views and attach after a running terminal appears. Exact action retries return the saved result.
+Session-scoped declaration tags also recover a committed creation if its action receipt was lost,
+without declaring a second member, even through another fleet gateway. Reusing a key for different
+parameters fails. New first messages have a durable launch-attempt receipt; see the runtime contract
+for its crash boundary.
+
+Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and Swift expose
+`agentCreate`, `terminalCreate`, `terminalEnd` with generated typed parameter bodies.
