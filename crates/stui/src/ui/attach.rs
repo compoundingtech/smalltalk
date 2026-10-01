@@ -27,6 +27,18 @@ impl Attachment {
     }
 }
 
+/// A terminal that draws images (kitty, Ghostty, WezTerm, iTerm2) and answers stui's query
+/// for how.
+pub fn graphics_terminal() -> bool {
+    let term = std::env::var("TERM").unwrap_or_default();
+    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    ["kitty", "ghostty", "wezterm"]
+        .iter()
+        .any(|name| term.contains(name))
+        || ["iTerm.app", "WezTerm", "ghostty"].contains(&program.as_str())
+        || std::env::var_os("KITTY_WINDOW_ID").is_some()
+}
+
 /// Where pasted images are kept: `$XDG_STATE_HOME/st3/stui/attachments`.
 pub fn dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
