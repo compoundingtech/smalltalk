@@ -57,12 +57,53 @@ impl Group {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Layout {
     Group(Group),
-    Split { split: Side, children: Vec<Layout> },
+    Split {
+        split: Side,
+        children: Vec<Layout>,
+        /// The first child's share of a two-way split, when a border was dragged; equal
+        /// otherwise. Kept on this device; the graph's glass does not carry it yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ratio: Option<f32>,
+    },
 }
+
+/// A border between two splits, as drawn: which split node it divides (counted in order, the
+/// whole layout first), its direction, and the area that split shares out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Divider {
+    pub rect: Rect,
+    pub side: Side,
+    pub node: usize,
+    pub area: Rect,
+}
+
+/// Layouts are equal by their structure: how a border was dragged here is this device's.
+impl PartialEq for Layout {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Layout::Group(a), Layout::Group(b)) => a == b,
+            (
+                Layout::Split {
+                    split: a,
+                    children: c,
+                    ..
+                },
+                Layout::Split {
+                    split: b,
+                    children: d,
+                    ..
+                },
+            ) => a == b && c == d,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Layout {}
 
 impl Default for Layout {
     fn default() -> Self {
@@ -132,6 +173,7 @@ impl Layout {
             *node = Layout::Split {
                 split: side,
                 children: vec![old, Layout::Group(group)],
+                ratio: None,
             };
         }
         index + 1
@@ -145,6 +187,7 @@ impl Layout {
             *node = Layout::Split {
                 split: side,
                 children: vec![Layout::Group(group), old],
+                ratio: None,
             };
         }
         index
@@ -155,7 +198,11 @@ impl Layout {
     pub fn remove(self, index: usize) -> Option<Layout> {
         match self {
             Layout::Group(_) => (index != 0).then_some(self),
-            Layout::Split { split, children } => {
+            Layout::Split {
+                split,
+                children,
+                ratio,
+            } => {
                 let mut index = index;
                 let mut kept = Vec::new();
                 for child in children {
@@ -173,6 +220,7 @@ impl Layout {
                     1 => kept.pop(),
                     _ => Some(Layout::Split {
                         split,
+                        ratio: ratio.filter(|_| kept.len() == 2),
                         children: kept,
                     }),
                 }
@@ -182,27 +230,62 @@ impl Layout {
 
     /// Where each group goes in `area`, in group order, and the one-cell dividers between them.
     pub fn rects(&self, area: Rect) -> (Vec<Rect>, Vec<(Rect, Side)>) {
+        let (groups, dividers) = self.layout_in(area);
+        (
+            groups,
+            dividers
+                .into_iter()
+                .map(|divider| (divider.rect, divider.side))
+                .collect(),
+        )
+    }
+
+    /// Where each group goes in `area`, and every border with the split it divides.
+    pub fn layout_in(&self, area: Rect) -> (Vec<Rect>, Vec<Divider>) {
         let mut groups = Vec::new();
         let mut dividers = Vec::new();
-        self.place(area, &mut groups, &mut dividers);
+        let mut nodes = 0;
+        self.place(area, &mut groups, &mut dividers, &mut nodes);
         (groups, dividers)
     }
 
-    fn place(&self, area: Rect, groups: &mut Vec<Rect>, dividers: &mut Vec<(Rect, Side)>) {
+    fn place(
+        &self,
+        area: Rect,
+        groups: &mut Vec<Rect>,
+        dividers: &mut Vec<Divider>,
+        nodes: &mut usize,
+    ) {
         match self {
             Layout::Group(_) => groups.push(area),
-            Layout::Split { split, children } => {
+            Layout::Split {
+                split,
+                children,
+                ratio,
+            } => {
+                let node = *nodes;
+                *nodes += 1;
                 let count = children.len().max(1) as u16;
                 let (total, start) = match split {
                     Side::Right => (area.width, area.x),
                     Side::Below => (area.height, area.y),
                 };
-                let each = total.saturating_sub(count - 1) / count;
+                let room = total.saturating_sub(count - 1);
+                let each = room / count;
+                // A dragged border sets the first of two children's share.
+                let first = match ratio {
+                    Some(ratio) if children.len() == 2 && room >= 2 => {
+                        ((f32::from(room) * ratio).round() as u16).clamp(1, room - 1)
+                    }
+                    _ => each,
+                };
                 let mut at = start;
                 for (index, child) in children.iter().enumerate() {
                     let last = index + 1 == children.len();
                     let size = if last {
                         (start + total).saturating_sub(at)
+                    } else if index == 0 {
+                        first
                     } else {
                         each
                     };
@@ -218,7 +301,7 @@ impl Layout {
                             ..area
                         },
                     };
-                    child.place(rect, groups, dividers);
+                    child.place(rect, groups, dividers, nodes);
                     at += size;
                     if !last {
                         let divider = match split {
@@ -233,10 +316,64 @@ impl Layout {
                                 ..area
                             },
                         };
-                        dividers.push((divider, *split));
+                        dividers.push(Divider {
+                            rect: divider,
+                            side: *split,
+                            node,
+                            area,
+                        });
                         at += 1;
                     }
                 }
+            }
+        }
+    }
+
+    /// Set (or, with `None`, clear) the share of split node `node`, counted as `layout_in`
+    /// counts them.
+    pub fn set_ratio(&mut self, node: usize, value: Option<f32>) {
+        fn walk(layout: &mut Layout, node: usize, counter: &mut usize, value: Option<f32>) -> bool {
+            let Layout::Split {
+                children, ratio, ..
+            } = layout
+            else {
+                return false;
+            };
+            if *counter == node {
+                *ratio = value.map(|value| value.clamp(0.1, 0.9));
+                return true;
+            }
+            *counter += 1;
+            children
+                .iter_mut()
+                .any(|child| walk(child, node, counter, value))
+        }
+        walk(self, node, &mut 0, value);
+    }
+
+    /// Carry the shares of `old`'s splits into this layout wherever its shape is the same, so a
+    /// border dragged here survives a glass update that changed something else.
+    pub fn carry_ratios(&mut self, old: &Layout) {
+        if let (
+            Layout::Split {
+                split,
+                children,
+                ratio,
+            },
+            Layout::Split {
+                split: old_split,
+                children: old_children,
+                ratio: old_ratio,
+            },
+        ) = (self, old)
+            && split == old_split
+            && children.len() == old_children.len()
+        {
+            if ratio.is_none() {
+                *ratio = *old_ratio;
+            }
+            for (child, old) in children.iter_mut().zip(old_children) {
+                child.carry_ratios(old);
             }
         }
     }
@@ -245,6 +382,39 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dragged_share_sizes_the_split_and_survives_an_update_of_the_same_shape() {
+        let mut layout = Layout::Group(Group::of(Tab::pane("agent:a")));
+        layout.split(0, Side::Right, Group::of(Tab::pane("mission:m")));
+        let area = Rect::new(0, 0, 101, 10);
+        layout.set_ratio(0, Some(0.25));
+        let (groups, dividers) = layout.layout_in(area);
+        assert_eq!(groups[0].width, 25);
+        assert_eq!(dividers[0].node, 0);
+        assert_eq!(dividers[0].area, area);
+        layout.set_ratio(0, Some(0.01));
+        assert_eq!(
+            layout.layout_in(area).0[0].width,
+            10,
+            "a share is kept within 10–90%"
+        );
+        // An update from st with the same shape keeps it; equality ignores it.
+        let mut update = Layout::Group(Group::of(Tab::pane("agent:a")));
+        update.split(0, Side::Right, Group::of(Tab::pane("mission:m")));
+        assert_eq!(update, layout);
+        update.carry_ratios(&layout);
+        assert_eq!(update.layout_in(area).0[0].width, 10);
+        // A different shape does not take it.
+        let mut other = Layout::Group(Group::of(Tab::pane("agent:a")));
+        other.split(0, Side::Below, Group::of(Tab::pane("mission:m")));
+        other.carry_ratios(&layout);
+        assert_eq!(
+            other.layout_in(area).0[0].height,
+            4,
+            "evenly, past the border"
+        );
+    }
 
     #[test]
     fn a_split_can_put_the_new_group_first() {
@@ -298,7 +468,7 @@ mod tests {
         let layout = layout.remove(1).unwrap();
         assert_eq!(tabs(&layout), [vec!["agent:a"], vec!["machine:h"]]);
         assert!(
-            matches!(&layout, Layout::Split { split: Side::Right, children } if children.len() == 2)
+            matches!(&layout, Layout::Split { split: Side::Right, children, .. } if children.len() == 2)
         );
         let layout = layout.remove(0).unwrap();
         assert_eq!(tabs(&layout), [vec!["machine:h"]]);

@@ -49,6 +49,8 @@ pub(crate) struct Glasses {
     pub(crate) sidebar: Sidebar,
     /// A tab being dragged with the mouse, from its press until the button is let go.
     drag: Option<TabDrag>,
+    /// The border last pressed and when, so a second press soon after evens it out.
+    last_border: Option<(usize, std::time::Instant)>,
     /// The glass made at start only because this device had none by the name asked for. If it
     /// is still empty when st first sends the person's glasses, st's glass of that name is
     /// shown instead of keeping both.
@@ -67,8 +69,10 @@ struct TabDrag {
 }
 
 /// What is being dragged.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum DragFrom {
+    /// A border between splits: it resizes them as it moves.
+    Border(super::layout::Divider),
     /// A tab: its group and place in the strip.
     Tab(usize, usize),
     /// A subject from the sidebar, which opens where it is let go.
@@ -181,7 +185,10 @@ impl Glass {
             .map(|group| group.current)
             .collect::<Vec<_>>();
         self.name = body.name;
-        self.layout = from_wire(body.layout);
+        let mut layout = from_wire(body.layout);
+        // Borders dragged here stay where the shape is still the same.
+        layout.carry_ratios(&self.layout);
+        self.layout = layout;
         let count = self.layout.groups().len();
         for index in 0..count {
             let shown = self.count(index);
@@ -344,6 +351,7 @@ impl Glasses {
             home: false,
             sidebar,
             drag: None,
+            last_border: None,
             pending: BTreeMap::new(),
             placeholder,
         }
@@ -832,9 +840,10 @@ impl Ui {
             rects[glass.focus] = body;
             (rects, Vec::new())
         } else {
-            glass.layout.rects(body)
+            glass.layout.layout_in(body)
         };
-        for (rect, side) in dividers {
+        self.frame.borrow_mut().glass_dividers = dividers.clone();
+        for super::layout::Divider { rect, side, .. } in dividers {
             let symbol = match side {
                 Side::Right => "│",
                 Side::Below => "─",
@@ -972,6 +981,30 @@ impl Ui {
                     at: point,
                     moving: false,
                 };
+                // A border between splits: drag to resize; press twice quickly to even it out.
+                let border = self
+                    .frame
+                    .borrow()
+                    .glass_dividers
+                    .iter()
+                    .find(|divider| super::contains(divider.rect, point.0, point.1))
+                    .copied();
+                if let Some(divider) = border {
+                    let now = std::time::Instant::now();
+                    let again = glasses.last_border.is_some_and(|(node, at)| {
+                        node == divider.node && now.duration_since(at).as_millis() < 400
+                    });
+                    if again {
+                        glasses.last_border = None;
+                        glasses.drag = None;
+                        glasses.glass_mut().layout.set_ratio(divider.node, None);
+                        glasses.save();
+                    } else {
+                        glasses.last_border = Some((divider.node, now));
+                        glasses.drag = Some(start(DragFrom::Border(divider)));
+                    }
+                    return true;
+                }
                 match hit {
                     // A tab shows at once, as a click; it may also be dragged.
                     Some(Hit::GlassTab(group, tab)) => {
@@ -1001,12 +1034,32 @@ impl Ui {
                 };
                 drag.at = point;
                 drag.moving |= point != drag.start;
+                if let DragFrom::Border(divider) = drag.from {
+                    let (at, start, total) = match divider.side {
+                        Side::Right => (point.0, divider.area.x, divider.area.width),
+                        Side::Below => (point.1, divider.area.y, divider.area.height),
+                    };
+                    if total > 2 {
+                        let share = f32::from(at.saturating_sub(start)) / f32::from(total - 1);
+                        glasses
+                            .glass_mut()
+                            .layout
+                            .set_ratio(divider.node, Some(share));
+                    }
+                }
                 true
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let Some(drag) = glasses.drag.take() else {
                     return false;
                 };
+                if let DragFrom::Border(_) = drag.from {
+                    // Kept on this device: the graph's glass does not carry sizes yet.
+                    if let Some(glasses) = self.glasses.as_mut() {
+                        glasses.save();
+                    }
+                    return true;
+                }
                 if !drag.moving {
                     // A click: a tab already showed; a sidebar row opens now.
                     if matches!(drag.from, DragFrom::Subject(_)) {
@@ -1020,7 +1073,7 @@ impl Ui {
                         self.drop_tab((group, tab), target)
                     }
                     (Some(target), DragFrom::Subject(id)) => self.drop_subject(&id, target),
-                    (None, _) => {}
+                    _ => {}
                 }
                 true
             }
@@ -1235,7 +1288,7 @@ impl Ui {
         else {
             return;
         };
-        if !drag.moving {
+        if !drag.moving || matches!(drag.from, DragFrom::Border(_)) {
             return;
         }
         let mark = Style::default().bg(theme::SURFACE1);
@@ -1302,6 +1355,7 @@ impl Ui {
             DragFrom::Subject(id) => pane_for(id)
                 .map(|pane| self.pane_title(&pane))
                 .unwrap_or_else(|| id.clone()),
+            DragFrom::Border(_) => return,
         };
         let label = format!(" ⇄ {name} ");
         let x = drag.at.0.saturating_add(1);
@@ -3002,7 +3056,9 @@ fn to_wire(layout: &Layout) -> GlassLayout {
                 })
                 .collect(),
         },
-        Layout::Split { split, children } => match children.as_slice() {
+        Layout::Split {
+            split, children, ..
+        } => match children.as_slice() {
             [] => GlassLayout::Group { tabs: Vec::new() },
             [only] => to_wire(only),
             [first, rest @ ..] => GlassLayout::Split {
@@ -3015,6 +3071,7 @@ fn to_wire(layout: &Layout) -> GlassLayout {
                     Box::new(to_wire(&Layout::Split {
                         split: *split,
                         children: rest.to_vec(),
+                        ratio: None,
                     })),
                 ],
             },
@@ -3042,6 +3099,7 @@ fn from_wire(layout: GlassLayout) -> Layout {
                     GlassSplit::Below => Side::Below,
                 },
                 children: vec![from_wire(*first), from_wire(*second)],
+                ratio: None,
             }
         }
     }
@@ -3663,6 +3721,66 @@ mod tests {
             ),
         );
         assert_eq!(tabs(&ui).2, vec![vec![agent(1)], vec![agent(2), agent(0)]]);
+    }
+
+    #[test]
+    fn a_border_drags_to_resize_its_splits_and_a_double_press_evens_them() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mouse = |ui: &mut Ui, kind, (column, row): (u16, u16)| {
+            ui.mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Right,
+        );
+        screen(&ui);
+        let widths = |ui: &Ui| {
+            screen(ui);
+            let info = ui.frame.borrow();
+            (info.glass_leaves[0].width, info.glass_leaves[1].width)
+        };
+        let (left, right) = widths(&ui);
+        assert!(left.abs_diff(right) <= 1, "equal at first");
+        let border = ui.frame.borrow().glass_dividers[0];
+        let from = (border.rect.x, border.rect.y + 3);
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), from);
+        mouse(
+            &mut ui,
+            MouseEventKind::Drag(MouseButton::Left),
+            (from.0 - 20, from.1),
+        );
+        mouse(
+            &mut ui,
+            MouseEventKind::Up(MouseButton::Left),
+            (from.0 - 20, from.1),
+        );
+        let (narrow, wide) = widths(&ui);
+        assert!(narrow + 15 < wide, "{narrow} vs {wide}");
+        // The structure did not change, so nothing goes to st.
+        assert!(
+            !ui.effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SaveGlass(_)))
+        );
+        // A second press soon after the first evens it out.
+        let border = ui.frame.borrow().glass_dividers[0];
+        let at = (border.rect.x, border.rect.y + 3);
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), at);
+        mouse(&mut ui, MouseEventKind::Up(MouseButton::Left), at);
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), at);
+        mouse(&mut ui, MouseEventKind::Up(MouseButton::Left), at);
+        let (left, right) = widths(&ui);
+        assert!(left.abs_diff(right) <= 1, "{left} vs {right}");
     }
 
     #[test]
@@ -4392,6 +4510,7 @@ mod tests {
         let three = Layout::Split {
             split: Side::Right,
             children: vec![Layout::default(), Layout::default(), Layout::default()],
+            ratio: None,
         };
         assert_eq!(from_wire(to_wire(&three)).groups().len(), 3);
     }
