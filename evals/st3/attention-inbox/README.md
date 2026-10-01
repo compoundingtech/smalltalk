@@ -2,7 +2,7 @@
 
 This model-free eval proves the complete human attention inbox.
 
-The controller creates one current item for each supported kind. It checks the global list and the selected person list.
+The controller creates one current item for each review kind, plus a message that stays in conversations: messages and faults never enter a person's attention. It checks the global list and the selected person list.
 
 The planning workspace is a file, not a directory. Its render fails, which prevents the temporary Codex planner from starting. The controller submits the fixed candidate directly as that planner and creates no model request.
 

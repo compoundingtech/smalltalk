@@ -20,8 +20,8 @@ use crate::model::{
     ApplyResponse, AttentionActionView, AttentionClosing, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, Capability,
     ClaimInput, ClaimRecord, ClaimsPage, ContextUsage, DependencySpec, DesiredSubject, EventRecord,
-    HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView,
-    MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
+    FaultView, HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS,
+    MessageView, MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
     MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView,
     MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
     OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
@@ -9982,64 +9982,52 @@ impl Store {
         self.attention_snapshot(person, now_ms())
     }
 
+    /// The current faults raised for `person` under the reviewer each one names, owners aside.
+    #[cfg(test)]
+    pub(crate) fn fault_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
+        Ok(self
+            .fault_snapshot(now_ms())?
+            .into_iter()
+            .map(|fault| fault.item)
+            .filter(|item| person.is_none_or(|person| item.person == person))
+            .collect())
+    }
+
+    /// What waits on `person` and no agent can resolve: requests (person steps and agents'
+    /// asks) and reviews (human gates, launch and revision approvals). Messages stay in
+    /// conversations, and a fault goes to the agent that owns it, see `fault_snapshot`.
     pub fn attention_snapshot(
         &self,
         person: Option<&str>,
         as_of: u128,
     ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
+        items.extend(self.person_attention_items(person, as_of)?);
+        self.current_attention(items, as_of)
+    }
 
-        // Only a person's messages need attention. Without a person, read each person's
-        // mailbox through the recipient index instead of every open message in the fleet.
-        let messages = match person {
-            Some(person) => self.messages(Some(person), false)?,
-            None => {
-                let people = {
-                    let connection = self.readers.get();
-                    let mut statement = connection.prepare(
-                        "SELECT DISTINCT json_extract(body, '$.fields.to')
-                         FROM claims INDEXED BY claims_message_to_index
-                         WHERE kind='message.sent'
-                           AND json_extract(body, '$.fields.to') >= 'person/'
-                           AND json_extract(body, '$.fields.to') < 'person0'",
-                    )?;
-                    statement
-                        .query_map([], |row| row.get::<_, String>(0))?
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                let mut messages = Vec::new();
-                for person in people {
-                    messages.extend(self.messages(Some(&person), false)?);
-                }
-                messages
-            }
-        };
-        let messages = selected_actionable_messages(&self.readers.get(), messages)?;
-        if !messages.is_empty() {
-            let connection = self.readers.get();
-            for message in messages.into_iter().filter(|message| {
-                message.to.starts_with("person/")
-                    && matches!(message.status.as_str(), "sent" | "delivered")
-            }) {
-                // The message's first claim in canonical order, so every node that holds it
-                // shows the same wait.
-                let requested_at_unix_ms = connection.query_row(
-                    &canonical_sql(
-                        "SELECT accepted_at_unix_ms FROM claims
-                     WHERE subject=?1
-                     ORDER BY CANONICAL_ASC(claims)
-                     LIMIT 1",
-                    ),
-                    [&message.subject],
-                    |row| row.get::<_, String>(0),
-                )?;
-                items.push(attention_item_from_message(
-                    message,
-                    requested_at_unix_ms.parse().unwrap_or(0),
-                ));
-            }
-        }
+    /// Every current fault, each with the agent that owns it: the agent assigned to the failed
+    /// step, else the run's requester when that is an agent, else the fleet's fault agent. No
+    /// fault is a person's: the owning agent retries, revises or cancels, and asks a person
+    /// only for what only a person can give.
+    pub fn fault_snapshot(&self, as_of: u128) -> Result<Vec<FaultView>> {
+        let mut items = self.subscription_fault_items(as_of)?;
+        items.extend(self.operational_attention_items(None, as_of)?);
+        items.extend(self.checkpoint_attention_items(None, as_of)?);
+        let fallback = self.fleet_fault_agent()?;
+        self.current_attention(items, as_of)?
+            .into_iter()
+            .map(|item| {
+                Ok(FaultView {
+                    owner: self.fault_owner(&item, fallback.as_deref())?,
+                    item,
+                })
+            })
+            .collect()
+    }
 
+    fn subscription_fault_items(&self, as_of: u128) -> Result<Vec<AttentionItemView>> {
+        let mut items = Vec::new();
         {
             let connection = self.readers.get();
             let mut statement = connection.prepare(
@@ -10073,9 +10061,6 @@ impl Store {
                 let reviewer = requester
                     .filter(|value| value.starts_with("person/"))
                     .unwrap_or_else(|| "person/operator".into());
-                if person.is_some_and(|person| !reviewer.is_empty() && person != reviewer) {
-                    continue;
-                }
                 let code = fields
                     .get("code")
                     .and_then(Value::as_str)
@@ -10115,9 +10100,15 @@ impl Store {
                 });
             }
         }
-        items.extend(self.person_attention_items(person, as_of)?);
-        items.extend(self.operational_attention_items(person, as_of)?);
-        items.extend(self.checkpoint_attention_items(person, as_of)?);
+        Ok(items)
+    }
+
+    /// Keep the items requested by `as_of` whose run is still current, then order them.
+    fn current_attention(
+        &self,
+        mut items: Vec<AttentionItemView>,
+        as_of: u128,
+    ) -> Result<Vec<AttentionItemView>> {
         let connection = self.readers.get();
         items.retain(|item| item.requested_at_unix_ms <= as_of);
         let mut live = Vec::new();
@@ -17254,44 +17245,6 @@ fn attention_item_from_revision(
                 ],
             ),
         ],
-    }
-}
-
-fn attention_item_from_message(
-    message: MessageView,
-    requested_at_unix_ms: u128,
-) -> AttentionItemView {
-    AttentionItemView {
-        episode: message.subject.clone(),
-        priority: "normal".into(),
-        kind: "unread-message".into(),
-        review_mode: None,
-        subject: message.subject.clone(),
-        person: message.to.clone(),
-        requester_id: Some(message.from.clone()),
-        launch_id: None,
-        variant_id: None,
-        message_id: Some(message.subject.clone()),
-        title: message
-            .title
-            .unwrap_or_else(|| format!("Message from {}", message.from)),
-        detail: format!("Unread message from {}.", message.from),
-        mission: None,
-        mission_run: None,
-        step: None,
-        targets: Vec::new(),
-        requested_at_unix_ms,
-        actions: vec![attention_action(
-            "read",
-            &[
-                "st",
-                "conversations",
-                "read",
-                &message.subject,
-                "--as",
-                &message.to,
-            ],
-        )],
     }
 }
 
@@ -40355,7 +40308,7 @@ mission "typecase" state="ready" {
     }
 
     #[test]
-    fn desired_person_messages_appear_in_attention_without_a_sent_claim() {
+    fn a_declared_person_message_stays_in_conversations_and_out_of_attention() {
         let store = Store::open_memory("node").unwrap();
         let source = r#"
 version 2
@@ -40380,32 +40333,20 @@ message "human-attention" {
             .apply(&intent, &preview.subject_tokens, "desired-human-attention")
             .unwrap();
 
-        let items = store.attention_items(Some("person/alex")).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "unread-message");
-        assert_eq!(items[0].title, "Please review");
-        assert!(items[0].requested_at_unix_ms > 0);
-        assert_eq!(
-            items[0].actions[0].argv,
-            [
-                "st",
-                "conversations",
-                "read",
-                "message/human-attention",
-                "--as",
-                "person/alex",
-            ]
-        );
+        let mailbox = store.messages(Some("person/alex"), false).unwrap();
+        assert_eq!(mailbox.len(), 1);
+        assert_eq!(mailbox[0].title.as_deref(), Some("Please review"));
         assert!(
             store
-                .claims_for("message/human-attention", Some("message.sent"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );
+        assert!(store.attention_items(None).unwrap().is_empty());
     }
 
     #[test]
-    fn unread_person_messages_leave_attention_after_read() {
+    fn an_unread_person_message_never_enters_attention() {
         let store = Store::open_memory("node").unwrap();
         let message = store
             .append_claim(&ClaimInput {
@@ -40415,6 +40356,7 @@ message "human-attention" {
                 fields: BTreeMap::from([
                     ("from".into(), Value::String("agent/demo/worker".into())),
                     ("to".into(), Value::String("person/alex".into())),
+                    ("title".into(), Value::String("Can you look?".into())),
                     ("content".into(), Value::String("Please read this.".into())),
                     ("status".into(), Value::String("sent".into())),
                 ]),
@@ -40423,10 +40365,14 @@ message "human-attention" {
                 idempotency_key: Some("human-attention-message".into()),
             })
             .unwrap();
-        let items = store.attention_items(Some("person/alex")).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "unread-message");
-        assert_eq!(items[0].actions[0].label, "read");
+        let quiet = |store: &Store| {
+            store
+                .attention_items(Some("person/alex"))
+                .unwrap()
+                .is_empty()
+                && store.attention_items(None).unwrap().is_empty()
+        };
+        assert!(quiet(&store));
 
         store
             .append_claim(&ClaimInput {
@@ -40442,26 +40388,10 @@ message "human-attention" {
                 idempotency_key: Some("deliver-human-attention-message".into()),
             })
             .unwrap();
+        assert!(quiet(&store));
         assert_eq!(
-            store.attention_items(Some("person/alex")).unwrap()[0].kind,
-            "unread-message"
-        );
-        store
-            .append_claim(&ClaimInput {
-                subject: message.subject,
-                kind: "message.read".into(),
-                actor: Some("person/alex".into()),
-                fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("read-human-attention-message".into()),
-            })
-            .unwrap();
-        assert!(
-            store
-                .attention_items(Some("person/alex"))
-                .unwrap()
-                .is_empty()
+            store.messages(Some("person/alex"), false).unwrap()[0].status,
+            "delivered"
         );
     }
 
