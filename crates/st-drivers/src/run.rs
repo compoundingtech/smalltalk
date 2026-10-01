@@ -46,7 +46,8 @@ const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
 const MAX_PRESENTATION_PATCHES_PER_PASS: usize = 8;
 
 #[derive(Debug, Default)]
-pub(crate) struct PresentationPatchCursor {
+#[doc(hidden)]
+pub struct PresentationPatchCursor {
     after_id: Option<String>,
 }
 
@@ -2499,7 +2500,8 @@ pub fn reconcile_pass_specs(
     )
 }
 
-pub(crate) fn reconcile_pass_specs_with_cursor(
+#[doc(hidden)]
+pub fn reconcile_pass_specs_with_cursor(
     specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
@@ -2553,7 +2555,8 @@ pub(crate) fn reconcile_pass_specs_with_cursor(
 /// process can exit between two `pty list` calls, be reaped by the second call, then look like a
 /// vanished crash on the next tick. The external snapshot deliberately omits
 /// `st2.runtime.observe`; its provenance is outside this pass.
-pub(crate) fn reconcile_pass_specs_with_sessions(
+#[doc(hidden)]
+pub fn reconcile_pass_specs_with_sessions(
     specs: &[agent_spec::spec::AgentSpec],
     sessions: &[Session],
     this_host: &str,

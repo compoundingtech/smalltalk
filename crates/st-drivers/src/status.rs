@@ -290,7 +290,8 @@ const TMP_PREFIX: &str = ".status";
 /// The full staged-name prefix six catalog and publication walkers match, spelled ONCE here so a
 /// walker can never drift from the writer. Tied to [`TMP_PREFIX`] by
 /// `the_staging_prefix_is_the_one_the_catalog_walkers_match`.
-pub(crate) const TMP_STAGING_PREFIX: &str = ".status.tmp-";
+#[doc(hidden)]
+pub const TMP_STAGING_PREFIX: &str = ".status.tmp-";
 
 /// Atomic write: a staged sibling + rename, so a concurrent reader sees either the old bytes or
 /// the new bytes, never a partial file.
