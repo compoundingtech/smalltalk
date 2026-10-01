@@ -89,7 +89,12 @@ pub fn validate_body(body: &Value) -> Result<(), ValidationError> {
         }
         nodes += 1;
         if nodes > MAX_NODES
-            || obj.len() != 2
+            || obj
+                .keys()
+                .any(|k| k != "split" && k != "children" && k != "ratio")
+            || obj
+                .get("ratio")
+                .is_some_and(|v| !v.as_f64().is_some_and(|ratio| (0.1..=0.9).contains(&ratio)))
             || !obj
                 .get("split")
                 .is_some_and(|v| matches!(v.as_str(), Some("right" | "below")))
@@ -290,6 +295,33 @@ mod tests {
         }
         assert!(validate_body(&json!({"name":"Main","tabs":[]})).is_err());
         assert!(validate_body(&json!({"name":"","layout":{"tabs":[]}})).is_err());
+    }
+    #[test]
+    fn split_ratios_are_bounded_and_survive_stored_projection() {
+        for ratio in [0.1, 0.5, 0.9] {
+            let value =
+                body(json!({"split":"right", "ratio":ratio, "children":[{"tabs":[]},{"tabs":[]}]}));
+            validate_body(&value).unwrap();
+            assert_eq!(body_for_read(&value).unwrap(), value);
+        }
+        for ratio in [
+            json!(0.099),
+            json!(0.901),
+            json!(1),
+            json!(-1),
+            json!(null),
+            json!("0.5"),
+            json!(true),
+        ] {
+            assert!(
+                validate_body(&body(
+                    json!({"split":"below", "ratio":ratio, "children":[{"tabs":[]},{"tabs":[]}]})
+                ))
+                .is_err()
+            );
+        }
+        assert!(validate_body(&body(json!({"tabs":[], "ratio":0.5}))).is_err());
+        assert!(validate_body(&body(json!({"split":"right", "ratio":0.5, "focus":0, "children":[{"tabs":[]},{"tabs":[]}]}))).is_err());
     }
     #[test]
     fn glass_groups_enforce_exact_byte_depth_and_combined_node_bounds() {

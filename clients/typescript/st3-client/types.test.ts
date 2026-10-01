@@ -29,13 +29,18 @@ const machineHost: string = machine.host_id;
 void glassName; void machineHost;
 
 import type { GlassBody, GlassLayout } from './Models.generated';
-const groupedBody: GlassBody = { name: 'Main', layout: { split: 'right', children: [
+const groupedBody: GlassBody = { name: 'Main', layout: { split: 'right', ratio: 0.3, children: [
     { tabs: [{ title: 'Work', pane: 'opaque:key' }] }, { tabs: [] },
 ] } };
 function tabPanes(layout: GlassLayout): string[] {
     return 'tabs' in layout ? layout.tabs.map(tab => tab.pane) : layout.children.flatMap(tabPanes);
 }
 void tabPanes(groupedBody.layout);
+const splitRatio: number | undefined = 'split' in groupedBody.layout ? groupedBody.layout.ratio : undefined;
+void splitRatio;
+// @ts-expect-error a split ratio must be numeric
+const badRatio: GlassLayout = { split: 'right', ratio: '0.3', children: [{ tabs: [] }, { tabs: [] }] };
+void badRatio;
 // @ts-expect-error the pre-deployment body with tabs at the root is no longer valid
 const legacyBody: GlassBody = { name: 'Old', tabs: [] };
 // @ts-expect-error panes belong to tabs, not layout leaves

@@ -2647,6 +2647,8 @@ pub enum GlassLayout {
     Split {
         split: GlassSplit,
         children: [Box<GlassLayout>; 2],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ratio: Option<f64>,
     },
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

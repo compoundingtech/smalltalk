@@ -18,10 +18,12 @@ fn glass_groups_preserve_nested_tabs_and_empty_groups_on_round_trip() {
     let GlassLayout::Split {
         split: GlassSplit::Right,
         children,
+        ratio,
     } = &put.body.layout
     else {
         panic!("expected right split");
     };
+    assert_eq!(*ratio, Some(0.3));
     let GlassLayout::Group { tabs } = &*children[0] else {
         panic!("expected tab group");
     };
@@ -31,6 +33,7 @@ fn glass_groups_preserve_nested_tabs_and_empty_groups_on_round_trip() {
     let GlassLayout::Split {
         split: GlassSplit::Below,
         children,
+        ratio: None,
     } = &*children[1]
     else {
         panic!("expected nested below split");

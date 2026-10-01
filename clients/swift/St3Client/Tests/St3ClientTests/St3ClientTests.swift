@@ -24,10 +24,12 @@ final class St3ClientTests: XCTestCase {
         let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/glasses.json"))
         let glass = try JSONDecoder().decode(Envelope<Glass>.self, from: data).value
         XCTAssertEqual(glass.body?.name, "Main workspace")
-        guard case .split(.right, let groups) = try XCTUnwrap(glass.body).layout,
+        guard case .split(.right, let groups, let ratio) = try XCTUnwrap(glass.body).layout,
               case .group(let tabs) = groups[0],
-              case .split(.below, let nested) = groups[1],
+              case .split(.below, let nested, let nestedRatio) = groups[1],
               case .group(let empty) = nested[1] else { return XCTFail("Expected nested groups") }
+        XCTAssertEqual(ratio, 0.3)
+        XCTAssertNil(nestedRatio)
         XCTAssertEqual(tabs.count, 2)
         XCTAssertEqual(tabs[0].pane, "agent:agent/example/worker")
         XCTAssertEqual(tabs[0].title, "Work")

@@ -1970,7 +1970,7 @@ pub struct TerminalScreen {
 #[serde(untagged)]
 pub enum GlassLayout {
     Group { tabs: Vec<GlassTab> },
-    Split { split: GlassSplit, children: [Box<GlassLayout>; 2] },
+    Split { split: GlassSplit, children: [Box<GlassLayout>; 2], #[serde(default, skip_serializing_if = "Option::is_none")] ratio: Option<f64> },
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all="lowercase")]

@@ -685,7 +685,11 @@ transaction. Both are null on a first creation. A deletion response has a null b
 The structure is `{name, layout}`. A layout is a leaf group
 `{tabs:[{title?, pane: "opaque key"}]}` or a binary split
 `{split: "right" | "below", children: [layout, layout]}`. Each group has its own tab strip.
-Pane keys convey no authority. Focus, the selected tab in each group, scroll, ratios, and
+A split may include `ratio`, a number from 0.1 through 0.9 specifying the first child’s share;
+absent means equal halves (0.5). Send it only to a member advertising the granted `glasses`
+capability at version 2 or later. Version 1 bodies remain valid without a ratio. This optional
+field changes neither depth nor node limits.
+Pane keys convey no authority. Focus, the selected tab in each group, scroll, and
 last-used glass stay local. Empty groups `{tabs: []}` are valid; clients supply their implicit
 Home locally in the first group. Names and pane keys must be nonempty; splits have exactly
 two children, and no unknown structure fields are accepted.
