@@ -229,7 +229,8 @@ a ready revision brings it back.
 A mission run owns the execution state declared inside that run. A top-level `agent` is instead a
 first-class durable seat with no mission owner. Seats can receive messages and claim work from many
 finite missions over their lifetime. A person's standalone shell is a top-level PTY named
-`pty/person/NAME/UUID`, with no mission or agent owner. Only that person may publish its
+`pty/person/NAME/UUID`, with no mission owner and no agent harness. Free-mode local agents
+can likewise create a plain shell at `pty/agent/PATH/UUID`. Only its exact creator may publish its
 `intent.desired` claims, including a stop; local admission and replication enforce this.
 Other top-level execution members still require a mission run.
 

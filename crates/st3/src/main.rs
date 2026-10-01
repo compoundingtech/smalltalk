@@ -5056,7 +5056,7 @@ async fn run_pty(
     match command {
         PtyCommand::New(args) => {
             let person =
-                configured_human(args.person.as_deref(), configured_person, "terminals new")?;
+                configured_actor(args.person.as_deref(), configured_person, "terminals new")?;
             let generated = generated_client(endpoint, Some(&person))?;
             let capabilities = generated.capabilities().await?;
             let local = client.get::<Value>("/v1/health").await?["node"]
@@ -5120,7 +5120,7 @@ async fn run_pty(
         }
         PtyCommand::End(args) => {
             let person =
-                configured_human(args.person.as_deref(), configured_person, "terminals end")?;
+                configured_actor(args.person.as_deref(), configured_person, "terminals end")?;
             let generated = generated_client(endpoint, Some(&person))?;
             let capabilities = generated.capabilities().await?;
             let nonce = uuid::Uuid::now_v7().simple().to_string();

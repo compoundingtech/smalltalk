@@ -9227,7 +9227,7 @@ impl Store {
             validate_actor(actor)?;
         }
         validate_claim_fields(input)?;
-        st3_schema::person_terminals::validate_declaration_owner(
+        st3_schema::owned_terminals::validate_declaration_owner(
             &input.subject,
             &input.kind,
             input.actor.as_deref(),
@@ -19323,7 +19323,7 @@ fn append_claim_tx(
     predecessors: &[String],
     forced_batch: Option<&str>,
 ) -> Result<ClaimRecord> {
-    st3_schema::person_terminals::validate_declaration_owner(subject, kind, actor)
+    st3_schema::owned_terminals::validate_declaration_owner(subject, kind, actor)
         .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
     let fields = schema_fields_for_body(kind, body)?;
@@ -26625,7 +26625,7 @@ fn validate_replicated_claim_with_registry(
             ),
         ));
     }
-    st3_schema::person_terminals::validate_declaration_owner(
+    st3_schema::owned_terminals::validate_declaration_owner(
         &claim.subject,
         &claim.kind,
         claim.actor.as_deref(),

@@ -1052,7 +1052,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             "unavailable"
         } else if session.allows(scope)
             && (!matches!(*action, "agent.create" | "terminal.create" | "terminal.end")
-                || require_creation_person(session).is_ok())
+                || require_creation_actor(session).is_ok())
         {
             "granted"
         } else {
@@ -6701,13 +6701,15 @@ fn creation_key(session: &ClientSession, request: &ActionRequest) -> String {
         session.actor, request.idempotency_key
     )))
 }
-fn require_creation_person(session: &ClientSession) -> Result<&str, ApiError> {
-    let person = session.authority_actor.as_str();
-    if !person.starts_with("person/") || person.matches('/').count() != 1 {
-        return Err(forbidden("creation requires the session's concrete person"));
+fn require_creation_actor(session: &ClientSession) -> Result<&str, ApiError> {
+    if !acting_party(session) {
+        return Err(forbidden(
+            "creation requires the session's concrete person or local agent",
+        ));
     }
-    Ok(person)
+    Ok(&session.authority_actor)
 }
+
 fn creation_string(value: &str, field: &str, max: usize) -> Result<(), ApiError> {
     if value.trim().is_empty() || value.len() > max || value.contains('\0') {
         return Err(validation(format!(
@@ -6826,7 +6828,7 @@ async fn create_agent(
     session: &ClientSession,
     request: &ActionRequest,
 ) -> Result<Vec<String>, ApiError> {
-    require_creation_person(session)?;
+    require_creation_actor(session)?;
     let mut parameters: st3_client::AgentCreateParameters =
         serde_json::from_value(request.parameters.clone())
             .map_err(|error| validation(error.to_string()))?;
@@ -6916,7 +6918,7 @@ async fn create_terminal(
     session: &ClientSession,
     request: &ActionRequest,
 ) -> Result<Vec<String>, ApiError> {
-    let person = require_creation_person(session)?;
+    let person = require_creation_actor(session)?;
     let parameters: st3_client::TerminalCreateParameters =
         serde_json::from_value(request.parameters.clone())
             .map_err(|error| validation(error.to_string()))?;
@@ -6957,13 +6959,13 @@ async fn dispatch_action(
         "agent.create" => create_agent(state, snapshot, session, request).await,
         "terminal.create" => create_terminal(state, snapshot, session, request).await,
         "terminal.end" => {
-            let person = require_creation_person(session)?;
+            let person = require_creation_actor(session)?;
             let subject = terminal_subject(&parameter_string(p, "target_id")?);
-            if st3_schema::person_terminals::owner(&subject)
+            if st3_schema::owned_terminals::owner(&subject)
                 .map_err(|error| validation(error.message))?
                 != Some(person)
             {
-                return Err(forbidden("only the terminal's person may end it"));
+                return Err(forbidden("only the terminal's creator may end it"));
             }
             if state
                 .store
@@ -7852,7 +7854,7 @@ pub(super) async fn action(
         let recovered_creation = matches!(
             request.action_type.as_str(),
             "agent.create" | "terminal.create"
-        ) && require_creation_person(&session).is_ok()
+        ) && require_creation_actor(&session).is_ok()
             && existing_creation(&state, &session, &request)?.is_some();
         if reconciled_attachment.is_none() && !recovered_creation {
             return Err(error);

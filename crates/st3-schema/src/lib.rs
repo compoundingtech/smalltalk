@@ -1,7 +1,7 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
 pub mod glasses;
-pub mod person_terminals;
+pub mod owned_terminals;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;

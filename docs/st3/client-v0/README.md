@@ -738,10 +738,11 @@ Its returned ID is `terminal/pty/person/NAME/UUID`, usable with existing screen,
 methods. `terminal.end` takes `target_id` and permanently stops this personal PTY, including before
 it has started or after its shell exits. It requires no runtime incarnation or terminal sequence.
 
-All three actions require the session's concrete person, a snapshot fence and a stable idempotency
+All three actions require the session's concrete person or trusted local agent, a snapshot fence and a stable idempotency
 key. Agent creation needs `control.runtimes`; terminal creation and ending need `terminal.control`.
 Their same-named action capabilities advertise availability. Terminal declaration admission checks
-the person owner in local writes and replicated claims. Existing fleet terminal read/control grants
+the creator in local writes and replicated claims. A local agent creates a shell at
+`pty/agent/PATH/UUID`, owned by that exact seat; no action selects another actor. Existing fleet terminal read/control grants
 continue to govern screen access and input.
 
 `affected_ids` contains the agent ID or terminal ID. A completed action means the durable declaration

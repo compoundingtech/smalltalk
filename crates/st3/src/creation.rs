@@ -123,7 +123,7 @@ fn creation_tags(key: &str) -> KdlNode {
         .push(KdlEntry::new_prop("st3.client.create-key", key));
     tags
 }
-/// A person-owned PTY shell, with no harness or agent declaration.
+/// A caller-owned PTY shell, with no harness or agent declaration.
 pub fn terminal_document(
     person: &str,
     id: &str,

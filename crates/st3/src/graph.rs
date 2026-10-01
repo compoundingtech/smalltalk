@@ -393,13 +393,13 @@ fn parse_desired_node(
             format!("unknown desired-state node `{kind}`"),
         ));
     }
-    let person_terminal = kind == "pty"
+    let owned_terminal = kind == "pty"
         && context.owner_run.is_none()
-        && st3_schema::person_terminals::owner(&format!("pty/{}", one_string_with_children(node)?))
+        && st3_schema::owned_terminals::owner(&format!("pty/{}", one_string_with_children(node)?))
             .map_err(|e| St3Error::new(e.code, e.message))?
             .is_some();
     if !context.allow_execution_root
-        && !person_terminal
+        && !owned_terminal
         && matches!(
             kind,
             "exec" | "pty" | "lane" | "observer" | "subscription" | "schedule"

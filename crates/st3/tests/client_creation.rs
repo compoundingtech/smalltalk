@@ -154,17 +154,28 @@ async fn personal_shell_creation_retry_and_end_use_person_ownership() {
             .as_deref(),
         Some("stop")
     );
+    let (status, agent_shell) = action(
+        app.clone(),
+        "agent/worker",
+        "terminal.create",
+        "shell-create-agent-01",
+        json!({"name":"Agent shell", "cwd":"/tmp"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{agent_shell}");
+    let agent_id = agent_shell["value"]["affected_ids"][0].as_str().unwrap();
+    assert!(agent_id.starts_with("terminal/pty/agent/worker/"));
     assert_eq!(
         action(
             app.clone(),
             "agent/worker",
-            "terminal.create",
-            "shell-create-agent-01",
-            json!({"name":"No"})
+            "terminal.end",
+            "shell-end-agent-0001",
+            json!({"target_id":agent_id})
         )
         .await
         .0,
-        StatusCode::FORBIDDEN
+        StatusCode::OK
     );
 }
 #[tokio::test]
@@ -241,6 +252,22 @@ async fn agent_creation_has_typed_parameters_and_native_first_message() {
         .0,
         StatusCode::UNPROCESSABLE_ENTITY
     );
+    let (status, created) = action(
+        app.clone(),
+        "agent/example/operator",
+        "agent.create",
+        "agent-free-mode-0001",
+        json!({"name":"second", "harness":"omp", "workspace":"/tmp", "message":"First"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let subject = created["value"]["affected_ids"][0].as_str().unwrap();
+    let claim = state
+        .store
+        .latest_claim(subject, Some("intent.desired"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.actor.as_deref(), Some("agent/example/operator"));
     assert_eq!(members.len(), 1);
 }
 

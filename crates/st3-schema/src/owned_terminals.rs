@@ -1,19 +1,22 @@
-//! Names and declaration ownership for a person's standalone shell PTY.
+//! Names and declaration ownership for a caller's standalone shell PTY.
 use super::{ValidationError, error};
 
-/// Other PTYs remain mission-owned. Personal shells have a stable UUID below their person.
+/// Other PTYs remain mission-owned. Standalone shells have a stable UUID below their person or local agent.
 pub fn owner(subject: &str) -> Result<Option<&str>, ValidationError> {
-    if !subject.starts_with("pty/person/") {
+    let Some(tail) = subject.strip_prefix("pty/") else {
+        return Ok(None);
+    };
+    let Some((owner, id)) = tail.rsplit_once('/') else {
+        return Ok(None);
+    };
+    let person = owner.starts_with("person/") && owner.matches('/').count() == 1;
+    let agent = owner.starts_with("agent/") && owner.len() > "agent/".len();
+    if !(person || agent) || owner.split('/').any(str::is_empty) || !super::glasses::valid_uuid(id)
+    {
+        // Other names remain mission-owned; malformed root declarations fail the graph parser.
         return Ok(None);
     }
-    let tail = subject.strip_prefix("pty/").expect("checked PTY prefix");
-    let parts: Vec<_> = tail.split('/').collect();
-    if parts.len() != 3 || parts[1].is_empty() || !super::glasses::valid_uuid(parts[2]) {
-        // A mission may already have a similarly named member. Only the complete personal
-        // namespace is reserved; malformed root personal declarations still fail the graph parser.
-        return Ok(None);
-    }
-    Ok(Some(&tail[..tail.len() - parts[2].len() - 1]))
+    Ok(Some(owner))
 }
 
 pub fn validate_declaration_owner(
@@ -27,7 +30,7 @@ pub fn validate_declaration_owner(
     {
         return Err(error(
             "terminal-owner-forbidden",
-            "only a terminal's person may declare or end it",
+            "only a terminal's creator may declare or end it",
         ));
     }
     Ok(())
@@ -55,6 +58,13 @@ mod tests {
             );
         }
         validate_declaration_owner(subject, "runtime.observed", Some(subject)).unwrap();
+        let agent_shell = "pty/agent/example/worker/019a0000-0000-7000-8000-000000000001";
+        assert_eq!(owner(agent_shell).unwrap(), Some("agent/example/worker"));
+        validate_declaration_owner(agent_shell, "intent.desired", Some("agent/example/worker"))
+            .unwrap();
+        assert!(
+            validate_declaration_owner(agent_shell, "intent.desired", Some("agent/other")).is_err()
+        );
         assert_eq!(owner("pty/person/ada/member").unwrap(), None);
         assert_eq!(owner("pty/run/member").unwrap(), None);
     }
