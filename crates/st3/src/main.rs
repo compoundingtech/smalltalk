@@ -26,13 +26,14 @@ use st3::model::{
     MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest, MissionRunView,
     MissionSpec, MissionState, OperationalRepairApplyRequest, OperationalRepairPlan,
-    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus,
-    ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
-    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionScreen,
-    SessionSignalRequest, StatusResponse, StepRunView, SubscriptionRequestDecision,
-    SubscriptionRequestView, WorkRequest, WorkRetryRequest, WorkWakeRequest,
+    OperationalRepairResult, PersonAskRequest, PersonStepResponse, PlannerSpec,
+    PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest,
+    ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
+    SessionInputMode, SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse,
+    StepRunView, SubscriptionRequestDecision, SubscriptionRequestView, WorkRequest,
+    WorkRetryRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -2644,35 +2645,11 @@ enum AttentionCommand {
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
     },
-    /// Request attention after an explicit fault.
-    ///
-    /// A request names what closes it. The item stays in `st now` until a person resolves it or
-    /// you withdraw it with `st attention withdraw` once the condition clears. It also leaves
-    /// `now` on its own:
-    ///
-    /// - when the step you have claimed ends, if the request names no target that can end, no
-    ///   --until and no --person-closes; the step ends when it completes, fails, is cancelled,
-    ///   starts another attempt or leaves its run's current generation, and --step names
-    ///   another step;
-    /// - once every target meets its --until condition;
-    /// - at once, when a `step-run/` or `run-generation/` target is no longer current, or a
-    ///   pull request target is merged or closed;
-    /// - otherwise, once every other target has ended after the request: a `mission/` retired or
-    ///   cancelled, a `mission-run/` terminal, an `attention/` item resolved or its gate no
-    ///   longer pending, an `agent/` stopped or ready on a later incarnation, an `observer/`
-    ///   stopped or observing again, a `subscription/` stopped, a `loop-run/` running again or
-    ///   its run revised or cancelled, or a `message/` closed.
-    ///
-    /// Other `resource/` targets and `doc/` targets are context and never end an item. A target
-    /// of any other kind, or one that had already ended when you made the request, keeps it open.
-    ///
-    /// st refuses a request that nothing could close. Pass --person-closes when only a person
-    /// can say it is done.
-    #[command(verbatim_doc_comment)]
+    /// Legacy mutation: returns attention-migrated. Use work ask or remedy the source.
     Request(AttentionRequestArgs),
-    /// Resolve or dismiss any attention request, as any person.
+    /// Legacy mutation: returns attention-migrated. Complete a person step with work done.
     Resolve(AttentionResolveArgs),
-    /// Withdraw an obsolete attention request as its original requester.
+    /// Legacy mutation: returns attention-migrated. Cancel your ask with work cancel-ask.
     Withdraw(AttentionWithdrawArgs),
     /// Approve one person-owned gate or launch review.
     Approve(ReviewArgs),
@@ -2734,6 +2711,12 @@ struct AttentionWithdrawArgs {
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Ask a person through a runtime step owned by live work.
+    Ask(WorkAskArgs),
+    /// Complete a person-assigned step with a response.
+    Done(WorkDoneArgs),
+    /// Cancel your own ask and resume its live origin.
+    CancelAsk(WorkDoneArgs),
     /// List current actionable work; use --as to filter one agent or --all for history.
     Ls {
         /// Follow current collection changes.
@@ -2785,6 +2768,41 @@ enum WorkCommand {
         #[command(subcommand)]
         command: WorkRevisionCommand,
     },
+}
+
+#[derive(Args)]
+struct WorkAskArgs {
+    #[arg(long = "for")]
+    person: String,
+    #[arg(long)]
+    title: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long, conflicts_with = "new_run")]
+    step: Option<String>,
+    #[arg(long, conflicts_with = "step")]
+    new_run: Option<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+    #[arg(long)]
+    idempotency_key: String,
+}
+
+#[derive(Args)]
+struct WorkDoneArgs {
+    subject: String,
+    #[arg(long = "as")]
+    actor: String,
+    #[arg(long, alias = "reason")]
+    summary: String,
+    #[arg(long)]
+    evidence: Vec<String>,
+    #[arg(long)]
+    episode: Option<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -3435,7 +3453,7 @@ fn guard_mutating_cli_actor(
     if let Some(actor) = actor {
         if actor.starts_with("person/") || actor == "requester" {
             anyhow::bail!(
-                "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}` on a mutating command; request a person through `st attention request --as \"$ST_AGENT\"`"
+                "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}` on a mutating command; request a person through `st work ask --as \"$ST_AGENT\"`"
             );
         }
         if let Some(message) = foreign_agent_actor(actor, Some(own), mission_run) {
@@ -10166,6 +10184,51 @@ async fn run_work(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        WorkCommand::Ask(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: StepRunView = client
+                .post(
+                    "/v1/work/ask",
+                    &PersonAskRequest {
+                        legacy_request: None,
+                        person: args.person,
+                        title: args.title,
+                        reason: args.reason,
+                        actor: args.actor,
+                        step: args.step,
+                        new_run: args.new_run,
+                        incarnation: args.incarnation,
+                        idempotency_key: args.idempotency_key,
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+        command @ (WorkCommand::Done(_) | WorkCommand::CancelAsk(_)) => {
+            let (args, path) = match command {
+                WorkCommand::Done(args) => (args, "/v1/work/done"),
+                WorkCommand::CancelAsk(args) => (args, "/v1/work/cancel-ask"),
+                _ => unreachable!(),
+            };
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: StepRunView = client
+                .post(
+                    path,
+                    &PersonStepResponse {
+                        subject: args.subject,
+                        actor: args.actor,
+                        summary: args.summary,
+                        evidence: args.evidence,
+                        episode: args.episode,
+                        idempotency_key: args.idempotency_key.unwrap_or_else(|| {
+                            format!("person-response:{}", uuid::Uuid::now_v7().simple())
+                        }),
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+
         WorkCommand::Ls {
             watch,
             actor,
@@ -16208,7 +16271,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_request_help_says_which_targets_end_an_item() {
+    fn legacy_attention_help_directs_callers_to_person_work() {
         let mut command = Cli::command();
         let help = command
             .find_subcommand_mut("attention")
@@ -16217,20 +16280,8 @@ mod tests {
             .unwrap()
             .render_long_help()
             .to_string();
-        for expected in [
-            "st attention withdraw",
-            "`step-run/` or `run-generation/` target is no longer current",
-            "a `mission/` retired or\n  cancelled",
-            "pull request target is merged or closed",
-            "a `loop-run/` running again",
-            "Other `resource/` targets and `doc/` targets are context",
-            "had already ended when you made the request, keeps it open",
-            "when the step you have claimed ends",
-            "st refuses a request that nothing could close",
-            "--person-closes",
-        ] {
-            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
-        }
+        assert!(help.contains("attention-migrated"), "{help}");
+        assert!(help.contains("work ask"), "{help}");
     }
 
     #[test]

@@ -41,8 +41,10 @@ use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
+mod attention_snapshot;
 mod canonical;
 mod checkpoint;
+mod person_work;
 mod projection_digest;
 use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 mod checkpoint_agreement;
@@ -9514,24 +9516,6 @@ impl Store {
                         claim_ids.push(claim);
                     }
                 }
-                "superseded-attention" => {
-                    let claim = append_claim_tx(
-                        &transaction,
-                        &self.origin,
-                        &item.subject,
-                        "attention.resolved",
-                        Some("daemon/runtime"),
-                        &json!({"fields": {
-                            "request": item.subject,
-                            "outcome": "resolved",
-                            "reason": item.reason,
-                        }}),
-                        &[],
-                        None,
-                    )
-                    .map_err(internal)?;
-                    claim_ids.push(claim.id);
-                }
                 "wake-contradiction" => {
                     let incarnation_id = item
                         .details
@@ -11004,6 +10988,7 @@ impl Store {
 
     /// Request attention for a condition the daemon watches itself. The daemon closes it once
     /// that condition clears.
+    /// Retained for historical import and audit fixtures. Current requests use `ask_person`.
     pub fn request_attention(
         &self,
         subject: &str,
@@ -11115,6 +11100,7 @@ impl Store {
             .ok_or_else(|| St3Error::new("internal", "the attention request was not stored"))
     }
 
+    /// Historical audit closure; current attention has no independent resolution.
     pub fn resolve_attention(
         &self,
         subject: &str,
@@ -11142,62 +11128,6 @@ impl Store {
                     "only a person resolves or dismisses attention request `{subject}`; its requester can withdraw it"
                 ),
             ));
-        }
-        if self
-            .attention_request(&subject)
-            .map_err(internal)?
-            .is_none()
-            && let Some(claim_id) = subject.strip_prefix("attention/subscription-failure-")
-        {
-            let failure = self
-                .claim_by_id(claim_id)
-                .map_err(internal)?
-                .filter(|claim| claim.kind == "subscription.mission-failed")
-                .ok_or_else(|| {
-                    St3Error::new(
-                        "missing-attention-request",
-                        format!("attention request `{subject}` does not exist"),
-                    )
-                })?;
-            let fields = failure.body.get("fields").unwrap_or(&failure.body);
-            let original_request = fields
-                .get("request")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let requester = self
-                .claim_by_id(original_request)
-                .map_err(internal)?
-                .and_then(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/requester")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_default();
-            // The failure is routed to the person who requested the delivery. A subscription
-            // that requests as an agent routes it to no person, so it goes to whoever closes it.
-            let reviewer = if requester.starts_with("person/") {
-                requester
-            } else {
-                actor.clone()
-            };
-            self.request_attention(
-                &subject,
-                &AttentionRequest {
-                    reviewer,
-                    title: "Subscription mission failed".into(),
-                    reason: fields
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Subscription mission failed")
-                        .into(),
-                    severity: "error".into(),
-                    targets: vec![failure.subject],
-                    actor: "agent/reconciler".into(),
-                    idempotency_key: format!("subscription-failure-attention:{claim_id}"),
-                },
-            )?;
         }
         let current = self
             .attention_request(&subject)
@@ -11284,44 +11214,6 @@ impl Store {
         self.attention_request(&subject)
             .map_err(internal)?
             .ok_or_else(|| St3Error::new("internal", "the attention withdrawal was not stored"))
-    }
-
-    /// Pending requests from `origin` that declared an `until` condition.
-    /// Open requests accepted on `origin` that the daemon closes on its own: those with an
-    /// `until` condition or a step whose end closes them.
-    pub fn pending_attention_closed_by_condition(
-        &self,
-        origin: &str,
-    ) -> Result<Vec<AttentionRequestView>> {
-        let connection = self.readers.get();
-        let mut statement = connection.prepare(&canonical_sql(
-            "SELECT request.subject FROM claims request
-             WHERE request.kind='attention.requested'
-               AND request.origin=?1
-               AND (json_extract(request.body, '$.fields.until') IS NOT NULL
-                    OR json_extract(request.body, '$.fields.step') IS NOT NULL)
-               AND NOT EXISTS (
-                 SELECT 1 FROM claims resolution
-                 WHERE resolution.subject=request.subject
-                   AND resolution.kind='attention.resolved'
-               )
-             ORDER BY CANONICAL_ASC(request)",
-        ))?;
-        let subjects = statement
-            .query_map([origin], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        subjects
-            .iter()
-            .filter_map(|subject| attention_request_view_tx(&connection, subject).transpose())
-            .collect()
-    }
-
-    /// Why the step whose end closes `request` has ended, or `None` while it runs.
-    pub fn attention_step_ended(&self, request: &AttentionRequestView) -> Result<Option<String>> {
-        let (Some(step), Some(attempt)) = (&request.step, request.step_attempt) else {
-            return Ok(None);
-        };
-        attention_step_ended_tx(&self.readers.get(), step, attempt)
     }
 
     pub(crate) fn resolve_attention_automatically(
@@ -11445,15 +11337,11 @@ impl Store {
             .collect()
     }
 
-    /// The runs a person's attention waits on: those with a gate review, a launch approval or a
-    /// revision approval pending, which `attention_items` lists with their mission run. Messages
-    /// and attention requests name no run, so a mission view reads none of them.
+    /// Current runs waiting on person steps, human gates or approvals.
     pub fn human_attention_runs(&self) -> Result<BTreeSet<String>> {
-        Ok(self
-            .mission_run_attention_items(None)?
-            .into_iter()
-            .filter_map(|item| item.mission_run)
-            .collect())
+        let mut items = self.mission_run_attention_items(None)?;
+        items.extend(self.person_attention_items(None, now_ms())?);
+        Ok(items.into_iter().filter_map(|item| item.mission_run).collect())
     }
 
     /// The attention items that belong to a mission run: gate reviews, launch approvals and
@@ -11547,6 +11435,14 @@ impl Store {
     }
 
     pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
+        self.attention_snapshot(person, now_ms())
+    }
+
+    pub fn attention_snapshot(
+        &self,
+        person: Option<&str>,
+        as_of: u128,
+    ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
 
         // Only a person's messages need attention. Without a person, read each person's
@@ -11602,20 +11498,6 @@ impl Store {
 
         {
             let connection = self.readers.get();
-            for request in pending_attention_requests_tx(&connection, person)? {
-                if request
-                    .subject
-                    .starts_with("attention/subscription-failure-")
-                {
-                    continue;
-                }
-                if attention_request_is_current_tx(&connection, &request)? {
-                    items.push(attention_item_from_request(request));
-                }
-            }
-        }
-        {
-            let connection = self.readers.get();
             let mut statement = connection.prepare(
                 &canonical_sql("SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                         predecessors, accepted_at_unix_ms
@@ -11625,9 +11507,8 @@ impl Store {
                 .query_map([], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             for failure in failures {
-                let attention_subject = subscription_failure_attention_subject(&failure.id);
-                if attention_request_view_tx(&connection, &attention_subject)?
-                    .is_some_and(|request| request.status != "pending")
+                if failure.accepted_at_unix_ms > as_of
+                    || !person_work::declaration_live(&connection, &failure.subject)?
                     || !subscription_failure_is_current_tx(&connection, &failure)?
                 {
                     continue;
@@ -11647,7 +11528,7 @@ impl Store {
                     .flatten();
                 let reviewer = requester
                     .filter(|value| value.starts_with("person/"))
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| "person/operator".into());
                 if person.is_some_and(|person| !reviewer.is_empty() && person != reviewer) {
                     continue;
                 }
@@ -11660,9 +11541,11 @@ impl Store {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 items.push(AttentionItemView {
+                    episode: failure.id.clone(),
+                    priority: "high".into(),
                     kind: "fault".into(),
                     review_mode: None,
-                    subject: attention_subject,
+                    subject: failure.subject.clone(),
                     person: reviewer,
                     // st's subscription observer raised it.
                     requester_id: Some(
@@ -11688,13 +11571,48 @@ impl Store {
                 });
             }
         }
-        items.sort_by(|left, right| {
-            left.requested_at_unix_ms
-                .cmp(&right.requested_at_unix_ms)
-                .then_with(|| left.kind.cmp(&right.kind))
+        items.extend(self.person_attention_items(person, as_of)?);
+        items.extend(self.operational_attention_items(person, as_of)?);
+        items.extend(self.checkpoint_attention_items(person, as_of)?);
+        let connection = self.readers.get();
+        items.retain(|item| item.requested_at_unix_ms <= as_of);
+        let mut live = Vec::new();
+        for mut item in items {
+            if let Some(run) = item.mission_run.as_deref() {
+                if !person_work::run_live(&connection, run, None, item.kind == "fault")? {
+                    continue;
+                }
+            }
+            if item.episode.is_empty() {
+                item.episode = connection
+                    .query_row(
+                        &canonical_sql(
+                            "SELECT id FROM claims WHERE subject=?1
+                    ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                        ),
+                        [&item.subject],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_else(|| item.subject.clone());
+            }
+            live.push(item);
+        }
+        let priority = |item: &AttentionItemView| match item.priority.as_str() {
+            "critical" => 0,
+            "high" => 1,
+            "normal" => 2,
+            _ => 3,
+        };
+        live.sort_by(|left, right| {
+            priority(left)
+                .cmp(&priority(right))
+                .then_with(|| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms))
                 .then_with(|| left.subject.cmp(&right.subject))
                 .then_with(|| left.person.cmp(&right.person))
+                .then_with(|| left.episode.cmp(&right.episode))
         });
+        let items = live;
         Ok(items)
     }
 
@@ -20348,7 +20266,7 @@ fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> 
 }
 
 /// Target kinds whose own state can end an attention request; see
-/// `attention_request_is_current_tx` and `attention_target_moved_on_tx`. A pull request resource
+/// the retained legacy request metadata. A pull request resource
 /// can end one too, once st has observed it.
 const ATTENTION_ENDING_TARGETS: &[&str] = &[
     "step-run/",
@@ -20445,127 +20363,6 @@ fn attention_closing_step(
 
 /// Why the step whose end closes an attention request has ended since `attempt`, or `None`
 /// while that attempt still runs. A step st no longer knows has not ended.
-fn attention_step_ended_tx(
-    connection: &Connection,
-    step: &str,
-    attempt: u64,
-) -> Result<Option<String>> {
-    let row = connection
-        .query_row(
-            "SELECT step_runs.status, step_runs.attempt,
-                    step_runs.generation_id=mission_runs.current_generation_id,
-                    mission_runs.status
-             FROM step_runs
-             JOIN mission_runs ON mission_runs.id=step_runs.run_id
-             WHERE step_runs.subject=?1",
-            [step],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, bool>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((status, current_attempt, current_generation, run_status)) = row else {
-        return Ok(None);
-    };
-    let terminal = |status: &str| matches!(status, "completed" | "failed" | "cancelled");
-    Ok(if current_attempt != attempt {
-        Some(format!("`{step}` started attempt {current_attempt}"))
-    } else if terminal(&status) {
-        Some(format!("`{step}` {status}"))
-    } else if !current_generation {
-        Some(format!("`{step}` left its run's current generation"))
-    } else if terminal(&run_status) {
-        Some(format!("the run of `{step}` {run_status}"))
-    } else {
-        None
-    })
-}
-
-/// A fault request stays current until a target that owns its lifecycle ends it. A stale
-/// `run-generation/` or `step-run/` target ends it at once, and so does a pull request that is
-/// merged or closed. Otherwise it ends once every target that is not context has moved on after
-/// the request was accepted. Other `resource/` targets and `doc/` targets are context. A target
-/// that had already moved on when the request was made keeps it current, because the request is
-/// then about that outcome.
-fn attention_request_is_current_tx(
-    connection: &Connection,
-    request: &AttentionRequestView,
-) -> Result<bool> {
-    if request.reason.to_ascii_lowercase().contains("superseded") {
-        return Ok(false);
-    }
-    if let (Some(step), Some(attempt)) = (&request.step, request.step_attempt)
-        && attention_step_ended_tx(connection, step, attempt)?.is_some()
-    {
-        return Ok(false);
-    }
-    // A decision about a pull request has nothing left to decide once it is merged or closed,
-    // even when that happened before the request.
-    for target in &request.targets {
-        if pull_request_closed_tx(connection, target)? {
-            return Ok(false);
-        }
-    }
-    let mut runtime_targets = false;
-    for target in &request.targets {
-        if let Some(generation) = target.strip_prefix("run-generation/") {
-            runtime_targets = true;
-            let current = connection
-                .query_row(
-                    "SELECT mission_runs.current_generation_id=run_generations.id
-                     FROM run_generations
-                     JOIN mission_runs ON mission_runs.id=run_generations.run_id
-                     WHERE run_generations.id=?1
-                       AND mission_runs.status NOT IN ('completed','failed','cancelled')",
-                    [generation],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()?;
-            if current != Some(true) {
-                return Ok(false);
-            }
-        } else if target.starts_with("step-run/") {
-            runtime_targets = true;
-            let current = connection
-                .query_row(
-                    "SELECT step_runs.generation_id=mission_runs.current_generation_id
-                            AND mission_runs.status NOT IN ('completed','failed','cancelled')
-                     FROM step_runs
-                     JOIN mission_runs ON mission_runs.id=step_runs.run_id
-                     WHERE step_runs.subject=?1",
-                    [target],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()?;
-            if current != Some(true) {
-                return Ok(false);
-            }
-        }
-    }
-    if runtime_targets {
-        return Ok(true);
-    }
-    let since = connection.query_row(
-        "SELECT accepted_at_unix_ms, id FROM claims WHERE id=?1",
-        [&request.request],
-        |row| claim_moment(connection, row),
-    )?;
-    let mut moved_on = false;
-    for target in &request.targets {
-        match attention_target_moved_on_tx(connection, target, since.clone())? {
-            Some(true) => moved_on = true,
-            Some(false) => return Ok(true),
-            None => {}
-        }
-    }
-    Ok(!moved_on)
-}
-
 /// The same canonical total-order key used by shared SQL folds, including equal-time episodes.
 type ClaimMoment = canonical::ClaimKey;
 
@@ -20575,220 +20372,6 @@ fn claim_moment(connection: &Connection, row: &rusqlite::Row<'_>) -> rusqlite::R
     })
 }
 
-/// Whether `target` reached an ending state after `since`: `None` when the target is context
-/// that could never end a request.
-fn attention_target_moved_on_tx(
-    connection: &Connection,
-    target: &str,
-    since: ClaimMoment,
-) -> Result<Option<bool>> {
-    let after = |moment: Option<ClaimMoment>| Some(moment.is_some_and(|moment| moment > since));
-    if let Some(mission) = target.strip_prefix("mission/") {
-        let retired = connection
-            .query_row(
-                "SELECT claims.accepted_at_unix_ms, claims.id
-                 FROM mission_definitions
-                 JOIN claims ON claims.id=mission_definitions.claim_id
-                 WHERE mission_definitions.mission_id=?1
-                   AND mission_definitions.state='retired'",
-                [mission],
-                |row| claim_moment(connection, row),
-            )
-            .optional()?;
-        if retired.is_some() {
-            return Ok(after(retired));
-        }
-        // A mission is cancelled when no run is active and its latest run was cancelled.
-        let mut statement = connection.prepare(
-            "SELECT id, status FROM mission_runs WHERE mission_id=?1
-             ORDER BY CAST(created_at_unix_ms AS INTEGER) DESC, id DESC",
-        )?;
-        let runs = statement
-            .query_map([mission], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        if runs
-            .iter()
-            .any(|(_, status)| !is_terminal_run_state(status))
-        {
-            return Ok(Some(false));
-        }
-        return match runs.first() {
-            Some((run, status)) if status == "cancelled" => {
-                Ok(after(mission_run_ended_tx(connection, run)?))
-            }
-            _ => Ok(Some(false)),
-        };
-    }
-    if let Some(run) = target.strip_prefix("mission-run/") {
-        return Ok(after(mission_run_ended_tx(connection, run)?));
-    }
-    if target.starts_with("attention/") {
-        if attention_request_view_tx(connection, target)?.is_some() {
-            let resolved = connection
-                .query_row(
-                    &canonical_sql(
-                        "SELECT accepted_at_unix_ms, id FROM claims
-                     WHERE subject=?1 AND kind='attention.resolved'
-                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                    ),
-                    [target],
-                    |row| claim_moment(connection, row),
-                )
-                .optional()?;
-            return Ok(after(resolved));
-        }
-        // Otherwise the target is a client attention ID, a digest of a human gate's owner
-        // (`attention_resource_id` in the API). It moved on when that gate, requested before
-        // this request, is no longer pending.
-        let gate_id = |owner: &str| {
-            let digest = hex::encode(Sha256::digest(owner.as_bytes()));
-            format!("attention/{}", &digest[..24])
-        };
-        if pending_human_reviews_tx(connection, None)?
-            .iter()
-            .any(|review| gate_id(&review.owner) == target)
-        {
-            return Ok(Some(false));
-        }
-        let mut statement = connection.prepare(
-            "SELECT json_extract(body, '$.fields.owner'), accepted_at_unix_ms, id
-             FROM claims
-             WHERE kind='gate.requested'
-               AND json_extract(body, '$.fields.reviewer') IS NOT NULL",
-        )?;
-        let requested_before = statement
-            .query_map([], |row| {
-                let owner = row.get::<_, Option<String>>(0)?;
-                let _accepted_at = row.get::<_, String>(1)?;
-                Ok((
-                    owner,
-                    canonical::claim_key(connection, &row.get::<_, String>(2)?).map_err(
-                        |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                error.into(),
-                            )
-                        },
-                    )?,
-                ))
-            })?
-            .collect::<Result<Vec<(Option<String>, ClaimMoment)>, _>>()?
-            .into_iter()
-            .any(|(owner, moment)| {
-                moment < since && owner.is_some_and(|owner| gate_id(&owner) == target)
-            });
-        return Ok(Some(requested_before));
-    }
-    if target.starts_with("agent/") {
-        let stopped = connection
-            .query_row(
-                "SELECT claims.accepted_at_unix_ms, claims.id
-                 FROM desired JOIN claims ON claims.id=desired.claim_id
-                 WHERE desired.subject=?1 AND desired.kind='stop'",
-                [target],
-                |row| claim_moment(connection, row),
-            )
-            .optional()?;
-        if stopped.is_some() {
-            return Ok(after(stopped));
-        }
-        // An agent that is ready on an incarnation that started after the request has
-        // recovered from whatever the request described.
-        let Some(harness) = current_harness_at(connection, target, None)? else {
-            return Ok(Some(false));
-        };
-        if !harness.is_ready() {
-            return Ok(Some(false));
-        }
-        let started = connection
-            .query_row(
-                &canonical_sql(
-                    "SELECT accepted_at_unix_ms, id FROM claims
-                 WHERE subject=?1 AND kind='runtime.observed'
-                   AND json_extract(body, '$.fields.incarnation_id')=?2
-                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
-                ),
-                params![target, harness.incarnation_id],
-                |row| claim_moment(connection, row),
-            )
-            .optional()?;
-        return Ok(after(started));
-    }
-    if target.starts_with("observer/") {
-        // A stopped observer has nothing left to observe. One that observes successfully again
-        // has recovered from what the request described.
-        if let Some(stopped) = declaration_stopped_tx(connection, target)? {
-            return Ok(after(Some(stopped)));
-        }
-        let state = connection
-            .query_row(
-                &canonical_sql(
-                    "SELECT json_extract(body, '$.fields.state'), accepted_at_unix_ms, id
-                 FROM claims WHERE subject=?1 AND kind='observer.state'
-                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
-                [target],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        canonical::claim_key(connection, &row.get::<_, String>(2)?).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    2,
-                                    rusqlite::types::Type::Text,
-                                    error.into(),
-                                )
-                            },
-                        )?,
-                    ))
-                },
-            )
-            .optional()?;
-        return Ok(match state {
-            Some((Some(state), moment)) if state == "healthy" => after(Some(moment)),
-            _ => Some(false),
-        });
-    }
-    if target.starts_with("subscription/") {
-        return Ok(after(declaration_stopped_tx(connection, target)?));
-    }
-    if let Some(path) = target.strip_prefix("loop-run/") {
-        return loop_run_moved_on_tx(connection, target, path, since);
-    }
-    if target.starts_with("message/") {
-        let closed = connection
-            .query_row(
-                &canonical_sql(
-                    "SELECT accepted_at_unix_ms, id FROM claims
-                 WHERE subject=?1 AND kind='message.closed'
-                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
-                [target],
-                |row| claim_moment(connection, row),
-            )
-            .optional()?;
-        return Ok(after(closed));
-    }
-    // Resources and documents are context. A target of any other kind has no rule here, so it
-    // keeps the request current.
-    if target.starts_with("resource/") || target.starts_with("doc/") {
-        return Ok(None);
-    }
-    Ok(Some(false))
-}
-
-/// Whether `target`, with or without a pinned observation, names a pull request whose latest
-/// observation shows it merged or closed.
-fn pull_request_closed_tx(connection: &Connection, target: &str) -> Result<bool> {
-    Ok(pull_request_state_tx(connection, target)?.is_some_and(|(state, _)| state != "open"))
-}
-
-/// The state of the pull request that `target` names, with or without a pinned observation, from
-/// its latest observation: `open`, `closed` or `merged`. An open listing records a pull request
-/// that left it as `closed`; the pull request provider records `state.state` and `state.merged`.
 fn pull_request_state_tx(connection: &Connection, target: &str) -> Result<Option<(String, u128)>> {
     let subject = target
         .split_once('@')
@@ -20860,89 +20443,6 @@ fn declaration_stopped_tx(connection: &Connection, subject: &str) -> Result<Opti
             |row| claim_moment(connection, row),
         )
         .optional()?)
-}
-
-/// A loop that stopped moved on once it runs again after a retry, once a revision replaced its
-/// run generation, or once its run was cancelled. Its run failing because it stopped does not
-/// end it: that failure is what the request reports.
-fn loop_run_moved_on_tx(
-    connection: &Connection,
-    target: &str,
-    path: &str,
-    since: ClaimMoment,
-) -> Result<Option<bool>> {
-    let after = |moment: Option<ClaimMoment>| Some(moment.is_some_and(|moment| moment > since));
-    let running_again = connection
-        .query_row(
-            &canonical_sql(
-                "SELECT accepted_at_unix_ms, id FROM claims
-             WHERE subject=?1 AND kind='loop.state'
-               AND json_extract(body, '$.fields.status')!='failed'
-             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-            ),
-            [target],
-            |row| claim_moment(connection, row),
-        )
-        .optional()?;
-    if after(running_again) == Some(true) {
-        return Ok(Some(true));
-    }
-    let Some((generation, _)) = path.split_once('/') else {
-        return Ok(Some(false));
-    };
-    let run = connection
-        .query_row(
-            "SELECT mission_runs.id, mission_runs.status,
-                    mission_runs.current_generation_id=run_generations.id
-             FROM run_generations
-             JOIN mission_runs ON mission_runs.id=run_generations.run_id
-             WHERE run_generations.id=?1",
-            [generation],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
-        )
-        .optional()?;
-    Ok(match run {
-        Some((_, _, false)) => Some(true),
-        Some((run, status, true)) if status == "cancelled" => {
-            after(mission_run_ended_tx(connection, &run)?)
-        }
-        _ => Some(false),
-    })
-}
-
-/// When a terminal run first reached a terminal status, from its own state history.
-fn mission_run_ended_tx(connection: &Connection, run: &str) -> Result<Option<ClaimMoment>> {
-    let run = run.strip_prefix("mission-run/").unwrap_or(run);
-    let terminal = connection
-        .query_row(
-            "SELECT status FROM mission_runs WHERE id=?1",
-            [run],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .is_some_and(|status| is_terminal_run_state(&status));
-    if !terminal {
-        return Ok(None);
-    }
-    connection
-        .query_row(
-            &canonical_sql(
-                "SELECT accepted_at_unix_ms, id FROM claims
-             WHERE subject=?1 AND kind='mission-run.state'
-               AND json_extract(body, '$.fields.status') IN ('completed','failed','cancelled')
-             ORDER BY CANONICAL_ASC(claims) LIMIT 1",
-            ),
-            [format!("mission-run/{run}")],
-            |row| claim_moment(connection, row),
-        )
-        .optional()
-        .map_err(Into::into)
 }
 
 type TargetState = (String, Option<u128>);
@@ -21093,15 +20593,10 @@ fn subscription_failure_is_current_tx(
     Ok(declaration_stopped_tx(connection, &failure.subject)?.is_none())
 }
 
-fn subscription_failure_attention_subject(claim_id: &str) -> String {
-    format!(
-        "attention/subscription-failure-{}",
-        claim_id.strip_prefix("claim/").unwrap_or(claim_id)
-    )
-}
-
 fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
     AttentionItemView {
+        episode: review.request.clone(),
+        priority: "normal".into(),
         kind: "human-gate".into(),
         review_mode: Some(review.mode.clone()),
         subject: review.owner.clone(),
@@ -21162,6 +20657,8 @@ fn attention_item_from_planning(
     preview: &PlanningPreviewView,
 ) -> AttentionItemView {
     AttentionItemView {
+        episode: preview.hash.clone(),
+        priority: "normal".into(),
         kind: "launch-approval".into(),
         review_mode: None,
         subject: session.subject.clone(),
@@ -21220,6 +20717,8 @@ fn attention_item_from_revision(
 ) -> AttentionItemView {
     let preview_hash = proposal.preview_hash.as_deref().unwrap_or_default();
     AttentionItemView {
+        episode: format!("{}:{}", proposal.source_generation, preview_hash),
+        priority: "normal".into(),
         kind: "revision-approval".into(),
         review_mode: None,
         subject: proposal.subject.clone(),
@@ -21271,6 +20770,8 @@ fn attention_item_from_message(
     requested_at_unix_ms: u128,
 ) -> AttentionItemView {
     AttentionItemView {
+        episode: message.subject.clone(),
+        priority: "normal".into(),
         kind: "unread-message".into(),
         review_mode: None,
         subject: message.subject.clone(),
@@ -21306,19 +20807,20 @@ pub(crate) fn agent_attention_requester(actor: &str) -> bool {
     actor.starts_with("agent/") && actor != "agent/st3/reconciler"
 }
 
-fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
-    let agent_request = agent_attention_requester(&request.actor);
+fn attention_item_from_failure(request: AttentionRequestView) -> AttentionItemView {
     AttentionItemView {
-        kind: if agent_request {
-            "agent-request"
+        episode: request.request.clone(),
+        priority: if request.severity == "warning" {
+            "normal"
         } else {
-            "fault"
+            "high"
         }
         .into(),
+        kind: "fault".into(),
         review_mode: None,
         subject: request.subject.clone(),
-        person: request.reviewer.clone(),
-        requester_id: Some(request.actor.clone()),
+        person: request.reviewer,
+        requester_id: Some(request.actor),
         launch_id: None,
         variant_id: None,
         message_id: None,
@@ -21329,34 +20831,10 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
         step: None,
         targets: request.targets,
         requested_at_unix_ms: request.requested_at_unix_ms,
-        actions: vec![
-            attention_action(
-                if agent_request { "answer" } else { "resolve" },
-                &[
-                    "st",
-                    "attention",
-                    "resolve",
-                    &request.subject,
-                    "--outcome",
-                    "resolved",
-                    "--as",
-                    &request.reviewer,
-                ],
-            ),
-            attention_action(
-                "dismiss",
-                &[
-                    "st",
-                    "attention",
-                    "resolve",
-                    &request.subject,
-                    "--outcome",
-                    "dismissed",
-                    "--as",
-                    &request.reviewer,
-                ],
-            ),
-        ],
+        actions: vec![attention_action(
+            "inspect source",
+            &["st", "subject", &request.subject],
+        )],
     }
 }
 
@@ -21515,20 +20993,6 @@ fn operational_repair_plan_tx(
                 "lease_expires_at_unix_ms".into(),
                 Value::String(expiry.to_string()),
             )]),
-        )?;
-    }
-
-    for request in pending_attention_requests_tx(connection, None)? {
-        if attention_request_is_current_tx(connection, &request)? {
-            continue;
-        }
-        push_operational_repair_item(
-            &mut items,
-            "superseded-attention",
-            &request.subject,
-            vec![request.subject.clone()],
-            "the attention target is terminal, superseded, or otherwise no longer current",
-            BTreeMap::new(),
         )?;
     }
 
@@ -25460,9 +24924,11 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
     // at one writer sequence all fall inside ranges both peers already hold.
     left.0
         .extend(test_envelope_ids("example-mac-like", [20_001], "a"));
-    right
-        .0
-        .extend(test_envelope_ids("example-linux-like", 20_001..=20_003, "a"));
+    right.0.extend(test_envelope_ids(
+        "example-linux-like",
+        20_001..=20_003,
+        "a",
+    ));
     left.0
         .remove(&test_envelope_ids("example-linux-like", [19_990], "a")[0]);
     right
@@ -27895,7 +27361,7 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
             1 => "claims.kind IN ('mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
                   'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
                   'step-run.carried','step-run.state','step-run.retried',
-                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')",
+                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released','work.person-asked','work.person-done','work.person-cancelled')",
             _ => "claims.kind='step-run.carried'",
         };
         let mut statement = transaction
@@ -28170,6 +27636,9 @@ fn project_mission_run_update(
     claim: &ClaimRecord,
 ) -> Result<(), St3Error> {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    if person_work::project(transaction, claim)? {
+        return Ok(());
+    }
     if claim.kind.starts_with("revision-proposal.") {
         project_revision_proposal(transaction, claim, fields)?;
         return Ok(());
@@ -30058,7 +29527,29 @@ fn enrich_step_queue_at(
     view.execution_elapsed_ms = execution_elapsed_ms;
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
-    enrich_step_definition(connection, view)
+    enrich_step_definition(connection, view)?;
+    let mut query = connection.prepare(&canonical_sql(
+        "SELECT resolution.body FROM claims resolution JOIN claims request
+        ON request.subject=resolution.subject AND request.kind='work.person-asked'
+        WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
+          AND json_extract(request.body,'$.fields.origin_step')=?1
+          AND json_extract(request.body,'$.fields.origin_attempt')=?2
+        ORDER BY CANONICAL_ASC(resolution)",
+    ))?;
+    // Aliases other than the fixed marker aliases use the same helper directly.
+    let responses = query
+        .query_map(params![view.subject, view.attempt], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for response in responses {
+        if let Ok(response) = serde_json::from_str::<Value>(&response) {
+            if let Some(summary) = response["fields"]["summary"].as_str() {
+                view.constraints.push(format!("Person response: {summary}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Copies the worker's latest progress summary and its completion summary for the
@@ -30119,7 +29610,29 @@ fn enrich_step_queue_for_reconcile_at(
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
     apply_effective_step_state(connection, view, snapshot_unix_ms)?;
-    enrich_step_definition(connection, view)
+    enrich_step_definition(connection, view)?;
+    let mut query = connection.prepare(&canonical_sql(
+        "SELECT resolution.body FROM claims resolution JOIN claims request
+        ON request.subject=resolution.subject AND request.kind='work.person-asked'
+        WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
+          AND json_extract(request.body,'$.fields.origin_step')=?1
+          AND json_extract(request.body,'$.fields.origin_attempt')=?2
+        ORDER BY CANONICAL_ASC(resolution)",
+    ))?;
+    // Aliases other than the fixed marker aliases use the same helper directly.
+    let responses = query
+        .query_map(params![view.subject, view.attempt], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for response in responses {
+        if let Ok(response) = serde_json::from_str::<Value>(&response) {
+            if let Some(summary) = response["fields"]["summary"].as_str() {
+                view.constraints.push(format!("Person response: {summary}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
@@ -30464,7 +29977,7 @@ fn step_execution_timing_at(
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1
            AND claims.kind IN ('step-run.state','step-run.carried','work.claimed','work.renewed',
-                               'work.progress','work.submitted','work.failed','work.released')
+                               'work.progress','work.submitted','work.failed','work.released','work.person-asked','work.person-done','work.person-cancelled')
          ORDER BY CANONICAL_ASC(claims)",
     ))?;
     let events = statement
@@ -30658,6 +30171,24 @@ fn apply_effective_step_state(
     else {
         return Ok(());
     };
+    if view
+        .assigned_to
+        .as_deref()
+        .is_some_and(|person| person.starts_with("person/"))
+    {
+        if let Some(ask) = person_work::request(connection, &view.subject)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+        {
+            if matches!(view.status.as_str(), "ready" | "pending")
+                && !person_work::current(connection, &ask, snapshot_unix_ms)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+            {
+                view.status = "cancelled".into();
+                view.blocked_reason =
+                    Some("the requester, originating attempt or owning run ended".into());
+            }
+        }
+    }
     let generation_id = generation_id_from_subject(&view.generation);
     if is_terminal_run_state(&run_status)
         || run_phase == "terminal"
@@ -30688,6 +30219,14 @@ fn apply_effective_step_state(
         view.claim_incarnation = None;
         view.claim_expires_at_unix_ms = None;
     }
+    if view.status == "waiting-person" {
+        view.blockers = active_step_blockers_tx(connection, &view.subject, snapshot_unix_ms)?;
+        if view.blockers.is_empty() {
+            view.status = "ready".into();
+            view.blocked_reason = None;
+            view.readiness_epoch += 1;
+        }
+    }
     if view.status == "ready" && view.blocked_reason.is_some() {
         view.blockers = active_step_blockers_tx(connection, &view.subject, snapshot_unix_ms)?;
         if view.blockers.is_empty() {
@@ -30707,28 +30246,20 @@ fn active_step_blockers_tx(
     subject: &str,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<Vec<String>> {
-    let snapshot = snapshot_unix_ms.to_string();
-    let mut statement = connection.prepare(&canonical_sql(
-        "SELECT DISTINCT request.subject
-         FROM claims request, json_each(json_extract(request.body, '$.fields.targets')) target
-         WHERE request.kind='attention.requested'
-           AND target.value=?1
-           AND (length(request.accepted_at_unix_ms)<length(?2)
-                OR (length(request.accepted_at_unix_ms)=length(?2)
-                    AND request.accepted_at_unix_ms<=?2))
-           AND NOT EXISTS (
-             SELECT 1 FROM claims resolution
-             WHERE resolution.subject=request.subject
-               AND resolution.kind='attention.resolved'
-               AND (length(resolution.accepted_at_unix_ms)<length(?2)
-                    OR (length(resolution.accepted_at_unix_ms)=length(?2)
-                        AND resolution.accepted_at_unix_ms<=?2))
-           )
-         ORDER BY CANONICAL_ASC(request), request.subject",
-    ))?;
-    statement
-        .query_map(params![subject, snapshot], |row| row.get::<_, String>(0))?
-        .collect()
+    let mut query = connection.prepare(&canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
+        FROM claims WHERE kind='work.person-asked' AND json_extract(body,'$.fields.origin_step')=?1 ORDER BY CANONICAL_ASC(claims)"))?;
+    let asks = query
+        .query_map([subject], claim_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut blockers = Vec::new();
+    for ask in asks {
+        if person_work::current(connection, &ask, snapshot_unix_ms)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+        {
+            blockers.push(ask.subject);
+        }
+    }
+    Ok(blockers)
 }
 
 fn planning_session_view_tx(
@@ -41146,182 +40677,7 @@ version 2
     }
 
     #[test]
-    fn an_attention_request_names_what_closes_it_and_an_agents_closes_with_its_step() {
-        let store = Store::open_memory("source").unwrap();
-        let source = r#"
-version 2
-
-mission "asks" state="ready" {
-  goal "Ask a person for a decision while working."
-  step "work" { assigned-to "agent/asker" }
-}
-"#;
-        let intent = crate::graph::parse_test_intent(source, "source").unwrap();
-        let planned = store
-            .mission(
-                &intent,
-                IntentInput {
-                    kdl: source.into(),
-                    source_name: None,
-                },
-            )
-            .unwrap();
-        store
-            .apply(&intent, &planned.subject_tokens, "asks-mission")
-            .unwrap();
-        let run = store
-            .create_mission_run(&MissionRunRequest {
-                mission: "asks".into(),
-                revision: None,
-                workspace: "/tmp".into(),
-                requester: Some("person/alex".into()),
-                mode: Some("run".into()),
-                inputs: BTreeMap::new(),
-                idempotency_key: "asks-run".into(),
-            })
-            .unwrap();
-        let step = run.steps[0].subject.clone();
-        store.set_step_state(&step, "ready", None).unwrap();
-        let agent = "agent/source.asker";
-        let ask = |key: &str, actor: &str, targets: &[&str], closing: AttentionClosing| {
-            store.request_attention_closing(
-                &format!("attention/{key}"),
-                &AttentionRequest {
-                    reviewer: "person/alex".into(),
-                    title: format!("Decide {key}"),
-                    reason: "A person needs to decide before the work goes on.".into(),
-                    severity: "warning".into(),
-                    targets: targets.iter().map(|target| (*target).to_owned()).collect(),
-                    actor: actor.into(),
-                    idempotency_key: key.into(),
-                },
-                &closing,
-            )
-        };
-        let open = |subject: &str| {
-            store
-                .attention_items(Some("person/alex"))
-                .unwrap()
-                .iter()
-                .any(|item| item.subject == subject)
-        };
-        let context = ["resource/fabric/queue", "host/ExampleMac"];
-
-        // Context and hosts never end an item, so a request naming only those is refused.
-        for (key, actor) in [("agent-unclaimed", agent), ("person", "person/alex")] {
-            assert_eq!(
-                ask(key, actor, &context, AttentionClosing::default())
-                    .unwrap_err()
-                    .code,
-                "attention-closes-never",
-                "{key}"
-            );
-        }
-        assert_eq!(
-            ask(
-                "someone",
-                agent,
-                &context,
-                AttentionClosing {
-                    closed_by: Some("someone".into()),
-                    ..AttentionClosing::default()
-                },
-            )
-            .unwrap_err()
-            .code,
-            "invalid-attention-closed-by"
-        );
-        assert_eq!(
-            ask(
-                "nowhere",
-                agent,
-                &context,
-                AttentionClosing {
-                    step: Some("step-run/missing/work".into()),
-                    ..AttentionClosing::default()
-                },
-            )
-            .unwrap_err()
-            .code,
-            "invalid-attention-step"
-        );
-        let person = ask(
-            "person-closes",
-            agent,
-            &context,
-            AttentionClosing {
-                closed_by: Some("person".into()),
-                ..AttentionClosing::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(person.closed_by.as_deref(), Some("person"));
-        assert_eq!(person.step, None);
-        let targeted = ask(
-            "targeted",
-            agent,
-            &[run.subject.as_str()],
-            AttentionClosing::default(),
-        )
-        .unwrap();
-        assert_eq!(targeted.step, None, "a run target that can end closes it");
-
-        // Once the agent has claimed a step, a request that names nothing else closes with it.
-        store
-            .work_action(
-                &step,
-                "claim",
-                &WorkRequest {
-                    actor: Some(agent.into()),
-                    incarnation: Some("asker-one".into()),
-                    summary: None,
-                    reason: None,
-                    evidence: Vec::new(),
-                    idempotency_key: "asks-claim".into(),
-                },
-            )
-            .unwrap();
-        let attempt = store.step_run(&step).unwrap().unwrap().attempt;
-        let asked = ask("asked", agent, &context, AttentionClosing::default()).unwrap();
-        assert_eq!(asked.step.as_deref(), Some(step.as_str()));
-        assert_eq!(asked.step_attempt, Some(u64::from(attempt)));
-        assert!(open(&asked.subject));
-        assert_eq!(store.attention_step_ended(&asked).unwrap(), None);
-        assert_eq!(
-            store
-                .pending_attention_closed_by_condition("source")
-                .unwrap()
-                .iter()
-                .map(|request| request.subject.as_str())
-                .collect::<Vec<_>>(),
-            [asked.subject.as_str()]
-        );
-
-        store.set_step_state(&step, "completed", None).unwrap();
-        assert_eq!(
-            store.attention_step_ended(&asked).unwrap().as_deref(),
-            Some(format!("`{step}` completed").as_str())
-        );
-        assert!(!open(&asked.subject), "the step that raised it ended");
-        assert!(open(&person.subject), "only a person closes this one");
-        assert_eq!(
-            ask(
-                "late",
-                "person/alex",
-                &context,
-                AttentionClosing {
-                    step: Some(step.clone()),
-                    ..AttentionClosing::default()
-                },
-            )
-            .unwrap_err()
-            .code,
-            "attention-step-ended"
-        );
-    }
-
-    #[test]
-    fn released_work_with_open_external_attention_is_blocked_until_resolution() {
+    fn legacy_attention_does_not_block_released_work_across_restart_and_replication() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("external-blocker.sqlite3");
         let store = Store::open(&path, "source").unwrap();
@@ -41393,35 +40749,13 @@ mission "external-blocker" state="ready" {
             )
             .unwrap();
 
-        let blocked = store.step_run(&subject).unwrap().unwrap();
-        assert_eq!(blocked.status, "blocked");
-        assert_eq!(blocked.blocked_reason.as_deref(), Some(reason));
-        assert_eq!(
-            blocked.blockers.as_slice(),
-            std::slice::from_ref(&attention.subject)
-        );
-        let listed = store.work(Some("agent/source.ios-owner"), false).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status, "blocked");
-        let annotation = store.work_annotation(&blocked).unwrap();
-        let batched = store.work_annotations(&[blocked.clone()]).unwrap();
-        assert_eq!(
-            serde_json::to_value(&annotation).unwrap(),
-            serde_json::to_value(&batched[&blocked.subject]).unwrap()
-        );
-        assert!(!annotation.actionable);
-        assert!(annotation.reasons.contains(&"external-blocker".into()));
-        assert_eq!(
-            store
-                .work_action(&subject, "claim", &request("blocked-reclaim", None),)
-                .unwrap_err()
-                .code,
-            "work-not-ready"
-        );
+        let ready = store.step_run(&subject).unwrap().unwrap();
+        assert_eq!(ready.status, "ready");
+        assert!(ready.blockers.is_empty());
         drop(store);
 
         let store = Store::open(&path, "source").unwrap();
-        assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "blocked");
+        assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "ready");
         let replica = Store::open_memory("replica").unwrap();
         let exchange = exchange_from(&store, &ReplicationInventory::default());
         assert_eq!(
@@ -41429,11 +40763,8 @@ mission "external-blocker" state="ready" {
             0
         );
         let replicated = replica.step_run(&subject).unwrap().unwrap();
-        assert_eq!(replicated.status, "blocked");
-        assert_eq!(
-            replicated.blockers.as_slice(),
-            std::slice::from_ref(&attention.subject)
-        );
+        assert_eq!(replicated.status, "ready");
+        assert!(replicated.blockers.is_empty());
 
         store
             .resolve_attention(
@@ -41813,7 +41144,7 @@ version 2
     }
 
     #[test]
-    fn operational_repair_closes_expired_attention_and_wake_contradictions() {
+    fn operational_repair_closes_expired_claims_and_wake_contradictions() {
         let store = Store::open_memory("node").unwrap();
         let source = r#"version 2
  agent "worker" { workspace "/tmp"; command "true" }
@@ -41950,14 +41281,8 @@ version 2
             .map(|item| item.class.as_str())
             .collect::<BTreeSet<_>>();
         assert!(classes.contains("expired-claim"));
-        assert!(classes.contains("superseded-attention"));
         assert!(classes.contains("wake-contradiction"));
-        assert!(plan.items.iter().any(|item| {
-            item.class == "superseded-attention"
-                && item
-                    .affected_subjects
-                    .contains(&"attention/typecase".to_owned())
-        }));
+        assert!(!classes.contains("superseded-attention"));
         let wake = plan
             .items
             .iter()
@@ -47225,14 +46550,6 @@ mission "asked-again" state="ready" {
             .unwrap();
     }
 
-    fn fault_is_current(store: &Store, subject: &str) -> bool {
-        store
-            .attention_items(Some("person/alex"))
-            .unwrap()
-            .iter()
-            .any(|item| item.kind == "fault" && item.subject == subject)
-    }
-
     fn start_agentless_run(store: &Store, mission: &str) -> MissionRunView {
         publish_mission(
             store,
@@ -47256,355 +46573,6 @@ mission "{mission}" state="ready" {{
                 idempotency_key: format!("{mission}-run"),
             })
             .unwrap()
-    }
-
-    #[test]
-    fn attention_whose_mission_target_is_cancelled_after_the_request_is_not_current() {
-        let store = Store::open_memory("node").unwrap();
-        let run = start_agentless_run(&store, "typecase");
-        request_fault(&store, "attention/typecase", &["mission/typecase"]);
-        assert!(fault_is_current(&store, "attention/typecase"));
-
-        store
-            .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
-            .unwrap();
-
-        assert!(!fault_is_current(&store, "attention/typecase"));
-        assert_eq!(
-            store
-                .attention_request("attention/typecase")
-                .unwrap()
-                .unwrap()
-                .status,
-            "pending",
-            "a request that is no longer current is not resolved on its own"
-        );
-    }
-
-    #[test]
-    fn attention_whose_attention_targets_are_all_closed_is_not_current() {
-        let store = Store::open_memory("node").unwrap();
-        let run = start_agentless_run(&store, "pull-request-review");
-        let step = run.steps[0].clone();
-        store
-            .append_claim(&ClaimInput {
-                subject: "gate-operation/pull-request-review/approval".into(),
-                kind: "gate.requested".into(),
-                actor: None,
-                fields: BTreeMap::from([
-                    ("owner".into(), Value::String(step.subject.clone())),
-                    ("reviewer".into(), Value::String("person/alex".into())),
-                    ("question".into(), Value::String("Approve it?".into())),
-                    ("review_targets".into(), Value::Array(Vec::new())),
-                    (
-                        "operation".into(),
-                        Value::String("gate-operation/pull-request-review/approval".into()),
-                    ),
-                    (
-                        "mission_revision".into(),
-                        Value::String(run.revision.clone()),
-                    ),
-                    (
-                        "step_definition".into(),
-                        Value::String(step.definition_hash.clone()),
-                    ),
-                    ("attempt".into(), Value::from(step.attempt)),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("pull-request-review-gate".into()),
-            })
-            .unwrap();
-        // The client names a human gate by a digest of its owner.
-        let gate = format!(
-            "attention/{}",
-            &hex::encode(Sha256::digest(step.subject.as_bytes()))[..24]
-        );
-        request_fault(&store, "attention/other-review", &["resource/review"]);
-        request_fault(
-            &store,
-            "attention/shared-review",
-            &[&gate, "attention/other-review", "resource/review"],
-        );
-        assert!(fault_is_current(&store, "attention/shared-review"));
-
-        store
-            .resolve_attention(
-                "attention/other-review",
-                &AttentionResolveRequest {
-                    outcome: "resolved".into(),
-                    reason: None,
-                    actor: "person/alex".into(),
-                    idempotency_key: "other-review-resolved".into(),
-                },
-            )
-            .unwrap();
-        assert!(
-            fault_is_current(&store, "attention/shared-review"),
-            "the gate it names is still pending"
-        );
-
-        store
-            .set_step_state(&step.subject, "completed", None)
-            .unwrap();
-        assert!(!fault_is_current(&store, "attention/shared-review"));
-    }
-
-    #[test]
-    fn attention_raised_after_its_run_failed_stays_current() {
-        let store = Store::open_memory("node").unwrap();
-        let run = start_agentless_run(&store, "crate-experiments");
-        store
-            .set_mission_run_state(&run.id, "failed", "terminal", Some("the gate failed"))
-            .unwrap();
-        request_fault(&store, "attention/post-mortem", &[&run.subject]);
-
-        assert!(fault_is_current(&store, "attention/post-mortem"));
-        assert!(
-            !store
-                .operational_repair_plan()
-                .unwrap()
-                .items
-                .iter()
-                .any(|item| item.class == "superseded-attention")
-        );
-    }
-
-    #[test]
-    fn a_decision_about_a_pull_request_ends_when_it_merges_or_closes() {
-        let store = Store::open_memory("node").unwrap();
-        let observe = |number: u64, state: &str, merged: Option<bool>| {
-            let mut facts = json!({
-                "repository": "resource/github/acme/demo",
-                "number": number,
-                "state": state,
-                "draft": false,
-                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            });
-            if let Some(merged) = merged {
-                facts["merged"] = Value::Bool(merged);
-            }
-            store
-                .append_claim(&ClaimInput {
-                    subject: format!("resource/github/acme/demo/pull-request/{number}"),
-                    kind: "resource.observed".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("kind".into(), Value::String("vcs.pull-request".into())),
-                        ("facts".into(), facts),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: None,
-                })
-                .unwrap()
-        };
-        let snapshot = observe(7, "open", Some(false));
-        request_fault(
-            &store,
-            "attention/review-7",
-            &[
-                &format!("resource/github/acme/demo/pull-request/7@{}", snapshot.id),
-                "doc/mission-run/example/review@abc",
-            ],
-        );
-        request_fault(
-            &store,
-            "attention/gate-8",
-            &["resource/github/acme/demo/pull-request/8"],
-        );
-        observe(8, "open", Some(false));
-        request_fault(&store, "attention/queue", &["resource/fabric/queue"]);
-        assert!(fault_is_current(&store, "attention/review-7"));
-        assert!(fault_is_current(&store, "attention/gate-8"));
-
-        // An open listing records a pull request that left it as closed.
-        observe(7, "closed", None);
-        assert!(!fault_is_current(&store, "attention/review-7"));
-        // The pull request provider records a merge.
-        observe(8, "closed", Some(true));
-        assert!(!fault_is_current(&store, "attention/gate-8"));
-
-        // A review raised after its pull request already merged has nothing to decide either.
-        request_fault(
-            &store,
-            "attention/late-review",
-            &["resource/github/acme/demo/pull-request/8"],
-        );
-        assert!(!fault_is_current(&store, "attention/late-review"));
-        // Other resources are still context.
-        assert!(fault_is_current(&store, "attention/queue"));
-        let states = store
-            .attention_target_states(&[
-                format!("resource/github/acme/demo/pull-request/7@{}", snapshot.id),
-                "resource/github/acme/demo/pull-request/8".into(),
-                "resource/fabric/queue".into(),
-            ])
-            .unwrap()
-            .into_iter()
-            .map(|state| state.state)
-            .collect::<Vec<_>>();
-        assert_eq!(states, ["closed", "merged"]);
-    }
-
-    #[test]
-    fn attention_about_an_observer_ends_when_it_observes_again() {
-        let store = Store::open_memory("node").unwrap();
-        let state = |state: &str, key: &str| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: "observer/demo".into(),
-                    kind: "observer.state".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("state".into(), Value::String(state.into())),
-                        ("revision".into(), Value::String("r1".into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(key.into()),
-                })
-                .unwrap();
-        };
-        state("healthy", "healthy-before");
-        state("unreachable", "unreachable");
-        request_fault(&store, "attention/observer", &["observer/demo"]);
-        assert!(
-            fault_is_current(&store, "attention/observer"),
-            "a healthy state from before the request is not a recovery"
-        );
-        assert_eq!(
-            store
-                .attention_target_states(&["observer/demo".into()])
-                .unwrap()[0]
-                .state,
-            "unreachable"
-        );
-        state("healthy", "healthy-after");
-        assert!(!fault_is_current(&store, "attention/observer"));
-    }
-
-    #[test]
-    fn attention_about_a_stopped_loop_ends_when_the_loop_runs_again() {
-        let store = Store::open_memory("node").unwrap();
-        let run = start_agentless_run(&store, "looping");
-        let generation = run.generation.strip_prefix("run-generation/").unwrap();
-        let loop_run = format!("loop-run/{generation}/review");
-        let loop_state = |status: &str, round: u64| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: loop_run.clone(),
-                    kind: "loop.state".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("status".into(), Value::String(status.into())),
-                        ("round".into(), Value::from(round)),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("{status}-{round}")),
-                })
-                .unwrap();
-        };
-        loop_state("running", 3);
-        request_fault(&store, "attention/loop", &[&loop_run, &run.subject]);
-        loop_state("failed", 3);
-        store
-            .set_mission_run_state(&run.id, "failed", "terminal", Some("the loop stopped"))
-            .unwrap();
-        assert!(
-            fault_is_current(&store, "attention/loop"),
-            "the run failing because its loop stopped is what the request reports"
-        );
-
-        loop_state("running", 4);
-        assert!(!fault_is_current(&store, "attention/loop"));
-    }
-
-    #[test]
-    fn attention_about_a_message_ends_when_the_message_is_closed() {
-        let store = Store::open_memory("node").unwrap();
-        let append = |kind: &str, status: &str| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: "message/0123456789abcdef".into(),
-                    kind: kind.into(),
-                    actor: Some("agent/example".into()),
-                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("anchor-{status}")),
-                })
-                .unwrap();
-        };
-        append("message.sent", "sent");
-        request_fault(&store, "attention/anchor", &["message/0123456789abcdef"]);
-        append("message.delivered", "delivered");
-        append("message.read", "read");
-        assert!(fault_is_current(&store, "attention/anchor"));
-        append("message.closed", "closed");
-        assert!(!fault_is_current(&store, "attention/anchor"));
-    }
-
-    #[test]
-    fn attention_whose_agent_target_moved_on_is_not_current() {
-        let store = Store::open_memory("node").unwrap();
-        let observe = |agent: &str, incarnation: &str| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: agent.into(),
-                    kind: "runtime.observed".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("status".into(), Value::String("running".into())),
-                        ("incarnation_id".into(), Value::String(incarnation.into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("{incarnation}-running")),
-                })
-                .unwrap();
-            store
-                .append_claim(&ClaimInput {
-                    subject: agent.into(),
-                    kind: "harness.observed".into(),
-                    actor: Some(agent.into()),
-                    fields: BTreeMap::from([
-                        ("state".into(), Value::String("idle".into())),
-                        ("incarnation_id".into(), Value::String(incarnation.into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("{incarnation}-idle")),
-                })
-                .unwrap();
-        };
-        observe("agent/node.seat", "seat-one");
-        request_fault(&store, "attention/seat", &["agent/node.seat"]);
-        request_fault(&store, "attention/retired", &["agent/node.retired"]);
-        assert!(
-            fault_is_current(&store, "attention/seat"),
-            "the incarnation that was ready at the request is not a recovery"
-        );
-
-        observe("agent/node.seat", "seat-two");
-        let source = "version 2\nstop \"agent/node.retired\"\n";
-        let intent = crate::graph::parse_intent(source, "node").unwrap();
-        let planned = store
-            .mission(
-                &intent,
-                IntentInput {
-                    kdl: source.into(),
-                    source_name: None,
-                },
-            )
-            .unwrap();
-        store
-            .apply(&intent, &planned.subject_tokens, "retired-stop")
-            .unwrap();
-
-        assert!(!fault_is_current(&store, "attention/seat"));
-        assert!(!fault_is_current(&store, "attention/retired"));
     }
 
     #[test]
@@ -47735,10 +46703,10 @@ mission "typecase" state="ready" {
         assert_eq!(first.reviewer, "person/alex");
         assert_eq!(first.status, "pending");
         let items = store.attention_items(Some("person/alex")).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "agent-request");
-        assert_eq!(items[0].actions[0].label, "answer");
-        assert_eq!(items[0].actions.len(), 2);
+        assert!(
+            items.is_empty(),
+            "historical legacy records do not enter current attention"
+        );
         assert!(
             store
                 .attention_items(Some("person/someone-else"))
@@ -47785,65 +46753,6 @@ mission "typecase" state="ready" {
             .resolve_attention(&first.subject, &resolution)
             .unwrap();
         assert_eq!(retry.resolved_at_unix_ms, closed.resolved_at_unix_ms);
-    }
-
-    #[test]
-    fn attention_until_needs_a_known_condition_and_a_target() {
-        let store = Store::open_memory("node").unwrap();
-        let request = |targets: Vec<String>, key: &str| AttentionRequest {
-            reviewer: "person/alex".into(),
-            title: "Publish this revision".into(),
-            reason: "Publish the prepared revision as a person.".into(),
-            severity: "warning".into(),
-            targets,
-            actor: "agent/node.requester".into(),
-            idempotency_key: key.into(),
-        };
-        let target = vec!["mission-run/release".to_owned()];
-        let unknown = store
-            .request_attention_closing(
-                "attention/unknown",
-                &request(target.clone(), "unknown"),
-                &crate::model::AttentionClosing {
-                    until: Some("published".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap_err();
-        assert_eq!(unknown.code, "invalid-attention-until");
-        let untargeted = store
-            .request_attention_closing(
-                "attention/untargeted",
-                &request(Vec::new(), "untargeted"),
-                &crate::model::AttentionClosing {
-                    until: Some("completed".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap_err();
-        assert_eq!(untargeted.code, "invalid-attention-until");
-
-        let stored = store
-            .request_attention_closing(
-                "attention/until",
-                &request(target, "until"),
-                &crate::model::AttentionClosing {
-                    until: Some("completed".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(stored.until.as_deref(), Some("completed"));
-        assert_eq!(
-            store.pending_attention_closed_by_condition("node").unwrap()[0].subject,
-            "attention/until"
-        );
-        assert!(
-            store
-                .pending_attention_closed_by_condition("other-host")
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]

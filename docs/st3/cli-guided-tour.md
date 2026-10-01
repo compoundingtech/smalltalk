@@ -128,8 +128,8 @@ If `ls` returns an item, copy its ID into `show`. Inspect the mutation help with
 state:
 
 ```sh
-st attention request --help
-st attention resolve --help
+st work ask --help
+st work done --help
 st attention approve --help
 st attention reject --help
 ```
