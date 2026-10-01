@@ -169,7 +169,7 @@ export function TerminalScreen({ route, navigation }: RootScreen<'Terminal'>) {
     </View>
     <View style={styles.strip}>
       <T dim style={styles.stripText}>
-        {status !== 'online' ? 'offline · the last frame' : !canControlTerminal ? 'read-only' : typing ? 'typing into the terminal' : 'tap the screen to type'}
+        {status !== 'online' ? 'offline · the last frame' : !canControlTerminal ? 'read-only: this phone was paired without terminal control' : typing ? 'typing into the terminal' : 'tap the screen to type'}
         {screen ? ` · ${screen.columns}×${screen.rows}` : ''}
       </T>
       {canType && screen && contentHeight < area.height * 0.8 ? <Pressable onPress={fitToPhone} hitSlop={8}><T style={styles.stripText} color={theme.accent}>fit to phone</T></Pressable> : null}

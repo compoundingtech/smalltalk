@@ -38,7 +38,7 @@ await assert.rejects(withFreshTerminalFence(
   { terminalScreen: async () => screen(++attempts) }, terminalId, 'incarnation/one',
   async () => { throw { response: { code: 'stale-fence' } }; },
 ), error => error.response.code === 'stale-fence');
-assert.equal(attempts, 3);
+assert.equal(attempts, 8);
 
 let nonStaleAttempts = 0;
 await assert.rejects(withFreshTerminalFence(

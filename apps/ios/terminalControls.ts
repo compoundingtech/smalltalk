@@ -1,6 +1,8 @@
 import type { St3Client } from '../../clients/typescript/st3-client';
 import type { Fence, TerminalScreen } from '../../clients/typescript/st3-client/Models.generated';
 
+const FENCE_ATTEMPTS = 8;
+
 type TerminalFence = Fence & Required<Pick<Fence, 'runtime_incarnation' | 'terminal_sequence'>>;
 
 function isStaleFence(error: unknown): boolean {
@@ -18,7 +20,9 @@ export async function withFreshTerminalFence<T>(
   expectedIncarnation: string,
   action: (fence: TerminalFence) => Promise<T>,
 ): Promise<T> {
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // st fences terminal actions to its whole store's index, which a busy host moves several
+  // times a second; a fresh read and a quick resend usually lands.
+  for (let attempt = 0; attempt < FENCE_ATTEMPTS; attempt++) {
     const screen = await client.terminalScreen(terminalId);
     if (screen.value.runtime_incarnation !== expectedIncarnation) {
       throw new Error('Terminal restarted; reopen it before sending input.');
@@ -30,7 +34,7 @@ export async function withFreshTerminalFence<T>(
       terminal_sequence: screen.value.next_sequence,
     };
     try { return await action(fence); }
-    catch (error) { if (!isStaleFence(error) || attempt === 2) throw error; }
+    catch (error) { if (!isStaleFence(error) || attempt === FENCE_ATTEMPTS - 1) throw error; }
   }
   throw new Error('Terminal changed too often; try again.');
 }

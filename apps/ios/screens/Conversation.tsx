@@ -6,13 +6,20 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
 import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName } from '../agentsView';
 import { Banners } from '../chrome';
-import { COLLAPSED_TOOL_LINES, conversationEntries, entryMatches, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
+import rules from '../../../fixtures/clients/conversation-style.json';
+import { tokenColor, type ConversationRules } from '../conversationStyle';
+import { COLLAPSED_TOOL_LINES, conversationEntries, entryMatches, folds, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
 import { rememberBounded } from '../boundedCache';
+import { sessionPerson } from '../homeView';
 import type { RootScreen } from '../navigation';
 import { applyConversation, isUnresolved, type Conversation } from '../sessionView';
 import { useStore } from '../store';
 import { fonts, theme } from '../theme';
-import { Button, Field, Markdown, T } from '../ui';
+import { Button, Field, LINE, Markdown, T } from '../ui';
+
+// Drawn by stui's rules (fixtures/clients/conversation-style.json), so both apps look alike.
+const RULES: ConversationRules = rules;
+const c = tokenColor;
 
 const empty: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1 };
 type Pending = { id: string; text: string; at: string; failed?: string };
@@ -91,7 +98,10 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
 
   const names = useMemo(() => {
     const map = new Map(data.agents.map(candidate => [candidate.id, agentName(candidate)]));
+    // The phone's session acts for a person (`person/NAME/session/…`); mail names the person.
+    const person = sessionPerson(caps?.session_actor);
     if (caps?.session_actor) map.set(caps.session_actor, 'you');
+    if (person) map.set(person, 'you');
     return map;
   }, [data.agents, caps?.session_actor]);
   // Half a conversation is worse than none: when st could not read the transcript, say why.
@@ -182,10 +192,10 @@ function AgentStrip({ agent, onMission }: { agent: NonNullable<ReturnType<typeof
 }
 
 const PendingView = memo(function PendingView({ pending }: { pending: Pending }) {
-  const color = pending.failed ? theme.red : theme.surface2;
-  return <View style={[styles.entry, styles.barred, { borderLeftColor: color }]}>
-    <T color={pending.failed ? theme.red : theme.overlay0}>{pending.failed ? `you · not sent: ${pending.failed}` : 'you · sending…'}<T dim>  {pending.at}</T></T>
-    <Markdown text={pending.text} color={theme.overlay0} />
+  const rule = RULES.pending;
+  return <View style={[styles.entry, styles.barred, { borderLeftColor: c(pending.failed ? rule.failed : rule.sending_edge) }]}>
+    <T color={c(pending.failed ? rule.failed : rule.sending.color)}>{pending.failed ? `you · not sent: ${pending.failed}` : rule.sending.text}<T dim>  {pending.at}</T></T>
+    <Markdown text={pending.text} color={c(rule.text)} />
   </View>;
 });
 
@@ -193,44 +203,60 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
   const body = entry.body;
   switch (body.kind) {
     case 'user':
-      return <View style={styles.user}>
-        <T dim style={{ alignSelf: 'flex-end' }}>{entry.at}</T>
-        <T selectable>{body.text}</T>
+      return <View style={[styles.user, { backgroundColor: c(RULES.user.fill) }]}>
+        <T color={c(RULES.user.time)} style={{ alignSelf: 'flex-end' }}>{entry.at}</T>
+        <T selectable color={c(RULES.user.text)}>{body.text}</T>
       </View>;
     case 'assistant':
-      return <View style={styles.entry}><Markdown text={body.text} /></View>;
-    case 'mail': {
-      // Mail to the person stands out; their own says how far it got: ✓ st has it, ✓✓ the agent has it.
-      const toYou = body.to === 'you';
-      // Mail the person is part of leads; mail between others stays in the background.
-      const theirs = toYou || body.from === 'you';
-      return <View style={[styles.entry, styles.barred, { borderLeftColor: theirs ? theme.sapphire : theme.surface2 }, toYou ? { backgroundColor: theme.toolBg } : null]}>
-        <T><T bold={theirs} color={theirs ? theme.sapphire : theme.overlay1}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={theirs} color={theirs ? undefined : theme.overlay1}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.from === 'you' ? (body.delivered ? <T color={theme.green}>  ✓✓ delivered</T> : <T dim>  ✓ sent</T>) : null}</T>
-        <Markdown text={body.text} color={theirs ? theme.text : theme.overlay1} />
-      </View>;
-    }
+      return <View style={styles.entry}><Markdown text={body.text} color={c(RULES.assistant)} /></View>;
+    case 'mail': return <MailView entry={entry} body={body} open={open} onToggle={onToggle} />;
     case 'event': {
-      const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : theme.overlay0;
+      const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : c(RULES.event.label);
       return <View style={[styles.entry, { flexDirection: 'row' }]}>
-        <T color={theme.surface1}>── </T><T color={color} style={{ flex: 1 }}>{body.text} · {entry.at}</T>
+        <T color={c(RULES.event.rule)}>── </T><T color={color} style={{ flex: 1 }}>{body.text} · {entry.at}</T>
       </View>;
     }
     case 'tool': {
       // Quiet until opened, as in stui: an edge in the outcome's colour, dim text, no fill, and
       // at most six one-line rows; opened, it reads at full brightness.
-      const [glyph, color] = body.state === 'running' ? ['⠿', theme.working] : body.state === 'ok' ? ['✓', theme.green] : ['✕', theme.red];
+      const rule = RULES.tool;
+      const [glyph, color] = body.state === 'running' ? ['⠿', c(rule.running)] : body.state === 'ok' ? [rule.ok.text, c(rule.ok.color)] : [rule.failed.text, c(rule.failed.color)];
       const shown = shownToolLines(body, open);
       const expandable = body.output.length > COLLAPSED_TOOL_LINES;
       const quiet = !open;
+      const look = quiet ? rule.quiet : rule.open;
       return <Pressable accessibilityRole={expandable ? 'button' : undefined} accessibilityState={expandable ? { expanded: open } : undefined} disabled={!expandable} onPress={() => onToggle(entry.id)} style={[styles.tool, { borderLeftColor: color }]}>
-        <T numberOfLines={1}><T bold color={color}>{glyph} </T><T bold={!quiet} color={quiet ? theme.overlay1 : theme.text}>{body.title}</T></T>
-        {shown.hidden ? <T dim>  … {shown.hidden} more lines · tap to show</T> : null}
-        {open && expandable ? <T dim>  ▴ collapse</T> : null}
-        {shown.lines.map((line, index) => <T key={index} selectable={!quiet} numberOfLines={quiet ? 1 : undefined} style={[styles.toolLine, quiet && { opacity: 0.7 }]} color={line.startsWith('+') ? theme.green : line.startsWith('-') || line.includes('error') ? theme.red : quiet ? theme.overlay0 : theme.subtext0}>{line || ' '}</T>)}
-        {open && expandable ? <T dim>  ▴ collapse</T> : null}
+        <T numberOfLines={1}><T bold color={color}>{glyph} </T><T bold={look.title_bold} color={c(look.title)}>{body.title}</T></T>
+        {shown.hidden ? <T color={c(rule.collapse.color)}>  … {shown.hidden} more lines · tap to show</T> : null}
+        {open && expandable ? <T color={c(rule.collapse.color)}>  {rule.collapse.text}</T> : null}
+        {shown.lines.map((line, index) => <T key={index} selectable={!quiet} numberOfLines={quiet ? 1 : undefined} style={[styles.toolLine, quiet && { opacity: 0.7 }]} color={c(line.startsWith('+') ? rule.added : line.startsWith('-') || line.includes('error') ? rule.removed : look.rows)}>{line || ' '}</T>)}
+        {open && expandable ? <T color={c(rule.collapse.color)}>  {rule.collapse.text}</T> : null}
       </Pressable>;
     }
   }
+});
+
+type Mail = Extract<ConversationEntry['body'], { kind: 'mail' }>;
+
+// Mail the person is part of leads; mail between others stays back and folds to a few rows,
+// like a tool call, until tapped. Mail to the person is filled like their own messages, and
+// their own says how far it got: ✓ st has it, ✓✓ the agent has it.
+const MailView = memo(function MailView({ entry, body, open, onToggle }: { entry: ConversationEntry; body: Mail; open: boolean; onToggle: (id: string) => void }) {
+  const rule = RULES.mail;
+  const toYou = body.to === 'you';
+  const look = folds(body) ? rule.between_others : rule.involving_you;
+  const [height, setHeight] = useState(0);
+  const limit = RULES.tool.collapsed_rows * LINE;
+  const long = folds(body) && height > limit;
+  const mark = body.from !== 'you' ? null : body.delivered ? rule.delivered : rule.sent;
+  return <Pressable disabled={!long} accessibilityRole={long ? 'button' : undefined} accessibilityState={long ? { expanded: open } : undefined} onPress={() => onToggle(entry.id)}
+    style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }, toYou ? { backgroundColor: c(rule.to_you_fill) } : null]}>
+    <T><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
+    <View style={long && !open ? { maxHeight: limit, overflow: 'hidden' } : null}>
+      <View onLayout={event => setHeight(event.nativeEvent.layout.height)}><Markdown text={body.text} color={c(look.text)} /></View>
+    </View>
+    {long ? <T color={c(RULES.tool.collapse.color)}>{open ? `  ${RULES.tool.collapse.text}` : '  … more · tap to show'}</T> : null}
+  </Pressable>;
 });
 
 const styles = StyleSheet.create({

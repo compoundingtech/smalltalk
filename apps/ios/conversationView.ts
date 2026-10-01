@@ -350,7 +350,13 @@ export function foldDeliveryFlaps(entries: ConversationEntry[]): ConversationEnt
 }
 
 /** The most lines a tool call shows until opened, failed ones too, as in stui. */
+/** As in stui's conversation-style rules (`tool.collapsed_rows`); a test holds them equal. */
 export const COLLAPSED_TOOL_LINES = 6;
+
+/** Whether an entry folds until opened: tool calls, and mail the person is not part of. */
+export function folds(body: Body): boolean {
+  return body.kind === 'tool' || (body.kind === 'mail' && body.from !== 'you' && body.to !== 'you');
+}
 /** The lines a tool box shows: all when open, failed, or short; otherwise its last five. */
 export function shownToolLines(body: Extract<Body, { kind: 'tool' }>, open: boolean): { hidden: number; lines: string[] } {
   if (open || body.output.length <= COLLAPSED_TOOL_LINES) return { hidden: 0, lines: body.output };

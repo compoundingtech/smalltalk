@@ -219,7 +219,8 @@ export class Feed {
 }
 
 // A terminal rides the feed's socket: attach, then subscribe with the capability the attachment
-// returned. A `stale-fence` shows the restart notice and never reattaches; a transient error
+// returned. A `stale-fence` on the stream shows the restart notice and never reattaches (one on
+// the attach itself only lost a race with a busy store, so it tries again); a transient error
 // reattaches on the same socket; anything else ends following. After a dropped socket the feed
 // attaches again, refusing a runtime now on another incarnation. Closing unsubscribes and detaches.
 class TerminalFollow {
@@ -272,6 +273,8 @@ class TerminalFollow {
       if (stale()) return;
       const code = errorCode(error);
       if (error instanceof Error && error.message === TERMINAL_RESTARTED) this.stop(TERMINAL_RESTARTED);
+      // The attach lost the race with a busy store (its fence is the store's whole index): try again.
+      else if (code === 'stale-fence') this.retry('Attaching to a busy terminal; trying again.');
       else if (code && !transient(code)) this.stop(errorMessage(error));
       else this.retry(errorMessage(error));
     }
