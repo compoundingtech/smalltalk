@@ -1807,6 +1807,10 @@ struct PlanningCancelArgs {
 
 #[derive(Subcommand)]
 enum PtyCommand {
+    /// Open a plain shell for the configured person, without an agent harness.
+    New(PtyNewArgs),
+    /// End a personal shell permanently, including its durable declaration.
+    End(PtyScreenArgs),
     /// List current terminal sessions; use --all for stopped history.
     Ls {
         #[arg(long)]
@@ -1850,6 +1854,20 @@ enum PtyCommand {
     Send(PtySendArgs),
     /// Deliver one supported Unix signal to a terminal member.
     Signal(PtySignalArgs),
+}
+
+#[derive(Args)]
+struct PtyNewArgs {
+    /// Display name; defaults to a generated name.
+    name: Option<String>,
+    #[arg(long)]
+    host: Option<String>,
+    /// Absolute directory on the selected host. Locally defaults to the caller's directory;
+    /// remotely defaults to the daemon's directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long = "as", value_parser = parse_actor_subject)]
+    person: Option<String>,
 }
 
 #[derive(Args)]
@@ -2547,6 +2565,9 @@ struct AgentStartArgs {
 
 #[derive(Args)]
 struct AgentNewArgs {
+    /// Start the harness with this first message using its native prompt argument.
+    #[arg(long, allow_hyphen_values = true)]
+    message: Option<String>,
     /// Stable seat identity. A slash-qualified identity is kept exactly after `agent/`; a simple
     /// name is prefixed with its host, as in `agent/HOST.NAME`.
     name: String,
@@ -3065,6 +3086,10 @@ struct DriverArgs {
     subject: Option<String>,
     #[arg(long)]
     identity: Option<String>,
+    #[arg(long, requires = "initial_message_id", allow_hyphen_values = true)]
+    initial_message: Option<String>,
+    #[arg(long, requires = "initial_message")]
+    initial_message_id: Option<String>,
     #[arg(last = true)]
     argv: Vec<String>,
 }
@@ -5029,6 +5054,92 @@ async fn run_pty(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        PtyCommand::New(args) => {
+            let person =
+                configured_human(args.person.as_deref(), configured_person, "terminals new")?;
+            let generated = generated_client(endpoint, Some(&person))?;
+            let capabilities = generated.capabilities().await?;
+            let local = client.get::<Value>("/v1/health").await?["node"]
+                .as_str()
+                .context("daemon has no node")?
+                .to_owned();
+            let cwd = if let Some(cwd) = args.cwd {
+                if args
+                    .host
+                    .as_deref()
+                    .is_none_or(|host| host.trim_start_matches("host/") == local)
+                {
+                    Some(std::path::absolute(cwd)?.display().to_string())
+                } else {
+                    anyhow::ensure!(
+                        cwd.is_absolute(),
+                        "remote cwd must be an absolute path on its host"
+                    );
+                    Some(cwd.display().to_string())
+                }
+            } else if args
+                .host
+                .as_deref()
+                .is_none_or(|host| host.trim_start_matches("host/") == local)
+            {
+                Some(std::env::current_dir()?.display().to_string())
+            } else {
+                None
+            };
+            let nonce = uuid::Uuid::now_v7().simple().to_string();
+            let result = generated
+                .terminal_create(
+                    format!("action/{nonce}"),
+                    format!("terminal-new:{nonce}"),
+                    ClientFence {
+                        snapshot_id: capabilities.snapshot.id,
+                        ..ClientFence::default()
+                    },
+                    st3_client::TerminalCreateParameters {
+                        name: args
+                            .name
+                            .unwrap_or_else(|| format!("shell-{}", &nonce[24..])),
+                        host: args.host,
+                        cwd,
+                    },
+                )
+                .await?;
+            if json_output {
+                print_client_value(&result, true)
+            } else {
+                println!(
+                    "{}",
+                    result
+                        .value
+                        .affected_ids
+                        .first()
+                        .context("creation returned no terminal")?
+                );
+                Ok(())
+            }
+        }
+        PtyCommand::End(args) => {
+            let person =
+                configured_human(args.person.as_deref(), configured_person, "terminals end")?;
+            let generated = generated_client(endpoint, Some(&person))?;
+            let capabilities = generated.capabilities().await?;
+            let nonce = uuid::Uuid::now_v7().simple().to_string();
+            let result = generated
+                .terminal_end(
+                    format!("action/{nonce}"),
+                    format!("terminal-end:{nonce}"),
+                    ClientFence {
+                        snapshot_id: capabilities.snapshot.id,
+                        ..ClientFence::default()
+                    },
+                    ClientTargetParameters {
+                        target_id: args.subject,
+                        ..ClientTargetParameters::default()
+                    },
+                )
+                .await?;
+            print_client_value(&result, json_output)
+        }
         PtyCommand::Ls { all, cursor, limit } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -8730,89 +8841,25 @@ fn agent_start_document(
     Ok(publication_document(agent))
 }
 
-/// The Claude settings the fleet's Claude seats run with: st's own channel plugin on, and the
-/// plugins st2's marketplace shipped off.
-const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":false,"st-channel@st":true}}"#;
+#[cfg(test)]
+use st3::creation::CLAUDE_SEAT_SETTINGS;
 
-/// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
-/// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
 fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bool) -> String {
-    let mut body = KdlDocument::new();
-    if let Some(description) = &args.description {
-        body.nodes_mut()
-            .push(kdl_node("description", [description.as_str()]));
-    }
-    if let Some(host) = &args.host {
-        body.nodes_mut().push(kdl_node("host", [host.as_str()]));
-    }
-    let mut workspace = kdl_node("workspace", [workspace]);
-    if create_workspace {
-        workspace
-            .entries_mut()
-            .push(KdlEntry::new_prop("create", true));
-    }
-    body.nodes_mut().push(workspace);
-    let arguments: &[&str] = match args.harness.as_str() {
-        "claude" => {
-            let mut environment = KdlNode::new("env");
-            let mut variables = KdlDocument::new();
-            variables
-                .nodes_mut()
-                .push(kdl_node("CLAUDE_CODE_CHILD_SESSION", ["0"]));
-            environment.set_children(variables);
-            body.nodes_mut().push(environment);
-            body.nodes_mut().push(render_node(&[
-                kdl_node("git-exclude", [".claude/"]),
-                kdl_node(
-                    "json-upsert",
-                    [".claude/settings.local.json", CLAUDE_SEAT_SETTINGS],
-                ),
-            ]));
-            &[
-                "--dangerously-skip-permissions",
-                "--settings",
-                CLAUDE_SEAT_SETTINGS,
-            ]
-        }
-        "codex" => &[
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--dangerously-bypass-hook-trust",
-        ],
-        _ => &[],
+    let parameters = st3_client::AgentCreateParameters {
+        name: args.name.clone(),
+        harness: args.harness.clone(),
+        host: args.host.clone(),
+        model: args.model.clone(),
+        effort: args.effort.clone(),
+        description: args.description.clone(),
+        workspace: None,
+        message: args.message.clone(),
     };
-    let mut harness = kdl_node("harness", [args.harness.as_str()]);
-    let mut harness_body = KdlDocument::new();
-    if let Some(model) = &args.model {
-        harness_body
-            .nodes_mut()
-            .push(kdl_node("model", [model.as_str()]));
-    }
-    if let Some(effort) = &args.effort {
-        harness_body
-            .nodes_mut()
-            .push(kdl_node("effort", [effort.as_str()]));
-    }
-    if !arguments.is_empty() {
-        harness_body
-            .nodes_mut()
-            .push(kdl_node("args", arguments.iter().copied()));
-    }
-    if !harness_body.nodes().is_empty() {
-        harness.set_children(harness_body);
-    }
-    body.nodes_mut().push(harness);
-    body.nodes_mut().push(kdl_node("restart", ["always"]));
-    let mut agent = kdl_node("agent", [args.name.as_str()]);
-    agent.set_children(body);
-    publication_document(agent)
-}
-
-fn render_node(operations: &[KdlNode]) -> KdlNode {
-    let mut render = KdlNode::new("render");
-    let mut body = KdlDocument::new();
-    body.nodes_mut().extend(operations.iter().cloned());
-    render.set_children(body);
-    render
+    let key = args
+        .message
+        .as_ref()
+        .map(|_| uuid::Uuid::now_v7().to_string());
+    st3::creation::agent_document(&parameters, workspace, create_workspace, key.as_deref())
 }
 
 async fn run_agent_new(
@@ -8877,7 +8924,33 @@ async fn run_agent_new(
         Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => {}
         Err(error) => return Err(error.into()),
     }
-    publish_text(&client, kdl, source_name, actor.clone()).await?;
+    if actor.starts_with("person/") {
+        let generated = generated_client(endpoint, Some(&actor))?;
+        let capabilities = generated.capabilities().await?;
+        let nonce = uuid::Uuid::now_v7().simple().to_string();
+        generated
+            .agent_create(
+                format!("action/{nonce}"),
+                format!("agent-new:{nonce}"),
+                ClientFence {
+                    snapshot_id: capabilities.snapshot.id,
+                    ..ClientFence::default()
+                },
+                st3_client::AgentCreateParameters {
+                    name: args.name.clone(),
+                    harness: args.harness.clone(),
+                    host: args.host.clone(),
+                    model: args.model.clone(),
+                    effort: args.effort.clone(),
+                    workspace: Some(workspace.clone()),
+                    description: args.description.clone(),
+                    message: args.message.clone(),
+                },
+            )
+            .await?;
+    } else {
+        publish_text(&client, kdl, source_name, actor.clone()).await?;
+    }
     if !json_output {
         eprintln!("Created {subject} in {workspace}; waiting for the agent to start.");
     }
@@ -11959,6 +12032,18 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         }
         if let Some(state) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV) {
             return resume_native_driver(client, subject, &args.driver, argv, &state).await;
+        }
+        if let (Some(message), Some(id)) = (&args.initial_message, &args.initial_message_id) {
+            // The durable launch receipt precedes invocation. A fresh incarnation never repeats
+            // the first message; adoption resumes above without invoking a new provider.
+            let incarnation = wait_for_agent_incarnation(client, subject).await?;
+            if retry_while_daemon_unreachable(subject, || {
+                st3::creation::claim_initial_message(client, subject, id, &incarnation)
+            })
+            .await?
+            {
+                st3::creation::append_native_message(&args.driver, &mut argv, message)?;
+            }
         }
         if args.driver == "codex" {
             return run_codex_native(client, subject, argv).await;
@@ -18260,6 +18345,57 @@ mod tests {
             panic!("agents new did not parse");
         };
         args
+    }
+
+    #[test]
+    fn creation_cli_accepts_a_literal_first_message_and_plain_shell_options() {
+        let args = agent_new_args(&[
+            "worker",
+            "--harness",
+            "codex",
+            "--message",
+            "--literal first message",
+        ]);
+        assert_eq!(args.message.as_deref(), Some("--literal first message"));
+        let source = agent_new_document(&args, "/tmp", false);
+        let intent = st3::graph::parse_intent(&source, "test").unwrap();
+        assert!(intent.subjects.values().next().unwrap().member.is_some());
+        let cli = Cli::try_parse_from([
+            "st3",
+            "terminals",
+            "new",
+            "Shell",
+            "--host",
+            "builder",
+            "--cwd",
+            "/tmp",
+            "--as",
+            "person/ada",
+        ])
+        .unwrap();
+        let Command::Terminals {
+            command: PtyCommand::New(args),
+        } = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(args.name.as_deref(), Some("Shell"));
+        assert_eq!(args.host.as_deref(), Some("builder"));
+        let cli = Cli::try_parse_from([
+            "st3",
+            "terminals",
+            "end",
+            "terminal/pty/person/ada/019a0000-0000-7000-8000-000000000001",
+            "--as",
+            "person/ada",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Terminals {
+                command: PtyCommand::End(_)
+            }
+        ));
     }
 
     #[test]
