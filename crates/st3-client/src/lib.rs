@@ -2784,9 +2784,9 @@ mod tests {
         assert!(stale.is_transient());
         let remote = api(
             ErrorCode::RemoteUnavailable,
-            "owner host/Silber is temporarily unavailable; cached data remains usable",
+            "owner host/Juniper is temporarily unavailable; cached data remains usable",
         );
-        assert_eq!(remote.plain(), "Silber cannot be reached right now");
+        assert_eq!(remote.plain(), "Juniper cannot be reached right now");
         assert!(remote.is_transient());
         let gone = api(ErrorCode::NotFound, "agent `agent/x` does not exist");
         assert_eq!(gone.plain(), "it is gone: agent `agent/x` does not exist");
