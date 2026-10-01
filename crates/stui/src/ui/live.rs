@@ -130,11 +130,15 @@ enum Fetched {
     AgentStarted(String),
     /// st started a shell asked for here.
     TerminalStarted(String),
-    /// A direct stream to an agent's PTY session, named by its runtime.
+    /// A direct stream to an agent's (or a shell's) PTY session.
     Native {
         agent: String,
-        name: String,
-        stream: std::os::unix::net::UnixStream,
+        direct: Direct,
+    },
+    /// Attaching again after the stream dropped: the new stream, or why not.
+    Reattached {
+        agent: String,
+        outcome: Result<Direct, String>,
     },
     /// st gave no direct stream; follow its view of the terminal instead.
     NativeFailed {
@@ -249,6 +253,9 @@ pub fn run(context: Context) -> Result<()> {
     let mut attached: Option<Following> = None;
     // The runtimes of the agent whose terminal view is open, to follow it again after a pause.
     let mut terminal_runtimes: Option<Vec<String>> = None;
+    // Attaching a dropped terminal again: whether a try is out, and how many failed.
+    let mut reattaching = false;
+    let mut reattach_tries = 0_u32;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
     let mut last_cache_save = Instant::now();
@@ -447,11 +454,7 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::GlassSaved { id, key, outcome } => ui.glass_saved(&id, &key, outcome),
                 Fetched::AgentStarted(id) => ui.agent_started(id),
                 Fetched::TerminalStarted(id) => ui.terminal_started(id),
-                Fetched::Native {
-                    agent,
-                    name,
-                    stream,
-                } => {
+                Fetched::Native { agent, direct } => {
                     let (rows, columns) = ui.terminal_size.get();
                     if let Some(view) = ui
                         .terminal
@@ -459,9 +462,29 @@ pub fn run(context: Context) -> Result<()> {
                         .filter(|view| view.agent == agent && view.native.is_none())
                     {
                         view.native = Some(super::pty::NativeTerminal::spawn(
-                            stream, &name, rows, columns,
+                            direct.stream,
+                            &direct.name,
+                            direct.incarnation,
+                            rows,
+                            columns,
                         ));
                         view.stale = None;
+                    }
+                }
+                Fetched::Reattached { agent, outcome } => {
+                    reattaching = false;
+                    if let Some(native) = ui
+                        .terminal
+                        .as_ref()
+                        .filter(|view| view.agent == agent)
+                        .and_then(|view| view.native.as_ref())
+                    {
+                        match outcome {
+                            Ok(direct) => native.reconnect(direct.stream, &direct.name),
+                            Err(reason) if reason.contains("restarted") => native.give_up(reason),
+                            // Still unreachable: the next try waits longer.
+                            Err(_) => reattach_tries += 1,
+                        }
                     }
                 }
                 Fetched::NativeFailed {
@@ -672,17 +695,9 @@ pub fn run(context: Context) -> Result<()> {
                         let tx = fetched_tx.clone();
                         let agent = agent.clone();
                         runtime.spawn(async move {
-                            let attached = if agent.starts_with("terminal/") {
-                                raw_attach_terminal(&client, &agent).await
-                            } else {
-                                raw_attach(&client, &runtime_ids).await
-                            };
+                            let attached = attach_direct(&client, &agent, &runtime_ids, None).await;
                             let _ = tx.send(match attached {
-                                Ok((name, stream)) => Fetched::Native {
-                                    agent,
-                                    name,
-                                    stream,
-                                },
+                                Ok(direct) => Fetched::Native { agent, direct },
                                 Err(reason) => Fetched::NativeFailed {
                                     agent,
                                     runtime_ids,
@@ -872,6 +887,34 @@ pub fn run(context: Context) -> Result<()> {
                     .map_err(|error| error.to_string());
                 let _ = tx.send(Fetched::Read(id, result));
             });
+        }
+        // A stream that dropped while the program ran attaches again, to the same incarnation,
+        // after a wait that grows with each try.
+        if !reattaching
+            && extras.live
+            && let Some(view) = ui.terminal.as_ref()
+            && let Some(native) = view.native.as_ref()
+            && let Some(at) = native.dropped()
+            && at.elapsed() >= Duration::from_secs(2_u64.pow(reattach_tries.min(5)))
+        {
+            reattaching = true;
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            let agent = view.agent.clone();
+            let expected = native.incarnation.clone();
+            let runtime_ids = terminal_runtimes.clone().unwrap_or_default();
+            runtime.spawn(async move {
+                let outcome = attach_direct(&client, &agent, &runtime_ids, Some(&expected)).await;
+                let _ = tx.send(Fetched::Reattached { agent, outcome });
+            });
+        }
+        if ui
+            .terminal
+            .as_ref()
+            .and_then(|view| view.native.as_ref())
+            .is_none()
+        {
+            reattach_tries = 0;
         }
         // While an attached terminal's output flows, draw it as it comes.
         let flowing = ui
@@ -1667,28 +1710,65 @@ mod tests {
     }
 }
 
-/// A direct stream to the PTY session of the first of `runtime_ids` that has a terminal: st's
-/// raw terminal stream, fenced to the runtime's incarnation and routed to the host that owns it.
-async fn raw_attach(
+/// A direct stream to a terminal's PTY session, and what it is.
+struct Direct {
+    name: String,
+    incarnation: String,
+    stream: std::os::unix::net::UnixStream,
+}
+
+/// A direct stream to `subject`'s PTY session: st's raw terminal stream, fenced to the
+/// terminal's incarnation and routed to the host that owns it. `subject` is an agent (its
+/// terminal is the first of `runtime_ids` that has one) or a shell's terminal. With `expected`,
+/// only that incarnation: a terminal that restarted since is not quietly swapped in.
+async fn attach_direct(
     client: &Client,
+    subject: &str,
     runtime_ids: &[String],
-) -> Result<(String, std::os::unix::net::UnixStream), String> {
+    expected: Option<&str>,
+) -> Result<Direct, String> {
+    let mut found = Vec::new();
+    if subject.starts_with("terminal/") {
+        // A shell just started may take a moment before its screen exists.
+        let mut tries = 0;
+        let screen = loop {
+            match client.terminal_screen(subject).await {
+                Ok(screen) => break screen,
+                Err(_) if tries < 10 => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        found.push((
+            subject.trim_start_matches("terminal/").replace('/', "."),
+            subject.to_owned(),
+            screen.value.runtime_incarnation,
+        ));
+    } else {
+        for id in runtime_ids {
+            let Ok(envelope) = client.runtimes_get(id).await else {
+                continue;
+            };
+            let Resource::Runtime(runtime) = envelope.value else {
+                continue;
+            };
+            if let (Some(terminal), Some(incarnation)) =
+                (runtime.terminal_id, runtime.incarnation_id)
+            {
+                found.push((runtime.runtime_id, terminal, incarnation));
+            }
+        }
+    }
     let mut reason = "the agent has no terminal right now".to_owned();
-    for id in runtime_ids {
-        let Ok(envelope) = client.runtimes_get(id).await else {
+    for (name, terminal, incarnation) in found {
+        if expected.is_some_and(|expected| expected != incarnation) {
+            reason = "the terminal restarted; Ctrl+] attaches the new one".into();
             continue;
-        };
-        let Resource::Runtime(runtime) = envelope.value else {
-            continue;
-        };
-        let (Some(terminal), Some(incarnation)) = (
-            runtime.terminal_id.as_deref(),
-            runtime.incarnation_id.as_deref(),
-        ) else {
-            continue;
-        };
+        }
         let attachment = match client
-            .raw_terminal_attachment(terminal, incarnation, st3_client::RawTerminalMode::Attach)
+            .raw_terminal_attachment(&terminal, &incarnation, st3_client::RawTerminalMode::Attach)
             .await
         {
             Ok(attachment) => attachment,
@@ -1701,47 +1781,15 @@ async fn raw_attach(
             Ok(stream) => {
                 return stream
                     .into_std()
-                    .map(|stream| (runtime.runtime_id.clone(), stream))
+                    .map(|stream| Direct {
+                        name,
+                        incarnation,
+                        stream,
+                    })
                     .map_err(|error| error.to_string());
             }
             Err(error) => reason = error.to_string(),
         }
     }
     Err(reason)
-}
-
-/// A direct stream to a plain shell's PTY session, fenced to its current incarnation.
-async fn raw_attach_terminal(
-    client: &Client,
-    terminal: &str,
-) -> Result<(String, std::os::unix::net::UnixStream), String> {
-    // A shell just started may take a moment before its screen exists.
-    let mut tries = 0;
-    let screen = loop {
-        match client.terminal_screen(terminal).await {
-            Ok(screen) => break screen,
-            Err(_) if tries < 10 => {
-                tries += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    };
-    let attachment = client
-        .raw_terminal_attachment(
-            terminal,
-            &screen.value.runtime_incarnation,
-            st3_client::RawTerminalMode::Attach,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    let stream = client
-        .raw_terminal_stream(&attachment)
-        .await
-        .map_err(|error| error.to_string())?;
-    let name = terminal.trim_start_matches("terminal/").replace('/', ".");
-    stream
-        .into_std()
-        .map(|stream| (name, stream))
-        .map_err(|error| error.to_string())
 }

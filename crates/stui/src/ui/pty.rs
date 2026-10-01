@@ -56,6 +56,8 @@ struct Screen {
     parser: Processor,
     /// Why the session is over, once it is.
     ended: Option<String>,
+    /// When the stream dropped while the program still ran, so stui can attach again.
+    dropped_at: Option<Instant>,
     /// Whether the first screen has arrived.
     attached: bool,
     /// When output last arrived, so stui can draw more often while it flows.
@@ -72,6 +74,7 @@ impl Screen {
             term: Term::new(config, &size, Quiet),
             parser: Processor::new(),
             ended: None,
+            dropped_at: None,
             attached: false,
             output_at: None,
         }
@@ -91,33 +94,71 @@ enum Input {
 /// A terminal attached through its PTY session. Dropping it detaches.
 pub(crate) struct NativeTerminal {
     screen: Arc<Mutex<Screen>>,
-    input: mpsc::Sender<Input>,
+    /// The current connection's; a reconnect replaces it.
+    input: Mutex<mpsc::Sender<Input>>,
     /// The size last asked of the PTY.
     size: Mutex<Size>,
+    /// The incarnation attached to; attaching again after a drop is only ever to this one.
+    pub(crate) incarnation: String,
 }
 
 impl NativeTerminal {
     /// Attach over `stream`, a connection that speaks the PTY session protocol (the gateway's
     /// raw stream, or the session socket itself), asking for `rows` by `columns`. The attach
     /// runs on its own thread; until the first screen arrives the terminal says so.
-    pub(crate) fn spawn(stream: UnixStream, name: &str, rows: u16, columns: u16) -> Self {
+    pub(crate) fn spawn(
+        stream: UnixStream,
+        name: &str,
+        incarnation: String,
+        rows: u16,
+        columns: u16,
+    ) -> Self {
         let size = Size {
             rows: rows.max(1),
             columns: columns.max(1),
         };
         let screen = Arc::new(Mutex::new(Screen::new(size)));
-        let (input, inputs) = mpsc::channel();
-        let shared = screen.clone();
-        let name = name.to_owned();
-        std::thread::Builder::new()
-            .name(format!("pty {name}"))
-            .spawn(move || run(stream, &name, size, &shared, &inputs))
-            .ok();
+        let input = start(stream, name, size, &screen);
         Self {
             screen,
-            input,
+            input: Mutex::new(input),
             size: Mutex::new(size),
+            incarnation,
         }
+    }
+
+    /// Attach again over a new stream after the last one dropped, into the same screen, so
+    /// what scrolled back stays.
+    pub(crate) fn reconnect(&self, stream: UnixStream, name: &str) {
+        let size = *self.size.lock().unwrap_or_else(|error| error.into_inner());
+        {
+            let mut screen = self.lock();
+            screen.ended = None;
+            screen.dropped_at = None;
+            screen.attached = false;
+        }
+        let input = start(stream, name, size, &self.screen);
+        *self.input.lock().unwrap_or_else(|error| error.into_inner()) = input;
+    }
+
+    /// When the stream dropped while the program still ran.
+    pub(crate) fn dropped(&self) -> Option<Instant> {
+        self.lock().dropped_at
+    }
+
+    /// The reconnect failed for good: say why, and stop trying.
+    pub(crate) fn give_up(&self, reason: String) {
+        let mut screen = self.lock();
+        screen.ended = Some(reason);
+        screen.dropped_at = None;
+    }
+
+    fn send(&self, input: Input) {
+        let _ = self
+            .input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .send(input);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Screen> {
@@ -129,7 +170,7 @@ impl NativeTerminal {
     /// Send what was typed, at the bottom of the history.
     pub(crate) fn write(&self, bytes: Vec<u8>) {
         self.lock().term.scroll_display(Scroll::Bottom);
-        let _ = self.input.send(Input::Bytes(bytes));
+        self.send(Input::Bytes(bytes));
     }
 
     /// A paste, bracketed when the program asked for that.
@@ -155,7 +196,7 @@ impl NativeTerminal {
         let mut current = self.size.lock().unwrap_or_else(|error| error.into_inner());
         if *current != size {
             *current = size;
-            let _ = self.input.send(Input::Resize(size));
+            self.send(Input::Resize(size));
         }
     }
 
@@ -174,7 +215,7 @@ impl NativeTerminal {
             } else {
                 format!("\x1b[M{}!!", char::from(32 + button as u8))
             };
-            let _ = self.input.send(Input::Bytes(
+            self.send(Input::Bytes(
                 report.repeat(lines.unsigned_abs() as usize).into_bytes(),
             ));
         } else if mode.contains(TermMode::ALT_SCREEN) {
@@ -185,7 +226,7 @@ impl NativeTerminal {
                 (false, true) => "\x1bOB",
                 (false, false) => "\x1b[B",
             };
-            let _ = self.input.send(Input::Bytes(
+            self.send(Input::Bytes(
                 arrow.repeat(lines.unsigned_abs() as usize).into_bytes(),
             ));
         } else {
@@ -279,6 +320,29 @@ impl Drop for NativeTerminal {
     }
 }
 
+/// Start the attach thread for `stream`; the sender takes what is typed and resizes.
+fn start(
+    stream: UnixStream,
+    name: &str,
+    size: Size,
+    screen: &Arc<Mutex<Screen>>,
+) -> mpsc::Sender<Input> {
+    let (input, inputs) = mpsc::channel();
+    let shared = screen.clone();
+    let name = name.to_owned();
+    std::thread::Builder::new()
+        .name(format!("pty {name}"))
+        .spawn(move || run(stream, &name, size, &shared, &inputs))
+        .ok();
+    input
+}
+
+/// The stream is gone but the program may still run: say so, and let stui attach again.
+fn dropped(screen: &mut Screen, reason: String) {
+    screen.ended = Some(format!("{reason}; attaching again…"));
+    screen.dropped_at = Some(Instant::now());
+}
+
 /// The attach thread: ATTACH at `size`, then feed what the session sends into the screen and
 /// send it what is typed, until stui lets go or the session ends.
 fn run(
@@ -302,7 +366,7 @@ fn run(
     ) {
         Ok(connection) => connection,
         Err(error) => {
-            lock().ended = Some(error.to_string());
+            dropped(&mut lock(), error.to_string());
             return;
         }
     };
@@ -352,12 +416,12 @@ fn run(
                 return;
             }
             Ok(Some(SessionEvent::Closed)) => {
-                lock().ended = Some("the session closed".into());
+                dropped(&mut lock(), "the connection closed".into());
                 return;
             }
             Ok(None) => {}
             Err(error) => {
-                lock().ended = Some(error.to_string());
+                dropped(&mut lock(), error.to_string());
                 return;
             }
         }
@@ -639,13 +703,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_dropped_stream_attaches_again_into_the_same_screen() {
+        use pty_core::protocol::{MessageType, encode_packet};
+        use std::io::{Read as _, Write as _};
+        let wait = |done: &dyn Fn() -> bool| {
+            let start = Instant::now();
+            while !done() {
+                assert!(start.elapsed() < Duration::from_secs(5), "timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let shown = |terminal: &NativeTerminal| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+            let area = buf.area;
+            terminal.draw(&mut buf, area);
+            buf.content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let (stui, mut daemon) = UnixStream::pair().unwrap();
+        let terminal = NativeTerminal::spawn(stui, "test", "one".into(), 6, 30);
+        let mut bytes = [0_u8; 64];
+        let _ = daemon.read(&mut bytes).unwrap();
+        daemon
+            .write_all(&encode_packet(MessageType::Screen, b""))
+            .unwrap();
+        for line in 0..10 {
+            daemon
+                .write_all(&encode_packet(
+                    MessageType::Data,
+                    format!("old {line}\r\n").as_bytes(),
+                ))
+                .unwrap();
+        }
+        wait(&|| shown(&terminal).contains("old 9"));
+        // The stream drops; the program did not exit.
+        drop(daemon);
+        wait(&|| terminal.dropped().is_some());
+        assert!(terminal.ended().unwrap().contains("attaching again"));
+        let (stui, mut daemon) = UnixStream::pair().unwrap();
+        terminal.reconnect(stui, "test");
+        let _ = daemon.read(&mut bytes).unwrap();
+        daemon
+            .write_all(&encode_packet(MessageType::Screen, b"new\r\n"))
+            .unwrap();
+        wait(&|| shown(&terminal).contains("new") && terminal.ended().is_none());
+        assert!(terminal.dropped().is_none());
+        // What scrolled off before the drop is still there to scroll back to.
+        terminal.wheel(20);
+        assert!(shown(&terminal).contains("old 0"), "{}", shown(&terminal));
+    }
+
     /// A PTY session daemon, played by the test: answer ATTACH with a screen, then data.
     #[test]
     fn a_session_draws_into_the_pane_takes_its_size_and_keys_and_ends() {
         use pty_core::protocol::{MessageType, PacketReader, encode_packet};
         use std::io::{Read as _, Write as _};
         let (stui, mut daemon) = UnixStream::pair().unwrap();
-        let terminal = NativeTerminal::spawn(stui, "test", 4, 20);
+        let terminal = NativeTerminal::spawn(stui, "test", "incarnation".into(), 4, 20);
         let mut reader = PacketReader::new();
         let mut packets = Vec::new();
         let mut next = |daemon: &mut UnixStream, packets: &mut Vec<_>| {
