@@ -115,7 +115,15 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         if std::thread::panicking() {
             eprintln!("isolated daemon log: {}", self.log());
-            for name in ["gate.pid", "exec.pid", "final.pid", "gate-child.pid"] {
+            for name in [
+                "gate.pid",
+                "exec.pid",
+                "root-exec.pid",
+                "completed-exec.pid",
+                "final.pid",
+                "final-exec.pid",
+                "gate-child.pid",
+            ] {
                 if let Ok(pid) = std::fs::read_to_string(self.root.join(name)) {
                     eprintln!(
                         "{name}: {} {:?}",
@@ -124,10 +132,17 @@ impl Drop for Daemon {
                     );
                 }
             }
-            eprintln!("run: {}", self.run());
         }
         // Even a failed assertion must not leave the test's detached work alive.
-        for name in ["gate.pid", "exec.pid", "final.pid", "gate-child.pid"] {
+        for name in [
+            "gate.pid",
+            "exec.pid",
+            "root-exec.pid",
+            "completed-exec.pid",
+            "final.pid",
+            "final-exec.pid",
+            "gate-child.pid",
+        ] {
             if let Ok(pid) = std::fs::read_to_string(self.root.join(name))
                 && let Ok(pid) = pid.trim().parse::<i32>()
                 && live(pid)
@@ -174,6 +189,17 @@ fn cancellation_stops_owned_work(restart: bool) {
 mission "orchid/cancellation" state="ready" {
   goal "Stop owned work when cancelled."
   completion { when "all-steps-exhausted" }
+  exec "root-worker" {
+    command "trap '' TERM; echo $$ > root-exec.pid; while :; do sleep 60; done"
+    restart "never"
+  }
+  step "setup-service" {
+    agentless
+    exec "service-worker" {
+      command "trap '' TERM; echo $$ > completed-exec.pid; while :; do sleep 60; done"
+      restart "never"
+    }
+  }
   step "wait" {
     agentless
     exec "worker" {
@@ -190,6 +216,10 @@ mission "orchid/cancellation" state="ready" {
   finally {
     step "report" {
       agentless
+      exec "final-worker" {
+        command "echo $$ > final-exec.pid; while [ ! -e finish ]; do sleep 0.05; done"
+        restart "never"
+      }
       gate "the final status is posted" {
         exec "echo $$ > final.pid; while [ ! -e finish ]; do sleep 0.05; done; exit 7"
         host "orchid"
@@ -220,12 +250,38 @@ mission "orchid/cancellation" state="ready" {
         "--as",
         "person/operator",
     ]);
-    wait_for("both owned processes", || {
-        ["exec.pid", "gate.pid", "gate-child.pid"]
-            .iter()
-            .all(|name| root.path().join(name).exists())
+    wait_for("all owned processes", || {
+        [
+            "exec.pid",
+            "root-exec.pid",
+            "completed-exec.pid",
+            "gate.pid",
+            "gate-child.pid",
+        ]
+        .iter()
+        .all(|name| {
+            std::fs::read_to_string(root.path().join(name))
+                .is_ok_and(|pid| pid.trim().parse::<i32>().is_ok())
+        })
     });
-    let pids = ["exec.pid", "gate.pid", "gate-child.pid"].map(|name| {
+    wait_for(
+        "the setup step to complete with its service still live",
+        || {
+            daemon.run()["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["step"] == "setup-service" && step["status"] == "completed")
+        },
+    );
+    let pids = [
+        "exec.pid",
+        "root-exec.pid",
+        "completed-exec.pid",
+        "gate.pid",
+        "gate-child.pid",
+    ]
+    .map(|name| {
         std::fs::read_to_string(root.path().join(name))
             .unwrap()
             .trim()
@@ -251,11 +307,24 @@ mission "orchid/cancellation" state="ready" {
         "person/operator",
     ]);
     wait_for("the final gate", || root.path().join("final.pid").exists());
+    wait_for("the final exec", || {
+        std::fs::read_to_string(root.path().join("final-exec.pid"))
+            .is_ok_and(|pid| pid.trim().parse::<i32>().is_ok())
+    });
+    let final_exec = std::fs::read_to_string(root.path().join("final-exec.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
     wait_for(
         "cancelled execs and gate descendants to die during finally",
         || pids.iter().all(|pid| !live(*pid)),
     );
     assert_eq!(daemon.run()["phase"], "final-cancelled");
+    assert!(
+        live(final_exec),
+        "finally work must remain eligible during cancellation"
+    );
     assert_eq!(unsafe { libc::flock(lane.as_raw_fd(), libc::LOCK_UN) }, 0);
     std::thread::sleep(Duration::from_millis(150));
     assert!(

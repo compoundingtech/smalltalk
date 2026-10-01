@@ -1653,6 +1653,8 @@ const TERMINAL_OWNED_RUNTIME_SUBJECTS: &str = "SELECT desired.subject
          OR root.phase='terminal'
          OR generation.status IN ('completed','failed','cancelled')
          OR step.status='cancelled'
+         OR (owner.phase='final-cancelled' AND desired.kind IN ('exec','pty')
+             AND (desired.owner_step IS NULL OR step.status IN ('completed','failed')))
        )
      ORDER BY desired.subject";
 const RETIRED_OWNED_INTAKE_SUBJECTS: &str = "SELECT desired.subject
