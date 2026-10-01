@@ -2681,7 +2681,7 @@ pub struct ReplicationHealReport {
 }
 
 /// A node's first sync after it joins: it ends once the node holds the same envelopes as a
-/// peer, and it checks that both project the same graph.
+/// peer. Matching registries also check the graph; mixed builds verify the wire log.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReplicationFirstSync {
     /// `syncing`, `verified`, or `failed`.
@@ -2698,6 +2698,9 @@ pub struct ReplicationFirstSync {
     pub graph_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_graph_digest: Option<String>,
+    /// Mixed builds verify the complete wire log while their projections wait for an upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_digest: Option<String>,
     /// The graphs matched only after a heal.
     #[serde(default)]
     pub healed: bool,
@@ -2774,7 +2777,11 @@ pub struct ReplicationStatus {
     pub received_envelopes: u64,
     pub pending_records: u64,
     pub valid_records: u64,
+    /// Compatibility name for claims waiting for a newer build.
     pub unknown_records: u64,
+    /// Authenticated claims retained without a projection until this build knows their schema.
+    #[serde(default)]
+    pub waiting_claims: u64,
     pub invalid_records: u64,
     pub repaired_records: u64,
     /// Envelopes of keyed writers held until their writer's signature arrives.
@@ -2859,6 +2866,9 @@ pub struct ReplicationPeerStatus {
     /// Comparable shared tables that differ at the last inventory-aligned comparison.
     #[serde(default)]
     pub differing_tables: Vec<String>,
+    /// Different registries or locally waiting claims make projection comparisons premature.
+    #[serde(default)]
+    pub projection_comparison_waiting: bool,
     /// How far apart the two envelope sets were at the last exchange that measured them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<ReplicationPeerSync>,

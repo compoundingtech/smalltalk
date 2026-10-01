@@ -3738,11 +3738,11 @@ async fn run_up(args: UpArgs) -> Result<()> {
             "st: the replicated projection is stale; the daemon will use its last good graph"
         );
     }
-    if admission.invalid != 0 || admission.unknown != 0 {
-        eprintln!(
-            "st: replication has {} invalid and {} unknown records",
-            admission.invalid, admission.unknown
-        );
+    if admission.unknown != 0 {
+        eprintln!("st: {} claims waiting for a newer build", admission.unknown);
+    }
+    if admission.invalid != 0 {
+        eprintln!("st: replication has {} invalid records", admission.invalid);
     }
     store.append_claim(&ClaimInput {
         subject: format!("daemon/{}", config.node),
@@ -7254,8 +7254,8 @@ async fn run_repair(client: &Client, command: RepairCommand, json_output: bool) 
 }
 
 /// Wait for this node's first sync to end, printing progress when `progress` is set. It ends at
-/// the first exchange at which this node holds the same envelopes as a peer; the two graphs must
-/// then match, at once or after a heal. Returns None when `timeout` passes first.
+/// the first exchange at which this node holds the same envelopes as a peer. With matching
+/// registries the graphs must also match, at once or after a heal. Returns None on timeout.
 async fn wait_for_first_sync(
     client: &Client,
     timeout: Duration,
@@ -7339,6 +7339,11 @@ fn render_first_sync(first: &st3::model::ReplicationFirstSync, now: u128) -> Str
         short_digest(first.peer_graph_digest.as_deref().unwrap_or("unknown"))
     );
     match first.state.as_str() {
+        "verified" if first.authority_digest.is_some() => format!(
+            "first sync verified {when}: this node holds the same {} as {peer}; log digest {}; projection comparison waits for matching builds",
+            envelope_count(first.envelopes.unwrap_or(0)),
+            short_digest(first.authority_digest.as_deref().unwrap_or("unknown")),
+        ),
         "verified" => format!(
             "first sync verified {when}: this node holds the same {} as {peer} and projects the same graph ({}){}",
             envelope_count(first.envelopes.unwrap_or(0)),
@@ -7406,8 +7411,8 @@ fn render_heal(peer: &str, report: &st3::model::ReplicationHealReport, now: u128
 }
 
 /// Each peer's line, then how far apart the two envelope sets are and how long catching up
-/// should take, in words. Two nodes are in sync only when they hold the same envelopes and
-/// project the same graph from them.
+/// should take, in words. Matching builds compare their graphs; mixed builds report the
+/// equal envelope log and the pending projection comparison.
 fn render_replication_peers(
     peers: &[ReplicationPeerStatus],
     local_graph_digest: &str,
@@ -7517,7 +7522,13 @@ fn render_replication_peers(
             if sync.graph_differs_since_unix_ms.is_some() {
                 continue;
             }
-            if peer.graph_digest.as_deref() == Some(local_graph_digest) {
+            if peer.projection_comparison_waiting {
+                let _ = writeln!(
+                    output,
+                    "  same envelopes (measured {}); projection comparison waits for a newer build",
+                    relative_time(sync.measured_at_unix_ms, now)
+                );
+            } else if peer.graph_digest.as_deref() == Some(local_graph_digest) {
                 let _ = writeln!(
                     output,
                     "  in sync: the same envelopes and the same graph (measured {})",
@@ -7588,10 +7599,10 @@ async fn run_replication(
             }
             println!("envelopes\t{}", status.received_envelopes);
             println!(
-                "records\tvalid={} pending={} unknown={} invalid={} repaired={} checkpointed={}",
+                "records\tvalid={} pending={} waiting={} invalid={} repaired={} checkpointed={}",
                 status.valid_records,
                 status.pending_records,
-                status.unknown_records,
+                status.waiting_claims,
                 status.invalid_records,
                 status.repaired_records,
                 status.checkpointed_envelopes
@@ -15543,6 +15554,7 @@ mod tests {
         st3::model::ReplicationPeerStatus {
             projection_digests: Default::default(),
             differing_tables: Vec::new(),
+            projection_comparison_waiting: false,
             peer: peer.into(),
             status: "up".into(),
             last_success_at_unix_ms: None,
@@ -15553,6 +15565,29 @@ mod tests {
             graph_digest: None,
             sync: None,
         }
+    }
+
+    #[test]
+    fn mixed_build_status_reports_log_verification_and_waiting_projections() {
+        let first = st3::model::ReplicationFirstSync {
+            state: "verified".into(),
+            authority_digest: Some("log-digest".into()),
+            envelopes: Some(3),
+            peer: Some("alder".into()),
+            ..Default::default()
+        };
+        let rendered = render_first_sync(&first, 0);
+        assert!(rendered.contains("log digest log-digest"));
+        assert!(rendered.contains("projection comparison waits"));
+        let mut peer = peer_status("alder", Some("log-digest"));
+        peer.graph_digest = Some("another-graph".into());
+        peer.projection_comparison_waiting = true;
+        peer.sync = Some(Default::default());
+        let rendered = render_replication_peers(&[peer], "local-graph", 0);
+        assert!(rendered.contains("same envelopes"));
+        assert!(rendered.contains("projection comparison waits for a newer build"));
+        assert!(!rendered.contains("graphs differ"));
+        assert!(!rendered.contains("diverged"));
     }
 
     #[test]
@@ -16733,6 +16768,7 @@ mod tests {
                 ReplicationPeerStatus {
                     projection_digests: BTreeMap::from([("claim_sources".into(), "sample".into())]),
                     differing_tables: Vec::new(),
+                    projection_comparison_waiting: false,
                     peer: name.into(),
                     status: "up".into(),
                     last_success_at_unix_ms: Some(now - 2_000),
