@@ -113,7 +113,7 @@ fn step_style(state: StepState, spinner: &'static str) -> (&'static str, Color, 
     }
 }
 
-fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
+pub fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
     match kind {
         AttentionKind::Review { .. }
         | AttentionKind::Feedback { .. }
@@ -1265,7 +1265,11 @@ pub fn mission_detail(
             ),
             span(format!("{:<11}", word), theme::fg(color)),
             span(
-                format!("{:<18}", step.owner.as_deref().unwrap_or("nobody")),
+                // A long owner is cut so its age never runs into it.
+                format!(
+                    "{:<18}",
+                    text::truncate(step.owner.as_deref().unwrap_or("nobody"), 17)
+                ),
                 if step.owner.is_some() {
                     theme::soft()
                 } else {
@@ -1570,7 +1574,7 @@ pub fn fleet_list(world: &World) -> Listing {
     }
 }
 
-fn reach_style(reach: Reach) -> (&'static str, Color) {
+pub fn reach_style(reach: Reach) -> (&'static str, Color) {
     match reach {
         Reach::Here | Reach::Direct => ("●", theme::GREEN),
         Reach::Indirect => ("◐", theme::SAPPHIRE),

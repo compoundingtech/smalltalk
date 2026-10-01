@@ -28,7 +28,11 @@ fn main() {
         println!("cargo:rustc-env=ST2_BUILD_STAMP_LOCAL={stamp}");
     }
     // Rebuild the stamp when HEAD moves or the working tree changes (dirty flag).
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
-    println!("cargo:rerun-if-changed=.git/index");
+    // This build script also stamps st-drivers from its crate directory. Git resolves the
+    // same worktree metadata for both callers, including linked-worktree layouts.
+    for path in ["HEAD", "refs", "index"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", path]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
 }

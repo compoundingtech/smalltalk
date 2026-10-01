@@ -39,7 +39,7 @@ sha2 = "0.10"
 st-runtime = { path = "../st-runtime" }
 st3-client = { path = "../st3-client" }
 st3-schema = { path = "../st3-schema" }
-st2 = { path = "../.." }
+st-drivers = { path = "../st-drivers" }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"

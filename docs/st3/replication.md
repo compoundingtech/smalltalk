@@ -24,6 +24,18 @@ its own digest so a mismatch names the source. Local receipt metadata, physical 
 lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
 tombstones represent the same logical source identity.
 
+Uploaded bytes in `local_blobs` are staged locally until a durable claim references them.
+Claim admission promotes those bytes into `blobs` in the claim's transaction; every column of
+`blobs` remains in the shared digest. Unreferenced uploads never enter envelopes and cannot be
+compared as shared authority. On upgrade, retained claim references, document bindings and valid
+received blob records identify existing shared bytes. Other bytes move to local staging without
+being deleted. If checkpoint tombstones already removed historical references, the upgrade
+conservatively keeps all existing shared blobs.
+
+A keyed worker signs batches beyond its last processed batch, including envelopes another
+unkeyed process already sealed at startup. Signature requests recover missing signatures after
+an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
+
 `store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
 checks both invariants by comparing shared rows, selected readers and per-table digest oracles
 across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
@@ -43,14 +55,6 @@ same order for existing claim queries. In-memory comparisons use `claim_key` or
 `key_from_record`, and claim-to-claim predicates use `after_sql`. Legacy batch position is its
 relative position within the batch. A global arrival index never chooses a shared winner.
 
-Document version rows retain the earliest canonical binding for repeated name/hash pairs;
-mission revision rows do the same for repeated identical revisions. Document latest flags,
-history order and cursor boundaries use binding claim keys. Complete mailbox readers and
-selected unread reminders use canonical sent-claim keys; bounded mailbox cursors remain local.
-The shuffle fixture compares paged document answers and the existing person attention view,
-including unread messages, reminder selection and episode onset. Proposal lifecycle tests
-compare all shared rows and digests through creation, review, draining, cancellation and apply.
-
 ## Projection digest coverage and cost
 
 `store/projection_digest.rs::TABLES` lists the shared tables: operations, blobs, documents,
@@ -69,6 +73,14 @@ payloads and ordering metadata. This covers the sources of on-demand views such 
 subscriptions, fleet membership, usage, observer/fault episodes, and attention. A timed view's
 answer must still be tested at the same explicit time and recipients. Host-local liveness,
 leases, receipts, cursors, secrets and notification bookkeeping stay outside shared digests.
+
+A repaired original is no longer an admitted projection source. One member may retain its
+old claim row while another rejected it before admission; both exclude it from claim-source
+and operation projections. The original wire bytes remain committed by authenticated envelope
+inventory, and the repair and replacement remain shared claim sources. A local
+`projection_digest_repaired_claims` cache retains the exclusion after receipt cleanup; repair
+record updates and cached source digests commit or roll back together. Registry version 5
+backfills existing repairs once, and operation rules version 2 rebuilds older operation rows.
 
 Operations are logical rows over the hot operation table and operation facts retained in
 checkpoint tombstones. Trimming a claim changes its storage representation, preserving its
@@ -93,7 +105,7 @@ the test inventory and production registry to agree, and the fixture exercises e
 
 `st replication status` prints `table-digest` entries and names differing tables under each
 peer. `st replication diff PEER` and `st doctor` also name them. Table differences are meaningful
-only when inventories agree, projection is current and local committed batches are sealed. Old peers omit `projection_digests`;
+only when inventories agree and projection is current. Old peers omit `projection_digests`;
 exchanges and heals then compare their unchanged six-table compatibility hash. Old peers cannot
 verify full projection coverage. Modern peers compare complete maps. SQLite schema 14 adds the
 transactional digest machinery and rebuilds shared projections once, correcting older stored

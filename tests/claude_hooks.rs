@@ -73,7 +73,7 @@ impl Fixture {
     /// `overrides` are applied last, so a test can drop `PATH` entries or retune staleness.
     fn run_with(&self, script: &str, overrides: &[(&str, &str)]) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("hooks")
+            .join("crates/st-drivers/hooks")
             .join(script);
         let current_path = std::env::var("PATH").unwrap_or_default();
         let mut command = Command::new(bash());

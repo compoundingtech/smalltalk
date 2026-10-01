@@ -19,17 +19,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
-/// Every hook this subcommand answers. The hook set holds one script per name.
-pub const HOOKS: [&str; 8] = [
-    "claude-observe",
-    "claude-statusline",
-    "claude-session-start",
-    "claude-pre-compact",
-    "claude-stop-failure",
-    "codex-session-start",
-    "codex-pre-compact",
-    "codex-stop",
-];
+/// Active hooks this subcommand answers. New hook sets hold one script per name.
+pub const HOOKS: [&str; 2] = ["claude-observe", "claude-statusline"];
 
 /// The subcommand name st3's hook scripts exec.
 pub const SUBCOMMAND: &str = "driver-hook";
@@ -76,7 +67,7 @@ pub fn run(
 ) -> u8 {
     // Harness-session state stays beneath st3's driver directory, never st2's.
     if let Some(drivers) = env.var("ST3_DRIVER_STATE_DIR") {
-        st2::run::use_harness_state_root(PathBuf::from(drivers).join("sessions"));
+        st_drivers::run::use_harness_state_root(PathBuf::from(drivers).join("sessions"));
     }
     match name {
         "claude-observe" => claude_observe(args, env, stdin, report),
@@ -93,7 +84,7 @@ pub fn run(
             let root = PathBuf::from(&root);
             let root = root.canonicalize().unwrap_or(root);
             // The tee records fail-open and chains to the operator's renderer itself.
-            match st2::claude_session::run_statusline(&root, &identity) {
+            match st_drivers::claude_session::run_statusline(&root, &identity) {
                 Ok(()) => 0,
                 Err(error) => {
                     eprintln!("st: the Claude status line failed: {error:#}");
@@ -101,19 +92,24 @@ pub fn run(
                 }
             }
         }
-        // st3 seats take no startup turn, the driver delivers messages, compaction is counted by
-        // `claude-observe`, and a failed turn is recorded there too. These are answered so a
-        // workspace whose own settings still name them keeps working; they add nothing.
-        "claude-session-start"
-        | "claude-pre-compact"
-        | "claude-stop-failure"
-        | "codex-session-start"
-        | "codex-pre-compact"
-        | "codex-stop" => {
-            let _ = std::io::copy(stdin, &mut std::io::sink());
-            0
-        }
         other => {
+            // A binary replacement must still answer scripts held by running old seats.
+            // New sets contain none of these aliases, and direct invocations are rejected.
+            if matches!(
+                other,
+                "claude-session-start"
+                    | "claude-pre-compact"
+                    | "claude-stop-failure"
+                    | "codex-session-start"
+                    | "codex-pre-compact"
+                    | "codex-stop"
+            ) && env
+                .var("ST_HOOKS")
+                .is_some_and(|dir| crate::hooks::older_set_contains_hook(Path::new(&dir), other))
+            {
+                let _ = std::io::copy(stdin, &mut std::io::sink());
+                return 0;
+            }
             let _ = std::io::copy(stdin, &mut std::io::sink());
             eprintln!(
                 "st: unknown driver hook `{other}`; this binary answers {}",
@@ -136,10 +132,10 @@ fn claude_observe(
     let session_start = event == "SessionStart";
     let mandatory = session_start
         && (env
-            .var(st2::claude_session::RESUME_GENERATION_ENV)
+            .var(st_drivers::claude_session::RESUME_GENERATION_ENV)
             .is_some()
             || env
-                .var(st2::claude_session::EXPECTED_NATIVE_SESSION_ENV)
+                .var(st_drivers::claude_session::EXPECTED_NATIVE_SESSION_ENV)
                 .is_some());
     let identity = env
         .var("ST2_CLAUDE_IDENTITY")
@@ -163,9 +159,9 @@ fn claude_observe(
     let root = PathBuf::from(&root);
     let root = root.canonicalize().unwrap_or(root);
     let runtime_id = env
-        .var(st2::claude_session::RUNTIME_ID_ENV)
+        .var(st_drivers::claude_session::RUNTIME_ID_ENV)
         .unwrap_or_else(|| identity.clone());
-    if let Err(error) = st2::claude_session::run_observe_payload(
+    if let Err(error) = st_drivers::claude_session::run_observe_payload(
         &root,
         &identity,
         Some(&runtime_id),
@@ -196,14 +192,14 @@ fn session_start_binding(
     raw: &str,
 ) -> std::result::Result<(), String> {
     let wrapper = env
-        .var(st2::claude_session::SESSION_ENV)
+        .var(st_drivers::claude_session::SESSION_ENV)
         .ok_or("the SessionStart hook has no wrapper session (ST2_CLAUDE_SESSION)")?;
     let payload: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
     let native = payload["session_id"]
         .as_str()
         .filter(|id| !id.is_empty())
         .ok_or("Claude's SessionStart payload names no session_id")?;
-    let agent_dir = st2::message::resolve_declared_dir(root, identity, &st2::run::detect_host())
+    let agent_dir = st_drivers::message::resolve_declared_dir(root, identity, &st_drivers::run::detect_host())
         .map_err(|error| format!("the driver catalog does not resolve: {error:#}"))?
         .ok_or_else(|| {
             format!(
@@ -232,7 +228,7 @@ fn unbound(env: &dyn HookEnv, report: &mut dyn FnMut(Diagnostic), reason: &str) 
         .filter(|subject| subject.starts_with("agent/"))
     {
         let session = env
-            .var(st2::claude_session::SESSION_ENV)
+            .var(st_drivers::claude_session::SESSION_ENV)
             .unwrap_or_else(|| "unknown".into());
         report(Diagnostic {
             idempotency_key: format!("{UNBOUND_CODE}-hook:{subject}:{session}"),
@@ -287,7 +283,7 @@ mod tests {
 
     fn seat(root: &Path) -> (PathBuf, BTreeMap<String, String>) {
         let catalog = root.join("catalog");
-        let host = st2::run::detect_host();
+        let host = st_drivers::run::detect_host();
         let agent_dir = catalog.join("agents").join(&host).join("seat");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(
@@ -401,27 +397,58 @@ mod tests {
         assert_eq!(hook("claude-observe", &["Stop"], &env, "{}").0, 0);
         // A mandatory resume fence propagates its failure, as st2's hook did.
         env.insert(
-            st2::claude_session::RESUME_GENERATION_ENV.into(),
+            st_drivers::claude_session::RESUME_GENERATION_ENV.into(),
             "3".into(),
         );
         env.insert(
-            st2::claude_session::EXPECTED_NATIVE_SESSION_ENV.into(),
+            st_drivers::claude_session::EXPECTED_NATIVE_SESSION_ENV.into(),
             "native-9".into(),
         );
         assert_eq!(hook("claude-observe", &["SessionStart"], &env, "{}").0, 1);
     }
 
     #[test]
-    fn context_and_inbox_hooks_answer_without_output() {
-        let env = BTreeMap::new();
-        for name in HOOKS {
-            if matches!(name, "claude-observe" | "claude-statusline") {
-                continue;
-            }
-            assert_eq!(
-                hook(name, &[], &env, r#"{"session_id":"x"}"#),
-                (0, Vec::new())
+    fn retired_hooks_require_an_intact_older_set() {
+        let root = tempfile::tempdir().unwrap();
+        let mut env = BTreeMap::new();
+        let mut files = BTreeMap::new();
+        let names = [
+            "claude-session-start",
+            "claude-pre-compact",
+            "claude-stop-failure",
+            "codex-session-start",
+            "codex-pre-compact",
+            "codex-stop",
+        ];
+        let script = b"#!/bin/sh\nexit 0\n";
+        use sha2::{Digest as _, Sha256};
+        for name in names {
+            files.insert(
+                format!("{name}.sh"),
+                format!("sha256:{}", hex::encode(Sha256::digest(script))),
             );
+        }
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schema": 1, "owner": "st3", "files": files,
+        }))
+        .unwrap();
+        let older = root
+            .path()
+            .join(format!("sha256-{}", hex::encode(Sha256::digest(&manifest))));
+        std::fs::create_dir(&older).unwrap();
+        std::fs::write(older.join(crate::hooks::MANIFEST), &manifest).unwrap();
+        let current = crate::hooks::ensure_installed(root.path()).unwrap();
+        for name in names {
+            std::fs::write(older.join(format!("{name}.sh")), script).unwrap();
+            assert_eq!(hook(name, &[], &env, "{}").0, 1);
+            env.insert("ST_HOOKS".into(), current.display().to_string());
+            assert_eq!(hook(name, &[], &env, "{}").0, 1);
+            assert!(!current.join(format!("{name}.sh")).exists());
+            env.insert("ST_HOOKS".into(), older.display().to_string());
+            assert_eq!(hook(name, &[], &env, "{}"), (0, Vec::new()));
+            std::fs::write(older.join(format!("{name}.sh")), "changed").unwrap();
+            assert_eq!(hook(name, &[], &env, "{}").0, 1);
+            env.clear();
         }
         assert_eq!(hook("st2-boot", &[], &env, "").0, 1);
     }

@@ -212,6 +212,12 @@ CREATE TABLE IF NOT EXISTS blobs (
     bytes BLOB NOT NULL,
     size INTEGER NOT NULL
 );
+-- Uploaded bytes become shared authority only when a durable claim references them.
+CREATE TABLE IF NOT EXISTS local_blobs (
+    hash TEXT PRIMARY KEY,
+    bytes BLOB NOT NULL,
+    size INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS documents (
     name TEXT NOT NULL,
@@ -2693,10 +2699,11 @@ impl Store {
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
         projection_digest::initialize(&connection)?;
+        separate_staged_blobs(&mut connection)?;
         {
             let transaction = connection.transaction()?;
             let upgraded: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='canonical_shared_projection_rules' AND value='2')",
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='canonical_shared_projection_rules')",
                 [],
                 |row| row.get(0),
             )?;
@@ -2707,7 +2714,7 @@ impl Store {
                     [DERIVED_TABLES_VERSION],
                 )?;
                 transaction.execute(
-                    "INSERT OR REPLACE INTO meta(key,value) VALUES('canonical_shared_projection_rules','2')",
+                    "INSERT INTO meta(key,value) VALUES('canonical_shared_projection_rules','1')",
                     [],
                 )?;
             } else {
@@ -4136,15 +4143,11 @@ impl Store {
         let connection = self.readers.get();
         let id = connection
             .query_row(
-                &canonical_sql(
-                    "SELECT p.id FROM revision_proposals p
+                "SELECT p.id FROM revision_proposals p
                  JOIN mission_runs r ON r.id=p.run_id
-                     JOIN claims created ON created.subject='revision-proposal/' || p.id
-                       AND created.kind='revision-proposal.created'
                  WHERE p.run_id=?1 AND p.source_generation_id=r.current_generation_id
                    AND p.status IN ('pending-approval','draining')
-                 ORDER BY CANONICAL_DESC(created) LIMIT 1",
-                ),
+                 ORDER BY p.created_at_unix_ms DESC LIMIT 1",
                 [run],
                 |row| row.get::<_, String>(0),
             )
@@ -4314,7 +4317,7 @@ impl Store {
                 .map_err(internal)?;
         }
         let subject = format!("revision-proposal/{proposal_id}");
-        let record = append_claim_tx(
+        append_claim_tx(
             &transaction,
             &self.origin,
             &subject,
@@ -4335,15 +4338,6 @@ impl Store {
             None,
         )
         .map_err(internal)?;
-        if status == "draining" {
-            transaction
-                .execute(
-                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
-                    params![run_id, record.accepted_at_unix_ms.to_string()],
-                )
-                .map_err(internal)?;
-        }
-
         let view = revision_proposal_view_tx(&transaction, &proposal_id).map_err(internal)?;
         transaction
             .execute(
@@ -4479,7 +4473,7 @@ impl Store {
                 )
                 .map_err(internal)?;
         }
-        let record = append_claim_tx(
+        append_claim_tx(
             &transaction,
             &self.origin,
             &proposal.subject,
@@ -4490,21 +4484,6 @@ impl Store {
             None,
         )
         .map_err(internal)?;
-        if status == "draining" {
-            transaction
-                .execute(
-                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
-                    params![
-                        proposal
-                            .run
-                            .strip_prefix("mission-run/")
-                            .unwrap_or(&proposal.run),
-                        record.accepted_at_unix_ms.to_string()
-                    ],
-                )
-                .map_err(internal)?;
-        }
-
         transaction.commit().map_err(internal)?;
         drop(connection);
 
@@ -4621,13 +4600,13 @@ impl Store {
                 params![proposal_id, now.to_string()],
             )
             .map_err(internal)?;
-        let phase_changed = transaction
+        transaction
             .execute(
                 "UPDATE mission_runs SET phase='normal', updated_at_unix_ms=?2 WHERE id=?1 AND phase='revision-draining'",
                 params![run_id, now.to_string()],
             )
             .map_err(internal)?;
-        let record = append_claim_tx(
+        append_claim_tx(
             &transaction,
             &self.origin,
             &current.subject,
@@ -4638,15 +4617,6 @@ impl Store {
             None,
         )
         .map_err(internal)?;
-        if phase_changed > 0 {
-            transaction
-                .execute(
-                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
-                    params![run_id, record.accepted_at_unix_ms.to_string()],
-                )
-                .map_err(internal)?;
-        }
-
         let view = revision_proposal_view_tx(&transaction, proposal_id).map_err(internal)?;
         transaction
             .execute(
@@ -4706,15 +4676,11 @@ impl Store {
             }
             let proposal_id = connection
                 .query_row(
-                    &canonical_sql(
-                        "SELECT p.id FROM revision_proposals p
+                    "SELECT p.id FROM revision_proposals p
                      JOIN mission_runs r ON r.id=p.run_id
-                     JOIN claims created ON created.subject='revision-proposal/' || p.id
-                       AND created.kind='revision-proposal.created'
                      WHERE p.run_id=?1 AND p.source_generation_id=r.current_generation_id
                        AND p.status='draining'
-                     ORDER BY CANONICAL_ASC(created) LIMIT 1",
-                    ),
+                     ORDER BY p.created_at_unix_ms LIMIT 1",
                     [run_id],
                     |row| row.get::<_, String>(0),
                 )
@@ -8934,26 +8900,17 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<DocumentVersion>> {
         let connection = self.readers.get();
-        let latest_order = canonical::order_sql("newer", true);
-        let version_order = canonical::order_sql("c", true);
-        let cursor_after = canonical::after_sql("cursor_claim", "c");
-        let query = format!("SELECT d.name, d.hash, b.size, d.created_index,
-                     d.hash=(SELECT n.hash FROM documents n JOIN claims newer ON newer.id=n.binding_claim_id
-                 WHERE n.name=d.name ORDER BY {latest_order} LIMIT 1)
+        let query = "SELECT d.name, d.hash, b.size, d.created_index,
+                     d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name)
                      ,d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
                      FROM documents d JOIN blobs b ON b.hash=d.hash
                      JOIN claims c ON c.id=d.binding_claim_id
                      WHERE (?1 IS NULL OR d.name=?1)
-                       AND (?2 OR d.hash=(SELECT n.hash FROM documents n JOIN claims newer ON newer.id=n.binding_claim_id
-                 WHERE n.name=d.name ORDER BY {latest_order} LIMIT 1))
+                       AND (?2 OR d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name))
                        AND (?3 IS NULL OR substr(d.name,1,length(?3))=?3)
-                       AND (?4 IS NULL OR d.name>?4 OR (d.name=?4 AND EXISTS (
-                           SELECT 1 FROM documents cursor_document JOIN claims cursor_claim
-                             ON cursor_claim.id=cursor_document.binding_claim_id
-                           WHERE cursor_document.name=?4 AND cursor_document.created_index=?5
-                             AND {cursor_after})))
-                     ORDER BY d.name, {version_order} LIMIT ?6");
-        let mut statement = connection.prepare(&query)?;
+                       AND (?4 IS NULL OR d.name>?4 OR (d.name=?4 AND d.created_index<?5))
+                     ORDER BY d.name, d.created_index DESC LIMIT ?6";
+        let mut statement = connection.prepare(query)?;
         let rows = statement.query_map(
             params![
                 name,
@@ -10626,10 +10583,7 @@ impl Store {
             all.extend(items);
             match next {
                 Some(cursor) => after = Some(cursor),
-                None => {
-                    sort_messages_canonically(&self.readers.get(), &mut all)?;
-                    return Ok(all);
-                }
+                None => return Ok(all),
             }
         }
     }
@@ -10670,7 +10624,6 @@ impl Store {
                 messages.push(message);
             }
         }
-        sort_messages_canonically(&connection, &mut messages)?;
         Ok(messages)
     }
 
@@ -10856,7 +10809,7 @@ impl Store {
         Ok(if include_history {
             messages
         } else {
-            selected_actionable_messages(&self.readers.get(), messages)?
+            selected_actionable_messages(messages)
         })
     }
 
@@ -11512,7 +11465,7 @@ impl Store {
                 messages
             }
         };
-        let messages = selected_actionable_messages(&self.readers.get(), messages)?;
+        let messages = selected_actionable_messages(messages);
         if !messages.is_empty() {
             let connection = self.readers.get();
             for message in messages.into_iter().filter(|message| {
@@ -13651,7 +13604,8 @@ impl Store {
         let hash = hex::encode(Sha256::digest(bytes));
         let connection = self.connection.write();
         connection.execute(
-            "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO local_blobs(hash, bytes, size)
+             SELECT ?1, ?2, ?3 WHERE NOT EXISTS(SELECT 1 FROM blobs WHERE hash=?1)",
             params![hash, bytes, bytes.len() as u64],
         )?;
         Ok(hash)
@@ -13660,9 +13614,12 @@ impl Store {
     pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
         let connection = self.readers.get();
         connection
-            .query_row("SELECT bytes FROM blobs WHERE hash=?1", [hash], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT bytes FROM blobs WHERE hash=?1
+                        UNION ALL SELECT bytes FROM local_blobs WHERE hash=?1 LIMIT 1",
+                [hash],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(Into::into)
     }
@@ -13712,9 +13669,8 @@ impl Store {
         let latest_batch = max_batch_rowid(&connection)?;
         if latest_batch > seeded_through {
             let transaction = connection.transaction()?;
-            let envelopes_before = max_envelope_rowid(&transaction)?;
             seed_replica_envelopes_tx(&transaction, &self.origin, Some(seeded_through))?;
-            self.sign_own_envelopes_tx(&transaction, Some(envelopes_before))?;
+            self.sign_own_envelopes_tx(&transaction, Some(seeded_through))?;
             transaction.commit()?;
             self.seeded_batch_rowid
                 .store(latest_batch, Ordering::Release);
@@ -14767,6 +14723,9 @@ impl Store {
                 }
             }
         }
+        if changed != 0 {
+            rebuild_operations_tx(&transaction)?;
+        }
         transaction.commit()?;
         drop(connection);
         if changed != 0 {
@@ -15173,13 +15132,6 @@ impl Store {
     ) -> Result<ReplicationStatus> {
         let snapshot = self.sealed_replication_snapshot()?;
         let connection = self.readers.get();
-        // Projection caches include committed local batches before their envelopes are sealed.
-        // Equal sealed inventories cannot diagnose those pending writes as peer divergence.
-        let unsealed_local: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>?1 AND origin=?2)",
-            params![self.seeded_batch_rowid.load(Ordering::Acquire), self.origin],
-            |row| row.get(0),
-        )?;
         let count = |state: &str| -> Result<u64> {
             Ok(connection.query_row(
                 "SELECT COUNT(*) FROM replica_records WHERE state=?1",
@@ -15278,7 +15230,6 @@ impl Store {
                     .optional()?;
                 if peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str())
                     && !self.replication_projection_deferred()
-                    && !unsealed_local
                 {
                     status.differing_tables = projection_digest::differing(
                         &snapshot.projection_digests,
@@ -17540,18 +17491,14 @@ fn find_document(
     name: &str,
     hash: &str,
 ) -> Result<Option<DocumentVersion>> {
-    let latest_order = canonical::order_sql("newer", true);
     connection
         .query_row(
-            &format!(
-                "SELECT d.name, d.hash, b.size, d.created_index,
-             d.hash=(SELECT n.hash FROM documents n JOIN claims newer ON newer.id=n.binding_claim_id
-                 WHERE n.name=d.name ORDER BY {latest_order} LIMIT 1),
+            "SELECT d.name, d.hash, b.size, d.created_index,
+             d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name),
              d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
              FROM documents d JOIN blobs b ON b.hash=d.hash
              JOIN claims c ON c.id=d.binding_claim_id
-             WHERE d.name=?1 AND d.hash=?2"
-            ),
+             WHERE d.name=?1 AND d.hash=?2",
             params![name, hash],
             |row| {
                 Ok(DocumentVersion {
@@ -18574,6 +18521,7 @@ fn expected_operations(
         "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
          FROM claims
          WHERE json_extract(body, '$._operation.id') IS NOT NULL
+           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
          ORDER BY id",
     )?;
     let claims = statement
@@ -18636,7 +18584,7 @@ fn expected_operations(
 /// this rule has opened. Rebuilding it read every claim and held a start for seconds before the
 /// API could answer. The planning tables are small and rebuilt on every start, since a planning
 /// claim written through the generic claim path is projected only by a rebuild.
-const DERIVED_TABLES_VERSION: &str = "1";
+const DERIVED_TABLES_VERSION: &str = "2";
 
 fn rebuild_derived_tables_once_tx(transaction: &Transaction<'_>) -> Result<()> {
     rebuild_planning_tx(transaction)?;
@@ -19240,6 +19188,7 @@ fn insert_claim(
     predecessors: &[String],
     now: u128,
 ) -> Result<u64> {
+    promote_claim_blobs(transaction, body)?;
     transaction.execute(
         "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -20279,26 +20228,7 @@ fn pending_attention_requests_tx(
         .collect()
 }
 
-fn sort_messages_canonically(connection: &Connection, messages: &mut [MessageView]) -> Result<()> {
-    let mut keys = BTreeMap::new();
-    let mut statement = connection.prepare(&canonical_sql(
-        "SELECT id FROM claims WHERE subject=?1 AND kind IN ('message.sent','intent.desired') ORDER BY CANONICAL_ASC(claims) LIMIT 1"
-    ))?;
-    for message in messages.iter() {
-        let id: String = statement.query_row([&message.subject], |row| row.get(0))?;
-        keys.insert(
-            message.subject.clone(),
-            canonical::claim_key(connection, &id)?,
-        );
-    }
-    messages.sort_by(|left, right| keys[&left.subject].cmp(&keys[&right.subject]));
-    Ok(())
-}
-
-fn selected_actionable_messages(
-    connection: &Connection,
-    messages: Vec<MessageView>,
-) -> Result<Vec<MessageView>> {
+fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> {
     let mut selected_reminders = BTreeMap::<String, (u64, MessageView)>::new();
     let mut selected = Vec::new();
     for message in messages {
@@ -20326,8 +20256,8 @@ fn selected_actionable_messages(
         }
     }
     selected.extend(selected_reminders.into_values().map(|(_, message)| message));
-    sort_messages_canonically(connection, &mut selected)?;
-    Ok(selected)
+    selected.sort_by_key(|message| message.created_index);
+    selected
 }
 
 /// Target kinds whose own state can end an attention request; see
@@ -22139,11 +22069,12 @@ impl Store {
     }
 
     /// Sign every envelope of this node's writer that has no signature by its member key,
-    /// optionally only those added after one `replica_envelopes` row.
+    /// optionally only those whose batches follow the last processed batch. Another process
+    /// can seal a batch before this keyed worker sees it; an envelope-row frontier would skip it.
     fn sign_own_envelopes_tx(
         &self,
         transaction: &Transaction<'_>,
-        after_rowid: Option<i64>,
+        after_batch_rowid: Option<i64>,
     ) -> Result<usize> {
         let _timing = time_stage(&self.replication_timers.signing);
         let Some(key) = self
@@ -22157,9 +22088,14 @@ impl Store {
         let Some(fleet_id) = fleet_meta(transaction, "fleet_id")? else {
             return Ok(0);
         };
-        let mut statement = transaction.prepare(
-            "SELECT sequence, envelope_hash FROM replica_envelopes AS envelopes
-             WHERE writer=?1 AND rowid>?2
+        let from = if after_batch_rowid.is_some() {
+            "FROM batches CROSS JOIN replica_envelopes AS envelopes
+             ON envelopes.batch_id=batches.id WHERE batches.rowid>?2 AND envelopes.writer=?1"
+        } else {
+            "FROM replica_envelopes AS envelopes WHERE envelopes.writer=?1 AND envelopes.rowid>?2"
+        };
+        let mut statement = transaction.prepare(&format!(
+            "SELECT envelopes.sequence, envelopes.envelope_hash {from}
                AND NOT EXISTS (
                  SELECT 1 FROM replica_envelope_signatures AS signatures
                  WHERE signatures.writer=envelopes.writer
@@ -22167,11 +22103,15 @@ impl Store {
                    AND signatures.envelope_hash=envelopes.envelope_hash
                    AND signatures.member_key=?3
                )
-             ORDER BY sequence",
-        )?;
+             ORDER BY envelopes.sequence"
+        ))?;
         let unsigned = statement
             .query_map(
-                params![self.origin, after_rowid.unwrap_or(i64::MIN), key.public()],
+                params![
+                    self.origin,
+                    after_batch_rowid.unwrap_or(i64::MIN),
+                    key.public()
+                ],
                 |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<Result<Vec<_>, _>>()?;
@@ -23431,6 +23371,130 @@ mod fleet_admission_tests {
                 envelope.signature.as_deref().unwrap(),
             ));
         }
+    }
+
+    #[test]
+    fn worker_signs_batches_already_sealed_by_an_unkeyed_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let worker = Store::open(&path, "alder").unwrap();
+        worker.bind_fleet(FLEET).unwrap();
+        let member = key();
+        worker.set_member_key(Some(member.clone())).unwrap();
+        let claim = note(&worker, "written while another process opens");
+        // Startup seeds envelopes without a member key; the keyed worker has not seen this
+        // batch yet. This is the main/replication-worker startup interleaving.
+        let daemon = Store::open(&path, "alder").unwrap();
+        let unsigned = daemon.replication_inventory().unwrap();
+        assert!(!unsigned.envelopes.is_empty());
+        let exchange = worker
+            .export_replication_exchange(FLEET, &ReplicationInventory::default())
+            .unwrap();
+        let envelope = exchange.envelopes.iter().find(|e| e.sequence == 1).unwrap();
+        assert!(verify_signature(
+            member.public(),
+            &envelope_signature_message(FLEET, "alder", envelope.sequence, &envelope.hash),
+            envelope
+                .signature
+                .as_deref()
+                .expect("already sealed batches must be signed")
+        ));
+        let receiver = node("birch", None, None);
+        sync(&worker, &receiver);
+        assert!(admitted(&receiver, &claim));
+    }
+
+    #[test]
+    fn staged_blobs_join_shared_authority_only_with_a_committed_claim() {
+        let source = node("alder", None, None);
+        let target = node("birch", None, None);
+        let baseline = source.replication_status(true, Some(FLEET), &[]).unwrap();
+        let hash = source.put_blob(b"staged upload").unwrap();
+        assert_eq!(source.get_blob(&hash).unwrap().unwrap(), b"staged upload");
+        assert_eq!(
+            source
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .graph_digest,
+            baseline.graph_digest
+        );
+        {
+            let mut connection = source.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            promote_claim_blobs(&transaction, &json!({"blob_hash":hash})).unwrap();
+            assert_ne!(
+                projection_digest::tables(&transaction).unwrap()["blobs"],
+                baseline.projection_digests["blobs"]
+            );
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            source
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .graph_digest,
+            baseline.graph_digest
+        );
+        append(
+            &source,
+            "file.observed",
+            "file/alder:/example/result",
+            json!({"status":"observed", "path":"/example/result", "blob_hash":hash}),
+        );
+        sync(&source, &target);
+        assert_eq!(target.get_blob(&hash).unwrap().unwrap(), b"staged upload");
+        assert_eq!(
+            source
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .projection_digests,
+            target
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .projection_digests
+        );
+    }
+
+    #[test]
+    fn legacy_unreferenced_blobs_are_staged_without_losing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let store = Store::open(&path, "alder").unwrap();
+        let bytes = b"unreferenced legacy upload";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let shared = store
+            .put_document("doc/example", b"shared document", &None, "shared")
+            .unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO blobs VALUES(?1,?2,?3)",
+                    params![hash, bytes.as_slice(), bytes.len()],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM meta WHERE key='staged_blob_scope'", [])
+                .unwrap();
+        }
+        drop(store);
+        let store = Store::open(&path, "alder").unwrap();
+        assert_eq!(store.get_blob(&hash).unwrap().unwrap(), bytes);
+        assert_eq!(
+            store.get_blob(&shared.hash).unwrap().unwrap(),
+            b"shared document"
+        );
+        let connection = store.readers.get();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            projection_digest::tables(&connection).unwrap(),
+            projection_digest::oracle(&connection).unwrap()
+        );
     }
 
     #[test]
@@ -25413,6 +25477,73 @@ fn collect_referenced_blobs(
             output.insert(hash, bytes);
         }
     }
+    Ok(())
+}
+
+/// Keep uncommitted uploads outside the shared graph. Promotion is part of the claim's
+/// transaction, so a failed write cannot change the shared blob digest.
+fn promote_claim_blobs(transaction: &Transaction<'_>, body: &Value) -> Result<()> {
+    let mut hashes = BTreeSet::new();
+    collect_hash_fields(body, &mut hashes);
+    for hash in hashes {
+        transaction.execute(
+            "INSERT OR IGNORE INTO blobs(hash,bytes,size)
+             SELECT hash,bytes,size FROM local_blobs WHERE hash=?1",
+            [&hash],
+        )?;
+        transaction.execute("DELETE FROM local_blobs WHERE hash=?1", [&hash])?;
+    }
+    Ok(())
+}
+
+/// Older put_blob calls mixed staged uploads with authority. Separate only bytes we can
+/// prove were never shared: retained claim references and received blob records stay shared.
+/// After a historical checkpoint removed those references, preserve all existing authority.
+fn separate_staged_blobs(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    let done: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='staged_blob_scope')",
+        [],
+        |row| row.get(0),
+    )?;
+    if done {
+        return Ok(());
+    }
+    let trimmed: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkpoint_claims)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !trimmed {
+        let mut hashes = BTreeSet::new();
+        let mut statement = transaction.prepare("SELECT body FROM claims")?;
+        for body in statement.query_map([], |row| row.get::<_, String>(0))? {
+            collect_hash_fields(&serde_json::from_str::<Value>(&body?)?, &mut hashes);
+        }
+        drop(statement);
+        transaction
+            .execute_batch("CREATE TEMP TABLE staged_blob_shared_hashes(hash TEXT PRIMARY KEY);")?;
+        let mut insert =
+            transaction.prepare("INSERT OR IGNORE INTO staged_blob_shared_hashes VALUES(?1)")?;
+        for hash in hashes {
+            insert.execute([hash])?;
+        }
+        drop(insert);
+        transaction.execute_batch(
+            "INSERT OR IGNORE INTO staged_blob_shared_hashes SELECT hash FROM documents;
+             INSERT OR IGNORE INTO staged_blob_shared_hashes
+                 SELECT substr(subject_hint,6) FROM replica_records WHERE kind_hint='blob' AND state='valid';
+             INSERT OR IGNORE INTO local_blobs SELECT * FROM blobs
+                 WHERE hash NOT IN (SELECT hash FROM staged_blob_shared_hashes);
+             DELETE FROM blobs WHERE hash NOT IN (SELECT hash FROM staged_blob_shared_hashes);
+             DROP TABLE staged_blob_shared_hashes;",
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO meta(key,value) VALUES('staged_blob_scope','1')",
+        [],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -28116,27 +28247,6 @@ fn select_replicated_document(
             )
         })?;
     validate_document_name(name)?;
-    let previous: Option<String> = transaction
-        .query_row(
-            "SELECT binding_claim_id FROM documents WHERE name=?1 AND hash=?2",
-            params![name, hash],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(internal)?;
-    if let Some(previous) = previous {
-        if canonical::claim_key(transaction, &claim.id).map_err(internal)?
-            < canonical::claim_key(transaction, &previous).map_err(internal)?
-        {
-            transaction
-                .execute(
-                    "UPDATE documents SET binding_claim_id=?3 WHERE name=?1 AND hash=?2",
-                    params![name, hash, claim.id],
-                )
-                .map_err(internal)?;
-        }
-        return Ok(());
-    }
     transaction
         .execute(
             "INSERT OR IGNORE INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
@@ -28189,23 +28299,6 @@ fn select_replicated_mission(
             params![mission.id, mission.revision, mission_state_name(&mission.state), serde_json::to_string(&mission).map_err(internal)?, claim.id, created_index],
         )
         .map_err(internal)?;
-    let previous: String = transaction
-        .query_row(
-            "SELECT claim_id FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
-            params![mission.id, mission.revision],
-            |row| row.get(0),
-        )
-        .map_err(internal)?;
-    if canonical::claim_key(transaction, &claim.id).map_err(internal)?
-        < canonical::claim_key(transaction, &previous).map_err(internal)?
-    {
-        transaction
-            .execute(
-                "UPDATE mission_revisions SET claim_id=?3 WHERE mission_id=?1 AND revision=?2",
-                params![mission.id, mission.revision, claim.id],
-            )
-            .map_err(internal)?;
-    }
     let current: Option<(String, String)> = transaction
         .query_row(
             "SELECT revision, claim_id FROM mission_definitions WHERE mission_id=?1",
@@ -38234,6 +38327,14 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             target.selected_desired_token("exec/work").unwrap().unwrap(),
             replacement
         );
+        // A build that rejected the original never put it in claims. Keep the raw repaired
+        // record, but model that admission difference explicitly.
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM claims WHERE id=?1", [&repaired_claim])
+            .unwrap();
 
         receive_and_project(
             &source,
@@ -38267,6 +38368,143 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             target_status.authority_digest
         );
         assert_eq!(source_status.graph_digest, target_status.graph_digest);
+    }
+
+    #[test]
+    fn repaired_original_sources_and_operations_ignore_local_retention_and_roll_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let source = Store::open(&path, "alder").unwrap();
+        let target = Store::open_memory("birch").unwrap();
+        let observation = |reason: &str, key: &str| {
+            source
+                .append_claim(&ClaimInput {
+                    subject: "daemon/alder".into(),
+                    kind: "daemon.diagnostic".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("severity".into(), json!("warning")),
+                        ("code".into(), json!("repair-test")),
+                        ("reason".into(), json!(reason)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap()
+        };
+        let original = observation("original", "original");
+        let replacement = observation("replacement", "replacement");
+        receive_and_project(
+            &target,
+            "alder",
+            &exchange_from(&source, &ReplicationInventory::default()),
+        );
+        let record = target
+            .replica_records(false)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.claim_id.as_deref() == Some(&original.id))
+            .unwrap();
+        let before = projection_digest::tables(&source.readers.get()).unwrap();
+        {
+            let mut connection = source.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE replica_records SET state='repaired' WHERE claim_id=?1",
+                    [&original.id],
+                )
+                .unwrap();
+            rebuild_operations_tx(&transaction).unwrap();
+            let current = projection_digest::tables(&transaction).unwrap();
+            assert_ne!(current["claim_sources"], before["claim_sources"]);
+            assert_ne!(current["operations"], before["operations"]);
+            assert_eq!(current, projection_digest::oracle(&transaction).unwrap());
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            before
+        );
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE replica_records SET state='unknown' WHERE record_ref=?1",
+                [&record.record_ref],
+            )
+            .unwrap();
+        target
+            .repair_replica_record(
+                &record.record_ref,
+                &replacement.id,
+                "replace an unsupported original",
+                "person/robin",
+                "repair",
+            )
+            .unwrap();
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM claims WHERE id=?1", [&original.id])
+            .unwrap();
+        receive_and_project(
+            &source,
+            "birch",
+            &exchange_from(&target, &source.replication_inventory().unwrap()),
+        );
+        let expected = projection_digest::tables(&target.readers.get()).unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            expected,
+            projection_digest::oracle(&target.readers.get()).unwrap()
+        );
+        assert!(source.claim_by_id(&original.id).unwrap().is_some());
+        assert!(target.claim_by_id(&original.id).unwrap().is_none());
+        // Receipt cleanup must not make a repaired original a source again.
+        source
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM replica_records WHERE claim_id=?1",
+                [&original.id],
+            )
+            .unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            projection_digest::oracle(&source.readers.get()).unwrap(),
+            expected
+        );
+        // Registry rebuilds and restart retain the repair meaning after receipts were trimmed.
+        source
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value='old-registry' WHERE key='projection_digest_registry'",
+                [],
+            )
+            .unwrap();
+        drop(source);
+        let source = Store::open(&path, "alder").unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            projection_digest::oracle(&source.readers.get()).unwrap(),
+            expected
+        );
     }
 
     proptest! {

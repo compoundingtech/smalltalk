@@ -11,7 +11,9 @@ mod contract;
 pub mod conversation;
 pub mod demo;
 pub mod doc;
+mod glass;
 pub mod live;
+pub mod pane;
 pub mod screens;
 pub mod text;
 pub mod theme;
@@ -32,6 +34,7 @@ use crossterm::{
     },
 };
 use doc::{Doc, Hit};
+use pane::Pane;
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend, TestBackend},
@@ -144,6 +147,8 @@ pub enum Effect {
 
 /// An agent's live terminal screen, drawn in place of its conversation.
 pub(crate) struct TerminalView {
+    /// The agent whose terminal this is.
+    pub(crate) agent: String,
     /// The agent's name; the title adds the program's own title once a screen names it.
     pub(crate) name: String,
     pub(crate) title: String,
@@ -209,6 +214,8 @@ pub struct Ui {
     revoke: Option<String>,
     /// Home items put off until later. Demo only: kept in memory on this machine.
     snoozed: HashSet<String>,
+    /// `stui --glasses`: tabs of panes and a palette in place of the sidebar layout.
+    pub(crate) glass: Option<glass::Glass>,
 }
 
 impl Ui {
@@ -247,6 +254,7 @@ impl Ui {
             new_mission: None,
             revoke: None,
             snoozed: HashSet::new(),
+            glass: None,
         }
     }
 
@@ -280,7 +288,11 @@ impl Ui {
     }
 
     fn listing(&self, width: usize) -> Listing {
-        match self.tab {
+        self.listing_for(self.tab, width)
+    }
+
+    fn listing_for(&self, tab: usize, width: usize) -> Listing {
+        match tab {
             0 => screens::home_list(&self.world, &self.snoozed),
             1 if self.tree => screens::agents_tree(&self.world, self.spinner()),
             1 => screens::agents_list(&self.world, self.spinner(), width),
@@ -330,12 +342,38 @@ impl Ui {
             );
             return;
         }
-        self.top_bar(buf, Rect { height: 1, ..area });
-        let body = Rect {
-            y: area.y + 1,
-            height: area.height - 2,
-            ..area
-        };
+        if self.glass.is_some() {
+            self.render_glass(buf, area);
+        } else {
+            self.top_bar(buf, Rect { height: 1, ..area });
+            self.draw_body(
+                buf,
+                Rect {
+                    y: area.y + 1,
+                    height: area.height - 2,
+                    ..area
+                },
+            );
+            self.footer(
+                buf,
+                Rect {
+                    y: area.y + area.height - 1,
+                    height: 1,
+                    ..area
+                },
+            );
+        }
+        if let Some(subject) = &self.popover {
+            self.draw_popover(buf, area, subject);
+        }
+        if self.help {
+            self.draw_help(buf, area);
+        }
+    }
+
+    /// The sidebar and the main area under the top bar.
+    fn draw_body(&self, buf: &mut Buffer, body: Rect) {
+        let area = body;
         let side = if self.sidebar && area.width >= 70 {
             (area.width * 3 / 10).clamp(30, 46)
         } else {
@@ -346,7 +384,7 @@ impl Ui {
                 width: side,
                 ..body
             };
-            self.draw_sidebar(buf, sidebar);
+            self.draw_pane(buf, sidebar, &Pane::List(self.tab));
             for y in body.y..body.y + body.height {
                 buf[(area.x + side, y)]
                     .set_symbol("│")
@@ -361,20 +399,15 @@ impl Ui {
             ..body
         };
         self.draw_main(buf, main);
-        self.footer(
-            buf,
-            Rect {
-                y: area.y + area.height - 1,
-                height: 1,
-                ..area
-            },
-        );
-        if let Some(subject) = &self.popover {
-            self.draw_popover(buf, area, subject);
-        }
-        if self.help {
-            self.draw_help(buf, area);
-        }
+    }
+
+    /// One pane alone, filling the frame: how a glass will draw each of its panes.
+    fn render_pane(&self, frame: &mut ratatui::Frame<'_>, pane: &Pane) {
+        let area = frame.area();
+        let buf = frame.buffer_mut();
+        *self.frame.borrow_mut() = FrameInfo::default();
+        buf.set_style(area, Style::default().bg(theme::BASE).fg(theme::TEXT));
+        self.draw_pane(buf, area, pane);
     }
 
     fn hit(&self, rect: Rect, hit: Hit) {
@@ -549,7 +582,11 @@ impl Ui {
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
         } else {
-            let mut hints = vec![("1-4", "tabs"), ("↑↓", "select")];
+            let mut hints = match &self.glass {
+                Some(_) if !self.on_home() => vec![("ctrl+k", "open"), ("ctrl+w", "close")],
+                Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
+                None => vec![("1-4", "tabs"), ("↑↓", "select")],
+            };
             match self.tab {
                 0 => hints.extend([("keys", "on the card"), ("c", "write")]),
                 1 => hints.extend([
@@ -629,11 +666,12 @@ impl Ui {
         }
     }
 
-    fn draw_sidebar(&self, buf: &mut Buffer, area: Rect) {
+    /// A tab's list, as the sidebar draws it.
+    fn draw_list(&self, buf: &mut Buffer, area: Rect, tab: usize) {
         buf.set_style(area, Style::default().bg(theme::MANTLE));
         // One column for the frame edge and one kept free for the scrollbar.
         let width = area.width.saturating_sub(2) as usize;
-        let listing = self.listing(width);
+        let listing = self.listing_for(tab, width);
         let legend_height = if listing.legend.is_empty() {
             0
         } else {
@@ -706,7 +744,7 @@ impl Ui {
             ListState::Ready => {}
         }
         // Lay the items out as lines, remembering where the selected row sits.
-        let selected = self.selected[self.tab].min(listing.ids.len().saturating_sub(1));
+        let selected = self.selected[tab].min(listing.ids.len().saturating_sub(1));
         let mut rows: Vec<(Option<usize>, Line<'static>, bool)> = Vec::new();
         let mut selected_range = (0, 0);
         for item in &listing.items {
@@ -772,8 +810,8 @@ impl Ui {
             }
         }
         let height = list.height as usize;
-        let mut top = self.list_top.borrow()[self.tab];
-        let followed = self.list_follows.borrow()[self.tab];
+        let mut top = self.list_top.borrow()[tab];
+        let followed = self.list_follows.borrow()[tab];
         if followed != Some(selected) {
             if selected_range.1 > top + height {
                 top = selected_range.1 - height;
@@ -781,10 +819,10 @@ impl Ui {
             if selected_range.0 < top {
                 top = selected_range.0.saturating_sub(1);
             }
-            self.list_follows.borrow_mut()[self.tab] = Some(selected);
+            self.list_follows.borrow_mut()[tab] = Some(selected);
         }
         top = top.min(rows.len().saturating_sub(height));
-        self.list_top.borrow_mut()[self.tab] = top;
+        self.list_top.borrow_mut()[tab] = top;
         {
             let mut info = self.frame.borrow_mut();
             info.sidebar_lines = rows.len();
@@ -827,25 +865,27 @@ impl Ui {
     fn attention_focus(&self) -> Option<String> {
         match self.tab {
             0 => self.selected_id(),
-            2 => {
-                let id = self.selected_id()?;
-                self.world
-                    .missions
-                    .items()
-                    .iter()
-                    .find(|mission| mission.id == id)?
-                    .decision
-                    .clone()
-                    .filter(|decision| {
-                        self.world
-                            .attention
-                            .items()
-                            .iter()
-                            .any(|item| &item.id == decision)
-                    })
-            }
+            2 => self.mission_decision(&self.selected_id()?),
             _ => None,
         }
+    }
+
+    /// The open decision a mission is waiting on, when Home still has it.
+    fn mission_decision(&self, id: &str) -> Option<String> {
+        self.world
+            .missions
+            .items()
+            .iter()
+            .find(|mission| mission.id == id)?
+            .decision
+            .clone()
+            .filter(|decision| {
+                self.world
+                    .attention
+                    .items()
+                    .iter()
+                    .any(|item| &item.id == decision)
+            })
     }
 
     fn drafts_for(&self, key: &str, width: usize) -> Drafts<'_> {
@@ -887,76 +927,73 @@ impl Ui {
         }
     }
 
-    fn draw_main(&self, buf: &mut Buffer, area: Rect) {
-        let width = area.width.saturating_sub(1) as usize;
+    /// What the main area shows for the current tab and selection.
+    fn main_pane(&self) -> Pane {
         let id = self.selected_id();
         match self.tab {
-            0 => {
-                let key = id.clone().unwrap_or_default();
-                let drafts = self.drafts_for(&key, width);
-                let doc = screens::home_detail(&self.world, id.as_deref(), width, &drafts);
-                self.pane(buf, &format!("home:{key}"), area, doc, false);
+            0 => Pane::Home(id),
+            1 => match &self.terminal {
+                Some(view) => Pane::Terminal(view.agent.clone()),
+                None => Pane::Agent(id),
+            },
+            2 if self.new_mission.is_some() => Pane::NewMission,
+            2 if self.kdl => Pane::Declaration(id),
+            2 => Pane::Mission(id),
+            3 => Pane::Machine(id.map(|name| format!("machine/{name}"))),
+            _ => Pane::Worktree(id),
+        }
+    }
+
+    fn draw_main(&self, buf: &mut Buffer, area: Rect) {
+        self.draw_pane(buf, area, &self.main_pane());
+    }
+
+    /// Draw any pane into any rectangle: every screen stui has goes through here. A pane that
+    /// scrolls as one document keeps its scroll under the pane's own key.
+    fn draw_pane(&self, buf: &mut Buffer, area: Rect, pane: &Pane) {
+        let width = area.width.saturating_sub(1) as usize;
+        let doc = match pane {
+            Pane::List(tab) => return self.draw_list(buf, area, *tab),
+            Pane::Agent(id) => return self.draw_agent(buf, area, id.as_deref()),
+            Pane::Terminal(agent) => return self.draw_terminal(buf, area, agent),
+            Pane::Home(id) => {
+                let drafts = self.drafts_for(id.as_deref().unwrap_or_default(), width);
+                screens::home_detail(&self.world, id.as_deref(), width, &drafts)
             }
-            1 if self.terminal.is_some() => self.draw_terminal(buf, area),
-            1 => self.draw_agent(buf, area, id.as_deref()),
-            2 if self.new_mission.is_some() => {
-                let (fields, focus) = self.new_mission.as_ref().unwrap();
-                let doc = screens::new_mission_form(fields, *focus, width);
-                self.pane(buf, "new-mission", area, doc, false);
+            Pane::NewMission => {
+                let empty = Default::default();
+                let (fields, focus) = self.new_mission.as_ref().unwrap_or(&empty);
+                screens::new_mission_form(fields, *focus, width)
             }
-            2 if self.kdl => {
-                let doc = screens::mission_kdl(&self.world, id.as_deref(), width);
-                self.pane(
-                    buf,
-                    &format!("kdl:{}", id.unwrap_or_default()),
-                    area,
-                    doc,
-                    false,
-                );
-            }
-            2 => {
-                let decision = self.attention_focus().map(|decision| {
-                    let drafts = self.drafts_for(&decision, width);
-                    screens::home_detail(&self.world, Some(&decision), width, &drafts)
-                });
-                let doc = screens::mission_detail(
+            Pane::Declaration(id) => screens::mission_kdl(&self.world, id.as_deref(), width),
+            Pane::Mission(id) => {
+                let decision =
+                    id.as_deref()
+                        .and_then(|id| self.mission_decision(id))
+                        .map(|decision| {
+                            let drafts = self.drafts_for(&decision, width);
+                            screens::home_detail(&self.world, Some(&decision), width, &drafts)
+                        });
+                screens::mission_detail(
                     &self.world,
                     id.as_deref(),
                     width,
                     self.spinner(),
                     decision,
                     &self.expanded,
-                );
-                self.pane(
-                    buf,
-                    &format!("mission:{}", id.unwrap_or_default()),
-                    area,
-                    doc,
-                    false,
-                );
+                )
             }
-            3 => {
-                let doc = screens::fleet_detail(&self.world, id.as_deref(), width, self.spinner());
-                self.pane(
-                    buf,
-                    &format!("fleet:{}", id.unwrap_or_default()),
-                    area,
-                    doc,
-                    false,
-                );
+            Pane::Machine(id) => {
+                let name = id
+                    .as_deref()
+                    .map(|id| id.strip_prefix("machine/").unwrap_or(id));
+                screens::fleet_detail(&self.world, name, width, self.spinner())
             }
-            _ => {
-                let doc =
-                    screens::worktree_detail(&self.world, id.as_deref(), width, self.spinner());
-                self.pane(
-                    buf,
-                    &format!("tree:{}", id.unwrap_or_default()),
-                    area,
-                    doc,
-                    false,
-                );
+            Pane::Worktree(id) => {
+                screens::worktree_detail(&self.world, id.as_deref(), width, self.spinner())
             }
-        }
+        };
+        self.pane(buf, &pane.key(), area, doc, false);
     }
 
     fn draw_agent(&self, buf: &mut Buffer, area: Rect, id: Option<&str>) {
@@ -1289,8 +1326,17 @@ impl Ui {
         }
     }
 
-    fn draw_terminal(&self, buf: &mut Buffer, area: Rect) {
-        let Some(view) = &self.terminal else { return };
+    fn draw_terminal(&self, buf: &mut Buffer, area: Rect, agent: &str) {
+        let Some(view) = self.terminal.as_ref().filter(|view| view.agent == agent) else {
+            buf.set_stringn(
+                area.x,
+                area.y + 1,
+                " Not attached. Open the agent and press Enter to attach its terminal.",
+                area.width as usize,
+                theme::dim(),
+            );
+            return;
+        };
         let header = format!(" ← Return · Ctrl+\\   {}", view.title);
         buf.set_stringn(
             area.x,
@@ -1530,6 +1576,9 @@ impl Ui {
 
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if self.glass_key(key) {
             return;
         }
         // An attached terminal gets every key first, Ctrl-C included.
@@ -1889,6 +1938,7 @@ impl Ui {
             self.flash("Opening the terminal…");
         } else {
             self.terminal = Some(TerminalView {
+                agent: agent.id.clone(),
                 title: format!("{} · demo terminal", agent.name),
                 name: agent.name.clone(),
                 lines: demo::terminal(&agent.name),
@@ -2355,6 +2405,9 @@ impl Ui {
 
     fn click(&mut self, hit: Hit) {
         match hit {
+            Hit::Palette => self.open_palette(None),
+            Hit::GlassTab(index) => self.show_tab(index),
+            Hit::PaletteChoice(index) => self.open_choice(Some(index), false),
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
             Hit::Key(key) if self.popover.is_some() => {
@@ -2681,7 +2734,9 @@ fn copy(text: &str) {
 
 // ------------------------------------------------------------------------ run
 
-struct Guard;
+struct Guard {
+    enhanced: bool,
+}
 
 /// How many of a terminal's rows to skip so it fits the pane. A terminal taller than the pane
 /// shows its bottom, where the prompt usually is, unless that would hide the cursor; then the
@@ -2708,18 +2763,41 @@ fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
 }
 
 impl Guard {
-    fn enter() -> Result<Self> {
+    /// `keys`: ask the terminal to report modifiers it usually keeps, such as Cmd on macOS,
+    /// where it can (kitty's keyboard protocol). Only glasses ask, for Cmd+K.
+    fn enter(keys: bool) -> Result<Self> {
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-        Ok(Self)
+        let enhanced = keys && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        if enhanced {
+            execute!(
+                io::stdout(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            )?;
+        }
+        Ok(Self { enhanced })
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        if self.enhanced {
+            let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
+}
+
+/// The glass `stui --glasses` or `stui --glass NAME` asks for; plain stui asks for none.
+pub fn glass_name(args: &[String]) -> Option<String> {
+    arg(args, "--glass").or_else(|| {
+        args.iter()
+            .any(|arg| arg == "--glasses")
+            .then(|| "main".to_owned())
+    })
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -2734,10 +2812,12 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     if args.iter().any(|arg| arg == "--dump") {
         return dump(args);
     }
-    let _guard = Guard::enter()?;
+    let glass = glass_name(args);
+    let _guard = Guard::enter(glass.is_some())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let mut ui = Ui::new(demo::loading());
+    ui.glass = glass.map(glass::Glass::new);
     ui.demo = Some(Demo {
         started: Instant::now(),
         loaded: false,
@@ -2801,15 +2881,26 @@ fn dump(args: &[String]) -> Result<()> {
     } else {
         demo::world()
     });
+    ui.glass = glass_name(args).map(glass::Glass::new);
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
-    // Keys: each character is a key; "\n" is Enter, "<esc>", "<end>", "<pgdn>", "<pgup>", "<down>".
+    // Keys: each character is a key; "\n" is Enter, "<esc>", "<end>", "<pgdn>", "<pgup>", "<down>";
+    // "<c-k>" is Ctrl+K and "<a-1>" Alt+1.
     if let Some(keys) = arg(args, "--keys") {
         let mut rest = keys.as_str();
         while !rest.is_empty() {
             terminal.draw(|frame| ui.render(frame))?;
+            let mut modifiers = KeyModifiers::NONE;
             let (code, len) =
                 if let Some(end) = rest.strip_prefix('<').and_then(|tail| tail.find('>')) {
-                    let name = &rest[1..=end];
+                    let mut name = &rest[1..=end];
+                    for (prefix, modifier) in
+                        [("c-", KeyModifiers::CONTROL), ("a-", KeyModifiers::ALT)]
+                    {
+                        if let Some(key) = name.strip_prefix(prefix) {
+                            modifiers |= modifier;
+                            name = key;
+                        }
+                    }
                     let code = match name {
                         "esc" => KeyCode::Esc,
                         "end" => KeyCode::End,
@@ -2819,6 +2910,8 @@ fn dump(args: &[String]) -> Result<()> {
                         "up" => KeyCode::Up,
                         "enter" => KeyCode::Enter,
                         "tab" => KeyCode::Tab,
+                        "bs" => KeyCode::Backspace,
+                        _ if name.chars().count() == 1 => KeyCode::Char(name.chars().next().unwrap()),
                         _ => KeyCode::Null,
                     };
                     (code, end + 2)
@@ -2826,7 +2919,7 @@ fn dump(args: &[String]) -> Result<()> {
                     let character = rest.chars().next().unwrap_or(' ');
                     (KeyCode::Char(character), character.len_utf8())
                 };
-            ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+            ui.key(KeyEvent::new(code, modifiers));
             rest = &rest[len..];
         }
     }
@@ -2842,9 +2935,20 @@ fn dump(args: &[String]) -> Result<()> {
             });
         }
     }
-    terminal.draw(|frame| ui.render(frame))?;
+    // `--pane KEY` draws that one pane alone, at the given size.
+    let pane = match arg(args, "--pane") {
+        Some(key) => {
+            Some(Pane::parse(&key).ok_or_else(|| anyhow::anyhow!("no pane is called {key}"))?)
+        }
+        None => None,
+    };
     // Draw twice so panes that follow the end settle.
-    terminal.draw(|frame| ui.render(frame))?;
+    for _ in 0..2 {
+        terminal.draw(|frame| match &pane {
+            Some(pane) => ui.render_pane(frame, pane),
+            None => ui.render(frame),
+        })?;
+    }
     let buffer = terminal.backend().buffer();
     let mut out = String::new();
     for y in 0..buffer.area.height {
@@ -2909,6 +3013,90 @@ mod tests {
         let header = top(&world);
         assert!(header.contains("⚠ diverged"), "{header}");
         assert!(!header.contains("live"), "{header}");
+    }
+
+    #[test]
+    fn every_pane_draws_alone_from_its_key_at_any_size() {
+        let mut ui = Ui::new(demo::world());
+        let first = |tab: usize| {
+            ui.listing_for(tab, 40)
+                .ids
+                .first()
+                .cloned()
+                .expect("the demo has one")
+        };
+        let (home, agent, mission, machine) = (first(0), first(1), first(2), first(3));
+        let name = |id: &str| {
+            ui.world
+                .agents
+                .items()
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .map(|candidate| candidate.name.clone())
+                .unwrap()
+        };
+        let agent_name = name(&agent);
+        let mission_title = ui
+            .world
+            .missions
+            .items()
+            .iter()
+            .find(|candidate| candidate.id == mission)
+            .map(|candidate| candidate.title.clone())
+            .unwrap();
+        ui.terminal = Some(TerminalView {
+            agent: agent.clone(),
+            name: agent_name.clone(),
+            title: agent_name.clone(),
+            lines: vec![Line::from("$ ready")],
+            cursor: None,
+            stale: None,
+            ended: None,
+        });
+        for (key, shows) in [
+            ("list:missions".to_owned(), "needs you".to_owned()),
+            (format!("home:{home}"), String::new()),
+            (format!("agent:{agent}"), agent_name.clone()),
+            (format!("terminal:{agent}"), "$ ready".to_owned()),
+            (format!("mission:{mission}"), mission_title.clone()),
+            (format!("declaration:{mission}"), String::new()),
+            (format!("machine:machine/{machine}"), machine.clone()),
+            ("new-mission:".to_owned(), String::new()),
+        ] {
+            let pane = Pane::parse(&key).unwrap();
+            for (width, height) in [(44, 14), (120, 40)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| ui.render_pane(frame, &pane)).unwrap();
+                let screen = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(
+                    !screen.trim().is_empty(),
+                    "{key} drew nothing at {width}x{height}"
+                );
+                assert!(
+                    screen.contains(&shows),
+                    "{key} at {width}x{height} does not show {shows:?}"
+                );
+            }
+        }
+        // A terminal pane for an agent that is not attached says so.
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        terminal
+            .draw(|frame| ui.render_pane(frame, &Pane::Terminal("agent/example/nobody".into())))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Not attached"));
     }
 
     #[test]
@@ -3218,6 +3406,7 @@ mod tests {
         let mut ui = Ui::new(demo::world());
         ui.tab = 1;
         ui.terminal = Some(TerminalView {
+            agent: "agent/example/harbor/keeper".into(),
             name: "Keeper".into(),
             title: "Keeper · vim".into(),
             lines: (0..40)

@@ -4596,7 +4596,7 @@ fn claude_hooks_check(
         ));
     }
     let drivers = state.state_dir.join("drivers");
-    let host = st2::run::detect_host();
+    let host = st_drivers::run::detect_host();
     let mut bound = 0;
     for subject in &seats {
         let Some(observed) = state
