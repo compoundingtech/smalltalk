@@ -63,6 +63,14 @@ The shuffle fixture compares paged document answers and the existing person atte
 including unread messages, reminder selection and episode onset. Proposal lifecycle tests
 compare all shared rows and digests through creation, review, draining, cancellation and apply.
 
+Documents record a sortable encoding of the complete binding claim key at admission.
+`document_canonical_latest(name,binding_key DESC)` serves latest selection and history order;
+readers never sort a name's entire claim history for each returned version. Schema 15 backfills
+the keys once, choosing the earliest canonical binding for each repeated name/hash. The key is
+a shared derived column and is digested with the document row. The fleet-size regression builds
+260,000 claims and 10,000 document versions, then requires latest listings, history pages,
+lookup and cursor reads to finish within two seconds and verifies the indexed latest query plan.
+
 ## Projection digest coverage and cost
 
 `store/projection_digest.rs::TABLES` lists the shared tables: operations, blobs, documents,

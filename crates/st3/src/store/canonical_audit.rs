@@ -203,8 +203,10 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                 .iter()
                 .filter(|name| !local_columns.contains(&name.as_str()))
                 .map(|name| {
-                    if *table == "blobs" && name == "bytes" {
-                        "hex(bytes)".to_owned()
+                    if (*table == "blobs" && name == "bytes")
+                        || (*table == "documents" && name == "binding_key")
+                    {
+                        format!("hex({name})")
                     } else {
                         name.clone()
                     }

@@ -43,6 +43,7 @@ use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod canonical;
 mod checkpoint;
+mod document_index;
 mod projection_digest;
 use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 mod checkpoint_agreement;
@@ -222,6 +223,7 @@ CREATE TABLE IF NOT EXISTS documents (
     hash TEXT NOT NULL REFERENCES blobs(hash),
     created_index INTEGER NOT NULL,
     binding_claim_id TEXT NOT NULL DEFAULT '',
+    binding_key BLOB NOT NULL DEFAULT x'',
     PRIMARY KEY(name, hash)
 );
 CREATE INDEX IF NOT EXISTS document_latest ON documents(name, created_index DESC);
@@ -697,7 +699,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
 ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
-PRAGMA user_version = 14;
+PRAGMA user_version = 15;
 "#;
 
 /// The writer connection's clock offset. Only a simulation sets it; see `write_time`.
@@ -2205,11 +2207,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=14),
+        table_count == 0 || matches!(version, 10..=15),
         "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12 | 13 | 14),
+        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15),
         "this database uses unsupported st schema version {version}"
     );
     Ok(())
@@ -2217,7 +2219,7 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0 || version == 13 || version == 14 {
+    if version == 0 || version == 13 || version == 14 || version == 15 {
         return Ok(());
     }
     if version == 12 {
@@ -2693,6 +2695,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        document_index::initialize(&connection)?;
         backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
@@ -2769,6 +2772,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        document_index::initialize(&connection)?;
         backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
@@ -7581,7 +7585,7 @@ impl Store {
             }
             let latest: Option<String> = connection
                 .query_row(
-                    &canonical_sql("SELECT documents.hash FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name = ?1 AND documents.created_index<=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                    &canonical_sql("SELECT documents.hash FROM documents WHERE documents.name = ?1 AND documents.created_index<=?2 ORDER BY binding_key DESC LIMIT 1"),
                     params![name, store_index],
                     |row| row.get(0),
                 )
@@ -8846,7 +8850,7 @@ impl Store {
                 }
                 let current: Option<String> = transaction
                     .query_row(
-                        &canonical_sql("SELECT documents.binding_claim_id FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                        &canonical_sql("SELECT documents.binding_claim_id FROM documents WHERE documents.name=?1 ORDER BY binding_key DESC LIMIT 1"),
                         [name],
                         |row| row.get(0),
                     )
@@ -8879,12 +8883,7 @@ impl Store {
                     None,
                 )
                 .map_err(internal)?;
-                transaction
-                    .execute(
-                        "INSERT INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
-                        params![name, hash, record.store_index, record.id],
-                    )
-                    .map_err(internal)?;
+                select_replicated_document(transaction, &record, record.store_index)?;
                 let version = DocumentVersion {
                     name: name.into(),
                     hash,
@@ -8939,26 +8938,22 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<DocumentVersion>> {
         let connection = self.readers.get();
-        let latest_order = canonical::order_sql("newer", true);
-        let version_order = canonical::order_sql("c", true);
-        let cursor_after = canonical::after_sql("cursor_claim", "c");
-        let query = format!("SELECT d.name, d.hash, b.size, d.created_index,
-                     d.hash=(SELECT n.hash FROM documents n JOIN claims newer ON newer.id=n.binding_claim_id
-                 WHERE n.name=d.name ORDER BY {latest_order} LIMIT 1)
+        let query = "SELECT d.name, d.hash, b.size, d.created_index,
+                     d.hash=(SELECT n.hash FROM documents n
+                 WHERE n.name=d.name ORDER BY n.binding_key DESC LIMIT 1)
                      ,d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
                      FROM documents d JOIN blobs b ON b.hash=d.hash
                      JOIN claims c ON c.id=d.binding_claim_id
                      WHERE (?1 IS NULL OR d.name=?1)
-                       AND (?2 OR d.hash=(SELECT n.hash FROM documents n JOIN claims newer ON newer.id=n.binding_claim_id
-                 WHERE n.name=d.name ORDER BY {latest_order} LIMIT 1))
+                       AND (?2 OR d.hash=(SELECT n.hash FROM documents n
+                 WHERE n.name=d.name ORDER BY n.binding_key DESC LIMIT 1))
                        AND (?3 IS NULL OR substr(d.name,1,length(?3))=?3)
                        AND (?4 IS NULL OR d.name>?4 OR (d.name=?4 AND EXISTS (
-                           SELECT 1 FROM documents cursor_document JOIN claims cursor_claim
-                             ON cursor_claim.id=cursor_document.binding_claim_id
+                           SELECT 1 FROM documents cursor_document
                            WHERE cursor_document.name=?4 AND cursor_document.created_index=?5
-                             AND {cursor_after})))
-                     ORDER BY d.name, {version_order} LIMIT ?6");
-        let mut statement = connection.prepare(&query)?;
+                             AND cursor_document.binding_key>d.binding_key)))
+                     ORDER BY d.name, d.binding_key DESC LIMIT ?6";
+        let mut statement = connection.prepare(query)?;
         let rows = statement.query_map(
             params![
                 name,
@@ -13596,7 +13591,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                &canonical_sql("SELECT documents.hash FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                &canonical_sql("SELECT documents.hash FROM documents WHERE documents.name=?1 ORDER BY binding_key DESC LIMIT 1"),
                 [name],
                 |row| row.get(0),
             )
@@ -13626,7 +13621,7 @@ impl Store {
         {
             if let Some(hash) = connection
                 .query_row(
-                    &canonical_sql("SELECT documents.hash FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 AND documents.created_index<=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                    &canonical_sql("SELECT documents.hash FROM documents WHERE documents.name=?1 AND documents.created_index<=?2 ORDER BY binding_key DESC LIMIT 1"),
                     params![reference, selected],
                     |row| row.get(0),
                 )
@@ -13642,7 +13637,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                &canonical_sql("SELECT documents.binding_claim_id FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                &canonical_sql("SELECT documents.binding_claim_id FROM documents WHERE documents.name=?1 ORDER BY binding_key DESC LIMIT 1"),
                 [name],
                 |row| row.get(0),
             )
@@ -17632,18 +17627,15 @@ fn find_document(
     name: &str,
     hash: &str,
 ) -> Result<Option<DocumentVersion>> {
-    let latest_order = canonical::order_sql("newer", true);
     connection
         .query_row(
-            &format!(
-                "SELECT d.name, d.hash, b.size, d.created_index,
-             d.hash=(SELECT n.hash FROM documents n JOIN claims newer ON newer.id=n.binding_claim_id
-                 WHERE n.name=d.name ORDER BY {latest_order} LIMIT 1),
+            "SELECT d.name, d.hash, b.size, d.created_index,
+             d.hash=(SELECT n.hash FROM documents n
+                 WHERE n.name=d.name ORDER BY n.binding_key DESC LIMIT 1),
              d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
              FROM documents d JOIN blobs b ON b.hash=d.hash
              JOIN claims c ON c.id=d.binding_claim_id
-             WHERE d.name=?1 AND d.hash=?2"
-            ),
+             WHERE d.name=?1 AND d.hash=?2",
             params![name, hash],
             |row| {
                 Ok(DocumentVersion {
@@ -28859,6 +28851,8 @@ fn select_replicated_document(
             )
         })?;
     validate_document_name(name)?;
+    let binding_key =
+        canonical::sortable_key(&canonical::claim_key(transaction, &claim.id).map_err(internal)?);
     let previous: Option<String> = transaction
         .query_row(
             "SELECT binding_claim_id FROM documents WHERE name=?1 AND hash=?2",
@@ -28873,8 +28867,8 @@ fn select_replicated_document(
         {
             transaction
                 .execute(
-                    "UPDATE documents SET binding_claim_id=?3 WHERE name=?1 AND hash=?2",
-                    params![name, hash, claim.id],
+                    "UPDATE documents SET binding_claim_id=?3,binding_key=?4 WHERE name=?1 AND hash=?2",
+                    params![name, hash, claim.id, binding_key],
                 )
                 .map_err(internal)?;
         }
@@ -28882,8 +28876,8 @@ fn select_replicated_document(
     }
     transaction
         .execute(
-            "INSERT OR IGNORE INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
-            params![name, hash, created_index, claim.id],
+            "INSERT OR IGNORE INTO documents(name, hash, created_index, binding_claim_id, binding_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, hash, created_index, claim.id, binding_key],
         )
         .map_err(internal)?;
     Ok(())
@@ -39928,7 +39922,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            14
+            15
         );
         assert_eq!(
             connection
@@ -40002,7 +39996,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            14
+            15
         );
     }
 
@@ -40035,7 +40029,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         assert_eq!(planner_column, 1);
     }
 

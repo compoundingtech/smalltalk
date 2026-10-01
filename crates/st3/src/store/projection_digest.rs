@@ -120,7 +120,7 @@ fn row_sql(columns: &[String], prefix: &str) -> String {
         .iter()
         .map(|column| {
             // SQLite JSON does not accept blobs; their complete bytes are shared data.
-            if column == "bytes" {
+            if matches!(column.as_str(), "bytes" | "binding_key") {
                 format!("hex({prefix}{column})")
             } else {
                 format!("{prefix}{column}")
