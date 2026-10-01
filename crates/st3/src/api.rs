@@ -419,6 +419,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/intent/mission", post(mission))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
+        .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/missions/{id}", get(get_mission))
         .route("/v1/missions/{id}/retire", post(retire_mission))
         .route("/v1/launches/{id}", get(get_planning_session))
@@ -4329,6 +4330,7 @@ async fn guard_bound_request(
         "/v1/intent/apply",
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
+        "/v1/agents/restart",
         "/v1/delivery/hold",
         "/v1/lane-changes",
         "/v1/work/",
@@ -7793,6 +7795,109 @@ async fn publication_refusals(
         })
     })
     .await
+}
+
+#[derive(Deserialize)]
+struct AgentRestartRequest {
+    subject: String,
+    actor: String,
+    idempotency_key: String,
+}
+
+async fn restart_agent(
+    State(state): State<AppState>,
+    Json(request): Json<AgentRestartRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "invalid-restart-actor")?;
+    let subject = if request.subject.starts_with("agent/") {
+        request.subject
+    } else {
+        format!("agent/{}", request.subject)
+    };
+    let key = format!("agent-restart:{subject}:{}", request.idempotency_key);
+    if let Some(prior) = state
+        .store
+        .operation_claim(&key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(Json(prior));
+    }
+    let status = state
+        .store
+        .status(Some(&subject))
+        .map_err(ApiError::internal)?;
+    let current = status
+        .subjects
+        .iter()
+        .find(|item| item.subject == subject)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-agent",
+                format!("no seat `{subject}`"),
+            ))
+        })?;
+    if !current.conflicts.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "restart-conflict",
+            "resolve the seat's conflicting declarations before restarting",
+        )));
+    }
+    let desired = state
+        .store
+        .desired_subject_with_writer(&subject)
+        .map_err(ApiError::internal)?
+        .map(|(desired, _)| desired)
+        .filter(|desired| desired.kind == "agent")
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "restart-not-declared",
+                "restart needs an active seat declaration; start a stopped seat first",
+            ))
+        })?;
+    let member = desired
+        .member
+        .as_ref()
+        .filter(|member| member.lifecycle == crate::model::MemberLifecycle::Service)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "restart-no-launch",
+                "the seat has no readable service launch declaration",
+            ))
+        })?;
+    let token = current.desired_token.clone().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "restart-not-declared",
+            "the seat has no selected declaration",
+        ))
+    })?;
+    let incarnation = current
+        .actual
+        .as_ref()
+        .map(|actual| actual.get("fields").unwrap_or(actual))
+        .and_then(|fields| fields.get("incarnation_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let claim = state
+        .store
+        .append_claim(&ClaimInput {
+            subject,
+            kind: "runtime.action.requested".into(),
+            actor: Some(actor),
+            fields: BTreeMap::from([
+                ("action".into(), Value::String("restart".into())),
+                (
+                    "runtime_id".into(),
+                    Value::String(member.runtime_id.clone()),
+                ),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]),
+            evidence: vec![token],
+            expected_subject: None,
+            idempotency_key: Some(key),
+        })
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(claim))
 }
 
 #[derive(Deserialize)]
@@ -11618,6 +11723,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         for path in [
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
+            "/v1/agents/restart",
             "/v1/work/revision/approve/proposal",
             "/v1/mission-runs/example%2Fdemo%2F1/outcome",
             "/v1/mission-runs/example%2Fdemo%2F1/revision",

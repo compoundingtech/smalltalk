@@ -2364,6 +2364,8 @@ enum AgentsCommand {
     Start(AgentStartArgs),
     /// Stop one exact durable seat.
     Stop(AgentStopArgs),
+    /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
+    Restart(AgentRestartArgs),
     /// Change only a seat's human label, without restarting its harness.
     Rename(AgentRenameArgs),
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
@@ -2631,6 +2633,18 @@ struct AgentStopArgs {
     /// Print the exact stop KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+}
+
+#[derive(Args)]
+struct AgentRestartArgs {
+    /// Exact seat subject or its identity without the `agent/` prefix.
+    #[arg(value_parser = parse_agent_start_identity)]
+    subject: String,
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+    /// How long to wait for a new running incarnation.
+    #[arg(long, default_value = "10m")]
+    timeout: String,
 }
 
 #[derive(Args)]
@@ -3493,6 +3507,7 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Apply(args) => Some(args.actor.as_str()),
             AgentsCommand::Start(args) => Some(args.actor.as_str()),
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
+            AgentsCommand::Restart(args) => Some(args.actor.as_str()),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness delivery hold needs explicit --as {own}")
             })?),
@@ -8717,6 +8732,113 @@ async fn run_agents(
             }
             Ok(())
         }
+        AgentsCommand::Restart(args) => {
+            let timeout = st3::graph::parse_duration(&args.timeout, false)?;
+            let subject = format!("agent/{}", args.subject);
+            let client = cli_client(endpoint);
+            let request: ClaimRecord = client
+                .post(
+                    "/v1/agents/restart",
+                    &json!({
+                        "subject": subject,
+                        "actor": args.actor,
+                        "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                    }),
+                )
+                .await?;
+            let previous = request.body["fields"]["incarnation_id"]
+                .as_str()
+                .unwrap_or("");
+            let gateway = generated_client(endpoint, None)?;
+            let wait = async {
+                let mut cursor = request.store_index;
+                loop {
+                    let status = status_for(&client, &subject).await?;
+                    let current = status
+                        .subjects
+                        .iter()
+                        .find(|item| item.subject == subject)
+                        .context("the seat disappeared during restart")?;
+                    anyhow::ensure!(
+                        current.conflicts.is_empty()
+                            && current.desired_token.as_deref()
+                                == request.body.pointer("/evidence/0").and_then(Value::as_str),
+                        "`{subject}` declaration changed during restart; inspect it with `st agents show {subject}`"
+                    );
+                    let response = gateway.agents_get(&subject).await?;
+                    if let ClientResource::Agent(agent) = response.value {
+                        if agent.state == "running"
+                            && agent
+                                .incarnation_id
+                                .as_deref()
+                                .is_some_and(|incarnation| incarnation != previous)
+                        {
+                            return Ok::<_, anyhow::Error>(agent);
+                        }
+                        if matches!(agent.state.as_str(), "failed" | "stopped")
+                            && agent
+                                .incarnation_id
+                                .as_deref()
+                                .is_some_and(|incarnation| incarnation != previous)
+                        {
+                            anyhow::bail!(
+                                "`{subject}` replacement is {}: {}; inspect it with `st agents show {subject}`",
+                                agent.state,
+                                agent
+                                    .fault
+                                    .as_deref()
+                                    .or(agent.harness_state.as_deref())
+                                    .unwrap_or("the replacement exited before becoming ready")
+                            );
+                        }
+                        if let Some(fault) = agent.fault.as_deref() {
+                            anyhow::bail!("`{subject}` could not restart: {fault}");
+                        }
+                        if agent.state == "waiting"
+                            && agent
+                                .incarnation_id
+                                .as_deref()
+                                .is_some_and(|incarnation| incarnation != previous)
+                        {
+                            anyhow::bail!(
+                                "`{subject}` restarted and is waiting for your input; attach with `st terminals attach {subject}`"
+                            );
+                        }
+                    }
+                    let events: Vec<EventRecord> = client
+                        .get(&format!(
+                            "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=1000",
+                            urlencoding::encode(&subject),
+                        ))
+                        .await?;
+                    for event in events {
+                        let fields = event.body.get("fields").unwrap_or(&event.body);
+                        if event.kind == "runtime.reconcile-decision"
+                            && matches!(fields["decision"].as_str(), Some("member-fault" | "raise"))
+                        {
+                            anyhow::bail!(
+                                "`{subject}` could not restart: {}; inspect it with `st agents show {subject}`",
+                                fields["reason"]
+                                    .as_str()
+                                    .unwrap_or("the runtime could not restart")
+                            );
+                        }
+                        cursor = cursor.max(event.store_index);
+                    }
+                }
+            };
+            let agent = tokio::time::timeout(Duration::from_millis(timeout), wait).await
+                .with_context(|| format!("`{subject}` did not reach a new running incarnation within {}; inspect it with `st agents show {subject}`", args.timeout))??;
+            if json_output {
+                print_value(&agent, true)
+            } else {
+                println!(
+                    "Restarted {subject}: running on incarnation {}",
+                    agent.incarnation_id.as_deref().unwrap_or("")
+                );
+                Ok(())
+            }
+        }
         AgentsCommand::Stop(args) => {
             let subject = normalize_member_subject(&args.subject, "agent");
             let kdl = publication_document(kdl_node("stop", [subject.as_str()]));
@@ -9299,6 +9421,7 @@ async fn run_agent_inspection(
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
+        | AgentsCommand::Restart(_)
         | AgentsCommand::Rename(_)
         | AgentsCommand::Queue(_)
         | AgentsCommand::Hold(_) => {

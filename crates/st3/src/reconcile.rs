@@ -1463,6 +1463,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 } else {
                     self.runtime.observe_exec(&member.runtime_id)?
                 };
+                if self.reconcile_requested_restart(
+                    subject,
+                    member,
+                    observed.as_ref(),
+                    blocked.as_ref(),
+                )? {
+                    return Ok(());
+                }
                 match observed {
                     Some(observation) if observation.status == "running" => {
                         self.record_member(subject, &observation, true)?;
@@ -3376,6 +3384,119 @@ impl<R: RuntimeControl> Reconciler<R> {
         )?;
         self.signal_changed();
         Ok(())
+    }
+
+    /// A requester-authored action replicates to the runtime owner. The declaration and old
+    /// incarnation fence it, so a delayed request cannot stop a replacement or revive a stop.
+    fn reconcile_requested_restart(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: Option<&RuntimeObservation>,
+        blocked: Option<&anyhow::Error>,
+    ) -> Result<bool> {
+        if subject.kind != "agent" {
+            return Ok(false);
+        }
+        let Some(request) = self
+            .store
+            .claims_for(&subject.subject, Some("runtime.action.requested"))?
+            .into_iter()
+            .rev()
+            .find(|claim| {
+                claim.actor.is_some()
+                    && claim.body.pointer("/fields/action").and_then(Value::as_str)
+                        == Some("restart")
+            })
+        else {
+            return Ok(false);
+        };
+        if self
+            .store
+            .selected_desired_token(&subject.subject)?
+            .as_deref()
+            != request.body.pointer("/evidence/0").and_then(Value::as_str)
+        {
+            return Ok(false);
+        }
+        let completion = format!("agent-restart-completed:{}", request.id);
+        if self.store.operation_claim(&completion)?.is_some() {
+            return Ok(false);
+        }
+        let previous = request.body["fields"]["incarnation_id"]
+            .as_str()
+            .unwrap_or("");
+        if let Some(observation) = observation
+            && observation.status != "unknown"
+            && observation
+                .incarnation_id
+                .as_deref()
+                .is_some_and(|value| value != previous)
+        {
+            self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.action.succeeded".into(),
+                actor: request.actor.clone(),
+                fields: BTreeMap::from([
+                    ("action".into(), Value::String("restart".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String(observation.incarnation_id.clone().unwrap()),
+                    ),
+                ]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some(completion),
+            })?;
+            self.signal_changed();
+            return Ok(false);
+        }
+        if let Some(observation) = observation.filter(|item| item.status == "running") {
+            // Rendering must succeed before we shut down a still-running seat.
+            if let Some(error) = blocked {
+                anyhow::bail!("restart blocked: {error:#}");
+            }
+            self.record_member(subject, observation, true)?;
+            self.reconcile_runtime_stop(
+                &subject.subject,
+                &member.runtime_id,
+                member.terminal,
+                observation.incarnation_id.as_deref(),
+                member.shutdown_timeout_ms,
+                Some(observation),
+            )?;
+            return Ok(true);
+        }
+        if observation
+            .is_some_and(|item| !matches!(item.status.as_str(), "exited" | "vanished" | "stopped"))
+        {
+            return Ok(true);
+        }
+        if let Some(error) = blocked {
+            anyhow::bail!("restart blocked: {error:#}");
+        }
+        let before = self
+            .store
+            .latest_observation(&subject.subject, "runtime.action.succeeded")?
+            .map(|claim| claim.id);
+        self.perform_start(subject, member, "an explicit seat restart was requested")?;
+        let after = self
+            .store
+            .latest_observation(&subject.subject, "runtime.action.succeeded")?
+            .map(|claim| claim.id);
+        if after != before {
+            self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.action.succeeded".into(),
+                actor: request.actor.clone(),
+                fields: BTreeMap::from([("action".into(), Value::String("restart".into()))]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some(completion),
+            })?;
+            self.signal_changed();
+        }
+        Ok(true)
     }
 
     fn reconcile_restart(
