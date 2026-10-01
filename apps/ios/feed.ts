@@ -67,7 +67,7 @@ export class Feed {
   private stream: CollectionStream | undefined;
   private windows: Partial<Record<FeedWindow, CollectionWindow>> = {};
   private terminal: TerminalFollow | undefined;
-  private conversation: { target: string; handlers: ConversationHandlers } | undefined;
+  private conversation: { target: string; handlers: ConversationHandlers; failures: number; timer?: ReturnType<typeof setTimeout> } | undefined;
   private glasses: { handlers: GlassesHandlers; window?: CollectionWindow } | undefined;
   private readonly unsubscribe: () => void;
   private readonly client: Client;
@@ -115,10 +115,11 @@ export class Feed {
 
   /** Follow the conversation of an agent or a session; a second call replaces the first. */
   followConversation(target: string, handlers: ConversationHandlers): Follow {
-    const follow = { target, handlers };
+    clearTimeout(this.conversation?.timer);
+    const follow: NonNullable<Feed['conversation']> = { target, handlers, failures: 0 };
     this.conversation = follow;
     this.stream?.subscribeConversation(CONVERSATION, target);
-    return { close: () => { if (this.conversation !== follow) return; this.conversation = undefined; this.stream?.unsubscribe(CONVERSATION); } };
+    return { close: () => { if (this.conversation !== follow) return; clearTimeout(follow.timer); this.conversation = undefined; this.stream?.unsubscribe(CONVERSATION); } };
   }
 
   /** Follow the person's glasses (st keeps at most 100 live); a second call replaces the first. */
@@ -206,12 +207,23 @@ export class Feed {
       if (id === TERMINAL) this.terminal?.screen(frame.value);
     } else if (frame.kind === 'conversation') {
       if (id === CONVERSATION && this.conversation) {
+        this.conversation.failures = 0;
         this.conversation.handlers.onIssue('');
         this.conversation.handlers.onEntries({ replace: frame.replace, items: frame.items, hasMore: !!frame.has_more });
       }
     } else if (frame.kind === 'error') {
       if (id === TERMINAL) this.terminal?.failed(frame.code, frame.message);
-      else if (id === CONVERSATION) this.conversation?.handlers.onIssue(frame.code ? `${frame.code}: ${frame.message}` : frame.message);
+      else if (id === CONVERSATION && this.conversation) {
+        // The subscription ended. Whatever stopped it may clear (a busy store moved under the
+        // page, the agent's host came back): ask again after a backoff, as stui does.
+        const follow = this.conversation;
+        const delay = this.retryDelaysMs[Math.min(follow.failures, this.retryDelaysMs.length - 1)];
+        follow.failures++;
+        clearTimeout(follow.timer);
+        follow.timer = setTimeout(() => { if (this.conversation === follow) this.stream?.subscribeConversation(CONVERSATION, follow.target); }, delay);
+        // A page that expired under a busy store is routine; say so only if it keeps happening.
+        if (frame.code !== 'page-cursor-expired' || follow.failures > 2) follow.handlers.onIssue(`${frame.code ? `${frame.code}: ${frame.message}` : frame.message} · trying again`);
+      }
       else if (id === GLASSES) this.glasses?.handlers.onIssue(frame.code ? `${frame.code}: ${frame.message}` : frame.message);
       else if (id && id in FEED_WINDOWS) this.handlers.onWindowError?.(id as FeedWindow, frame.message);
     }
