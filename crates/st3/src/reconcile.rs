@@ -18,11 +18,11 @@ use crate::mission::{
     CANDIDATE_INDEX_INPUT, LOOP_FEEDBACK_INPUT, LOOP_ITEM_INPUT, LOOP_ROUND_INPUT,
 };
 use crate::model::{
-    AttentionRequest, ClaimInput, CurrentHarnessView, DependencySpec, DesiredSubject, GateContext,
-    GateSpec, LaunchSpec, LoopCandidateSelector, LoopExhaustionSpec, LoopSpec, MemberKind,
-    MemberLifecycle, MemberSpec, MessageView, MetricSource, MissionInputKind, MissionRunRequest,
-    MissionRunView, MissionSpec, MissionState, RestartIntensity, RestartType, StepRunView,
-    StepSpec, SubscriptionSpec, UsedMissionSpec, WorkSelector, CalendarSchedule,
+    AttentionRequest, CalendarSchedule, ClaimInput, CurrentHarnessView, DependencySpec,
+    DesiredSubject, GateContext, GateSpec, LaunchSpec, LoopCandidateSelector, LoopExhaustionSpec,
+    LoopSpec, MemberKind, MemberLifecycle, MemberSpec, MessageView, MetricSource, MissionInputKind,
+    MissionRunRequest, MissionRunView, MissionSpec, MissionState, RestartIntensity, RestartType,
+    StepRunView, StepSpec, SubscriptionSpec, UsedMissionSpec, WorkSelector,
 };
 use crate::resource::{
     ObservationRequest, ProviderForbidden, ProviderRateLimit, ProviderUnauthenticated,
@@ -865,7 +865,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let title = format!("Disk space is low on {}", self.host);
         let pending = self
             .store
-            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .pending_operational_failures(RECONCILER_ACTOR, &self.host)?
             .into_iter()
             .filter(|request| request.title == title && request.targets == [daemon.as_str()])
             .collect::<Vec<_>>();
@@ -882,7 +882,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             if pending.is_empty() && !check.1 {
                 let key = format!("disk-low:{}:{}", self.host, self.store.index()?);
                 let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-                self.store.request_attention(
+                self.store.record_operational_failure(
                     &format!("attention/{}", &digest[..32]),
                     &AttentionRequest {
                         reviewer: "person/operator".into(),
@@ -907,7 +907,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         for request in pending {
-            self.store.resolve_attention_automatically(
+            self.store.recover_operational_failure(
                 &request.subject,
                 "every filesystem this daemon writes to has 4 GiB and 4% free again",
                 &format!("disk-recovered:{}", request.request),
@@ -927,7 +927,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let daemon = format!("daemon/{}", self.host);
         if self
             .store
-            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .pending_operational_failures(RECONCILER_ACTOR, &self.host)?
             .iter()
             .any(|request| {
                 request.title == RECONCILER_FAILING_TITLE && request.targets == [daemon.as_str()]
@@ -937,7 +937,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let key = format!("reconciler-failing:{}:{}", self.host, now_ms());
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        self.store.request_attention(
+        self.store.record_operational_failure(
             &format!("attention/{}", &digest[..32]),
             &AttentionRequest {
                 reviewer: "person/operator".into(),
@@ -959,10 +959,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         let daemon = format!("daemon/{}", self.host);
         for request in self
             .store
-            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .pending_operational_failures(RECONCILER_ACTOR, &self.host)?
         {
             if request.title == RECONCILER_FAILING_TITLE && request.targets == [daemon.as_str()] {
-                self.store.resolve_attention_automatically(
+                self.store.recover_operational_failure(
                     &request.subject,
                     "a reconcile pass succeeded",
                     &format!("reconciler-recovered:{}", request.request),
@@ -1023,13 +1023,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let key = (subject.to_owned(), scope.to_owned());
                 if open.get(&key) == Some(&reason) {
                     drop(faults);
-                    return self.request_fault_attention(subject, scope);
+                    return Ok(());
                 }
-                let replaced = open.contains_key(&key);
                 drop(faults);
-                if replaced {
-                    self.resolve_fault_attention(subject, scope, "its cause changed")?;
-                }
                 self.append_fault(subject, scope, "faulted", &reason)?;
                 self.open_faults()?
                     .get_or_insert_with(BTreeMap::new)
@@ -1049,69 +1045,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
-        self.resolve_fault_attention(subject, scope, reason)?;
         self.append_fault(subject, scope, "recovered", reason)?;
         self.open_faults()?
             .get_or_insert_with(BTreeMap::new)
             .remove(&key);
-        Ok(())
-    }
-
-    /// Raise the attention item of the open fault on `subject` in `scope` once it has lasted
-    /// long enough that st's own retries did not clear it.
-    fn request_fault_attention(&self, subject: &str, scope: &str) -> Result<()> {
-        let Some(fault) = self.store.open_reconcile_fault_claim(subject, scope)? else {
-            return Ok(());
-        };
-        if now_ms().saturating_sub(fault.accepted_at_unix_ms) < FAULT_ATTENTION_AFTER_MS {
-            return Ok(());
-        }
-        let attention = fault_attention_subject(&fault.id);
-        if self.store.attention_request(&attention)?.is_some() {
-            return Ok(());
-        }
-        let reason = fault
-            .body
-            .pointer("/fields/reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        self.store.request_attention(
-            &attention,
-            &AttentionRequest {
-                reviewer: "person/operator".into(),
-                title: format!("st cannot reconcile {subject}"),
-                reason: format!(
-                    "{scope} for {subject} on {} keeps failing: {reason}. st retries it on every pass. Inspect it with `st subject {subject}`; `st doctor` checks the host. This item closes when it reconciles.",
-                    self.host
-                ),
-                severity: "error".into(),
-                targets: vec![subject.into()],
-                actor: RECONCILER_ACTOR.into(),
-                idempotency_key: format!("reconcile-fault-attention:{}", fault.id),
-            },
-        )?;
-        self.signal_changed();
-        Ok(())
-    }
-
-    /// Close the attention item of the open fault on `subject` in `scope`, if it raised one.
-    fn resolve_fault_attention(&self, subject: &str, scope: &str, reason: &str) -> Result<()> {
-        let Some(fault) = self.store.open_reconcile_fault_claim(subject, scope)? else {
-            return Ok(());
-        };
-        let attention = fault_attention_subject(&fault.id);
-        if self
-            .store
-            .attention_request(&attention)?
-            .is_some_and(|request| request.status == "pending")
-        {
-            self.store.resolve_attention_automatically(
-                &attention,
-                &format!("{scope} for {subject}: {reason}"),
-                &format!("reconcile-fault-closed:{}", fault.id),
-            )?;
-            self.signal_changed();
-        }
         Ok(())
     }
 
@@ -1238,44 +1175,8 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     /// A request that declared `until` closes on its own once every target meets that `trace
-    /// wait` condition, and one tied to a step closes once that step ends. The host that accepted
+    /// Person asks are runtime dependencies fenced by their owning work. The host that accepted
     /// the request evaluates it, so it closes once.
-    fn resolve_attention_whose_until_holds(&self) -> Result<()> {
-        for request in self
-            .store
-            .pending_attention_closed_by_condition(&self.host)?
-        {
-            if let Some(ended) = self.store.attention_step_ended(&request)? {
-                self.store.resolve_attention_automatically(
-                    &request.subject,
-                    &format!("the step that raised it ended: {ended}"),
-                    &format!("{}:step", request.request),
-                )?;
-                self.signal_changed();
-                continue;
-            }
-            let Some(until) = request.until.as_deref() else {
-                continue;
-            };
-            let mut holds = !request.targets.is_empty();
-            for target in &request.targets {
-                let status = self.store.status_at(Some(target), None, None)?;
-                if !crate::model::status_wait_condition_holds(until, status.subjects.first()) {
-                    holds = false;
-                    break;
-                }
-            }
-            if holds {
-                self.store.resolve_attention_automatically(
-                    &request.subject,
-                    &format!("every target is {until}"),
-                    &format!("{}:until", request.request),
-                )?;
-                self.signal_changed();
-            }
-        }
-        Ok(())
-    }
 
     fn next_provider_capacity_retry_deadline(&self) -> Result<Option<u128>> {
         let mut deadline = None;
@@ -1741,8 +1642,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.isolate("stage/provider-capacity-retries", &daemon, || {
             self.reconcile_provider_capacity_retries(&desired)
         });
-        self.isolate("stage/retired-agent-attention", &daemon, || {
-            self.resolve_attention_for_retired_agents(&desired)
+        self.isolate("stage/person-asks", &daemon, || {
+            self.store.reconcile_person_asks()
         });
         self.isolate("stage/disk-space", &daemon, || {
             self.reconcile_disk_space(&desired)
@@ -1753,9 +1654,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .clear();
         self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
         self.release_unused_file_watchers();
-        self.isolate("stage/attention-until", &daemon, || {
-            self.resolve_attention_whose_until_holds()
-        });
+
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
@@ -2062,7 +1961,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .and_then(Value::as_str)
                     == Some(incarnation)
             });
-        let attention_recorded = self.store.attention_request(&attention_subject)?.is_some();
+        let attention_recorded = self
+            .store
+            .operational_failure(&attention_subject)?
+            .is_some();
         let mut changed = false;
         if !deadline_recorded {
             self.store.append_claim(&ClaimInput {
@@ -2089,7 +1991,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             changed = true;
         }
         if !attention_recorded {
-            self.store.request_attention(
+            self.store.record_runtime_failure(
                 &attention_subject,
                 &AttentionRequest {
                     reviewer: "person/operator".into(),
@@ -2100,6 +2002,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     actor: "agent/st3/reconciler".into(),
                     idempotency_key: format!("{attention_key}:requested"),
                 },
+                "readiness",
             )?;
             changed = true;
         }
@@ -2160,72 +2063,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                 "a later runtime incarnation became ready",
             )?;
         }
-        let token = self
-            .store
-            .selected_desired_token(subject)?
-            .unwrap_or_default();
-        for claim in self
-            .store
-            .claims_for(subject, Some("runtime.reconcile-decision"))?
-        {
-            let Some(old_token) = claim
-                .body
-                .pointer("/fields/key")
-                .and_then(Value::as_str)
-                .and_then(|key| key.strip_prefix("codex-crash-loop:"))
-            else {
-                continue;
-            };
-            if old_token == token {
-                continue;
-            }
-            self.resolve_pending_alert(
-                &format!("codex-crash-loop:{subject}:{old_token}"),
-                "a new desired revision became ready",
-            )?;
-        }
         Ok(())
     }
 
     /// Alerts this host raised about an agent that is no longer desired, or is desired stopped,
     /// have nothing left to fix. Alerts with any other target stay with their reviewer.
-    fn resolve_attention_for_retired_agents(&self, desired: &[DesiredSubject]) -> Result<()> {
-        let active = desired
-            .iter()
-            .filter(|subject| subject.kind != "stop")
-            .map(|subject| subject.subject.as_str())
-            .collect::<BTreeSet<_>>();
-        for request in self
-            .store
-            .pending_attention_requests_raised_by("agent/st3/reconciler", &self.host)?
-        {
-            if request.targets.is_empty()
-                || !request
-                    .targets
-                    .iter()
-                    .all(|target| target.starts_with("agent/") && !active.contains(target.as_str()))
-            {
-                continue;
-            }
-            self.store.resolve_attention_automatically(
-                &request.subject,
-                "the agent it names was removed or stopped",
-                &format!("{}:agent-retired", request.request),
-            )?;
-            self.signal_changed();
-        }
-        Ok(())
-    }
 
     fn resolve_pending_alert(&self, key: &str, reason: &str) -> Result<()> {
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
         let attention_subject = format!("attention/{}", &digest[..32]);
         if self
             .store
-            .attention_request(&attention_subject)?
+            .operational_failure(&attention_subject)?
             .is_some_and(|attention| attention.status == "pending")
         {
-            self.store.resolve_attention_automatically(
+            self.store.recover_operational_failure(
                 &attention_subject,
                 reason,
                 &format!("{key}:resolved"),
@@ -2291,7 +2143,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
         let attention_subject = format!("attention/{}", &digest[..32]);
-        if self.store.attention_request(&attention_subject)?.is_some() {
+        if self
+            .store
+            .operational_failure(&attention_subject)?
+            .is_some()
+        {
             return Ok(());
         }
         self.store.append_claim(&ClaimInput {
@@ -2310,7 +2166,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(key.clone()),
         })?;
-        self.store.request_attention(&attention_subject, &AttentionRequest {
+        self.store.record_runtime_failure(&attention_subject, &AttentionRequest {
                 reviewer: "person/alex".into(),
                 title: "Claude login expired".into(),
                 reason: format!("{} on {} is unauthenticated. Run /login in its terminal, then restart this harness; work delivery is held until a new authenticated incarnation.", subject.subject, self.host),
@@ -2318,7 +2174,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 targets: vec![subject.subject.clone()],
                 actor: "agent/st3/reconciler".into(),
                 idempotency_key: format!("{key}:attention"),
-        })?;
+        }, "provider-auth")?;
         self.signal_changed();
         Ok(())
     }
@@ -2436,8 +2292,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             );
             let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
             let attention_subject = format!("attention/{}", &digest[..32]);
-            if self.store.attention_request(&attention_subject)?.is_none() {
-                self.store.request_attention(
+            if self
+                .store
+                .operational_failure(&attention_subject)?
+                .is_none()
+            {
+                self.store.record_runtime_failure(
                     &attention_subject,
                     &AttentionRequest {
                         reviewer: "person/operator".into(),
@@ -2452,8 +2312,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         targets: vec![subject.subject.clone()],
                         actor: "agent/st3/reconciler".into(),
                         idempotency_key: format!("{key}:requested"),
-                    },
-                )?;
+                    }, "provider-trust",
+            )?;
                 self.signal_changed();
             }
             return Ok(());
@@ -3770,8 +3630,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn raise_runtime_crash_loop(&self, subject: &str, token: &str, reason: &str) -> Result<()> {
         let key = format!("runtime-crash-loop:{subject}:{token}");
         let decision_key = format!("runtime-crash-loop:{token}");
-        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        let attention_subject = format!("attention/{}", &digest[..32]);
         let mut changed = false;
         if !self.runtime_crash_loop_raised(subject, token)? {
             self.store.append_claim(&ClaimInput {
@@ -3790,17 +3648,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             })?;
             changed = true;
         }
-        if self.store.attention_request(&attention_subject)?.is_none() {
-            self.store.request_attention(&attention_subject, &AttentionRequest {
-                reviewer: "person/operator".into(),
-                title: "An agent stopped after repeated runtime failures".into(),
-                reason: format!("{subject}: {reason}. Inspect the seat and revise its desired declaration before restarting."),
-                severity: "error".into(), targets: vec![subject.into()],
-                actor: "agent/st3/reconciler".into(),
-                idempotency_key: format!("{key}:attention"),
-            })?;
-            changed = true;
-        }
         if changed {
             self.signal_changed();
         }
@@ -3810,8 +3657,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn raise_codex_crash_loop(&self, subject: &str, token: &str, reason: &str) -> Result<()> {
         let key = format!("codex-crash-loop:{subject}:{token}");
         let decision_key = format!("codex-crash-loop:{token}");
-        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        let attention_subject = format!("attention/{}", &digest[..32]);
         let existing = self
             .store
             .claims_for(subject, Some("runtime.reconcile-decision"))?
@@ -3820,11 +3665,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 claim.body.pointer("/fields/key").and_then(Value::as_str)
                     == Some(decision_key.as_str())
             });
-        let retained_reason = existing
-            .as_ref()
-            .and_then(|claim| claim.body.pointer("/fields/reason"))
-            .and_then(Value::as_str)
-            .unwrap_or(reason);
         let mut changed = false;
         if existing.is_none() {
             self.store.append_claim(&ClaimInput {
@@ -3841,21 +3681,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("{key}:raised")),
             })?;
-            changed = true;
-        }
-        if self.store.attention_request(&attention_subject)?.is_none() {
-            self.store.request_attention(
-                &attention_subject,
-                &AttentionRequest {
-                    reviewer: "person/alex".into(),
-                    title: "A Codex agent stopped after repeated failures".into(),
-                    reason: format!("{subject}: {retained_reason}. Inspect the seat and revise its desired declaration before restarting."),
-                    severity: "error".into(),
-                    targets: vec![subject.into()],
-                    actor: "agent/st3/reconciler".into(),
-                    idempotency_key: format!("{key}:attention"),
-                },
-            )?;
             changed = true;
         }
         if changed {
@@ -4500,7 +4325,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                         }
                         return Ok(changed);
                     }
-                    if matches!(view.status.as_str(), "completed" | "cancelled") {
+                    if matches!(
+                        view.status.as_str(),
+                        "completed" | "cancelled" | "waiting-person"
+                    ) {
                         return Ok(changed);
                     }
                     if view.status == "orphaned" {
@@ -4613,7 +4441,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 .iter()
                                 .any(|kind| kind.as_deref() == Some("agent")))
                         };
-                        let mut eligible = view.agentless || eligible_agent()?;
+                        let mut eligible = view.agentless
+                            || view
+                                .assigned_to
+                                .as_deref()
+                                .is_some_and(|actor| actor.starts_with("person/"))
+                            || eligible_agent()?;
                         if !eligible {
                             // A step can declare its own assigned agent. Create only that agent before
                             // checking eligibility; other declarations still wait for active execution.
@@ -4688,7 +4521,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                     if let Some(loop_spec) = &step.spec.loop_spec {
                         if self.evaluate_loop_step(run, &step, view, loop_spec)? {
                             changed = true;
-                            self.request_stopped_loop_attention(run, view, loop_spec)?;
                         }
                         return Ok(changed);
                     }
@@ -7191,118 +7023,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
     }
 
-    /// Raise one attention item for a loop whose step just failed or was cancelled: it failed
-    /// at exhaustion or in its human review, or a round or branch mission stopped it. The item
-    /// names the loop, the cause and the command that continues or ends it. It closes when the
-    /// loop runs again, a revision replaces its generation, or its run is cancelled. A loop that
-    /// declares `on-exhausted { attention }` names its title, reviewer and severity; any other
-    /// loop asks the person who requested the run.
-    fn request_stopped_loop_attention(
-        &self,
-        run: &MissionRunView,
-        view: &crate::model::StepRunView,
-        loop_spec: &LoopSpec,
-    ) -> Result<()> {
-        let Some(state) = self
-            .store
-            .latest_claim(&view.subject, Some("step-run.state"))?
-        else {
-            return Ok(());
-        };
-        let status = state
-            .body
-            .pointer("/fields/status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !matches!(status, "failed" | "cancelled") {
-            return Ok(());
-        }
-        let reason = state
-            .body
-            .pointer("/fields/reason")
-            .and_then(Value::as_str)
-            .unwrap_or("the loop stopped");
-        let loop_subject = format!(
-            "loop-run/{}/{}",
-            run.generation
-                .strip_prefix("run-generation/")
-                .unwrap_or(&run.generation),
-            loop_spec.path
-        );
-        let feedback = self
-            .store
-            .claims_for(&loop_subject, Some("loop.round-result"))?
-            .into_iter()
-            .rev()
-            .find_map(|claim| {
-                claim
-                    .body
-                    .pointer("/fields/feedback")
-                    .and_then(Value::as_str)
-                    .filter(|feedback| !feedback.is_empty())
-                    .map(str::to_owned)
-            });
-        let mission = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
-        let remedy = if status == "failed" {
-            format!(
-                "`st work retry {} --reason \"...\"` runs round {} after you address the cause; `st missions cancel {} --reason \"...\"` ends the run.",
-                view.subject,
-                view.attempt.saturating_add(1),
-                run.subject
-            )
-        } else {
-            format!(
-                "st cannot retry a cancelled step. Correct the mission, then end this run with `st missions cancel {} --reason \"...\"` if it still runs, and start a new one with `st missions start {mission}`.",
-                run.subject
-            )
-        };
-        let mut detail = format!(
-            "Loop `{loop_subject}` stopped in round {}: {reason}.",
-            view.attempt
-        );
-        if let Some(feedback) = feedback {
-            detail.push_str(&format!(" Latest feedback: `{feedback}`."));
-        }
-        detail.push(' ');
-        detail.push_str(&remedy);
-        detail.push_str(
-            " This item closes when the loop runs again or its run is revised or cancelled.",
-        );
-        let (title, reviewer, severity) = match &loop_spec.exhaustion_attention {
-            Some(attention) => (
-                attention.title.clone(),
-                attention.reviewer.clone(),
-                attention.severity.clone(),
-            ),
-            None => (
-                format!("Loop `{}` stopped", loop_spec.id),
-                if run.requester.starts_with("person/") {
-                    run.requester.clone()
-                } else {
-                    "person/operator".into()
-                },
-                "error".into(),
-            ),
-        };
-        // One item per stop. A retry runs the next round, so a later stop raises a new item.
-        let idempotency_key = format!("loop-stopped-attention:{loop_subject}:{}", view.attempt);
-        let digest = hex::encode(sha2::Sha256::digest(idempotency_key.as_bytes()));
-        self.store.request_attention(
-            &format!("attention/{}", &digest[..32]),
-            &AttentionRequest {
-                reviewer,
-                title,
-                reason: detail,
-                severity,
-                targets: vec![loop_subject, run.subject.clone()],
-                actor: RECONCILER_ACTOR.into(),
-                idempotency_key,
-            },
-        )?;
-        self.signal_changed();
-        Ok(())
-    }
-
     fn step_dependencies_hold(
         &self,
         run: &MissionRunView,
@@ -8652,16 +8372,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             let attention = schedule_head_attention_subject(&schedule.subject);
             if self
                 .store
-                .attention_request(&attention)?
+                .operational_failure(&attention)?
                 .is_some_and(|item| item.status == "pending")
             {
-                self.store.withdraw_attention(
+                self.store.recover_operational_failure(
                     &attention,
-                    &crate::model::AttentionWithdrawRequest {
-                        actor: RECONCILER_ACTOR.into(),
-                        reason: "A subsequent schedule occurrence started successfully.".into(),
-                        idempotency_key: format!("schedule-head-ready:{}", run.id),
-                    },
+                    "A subsequent schedule occurrence started successfully.",
+                    &format!("schedule-head-ready:{}", run.id),
                 )?;
             }
         }
@@ -9182,14 +8899,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         let deadlines = self.observer_deadlines.clone();
         let cursors = self.observer_cursors.clone();
         let observer_subject = observer.subject.clone();
-        let observer_owner_run = observer.owner_run.clone();
-        let host = self.host.clone();
-        let was_failing = observer_actual.as_ref().is_some_and(|actual| {
-            matches!(
-                actual.get("state").and_then(Value::as_str),
-                Some("unreachable" | "degraded")
-            )
-        });
         let previous_facts = self
             .store
             .latest_actual_value(&spec.resource)?
@@ -9270,13 +8979,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     .lock()
                                     .unwrap_or_else(PoisonError::into_inner)
                                     .insert(deadline_key.clone(), observation.cursor);
-                                if was_failing {
-                                    let _ = resolve_observer_attention(
-                                        &store,
-                                        &host,
-                                        &observer_subject,
-                                    );
-                                }
                             }
                             Err(error) => {
                                 let retry_at = now_ms().saturating_add(60_000);
@@ -9315,17 +9017,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     expected_subject: None,
                                     idempotency_key: Some(key),
                                 });
-                                // A permanent error is not polled again, so it waits for a
-                                // person to correct the declaration.
-                                if permanent_observation_error(error.code) {
-                                    let _ = request_observer_attention(
-                                        &store,
-                                        &observer_subject,
-                                        observer_owner_run.as_deref(),
-                                        &revision,
-                                        &ObserverCondition::Rejected(error.to_string()),
-                                    );
-                                }
                             }
                         }
                     }
@@ -9349,7 +9040,17 @@ impl<R: RuntimeControl> Reconciler<R> {
                         });
                         if !unchanged_failure || refresh_attempt.is_some() {
                             let failure_hash = hex::encode(sha2::Sha256::digest(
-                                format!("{operation}:{reason}").as_bytes(),
+                                format!(
+                                    "{operation}:{reason}:{}",
+                                    store
+                                        .claims_for(&observer_subject, Some("observer.state"))
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .rev()
+                                        .find(|claim| claim.body["fields"]["state"] == "healthy")
+                                        .map_or_else(|| "first".into(), |claim| claim.id)
+                                )
+                                .as_bytes(),
                             ));
                             let mut fields = BTreeMap::from([
                                 ("state".into(), Value::String("unreachable".into())),
@@ -9376,19 +9077,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     &failure_hash[..20]
                                 )),
                             });
-                        }
-                        let since = observer_unreachable_since(&store, &observer_subject)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(now_ms);
-                        if condition.needs_person(now_ms().saturating_sub(since)) {
-                            let _ = request_observer_attention(
-                                &store,
-                                &observer_subject,
-                                observer_owner_run.as_deref(),
-                                &revision,
-                                &condition,
-                            );
                         }
                     }
                 }
@@ -10306,30 +9994,11 @@ const RECONCILER_FAILING_TITLE: &str = "The reconciler is failing";
 
 /// How long a fault must last before it asks a person. st retries a faulted item on every pass,
 /// so most faults clear sooner and never reach anyone.
+#[cfg(test)]
 const FAULT_ATTENTION_AFTER_MS: u128 = 120_000;
 
-fn fault_attention_subject(fault: &str) -> String {
-    let digest = hex::encode(sha2::Sha256::digest(
-        format!("reconcile-fault-attention:{fault}").as_bytes(),
-    ));
-    format!("attention/{}", &digest[..32])
-}
-
-fn observer_unreachable_since(store: &Store, subject: &str) -> Result<Option<u128>> {
-    let mut since = None;
-    for claim in store.claims_for(subject, Some("observer.state"))? {
-        let state = claim.body.pointer("/fields/state").and_then(Value::as_str);
-        if state == Some("unreachable") {
-            since.get_or_insert(claim.accepted_at_unix_ms);
-        } else {
-            since = None;
-        }
-    }
-    Ok(since)
-}
-
 /// Why an observer cannot observe, and whether a person has to act.
-enum ObserverCondition {
+pub(crate) enum ObserverCondition {
     /// GitHub rejected the token or refused access. Nothing changes until a person acts.
     Access(String),
     /// A rate limit ends at a known reset. It needs a person only when the observer was already
@@ -10379,7 +10048,7 @@ impl ObserverCondition {
         }
     }
 
-    fn needs_person(&self, failing_for_ms: u128) -> bool {
+    pub(crate) fn needs_person(&self, failing_for_ms: u128) -> bool {
         match self {
             Self::Access(_) | Self::Rejected(_) => true,
             Self::RateLimited { outlasted, .. } => *outlasted,
@@ -10387,7 +10056,7 @@ impl ObserverCondition {
         }
     }
 
-    fn title(&self) -> &'static str {
+    pub(crate) fn title(&self) -> &'static str {
         match self {
             Self::Access(_) => "An observer has no access to GitHub",
             Self::RateLimited { .. } => "A GitHub rate limit outlasted its reset",
@@ -10397,7 +10066,7 @@ impl ObserverCondition {
     }
 
     /// The cause and the command that fixes it. `host` polls the observer.
-    fn reason(&self, subject: &str, host: &str) -> String {
+    pub(crate) fn reason(&self, subject: &str, host: &str) -> String {
         let closes = "This item closes when the observer observes again.";
         match self {
             Self::Access(reason) => format!(
@@ -10414,67 +10083,6 @@ impl ObserverCondition {
             ),
         }
     }
-}
-
-/// Raise one attention item per observer, revision, cause and failure episode. An episode ends
-/// when the observer records a healthy state, so a later failure raises a new item even after a
-/// person closed the last one.
-fn request_observer_attention(
-    store: &Store,
-    subject: &str,
-    owner_run: Option<&str>,
-    revision: &str,
-    condition: &ObserverCondition,
-) -> Result<()> {
-    let episode = store
-        .claims_for(subject, Some("observer.state"))?
-        .into_iter()
-        .rev()
-        .find(|claim| {
-            claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("healthy")
-        })
-        .map_or_else(|| "first".to_owned(), |claim| claim.id);
-    let key = format!(
-        "observer-attention:{subject}:{revision}:{}:{episode}",
-        condition.code()
-    );
-    let hash = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-    let attention = format!("attention/observer-{}", &hash[..24]);
-    if store.attention_request(&attention)?.is_some() {
-        return Ok(());
-    }
-    let reviewer = owner_run
-        .and_then(|owner| store.mission_run(owner).ok().flatten())
-        .map(|run| run.requester)
-        .filter(|requester| requester.starts_with("person/"))
-        .unwrap_or_else(|| "person/operator".into());
-    store.request_attention(
-        &attention,
-        &AttentionRequest {
-            reviewer,
-            title: condition.title().into(),
-            reason: condition.reason(subject, store.origin()),
-            severity: "error".into(),
-            targets: vec![subject.into()],
-            actor: RECONCILER_ACTOR.into(),
-            idempotency_key: key,
-        },
-    )?;
-    Ok(())
-}
-
-/// Close every item this host raised about `subject` once the observer observes again.
-fn resolve_observer_attention(store: &Store, host: &str, subject: &str) -> Result<()> {
-    for request in store.pending_attention_requests_raised_by(RECONCILER_ACTOR, host)? {
-        if request.targets == [subject] {
-            store.resolve_attention_automatically(
-                &request.subject,
-                &format!("{subject} observes again"),
-                &format!("observer-recovered:{}", request.request),
-            )?;
-        }
-    }
-    Ok(())
 }
 
 struct RuntimeStep<'a> {
@@ -10742,12 +10350,12 @@ fn request_schedule_head_attention(
 ) -> Result<()> {
     let attention = schedule_head_attention_subject(schedule);
     if store
-        .attention_request(&attention)?
+        .operational_failure(&attention)?
         .is_some_and(|item| item.status == "pending")
     {
         return Ok(());
     }
-    store.request_attention(
+    store.record_operational_failure(
         &attention,
         &AttentionRequest {
             reviewer: "person/operator".into(),
@@ -15517,7 +15125,7 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
     }
 
     #[test]
-    fn an_attention_request_closes_when_its_until_condition_holds_and_not_before() {
+    fn legacy_attention_until_conditions_no_longer_mutate_or_surface() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(
             &store,
@@ -15578,24 +15186,17 @@ mission "publish" state="ready" {
             .unwrap();
         reconciler.reconcile_once().unwrap();
 
-        let resolved = store.attention_request(&until.subject).unwrap().unwrap();
-        assert_eq!(resolved.status, "resolved");
         assert_eq!(
-            resolved.resolution_reason.as_deref(),
-            Some("every target is completed")
-        );
-        assert_eq!(
-            store
-                .claims_for(&until.subject, Some("attention.resolved"))
-                .unwrap()[0]
-                .actor
-                .as_deref(),
-            Some("daemon/runtime")
-        );
-        assert_eq!(
-            status(&plain.subject),
+            status(&until.subject),
             "pending",
-            "a request without until waits for a person"
+            "legacy claims are retained for audit"
+        );
+        assert_eq!(status(&plain.subject), "pending");
+        assert!(
+            store
+                .attention_items(Some("person/alex"))
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -15655,13 +15256,19 @@ mission "asks" state="ready" {
             )
             .unwrap();
         assert_eq!(asked.step.as_deref(), Some(step.as_str()));
-        let reconciler = Reconciler::new(
+        let _reconciler = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
             "node".into(),
             Arc::new(Notify::new()),
         );
-        reconciler.resolve_attention_whose_until_holds().unwrap();
+        assert!(
+            store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != asked.subject)
+        );
         assert_eq!(
             store
                 .attention_request(&asked.subject)
@@ -15672,12 +15279,18 @@ mission "asks" state="ready" {
         );
 
         store.set_step_state(&step, "failed", None).unwrap();
-        reconciler.resolve_attention_whose_until_holds().unwrap();
+        assert!(
+            store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != asked.subject)
+        );
         let resolved = store.attention_request(&asked.subject).unwrap().unwrap();
-        assert_eq!(resolved.status, "resolved");
-        assert_eq!(
-            resolved.resolution_reason,
-            Some(format!("the step that raised it ended: `{step}` failed"))
+        assert_eq!(resolved.status, "pending");
+        assert!(
+            resolved.resolution_reason.is_none(),
+            "legacy requests remain immutable audit data"
         );
     }
 
@@ -15716,16 +15329,12 @@ agent "worker" {
             .selected_desired_token("agent/node.worker")
             .unwrap()
             .unwrap();
-        let key = format!("codex-crash-loop:agent/node.worker:{token}");
-        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        let attention = store
-            .attention_request(&format!("attention/{}", &digest[..32]))
-            .unwrap()
-            .unwrap();
-        assert_eq!(attention.status, "pending");
+        let attention = store.attention_items(Some("person/alex")).unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].subject, "agent/node.worker");
         assert!(
-            attention
-                .reason
+            attention[0]
+                .detail
                 .contains("the fake runtime rejected the start")
         );
         let decisions = store
@@ -15964,7 +15573,7 @@ agent "worker" {
         assert_eq!(runtime.starts.lock().unwrap().len(), 3);
         assert!(
             store
-                .attention_requests(None, false)
+                .attention_items(None)
                 .unwrap()
                 .iter()
                 .any(|attention| { attention.targets.contains(&"agent/node.worker".to_owned()) })
@@ -16313,9 +15922,17 @@ mission "scheduled-cycle" state="ready" {
     }
     #[test]
     fn daily_calendar_gap_fold_and_catch_up_keep_local_date_keys() {
-        let berlin = CalendarSchedule { at_minute: 150, weekday: None, timezone: "Europe/Berlin".into() };
+        let berlin = CalendarSchedule {
+            at_minute: 150,
+            weekday: None,
+            timezone: "Europe/Berlin".into(),
+        };
         let date = |value| NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap();
-        let utc = |value| chrono::DateTime::parse_from_rfc3339(value).unwrap().timestamp_millis();
+        let utc = |value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .timestamp_millis()
+        };
         assert_eq!(
             calendar_instant(chrono_tz::Europe::Berlin, berlin.at_minute, date("2027-03-28")).unwrap(),
             utc("2027-03-28T01:00:00Z"),
@@ -16326,7 +15943,11 @@ mission "scheduled-cycle" state="ready" {
             utc("2026-10-25T00:30:00Z"),
             "02:30 occurs twice: choose the earlier offset"
         );
-        let morning = CalendarSchedule { at_minute: 480, weekday: None, timezone: "Europe/Berlin".into() };
+        let morning = CalendarSchedule {
+            at_minute: 480,
+            weekday: None,
+            timezone: "Europe/Berlin".into(),
+        };
         let now = utc("2027-03-30T05:00:00Z"); // Before today's 08:00 local.
         assert_eq!(
             calendar_occurrence(&morning, Some(20270327), now, "latest", None).unwrap(),
@@ -16354,7 +15975,11 @@ mission "scheduled-cycle" state="ready" {
         let weekly = CalendarSchedule {
             at_minute: 540, weekday: Some(1), timezone: "Europe/Berlin".into(),
         };
-        let utc = |value| chrono::DateTime::parse_from_rfc3339(value).unwrap().timestamp_millis();
+        let utc = |value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .timestamp_millis()
+        };
         assert_eq!(
             calendar_occurrence(&weekly, Some(20260323), utc("2026-03-29T12:00:00Z"), "latest", None).unwrap(),
             (20260330, utc("2026-03-30T07:00:00Z")),
@@ -16411,7 +16036,10 @@ schedule "daily" {{
   calendar {{ at "00:00"; timezone "Etc/UTC" }}
   catch-up "latest"
   work {{ mission "scheduled-cycle@{revision}"; workspace "/tmp/st3-calendar-test" }}
-}}"#), "calendar-schedule");
+}}"#
+            ),
+            "calendar-schedule",
+        );
         let reconciler = Reconciler::new(
             store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
         );
@@ -16436,23 +16064,34 @@ schedule "daily" {{
 schedule "daily" {{
   calendar {{ at "23:59"; timezone "Etc/UTC" }}
   work {{ mission "scheduled-cycle@{mission_revision}"; workspace "/tmp/st3-calendar-test" }}
-}}"#), "calendar-schedule");
-        let revision = store.selected_desired_revision("schedule/daily").unwrap().unwrap();
+}}"#
+            ),
+            "calendar-schedule",
+        );
+        let revision = store
+            .selected_desired_revision("schedule/daily")
+            .unwrap()
+            .unwrap();
         let key: u64 = Utc::now().format("%Y%m%d").to_string().parse().unwrap();
         let recorded = (now_ms() as i64 - 100).to_string();
-        store.append_claim(&ClaimInput {
-            subject: "schedule/daily".into(),
-            kind: "schedule.occurrence-scheduled".into(),
-            actor: None,
-            fields: BTreeMap::from([
-                ("revision".into(), Value::String(revision.clone())),
-                ("occurrence".into(), Value::from(key)),
-                ("scheduled_at_unix_ms".into(), Value::String(recorded.clone())),
-            ]),
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: Some(format!("clock-wake:schedule/daily:{revision}:{key}")),
-        }).unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "schedule/daily".into(),
+                kind: "schedule.occurrence-scheduled".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("revision".into(), Value::String(revision.clone())),
+                    ("occurrence".into(), Value::from(key)),
+                    (
+                        "scheduled_at_unix_ms".into(),
+                        Value::String(recorded.clone()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("clock-wake:schedule/daily:{revision}:{key}")),
+            })
+            .unwrap();
         let reconciler = Reconciler::new(
             store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
         );
@@ -16705,14 +16344,18 @@ schedule "unready" {{
             reconciler.reconcile_once().unwrap();
             assert_eq!(
                 store
-                    .claims_for(&attention, Some("attention.requested"))
+                    .claims_for("schedule/unready", Some("operational.failure"))
                     .unwrap()
                     .len(),
                 1
             );
             if occurrence < 3 {
                 assert_eq!(
-                    store.attention_request(&attention).unwrap().unwrap().status,
+                    store
+                        .operational_failure(&attention)
+                        .unwrap()
+                        .unwrap()
+                        .status,
                     "pending"
                 );
             }
@@ -16732,10 +16375,10 @@ schedule "unready" {{
             1
         );
         let closed = store
-            .claims_for(&attention, Some("attention.resolved"))
+            .claims_for("schedule/unready", Some("operational.recovered"))
             .unwrap();
         assert_eq!(closed.len(), 1);
-        assert_eq!(closed[0].body["fields"]["outcome"], "withdrawn");
+        assert_eq!(closed[0].kind, "operational.recovered");
         assert!(
             store
                 .attention_items(None)
@@ -20720,6 +20363,14 @@ observer "repo" {
         .expect("the observation finished");
     }
 
+    fn failure_for_item(
+        store: &Store,
+        item: &crate::model::AttentionItemView,
+    ) -> Result<Option<crate::model::AttentionRequestView>> {
+        let claim = store.claim_by_id(&item.episode)?.unwrap();
+        store.operational_failure(claim.body["fields"]["episode"].as_str().unwrap())
+    }
+
     fn observer_items(store: &Store) -> Vec<crate::model::AttentionItemView> {
         store
             .attention_items(None)
@@ -20798,8 +20449,14 @@ observer "repo" {
         // Observing again closes it.
         observe_now(&reconciler, &calls).await;
         assert!(observer_items(&store).is_empty());
-        let closed = store.attention_request(&items[0].subject).unwrap().unwrap();
-        assert_eq!(closed.status, "resolved");
+        assert_eq!(
+            store
+                .latest_claim("observer/repo", Some("observer.state"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["state"],
+            "healthy"
+        );
     }
 
     #[tokio::test]
@@ -20835,18 +20492,19 @@ observer "repo" {
         assert!(observer_items(&store).is_empty());
         assert_eq!(
             store
-                .attention_request(&first[0].subject)
+                .latest_claim("observer/repo", Some("observer.state"))
                 .unwrap()
                 .unwrap()
-                .status,
-            "resolved"
+                .body["fields"]["state"],
+            "healthy"
         );
 
         // A later failure is a new episode, and raises a new item.
         observe_now(&reconciler, &calls).await;
         let second = observer_items(&store);
         assert_eq!(second.len(), 1);
-        assert_ne!(second[0].subject, first[0].subject);
+        assert_eq!(second[0].subject, first[0].subject);
+        assert_ne!(second[0].episode, first[0].episode);
     }
 
     #[test]
@@ -20919,11 +20577,11 @@ observer "repo" {
         assert!(items().is_empty());
         assert_eq!(
             store
-                .attention_request(&second[0].subject)
+                .latest_claim(&second[0].subject, Some("reconcile.fault"))
                 .unwrap()
                 .unwrap()
-                .status,
-            "resolved"
+                .body["fields"]["status"],
+            "recovered"
         );
     }
 
@@ -20985,7 +20643,7 @@ observer "repo" {
         set(10 * GIB);
         reconciler.reconcile_once().unwrap();
         assert!(items().is_empty());
-        let closed = store.attention_request(&first[0].subject).unwrap().unwrap();
+        let closed = failure_for_item(&store, &first[0]).unwrap().unwrap();
         assert_eq!(closed.status, "resolved");
 
         // A new episode raises a new item. A person who closes it early is not asked again
@@ -20994,22 +20652,12 @@ observer "repo" {
         reconciler.reconcile_once().unwrap();
         let second = items();
         assert_eq!(second.len(), 1);
-        assert_ne!(second[0].subject, first[0].subject);
-        store
-            .resolve_attention(
-                &second[0].subject,
-                &crate::model::AttentionResolveRequest {
-                    outcome: "dismissed".into(),
-                    reason: Some("cleaning up".into()),
-                    actor: "person/operator".into(),
-                    idempotency_key: "dismiss-disk".into(),
-                },
-            )
-            .unwrap();
+        assert_eq!(second[0].subject, first[0].subject);
+        assert_ne!(second[0].episode, first[0].episode);
         for _ in 0..3 {
             reconciler.reconcile_once().unwrap();
         }
-        assert!(items().is_empty());
+        assert_eq!(items().len(), 1, "the source is still low");
     }
 
     #[test]
@@ -21345,29 +20993,19 @@ subscription "reviews" {{
             .into_iter()
             .find(|item| item.kind == "fault" && item.targets == ["subscription/reviews"])
             .unwrap();
-        assert!(
-            failure_attention
-                .subject
-                .starts_with("attention/subscription-failure-")
+        assert_eq!(failure_attention.subject, "subscription/reviews");
+        apply_source(
+            &store,
+            r#"version 2
+subscription "reviews" { stop }"#,
+            "stop-failed-subscription",
         );
-        let resolved = store
-            .resolve_attention(
-                &failure_attention.subject,
-                &crate::model::AttentionResolveRequest {
-                    outcome: "resolved".into(),
-                    reason: Some("Corrected the subscription input".into()),
-                    actor: "person/alex".into(),
-                    idempotency_key: "resolve-subscription-failure".into(),
-                },
-            )
-            .unwrap();
-        assert_eq!(resolved.status, "resolved");
         assert!(
-            !store
+            store
                 .attention_items(None)
                 .unwrap()
                 .iter()
-                .any(|item| item.subject == failure_attention.subject)
+                .all(|item| item.subject != failure_attention.subject)
         );
     }
 
@@ -21463,31 +21101,12 @@ subscription "reviews" {{
                 .attention_items(None)
                 .unwrap()
                 .into_iter()
-                .filter(|item| item.subject.starts_with("attention/subscription-failure-"))
+                .filter(|item| item.subject == "subscription/reviews")
                 .collect::<Vec<_>>()
         };
         let open = failures();
         assert_eq!(open.len(), 2);
-        assert!(
-            open.iter().all(|item| item.person.is_empty()),
-            "a failure requested by an agent is routed to no person"
-        );
-
-        // The requester is an agent, which cannot close an item. Any person can.
-        let closed = store
-            .resolve_attention(
-                &open[0].subject,
-                &crate::model::AttentionResolveRequest {
-                    outcome: "dismissed".into(),
-                    reason: Some("The intake run was cancelled days ago".into()),
-                    actor: "person/ada".into(),
-                    idempotency_key: "dismiss-agent-subscription-failure".into(),
-                },
-            )
-            .unwrap();
-        assert_eq!(closed.status, "dismissed");
-        assert_eq!(closed.reviewer, "person/ada");
-        assert_eq!(failures().len(), 1);
+        assert!(open.iter().all(|item| item.person == "person/operator"));
 
         // A stopped subscription starts nothing more, so its failures end on their own.
         apply_source(
@@ -22949,10 +22568,9 @@ subscription "reviews" {
                                 ("kind".into(), Value::String("vcs.pull-request".into())),
                                 ("facts".into(), facts),
                             ]),
-                            evidence: vec![discovery.body["evidence"][0]
-                                .as_str()
-                                .unwrap()
-                                .to_owned()],
+                            evidence: vec![
+                                discovery.body["evidence"][0].as_str().unwrap().to_owned(),
+                            ],
                             expected_subject: None,
                             idempotency_key: Some("legacy-headless-item".into()),
                         })
@@ -24510,7 +24128,7 @@ version 2
         );
         assert_eq!(
             store
-                .claims_for(&attention[0].subject, Some("attention.resolved"))
+                .claims_for(&attention[0].subject, Some("operational.recovered"))
                 .unwrap()[0]
                 .actor
                 .as_deref(),
@@ -24566,11 +24184,11 @@ version 2
     fn alert_resolution_actor(store: &Store, key: &str) -> Option<String> {
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
         let attention = store
-            .attention_request(&format!("attention/{}", &digest[..32]))
+            .operational_failure(&format!("attention/{}", &digest[..32]))
             .unwrap()
             .expect("the alert was raised");
         store
-            .claims_for(&attention.subject, Some("attention.resolved"))
+            .claims_for(&attention.targets[0], Some("operational.recovered"))
             .unwrap()
             .last()
             .and_then(|claim| claim.actor.clone())
@@ -24674,8 +24292,7 @@ version 2
         reconciler
             .raise_codex_crash_loop("agent/node.worker", &token_a, "the start failed")
             .unwrap();
-        let key = format!("codex-crash-loop:agent/node.worker:{token_a}");
-        assert_eq!(alert_resolution_actor(&store, &key), None);
+        assert_eq!(store.attention_items(Some("person/alex")).unwrap().len(), 1);
 
         // A person revises the declaration, and the new revision's incarnation becomes ready.
         apply_source(&store, &source("gpt-5.6-sol"), "crash-loop-b");
@@ -24700,10 +24317,6 @@ version 2
             )
             .unwrap();
 
-        assert_eq!(
-            alert_resolution_actor(&store, &key).as_deref(),
-            Some("daemon/runtime")
-        );
         assert!(
             store
                 .attention_items(Some("person/alex"))
@@ -24713,7 +24326,7 @@ version 2
     }
 
     #[test]
-    fn removing_an_agent_resolves_its_reconciler_alerts() {
+    fn removed_agents_disappear_from_snapshot_before_cleanup() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(
             &store,
@@ -24726,7 +24339,7 @@ agent "keeper" { workspace "/tmp"; command "true"; restart "never" }
         let raise = |agent: &str, actor: &str| {
             let subject = format!("attention/alert-{}", agent.replace('/', "-"));
             store
-                .request_attention(
+                .record_operational_failure(
                     &subject,
                     &AttentionRequest {
                         reviewer: "person/operator".into(),
@@ -24744,35 +24357,20 @@ agent "keeper" { workspace "/tmp"; command "true"; restart "never" }
         let stopped = raise("agent/node.worker", "agent/st3/reconciler");
         let gone = raise("agent/node.gone", "agent/st3/reconciler");
         let kept = raise("agent/node.keeper", "agent/st3/reconciler");
-        let personal = raise("agent/node.elsewhere", "agent/node.keeper");
         apply_source(
             &store,
             "version 2\nstop \"agent/node.worker\"\n",
             "retired-agent-stop",
         );
-        let reconciler = Reconciler::new(
-            store.clone(),
-            Arc::new(FakeRuntime::default()),
-            "node".into(),
-            Arc::new(Notify::new()),
-        );
-
-        reconciler.reconcile_once().unwrap();
-
-        let status = |subject: &str| store.attention_request(subject).unwrap().unwrap().status;
-        assert_eq!(status(&stopped), "resolved");
-        assert_eq!(status(&gone), "resolved");
-        assert_eq!(status(&kept), "pending");
-        // Only the reconciler's own alerts close this way; an agent's request stays with it.
-        assert_eq!(status(&personal), "pending");
-        assert_eq!(
-            store
-                .claims_for(&stopped, Some("attention.resolved"))
-                .unwrap()[0]
-                .actor
-                .as_deref(),
-            Some("daemon/runtime")
-        );
+        let current = store.attention_items(Some("person/operator")).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].subject, "agent/node.keeper");
+        for episode in [&stopped, &gone, &kept] {
+            assert_eq!(
+                store.operational_failure(episode).unwrap().unwrap().status,
+                "pending"
+            );
+        }
     }
 
     #[test]
@@ -25351,7 +24949,7 @@ mission "work-alert" state="ready" {
     }
 
     #[test]
-    fn unresolved_external_attention_suppresses_ready_work_wakes_until_resolved() {
+    fn person_asks_suspend_wakes_and_resume_once_after_response() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
@@ -25407,31 +25005,18 @@ mission "ios-proof-blocked" state="ready" {
         store
             .work_action(&subject, "claim", &work("ios-proof-claim", None))
             .unwrap();
-        let attention = store
-            .request_attention(
-                "attention/ios-proof-xcode",
-                &crate::model::AttentionRequest {
-                    reviewer: "person/alex".into(),
-                    title: "ExampleMac needs its Xcode simulator components updated".into(),
-                    reason: "CoreSimulator cannot start until the privileged repair runs.".into(),
-                    severity: "error".into(),
-                    targets: vec!["host/example-mac".into(), subject.clone()],
-                    actor: "agent/node.ios-owner".into(),
-                    idempotency_key: "ios-proof-xcode-attention".into(),
-                },
-            )
-            .unwrap();
-        store
-            .work_action(
-                &subject,
-                "release",
-                &work(
-                    "ios-proof-release",
-                    Some(
-                        "A privileged Xcode repair is required; an idle lease would be misleading.",
-                    ),
-                ),
-            )
+        let ask = store
+            .ask_person(&crate::model::PersonAskRequest {
+                legacy_request: None,
+                person: "person/alex".into(),
+                title: "Repair simulator components".into(),
+                reason: "Repair CoreSimulator before automated proof can run.".into(),
+                actor: desired.subject.clone(),
+                step: Some(subject.clone()),
+                new_run: None,
+                incarnation: Some("ios-owner-one".into()),
+                idempotency_key: "repair-simulator".into(),
+            })
             .unwrap();
         store
             .append_claim(&ClaimInput {
@@ -25455,7 +25040,10 @@ mission "ios-proof-blocked" state="ready" {
         for _ in 0..2 {
             reconciler.reconcile_once().unwrap();
         }
-        assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "blocked");
+        assert_eq!(
+            store.step_run(&subject).unwrap().unwrap().status,
+            "waiting-person"
+        );
         assert!(
             store
                 .messages(Some("agent/node.ios-owner"), true)
@@ -25465,14 +25053,16 @@ mission "ios-proof-blocked" state="ready" {
         );
 
         store
-            .resolve_attention(
-                &attention.subject,
-                &crate::model::AttentionResolveRequest {
-                    outcome: "resolved".into(),
-                    reason: Some("Xcode simulator components are healthy.".into()),
+            .finish_person_step(
+                &crate::model::PersonStepResponse {
+                    subject: ask.subject,
                     actor: "person/alex".into(),
-                    idempotency_key: "ios-proof-xcode-resolved".into(),
+                    summary: "Simulator components repaired.".into(),
+                    episode: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "simulator-repaired".into(),
                 },
+                false,
             )
             .unwrap();
         reconciler.reconcile_once().unwrap();

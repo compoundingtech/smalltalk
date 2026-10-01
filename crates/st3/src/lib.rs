@@ -20,6 +20,7 @@ pub mod mission;
 pub mod model;
 pub mod otlp;
 pub mod peer;
+pub mod performance;
 /// Opt-in accounting of where the daemon's time goes, turned on by `ST3_PROFILE_DIR`.
 pub mod profile;
 pub mod projection;
