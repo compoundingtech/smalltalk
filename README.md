@@ -2,8 +2,9 @@
 
 ## Continuous integration
 
-Small Talk runs pull request CI on GitHub Actions with Namespace runners. `linux-gate`,
-`isolation-vm` and `genie-freshness` are the required checks; `macos-ci` is optional and runs
+Small Talk runs pull request CI and every push to `main` on GitHub Actions with Namespace runners.
+Main pushes each run Workspace CI and macOS CI independently. `linux-gate`, `isolation-vm` and
+`genie-freshness` are the required checks; `macos-ci` is optional on pull requests and runs
 when a pull request carries the `macos-ci` label. A ready pull request lands through GitHub's
 merge queue: `gh pr merge NUMBER --auto`. See [CI operations](docs/ci.md) for the queue and to
 inspect a failing run.
@@ -294,9 +295,22 @@ connects straight to the PTY session, so a busy daemon cannot stall it. If the d
 answer within a second, st attaches to the seat's newest PTY session on that host without it and
 says so.
 
-A running seat keeps its current process when you apply a changed declaration; the change takes
-effect the next time it starts. To use it now, stop the seat and apply again. `st agents stop
+A running seat keeps its current process when you apply a changed declaration; launch changes
+take effect the next time it starts. To use those now, stop the seat and apply again. `st agents stop
 agent/example/worker --as person/ada` stops a seat until you apply its file again.
+
+Human labels are presentation, not launch configuration:
+
+```sh
+st agents rename agent/example/worker "Garden maintenance" --as person/ada
+st agents rename agent/example/worker --clear --as person/ada
+```
+
+Rename publishes only `desired.display_name`, the same durable field as KDL `name`. It does not
+restart the seat or change its identity, and a stopped seat keeps its restart budget and any
+crash-loop hold. The Agent API uses this effective label; clearing it restores `example/worker`.
+The label must be non-empty. Like declaring a seat in free mode, a person or an agent may rename
+any seat. A bound harness must act as itself, and rename preserves the original declaring actor.
 
 [`examples/st3/seats`](examples/st3/seats) has a seat file for each harness.
 
@@ -360,6 +374,11 @@ st conversations read MESSAGE --as person/ada
 st conversations thread MESSAGE
 st conversations archive MESSAGE --as person/ada
 ```
+
+If a send or reply goes unanswered, st retries once with the same message and idempotency
+key. If delivery remains unconfirmed, the error prints the key: rerun the same command with
+`--idempotency-key KEY` to recover its result without sending a second message. Use a new key
+for a new message.
 
 `st conversations sessions` lists harness sessions and `st conversations timeline SESSION`
 shows one session's messages and tool calls.

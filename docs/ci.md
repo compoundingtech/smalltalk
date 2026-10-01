@@ -2,9 +2,10 @@
 
 ## GitHub Actions on Namespace
 
-**Main CI is off.** Neither `Workspace CI` nor `macOS CI` runs on pushes to `main` until the
-`push: { branches: ['main'] }` trigger is restored in `fleet.yml.genie.ts` and `macos.yml.genie.ts`
-(a one-line change in each; regenerate with genie).
+Every push to `main` runs both `Workspace CI` and `macOS CI` on Namespace. Each non-PR run
+uses its own `github.run_id` in the concurrency group, so successive pushes can run concurrently
+without cancelling running checks or replacing pending runs. PR updates still cancel stale
+checks for that PR; macOS checks on PRs require the `macos-ci` label.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`

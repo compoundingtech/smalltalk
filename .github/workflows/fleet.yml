@@ -6,13 +6,15 @@ name: Workspace CI
 on:
   pull_request: {}
   merge_group: {}
+  push:
+    branches: [main]
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: "workspace-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}"
+  group: "workspace-${{ github.event.pull_request.number || github.run_id }}-${{ github.event_name }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

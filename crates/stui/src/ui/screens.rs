@@ -2402,7 +2402,7 @@ mod tree_tests {
 
     #[test]
     fn a_request_holding_a_json_report_shows_what_happened_and_folds_the_rest() {
-        let text = r#"The deploy finished: {"status":"failed","error":"unit st3.service did not start","commit":"8821eced","host":"bluey","attempt":2,"log":"/var/log/x","duration_ms":1234,"members":["hetz","Silber"],"plan":{"a":1},"notes":"long\nnotes"}"#;
+        let text = r#"The deploy finished: {"status":"failed","error":"unit st3.service did not start","commit":"8821eced","host":"willow","attempt":2,"log":"/var/log/x","duration_ms":1234,"members":["maple","cedar"],"plan":{"a":1},"notes":"long\nnotes"}"#;
         let shown = report(text, 60)
             .unwrap()
             .iter()
