@@ -1584,6 +1584,10 @@ pub struct AttentionActionView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionItemView {
+    #[serde(default)]
+    pub episode: String,
+    #[serde(default)]
+    pub priority: String,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_mode: Option<String>,
@@ -1935,6 +1939,8 @@ pub struct DoctorCheck {
 pub struct DoctorReport {
     pub status: String,
     pub checks: Vec<DoctorCheck>,
+    #[serde(default)]
+    pub performance: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2338,6 +2344,36 @@ pub struct WorkRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub evidence: Vec<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PersonAskRequest {
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub legacy_request: Option<String>,
+    pub person: String,
+    pub title: String,
+    pub reason: String,
+    pub actor: String,
+    #[serde(default)]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub new_run: Option<String>,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PersonStepResponse {
+    pub subject: String,
+    pub actor: String,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub episode: Option<String>,
     pub idempotency_key: String,
 }
 

@@ -127,6 +127,7 @@ const stepStyles: Record<WorkState, StepStyle> = {
   claimed: { glyph: '⠿', color: theme.working, word: 'working', rank: 2 },
   verifying: { glyph: '⠿', color: theme.working, word: 'working', rank: 2 },
   ready: { glyph: '▱', color: theme.waiting, word: 'ready', rank: 3 },
+  'waiting-person': { glyph: '◐', color: theme.sapphire, word: 'waiting for a person', rank: 4 },
   waiting: { glyph: '◐', color: theme.sapphire, word: 'waiting', rank: 4 },
   blocked: { glyph: '◐', color: theme.sapphire, word: 'waiting', rank: 4 },
 };

@@ -28,7 +28,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `operations` | Shared projection | Shared operation identity, canonical claim, request digest and conflict state, derived from live claims plus tombstones. After trim, operations with no live claim are served by tombstones. |
 | `blobs` | Shared projection | Shared immutable bytes/hash/size carried by durable claims or admitted blob records; all columns remain digested, including content retained after checkpoint trimming. |
 | `local_blobs` | Local | Staged upload bytes awaiting a durable claim reference. Promotion into `blobs` commits with the referencing claim. |
-| `documents` | Shared projection | Shared immutable name/hash binding and binding_claim_id. created_index is a local arrival cursor; current latest selection must join the binding claim and use canonical order. |
+| `documents` | Shared projection | Shared immutable name/hash binding, binding_claim_id and materialized canonical binding_key. created_index is a local arrival cursor; latest selection and history order use the indexed binding_key. |
 | `desired` | Shared projection | Shared selected declaration, ancestry/conflicts, ownership and full canonical body; existing ancestry/revision/id selection is deterministic and must be preserved. |
 | `idempotency` | Local | Local opaque HTTP/operation response cache with local indexes; shared operation identity is operations plus checkpoint_claims. |
 | `mission_run_requests` | Local | Local original request-hash cache paired with idempotency; run identities in this legacy API are origin-scoped. |
@@ -73,6 +73,11 @@ The temporary tables write_clock, sealed_claims, sealed_envelopes, canonical_ind
 ## Every store_index order
 
 Locations below refer to the audited commit, so later line-number changes do not invalidate the inventory. Shared rows must move to the canonical helper, including commutative enumerations whose returned ordering is observable. Local rows may retain arrival order only for the purpose stated.
+
+Added operational reader `outcome_history` is a local raw terminal-claim history page, using
+the serving node's claim index as its continuation cursor. It does not reduce shared state.
+Its recovered reasons and `mission_overview` reasons use canonical claim ordering; a local
+history cursor is not an exception for choosing a shared reason.
 
 | store.rs line | Function / constant | Scope | Reason |
 | --- | --- | --- | --- |
