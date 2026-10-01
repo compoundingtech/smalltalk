@@ -835,6 +835,16 @@ impl Client {
         ))
         .await
     }
+    pub async fn subject_definition(
+        &self,
+        subject: &str,
+    ) -> Result<Envelope<SubjectDefinition>, ClientError> {
+        self.get(&format!(
+            "/v1/client/subject-definition?subject={}",
+            percent_encode(subject)
+        ))
+        .await
+    }
     pub async fn now_list(
         &self,
         cursor: Option<&str>,
