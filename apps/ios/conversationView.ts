@@ -199,6 +199,8 @@ export function unreadableTranscript(timeline: Entry[]): string | null {
     if (entry.type !== 'error') continue;
     const body = record(entry.body);
     if (str(body.code) !== 'transcript-not-bound') continue;
+    // A seat that has said nothing since it started has no transcript yet; that is not a failure.
+    if (record(body.details).not_yet === true) return null;
     const reason = (str(body.message) ?? '').replace(/^transcript not bound: /, '');
     const path = str(record(body.details).transcript);
     return path ? `This conversation could not be loaded: ${reason} (transcript ${path})` : `This conversation could not be loaded: ${reason}`;
@@ -276,6 +278,10 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
         break;
       }
       case 'error': {
+        if (str(body.code) === 'transcript-not-bound' && record(body.details).not_yet === true) {
+          push(entry, entry.id, { kind: 'event', tone: 'quiet', text: 'nothing in the harness yet since this seat started' });
+          break;
+        }
         const tone = diagnosticTone(body);
         const message = str(body.message) ?? str(body.code) ?? 'st reported a problem';
         push(entry, entry.id, { kind: 'event', tone, text: tone === 'fault' ? `error: ${message}` : message });

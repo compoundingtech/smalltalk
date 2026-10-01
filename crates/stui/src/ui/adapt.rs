@@ -930,6 +930,10 @@ pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
         TimelineBody::Error(error) if error.code == "transcript-not-bound" => Some(error),
         _ => None,
     })?;
+    // A seat that has said nothing since it started has no transcript yet; that is not a failure.
+    if not_yet(error) {
+        return None;
+    }
     let reason = error
         .message
         .strip_prefix("transcript not bound: ")
@@ -942,6 +946,11 @@ pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
             None => format!("This conversation could not be loaded: {reason}"),
         },
     )
+}
+
+/// st's notice that the seat's harness has written nothing since it started.
+fn not_yet(error: &st3_client::TimelineErrorBody) -> bool {
+    error.details.get("not_yet").and_then(Value::as_bool) == Some(true)
 }
 
 /// One conversation: the harness transcript and Small Talk messages, in time order.
@@ -1109,6 +1118,9 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     } else {
                         "delivery failing · retrying".into()
                     })
+                }
+                "transcript-not-bound" if not_yet(error) => {
+                    Body::Event("nothing in the harness yet since this seat started".into())
                 }
                 "native-delivery-recovered" => {
                     delivery.insert(entry.id.clone(), true);
@@ -1965,6 +1977,27 @@ mod tests {
     }
 
     #[test]
+    fn a_seat_that_has_said_nothing_since_it_started_shows_its_small_talk() {
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
+            {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/one","from":"person/avery","to":"agent/example/harbor/keeper","title":"Status?"}},
+            {"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"How is the audit going?"}},
+            {"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
+             "body":{"code":"transcript-not-bound","message":"transcript not bound: Claude session 0190 has no transcript file yet","retryable":true,
+                     "details":{"driver":"claude","not_yet":true}}},
+        ]))
+        .unwrap();
+        assert_eq!(unreadable_transcript(&timeline), None, "nothing is wrong");
+        let entries = conversation(&timeline, &BTreeMap::new());
+        assert!(matches!(&entries[0].body, Body::Mail { subject, .. } if subject == "Status?"));
+        assert!(
+            matches!(&entries[1].body, Body::Event(line) if line == "nothing in the harness yet since this seat started"),
+            "{entries:?}"
+        );
+    }
+
+    #[test]
     fn delivery_pauses_that_recovered_fold_into_one_quiet_line() {
         let diagnostic = |id: &str, at: &str, code: &str, severity: &str, message: &str| {
             json!({"id":id,"sequence":1,"revision":1,"timestamp":at,"role":"system","type":"error","final":true,
@@ -2408,12 +2441,14 @@ mod tests {
     #[test]
     fn a_waiting_human_ask_needs_you_even_while_the_harness_activity_is_working() {
         let mut model = Model::default();
-        let resource = |state: &str, activity: &str, blocked_on: Option<&str>| serde_json::json!({
-            "id": "agent/human-omp", "kind": "agent", "revision": "r1",
-            "updated_at": "2026-09-30T12:00:00Z", "name": "human-omp",
-            "state": state, "reachability": "local", "harness_state": activity,
-            "blocked_on": blocked_on, "runtime_ids": [], "under": [],
-        });
+        let resource = |state: &str, activity: &str, blocked_on: Option<&str>| {
+            serde_json::json!({
+                "id": "agent/human-omp", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-09-30T12:00:00Z", "name": "human-omp",
+                "state": state, "reachability": "local", "harness_state": activity,
+                "blocked_on": blocked_on, "runtime_ids": [], "under": [],
+            })
+        };
         model.agents = window(vec![resource("waiting", "working", Some("human"))]);
         assert_eq!(agents(&model)[0].state, AgentState::NeedsYou);
         model.agents = window(vec![resource("running", "working", None)]);
