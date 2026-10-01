@@ -305,9 +305,11 @@ async fn connected(
     conversing: &mut Vec<Conversing>,
     failures: &mut usize,
 ) -> Ended {
-    // A blackholed network can leave a WebSocket open indefinitely. A bounded read
-    // detects that case even when the graph is idle; it never resends a mutation.
-    let mut probe = tokio::time::interval(Duration::from_secs(15));
+    // A blackholed network, or a wedged daemon, can leave a socket open and silent while the
+    // views say live. A bounded read every 10 s notices, on this host too; one slow answer from
+    // a busy daemon is not enough to drop everything: it is asked again at once, and only two
+    // misses in a row drop the socket. It never resends a mutation.
+    let mut probe = tokio::time::interval(Duration::from_secs(10));
     probe.tick().await;
     // Glasses are followed only where st grants them in the shape this stui reads (splits of
     // tab groups, version 1); elsewhere stui keeps them on the device. A member still on the
@@ -337,6 +339,9 @@ async fn connected(
         }
     }
     let mut windows = BTreeMap::<Window, BTreeMap<String, Resource>>::new();
+    // A window st stopped (its first read failed) is asked for again after a backoff, so a list
+    // never stays stale under a live connection.
+    let mut window_retries = WindowRetries::default();
     if following.is_some() {
         match follow(client, stream, updates, following).await {
             Ok(()) => {}
@@ -349,13 +354,28 @@ async fn connected(
             .iter()
             .filter_map(|current| current.retry_at)
             .min();
+        let window_at = window_retries.next();
         tokio::select! {
-            _ = probe.tick(), if remote => {
-                match tokio::time::timeout(Duration::from_secs(5), client.capabilities()).await {
-                    Ok(Ok(_)) => *failures = 0,
-                    Ok(Err(error)) => return Ended::Dropped(error.to_string()),
-                    Err(_) => return Ended::Dropped("Member stopped answering".into()),
+            _ = probe.tick() => {
+                let mut answered = false;
+                for _ in 0..2 {
+                    match tokio::time::timeout(Duration::from_secs(5), client.capabilities()).await {
+                        Ok(Ok(_)) => {
+                            answered = true;
+                            break;
+                        }
+                        Ok(Err(error)) if !error.is_transient() => return Ended::Dropped(error.plain()),
+                        Ok(Err(_)) | Err(_) => {}
+                    }
                 }
+                if !answered {
+                    return Ended::Dropped(if remote {
+                        "the member stopped answering".into()
+                    } else {
+                        "st stopped answering".into()
+                    });
+                }
+                *failures = 0;
             }
             event = stream.next_event() => {
                 let event = match event {
@@ -368,6 +388,7 @@ async fn connected(
                     CollectionEvent::Snapshot { id, snapshot, items, order, has_more } => {
                         let Some(window) = Window::from_id(&id) else { continue };
                         *failures = 0;
+                        window_retries.loaded(window);
                         let rows = windows.entry(window).or_default();
                         rows.clear();
                         rows.extend(items.into_iter().map(|item| (item.header().id.clone(), item)));
@@ -400,7 +421,8 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
-                    CollectionEvent::Error { id, message, .. } if id.starts_with(CONVERSATION) => {
+                    CollectionEvent::Error { id, code, message } if id.starts_with(CONVERSATION) => {
+                        let message = st3_client::plain_message(code.as_ref(), &message);
                         let Some(current) = conversing.iter_mut().find(|current| current.id == id) else { continue };
                         // Anything may clear: the agent starts, its host comes back, its
                         // history arrives. Ask again after a backoff.
@@ -412,8 +434,12 @@ async fn connected(
                     }
                     CollectionEvent::Error { id, code, message } => {
                         if let Some(window) = Window::from_id(&id) {
-                            if updates.send(Update::WindowFailed(window, message)).is_err() {
-                                return Ended::Closed;
+                            // Said once; the retries are quiet until it loads.
+                            if window_retries.failed(window, Instant::now()) {
+                                let message = st3_client::plain_message(code.as_ref(), &message);
+                                if updates.send(Update::WindowFailed(window, message)).is_err() {
+                                    return Ended::Closed;
+                                }
                             }
                         } else if id == TERMINAL {
                             terminal_failed(updates, following, code, message);
@@ -484,6 +510,13 @@ async fn connected(
                     return Ended::Dropped(error.to_string());
                 }
             }
+            () = tokio::time::sleep_until(window_at.unwrap_or_else(Instant::now)), if window_at.is_some() => {
+                for window in window_retries.due(Instant::now()) {
+                    if let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None).await {
+                        return Ended::Dropped(error.to_string());
+                    }
+                }
+            }
             () = tokio::time::sleep_until(converse_at.unwrap_or_else(Instant::now)), if converse_at.is_some() => {
                 let now = Instant::now();
                 for current in conversing.iter_mut().filter(|current| current.retry_at.is_some_and(|at| at <= now)) {
@@ -493,6 +526,51 @@ async fn connected(
                 }
             }
         }
+    }
+}
+
+/// Windows st stopped sending, and when to ask for each again.
+#[derive(Default)]
+struct WindowRetries {
+    failures: BTreeMap<Window, usize>,
+    at: BTreeMap<Window, Instant>,
+}
+
+impl WindowRetries {
+    /// `window` failed: ask again after a wait that grows with each failure. Whether this is
+    /// its first failure since it last loaded, the one worth telling the person about.
+    fn failed(&mut self, window: Window, now: Instant) -> bool {
+        let failures = self.failures.entry(window).or_default();
+        self.at.insert(
+            window,
+            now + RETRY_DELAYS[(*failures).min(RETRY_DELAYS.len() - 1)],
+        );
+        *failures += 1;
+        *failures == 1
+    }
+
+    fn loaded(&mut self, window: Window) {
+        self.failures.remove(&window);
+        self.at.remove(&window);
+    }
+
+    /// When the next window is due.
+    fn next(&self) -> Option<Instant> {
+        self.at.values().min().copied()
+    }
+
+    /// The windows due by `now`, each taken off until it fails again.
+    fn due(&mut self, now: Instant) -> Vec<Window> {
+        let due = self
+            .at
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(window, _)| *window)
+            .collect::<Vec<_>>();
+        for window in &due {
+            self.at.remove(window);
+        }
+        due
     }
 }
 
@@ -530,25 +608,27 @@ fn terminal_failed(
         return;
     };
     current.attachment_id = None;
+    let plain = st3_client::plain_message(code.as_ref(), &message);
     let update = match code {
-        Some(ErrorCode::StaleFence) => {
-            *following = None;
-            TerminalUpdate::Ended {
-                restarted: true,
-                reason: "Terminal restarted".into(),
-            }
-        }
-        Some(ErrorCode::Internal | ErrorCode::RemoteUnavailable | ErrorCode::RateLimited) => {
+        // st also says stale-fence when the owner is briefly out of reach or the viewer idled:
+        // follow again, and the attach itself refuses a terminal that really restarted.
+        Some(
+            ErrorCode::StaleFence
+            | ErrorCode::Internal
+            | ErrorCode::RemoteUnavailable
+            | ErrorCode::RateLimited
+            | ErrorCode::RuntimeAuthorityIndeterminate,
+        ) => {
             current.retry_at =
                 Some(Instant::now() + RETRY_DELAYS[current.failures.min(RETRY_DELAYS.len() - 1)]);
             current.failures += 1;
-            TerminalUpdate::Reconnecting(message)
+            TerminalUpdate::Reconnecting(plain)
         }
         _ => {
             *following = None;
             TerminalUpdate::Ended {
                 restarted: false,
-                reason: message,
+                reason: plain,
             }
         }
     };
@@ -677,7 +757,10 @@ async fn resolve(client: &Client, runtime_ids: &[String]) -> Result<(String, Str
     Err("that agent has no terminal right now".into())
 }
 
-/// `terminal.attach` with a fresh fence, retried on `stale-fence` three times. With `expected`,
+/// How many times a fenced terminal request is tried while it races a busy store.
+const FENCE_TRIES: u32 = 8;
+
+/// `terminal.attach` with a fresh fence, retried on `stale-fence` with a growing pause. With `expected`,
 /// a runtime now on another incarnation is a restart rather than something to attach to.
 async fn attach(
     client: &Client,
@@ -685,7 +768,7 @@ async fn attach(
     terminal_id: &str,
     expected: Option<&str>,
 ) -> Result<st3_client::TerminalAttachment, Refusal> {
-    for attempt in 0..3 {
+    for attempt in 0..FENCE_TRIES {
         let current = client
             .runtimes_get(runtime_id)
             .await
@@ -726,7 +809,10 @@ async fn attach(
                     .terminal_attachment
                     .ok_or_else(|| Refusal::Failed("st attached no viewer".into()));
             }
-            Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
+            Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt + 1 < FENCE_TRIES => {
+                tokio::time::sleep(Duration::from_millis(25 << attempt)).await;
+                continue;
+            }
             Err(error) => return Err(Refusal::Failed(error.to_string())),
         }
     }
@@ -735,14 +821,14 @@ async fn attach(
     ))
 }
 
-/// End a viewer record with a fresh fence, retried on `stale-fence` three times.
+/// End a viewer record with a fresh fence, retried on `stale-fence` with a growing pause.
 pub async fn detach(
     client: &Client,
     terminal_id: &str,
     attachment_id: &str,
     incarnation: &str,
 ) -> anyhow::Result<()> {
-    for attempt in 0..3 {
+    for attempt in 0..FENCE_TRIES {
         let fence = crate::terminal_fence(client, terminal_id, incarnation).await?;
         let (id, key) = crate::action_pair();
         match client
@@ -758,7 +844,10 @@ pub async fn detach(
             .await
         {
             Ok(_) => return Ok(()),
-            Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
+            Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt + 1 < FENCE_TRIES => {
+                tokio::time::sleep(Duration::from_millis(25 << attempt)).await;
+                continue;
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -791,25 +880,50 @@ mod tests {
     }
 
     #[test]
-    fn stale_fence_ends_following_as_a_restart_and_never_reattaches() {
+    fn a_window_st_stopped_is_asked_for_again_after_a_growing_wait() {
+        let mut retries = WindowRetries::default();
+        let start = Instant::now();
+        assert!(
+            retries.failed(Window::Agents, start),
+            "the first failure is said"
+        );
+        assert_eq!(retries.next(), Some(start + RETRY_DELAYS[0]));
+        assert!(retries.due(start).is_empty());
+        assert_eq!(retries.due(start + RETRY_DELAYS[0]), vec![Window::Agents]);
+        assert_eq!(retries.next(), None, "asked again; it waits for an answer");
+        assert!(
+            !retries.failed(Window::Agents, start),
+            "later failures are quiet"
+        );
+        assert_eq!(retries.next(), Some(start + RETRY_DELAYS[1]));
+        retries.loaded(Window::Agents);
+        assert_eq!(retries.next(), None);
+        assert!(
+            retries.failed(Window::Agents, start),
+            "after loading, a failure is said again"
+        );
+    }
+
+    #[test]
+    fn stale_fence_on_the_stream_follows_again_and_the_attach_decides_if_it_restarted() {
+        // st says stale-fence for an owner briefly out of reach or a viewer that idled, not only
+        // for a restart: stui follows again, and `attach` refuses a changed incarnation.
         let (tx, rx) = mpsc::channel();
         let mut current = following();
         terminal_failed(
             &tx,
             &mut current,
             Some(ErrorCode::StaleFence),
-            "stale".into(),
+            "the terminal owner is not reachable".into(),
         );
         assert!(
-            current.is_none(),
-            "a restart is never followed again on its own"
+            current
+                .as_ref()
+                .is_some_and(|state| state.retry_at.is_some())
         );
         assert!(matches!(
             terminal_update(&rx),
-            TerminalUpdate::Ended {
-                restarted: true,
-                ..
-            }
+            TerminalUpdate::Reconnecting(reason) if !reason.contains("StaleFence")
         ));
     }
 
@@ -844,7 +958,7 @@ mod tests {
         assert!(current.is_none(), "a refusal is not retried");
         assert!(matches!(
             terminal_update(&rx),
-            TerminalUpdate::Ended { restarted: false, reason } if reason == "no"
+            TerminalUpdate::Ended { restarted: false, reason } if reason == "not allowed: no"
         ));
     }
 

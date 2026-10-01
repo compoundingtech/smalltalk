@@ -2155,7 +2155,8 @@ async fn send_terminal_key(
     key: KeyEvent,
 ) -> Result<()> {
     if let Some(value) = key_input(key) {
-        for attempt in 0..3 {
+        // A key races a busy store's fence; a fresh read and a short pause usually land it.
+        for attempt in 0..8 {
             let fence = terminal_fence(client, terminal_id, incarnation).await?;
             let (id, idem) = action_pair();
             match client
@@ -2172,7 +2173,9 @@ async fn send_terminal_key(
                 .await
             {
                 Ok(_) => break,
-                Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
+                Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 7 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25 << attempt)).await;
+                }
                 Err(error) => return Err(error.into()),
             }
         }
