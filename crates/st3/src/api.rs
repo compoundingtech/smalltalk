@@ -14035,11 +14035,11 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
             router(state(root.path())),
             "/v1/launches",
             serde_json::to_value(PlanningSessionStartRequest {
-                mission: "fleet/example/planned".into(),
+                mission: "example/planned".into(),
                 run: None,
                 request: b"Plan a harmless task.".to_vec(),
                 workspace: workspace.display().to_string(),
-                requester: Some("agent/fleet/example/chief".into()),
+                requester: Some("agent/example/chief".into()),
                 provider: None,
                 model: None,
                 effort: None,
@@ -14049,7 +14049,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{started}");
-        assert_eq!(started["requester"], "agent/fleet/example/chief");
+        assert_eq!(started["requester"], "agent/example/chief");
     }
 
     #[tokio::test]
