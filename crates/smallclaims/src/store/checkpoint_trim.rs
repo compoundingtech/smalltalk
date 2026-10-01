@@ -9,14 +9,14 @@
 
 use super::checkpoint::{
     CheckpointManifest, ClaimTombstone, EnvelopeTombstone, checkpoint_name, delete_dropped_rows_tx,
-    plan_drops, record_checkpoint_tombstones_tx, verify_checkpoint_manifest,
+    record_checkpoint_tombstones_tx, verify_checkpoint_manifest,
 };
 use super::checkpoint_agreement::{
     Certificate, CheckpointAction, CheckpointClaim, certificates, chosen_certificate,
     stable_checkpoints,
 };
 use super::*;
-use crate::model::InventoryCheckpoint;
+use crate::replication::InventoryCheckpoint;
 
 /// Envelopes deleted per transaction, so a trim never holds the writer for long.
 pub const TRIM_CHUNK_ENVELOPES: usize = 2_000;
@@ -45,7 +45,7 @@ pub struct CheckpointManifestNeed {
     pub drop_digest: String,
 }
 
-fn local_checkpoint(
+pub fn local_checkpoint(
     connection: &Connection,
     checkpoint: &str,
 ) -> Result<Option<(String, Option<i64>)>> {
@@ -61,7 +61,7 @@ fn local_checkpoint(
 /// Whether this node has applied the certificate with `drop_digest` for the cut, or anything
 /// newer, or set the cut aside. A node that applied the other side's certificate for the same
 /// cut has not applied this one.
-fn applied(connection: &Connection, cut_unix_ms: u128, drop_digest: &str) -> Result<bool> {
+pub fn applied(connection: &Connection, cut_unix_ms: u128, drop_digest: &str) -> Result<bool> {
     Ok(connection
         .query_row(
             "SELECT 1 FROM checkpoints
@@ -77,7 +77,7 @@ fn applied(connection: &Connection, cut_unix_ms: u128, drop_digest: &str) -> Res
 }
 
 /// Delete every tombstone that is not among `envelopes` and `claims`.
-fn keep_only_tombstones_tx(
+pub fn keep_only_tombstones_tx(
     transaction: &Transaction<'_>,
     envelopes: &[EnvelopeTombstone],
     claims: &[ClaimTombstone],
@@ -122,7 +122,7 @@ fn keep_only_tombstones_tx(
 }
 
 /// How this node applies the newest stable checkpoint.
-enum Application {
+pub enum Application {
     /// It already did.
     Done,
     /// It verified the certificate every node applies, so it trims from its own plan.
@@ -151,7 +151,7 @@ impl Store {
     }
 
     /// Apply a graph fault a test armed, inside the first chunk's transaction.
-    fn alter_graph_for_trim_fault(&self, transaction: &Transaction<'_>) -> Result<()> {
+    pub fn alter_graph_for_trim_fault(&self, transaction: &Transaction<'_>) -> Result<()> {
         let mut fault = self
             .trim_fault
             .lock()
@@ -174,7 +174,7 @@ impl Store {
         Ok(())
     }
 
-    fn stop_for_trim_fault(&self, at: TrimFault) -> Result<()> {
+    pub fn stop_for_trim_fault(&self, at: TrimFault) -> Result<()> {
         let mut fault = self
             .trim_fault
             .lock()
@@ -186,7 +186,7 @@ impl Store {
         Ok(())
     }
 
-    fn newest_application(&self, claims: &[CheckpointClaim]) -> Result<Option<Application>> {
+    pub fn newest_application(&self, claims: &[CheckpointClaim]) -> Result<Option<Application>> {
         let stable = stable_checkpoints(claims);
         let Some((cut, certificates)) = stable.into_iter().next_back() else {
             return Ok(None);
@@ -221,7 +221,7 @@ impl Store {
     /// or report that it needs that certificate's manifest. Until it is applied, this node must
     /// not verify a newer checkpoint, because every node trims the same checkpoints in the same
     /// order.
-    pub(super) fn apply_stable_checkpoints(
+    pub fn apply_stable_checkpoints(
         &self,
         claims: &[CheckpointClaim],
         actions: &mut Vec<CheckpointAction>,
@@ -246,7 +246,7 @@ impl Store {
             }) => {
                 let cut = certificate.terms.cut_unix_ms;
                 let sealed = self.checkpoint_sealed_set_through(cut, Some(seal_rowid))?;
-                let plan = plan_drops(&sealed);
+                let plan = self.runtime.plan_checkpoint_drops(&sealed);
                 if plan.sealed_digest == certificate.terms.sealed_digest
                     && plan.drop_digest == certificate.terms.drop_digest
                 {
@@ -416,7 +416,7 @@ impl Store {
         Ok(forgotten)
     }
 
-    fn set_checkpoint_state(&self, checkpoint: &str, cut_unix_ms: u128, state: &str) -> Result<()> {
+    pub fn set_checkpoint_state(&self, checkpoint: &str, cut_unix_ms: u128, state: &str) -> Result<()> {
         let connection = self.connection.write();
         connection.execute(
             "INSERT INTO checkpoints(id, cut_unix_ms, state, updated_at_unix_ms)
@@ -433,7 +433,7 @@ impl Store {
         Ok(())
     }
 
-    fn checkpoint_diagnostic(&self, code: &str, reason: &str, checkpoint: &str) -> Result<()> {
+    pub fn checkpoint_diagnostic(&self, code: &str, reason: &str, checkpoint: &str) -> Result<()> {
         self.append_claim(&ClaimInput {
             subject: format!("daemon/{}", self.origin),
             kind: "daemon.diagnostic".into(),
@@ -460,7 +460,7 @@ impl Store {
     /// that applied the other side's certificate for a cut both sides of a partition certified.
     /// Its identities leave the inventory, and peers that kept those envelopes send them again.
     #[allow(clippy::too_many_arguments)]
-    fn trim_checkpoint(
+    pub fn trim_checkpoint(
         &self,
         checkpoint: &str,
         cut_unix_ms: u128,
@@ -502,7 +502,7 @@ impl Store {
     /// Delete every row a tombstone stands for, in chunks, then mark the checkpoint trimmed.
     /// Running it again after a crash deletes only what is left. Each chunk checks, inside its
     /// own transaction, that the graph did not change; the proof showed it cannot.
-    fn finish_trim(&self, checkpoint: &str, actions: &mut Vec<CheckpointAction>) -> Result<()> {
+    pub fn finish_trim(&self, checkpoint: &str, actions: &mut Vec<CheckpointAction>) -> Result<()> {
         let mut chunks = 0;
         let mut deleted_envelopes = 0;
         let mut deleted_claims = 0;

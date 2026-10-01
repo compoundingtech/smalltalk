@@ -13,6 +13,7 @@ pub mod performance;
 pub mod profile;
 pub mod replication;
 pub mod sqlite;
+pub mod store;
 
 pub use claim::{
     ClaimInput, ClaimRecord, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,

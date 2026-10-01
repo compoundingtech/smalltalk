@@ -8,31 +8,7 @@ use super::*;
 use rusqlite::functions::FunctionFlags;
 use sha2::Sha512;
 
-pub(super) const TABLES: &[(&str, &[&str])] = &[
-    ("operations", &[]),
-    ("blobs", &[]),
-    ("documents", &["created_index"]),
-    ("desired", &[]),
-    ("message_index", &["created_index"]),
-    ("mission_revisions", &["created_index"]),
-    ("mission_definitions", &[]),
-    ("mission_runs", &[]),
-    ("mission_run_deadlines", &[]),
-    ("mission_run_after", &[]),
-    ("run_generations", &[]),
-    // These effective timestamps include member-local lease renewals. The underlying durable
-    // claim identity, including its lease timestamps, remains covered by claim_sources.
-    (
-        "step_runs",
-        &["lease_expires_at_unix_ms", "updated_at_unix_ms"],
-    ),
-    ("revision_proposals", &[]),
-    ("planning_sessions", &[]),
-    ("planning_candidates", &[]),
-    ("planning_previews", &[]),
-];
-
-const SCHEMA: &str = "
+pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS projection_digest_state (
     table_name TEXT PRIMARY KEY,
     columns_json TEXT NOT NULL,
@@ -50,7 +26,7 @@ CREATE TABLE IF NOT EXISTS projection_digest_generation (
 );
 INSERT OR IGNORE INTO projection_digest_generation VALUES(1,0);";
 
-fn row_hash(table: &str, columns: &str, row: &str) -> [u8; 64] {
+pub fn row_hash(table: &str, columns: &str, row: &str) -> [u8; 64] {
     let mut hash = Sha512::new();
     hash.update(b"st3-projection-row-v1\0");
     for value in [table, columns, row] {
@@ -60,7 +36,7 @@ fn row_hash(table: &str, columns: &str, row: &str) -> [u8; 64] {
     hash.finalize().into()
 }
 
-fn add(accumulator: &mut [u8; 64], hash: &[u8; 64], subtract: bool) {
+pub fn add(accumulator: &mut [u8; 64], hash: &[u8; 64], subtract: bool) {
     let mut carry = u16::from(subtract);
     for (sum, byte) in accumulator.iter_mut().zip(hash).rev() {
         let byte = if subtract { !byte } else { *byte };
@@ -71,7 +47,7 @@ fn add(accumulator: &mut [u8; 64], hash: &[u8; 64], subtract: bool) {
 }
 
 /// Register before any writes on every writer connection, including checkpoint proof copies.
-pub(super) fn register(connection: &Connection) -> Result<()> {
+pub fn register(connection: &Connection) -> Result<()> {
     // REPLACE deletes its previous row; digest that delete as well as the insertion.
     connection.execute_batch("PRAGMA recursive_triggers=ON;")?;
     connection.create_scalar_function(
@@ -108,7 +84,7 @@ pub(super) fn register(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn columns(connection: &Connection, table: &str, excluded: &[&str]) -> Result<Vec<String>> {
+pub fn columns(connection: &Connection, table: &str, excluded: &[&str]) -> Result<Vec<String>> {
     let mut columns = connection
         .prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -122,7 +98,7 @@ fn columns(connection: &Connection, table: &str, excluded: &[&str]) -> Result<Ve
     Ok(columns)
 }
 
-fn row_sql(columns: &[String], prefix: &str) -> String {
+pub fn row_sql(columns: &[String], prefix: &str) -> String {
     let values = columns
         .iter()
         .map(|column| {
@@ -138,7 +114,7 @@ fn row_sql(columns: &[String], prefix: &str) -> String {
     format!("json_array({values})")
 }
 
-fn change_sql(table: &str, old: &str, new: &str, delta: i32) -> String {
+pub fn change_sql(table: &str, old: &str, new: &str, delta: i32) -> String {
     format!(
         "UPDATE projection_digest_state SET row_count=row_count+({delta}),
         accumulator=st_projection_change(accumulator,table_name,columns_json,{old},{new},1)
@@ -148,9 +124,9 @@ fn change_sql(table: &str, old: &str, new: &str, delta: i32) -> String {
 }
 
 /// Initialize once per registry/schema version. Subsequent opens inspect table schemas only.
-pub(super) fn initialize(connection: &Connection) -> Result<()> {
+pub fn initialize(connection: &Connection, tables: &[(&str, &[&str])]) -> Result<()> {
     connection.execute_batch(SCHEMA)?;
-    let registry = TABLES
+    let registry = tables
         .iter()
         .map(|(table, excluded)| Ok((*table, columns(connection, table, excluded)?)))
         .collect::<Result<Vec<_>>>()?;
@@ -168,8 +144,8 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         })?;
     let trigger_rows: usize=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'projection_digest_%'",[],|row|row.get(0))?;
     if previous.as_deref() == Some(&signature)
-        && state_rows == TABLES.len() + 1
-        && trigger_rows == 3 * (TABLES.len() - 1) + 8 + 8 + 4
+        && state_rows == tables.len() + 1
+        && trigger_rows == 3 * (tables.len() - 1) + 8 + 8 + 4
     {
         return Ok(());
     }
@@ -287,7 +263,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
 
 /// The hot operations table names a retained claim because of its foreign key. Once every
 /// claim of an operation is trimmed, its complete logical row is instead in tombstones.
-fn operation_fallback(operation: &str) -> String {
+pub fn operation_fallback(operation: &str) -> String {
     format!("(SELECT json_array(
         (SELECT MIN(c.id) FROM checkpoint_claims c WHERE c.operation_id={operation}
           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=c.id)
@@ -300,7 +276,7 @@ fn operation_fallback(operation: &str) -> String {
         GROUP BY operation_id)")
 }
 
-pub(super) fn operation_rows() -> String {
+pub fn operation_rows() -> String {
     format!(
         "SELECT json_array(canonical_claim_id,id,request_digest,state) AS row_json FROM operations
         UNION ALL SELECT {} FROM
@@ -311,7 +287,7 @@ pub(super) fn operation_rows() -> String {
     )
 }
 
-fn refresh_operation(operation: &str) -> String {
+pub fn refresh_operation(operation: &str) -> String {
     let previous = format!(
         "(SELECT row_json FROM projection_digest_operation_rows WHERE operation_id={operation})"
     );
@@ -331,7 +307,7 @@ fn refresh_operation(operation: &str) -> String {
         DELETE FROM projection_digest_operation_rows WHERE operation_id={operation} AND {current} IS NULL;")
 }
 
-fn operation_triggers(connection: &Connection, columns: &[String]) -> Result<()> {
+pub fn operation_triggers(connection: &Connection, columns: &[String]) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO projection_digest_operation_rows
@@ -380,7 +356,7 @@ fn operation_triggers(connection: &Connection, columns: &[String]) -> Result<()>
     Ok(())
 }
 
-fn source_query() -> &'static str {
+pub fn source_query() -> &'static str {
     "SELECT json_array(id,accepted_at_unix_ms) FROM (
         SELECT id,accepted_at_unix_ms FROM claims UNION ALL
         SELECT id,CAST(accepted_at_unix_ms AS TEXT) FROM checkpoint_claims
@@ -388,7 +364,7 @@ fn source_query() -> &'static str {
         WHERE NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=sources.id)"
 }
 
-fn repair_source_triggers(connection: &Connection) -> Result<()> {
+pub fn repair_source_triggers(connection: &Connection) -> Result<()> {
     for event in ["INSERT", "UPDATE OF state,claim_id"] {
         let suffix = if event == "INSERT" {
             "insert"
@@ -413,7 +389,7 @@ fn repair_source_triggers(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn scan(
+pub fn scan(
     connection: &Connection,
     table: &str,
     columns: &str,
@@ -434,7 +410,7 @@ fn scan(
     Ok((count, accumulator))
 }
 
-fn seed(connection: &Connection, table: &str, columns: &str, query: &str) -> Result<()> {
+pub fn seed(connection: &Connection, table: &str, columns: &str, query: &str) -> Result<()> {
     let (count, accumulator) = scan(connection, table, columns, query)?;
     connection.execute(
         "INSERT INTO projection_digest_state VALUES(?1,?2,?3,?4)",
@@ -443,7 +419,7 @@ fn seed(connection: &Connection, table: &str, columns: &str, query: &str) -> Res
     Ok(())
 }
 
-fn table_digest(table: &str, columns: &str, count: u64, accumulator: &[u8]) -> String {
+pub fn table_digest(table: &str, columns: &str, count: u64, accumulator: &[u8]) -> String {
     let mut hash = Sha256::new();
     hash.update(b"st3-projection-table-v1\0");
     for value in [table.as_bytes(), columns.as_bytes()] {
@@ -455,7 +431,7 @@ fn table_digest(table: &str, columns: &str, count: u64, accumulator: &[u8]) -> S
     hex::encode(hash.finalize())
 }
 
-pub(super) fn generation(connection: &Connection) -> Result<i64> {
+pub fn generation(connection: &Connection) -> Result<i64> {
     Ok(connection.query_row(
         "SELECT value FROM projection_digest_generation WHERE id=1",
         [],
@@ -463,7 +439,7 @@ pub(super) fn generation(connection: &Connection) -> Result<i64> {
     )?)
 }
 
-pub(super) fn tables(connection: &Connection) -> Result<BTreeMap<String, String>> {
+pub fn tables(connection: &Connection) -> Result<BTreeMap<String, String>> {
     let mut statement = connection.prepare(
         "SELECT table_name,columns_json,row_count,accumulator FROM projection_digest_state ORDER BY table_name")?;
     Ok(statement
@@ -480,7 +456,7 @@ pub(super) fn tables(connection: &Connection) -> Result<BTreeMap<String, String>
         .collect::<rusqlite::Result<_>>()?)
 }
 
-pub(super) fn root(tables: &BTreeMap<String, String>) -> String {
+pub fn root(tables: &BTreeMap<String, String>) -> String {
     let mut hash = Sha256::new();
     hash.update(b"st3-projection-graph-v1\0");
     for (table, digest) in tables {
@@ -491,7 +467,7 @@ pub(super) fn root(tables: &BTreeMap<String, String>) -> String {
     hex::encode(hash.finalize())
 }
 
-pub(super) fn differing(
+pub fn differing(
     local: &BTreeMap<String, String>,
     remote: &BTreeMap<String, String>,
 ) -> Vec<String> {
@@ -505,10 +481,13 @@ pub(super) fn differing(
         .collect()
 }
 
-#[cfg(test)]
-pub(super) fn oracle(connection: &Connection) -> Result<BTreeMap<String, String>> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn oracle(
+    connection: &Connection,
+    tables: &[(&str, &[&str])],
+) -> Result<BTreeMap<String, String>> {
     let mut result = BTreeMap::new();
-    for (table, excluded) in TABLES {
+    for (table, excluded) in tables {
         let columns = columns(connection, table, excluded)?;
         let encoded = serde_json::to_string(&columns)?;
         let (count, accumulator) = scan(

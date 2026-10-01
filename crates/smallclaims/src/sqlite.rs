@@ -11,6 +11,8 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OpenFlags, Transaction};
 
+use crate::store::current_index;
+
 /// Read connections a store keeps open between reads; more open while more reads run at once.
 /// Each caches up to 8 MiB of pages.
 pub const IDLE_READ_CONNECTIONS: usize = 32;
@@ -26,13 +28,13 @@ pub const STATEMENT_CACHE_CAPACITY: usize = 128;
 /// after that commit. `write` lends the connection itself to its caller until the guard drops,
 /// for writes that manage their own transactions. Nothing else ever takes SQLite's write lock.
 pub struct WriterConnection {
-    jobs: Mutex<Option<std::sync::mpsc::Sender<WriterJob>>>,
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    committed_index: Arc<AtomicU64>,
+    pub jobs: Mutex<Option<std::sync::mpsc::Sender<WriterJob>>>,
+    pub thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub committed_index: Arc<AtomicU64>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
     /// Tests read them; `st replication status` counts every commit.
     #[cfg_attr(not(test), allow(dead_code))]
-    batches: Arc<(AtomicU64, AtomicU64)>,
+    pub batches: Arc<(AtomicU64, AtomicU64)>,
 }
 
 pub enum WriterJob {
@@ -61,10 +63,10 @@ pub const WRITE_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_mi
 
 pub struct WriterGuard<'a> {
     pub connection: Option<Connection>,
-    give_back: std::sync::mpsc::SyncSender<Connection>,
-    committed_index: &'a AtomicU64,
+    pub give_back: std::sync::mpsc::SyncSender<Connection>,
+    pub committed_index: &'a AtomicU64,
     /// When profiling, when this thread took the writer.
-    acquired: Option<std::time::Instant>,
+    pub acquired: Option<std::time::Instant>,
 }
 
 impl WriterConnection {
@@ -158,7 +160,7 @@ impl WriterConnection {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn lock(&self) -> Result<WriterGuard<'_>, &'static str> {
         Ok(self.write())
     }
@@ -332,12 +334,12 @@ impl Drop for WriterGuard<'_> {
 /// ever ran at once, keeps up to `IDLE_READ_CONNECTIONS` of them between reads, and closes them
 /// with the store. Reads see the last committed state and, in WAL mode, never wait for the writer.
 pub struct ReadPool {
-    idle: Mutex<Vec<Connection>>,
+    pub idle: Mutex<Vec<Connection>>,
     /// Wakes a read waiting for an idle connection, which happens only when the operating system
     /// refuses another one, for example past the open file limit.
-    returned: Condvar,
-    path: PathBuf,
-    shared_memory: bool,
+    pub returned: Condvar,
+    pub path: PathBuf,
+    pub shared_memory: bool,
 }
 
 pub struct ReadGuard<'a> {

@@ -11,65 +11,65 @@
 //! running report lives between two questions.
 
 use super::*;
-use crate::model::{
+use crate::replication::{
     ClaimRange, ClaimRangeDigest, ClaimSubjectDigest, HealClaim, ReplicationFirstSync,
     ReplicationHealAnswer, ReplicationHealQuery, ReplicationHealReport, ReplicationHealStep,
 };
 
-const CLAIM_RANGE_DOMAIN: &[u8] = b"st3-heal-claim-range-v1\0";
-const CLAIM_SUBJECT_DOMAIN: &[u8] = b"st3-heal-claim-subject-v1\0";
+pub const CLAIM_RANGE_DOMAIN: &[u8] = b"st3-heal-claim-range-v1\0";
+pub const CLAIM_SUBJECT_DOMAIN: &[u8] = b"st3-heal-claim-subject-v1\0";
 
 /// Writer ranges one question narrows by subject.
-const HEAL_RANGE_LIMIT: usize = 64;
+pub const HEAL_RANGE_LIMIT: usize = 64;
 /// Subjects one question lists claims for.
-const HEAL_SUBJECT_LIMIT: usize = 256;
+pub const HEAL_SUBJECT_LIMIT: usize = 256;
 /// Envelopes one swap sends in each direction.
-const HEAL_ENVELOPE_LIMIT: usize = 512;
+pub const HEAL_ENVELOPE_LIMIT: usize = 512;
 /// Rounds of narrowing one heal makes while each round still moves claims.
-const HEAL_ROUND_LIMIT: u32 = 8;
+pub const HEAL_ROUND_LIMIT: u32 = 8;
 /// A heal report older than this belongs to a heal whose worker went away.
-const HEAL_SESSION_STALE_MS: u128 = 10 * 60 * 1000;
+pub const HEAL_SESSION_STALE_MS: u128 = 10 * 60 * 1000;
 
 /// The shortest wait between two heals with one peer, and the longest backoff after heals that
 /// changed nothing.
-pub(super) const HEAL_RETRY_MS: u128 = 60_000;
-const HEAL_BACKOFF_MAX_MS: u128 = 60 * 60 * 1000;
+pub const HEAL_RETRY_MS: u128 = 60_000;
+pub const HEAL_BACKOFF_MAX_MS: u128 = 60 * 60 * 1000;
 
 /// A replay from nothing holds the store for as long as it takes, 41 seconds on a 2 GB store, so
 /// a node replays for heals at most this often, and half as often after each replay that did not
 /// make the graphs agree.
-const HEAL_REPLAY_BACKOFF_MS: u128 = if cfg!(test) { 0 } else { 10 * 60 * 1000 };
-const HEAL_REPLAY_BACKOFF_MAX_MS: u128 = 24 * 60 * 60 * 1000;
+pub const HEAL_REPLAY_BACKOFF_MS: u128 = if cfg!(test) { 0 } else { 10 * 60 * 1000 };
+pub const HEAL_REPLAY_BACKOFF_MAX_MS: u128 = 24 * 60 * 60 * 1000;
 
 /// The claims a projection reads: every claim with its batch, except repaired originals.
-const PROJECTED_CLAIMS: &str = "FROM claims JOIN batches ON batches.id=claims.batch_id
+pub const PROJECTED_CLAIMS: &str = "FROM claims JOIN batches ON batches.id=claims.batch_id
      WHERE NOT EXISTS (
          SELECT 1 FROM replica_records
          WHERE replica_records.claim_id=claims.id AND replica_records.state='repaired'
      )";
 
 #[derive(Default)]
-pub(super) struct HealState {
+pub struct HealState {
     /// When this node last replayed its graph for a heal, and how long it waits until the next.
-    replayed_at_unix_ms: Option<u128>,
-    replay_backoff_ms: u128,
+    pub replayed_at_unix_ms: Option<u128>,
+    pub replay_backoff_ms: u128,
     /// Each heal this node is asking, by peer.
-    sessions: BTreeMap<String, HealSession>,
+    pub sessions: BTreeMap<String, HealSession>,
 }
 
 #[derive(Default)]
-struct HealSession {
-    report: ReplicationHealReport,
-    rounds: u32,
+pub struct HealSession {
+    pub report: ReplicationHealReport,
+    pub rounds: u32,
     /// The claims the last swap asked for, to check that they arrived.
-    wanted: Vec<HealClaim>,
+    pub wanted: Vec<HealClaim>,
     /// This node asked the peer to replay.
-    asked_replay: bool,
+    pub asked_replay: bool,
 }
 
 /// How long divergence lasts before a heal starts. `ST3_REPLICATION_HEAL_AFTER_MS` changes it,
 /// for example to watch a divergence before it heals.
-fn heal_after_ms() -> u128 {
+pub fn heal_after_ms() -> u128 {
     static AFTER: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
     *AFTER.get_or_init(|| {
         std::env::var("ST3_REPLICATION_HEAL_AFTER_MS")
@@ -83,7 +83,7 @@ impl PeerSyncProgress {
     /// Whether a heal with this peer should start now. The graphs must have differed since
     /// longer than a peer takes to project what it stored, unless `now_or_never` says this
     /// comparison ends a first sync, which checks at once. Returns true once per backoff.
-    pub(super) fn heal_due(&mut self, now: u128, now_or_never: bool) -> bool {
+    pub fn heal_due(&mut self, now: u128, now_or_never: bool) -> bool {
         let Some(since) = self.graph_differs_since_unix_ms else {
             return false;
         };
@@ -99,7 +99,7 @@ impl PeerSyncProgress {
         true
     }
 
-    pub(super) fn finish_heal(&mut self, report: &ReplicationHealReport) {
+    pub fn finish_heal(&mut self, report: &ReplicationHealReport) {
         let moved = report.refetched + report.pushed != 0 || report.replayed;
         self.heal_backoff_ms = if report.healed || moved {
             HEAL_RETRY_MS
@@ -420,7 +420,7 @@ impl Store {
 
     /// End a mixed-build first sync at a verified equal wire log. Projection equality is
     /// deliberately left unasserted until both members have the same registry.
-    pub(super) fn observe_first_sync_log(
+    pub fn observe_first_sync_log(
         &self,
         peer: &str,
         envelopes: u64,
@@ -447,7 +447,7 @@ impl Store {
 
     /// Record one graph comparison with `peer` for the first sync. Returns true when the graphs
     /// differ at the end of a first sync, which heals at once.
-    pub(super) fn observe_first_sync(
+    pub fn observe_first_sync(
         &self,
         peer: &str,
         equal: bool,
@@ -492,7 +492,7 @@ impl Store {
         }
     }
 
-    fn heal_graph_equal(
+    pub fn heal_graph_equal(
         &self,
         legacy: &str,
         projections: &BTreeMap<String, String>,
@@ -506,7 +506,7 @@ impl Store {
     }
 
     /// Update the running report of the heal this node asks `peer`, starting one if none runs.
-    fn heal_session<T>(&self, peer: &str, update: impl FnOnce(&mut HealSession) -> T) -> T {
+    pub fn heal_session<T>(&self, peer: &str, update: impl FnOnce(&mut HealSession) -> T) -> T {
         let now = now_ms();
         let mut state = self.heal.lock().unwrap_or_else(PoisonError::into_inner);
         let session = state.sessions.entry(peer.to_owned()).or_default();
@@ -522,7 +522,7 @@ impl Store {
         update(session)
     }
 
-    fn finish_heal(
+    pub fn finish_heal(
         &self,
         peer: &str,
         healed: bool,
@@ -573,13 +573,13 @@ impl Store {
         Ok(ReplicationHealStep::Done { report })
     }
 
-    fn current_graph_digest_tx(&self, connection: &Connection) -> Result<String> {
+    pub fn current_graph_digest_tx(&self, connection: &Connection) -> Result<String> {
         graph_digest(connection)
     }
 
     /// Replay the graph from nothing for a heal, unless this node's replay backoff has not
     /// passed. Returns whether it replayed.
-    fn replay_graph_for_heal(&self) -> Result<bool> {
+    pub fn replay_graph_for_heal(&self) -> Result<bool> {
         let now = now_ms();
         {
             let state = self.heal.lock().unwrap_or_else(PoisonError::into_inner);
@@ -600,7 +600,7 @@ impl Store {
     /// Store envelopes a peer sent for a heal and admit them again, then project. An envelope
     /// counts only when its payload is the one its hash names; it replaces this node's copy,
     /// which a hash-checked copy cannot make worse.
-    fn readmit_envelopes(&self, relay: &str, envelopes: &[ReplicaEnvelope]) -> Result<()> {
+    pub fn readmit_envelopes(&self, relay: &str, envelopes: &[ReplicaEnvelope]) -> Result<()> {
         if envelopes.is_empty() {
             return Ok(());
         }
@@ -691,7 +691,7 @@ impl Store {
     }
 
     /// The envelopes of `identities` this node holds; one it no longer holds is left out.
-    fn held_envelopes<'a>(
+    pub fn held_envelopes<'a>(
         &self,
         identities: impl IntoIterator<Item = &'a ReplicaEnvelopeId>,
     ) -> Result<Vec<ReplicaEnvelope>> {
@@ -713,7 +713,7 @@ impl Store {
     }
 
     /// How many claims of `envelopes` this node projects, and what it cannot admit, by reason.
-    fn envelope_claim_states(
+    pub fn envelope_claim_states(
         &self,
         envelopes: &[ReplicaEnvelope],
     ) -> Result<(u64, Option<String>)> {
@@ -752,7 +752,7 @@ impl Store {
     }
 
     /// How many of `claims` this node now projects, and the rest by reason.
-    fn projected_claims_among(&self, claims: &[HealClaim]) -> Result<(u64, Option<String>)> {
+    pub fn projected_claims_among(&self, claims: &[HealClaim]) -> Result<(u64, Option<String>)> {
         let connection = self.readers.get();
         let mut projected = connection.prepare(
             "SELECT 1 FROM claims WHERE id=?1 AND NOT EXISTS (
@@ -789,7 +789,7 @@ impl Store {
     }
 }
 
-fn describe_claim_counts(counts: &BTreeMap<String, u64>) -> Option<String> {
+pub fn describe_claim_counts(counts: &BTreeMap<String, u64>) -> Option<String> {
     let total = counts.values().sum::<u64>();
     (total != 0).then(|| {
         format!(
@@ -804,7 +804,7 @@ fn describe_claim_counts(counts: &BTreeMap<String, u64>) -> Option<String> {
     })
 }
 
-fn first_sync_tx(connection: &Connection) -> Result<Option<ReplicationFirstSync>> {
+pub fn first_sync_tx(connection: &Connection) -> Result<Option<ReplicationFirstSync>> {
     let value = connection
         .query_row("SELECT value FROM meta WHERE key='first_sync'", [], |row| {
             row.get::<_, String>(0)
@@ -813,7 +813,7 @@ fn first_sync_tx(connection: &Connection) -> Result<Option<ReplicationFirstSync>
     Ok(value.and_then(|value| serde_json::from_str(&value).ok()))
 }
 
-fn save_first_sync(connection: &Connection, first: &ReplicationFirstSync) -> Result<()> {
+pub fn save_first_sync(connection: &Connection, first: &ReplicationFirstSync) -> Result<()> {
     connection.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('first_sync', ?1)",
         [serde_json::to_string(first)?],
@@ -821,20 +821,20 @@ fn save_first_sync(connection: &Connection, first: &ReplicationFirstSync) -> Res
     Ok(())
 }
 
-fn digest_claim(digest: &mut Sha256, sequence: u64, claim_id: &str) {
+pub fn digest_claim(digest: &mut Sha256, sequence: u64, claim_id: &str) {
     digest.update(sequence.to_be_bytes());
     digest.update((claim_id.len() as u64).to_be_bytes());
     digest.update(claim_id.as_bytes());
 }
 
-fn new_digest(domain: &[u8]) -> Sha256 {
+pub fn new_digest(domain: &[u8]) -> Sha256 {
     let mut digest = Sha256::new();
     digest.update(domain);
     digest
 }
 
 /// One claim of `range_claims`.
-fn projected_claim(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealClaim> {
+pub fn projected_claim(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealClaim> {
     Ok(HealClaim {
         writer: row.get(0)?,
         sequence: row.get(1)?,
@@ -845,7 +845,7 @@ fn projected_claim(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealClaim> {
 }
 
 /// The digest of the claims this node projects from each writer range, in range order.
-fn claim_ranges(connection: &Connection) -> Result<Vec<ClaimRangeDigest>> {
+pub fn claim_ranges(connection: &Connection) -> Result<Vec<ClaimRangeDigest>> {
     let mut statement = connection.prepare(&format!(
         "SELECT batches.origin, batches.replica_sequence, claims.id {PROJECTED_CLAIMS}
          ORDER BY batches.origin, batches.replica_sequence, claims.id"
@@ -888,7 +888,7 @@ fn claim_ranges(connection: &Connection) -> Result<Vec<ClaimRangeDigest>> {
 }
 
 /// The claims this node projects from one writer range, in sequence and claim order.
-fn range_claims(connection: &Connection, range: &ClaimRange) -> Result<Vec<HealClaim>> {
+pub fn range_claims(connection: &Connection, range: &ClaimRange) -> Result<Vec<HealClaim>> {
     let mut statement = connection.prepare_cached(&format!(
         "SELECT batches.origin, batches.replica_sequence, claims.id, claims.subject,
                 (SELECT envelope_hash FROM replica_envelopes
@@ -912,7 +912,7 @@ fn range_claims(connection: &Connection, range: &ClaimRange) -> Result<Vec<HealC
 }
 
 /// The digest of the claims this node projects about each subject within `ranges`.
-fn claim_subjects(
+pub fn claim_subjects(
     connection: &Connection,
     ranges: &[ClaimRange],
 ) -> Result<Vec<ClaimSubjectDigest>> {
@@ -940,7 +940,7 @@ fn claim_subjects(
 }
 
 /// The claims this node projects about `subjects` within `ranges`.
-fn claims_in(
+pub fn claims_in(
     connection: &Connection,
     ranges: &[ClaimRange],
     subjects: &BTreeSet<String>,
@@ -957,7 +957,7 @@ fn claims_in(
 }
 
 /// The ranges whose digests differ or that only one side has.
-fn differing_ranges(local: &[ClaimRangeDigest], peer: &[ClaimRangeDigest]) -> Vec<ClaimRange> {
+pub fn differing_ranges(local: &[ClaimRangeDigest], peer: &[ClaimRangeDigest]) -> Vec<ClaimRange> {
     let index = |ranges: &[ClaimRangeDigest]| {
         ranges
             .iter()
@@ -979,7 +979,7 @@ fn differing_ranges(local: &[ClaimRangeDigest], peer: &[ClaimRangeDigest]) -> Ve
 }
 
 /// The subjects whose digests differ, or that only one side has, in any range.
-fn differing_subjects(local: &[ClaimSubjectDigest], peer: &[ClaimSubjectDigest]) -> Vec<String> {
+pub fn differing_subjects(local: &[ClaimSubjectDigest], peer: &[ClaimSubjectDigest]) -> Vec<String> {
     let index = |subjects: &[ClaimSubjectDigest]| {
         subjects
             .iter()
