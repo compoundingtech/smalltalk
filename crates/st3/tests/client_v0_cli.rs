@@ -2340,6 +2340,294 @@ async fn serve_creation_api(
     (socket, server)
 }
 
+async fn agent_declaration(socket: &Path, subject: &str) -> st3::model::DesiredSubject {
+    let client = st3::client::Client::unix(socket);
+    let status: st3::model::StatusResponse = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(subject)
+        ))
+        .await
+        .unwrap();
+    let token = status.subjects[0].desired_token.as_ref().unwrap();
+    let claim: st3::model::ClaimRecord = client
+        .get(&format!("/v1/claims/by-id/{token}"))
+        .await
+        .unwrap();
+    serde_json::from_value(claim.body).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_start_preserves_command_declarations_and_refuses_harness_options() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, server) = serve_creation_api(root.path(), None).await;
+    for (name, launch) in [
+        ("command", r#"command "omp --model original""#),
+        ("argv", r#"argv "omp" "--model" "original""#),
+    ] {
+        let source = root.path().join(format!("{name}.kdl"));
+        std::fs::write(
+            &source,
+            format!(
+                "version 2\nhost \"remote\" {{\n agent \"{name}\" {{\n\
+                 workspace \"/original\"\n restart never\n {launch}\n\
+                 env {{ ORIGINAL \"kept\" }}\n }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        value(
+            &run_cli(
+                &socket,
+                &[
+                    "agents",
+                    "apply",
+                    source.to_str().unwrap(),
+                    "--as",
+                    "person/avery",
+                ],
+            )
+            .await,
+        );
+        let subject = format!("agent/remote.{name}");
+        let original = agent_declaration(&socket, &subject).await;
+        for stopped in [false, true] {
+            if stopped {
+                value(
+                    &run_cli(
+                        &socket,
+                        &["agents", "stop", &subject, "--as", "person/avery"],
+                    )
+                    .await,
+                );
+            }
+            let preview = run_cli(
+                &socket,
+                &[
+                    "agents",
+                    "start",
+                    &subject,
+                    "--as",
+                    "person/avery",
+                    "--print-kdl",
+                ],
+            )
+            .await;
+            assert!(preview.status.success(), "{preview:?}");
+            let intent =
+                st3::parse_intent(&String::from_utf8(preview.stdout).unwrap(), "client-v0-cli")
+                    .unwrap();
+            assert_eq!(intent.subjects[&subject].member, original.member);
+            value(
+                &run_cli(
+                    &socket,
+                    &["agents", "start", &subject, "--as", "person/avery"],
+                )
+                .await,
+            );
+            assert_eq!(
+                agent_declaration(&socket, &subject).await.member,
+                original.member
+            );
+        }
+        for option in ["--model", "--effort", "--arg"] {
+            let rejected = run_cli(
+                &socket,
+                &[
+                    "agents",
+                    "start",
+                    &subject,
+                    "--as",
+                    "person/avery",
+                    option,
+                    "new",
+                ],
+            )
+            .await;
+            assert!(!rejected.status.success(), "{rejected:?}");
+            let error = String::from_utf8(rejected.stderr).unwrap();
+            assert!(
+                error.contains(name) && error.contains("typed harness"),
+                "{error}"
+            );
+            assert_eq!(
+                agent_declaration(&socket, &subject).await.member,
+                original.member
+            );
+        }
+        value(
+            &run_cli(
+                &socket,
+                &[
+                    "agents",
+                    "start",
+                    &subject,
+                    "--as",
+                    "person/avery",
+                    "--host",
+                    "moved",
+                    "--workspace",
+                    root.path().to_str().unwrap(),
+                ],
+            )
+            .await,
+        );
+        let moved = agent_declaration(&socket, &subject).await;
+        let mut expected = original.member.unwrap();
+        expected.host = "moved".into();
+        expected.workspace = root.path().to_str().unwrap().into();
+        expected.cwd = expected.workspace.clone();
+        assert_eq!(moved.member, Some(expected));
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_start_patches_only_explicit_typed_harness_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, server) = serve_creation_api(root.path(), None).await;
+    let source = root.path().join("harness.kdl");
+    std::fs::write(
+        &source,
+        "version 2\nagent \"example/typed\" {\n host \"remote\"\n\
+         workspace \"/original\"\n restart never\n env { ORIGINAL \"kept\" }\n\
+         harness omp { model \"old\"; effort \"low\"; args \"--old\" }\n}\n",
+    )
+    .unwrap();
+    value(
+        &run_cli(
+            &socket,
+            &[
+                "agents",
+                "apply",
+                source.to_str().unwrap(),
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await,
+    );
+    let subject = "agent/example/typed";
+    let original = agent_declaration(&socket, subject).await;
+    for (option, model, effort, arguments, driver) in [
+        (vec![], "old", "low", vec!["--old"], "omp"),
+        (vec!["--model", "new"], "new", "low", vec!["--old"], "omp"),
+        (
+            vec!["--effort", "high"],
+            "new",
+            "high",
+            vec!["--old"],
+            "omp",
+        ),
+        (
+            vec!["--arg=--new", "--arg", "value"],
+            "new",
+            "high",
+            vec!["--new", "value"],
+            "omp",
+        ),
+        (
+            vec!["--harness", "pi"],
+            "new",
+            "high",
+            vec!["--new", "value"],
+            "pi",
+        ),
+    ] {
+        let mut args = vec!["agents", "start", subject, "--as", "person/avery"];
+        args.extend(option.iter().copied());
+        value(&run_cli(&socket, &args).await);
+        let current = agent_declaration(&socket, subject).await;
+        let member = current.member.unwrap();
+        let previous = original.member.as_ref().unwrap();
+        assert_eq!(member.host, previous.host);
+        assert_eq!(member.workspace, previous.workspace);
+        assert_eq!(member.restart, previous.restart);
+        assert_eq!(member.environment, previous.environment);
+        let nodes = current.desired["children"].as_array().unwrap();
+        let harness = nodes.iter().find(|node| node["name"] == "harness").unwrap();
+        let children = harness["children"].as_array().unwrap();
+        let field =
+            |name: &str| &children.iter().find(|node| node["name"] == name).unwrap()["arguments"];
+        assert_eq!(field("model"), &serde_json::json!([model]));
+        assert_eq!(field("effort"), &serde_json::json!([effort]));
+        assert_eq!(field("args"), &serde_json::json!(arguments));
+        assert_eq!(harness["arguments"][0], driver);
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_start_accepts_explicit_identity_and_rejects_doubled_prefixes() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, server) = serve_creation_api(root.path(), None).await;
+    for (identity, subject) in [
+        ("example/worker", "agent/example/worker"),
+        ("agent/example/worker", "agent/example/worker"),
+        ("worker", "agent/placement.worker"),
+        ("agent/other.worker", "agent/other.worker"),
+    ] {
+        let output = run_cli(
+            &socket,
+            &[
+                "agents",
+                "start",
+                identity,
+                "--host",
+                "placement",
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await;
+        let applied = value(&output);
+        assert!(
+            applied["subject_tokens"].get(subject).is_some(),
+            "{identity}: {applied}"
+        );
+        let preview = run_cli(
+            &socket,
+            &[
+                "agents",
+                "start",
+                identity,
+                "--host",
+                "placement",
+                "--as",
+                "person/avery",
+                "--print-kdl",
+            ],
+        )
+        .await;
+        assert!(preview.status.success());
+        let kdl = String::from_utf8(preview.stdout).unwrap();
+        let intent = st3::parse_intent(&kdl, "client-v0-cli").unwrap();
+        assert!(intent.subjects.contains_key(subject), "{kdl}");
+    }
+    for preview in [false, true] {
+        let mut args = vec![
+            "agents",
+            "start",
+            "agent/agent/example/accidental",
+            "--as",
+            "person/avery",
+        ];
+        if preview {
+            args.push("--print-kdl");
+        }
+        let output = run_cli(&socket, &args).await;
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("agent/agent/"), "{error}");
+        assert!(error.contains("ID or agent/ID"), "{error}");
+    }
+    let agents = value(&run_cli(&socket, &["agents", "ls", "--all"]).await);
+    assert!(
+        !agents.to_string().contains("accidental"),
+        "rejected identity created a seat: {agents}"
+    );
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json() {
     for (harness, json) in [

@@ -9,10 +9,14 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, State, OriginalUri, Query};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
+use futures_util::{SinkExt as _, StreamExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use hmac::{Hmac, Mac as _};
 use notify::Watcher as _;
 use serde::{Deserialize, Serialize};
@@ -26,8 +30,8 @@ use crate::client::Client;
 use crate::config::{Config, PeerConfig};
 use crate::fleet::transport::{
     Fabric, FabricGrantRefusal, LocalTransports, Route, bindable_tailnet_addresses,
-    default_fabric_protocol, local_addresses, parse_route, resolve_tool, routes_from_endpoints,
-    tailscale_addresses,
+    default_fabric_protocol, is_tailnet_address, local_addresses, parse_route, resolve_tool,
+    routes_from_endpoints, tailscale_addresses,
 };
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
 use crate::model::InventoryCheckpoint;
@@ -57,6 +61,7 @@ const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// briefly without exporting inventories or writing failures; long absences stay quiet.
 const PEER_PROBE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
+const RAW_TERMINAL_PATH: &str = "/v1/peer/raw-terminal";
 const HEAL_PATH: &str = "/v1/peer/heal";
 /// A heal question can make the peer replay its graph from nothing, which takes 41 seconds on a
 /// 2 GB store and longer under load.
@@ -270,12 +275,16 @@ impl FleetAuth {
     }
 
     fn request_headers_for(&self, path: &str, node: &str, body: &[u8]) -> Result<HeaderMap> {
+        self.request_headers_method("POST", path, node, body)
+    }
+
+    fn request_headers_method(&self, method: &str, path: &str, node: &str, body: &[u8]) -> Result<HeaderMap> {
         let digest = Self::body_digest(body);
-        let signature = self.signature("POST", path, node, &digest, None);
+        let signature = self.signature(method, path, node, &digest, None);
         let mut headers = headers(&self.fleet_id, node, &digest, &signature, None)?;
         self.add_member_signature(
             &mut headers,
-            &self.canonical("POST", path, node, &digest, None),
+            &self.canonical(method, path, node, &digest, None),
         )?;
         Ok(headers)
     }
@@ -497,6 +506,7 @@ pub struct ClientRelay {
     /// The links last read from that store, and when, so a busy gateway reads them rarely.
     observed: Arc<std::sync::Mutex<Option<ObservedLinks>>>,
     fabric: Option<Fabric>,
+    legacy: bool,
 }
 
 impl ClientRelay {
@@ -603,6 +613,7 @@ impl ClientRelay {
                 .connect_timeout(Duration::from_secs(3))
                 .build()?,
             links: None,
+            legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
             observed: Arc::default(),
             fabric: resolve_tool(
                 config
@@ -784,6 +795,96 @@ impl ClientRelay {
             .into());
         }
         Ok(envelope.value)
+    }
+
+    /// Open a persistent authenticated byte route to the terminal's owning member.
+    /// Unlike screen reads this never polls or creates a temporary geometry writer.
+    pub async fn raw_terminal(
+        &self,
+        host: &str,
+        person: &str,
+        terminal_id: &str,
+        incarnation: &str,
+        mode: st3_client::RawTerminalMode,
+    ) -> Result<tokio::net::UnixStream> {
+        let target = host.strip_prefix("host/").context("invalid owner host")?;
+        let mode = match mode {
+            st3_client::RawTerminalMode::Attach => "attach",
+            st3_client::RawTerminalMode::Peek => "peek",
+        };
+        let path = format!("{RAW_TERMINAL_PATH}?person={}&terminal={}&incarnation={}&mode={mode}",
+            urlencoding::encode(person), urlencoding::encode(terminal_id), urlencoding::encode(incarnation));
+        let mut last = None;
+        for peer in self.next_hops(target, &[self.node.clone()]).into_iter().filter(|peer| peer.name == target) {
+            let result = async {
+                let url = match parse_route(&peer.url).context("invalid raw terminal route")? {
+                    Route::Http(url) => url,
+                    Route::Fabric { node, protocol } => {
+                        let address = self.fabric.as_ref().context("Fabric unavailable")?.dial(&node, &protocol).await?;
+                        format!("http://{address}")
+                    }
+                };
+                let base = url.strip_prefix("http://").context("peer byte transport requires HTTP")?;
+                let mut request = format!("ws://{}{path}", base.trim_end_matches('/')).into_client_request()?;
+                request.headers_mut().extend(self.auth.request_headers_method("GET", &path, &self.node, &[])?);
+                let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .max_message_size(Some(64 * 1024)).max_frame_size(Some(64 * 1024));
+                let (socket, response) = tokio::time::timeout(CLIENT_READ_TIMEOUT, tokio_tungstenite::connect_async_with_config(request, Some(config), false)).await??;
+                let sender = self.auth.verify_sender(response.headers(), "RESPONSE", &path, &[], Some(&peer.name), Some(&FleetAuth::body_digest(&[])))?;
+                let view = self.links.as_ref().and_then(|store| store.fleet_view_sealed().ok()).unwrap_or_default();
+                crate::fleet::accept(&view, &sender, self.peers.iter().any(|peer| peer.name == sender.name), self.legacy)
+                    .map_err(|refusal| anyhow::anyhow!("raw terminal member refused: {refusal:?}"))?;
+                let (client, bridge) = tokio::net::UnixStream::pair()?;
+                let bridge = bridge.into_std()?;
+                let monitor = tokio::io::unix::AsyncFd::new(bridge.try_clone()?)?;
+                let bridge = tokio::net::UnixStream::from_std(bridge)?;
+                tokio::spawn(async move {
+                    let (mut sink, mut source) = socket.split();
+                    let (mut reader, mut writer) = bridge.into_split();
+                    let flush = tokio::sync::Notify::new();
+                    let upload = async {
+                        let mut bytes = [0_u8; 16 * 1024];
+                        loop {
+                            tokio::select! {
+                                read = reader.read(&mut bytes) => {
+                                    let Ok(count) = read else { break; };
+                                    if count == 0 || sink.send(tokio_tungstenite::tungstenite::Message::Binary(bytes[..count].to_vec().into())).await.is_err() { break; }
+                                }
+                                () = flush.notified() => {
+                                    if sink.flush().await.is_err() { break; }
+                                }
+                            }
+                        }
+                    };
+                    let download = async {
+                        while let Some(Ok(message)) = source.next().await {
+                            match message {
+                                tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                                    if writer.write_all(&bytes).await.is_err() { break; }
+                                }
+                                tokio_tungstenite::tungstenite::Message::Ping(_) => flush.notify_one(),
+                                tokio_tungstenite::tungstenite::Message::Pong(_) => {}
+                                _ => break,
+                            }
+                        }
+                    };
+                    let closed = async {
+                        loop {
+                            let Ok(mut ready) = monitor.readable().await else { break; };
+                            if ready.ready().is_read_closed() || ready.ready().is_error() { break; }
+                            ready.clear_ready();
+                        }
+                    };
+                    tokio::select! { () = upload => {}, () = download => {}, () = closed => {} }
+                });
+                Ok::<_, anyhow::Error>(client)
+            }.await;
+            match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("no direct member route to owner {host}")))
     }
 }
 
@@ -1452,17 +1553,23 @@ pub async fn run_worker(config: Config) -> Result<()> {
         ),
         None => None,
     };
-    let loopback = listener
+    let bound_address = listener
         .as_ref()
         .and_then(|listener| listener.local_addr().ok());
+    let loopback = bound_address.filter(|address| address.ip().is_loopback());
+    let tailnet = bound_address.filter(|address| is_tailnet_address(&address.ip()));
     if let Some(file) = &config.fleet {
         if let (Some(address), true) = (loopback, file.advertise_loopback) {
             endpoints.set_loopback(Some(address));
         }
+        if let Some(address) = tailnet {
+            endpoints.update(|set| set.tailscale = vec![address]);
+        }
         if let Some(tailscale) = tailscale {
             tokio::spawn(keep_tailnet_current(
                 tailscale,
-                loopback.map(|address| (address.port(), app.clone())),
+                bound_address.map(|address| (address.port(), app.clone())),
+                tailnet.map(|address| address.ip()),
                 endpoints.clone(),
                 fleet_transports,
                 notify_for_transports,
@@ -1552,12 +1659,13 @@ impl Endpoints {
 async fn keep_tailnet_current(
     tailscale: PathBuf,
     listen: Option<(u16, Router)>,
+    already_bound: Option<std::net::IpAddr>,
     endpoints: Endpoints,
     transports: Arc<std::sync::RwLock<LocalTransports>>,
     notify: watch::Sender<u64>,
     mut connectivity: watch::Receiver<u64>,
 ) {
-    let mut bound = BTreeSet::new();
+    let mut bound = already_bound.into_iter().collect::<BTreeSet<_>>();
     loop {
         let bindable = match tailscale_addresses(&tailscale).await {
             Ok(reported) => bindable_tailnet_addresses(&reported, &local_addresses()),
@@ -1818,8 +1926,57 @@ fn peer_router(state: PeerState) -> Router {
             CLIENT_READ_PATH,
             post(receive_client_read).layer(DefaultBodyLimit::max(16_384)),
         )
+        .route(RAW_TERMINAL_PATH, get(receive_raw_terminal))
         .layer(DefaultBodyLimit::max(MAX_EXCHANGE_BYTES))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct RawTerminalQuery {
+    person: String,
+    terminal: String,
+    incarnation: String,
+    mode: st3_client::RawTerminalMode,
+}
+
+async fn receive_raw_terminal(
+    websocket: WebSocketUpgrade,
+    State(state): State<PeerState>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<RawTerminalQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let path = uri.path_and_query().map_or(uri.path(), |value| value.as_str());
+    if path.len() > 16_384 || !query.person.starts_with("person/") || query.person.matches('/').count() != 1 {
+        return (StatusCode::BAD_REQUEST, "invalid raw terminal route").into_response();
+    }
+    let _sender = match state.auth.verify_sender(&headers, "GET", path, &[], None, None) {
+        Ok(sender) if state.fleet.accept(&sender).is_ok() => sender,
+        _ => return (StatusCode::UNAUTHORIZED, "untrusted raw terminal member").into_response(),
+    };
+    // The owner daemon validates its current graph incarnation and person authority, then
+    // connects once. The peer worker carries that one connection, not synthetic screens.
+    let client = st3_client::Client::unix_as(&state.main_socket, &query.person);
+    let transport = async {
+        let attachment = client.raw_terminal_attachment(&query.terminal, &query.incarnation, query.mode).await?;
+        if attachment.owner_host_id != format!("host/{}", state.node) {
+            return Err(st3_client::ClientError::Protocol("raw terminal route is not owner-local".into()));
+        }
+        client.raw_terminal_stream(&attachment).await
+    }.await;
+    let transport = match transport {
+        Ok(transport) => transport,
+        Err(st3_client::ClientError::Api(_, _, _)) => return (StatusCode::CONFLICT, "owner rejected raw terminal incarnation or authority").into_response(),
+        Err(_) => return (StatusCode::BAD_GATEWAY, "owner raw terminal unavailable").into_response(),
+    };
+    let signed = match state.auth.response_headers_for(path, &state.node, &[], &FleetAuth::body_digest(&[])) {
+        Ok(headers) => headers,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "raw terminal signature failed").into_response(),
+    };
+    let mut response = websocket.max_message_size(64 * 1024).max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| crate::api::raw_terminal_splice(socket, transport, None));
+    response.headers_mut().extend(signed);
+    response
 }
 
 /// Hand a read bound for another owner to this node's daemon, which knows the routes and the
@@ -3423,6 +3580,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex;
     use tower::ServiceExt as _;
+
+    include!("peer/raw_terminal_tests.rs");
 
     #[tokio::test]
     async fn stalled_replication_http_stream_is_bounded() {
@@ -6739,6 +6898,7 @@ mod retry_tests {
         let (changed, connectivity) = watch::channel(0);
         let task = tokio::spawn(keep_tailnet_current(
             program,
+            None,
             None,
             Endpoints::default(),
             Arc::default(),
