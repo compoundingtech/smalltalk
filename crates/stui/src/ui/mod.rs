@@ -2999,10 +2999,15 @@ impl Ui {
                 .find(|item| item.id == id)
                 .is_some_and(|item| item.actions.iter().any(|action| action == name));
             if offered {
+                // Notes written on a review go with an approval too.
+                let reason = (name == "review.approve")
+                    .then(|| self.conversation_state.drafts.remove(&id))
+                    .flatten()
+                    .filter(|notes| !notes.trim().is_empty());
                 self.effects.push(Effect::Attention {
                     id,
                     action: name.into(),
-                    reason: None,
+                    reason,
                 });
                 self.flash("Sending…");
             } else {
@@ -4071,7 +4076,7 @@ mod tests {
     fn every_attention_kind_draws_its_own_card() {
         let mut ui = Ui::new(demo::world());
         let expectations = [
-            ("attention/1", "Request changes"),
+            ("attention/1", "c or click to write"),
             ("attention/2", "YOUR FEEDBACK"),
             ("attention/3", "Approve launch"),
             ("attention/4", "SUGGESTED FIX"),

@@ -415,15 +415,22 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 card.field("step", step, inner, theme::soft());
             }
             card.blank();
-            if !confirm_row(&mut card, drafts, "Approve the cut-over") {
-                if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
-                    text_box(
-                        &mut card,
-                        "what should change · the agent reads this",
-                        drafts,
-                        "",
-                        inner,
-                    );
+            // There is always somewhere to write: the agent reads the words with either answer.
+            let written = drafts.text.is_some_and(|text| !text.trim().is_empty());
+            let label = if written {
+                "Approve, with your notes"
+            } else {
+                "Approve"
+            };
+            if !confirm_row(&mut card, drafts, label) {
+                text_box(
+                    &mut card,
+                    "your notes · the agent reads these",
+                    drafts,
+                    "c or click to write what you think, what should change, anything it should know",
+                    inner,
+                );
+                if drafts.editing {
                     card.buttons(&[
                         (
                             "enter",
@@ -431,12 +438,18 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                             Hit::Enter,
                             theme::YELLOW,
                         ),
-                        ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+                        ("esc", "Stop writing", Hit::Escape, theme::OVERLAY1),
+                    ]);
+                } else if written {
+                    card.buttons(&[
+                        ("a", "Approve, with your notes", Hit::Key('a'), theme::GREEN),
+                        ("c", "Keep writing", Hit::Key('c'), theme::OVERLAY1),
+                        ("enter", "Send back with these notes", Hit::Enter, theme::YELLOW),
                     ]);
                 } else {
                     card.buttons(&[
                         ("a", "Approve", Hit::Key('a'), theme::GREEN),
-                        ("c", "Request changes", Hit::Key('c'), theme::YELLOW),
+                        ("c", "Write notes or request changes", Hit::Key('c'), theme::YELLOW),
                     ]);
                 }
             }
