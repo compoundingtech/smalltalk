@@ -63,15 +63,22 @@ impl Screen {
         &self.revision
     }
 
+    /// An opaque screen fence that fits exactly in a JavaScript number. It is stable
+    /// across watcher/daemon restarts and depends only on the observed screen; incarnation
+    /// is fenced separately. Clients compare it for equality, never order it.
+    pub(super) fn sequence(&self) -> u64 {
+        u64::from_str_radix(&self.revision[..13], 16).expect("screen revisions are SHA-256 hex")
+    }
+
     /// The client `TerminalScreen` value for one viewer.
-    pub(super) fn value(&self, terminal_id: &str, incarnation: &str, next_sequence: u64) -> Value {
+    pub(super) fn value(&self, terminal_id: &str, incarnation: &str) -> Value {
         let mut value = serde_json::Map::with_capacity(self.body.len() + 5);
         value.insert("kind".into(), "terminal-screen".into());
         value.insert("terminal_id".into(), terminal_id.into());
         value.insert("runtime_incarnation".into(), incarnation.into());
         value.extend(self.body.clone());
         value.insert("revision".into(), self.revision.clone().into());
-        value.insert("next_sequence".into(), next_sequence.into());
+        value.insert("next_sequence".into(), self.sequence().into());
         Value::Object(value)
     }
 }
@@ -646,7 +653,7 @@ mod tests {
     fn screen_of(rows: u16, columns: u16, bytes: &[u8]) -> Value {
         let mut emulator = Emulator::new(rows, columns, TitleListener::default());
         emulator.feed(bytes);
-        emulator.screen("fallback").value("terminal/demo", "1:now", 7)
+        emulator.screen("fallback").value("terminal/demo", "1:now")
     }
 
     #[test]
