@@ -1,11 +1,12 @@
-import type { Agent, Attention, Glass, GlassLayout, Mission } from '../../clients/typescript/st3-client';
+import type { Agent, Attention, Glass, GlassLayout, GlassTab, Mission } from '../../clients/typescript/st3-client';
 import { agentName } from './agentsView';
 import { missionLabels } from './presentation';
 import type { MachineView } from './projectionCache';
 
 // Glasses on the phone, an experiment behind a setting (mission fleet/stui/glass): the person's
-// named workspaces from stui, read from st. The phone shows one thing at a time: a glass's tabs
-// as a list, Home first, and a tab's panes one after another. Pane keys are stui's
+// named workspaces from stui, read from st. A glass is splits, each with its own tabs, and each
+// tab one pane. The phone shows one thing at a time: Home, then each split's tabs as a list, and
+// a tab opens its pane full screen. Pane keys are stui's
 // (crates/stui/src/ui/pane.rs): `agent:agent/…`, `mission:mission/…`, `machine:machine/…`.
 
 /** What a pane opens on the phone. */
@@ -22,10 +23,16 @@ export type PaneTarget = {
 };
 
 export type GlassTabRow = {
+  /** Its split, counted left to right and top to bottom, as stui counts them. */
+  group: number;
   index: number;
   title: string;
-  panes: PaneTarget[];
-  needsYou: boolean;
+  pane: PaneTarget;
+};
+
+export type GlassGroupRow = {
+  index: number;
+  tabs: GlassTabRow[];
 };
 
 export type GlassLists = {
@@ -35,10 +42,10 @@ export type GlassLists = {
   machines: MachineView[];
 };
 
-/** Every pane key in a layout, left to right and top to bottom. */
-export function leaves(layout: GlassLayout): string[] {
-  if ('pane' in layout) return [layout.pane];
-  return layout.children.flatMap(leaves);
+/** Every split's tabs, left to right and top to bottom. */
+export function groups(layout: GlassLayout): GlassTab[][] {
+  if ('tabs' in layout) return [layout.tabs];
+  return layout.children.flatMap(groups);
 }
 
 /** The glasses to choose between, by name, live ones only. */
@@ -85,18 +92,15 @@ export function paneTarget(key: string, lists: GlassLists, labels = missionLabel
   return { key, kind: 'other', id: key, title: key, needsYou: false, gone: false };
 }
 
-/** A glass's tabs after Home: titled by their own title or their first pane. */
-export function glassTabs(glass: Glass, lists: GlassLists): GlassTabRow[] {
+/** A glass's splits and their tabs, after Home: each tab titled by its own title or its pane. */
+export function glassGroups(glass: Glass, lists: GlassLists): GlassGroupRow[] {
   const labels = missionLabels(lists.missions);
-  return (glass.body?.tabs ?? []).map((tab, index) => {
-    const panes = leaves(tab.layout).map(key => paneTarget(key, lists, labels));
-    const first = panes[0]?.title ?? 'empty';
-    const more = panes.length - 1;
-    return {
-      index,
-      title: tab.title ?? (more > 0 ? `${first} +${more}` : first),
-      panes,
-      needsYou: panes.some(pane => pane.needsYou),
-    };
-  });
+  const layout = glass.body?.layout ?? { tabs: [] };
+  return groups(layout).map((tabs, group) => ({
+    index: group,
+    tabs: tabs.map((tab, index) => {
+      const pane = paneTarget(tab.pane, lists, labels);
+      return { group, index, title: tab.title ?? pane.title, pane };
+    }),
+  }));
 }

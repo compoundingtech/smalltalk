@@ -28,6 +28,7 @@ class OracleTests(unittest.TestCase):
     def test_false_positive_controls(self):
         for change, reason in [
             ({"received_copies": 0}, "received 0 copies"),
+            ({"projected_message_files": 1}, "file-mailbox messages"),
             ({"received_copies": 2}, "received 2 copies"),
             ({"read_after_clear_ms": None}, "not read"),
             ({"read_after_clear_ms": 10001}, "limit 10000"),

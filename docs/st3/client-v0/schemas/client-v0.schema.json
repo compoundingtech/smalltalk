@@ -10,9 +10,9 @@
     { "$ref": "#/$defs/PairingComplete" }
   ],
   "$defs": {
-    "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["pane"], "properties": {"pane": {"type": "string", "minLength": 1}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
-    "GlassTab": {"type": "object", "additionalProperties": false, "required": ["layout"], "properties": {"title": {"type": "string"}, "layout": {"$ref": "#/$defs/GlassLayout"}}},
-    "GlassBody": {"type": "object", "additionalProperties": false, "required": ["name", "tabs"], "properties": {"name": {"type": "string", "minLength": 1}, "tabs": {"type": "array", "minItems": 0, "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}},
+    "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
+    "GlassTab": {"type": "object", "additionalProperties": false, "required": ["pane"], "properties": {"title": {"type": "string"}, "pane": {"type": "string", "minLength": 1}}},
+    "GlassBody": {"type": "object", "additionalProperties": false, "required": ["name", "layout"], "properties": {"name": {"type": "string", "minLength": 1}, "layout": {"$ref": "#/$defs/GlassLayout"}}},
     "Glass": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "body", "deleted", "base_revision", "replaced_revision"], "properties": {"kind": {"const": "glass"}, "body": {"oneOf": [{"$ref": "#/$defs/GlassBody"}, {"type": "null"}]}, "deleted": {"type": "boolean"}, "base_revision": {"type": ["string", "null"]}, "replaced_revision": {"type": ["string", "null"]}}}]},
     "GlassPut": {"type": "object", "additionalProperties": false, "required": ["body", "base_revision"], "properties": {"body": {"$ref": "#/$defs/GlassBody"}, "base_revision": {"type": ["string", "null"]}}},
     "GlassDelete": {"type": "object", "additionalProperties": false, "required": ["base_revision"], "properties": {"base_revision": {"type": ["string", "null"]}}},
@@ -30,6 +30,31 @@
         "store_index": { "type": "integer", "minimum": 0 },
         "projection_version": { "const": "client-projection.v0" },
         "created_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "CanonicalNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "arguments": { "type": "array", "items": { "type": ["string", "number", "boolean", "null"] } },
+        "properties": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean", "null"] } },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/CanonicalNode" } }
+      }
+    },
+    "SubjectDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "subject", "desired", "kdl", "desired_revision", "desired_token", "conflicts"],
+      "properties": {
+        "kind": { "const": "subject-definition" },
+        "subject": { "type": "string", "pattern": "^agent/[^\\s]+$" },
+        "desired": { "$ref": "#/$defs/CanonicalNode" },
+        "kdl": { "type": "string" },
+        "desired_revision": { "$ref": "#/$defs/Revision" },
+        "desired_token": { "type": "string", "minLength": 1 },
+        "conflicts": { "type": "array", "items": { "type": "string" } }
       }
     },
     "PageInfo": {
@@ -55,6 +80,7 @@
           "oneOf": [
             { "$ref": "#/$defs/Capabilities" },
             { "$ref": "#/$defs/DocumentContent" },
+            { "$ref": "#/$defs/SubjectDefinition" },
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
@@ -598,6 +624,9 @@
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
             "harness_state": { "type": ["string", "null"] },
+            "blocked_on": { "type": ["string", "null"], "description": "Current incarnation's harness blocking axis; human means a person must answer before it continues." },
+            "ask": { "type": ["string", "null"], "description": "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." },
+            "reason": { "type": ["string", "null"], "description": "Diagnostic harness reason, not a machine-readable verdict." },
             "host_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "last_activity_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
             "silent_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
@@ -613,25 +642,11 @@
             "next_work": { "oneOf": [{ "$ref": "#/$defs/WorkLabel" }, { "type": "null" }] },
             "upcoming_work": { "type": "array", "items": { "$ref": "#/$defs/WorkLabel" } },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
-            "mission_authority": { "oneOf": [{ "$ref": "#/$defs/AgentMissionAuthority" }, { "type": "null" }] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
             "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present only for a local native seat whose harness can take work; a stale path makes the agent `waiting`." }
           }
         }
       ]
-    },
-    "AgentMissionAuthority": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["source"],
-      "description": "Missions the agent may publish, start, revise, and cancel. Patterns are exact mission IDs or terminal `/*` namespaces without `mission/`.",
-      "properties": {
-        "source": { "enum": ["declared", "default", "none"], "description": "`declared`: the declaration's `mission-authority`. `default`: a person-declared top-level seat `fleet/PROJECT/...` holds `fleet/PROJECT/*`. `none`: neither." },
-        "publish": { "type": "array", "items": { "type": "string" } },
-        "start": { "type": "array", "items": { "type": "string" } },
-        "revise": { "type": "array", "items": { "type": "string" } },
-        "cancel": { "type": "array", "items": { "type": "string" } }
-      }
     },
     "AgentDelivery": {
       "type": "object",

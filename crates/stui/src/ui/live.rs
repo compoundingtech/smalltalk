@@ -20,13 +20,13 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use st3_client::{
-    Client, Fence, LaunchReviseParameters, MessageSendParameters, Resource, TimelineBody,
-    TimelineEntry,
+    Client, ClientError, Fence, LaunchReviseParameters, MessageSendParameters, Resource,
+    TimelineBody,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     io,
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -38,6 +38,20 @@ struct Pending {
     at: String,
     message_id: Option<String>,
     failed: Option<String>,
+    /// st did not answer, so the message may have arrived.
+    unconfirmed: bool,
+    /// What was asked of st, to ask again.
+    effect: Effect,
+    /// The exact request last sent; a retry repeats it so st can answer with the first result.
+    sent: Arc<Mutex<Option<Sent>>>,
+}
+
+/// A message request as sent: st keys its receipt on the whole request.
+#[derive(Clone, Debug)]
+struct Sent {
+    id: String,
+    idempotency_key: String,
+    snapshot_id: String,
 }
 
 pub struct Context {
@@ -70,8 +84,9 @@ enum Fetched {
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
     Devices(Collection),
-    /// A send finished: the pending token and st's message id, or why it failed.
-    Sent(String, Result<Option<String>, String>),
+    /// A send finished: the pending token and st's message id, or why it failed and whether st's
+    /// answer is unknown.
+    Sent(String, Result<Option<String>, (String, bool)>),
     /// st answered a glass write: the glass, the write's key, and the revision it accepted.
     GlassSaved {
         id: String,
@@ -143,19 +158,22 @@ pub fn run(context: Context) -> Result<()> {
     model.actor = person.clone();
     let mut extras = Extras::default();
     // Each conversation st has sent, kept after it closes so reopening it shows its last entries.
-    let mut timelines: BTreeMap<String, Vec<TimelineEntry>> = BTreeMap::new();
+    let mut timelines: BTreeMap<String, st3_conversation_ui::Timeline> = BTreeMap::new();
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
     // The agent or session whose conversation the feed holds.
-    let mut conversing: Option<String> = None;
+    let mut conversing: Vec<String> = Vec::new();
     let mut preview_requested: HashSet<String> = HashSet::new();
     let mut body_requested: HashSet<String> = HashSet::new();
     // Messages sent from here, shown at once until st reports them back.
     let mut pending: Vec<Pending> = Vec::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
+    ui.build = true;
     ui.live = true;
     ui.glasses = glass.map(|name| {
         super::glass::Glasses::open(name, super::glass_store::path(&person))
     });
+    // A glass opens where this device left it.
+    ui.show_focused();
 
     let _guard = Guard::enter(ui.glasses.is_some())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -236,37 +254,30 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     extras.live = true;
                     extras.offline = None;
-                    model.last_connected = Some(
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    );
+                    model.last_connected =
+                        Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
                     changed = true;
                 }
                 feed::Update::Conversation {
                     target,
                     replace,
+                    has_more,
                     items,
                 } => {
                     failed.remove(&target);
-                    let entries = timelines.entry(target).or_default();
-                    if replace {
-                        *entries = items;
-                    } else {
-                        for item in items {
-                            match entries.iter_mut().find(|entry| entry.id == item.id) {
-                                Some(entry) => *entry = item,
-                                None => entries.push(item),
-                            }
-                        }
-                        entries.sort_by(|a, b| {
-                            a.timestamp
-                                .cmp(&b.timestamp)
-                                .then(a.sequence.cmp(&b.sequence))
+                    ui.conversation_updated(&target);
+                    timelines
+                        .entry(target)
+                        .or_default()
+                        .apply(st3_conversation_ui::Frame {
+                            replace,
+                            has_more,
+                            items,
                         });
-                    }
                     // A message sent from here is done once st shows it in the conversation.
                     pending.retain(|pending| {
                         pending.message_id.as_ref().is_none_or(|id| {
-                            !timelines.values().flatten().any(|entry| {
+                            !timelines.values().flat_map(|timeline| &timeline.items).any(|entry| {
                                 matches!(&entry.body, TimelineBody::Message(message) if &message.message_id == id)
                             })
                         })
@@ -274,6 +285,7 @@ pub fn run(context: Context) -> Result<()> {
                     changed = true;
                 }
                 feed::Update::ConversationFailed { target, message } => {
+                    ui.conversation_failed(&target, &message);
                     failed.insert(target, message);
                     changed = true;
                 }
@@ -341,8 +353,14 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Sent(token, outcome) => {
                     if let Some(entry) = pending.iter_mut().find(|entry| entry.token == token) {
                         match outcome {
-                            Ok(id) => entry.message_id = id,
-                            Err(error) => entry.failed = Some(error),
+                            Ok(id) => {
+                                entry.message_id = id;
+                                entry.failed = None;
+                            }
+                            Err((error, unconfirmed)) => {
+                                entry.failed = Some(error);
+                                entry.unconfirmed = unconfirmed;
+                            }
                         }
                     }
                 }
@@ -421,15 +439,12 @@ pub fn run(context: Context) -> Result<()> {
                 });
             }
         }
-        // The selected agent's conversation rides the feed's socket while the Agents tab is
-        // open: st pushes each change, so nothing here reads it again on a timer.
-        let wanted = selected.clone().filter(|_| tab == 1);
+        // Every conversation on screen rides the feed's socket (the focused one first): st
+        // pushes each change, so nothing here reads one again on a timer.
+        let wanted = ui.live_conversations();
         if wanted != conversing {
-            let _ = commands.send(match &wanted {
-                Some(target) => Command::Converse {
-                    target: target.clone(),
-                },
-                None => Command::Unconverse,
+            let _ = commands.send(Command::Converse {
+                targets: wanted.clone(),
             });
             conversing = wanted;
             changed = true;
@@ -581,12 +596,39 @@ pub fn run(context: Context) -> Result<()> {
             }
         }
         for effect in effects {
-            let token = match &effect {
-                Effect::Send { agent, text }
+            let (effect, token, sent) = match effect {
+                Effect::Resend { entry } => {
+                    let token = entry.trim_start_matches("pending:");
+                    let Some(retry) = pending.iter_mut().find(|pending| pending.token == token)
+                    else {
+                        continue;
+                    };
+                    retry.failed = None;
+                    retry.unconfirmed = false;
+                    changed = true;
+                    (
+                        retry.effect.clone(),
+                        Some(retry.token.clone()),
+                        Some(retry.sent.clone()),
+                    )
+                }
+                Effect::Forget { entry } => {
+                    let token = entry.trim_start_matches("pending:");
+                    pending.retain(|pending| pending.token != token);
+                    changed = true;
+                    continue;
+                }
+                Effect::Send {
+                    ref agent,
+                    ref text,
+                }
                 | Effect::Discuss {
-                    to: agent, text, ..
+                    to: ref agent,
+                    ref text,
+                    ..
                 } => {
                     let token = uuid::Uuid::now_v7().to_string();
+                    let sent = Arc::new(Mutex::new(None));
                     pending.push(Pending {
                         token: token.clone(),
                         agent: agent.clone(),
@@ -594,25 +636,32 @@ pub fn run(context: Context) -> Result<()> {
                         at: chrono::Local::now().format("%H:%M").to_string(),
                         message_id: None,
                         failed: None,
+                        unconfirmed: false,
+                        effect: effect.clone(),
+                        sent: sent.clone(),
                     });
                     changed = true;
-                    Some(token)
+                    (effect, Some(token), Some(sent))
                 }
-                _ => None,
+                other => (other, None, None),
             };
             let client = client.clone();
             let tx = fetched_tx.clone();
             let person = person.clone();
             let model = model.clone();
             runtime.spawn(async move {
-                let outcome = perform(&client, &person, &model, effect).await;
+                let outcome = perform(&client, &person, &model, effect, sent.as_deref()).await;
                 if let Some(token) = token {
                     let _ = tx.send(Fetched::Sent(
                         token,
-                        outcome
-                            .as_ref()
-                            .map(|(_, id)| id.clone())
-                            .map_err(|error| error.to_string()),
+                        outcome.as_ref().map(|(_, id)| id.clone()).map_err(|error| {
+                            // A transport failure left st's answer unknown; anything else is
+                            // st saying no, or never reaching it.
+                            let unconfirmed = error
+                                .downcast_ref::<ClientError>()
+                                .is_some_and(|error| matches!(error, ClientError::Transport(_)));
+                            (error.to_string(), unconfirmed)
+                        }),
                     ));
                 }
                 let _ = tx.send(Fetched::Notice(match outcome {
@@ -623,8 +672,7 @@ pub fn run(context: Context) -> Result<()> {
         }
 
         if changed {
-            extras.conversations =
-                conversations(&model, &person, &timelines, &failed, conversing.as_deref());
+            extras.conversations = conversations(&model, &person, &timelines, &failed, &conversing);
             for entry in &pending {
                 if let Some(Load::Ready(entries)) = extras.conversations.get_mut(&entry.agent) {
                     entries.push(super::view::Entry {
@@ -633,6 +681,7 @@ pub fn run(context: Context) -> Result<()> {
                         body: super::view::Body::Pending {
                             text: entry.text.clone(),
                             failed: entry.failed.clone(),
+                            unconfirmed: entry.unconfirmed,
                         },
                     });
                 }
@@ -727,34 +776,29 @@ fn screen_lines(screen: &st3_client::TerminalScreen) -> Vec<ratatui::text::Line<
 fn conversations(
     model: &Model,
     person: &str,
-    timelines: &BTreeMap<String, Vec<TimelineEntry>>,
+    timelines: &BTreeMap<String, st3_conversation_ui::Timeline>,
     failed: &BTreeMap<String, String>,
-    conversing: Option<&str>,
+    conversing: &[String],
 ) -> BTreeMap<String, Load<Vec<super::view::Entry>>> {
     let mut out = BTreeMap::new();
     let names = adapt::names(model, person);
     let targets = timelines
         .keys()
         .chain(failed.keys())
-        .map(String::as_str)
         .chain(conversing)
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
     for target in targets {
         let load = match (timelines.get(target), failed.get(target)) {
-            (Some(timeline), error) => {
-                let mut entries = adapt::conversation(timeline, &names);
-                // Never hide a failure behind what loaded before it.
-                if let Some(error) = error {
-                    entries.push(super::view::Entry {
-                        id: format!("failed:{target}"),
-                        at: String::new(),
-                        body: super::view::Body::Event(format!(
-                            "Could not load newer entries: {error}"
-                        )),
-                    });
-                }
-                Load::Ready(entries)
+            // Half a conversation is worse than none: say why instead.
+            (Some(timeline), _)
+                if let Some(reason) = adapt::unreadable_transcript(&timeline.items) =>
+            {
+                Load::Failed(reason)
             }
+            // A failure after the conversation loaded is said on the rule above its message
+            // box, where it clears once st catches up; the feed retries on its own.
+            (Some(timeline), _) => Load::Ready(adapt::conversation(&timeline.items, &names)),
             (None, Some(error)) => {
                 Load::Failed(format!("Could not load this conversation: {error}"))
             }
@@ -770,10 +814,13 @@ async fn perform(
     person: &str,
     model: &Model,
     effect: Effect,
+    sent: Option<&Mutex<Option<Sent>>>,
 ) -> Result<(String, Option<String>)> {
     match effect {
-        // Glass writes never reach here: the loop sends them itself.
-        Effect::SaveGlass(_) => Ok((String::new(), None)),
+        // Glass writes and retries never reach here: the loop handles them itself.
+        Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } => {
+            Ok((String::new(), None))
+        }
         Effect::Attention { id, action, reason } => {
             crate::attention_action(client, person, &id, &action, reason)
                 .await
@@ -814,12 +861,13 @@ async fn perform(
             let Resource::Attention(attention) = &current.value else {
                 anyhow::bail!("This message changed; look again");
             };
-            send(
+            send_message(
                 client,
-                model,
                 &to,
                 text,
+                None,
                 Some(attention.source_id.clone()),
+                None,
                 None,
             )
             .await?;
@@ -833,7 +881,7 @@ async fn perform(
                     .find(|candidate| candidate.header.id == to)
                     .and_then(|agent| agent.current_session_id.clone()),
             );
-            let id = send_titled(client, model, &to, text, Some(title), session).await?;
+            let id = send_message(client, &to, text, Some(title), None, session, sent).await?;
             Ok((
                 "Sent; the reply will show here and in their conversation".into(),
                 id,
@@ -932,77 +980,85 @@ async fn perform(
                 .agents()
                 .find(|candidate| candidate.header.id == agent)
                 .and_then(|agent| agent.current_session_id.clone());
-            let id = send(client, model, &agent, text, None, session).await?;
+            let id = send_message(client, &agent, text, None, None, session, sent).await?;
             Ok(("Message sent".into(), id))
         }
     }
 }
 
-async fn send(
-    client: &Client,
-    model: &Model,
-    to: &str,
-    content: String,
-    in_reply_to: Option<String>,
-    session_id: Option<String>,
-) -> Result<Option<String>> {
-    send_message(client, model, to, content, None, in_reply_to, session_id).await
-}
-
-async fn send_titled(
-    client: &Client,
-    model: &Model,
-    to: &str,
-    content: String,
-    title: Option<String>,
-    session_id: Option<String>,
-) -> Result<Option<String>> {
-    send_message(client, model, to, content, title, None, session_id).await
-}
-
+/// Send a message. `sent` keeps the exact request: when it already holds one, that request goes
+/// again first, and st answers a repeat of a request it accepted with the first result, so a
+/// message st took but never confirmed is not sent twice.
 async fn send_message(
     client: &Client,
-    _model: &Model,
     to: &str,
     content: String,
     title: Option<String>,
     in_reply_to: Option<String>,
     session_id: Option<String>,
+    sent: Option<&Mutex<Option<Sent>>>,
 ) -> Result<Option<String>> {
+    let parameters = MessageSendParameters {
+        to: to.to_owned(),
+        content,
+        title,
+        in_reply_to,
+        session_id,
+        tags: vec![],
+    };
+    let message_id = |result: st3_client::Envelope<st3_client::ActionResult>| {
+        // The new message's id, so the pending copy can give way to the real one.
+        result
+            .value
+            .affected_ids
+            .into_iter()
+            .find(|id| id.starts_with("message/"))
+    };
+    let earlier = sent.and_then(|sent| sent.lock().ok()?.clone());
+    if let Some(earlier) = earlier {
+        let fence = Fence {
+            snapshot_id: earlier.snapshot_id,
+            ..Fence::default()
+        };
+        match client
+            .message_send(
+                earlier.id,
+                earlier.idempotency_key,
+                fence,
+                parameters.clone(),
+            )
+            .await
+        {
+            Ok(result) => return Ok(message_id(result)),
+            // st checks a repeat before the fence: a stale fence means it never took it.
+            Err(error) if error.to_string().contains("StaleFence") => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     // A send only needs a current snapshot. Take a fresh one each time, and once more if the
     // graph moves between reading it and sending: a stale fence is not the person's problem.
     let mut last = None;
     for _ in 0..2 {
         let snapshot = client.capabilities().await?.snapshot.id;
+        let (id, idem) = crate::action_pair();
+        if let Some(sent) = sent
+            && let Ok(mut slot) = sent.lock()
+        {
+            *slot = Some(Sent {
+                id: id.clone(),
+                idempotency_key: idem.clone(),
+                snapshot_id: snapshot.clone(),
+            });
+        }
         let fence = Fence {
             snapshot_id: snapshot,
             ..Fence::default()
         };
-        let (id, idem) = crate::action_pair();
         match client
-            .message_send(
-                id,
-                idem,
-                fence,
-                MessageSendParameters {
-                    to: to.to_owned(),
-                    content: content.clone(),
-                    title: title.clone(),
-                    in_reply_to: in_reply_to.clone(),
-                    session_id: session_id.clone(),
-                    tags: vec![],
-                },
-            )
+            .message_send(id, idem, fence, parameters.clone())
             .await
         {
-            Ok(result) => {
-                // The new message's id, so the pending copy can give way to the real one.
-                return Ok(result
-                    .value
-                    .affected_ids
-                    .into_iter()
-                    .find(|id| id.starts_with("message/")));
-            }
+            Ok(result) => return Ok(message_id(result)),
             Err(error) if error.to_string().contains("StaleFence") => last = Some(error),
             Err(error) => return Err(error.into()),
         }
@@ -1015,6 +1071,41 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversation_without_its_transcript_is_one_failure_not_half_a_conversation() {
+        let items: Vec<st3_client::TimelineEntry> = serde_json::from_value(serde_json::json!([
+            {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/one","from":"person/avery","to":"agent/example/harbor/keeper","title":"Status?"}},
+            {"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"How is the audit going?"}},
+            {"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
+             "body":{"code":"transcript-not-bound","message":"transcript not bound: the transcript could not be read: line 12: expected value","retryable":true,
+                     "details":{"driver":"omp","transcript":"/srv/example/omp/sessions/harbor/0190.jsonl"}}},
+        ]))
+        .unwrap();
+        let target = "agent/example/harbor/keeper";
+        let shown = conversations(
+            &Model::default(),
+            "person/avery",
+            &BTreeMap::from([(
+                target.to_owned(),
+                st3_conversation_ui::Timeline {
+                    items,
+                    ..Default::default()
+                },
+            )]),
+            &BTreeMap::new(),
+            &[target.to_owned()],
+        );
+        match &shown[target] {
+            Load::Failed(reason) => assert!(
+                reason.contains("line 12: expected value") && reason.contains("0190.jsonl"),
+                "{reason}"
+            ),
+            other => panic!("expected one failure, not entries: {other:?}"),
+        }
+    }
 
     fn fixture_screen() -> st3_client::TerminalScreen {
         let text = include_str!("../../../../docs/st3/client-v0/fixtures/terminal-screen.json");

@@ -4,7 +4,7 @@
 //! and one hit map for all of them. A click target is stored against its line, so it still
 //! works after the pane scrolls.
 
-use super::text::{self, Run, run};
+use super::text::{self, run};
 use super::theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -17,6 +17,7 @@ pub enum Hit {
     Enter,
     Escape,
     ToggleTool(String),
+    Pane(st3_conversation_ui::PaneIntent),
     JumpLatest,
     Composer,
     Help,
@@ -29,48 +30,32 @@ pub enum Hit {
     Revoke(String),
     /// Leave the terminal view.
     Detach,
-    /// Glasses: open the palette.
-    Palette,
     /// Glasses: open the palette at the glasses section.
     GlassMenu,
-    /// Glasses: show a tab (0 is Home).
-    GlassTab(usize),
+    /// Glasses: open the palette at one section.
+    PaletteSection(usize),
+    /// Glasses: show a group's tab (group 0's tab 0 is Home).
+    GlassTab(usize, usize),
+    /// Glasses: open the palette for a new tab in a group.
+    GlassAdd(usize),
     /// Glasses: open a palette row.
     PaletteChoice(usize),
 }
 
-#[derive(Clone, Debug)]
-pub struct Target {
-    pub line: usize,
-    pub column: u16,
-    pub width: u16,
-    pub hit: Hit,
+pub type Target = st3_conversation_ui::doc::Target<Hit>;
+pub type Doc = st3_conversation_ui::doc::Doc<Hit>;
+
+/// Shell-only cards, graph fields and buttons layered on the shared document.
+pub trait DocExt {
+    fn field(&mut self, label: &str, value: &str, width: usize, value_style: Style);
+    fn section(&mut self, title: &str, count: Option<usize>, width: usize);
+    fn buttons(&mut self, buttons: &[(&str, &str, Hit, Color)]);
+    fn card(&mut self, title: &str, color: Color, heavy: bool, inner: Doc, width: usize);
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Doc {
-    pub lines: Vec<Line<'static>>,
-    pub targets: Vec<Target>,
-}
-
-impl Doc {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn line(&mut self, line: Line<'static>) {
-        self.lines.push(line);
-    }
-    pub fn blank(&mut self) {
-        self.lines.push(Line::default());
-    }
-    pub fn lines(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
-        self.lines.extend(lines);
-    }
-    pub fn wrap(&mut self, runs: &[Run], width: usize) {
-        self.lines.extend(text::wrap(runs, width, &[], &[], None));
-    }
+impl DocExt for Doc {
     /// A "label   value" row with the value wrapped under itself.
-    pub fn field(&mut self, label: &str, value: &str, width: usize, value_style: Style) {
+    fn field(&mut self, label: &str, value: &str, width: usize, value_style: Style) {
         let label = format!("{label:<10}");
         let indent = " ".repeat(text::width(&label));
         self.lines.extend(text::wrap(
@@ -82,7 +67,7 @@ impl Doc {
         ));
     }
     /// A section heading: a small bold label and a rule.
-    pub fn section(&mut self, title: &str, count: Option<usize>, width: usize) {
+    fn section(&mut self, title: &str, count: Option<usize>, width: usize) {
         let mut spans = vec![Span::styled(title.to_owned(), theme::label())];
         if let Some(count) = count {
             spans.push(Span::styled(format!(" {count}"), theme::dim()));
@@ -96,7 +81,7 @@ impl Doc {
         self.lines.push(Line::from(spans));
     }
     /// A row of buttons. Each is `[key label]`, and clicking it presses the key.
-    pub fn buttons(&mut self, buttons: &[(&str, &str, Hit, Color)]) {
+    fn buttons(&mut self, buttons: &[(&str, &str, Hit, Color)]) {
         let line = self.lines.len();
         let mut spans = Vec::new();
         let mut column = 0u16;
@@ -129,30 +114,9 @@ impl Doc {
         }
         self.lines.push(Line::from(spans));
     }
-    /// Append another document, shifting its lines and targets.
-    pub fn append(&mut self, other: Doc, indent: u16) {
-        let base = self.lines.len();
-        for target in other.targets {
-            self.targets.push(Target {
-                line: base + target.line,
-                column: target.column + indent,
-                ..target
-            });
-        }
-        if indent == 0 {
-            self.lines.extend(other.lines);
-        } else {
-            let pad = " ".repeat(indent as usize);
-            self.lines.extend(other.lines.into_iter().map(|line| {
-                let mut spans = vec![Span::raw(pad.clone())];
-                spans.extend(line.spans);
-                Line::from(spans)
-            }));
-        }
-    }
     /// A card in deck's style: a rounded frame with its title in the top edge. A heavy
     /// card (thick frame, coloured) is reserved for the thing that needs a person.
-    pub fn card(&mut self, title: &str, color: Color, heavy: bool, inner: Doc, width: usize) {
+    fn card(&mut self, title: &str, color: Color, heavy: bool, inner: Doc, width: usize) {
         let width = width.max(8);
         let (tl, tr, bl, br, h, v) = if heavy {
             ("┏", "┓", "┗", "┛", "━", "┃")

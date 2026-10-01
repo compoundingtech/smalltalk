@@ -28,7 +28,6 @@ A mission run has one stable subject. Each immutable run generation binds that r
 - `assigned-to` and `available-to` can set a mission default or select one step.
 - `fresh-context` on a step starts its claiming seat in a new harness session for that step. On an agent seat, it does so for every step the seat claims.
 - `agentless` is step-only. A step with no inherited selector is also agentless.
-- A selector does not grant revision authority.
 - A mission allows one active run by default.
 - `concurrent-runs` enables concurrent active runs. An optional `max` property bounds them.
 - A mission can declare exact text and resource inputs.
@@ -1123,8 +1122,7 @@ An operator can request another delivery through the same driver path with:
 st work wake STEP --as person/operator --reason "retry native delivery"
 ```
 
-The assignee may also wake its own step. Another agent needs `queue-authority` for the assignee's
-seat. Manual wakes are recorded in the inbox but do not consume the three automatic retry
+Any agent may also wake a step, its own or another seat's. Manual wakes are recorded in the inbox but do not consume the three automatic retry
 attempts shown by `st work show`.
 
 Generic terminal programs without a maintained native driver do not have an automatic wake path.
@@ -1265,6 +1263,11 @@ harness defaults, waits until its harness is ready, and attaches from any fleet 
 `--print-kdl` prints the exact declaration. `st agents stop SUBJECT` publishes an explicit root
 stop.
 
+For `agents start`, `example/cos/standing/cos` and `agent/example/cos/standing/cos` both name
+`agent/example/cos/standing/cos`. Pass an identity or its complete `agent/` subject, never a
+doubled `agent/agent/` prefix. Slash-qualified and dotted identities are exact; a simple name
+becomes `agent/HOST.NAME` on its placement host.
+
 A mission run does not stop because a controller deletes its runtime. The graph must publish cancellation.
 
 ```kdl
@@ -1387,47 +1390,14 @@ The schedule does not assign work. The referenced mission defines its work selec
 
 ## Mission revisions
 
-Revision authority comes from agent placement in the current generation.
+In [free mode](kdl-lifecycle.md#free-mode), any person or agent may revise any part of a run, as
+itself. Human-only revision protection still selects the reviewers who must approve the change.
+`mission-authority` blocks still parse and are ignored.
 
-- A direct agent in a step can revise that step subtree.
-- A direct agent in a mission can revise the complete mission.
-- A direct agent adjacent to missions can revise those missions.
+Publishing a generated nested mission requires a claimed step with the exact `produces-mission`
+declaration. The agent must use `st work publish-mission`.
 
-The run requester and any person can propose any revision. A work selector does not grant revision authority.
-
-An agent also needs explicit mission operation authority in its current desired declaration:
-
-```kdl
-agent "planner" {
-  workspace "${ST_WORKSPACE}"
-  harness "codex" {}
-  mission-authority {
-    publish "project/generated"
-    start "fleet/fabric/*"
-    revise "fleet/fabric/*"
-  }
-}
-```
-
-Each rule accepts an exact mission ID or a terminal `/*` namespace. The value omits the `mission/` subject prefix.
-
-A mission-scoped agent, such as this planner, receives no mission authority by default. A
-top-level seat named `fleet/PROJECT/...` that a person declared holds `publish`, `start`, and
-`revise` for `fleet/PROJECT/*` unless its declaration carries `mission-authority`; see
-[agent mission authority](kdl-lifecycle.md#agent-mission-authority). `publish`, `start`, and
-`revise` are separate permissions.
-
-Mission publication requires a claimed step with the exact `produces-mission` declaration. The agent must use `st work publish-mission`.
-
-Mission start requires `start` authority. Mission revision requires both `revise` authority and existing structural revision authority.
-
-The daemon reads authority from the current desired agent. A candidate mission cannot grant authority to its publisher.
-
-Persons and internal system actions keep their existing authority. System starts from `uses-mission`, schedules, and subscriptions are unchanged.
-
-This check protects a trusted local runtime. Caller identity is not cryptographically authenticated, so `--as` remains a trusted-operator boundary.
-
-st checks the current generation. A candidate cannot add itself as an owner and use that new authority.
+System starts from `uses-mission`, schedules, and subscriptions are unchanged.
 
 `revisions="human-only"` protects a mission or step. The protection is inherited by nested steps.
 

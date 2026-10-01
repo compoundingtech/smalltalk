@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Exercise real OMP 18.4.4 title events with no prompts or model calls."""
+import argparse,asyncio,json,os,tempfile,pathlib
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('omp',type=pathlib.Path)
+parser.add_argument('extension',type=pathlib.Path)
+parser.add_argument('out',type=pathlib.Path)
+args=parser.parse_args()
+ROOT=pathlib.Path(tempfile.mkdtemp(prefix='st-omp-labels-'))
+CLI=str(args.omp.resolve())
+ASSET=str(args.extension.resolve())
+LABEL=ROOT/'seat.json'
+LABEL.write_text(json.dumps({'subject':'agent/eval.worker','desired':{'display_name':'Quartz'},'member':{'tags':{'persona':'gen'}}}))
+CHANNEL=ROOT/'channel.mjs'
+CHANNEL.write_text('''#!/usr/bin/env node
+import fs from "node:fs";
+const path=process.env.LABEL_FIXTURE;
+process.stdout.write(JSON.stringify({type:"hello",protocol:2,sessionContext:""})+"\\n");
+let previous="";
+const publish=()=>{const text=fs.readFileSync(path,"utf8");if(text!==previous){previous=text;process.stdout.write(JSON.stringify({type:"seat",seat:JSON.parse(text)})+"\\n");}};
+publish();setInterval(publish,30);
+process.stdin.on("data",()=>{});process.stdin.on("end",()=>process.exit(0));
+''');CHANNEL.chmod(0o755)
+async def main():
+ env={'PATH':os.environ['PATH'],'HOME':str(ROOT/'home'),'PI_CODING_AGENT_DIR':str(ROOT/'config'),'LABEL_FIXTURE':str(LABEL),
+ 'ST_OMP_CHANNEL_BIN':str(CHANNEL),'ST_OMP_CHANNEL_CATALOG':'/test/catalog','ST_OMP_CHANNEL_IDENTITY':'eval.worker','ST_OMP_CHANNEL_RUNTIME_ID':'eval.worker','ST_OMP_CHANNEL_SESSION':'wrapper','ST_OMP_CHANNEL_SEQ':'1'}
+ for d in ('home','config','work','sessions'):(ROOT/d).mkdir()
+ (ROOT/'config'/'models.yml').write_text(json.dumps({'providers':{'fixture':{'baseUrl':'http://127.0.0.1:9/v1','apiKey':'offline-fixture','api':'openai-completions','models':[{'id':'quartz','name':'Quartz offline fixture','contextWindow':128000,'maxTokens':1024,'input':['text'],'reasoning':False}]}}}))
+ version=await asyncio.create_subprocess_exec(CLI,'--version',env=env,cwd=ROOT/'work',stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+ output,error=await version.communicate()
+ assert version.returncode==0 and output.decode().strip()=='omp/18.4.4',(output.decode(),error.decode())
+ proof={'version':'18.4.4','agent_tokens':0,'model_calls':0,'cases':{}}
+ processes=[];reader=None;seq=0;pending={}
+ async def launch(resume=None):
+  nonlocal reader
+  args=[CLI,'--model','fixture/quartz','--mode','rpc','--no-extensions','--no-tools','--no-skills','--no-rules','--session-dir',str(ROOT/'sessions'),'-e',ASSET]
+  if resume:args+=['--resume',resume]
+  err=(ROOT/f'errors-{len(processes)}.log').open('wb')
+  p=await asyncio.create_subprocess_exec(*args,env=env,cwd=ROOT/'work',stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=err,start_new_session=True)
+  processes.append(p)
+  async def read():
+   while line:=await p.stdout.readline():
+    try:x=json.loads(line)
+    except:continue
+    if x.get('id') in pending and x.get('type')=='response':pending.pop(x['id']).set_result(x)
+  reader=asyncio.create_task(read())
+  return p
+ async def rpc(p,kind,**fields):
+  nonlocal seq
+  seq+=1;ident=str(seq);f=asyncio.get_running_loop().create_future();pending[ident]=f
+  p.stdin.write((json.dumps(dict(id=ident,type=kind,**fields))+'\n').encode());await p.stdin.drain()
+  r=await asyncio.wait_for(f,30)
+  assert r['success'],r
+  return r.get('data')
+ async def title(p,want):
+  for _ in range(150):
+   state=await rpc(p,'get_state')
+   if state.get('sessionName')==want:return state
+   await asyncio.sleep(.1)
+  raise AssertionError((want,state))
+ async def stop(p):
+  p.terminate()
+  try:await asyncio.wait_for(p.wait(),5)
+  except asyncio.TimeoutError:p.kill();await p.wait()
+  reader.cancel()
+ try:
+  p=await launch();initial=await title(p,'Quartz [gen]');proof['cases']['initial']=initial['sessionName'];assert initial['messageCount']==0
+  await rpc(p,'set_session_name',name='Native temporary rename')
+  await rpc(p,'new_session');new=await title(p,'Quartz [gen]');proof['cases']['new']=new['sessionName'];assert new['messageCount']==0
+  await rpc(p,'switch_session',sessionPath=initial['sessionFile']);switched=await title(p,'Quartz [gen]');proof['cases']['in_process_resume']=switched['sessionName'];assert switched['messageCount']==0
+  await rpc(p,'set_session_name',name='Stale saved title');session=switched['sessionFile']
+  await stop(p)
+  p=await launch(session);cold=await title(p,'Quartz [gen]');proof['cases']['cold_resume']=cold['sessionName'];assert cold['messageCount']==0
+  await rpc(p,'set_session_name',name='Native temporary rename')
+  LABEL.write_text(json.dumps({'subject':'agent/eval.worker','desired':{'display_name':'Indigo'},'member':{'tags':{'persona':'gen'}}}))
+  live=await title(p,'Indigo [gen]');proof['cases']['authority_update']=live['sessionName'];assert live['messageCount']==0
+  proof['verdict']='pass'
+  args.out.parent.mkdir(parents=True,exist_ok=True)
+  args.out.write_text(json.dumps(proof,indent=2)+'\n')
+  print('OMP 18.4.4 labels: PASS (no prompts or model calls)',flush=True)
+ finally:
+  for p in processes:
+   if p.returncode is None:await stop(p)
+  print('evidence:',ROOT,flush=True)
+asyncio.run(main())

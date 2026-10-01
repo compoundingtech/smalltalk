@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { cleanMessageText, conversationEntries, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle } from './conversationView.ts';
+import { unreadableTranscript, cleanMessageText, conversationEntries, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle } from './conversationView.ts';
 
 let sequence = 0;
 const at = minute => `2026-09-30T12:${String(minute).padStart(2, '0')}:00Z`;
@@ -65,3 +65,32 @@ assert.equal(shownToolLines(tool, false).hidden, 15);
 assert.equal(shownToolLines(tool, false).lines.at(-1), 'line 19');
 assert.equal(shownToolLines(tool, true).lines.length, 20);
 assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 0);
+
+// Half a conversation is not shown: st's notice that it could not read the transcript becomes
+// one reason, with the transcript's path.
+{
+  const notice = details => ({ id: 'n', role: 'system', timestamp: '2026-10-01T10:00:01Z', type: 'error', body: { code: 'transcript-not-bound', message: 'transcript not bound: the transcript could not be read: line 12: expected value', retryable: true, details } });
+  const mail = { id: 'm', role: 'user', timestamp: '2026-10-01T10:00:00Z', type: 'content', body: { media_type: 'text/plain', text: 'How is the audit going?' } };
+  assert.equal(unreadableTranscript([mail]), null);
+  assert.equal(unreadableTranscript([mail, notice({ driver: 'omp', transcript: '/srv/example/omp/sessions/harbor/0190.jsonl' })]), 'This conversation could not be loaded: the transcript could not be read: line 12: expected value (transcript /srv/example/omp/sessions/harbor/0190.jsonl)');
+  assert.equal(unreadableTranscript([mail, notice({ driver: 'omp' })]), 'This conversation could not be loaded: the transcript could not be read: line 12: expected value');
+}
+
+// A seat that has said nothing since it started shows its Small Talk and one quiet line.
+{
+  const notYet = { id: 'n', role: 'system', timestamp: '2026-10-01T10:00:01Z', type: 'error', body: { code: 'transcript-not-bound', message: 'transcript not bound: Claude session 0190 has no transcript file yet', retryable: true, details: { driver: 'claude', not_yet: true } } };
+  assert.equal(unreadableTranscript([notYet]), null);
+  const shown = conversationEntries([notYet], new Map());
+  assert.deepEqual(shown.map(entry => entry.body), [{ kind: 'event', tone: 'quiet', text: 'nothing in the harness yet since this seat started' }]);
+}
+
+
+// The person's mail says when the agent has it; the delivery is not another line.
+{
+  const delivered = conversationEntries([
+    { id: 'm', sequence: 1, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'message', final: true, body: { message_id: 'message/one', from: 'person/avery', to: 'agent/example/harbor/keeper' } },
+    { id: 'c', sequence: 2, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text: 'How is the audit going?' } },
+    { id: 'h', sequence: 3, revision: 1, timestamp: '2026-10-01T10:00:02Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text: '<channel source="plugin:st3-channel:st3" from="person/avery">[st3-delivery:1.md]\n[PING from st3] message/one from person/avery: (no subject)\n</channel>' } },
+  ], new Map([['person/avery', 'you']]));
+  assert.deepEqual(delivered.map(entry => [entry.body.kind, entry.body.delivered]), [['mail', true]]);
+}

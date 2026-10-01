@@ -241,6 +241,11 @@ agent "no-st2" {{
         channel = [row for row in receipts(node) if row["event"] == "channel"]
         if not any(message in row["content"] for row in channel):
             fail("the message never reached the channel")
+        checks["projected_message_files"] = sum(
+            1 for path in (root / "state").rglob("*")
+            if path.is_file() and any(parent.name in ("inbox", "archive") for parent in path.parents))
+        if checks["projected_message_files"]:
+            fail("the Claude push seat projected inbox/archive message files")
 
         doctor = node.api("/v1/doctor") or {}
         hook_check = next((row for row in doctor.get("checks", []) if row.get("name") == "claude-hooks"), None)
@@ -274,6 +279,10 @@ agent "no-st2" {{
                 if schema != f"st.{name}.v1":
                     fail(f"fresh {name} record has legacy or unsupported schema {schema!r}")
                 checks["record_schemas"][name] = schema
+        status_files = [str(path.relative_to(root)) for path in (root / "state").rglob("status")]
+        checks["legacy_status_files"] = status_files
+        if status_files:
+            fail(f"the native seat created legacy status files: {status_files}")
         leftovers = [str(path) for path in root.rglob("st2") if path.is_dir()]
         if leftovers:
             fail(f"st2 state directories were created: {leftovers}")

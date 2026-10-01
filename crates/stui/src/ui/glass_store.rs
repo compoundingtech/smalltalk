@@ -1,8 +1,8 @@
 //! A person's glasses on this device, until the graph keeps them. The file holds what the graph
-//! will: each glass's name and tabs as layouts of pane keys, and nothing about focus or scroll
+//! does: each glass's name and its splits of tab groups, and nothing about focus or scroll
 //! beyond which glass was used last here.
 
-use super::layout::Layout;
+use super::layout::{Group, Layout, Tab};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
@@ -11,7 +11,8 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const VERSION: u32 = 1;
+/// 2: splits whose leaves are groups of tabs. 1 (tabs of splits) is read once and converted.
+const VERSION: u32 = 2;
 const MAX_BYTES: u64 = 1 << 20;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -31,15 +32,92 @@ pub struct StoredGlass {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
     pub name: String,
-    /// The tabs after Home.
-    pub tabs: Vec<StoredTab>,
+    /// Its splits and their tabs; Home, the first group's first tab, is not stored.
+    pub layout: Layout,
+    /// Where this device left it: the focused group and each group's shown tab. Kept on this
+    /// device only; st keeps structure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<StoredView>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct StoredTab {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    pub layout: Layout,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredView {
+    pub focus: usize,
+    /// Each group's shown tab as its strip counts them: in the first group, 0 is Home.
+    pub current: Vec<usize>,
+}
+
+/// Version 1: a glass was tabs, and each tab a tree of split panes.
+#[derive(Deserialize)]
+struct StoredV1 {
+    last: Option<String>,
+    glasses: Vec<GlassV1>,
+}
+
+#[derive(Deserialize)]
+struct GlassV1 {
+    #[serde(default)]
+    id: String,
+    name: String,
+    tabs: Vec<TabV1>,
+}
+
+#[derive(Deserialize)]
+struct TabV1 {
+    title: Option<String>,
+    layout: LayoutV1,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LayoutV1 {
+    Pane { pane: String },
+    Split { children: Vec<LayoutV1> },
+}
+
+impl LayoutV1 {
+    fn panes(self) -> Vec<String> {
+        match self {
+            LayoutV1::Pane { pane } => vec![pane],
+            LayoutV1::Split { children } => {
+                children.into_iter().flat_map(LayoutV1::panes).collect()
+            }
+        }
+    }
+}
+
+/// A version 1 file in today's shape: every pane it held becomes a tab of one group, in order,
+/// a tab's title going to its first pane. Nothing the person opened is lost; splits are.
+fn from_v1(old: StoredV1) -> Stored {
+    Stored {
+        version: VERSION,
+        last: old.last,
+        glasses: old
+            .glasses
+            .into_iter()
+            .map(|glass| StoredGlass {
+                id: glass.id,
+                // The graph never kept the old shape, so no revision there matches it.
+                revision: None,
+                name: glass.name,
+                layout: Layout::Group(Group {
+                    tabs: glass
+                        .tabs
+                        .into_iter()
+                        .flat_map(|tab| {
+                            let mut title = tab.title;
+                            tab.layout.panes().into_iter().map(move |pane| Tab {
+                                title: title.take(),
+                                pane,
+                            })
+                        })
+                        .collect(),
+                    current: 0,
+                }),
+                view: None,
+            })
+            .collect(),
+    }
 }
 
 /// Where this person's glasses live on this device.
@@ -69,11 +147,21 @@ pub fn load(path: &Path) -> Stored {
     let readable = fs::metadata(path).ok().filter(|metadata| {
         metadata.len() <= MAX_BYTES && metadata.permissions().mode() & 0o077 == 0
     });
-    readable
-        .and_then(|_| fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<Stored>(&bytes).ok())
-        .filter(|stored| stored.version == VERSION)
-        .unwrap_or_default()
+    let Some(bytes) = readable.and_then(|_| fs::read(path).ok()) else {
+        return Stored::default();
+    };
+    let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
+    match version {
+        Some(1) => serde_json::from_slice::<StoredV1>(&bytes)
+            .map(from_v1)
+            .unwrap_or_default(),
+        Some(v) if v == u64::from(VERSION) => {
+            serde_json::from_slice::<Stored>(&bytes).unwrap_or_default()
+        }
+        _ => Stored::default(),
+    }
 }
 
 /// Replace the file at once, readable by this user only.
@@ -111,8 +199,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("st3").join("stui").join("glasses.json");
         assert_eq!(load(&path), Stored::default(), "nothing saved yet");
-        let mut layout = Layout::pane("agent:agent/example/harbor");
-        layout.split(0, Side::Right, "mission:mission/example/audit");
+        let mut layout = Layout::Group(Group::of(Tab::pane("agent:agent/example/harbor")));
+        layout.split(
+            0,
+            Side::Right,
+            Group::of(Tab {
+                title: Some("the audit".into()),
+                pane: "mission:mission/example/audit".into(),
+            }),
+        );
         let stored = Stored {
             version: VERSION,
             last: Some("review".into()),
@@ -121,16 +216,18 @@ mod tests {
                     id: "0190a1b2-0000-7000-8000-000000000001".into(),
                     revision: None,
                     name: "main".into(),
-                    tabs: vec![],
+                    layout: Layout::default(),
+                    view: None,
                 },
                 StoredGlass {
                     id: "0190a1b2-0000-7000-8000-000000000002".into(),
                     revision: Some("r2".into()),
                     name: "review".into(),
-                    tabs: vec![StoredTab {
-                        title: Some("the audit".into()),
-                        layout,
-                    }],
+                    layout,
+                    view: Some(StoredView {
+                        focus: 1,
+                        current: vec![0, 1],
+                    }),
                 },
             ],
         };
@@ -141,5 +238,36 @@ mod tests {
         // A file others can read is not trusted.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(load(&path), Stored::default());
+    }
+
+    #[test]
+    fn a_version_1_file_keeps_every_pane_as_a_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glasses.json");
+        let old = serde_json::json!({"version": 1, "last": "main", "glasses": [{
+        "id": "0190a1b2-0000-7000-8000-000000000003", "revision": "r9", "name": "main",
+        "tabs": [
+            {"title": "audit work", "layout": {"split": "right", "children": [
+                {"pane": "mission:mission/example/audit"}, {"pane": "machine:machine/harbor"}]}},
+            {"layout": {"pane": "agent:agent/example/keeper"}}
+        ]}]});
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let stored = load(&path);
+        assert_eq!(stored.version, VERSION);
+        assert_eq!(stored.last.as_deref(), Some("main"));
+        let glass = &stored.glasses[0];
+        assert_eq!(glass.revision, None, "the graph never kept the old shape");
+        let tabs = &glass.layout.groups()[0].tabs;
+        assert_eq!(
+            tabs.iter()
+                .map(|tab| (tab.title.as_deref(), tab.pane.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("audit work"), "mission:mission/example/audit"),
+                (None, "machine:machine/harbor"),
+                (None, "agent:agent/example/keeper"),
+            ]
+        );
     }
 }

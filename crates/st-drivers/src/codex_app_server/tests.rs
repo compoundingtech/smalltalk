@@ -1096,6 +1096,7 @@ fn captured_delivery_frames_carrying_no_token_count_publish_no_record() {
 fn delivery_config(root: &Path) -> CodexDeliveryConfig {
     let agent_dir = root.join("agents/h/worker");
     CodexDeliveryConfig {
+        control: crate::session_control::SessionControl::Catalog,
         catalog_root: root.to_path_buf(),
         inbox: message::inbox_dir(&agent_dir),
         agent_dir,
@@ -1395,6 +1396,43 @@ fn delivery_client_id_is_stable_and_binds_every_identity_component() {
         id,
         stable_client_user_message_id("h.worker", "thread-main", "1786380000000-def456.md")
     );
+}
+
+#[test]
+fn graph_hold_allows_readonly_thread_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = delivery_config(root.path());
+    config.control = crate::session_control::SessionControl::Graph(
+        crate::session_control::DeliveryGate::default(),
+    );
+    message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
+    let mut delivery = inbox_delivery(root.path(), config);
+    let state = subscribed_state(CodexObservedState::Idle);
+    assert!(delivery.maybe_request(&state).unwrap().is_none());
+    let request = delivery.maybe_snapshot_request(&state).unwrap().unwrap();
+    assert_eq!(request["method"], "thread/read");
+}
+
+#[test]
+fn graph_hold_controls_native_handoff_independently_of_status_and_inbox_refresh() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = delivery_config(root.path());
+    let gate = crate::session_control::DeliveryGate::default();
+    config.control = crate::session_control::SessionControl::Graph(gate.clone());
+    let filename =
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
+    let mut delivery = inbox_delivery(root.path(), config.clone());
+    let state = subscribed_state(CodexObservedState::Idle);
+    assert!(delivery.maybe_request(&state).unwrap().is_none());
+    assert!(!config.agent_dir.join("status").exists());
+    status::set_state(&config.agent_dir.join("status"), status::State::Dnd).unwrap();
+    gate.update(false, Duration::from_secs(30));
+    gate.update(true, Duration::from_secs(30));
+    assert!(delivery.maybe_request(&state).unwrap().is_none());
+    assert!(config.inbox.join(&filename).exists());
+    gate.update(false, Duration::from_secs(30));
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    assert_eq!(request["method"], "turn/start");
 }
 
 #[test]
@@ -6789,6 +6827,59 @@ fn an_error_with_no_optional_codex_error_info_reports_an_unclassified_failure() 
         };
         assert_eq!(failure.reason, driver_diagnostic::Reason::TurnUnclassified);
     }
+}
+
+#[test]
+fn codex_native_push_delivery_reconciles_an_uncertain_handoff_without_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    std::fs::create_dir_all(&config.agent_dir).unwrap();
+    crate::push_mailbox::register(&config.agent_dir);
+    let key = "message/quartz-native";
+    let mut input = message::parse_message(key, "---\nfrom: person/eval\n---\nQUARTZ SIGNAL\n");
+    input.tags.push(format!("st3-message:{key}"));
+    crate::push_mailbox::replace(&config.agent_dir, vec![input.clone()]);
+    let idle = subscribed_state(CodexObservedState::Idle);
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let request = delivery.maybe_request(&idle).unwrap().unwrap();
+    assert_eq!(request["method"], "turn/start");
+    assert!(
+        request["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("QUARTZ SIGNAL")
+    );
+    let client_id = request["params"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(delivery);
+    crate::push_mailbox::replace_active(
+        &config.agent_dir,
+        Vec::new(),
+        BTreeSet::from([key.into()]),
+    );
+    let mut resumed = inbox_delivery(tmp.path(), config.clone());
+    assert_eq!(
+        resumed.maybe_request(&idle).unwrap(),
+        None,
+        "an uncertain handoff is held"
+    );
+    assert!(
+        resumed.ledger.entry(key).is_some(),
+        "an unavailable body cannot prune uncertainty"
+    );
+    crate::push_mailbox::replace(&config.agent_dir, vec![input]);
+    resumed.reconcile_resume(&json!({"id":CONTROL_SUBSCRIBE_REQUEST_ID,"result":{"thread":{
+        "id":"thread-main","turns":[{"id":"turn-native","items":[{"type":"userMessage","id":"item-native",
+            "clientId":client_id,"content":[]}]}]}}}), &idle).unwrap();
+    assert_eq!(
+        resumed.ledger.entry(key).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+    assert_eq!(resumed.maybe_request(&idle).unwrap(), None);
+    assert!(!config.inbox.exists());
+    assert!(!message::archive_dir(&config.agent_dir).exists());
 }
 
 #[test]

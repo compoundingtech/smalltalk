@@ -62,6 +62,7 @@ mod pi_family_session;
 pub mod pi_session;
 pub mod pretrust;
 pub mod provider_session;
+pub mod push_mailbox;
 pub mod reconcile;
 pub mod reexec;
 
@@ -73,6 +74,7 @@ pub mod resource_profile_supervisor;
 pub mod resync;
 pub mod run;
 
+pub mod session_control;
 pub mod status;
 pub mod supervisor_chain;
 pub mod task_inventory;

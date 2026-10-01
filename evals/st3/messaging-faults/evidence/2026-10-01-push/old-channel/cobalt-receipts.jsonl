@@ -1,0 +1,12 @@
+{"at_unix_ms":1790866554182,"pid":3002447,"event":"started"}
+{"at_unix_ms":1790866554232,"pid":3002447,"event":"ready"}
+{"at_unix_ms":1790866555235,"pid":3002447,"event":"wire-frame","subject":"message/41cfb161ef5e2535"}
+{"at_unix_ms":1790866555235,"pid":3002447,"event":"received","subject":"message/41cfb161ef5e2535","content":"Subject: Fault probe: warmup\n\nreceipt-token:warmup"}
+{"at_unix_ms":1790866555261,"pid":3002447,"event":"delivered","subject":"message/41cfb161ef5e2535","accepted_at_unix_ms":1790866555248}
+{"at_unix_ms":1790866555283,"pid":3002447,"event":"read","subject":"message/41cfb161ef5e2535","accepted_at_unix_ms":1790866555272}
+{"at_unix_ms":1790866555297,"pid":3002447,"event":"closed","subject":"message/41cfb161ef5e2535","accepted_at_unix_ms":1790866555285}
+{"at_unix_ms":1790866560781,"pid":3002447,"event":"wire-frame","subject":"message/909ae36e5f5f041f"}
+{"at_unix_ms":1790866560781,"pid":3002447,"event":"received","subject":"message/909ae36e5f5f041f","content":"Subject: Fault probe: old-channel\n\nreceipt-token:old-channel"}
+{"at_unix_ms":1790866560801,"pid":3002447,"event":"delivered","subject":"message/909ae36e5f5f041f","accepted_at_unix_ms":1790866560786}
+{"at_unix_ms":1790866560829,"pid":3002447,"event":"read","subject":"message/909ae36e5f5f041f","accepted_at_unix_ms":1790866560813}
+{"at_unix_ms":1790866560850,"pid":3002447,"event":"closed","subject":"message/909ae36e5f5f041f","accepted_at_unix_ms":1790866560836}

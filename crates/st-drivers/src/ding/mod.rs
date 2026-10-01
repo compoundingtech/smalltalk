@@ -43,6 +43,7 @@ const SENDER_MAX_CHARS: usize = 80;
 /// Envelope identities are whole graph subjects, so they keep a larger bound than the PING header.
 const ADDRESS_MAX_CHARS: usize = 256;
 const ST3_BODY_MAX_CHARS: usize = 2048;
+const PERSON_REPLY_LOCATION: &str = "The person reads replies in st, not in the agent's session.";
 /// The marker for a declared non-agent event source. A fixed st2-chosen literal — never
 /// producer-supplied text — so the bounded-notice proofs are unaffected.
 const SOURCE_MARKER: &str = "»";
@@ -107,17 +108,23 @@ fn st3_body_preview(body: &str) -> (String, bool) {
 /// The plain ST3 notice. Claude receives it inside its own channel tag.
 /// The graph remains the source of the complete message when the preview is bounded.
 pub fn st3_ping_text(reference: &str, from: &str, subject: Option<&str>, body: &str) -> String {
+    let person_message = from.starts_with("person/");
     let from = normalize_field(Some(from), "unknown", SENDER_MAX_CHARS);
     let subject = normalize_field(subject, "(no subject)", SUBJECT_MAX_CHARS);
     let header = format!("[PING from st3] {reference} from {from}: {subject}");
     let (preview, truncated) = st3_body_preview(body);
-    if preview.is_empty() {
+    let mut notice = if preview.is_empty() {
         header
     } else if truncated {
         format!("{header}\n\n{preview}… [read the full message in st3]")
     } else {
         format!("{header}\n\n{preview}")
+    };
+    if person_message {
+        notice.push('\n');
+        notice.push_str(PERSON_REPLY_LOCATION);
     }
+    notice
 }
 
 /// One `<smalltalk-message>` envelope, shared by the Codex, OpenCode, pi, and omp drivers.
@@ -133,6 +140,7 @@ pub fn st3_notification_text(
     body: &str,
     body_sha256: &str,
 ) -> String {
+    let person_message = from.starts_with("person/");
     let graph = normalize_field(Some(reference), "message/unknown", ADDRESS_MAX_CHARS);
     let id = graph.strip_prefix("message/").unwrap_or(&graph);
     let from = normalize_field(Some(from), "unknown", ADDRESS_MAX_CHARS);
@@ -159,6 +167,10 @@ pub fn st3_notification_text(
     envelope.push_str("</smalltalk-message>");
     if truncated {
         envelope.push_str("\n[preview truncated; read the full message in st3]");
+    }
+    if person_message {
+        envelope.push('\n');
+        envelope.push_str(PERSON_REPLY_LOCATION);
     }
     envelope
 }

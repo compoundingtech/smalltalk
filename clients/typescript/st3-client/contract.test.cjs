@@ -226,6 +226,7 @@ test('glass methods preserve structure, null creation base, and idempotency head
     }});
     const uuid = fixture.value.id.split('/').pop();
     assert.equal((await client.putGlass(uuid, put, 'create')).value.body.name, 'Main workspace');
+    assert.deepEqual(JSON.parse(calls[0].options.body).body, put.body);
     assert.equal(calls[0].options.method, 'PUT');
     assert.equal(calls[0].options.headers['Idempotency-Key'], 'create');
     assert.equal(JSON.parse(calls[0].options.body).base_revision, null);

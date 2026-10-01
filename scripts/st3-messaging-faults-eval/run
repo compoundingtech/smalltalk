@@ -306,6 +306,8 @@ async def send(node, case):
 def judge(proof):
     """Require independent native, graph, runtime, and sender evidence."""
     failures = []
+    if proof.get("projected_message_files", 0):
+        failures.append("delivery created file-mailbox messages")
     delay = proof["read_after_clear_ms"]
     if delay is None:
         failures.append("message was not read")
@@ -344,6 +346,7 @@ async def run_case(args, case, directory, candidate, old, replacement):
     nodes = []
     link = Link()
     result = {"case": case, "verdict": "error", "failures": []}
+    phase = "setup"
     try:
         env = {"PATH": os.environ["PATH"], "USER": os.environ.get("USER", "eval"),
                "LOGNAME": os.environ.get("USER", "eval"), "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
@@ -397,18 +400,23 @@ agent "fault-probe" {{
         async def ready():
             value = await agent(target)
             return value if value.get("harness_state") == "idle" and provider_pids(target.seats()) else None
+        phase = "provider-readiness"
         await until(ready, args.ready_seconds)
         # A cross-node warmup proves the fixture before injecting any fault.
+        phase = "cross-node-warmup"
         warmup = await send(source, "warmup")
         async def warm():
             return any(row.get("event") == "read" and row.get("subject") == warmup for row in receipts(target))
-        await until(warm, 30)
+        # A peer exchange can already be in its 30-second long poll when we send.
+        # Warmup uses the setup deadline; the injected fault retains its 10-second oracle.
+        await until(warm, args.ready_seconds)
         before = target.seats()
         before_card = await agent(target)
         initial = provider_pids(before)
         fault_started = now_ms()
         fault_monotonic = time.monotonic()
         subject = None
+        phase = "fault-injection"
         if case == "daemon-restart":
             # Queue before shutting down, without racing a successful handoff.
             # The temporary link gate is removed while the daemon is still down.
@@ -431,6 +439,10 @@ agent "fault-probe" {{
             shutil.copy2(candidate if case == "old-channel" else replacement, next_binary)
             os.replace(next_binary, target.binary)
             await target.down()
+            if case == "old-channel":
+                # Ensure the historical poller observes the daemon outage instead of racing
+                # between one-second polls. The real extension owns channel recovery.
+                await asyncio.sleep(args.short_seconds)
             await target.start()
             link.enabled = True
         elif case in ("link-seconds", "link-minutes"):
@@ -479,6 +491,7 @@ agent "fault-probe" {{
             await until(restarted, args.ready_seconds)
         else:
             subject = await send(source, case)
+        phase = "fault-observation"
         cleared = now_ms()
         result.update(message=subject, fault_started_at_unix_ms=fault_started,
                       fault_cleared_at_unix_ms=cleared,
@@ -507,6 +520,8 @@ agent "fault-probe" {{
         graph_reads = [claim for claim in claims if claim.get("kind") == "message.read"]
         source_view = await source.api("/v1/messages/read/" + subject)
         result.update(
+            projected_message_files=sum(1 for path in (target.root / "state").rglob("*")
+                if path.is_file() and any(part in ("inbox", "archive") for part in path.parts)),
             read_after_clear_ms=delay, received_copies=len(received), graph_read_claims=len(graph_reads),
             provider_starts=len(starts), expected_provider_starts=expected_starts,
             provider_pids_before=initial, provider_pids_after=provider_pids(after),
@@ -524,6 +539,7 @@ agent "fault-probe" {{
         for node in nodes:
             write_json(directory / f"{node.name}-replication.json", await node.api("/v1/replication/status"))
     except Exception as error:
+        result["fixture_error_phase"] = phase
         result["failures"].append(f"fixture error: {type(error).__name__}: {error}")
         for node in nodes:
             write_json(directory / f"{node.name}-error-agent.json", await agent(node))

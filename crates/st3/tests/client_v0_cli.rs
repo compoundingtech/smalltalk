@@ -93,7 +93,7 @@ fn value(output: &Output) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_granted_seat_bootstraps_and_cancels_with_its_own_cli_identity() {
+async fn a_seat_bootstraps_cancels_and_stops_with_its_own_cli_identity() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
@@ -116,8 +116,6 @@ async fn a_granted_seat_bootstraps_and_cancels_with_its_own_cli_identity() {
 agent "example/operations/coordinator" {
   workspace "."
   command "true"
-  agent-authority { apply "example/operations/*" }
-  mission-authority { publish "example/jobs/*"; start "example/jobs/*"; cancel "example/jobs/*" }
 }
 "#,
     )
@@ -148,13 +146,21 @@ agent "example/operations/deputy" {
 "#,
     )
     .unwrap();
-    value(
-        &run_cli_with_agent_env(
-            &socket,
-            actor,
-            &["agents", "apply", deputy.to_str().unwrap(), "--as", actor],
-        )
-        .await,
+    // Free mode: the seat declares another seat with no grant, and st says it ignores the
+    // deputy's authority block.
+    let applied = run_cli_with_agent_env(
+        &socket,
+        actor,
+        &["agents", "apply", deputy.to_str().unwrap(), "--as", actor],
+    )
+    .await;
+    value(&applied);
+    assert!(
+        String::from_utf8_lossy(&applied.stderr).contains(
+            "`agent/example/operations/deputy` declares `mission-authority`, which st ignores"
+        ),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
     );
     let mission = root.path().join("mission.kdl");
     std::fs::write(&mission, "version 2\nmission \"example/jobs/docs/one\" state=\"ready\" { goal \"Do the assigned work.\"; step \"wait\" { agentless } }\n").unwrap();
@@ -215,20 +221,11 @@ agent "example/operations/deputy" {
             .phase,
         "cleanup-cancelled"
     );
-    let escalate = root.path().join("escalate.kdl");
-    std::fs::write(&escalate, "version 2\nagent \"example/operations/deputy\" { workspace \".\"; command \"true\"; mission-authority { publish \"example/*\" } }\n").unwrap();
-    let denied = run_cli_with_agent_env(
-        &socket,
-        actor,
-        &["agents", "apply", escalate.to_str().unwrap(), "--as", actor],
-    )
-    .await;
-    assert!(!denied.status.success());
-    assert!(
-        String::from_utf8_lossy(&denied.stderr).contains("agent-authority-grant-denied"),
-        "{}",
-        String::from_utf8_lossy(&denied.stderr)
-    );
+    let run = store
+        .mission_run("example/jobs/docs/one/run")
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.requester, actor, "the agent started the run as itself");
     value(
         &run_cli_with_agent_env(
             &socket,
@@ -237,6 +234,17 @@ agent "example/operations/deputy" {
         )
         .await,
     );
+    // A seat stops itself.
+    value(&run_cli_with_agent_env(&socket, actor, &["agents", "stop", actor, "--as", actor]).await);
+    let stopped = store
+        .desired_subjects()
+        .unwrap()
+        .into_iter()
+        .filter(|desired| desired.kind == "stop")
+        .map(|desired| desired.subject)
+        .collect::<Vec<_>>();
+    assert!(stopped.contains(&actor.to_owned()), "{stopped:?}");
+    assert!(stopped.contains(&deputy_actor.to_owned()), "{stopped:?}");
     server.abort();
 }
 
@@ -376,9 +384,24 @@ async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance(
     assert_eq!(report["window_seconds"], 300);
     assert!(!report["requests"].as_array().unwrap().is_empty());
     assert!(!report["queries"].as_array().unwrap().is_empty());
+    // Each request is counted under the command that sent it.
+    assert!(report["request_count"].as_u64().unwrap() > 0);
+    assert!(
+        report["client_requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |row| row["client"].as_str().unwrap().contains("st3 missions")
+                    && row["count"].as_u64().unwrap() > 0
+            ),
+        "{report:#}"
+    );
     let shown = run_cli_human(&socket, &["doctor", "--performance"]).await;
     assert!(shown.status.success());
-    assert!(String::from_utf8_lossy(&shown.stdout).contains("REQUESTS AND TASKS"));
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("REQUESTS AND TASKS"));
+    assert!(shown.contains("REQUESTS BY CLIENT"), "{shown}");
     server.abort();
 }
 
@@ -1396,7 +1419,7 @@ mission "queued-work" state="ready" {
     assert_eq!(queue["value"]["moves"][0]["placement"], "after");
     assert_eq!(queue["value"]["moves"][0]["anchor_run_id"], run(1));
 
-    // An agent with queue authority for the seat moves runs as itself.
+    // Another agent moves the seat's runs as itself.
     let chief = "agent/client-v0-cli.queue-chief";
     let moved = run_queue_cli(
         &socket,
@@ -1462,29 +1485,26 @@ mission "queued-work" state="ready" {
     assert_eq!(queue["value"]["moves"][0]["actor_id"], chief);
     assert_eq!(queue["value"]["move_count"], 4);
 
-    // The seat has no grant over its own queue.
-    let refused = run_queue_cli(
-        &socket,
-        &config_home,
-        false,
-        &[
-            "agents",
-            "queue",
-            "move",
-            &seat,
-            run(2),
-            "--top",
-            "--as",
-            &seat,
-        ],
-    )
-    .await;
-    assert!(!refused.status.success());
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("queue-authority-denied"),
-        "{}",
-        String::from_utf8_lossy(&refused.stderr)
+    // Free mode: the seat moves its own queue without a grant.
+    let claim = value(
+        &run_queue_cli(
+            &socket,
+            &config_home,
+            true,
+            &[
+                "agents",
+                "queue",
+                "move",
+                &seat,
+                run(2),
+                "--top",
+                "--as",
+                &seat,
+            ],
+        )
+        .await,
     );
+    assert_eq!(claim["actor"], seat);
     let refused = run_queue_cli(
         &socket,
         &config_home,
@@ -2333,6 +2353,294 @@ async fn serve_creation_api(
     }
     assert!(socket.exists());
     (socket, server)
+}
+
+async fn agent_declaration(socket: &Path, subject: &str) -> st3::model::DesiredSubject {
+    let client = st3::client::Client::unix(socket);
+    let status: st3::model::StatusResponse = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(subject)
+        ))
+        .await
+        .unwrap();
+    let token = status.subjects[0].desired_token.as_ref().unwrap();
+    let claim: st3::model::ClaimRecord = client
+        .get(&format!("/v1/claims/by-id/{token}"))
+        .await
+        .unwrap();
+    serde_json::from_value(claim.body).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_start_preserves_command_declarations_and_refuses_harness_options() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, server) = serve_creation_api(root.path(), None).await;
+    for (name, launch) in [
+        ("command", r#"command "omp --model original""#),
+        ("argv", r#"argv "omp" "--model" "original""#),
+    ] {
+        let source = root.path().join(format!("{name}.kdl"));
+        std::fs::write(
+            &source,
+            format!(
+                "version 2\nhost \"remote\" {{\n agent \"{name}\" {{\n\
+                 workspace \"/original\"\n restart never\n {launch}\n\
+                 env {{ ORIGINAL \"kept\" }}\n }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        value(
+            &run_cli(
+                &socket,
+                &[
+                    "agents",
+                    "apply",
+                    source.to_str().unwrap(),
+                    "--as",
+                    "person/avery",
+                ],
+            )
+            .await,
+        );
+        let subject = format!("agent/remote.{name}");
+        let original = agent_declaration(&socket, &subject).await;
+        for stopped in [false, true] {
+            if stopped {
+                value(
+                    &run_cli(
+                        &socket,
+                        &["agents", "stop", &subject, "--as", "person/avery"],
+                    )
+                    .await,
+                );
+            }
+            let preview = run_cli(
+                &socket,
+                &[
+                    "agents",
+                    "start",
+                    &subject,
+                    "--as",
+                    "person/avery",
+                    "--print-kdl",
+                ],
+            )
+            .await;
+            assert!(preview.status.success(), "{preview:?}");
+            let intent =
+                st3::parse_intent(&String::from_utf8(preview.stdout).unwrap(), "client-v0-cli")
+                    .unwrap();
+            assert_eq!(intent.subjects[&subject].member, original.member);
+            value(
+                &run_cli(
+                    &socket,
+                    &["agents", "start", &subject, "--as", "person/avery"],
+                )
+                .await,
+            );
+            assert_eq!(
+                agent_declaration(&socket, &subject).await.member,
+                original.member
+            );
+        }
+        for option in ["--model", "--effort", "--arg"] {
+            let rejected = run_cli(
+                &socket,
+                &[
+                    "agents",
+                    "start",
+                    &subject,
+                    "--as",
+                    "person/avery",
+                    option,
+                    "new",
+                ],
+            )
+            .await;
+            assert!(!rejected.status.success(), "{rejected:?}");
+            let error = String::from_utf8(rejected.stderr).unwrap();
+            assert!(
+                error.contains(name) && error.contains("typed harness"),
+                "{error}"
+            );
+            assert_eq!(
+                agent_declaration(&socket, &subject).await.member,
+                original.member
+            );
+        }
+        value(
+            &run_cli(
+                &socket,
+                &[
+                    "agents",
+                    "start",
+                    &subject,
+                    "--as",
+                    "person/avery",
+                    "--host",
+                    "moved",
+                    "--workspace",
+                    root.path().to_str().unwrap(),
+                ],
+            )
+            .await,
+        );
+        let moved = agent_declaration(&socket, &subject).await;
+        let mut expected = original.member.unwrap();
+        expected.host = "moved".into();
+        expected.workspace = root.path().to_str().unwrap().into();
+        expected.cwd = expected.workspace.clone();
+        assert_eq!(moved.member, Some(expected));
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_start_patches_only_explicit_typed_harness_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, server) = serve_creation_api(root.path(), None).await;
+    let source = root.path().join("harness.kdl");
+    std::fs::write(
+        &source,
+        "version 2\nagent \"example/typed\" {\n host \"remote\"\n\
+         workspace \"/original\"\n restart never\n env { ORIGINAL \"kept\" }\n\
+         harness omp { model \"old\"; effort \"low\"; args \"--old\" }\n}\n",
+    )
+    .unwrap();
+    value(
+        &run_cli(
+            &socket,
+            &[
+                "agents",
+                "apply",
+                source.to_str().unwrap(),
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await,
+    );
+    let subject = "agent/example/typed";
+    let original = agent_declaration(&socket, subject).await;
+    for (option, model, effort, arguments, driver) in [
+        (vec![], "old", "low", vec!["--old"], "omp"),
+        (vec!["--model", "new"], "new", "low", vec!["--old"], "omp"),
+        (
+            vec!["--effort", "high"],
+            "new",
+            "high",
+            vec!["--old"],
+            "omp",
+        ),
+        (
+            vec!["--arg=--new", "--arg", "value"],
+            "new",
+            "high",
+            vec!["--new", "value"],
+            "omp",
+        ),
+        (
+            vec!["--harness", "pi"],
+            "new",
+            "high",
+            vec!["--new", "value"],
+            "pi",
+        ),
+    ] {
+        let mut args = vec!["agents", "start", subject, "--as", "person/avery"];
+        args.extend(option.iter().copied());
+        value(&run_cli(&socket, &args).await);
+        let current = agent_declaration(&socket, subject).await;
+        let member = current.member.unwrap();
+        let previous = original.member.as_ref().unwrap();
+        assert_eq!(member.host, previous.host);
+        assert_eq!(member.workspace, previous.workspace);
+        assert_eq!(member.restart, previous.restart);
+        assert_eq!(member.environment, previous.environment);
+        let nodes = current.desired["children"].as_array().unwrap();
+        let harness = nodes.iter().find(|node| node["name"] == "harness").unwrap();
+        let children = harness["children"].as_array().unwrap();
+        let field =
+            |name: &str| &children.iter().find(|node| node["name"] == name).unwrap()["arguments"];
+        assert_eq!(field("model"), &serde_json::json!([model]));
+        assert_eq!(field("effort"), &serde_json::json!([effort]));
+        assert_eq!(field("args"), &serde_json::json!(arguments));
+        assert_eq!(harness["arguments"][0], driver);
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_start_accepts_explicit_identity_and_rejects_doubled_prefixes() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, server) = serve_creation_api(root.path(), None).await;
+    for (identity, subject) in [
+        ("example/worker", "agent/example/worker"),
+        ("agent/example/worker", "agent/example/worker"),
+        ("worker", "agent/placement.worker"),
+        ("agent/other.worker", "agent/other.worker"),
+    ] {
+        let output = run_cli(
+            &socket,
+            &[
+                "agents",
+                "start",
+                identity,
+                "--host",
+                "placement",
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await;
+        let applied = value(&output);
+        assert!(
+            applied["subject_tokens"].get(subject).is_some(),
+            "{identity}: {applied}"
+        );
+        let preview = run_cli(
+            &socket,
+            &[
+                "agents",
+                "start",
+                identity,
+                "--host",
+                "placement",
+                "--as",
+                "person/avery",
+                "--print-kdl",
+            ],
+        )
+        .await;
+        assert!(preview.status.success());
+        let kdl = String::from_utf8(preview.stdout).unwrap();
+        let intent = st3::parse_intent(&kdl, "client-v0-cli").unwrap();
+        assert!(intent.subjects.contains_key(subject), "{kdl}");
+    }
+    for preview in [false, true] {
+        let mut args = vec![
+            "agents",
+            "start",
+            "agent/agent/example/accidental",
+            "--as",
+            "person/avery",
+        ];
+        if preview {
+            args.push("--print-kdl");
+        }
+        let output = run_cli(&socket, &args).await;
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("agent/agent/"), "{error}");
+        assert!(error.contains("ID or agent/ID"), "{error}");
+    }
+    let agents = value(&run_cli(&socket, &["agents", "ls", "--all"]).await);
+    assert!(
+        !agents.to_string().contains("accidental"),
+        "rejected identity created a seat: {agents}"
+    );
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

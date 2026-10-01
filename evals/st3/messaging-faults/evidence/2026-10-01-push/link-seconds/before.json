@@ -1,0 +1,71 @@
+{
+  "agent": {
+    "kind": "agent",
+    "id": "agent/eval/fault-probe",
+    "revision": "7e1e68643b4e8a083b776a5ef31d884d8c2a82b9269dfc5701c7420c39b505aa",
+    "updated_at": "2026-10-01T14:50:56.610Z",
+    "operational": {
+      "layer": "current",
+      "actionable": true,
+      "reasons": [],
+      "owner_generation": null,
+      "runtime_incarnation": "2964011:2026-10-01T14:50:56.084Z",
+      "runtime_desired_revision": null
+    },
+    "name": "eval/fault-probe",
+    "state": "running",
+    "reachability": "reachable",
+    "runtime_ids": [
+      "runtime/eval.fault-probe"
+    ],
+    "owner_run_id": null,
+    "driver": "omp",
+    "harness_state": "idle",
+    "host_id": "host/cobalt",
+    "last_activity_at": "2026-10-01T14:50:56.751Z",
+    "silent_since": null,
+    "fault": null,
+    "incarnation_id": "2964011:2026-10-01T14:50:56.084Z",
+    "current_session_id": "session/e412bd1ff9a39ed474f596fd",
+    "current_work_ids": [],
+    "active_work_count": 0,
+    "next_work_id": null,
+    "upcoming_work_ids": [],
+    "queued_work_count": 0,
+    "current_work": [],
+    "next_work": null,
+    "upcoming_work": [],
+    "usage": null,
+    "mission_authority": {
+      "source": "none",
+      "publish": [],
+      "start": [],
+      "revise": [],
+      "cancel": []
+    },
+    "under": [],
+    "delivery": {
+      "state": "current",
+      "reason": null,
+      "polled_seconds_ago": 0,
+      "transport": "omp-channel"
+    }
+  },
+  "processes": [
+    {
+      "pid": 2964015,
+      "argv": "<eval-root>/cobalt/bin/st3 driver omp --subject agent/eval/fault-probe -- omp ",
+      "image": "<eval-root>/cobalt/bin/st3"
+    },
+    {
+      "pid": 2964132,
+      "argv": "<home>/.nvm/versions/node/v24.18.0/bin/node <repo>/scripts/st3-messaging-faults-eval/provider.mjs --session-dir <eval-root>/cobalt/state/drivers/61ab2a675dbbb8b48329718b/catalog/agents/cobalt/54bf4d98c9bfd281/provider-sessions -e <eval-root>/cobalt/state/hooks/sets/sha256-b80ce514aeabd5ef185ebfe6a5d4dedab18073801628c730fb11f18cf0cfe9c1/omp-channel.ts ",
+      "image": "<home>/.nvm/versions/node/v24.18.0/bin/node"
+    },
+    {
+      "pid": 2964176,
+      "argv": "<eval-root>/cobalt/bin/st3 --catalog <eval-root>/cobalt/state/drivers/61ab2a675dbbb8b48329718b/catalog driver omp-channel --identity eval/fault-probe ",
+      "image": "<eval-root>/cobalt/bin/st3"
+    }
+  ]
+}

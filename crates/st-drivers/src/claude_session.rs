@@ -1,8 +1,8 @@
-//! Controlled Claude launch with a session-owned presence lease.
+//! Controlled Claude launch with session-owned observed state.
 //!
 //! Claude can close its stdio MCP child after startup. That child cannot prove that the interactive
-//! provider still lives. This wrapper launches the provider and refreshes presence while that exact
-//! child remains alive. It uses the provider's existing terminal process group. The launch body
+//! provider still lives. This wrapper supervises that exact child and refreshes its observed
+//! record while it remains alive. Catalog launches also maintain their status lease. It uses the provider's existing terminal process group. The launch body
 //! itself lives in [`crate::provider_session`], which every interactive harness wrapper shares.
 //!
 //! Observed harness state for Claude has two producers with one owner each: hook invocations
@@ -122,11 +122,11 @@ fn run_with_required_resume(
     }
     run_provider_with_env_removals(
         "Claude",
-        &status::status_path(&agent_dir),
+        Some(&status::status_path(&agent_dir)),
         &claude_argv,
         &env,
         &[EXPECTED_NATIVE_SESSION_ENV, RESUME_GENERATION_ENV],
-        status::STATUS_REFRESH,
+        crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
         Some(&observer),
@@ -169,11 +169,11 @@ pub fn run_controlled_paths(
     // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
     run_provider_with_env_removals(
         "Claude",
-        &status::status_path(agent_dir),
+        None,
         &claude_argv,
         &env,
         &[EXPECTED_NATIVE_SESSION_ENV, RESUME_GENERATION_ENV],
-        status::STATUS_REFRESH,
+        crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
         Some(&observer),
@@ -194,9 +194,9 @@ pub fn adopt_controlled_paths(
     let observer = SessionObserver::adopt(agent_dir, identity, "claude", runtime_id, session, seq);
     crate::provider_session::adopt_provider(
         "Claude",
-        &status::status_path(agent_dir),
+        None,
         pid,
-        status::STATUS_REFRESH,
+        crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
         Some(&observer),
@@ -627,6 +627,11 @@ fn with_resume_and_option_terminator(
 }
 
 fn transcript_matches(root: &Path, native_session_id: &str, codex: bool) -> Result<Vec<PathBuf>> {
+    // A Claude-only machine need not have a Codex transcript store. An absent store
+    // contributes no candidates; existing unreadable or invalid stores still fail closed.
+    if fs::symlink_metadata(root).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(Vec::new());
+    }
     let root = fs::canonicalize(root)
         .with_context(|| format!("opening managed transcript store {}", root.display()))?;
     let expected = format!("{native_session_id}.jsonl");
@@ -845,6 +850,21 @@ fn load_binding(
     runtime_id: &str,
 ) -> Result<Option<ClaudeSessionBinding>> {
     load_binding_file(&state_dir.join(BINDING_FILE), agent, runtime_id)
+}
+
+/// The verified transcript of this wrapper session. Channel receipts observe native user
+/// records directly; they never depend on a UserPromptSubmit marker or hook receipt.
+pub fn channel_transcript(
+    catalog_root: &Path,
+    identity: &str,
+    runtime_id: &str,
+    incarnation: &str,
+) -> Result<Option<PathBuf>> {
+    Ok(
+        load_binding(&state_dir(catalog_root, identity), identity, runtime_id)?
+            .filter(|binding| binding.runtime_incarnation == incarnation)
+            .map(|binding| binding.transcript_path),
+    )
 }
 
 fn load_pending_binding(
@@ -2020,7 +2040,7 @@ mod tests {
 
         run_provider(
             "Claude",
-            &presence,
+            Some(&presence),
             &[
                 "sh".into(),
                 "-c".into(),
@@ -2487,7 +2507,7 @@ mod tests {
 
         let result = run_provider(
             "Claude",
-            &presence,
+            Some(&presence),
             &["sh".into(), "-c".into(), "kill -9 $$".into()],
             &[],
             Duration::from_millis(25),
@@ -2512,7 +2532,7 @@ mod tests {
 
         run_provider(
             "Claude",
-            &presence,
+            Some(&presence),
             &["true".into()],
             &[],
             Duration::from_millis(25),
@@ -3201,6 +3221,23 @@ mod tests {
         let link = link_root.join(format!("{RESUME_ID}.jsonl"));
         symlink(&transcript, &link).unwrap();
         assert!(validate_transcript(&link, RESUME_ID, &workspace).is_err());
+    }
+
+    #[test]
+    fn claude_transcript_can_bind_without_a_codex_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude_root = temp.path().join("claude/projects/project");
+        let codex_root = temp.path().join("codex/sessions");
+        fs::create_dir_all(&claude_root).unwrap();
+        let transcript = claude_root.join(format!("{RESUME_ID}.jsonl"));
+        fs::write(&transcript, "{}\n").unwrap();
+        assert_eq!(resolve_managed_transcript(&transcript, RESUME_ID,
+            &temp.path().join("claude/projects"), &codex_root).unwrap(),
+            fs::canonicalize(&transcript).unwrap());
+        fs::create_dir_all(codex_root.parent().unwrap()).unwrap();
+        fs::write(&codex_root, "not a directory").unwrap();
+        assert!(resolve_managed_transcript(&transcript, RESUME_ID,
+            &temp.path().join("claude/projects"), &codex_root).is_err());
     }
 
     #[test]

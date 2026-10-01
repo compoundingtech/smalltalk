@@ -71,6 +71,40 @@ a shared derived column and is digested with the document row. The fleet-size re
 260,000 claims and 10,000 document versions, then requires latest listings, history pages,
 lookup and cursor reads to finish within two seconds and verifies the indexed latest query plan.
 
+## Rolling upgrades and waiting claims
+
+A registry difference never refuses an exchange. Admission checks the envelope signature,
+wire hashes and batch identity before classifying its claims. Kinds and fields this build does
+not know remain in the original envelope and in retryable `unknown` receipt records. Known
+claims in that envelope and later envelopes from the same writer continue to project. An
+unknown claim alone does not degrade its envelope or mark a projection unhealthy.
+
+`st replication status` reports `waiting` claims; JSON exposes `waiting_claims` and retains
+`unknown_records` for existing readers. Doctor reports the waiting count without treating it
+as a fault. At daemon startup, admission retries those original records using the upgraded
+registry, then the canonical projector rebuilds their shared rows. An earlier claim learned
+on upgrade must sort by its original canonical key, never its new local arrival index.
+
+The `authority_digest` is the build-independent log digest: it commits every stored envelope
+identity, including envelopes containing unprojected claims and checkpoint tombstones. Each
+envelope hash commits its original payload and chain metadata. Thus members holding the same
+wire log agree on this digest even while their projections differ. Inventory equality does
+not prove signature admission; unsigned, fenced and invalid records retain their diagnostics.
+The graph and table digests describe this build's admitted projections and may differ until
+all members learn the same claim vocabulary. Automatic projection comparisons and heals run
+only for matching registry digests with no locally waiting claims. A rolling upgrade clears
+old divergence measurements; comparisons resume after upgrade. A first sync between different
+builds verifies the equal wire log once every envelope passes admission, recording its
+`authority_digest` and leaving graph equality unasserted. Fleet join can then complete while
+claims wait for an upgrade. This preserves full projection
+checks for members with the same registry without asking an older reader to project new facts.
+
+The signed two-node regression
+`store::fleet_admission_tests::mixed_builds_keep_signed_unknown_claims_and_project_them_after_upgrade`
+uses one registry without document bindings, exchanges unknown claims and later known claims
+in both directions, then reopens the older store with the current registry. It requires equal
+log digests before upgrade and equal graph and every table digest after canonical replay.
+
 ## Projection digest coverage and cost
 
 `store/projection_digest.rs::TABLES` lists the shared tables: operations, blobs, documents,
@@ -124,7 +158,8 @@ the test inventory and production registry to agree, and the fixture exercises e
 
 `st replication status` prints `table-digest` entries and names differing tables under each
 peer. `st replication diff PEER` and `st doctor` also name them. Table differences are meaningful
-only when inventories agree, projection is current and local committed batches are sealed. Old peers omit `projection_digests`;
+only when inventories and claim registries agree, no claims wait for a newer build, projection
+is current and local committed batches are sealed. Old peers omit `projection_digests`;
 exchanges and heals then compare their unchanged six-table compatibility hash. Old peers cannot
 verify full projection coverage. Modern peers compare complete maps. SQLite schema 14 adds the
 transactional digest machinery and rebuilds shared projections once, correcting older stored
@@ -195,12 +230,27 @@ The fleet ID is a persistent UUID. A store rejects another fleet ID after its fi
 
 The secret contains 32 raw bytes or 64 hexadecimal characters. Its file mode must deny group and other access.
 
-The peer listener binds loopback; the worker can additionally bind discovered tailnet addresses.
-Explicit routes accept loopback or tailnet HTTP and `fabric://NODE_ID/PROTOCOL`. Fabric routes
-name the lasting remote endpoint: the worker creates or reacquires the local tunnel itself.
-Several peer entries may name the same member with distinct routes. Arbitrary LAN/public HTTP
-addresses remain rejected. See [the migration procedure](../fleet-join.md#move-an-existing-fleet-off-local-dial-helpers)
-to replace a legacy local dial helper.
+The peer listener accepts loopback or a literal Tailscale IP in `100.64.0.0/10` or
+`fd7a:115c:a1e0::/48`; the worker can also bind discovered tailnet addresses. A listener bound
+to a Tailscale IP is advertised as this member's Tailscale endpoint.
+Explicit peer routes accept loopback or tailnet HTTP and `fabric://NODE_ID/PROTOCOL`.
+Fabric routes name the lasting remote endpoint: the worker creates or reacquires the local
+tunnel itself. Several peer entries may name the same member with distinct routes.
+Arbitrary DNS names and LAN/public HTTP peer URLs remain rejected. The listener refuses a
+wildcard, LAN or public address unless `peer_listen_allow_plain_http = true` (or
+`--peer-listen-allow-plain-http`) is set: st cannot tell whether such a path is encrypted,
+and the listener carries terminal input and attach grants as well as replication.
+Replication is plain HTTP, encrypted between hosts by Tailscale or a Fabric tunnel;
+the fleet secret and joined members' signatures still authenticate the exchange.
+See [Tailscale setup](tailscale.md) for direct-host setup and
+[the migration procedure](../fleet-join.md#move-an-existing-fleet-off-local-dial-helpers)
+for replacing a legacy local dial helper.
+
+The peer HTTP listener is not the privileged local Unix API: it exposes only fleet replication,
+join, and owner-forwarded client operations. Replication and forwarded client requests require
+the fleet HMAC and peer admission; current members must also sign with their member key.
+Joining instead requires a valid invitation proof and the joining member's signature.
+Binding a tailnet address does not expose the privileged Unix API or bypass these checks.
 
 On a node that only receives connections from a peer, list its name without a URL:
 

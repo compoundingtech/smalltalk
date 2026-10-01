@@ -19,8 +19,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::message;
-
 pub(crate) const LEDGER_SCHEMA: &str = "st.delivery-ledger.v1";
 pub(crate) const LEDGER_FILE: &str = "delivery-ledger.json";
 
@@ -360,7 +358,7 @@ impl Ledger {
 
     fn validate(&self, entry: &Entry, correlate: &impl Fn(&str, &str) -> String) -> Result<()> {
         anyhow::ensure!(
-            message::is_message_filename(&entry.filename) && !entry.binding.is_empty(),
+            crate::push_mailbox::is_delivery_key(&entry.filename) && !entry.binding.is_empty(),
             "delivery ledger entry has an invalid binding or filename"
         );
         anyhow::ensure!(
@@ -418,7 +416,7 @@ impl Ledger {
     pub fn begin(&mut self, begin: Begin) -> Result<Entry> {
         self.ensure_writable()?;
         anyhow::ensure!(
-            message::is_message_filename(&begin.filename) && !begin.binding.is_empty(),
+            crate::push_mailbox::is_delivery_key(&begin.filename) && !begin.binding.is_empty(),
             "delivery attempt has an invalid binding or filename"
         );
         let entry = match self

@@ -11,7 +11,8 @@ export type Body =
   | { kind: 'user'; text: string }
   | { kind: 'assistant'; text: string }
   | { kind: 'tool'; title: string; state: ToolState; output: string[] }
-  | { kind: 'mail'; from: string; to: string; subject: string; text: string }
+  /** `delivered`: the recipient's harness has it, seen in the agent's own transcript. */
+  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean }
   | { kind: 'event'; text: string; tone: 'quiet' | 'warning' | 'fault' };
 export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body };
 
@@ -113,8 +114,17 @@ function shorten(text: string, max: number): string {
   return [...line].length <= max ? line : `${[...line].slice(0, max).join('')}…`;
 }
 
-/** A user or system entry from a harness transcript, turned into what a person should see. */
-export function fromHarness(isUser: boolean, raw: string): Body[] {
+/** The graph message a `[PING from st3] message/ID from …` line announces. */
+function pingId(text: string): string | undefined {
+  return /^\s*\[PING from st3\] (message\/\S+) from /m.exec(text)?.[1];
+}
+
+/**
+ * A user or system entry from a harness transcript, turned into what a person should see.
+ * A delivery of mail the stream already shows (`shown`) is not announced again: its id goes in
+ * `delivered`, and the mail itself says it arrived.
+ */
+export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<string> = new Set(), delivered: Set<string> = new Set()): Body[] {
   const text = { value: raw.replace(/\r\n/g, '\n') };
   const bodies: Body[] = [];
   for (const block of takeBlocks(text, 'task-notification')) {
@@ -122,6 +132,8 @@ export function fromHarness(isUser: boolean, raw: string): Body[] {
   }
   const senders = [...text.value.matchAll(/<channel\b[^>]*>/g)].map(match => /from="([^"]*)"/.exec(match[0])?.[1] ?? 'someone');
   takeBlocks(text, 'channel').forEach((block, index) => {
+    const id = pingId(block);
+    if (id && shown.has(id)) { delivered.add(id); return; }
     const subject = block.split('\n').map(line => line.trim()).find(line => line.startsWith('Subject:'))?.slice('Subject:'.length).trim() ?? shorten(cleanMessageText(block), 70);
     bodies.push({ kind: 'event', tone: 'quiet', text: `delivered to the agent: ${shorten(subject, 80)} · from ${senders[index] ?? 'someone'}` });
   });
@@ -189,6 +201,26 @@ function diagnosticTone(body: Record<string, unknown>): 'quiet' | 'warning' | 'f
 }
 
 /**
+ * Why a conversation cannot be shown whole: st could not read the harness's transcript, and sent
+ * only the Small Talk around it. Half a conversation reads as the agent ignoring the person, so
+ * neither half shows; this says why, with the transcript's path so it can be reported (Nathan,
+ * 2026-10-01). As stui's `unreadable_transcript`.
+ */
+export function unreadableTranscript(timeline: Entry[]): string | null {
+  for (const entry of [...timeline].reverse()) {
+    if (entry.type !== 'error') continue;
+    const body = record(entry.body);
+    if (str(body.code) !== 'transcript-not-bound') continue;
+    // A seat that has said nothing since it started has no transcript yet; that is not a failure.
+    if (record(body.details).not_yet === true) return null;
+    const reason = (str(body.message) ?? '').replace(/^transcript not bound: /, '');
+    const path = str(record(body.details).transcript);
+    return path ? `This conversation could not be loaded: ${reason} (transcript ${path})` : `This conversation could not be loaded: ${reason}`;
+  }
+  return null;
+}
+
+/**
  * One conversation as st joined it: the harness's turns and the agent's Small Talk, in time
  * order. `names` maps graph ids to what a person calls them; the viewer is `you`.
  */
@@ -196,6 +228,8 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
   const name = (id: string): string => names.get(id) ?? (id === 'daemon/runtime' ? 'st' : id.startsWith('person/') ? id.slice('person/'.length) : short(id));
   const stamped: ConversationEntry[] = [];
   const tools = new Map<string, number>();
+  const shown = new Set(timeline.filter(entry => entry.type === 'message').map(entry => str(record(entry.body).message_id) ?? '').filter(id => id.startsWith('message/')));
+  const delivered = new Set<string>();
   let mail: Record<string, unknown> | undefined;
   const push = (entry: Entry, id: string, body: Body) => stamped.push({ id, at: clock(entry.timestamp), timestamp: entry.timestamp, body });
   // Entries arrive in st's order (applyConversation keeps them by sequence).
@@ -232,7 +266,7 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
       case 'content': {
         const raw = contentText(entry.body);
         if (entry.role === 'user' || entry.role === 'system') {
-          fromHarness(entry.role === 'user', raw).forEach((part, index) => push(entry, `${entry.id}#${index}`, part));
+          fromHarness(entry.role === 'user', raw, shown, delivered).forEach((part, index) => push(entry, `${entry.id}#${index}`, part));
         } else if (entry.role === 'tool') {
           const lines = cleanMessageText(raw).split('\n');
           if (lines.join('').trim()) push(entry, entry.id, { kind: 'tool', title: lines[0], state: 'ok', output: lines.slice(1) });
@@ -258,6 +292,10 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
         break;
       }
       case 'error': {
+        if (str(body.code) === 'transcript-not-bound' && record(body.details).not_yet === true) {
+          push(entry, entry.id, { kind: 'event', tone: 'quiet', text: 'nothing in the harness yet since this seat started' });
+          break;
+        }
         const tone = diagnosticTone(body);
         const message = str(body.message) ?? str(body.code) ?? 'st reported a problem';
         push(entry, entry.id, { kind: 'event', tone, text: tone === 'fault' ? `error: ${message}` : message });
@@ -273,6 +311,9 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
         push(entry, entry.id, { kind: 'event', tone: 'quiet', text: shorten(text, 120) });
       }
     }
+  }
+  for (const entry of stamped) {
+    if (entry.body.kind === 'mail' && delivered.has(entry.id)) entry.body = { ...entry.body, delivered: true };
   }
   return foldDeliveryFlaps(stamped.map((entry, order) => ({ entry, order })).sort((a, b) => a.entry.timestamp.localeCompare(b.entry.timestamp) || a.order - b.order).map(({ entry }) => entry));
 }

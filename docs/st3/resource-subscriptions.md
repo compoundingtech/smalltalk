@@ -247,7 +247,7 @@ with a reason. Current requests start as capacity allows. Stored attention items
 five-request cap close automatically, including while the queue is waiting for capacity.
 `st missions release` remains available for legacy held requests; automatic intake does not need it.
 
-An optional `requester` assigns run revision authority to one exact agent or person. The requester still needs matching mission authority, from its `mission-authority` rules or the default of a person-declared `fleet/PROJECT/...` seat.
+An optional `requester` names one exact agent or person as the run's requester.
 
 A draft pull request does not create a resource. Its first ready observation creates one resource and one mission request.
 

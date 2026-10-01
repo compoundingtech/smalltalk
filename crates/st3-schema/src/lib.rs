@@ -351,7 +351,7 @@ impl Registry {
                 ));
             }
             if kind == "glass.upserted" {
-                glasses::validate_body(fields.get("body").unwrap_or(&Value::Null))?;
+                glasses::body_for_read(fields.get("body").unwrap_or(&Value::Null))?;
             }
         }
         Ok(spec)
@@ -1397,6 +1397,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Cardinality::Append,
             Some("runtimes"),
             true,
+            &[],
+        ),
+        (
+            "delivery.hold",
+            &["agent"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::StateTransition,
+            Some("delivery-holds"),
+            false,
             &[],
         ),
         (
@@ -2517,6 +2526,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("deadline_unix_ms", required_string()),
             ("reason", required_string()),
         ],
+        "delivery.hold" => &[
+            ("held", required_boolean()),
+            ("until_unix_ms", required_integer()),
+            ("reason", required_string()),
+            ("legacy_adoption", boolean()),
+        ],
         "harness.observed" => &[
             (
                 "state",
@@ -3138,6 +3153,7 @@ mod tests {
                 "checkpoint.verified",
                 "daemon.diagnostic",
                 "daemon.started",
+                "delivery.hold",
                 "doc.bound",
                 "eval.verdict",
                 "file.observed",
