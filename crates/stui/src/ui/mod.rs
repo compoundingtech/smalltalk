@@ -2255,6 +2255,11 @@ impl Ui {
             match key.code {
                 // Terminals send Ctrl+\\ as 0x1c, which crossterm reports as Ctrl+4.
                 KeyCode::Char('\\' | '4') if control => {
+                    // In glasses the tab turns back into the agent's conversation.
+                    if let Some(Pane::Terminal(agent)) = self.focused_pane() {
+                        self.swap_focused_pane(Pane::Agent(Some(agent)));
+                        self.terminal = None;
+                    }
                     self.effects.push(Effect::CloseTerminal);
                 }
                 KeyCode::Char(letter @ ('c' | 'd')) if control => {
@@ -2713,14 +2718,16 @@ impl Ui {
             self.flash(format!("{} has no terminal to open", agent.name));
             return;
         }
-        // In glasses the terminal is a tab of its own; focusing it attaches it.
+        // In glasses the agent's tab turns into its terminal, and Ctrl+\ turns it back.
         if self.glasses.is_some() {
-            if self.focused_pane() == Some(Pane::Terminal(agent.id.clone())) {
-                self.attach_terminal(&agent.id);
-            } else {
-                self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab);
-                self.attach_terminal(&agent.id);
+            match self.focused_pane() {
+                Some(Pane::Terminal(id)) if id == agent.id => {}
+                Some(Pane::Agent(Some(id))) if id == agent.id => {
+                    self.swap_focused_pane(Pane::Terminal(agent.id.clone()))
+                }
+                _ => self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab),
             }
+            self.attach_terminal(&agent.id);
             return;
         }
         self.attach_terminal(&agent.id);
