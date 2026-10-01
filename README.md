@@ -277,13 +277,16 @@ st agents show agent/example/worker
 st terminals peek agent/example/worker
 ```
 
-Token spend across the fleet is available by agent, mission, model, or host. The period ends now:
+Token spend across the fleet is available by agent, mission, step, model, account, or host, with
+its API-equivalent cost: what the tokens would cost at the provider's list price, from a pricing
+table built into st. Tokens on a model the table does not price are counted as unpriced, and a
+cost that leaves them out ends in `+`. An account is a short digest of the harness's own login,
+never the login itself. The period ends now:
 
 ```sh
-st usage --hours 24 --by agent
-st usage --hours 24 --by mission
-st usage --hours 24 --by model
-st usage --hours 24 --by host
+st usage --hours 24
+st usage --hours 24 --by step
+st usage --hours 24 --by account
 ```
 
 The seat starts its harness in the workspace with no prompt. It stays idle, taking no turn, until

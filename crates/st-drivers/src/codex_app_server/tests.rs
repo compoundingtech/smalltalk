@@ -2482,6 +2482,15 @@ fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
             }),
         )
         .unwrap();
+        // Once bound, the observer first reads which account pays for this thread's responses.
+        let account = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(account["method"], "account/read");
+        assert_eq!(account["id"], ACCOUNT_READ_REQUEST_ID);
+        write_json_message(
+            &mut websocket,
+            &json!({ "id": ACCOUNT_READ_REQUEST_ID, "result": { "account": { "type": "apiKey" } } }),
+        )
+        .unwrap();
         let snapshot = read_json_message(&mut websocket).unwrap().unwrap();
         assert_eq!(snapshot["id"], FIRST_DELIVERY_REQUEST_ID);
         assert_eq!(snapshot["method"], "thread/read");

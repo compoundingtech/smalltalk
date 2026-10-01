@@ -193,6 +193,7 @@ pub fn run_with_control(
             // The same incarnation token as the state record beside it, carried as provenance
             // only (HC-R15): nothing on this record is fenced on it. The claim above already
             // removed any predecessor's context record, so no second removal belongs here.
+            spend: SpendProducer::new(&agent_dir, &session),
             context: match ContextProducer::new(&agent_dir, &identity, &session) {
                 Ok(producer) => Some(producer),
                 Err(error) => {
@@ -303,6 +304,7 @@ pub fn adopt_with_control(
         )
         .with_ownership(session.clone(), seq),
         context: ContextProducer::new(&agent_dir, &identity, &session).ok(),
+        spend: SpendProducer::new(&agent_dir, &session),
         delivery: {
             let mut delivery =
                 Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id);
@@ -341,6 +343,8 @@ struct Session {
     /// The numeric axis, `None` only where the record has nowhere safe to stage. Its absence is a
     /// missing advisory number, never a reason to fail a launch that is otherwise healthy.
     context: Option<ContextProducer>,
+    /// Per-response spend for the harness timeline, keyed to the same incarnation token.
+    spend: SpendProducer,
     delivery: Delivery,
     diagnostics: DiagnosticPublisher,
     adoption: Adoption,
@@ -506,6 +510,7 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
                     if let Some(context) = session.context.as_mut() {
                         fresh_reading |= context.apply(&value);
                     }
+                    session.spend.apply(&value);
                 }
             }
         }
@@ -1457,6 +1462,89 @@ impl ContextProducer {
 }
 
 /// OpenCode's own spelling for a model, and the key a window is cached under.
+/// Each finished assistant response's tokens and cost, recorded once into the harness timeline.
+///
+/// OpenCode repeats `message.updated` while a response streams, so a response is recorded only
+/// once `time.completed` is set, and only once per message ID. Its token buckets are disjoint, as
+/// st records them; reasoning is billed as output. Compaction summaries are real requests and
+/// count too. OpenCode does not expose the paying account, so responses carry none.
+struct SpendProducer {
+    timeline: crate::harness_timeline::Writer,
+    recorded: BTreeSet<String>,
+}
+
+impl SpendProducer {
+    fn new(agent_dir: &Path, session: &str) -> Self {
+        Self {
+            timeline: crate::harness_timeline::Writer::new(agent_dir, "opencode", session),
+            recorded: BTreeSet::new(),
+        }
+    }
+
+    fn apply(&mut self, event: &Value) {
+        if event.get("type").and_then(Value::as_str) != Some("message.updated") {
+            return;
+        }
+        let Some(info) = event.pointer("/properties/info") else {
+            return;
+        };
+        if info.get("role").and_then(Value::as_str) != Some("assistant")
+            || info.pointer("/time/completed").is_none_or(Value::is_null)
+        {
+            return;
+        }
+        let (Some(id), Some(tokens)) = (
+            info.get("id").and_then(Value::as_str),
+            info.get("tokens").filter(|tokens| tokens.is_object()),
+        ) else {
+            return;
+        };
+        if self.recorded.contains(id) {
+            return;
+        }
+        let leaf = |pointer: &str| tokens.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+        let reasoning = leaf("/reasoning");
+        let output = leaf("/output").saturating_add(reasoning);
+        let (input, reads, writes) = (leaf("/input"), leaf("/cache/read"), leaf("/cache/write"));
+        let mut body = json!({
+            "semantics": "response",
+            "model": info.get("modelID").and_then(Value::as_str),
+            "provider": info.get("providerID").and_then(Value::as_str),
+            "input_tokens": input,
+            "output_tokens": output,
+            "reasoning_tokens": reasoning,
+            "cached_tokens": reads,
+            "cache_write_tokens": writes,
+            "total_tokens": input.saturating_add(output).saturating_add(reads).saturating_add(writes),
+        });
+        if let Some(cost) = info
+            .get("cost")
+            .and_then(Value::as_f64)
+            .filter(|cost| cost.is_finite() && *cost > 0.0)
+        {
+            body["cost"] = json!(cost);
+            body["currency"] = json!("USD");
+        }
+        match self.timeline.append(
+            format!("opencode:{id}:usage"),
+            crate::harness_timeline::Role::System,
+            crate::harness_timeline::EntryType::Usage,
+            body,
+            true,
+        ) {
+            Ok(()) => {
+                if self.recorded.len() >= 1_024 {
+                    self.recorded.pop_first();
+                }
+                self.recorded.insert(id.to_owned());
+            }
+            Err(error) => {
+                tracing::warn!("st opencode-session: harness-timeline write failed: {error:#}")
+            }
+        }
+    }
+}
+
 fn model_key(provider_id: &str, model_id: &str) -> String {
     format!("{provider_id}/{model_id}")
 }
@@ -3363,5 +3451,43 @@ mod tests {
             "the record pairs a numerator with the model that produced it"
         );
         assert_eq!(record.window_tokens, Some(OC_WINDOW));
+    }
+
+    #[test]
+    fn spend_records_each_finished_response_once_with_disjoint_buckets() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut spend = SpendProducer::new(directory.path(), "incarnation-1");
+        let message = |completed: Option<u64>, output: u64| {
+            json!({"type": "message.updated", "properties": {"info": {
+                "id": "msg-a", "role": "assistant", "modelID": "model-example", "providerID": "provider-example",
+                "cost": 0.004, "time": {"created": 1, "completed": completed},
+                "tokens": {"input": 12, "output": output, "reasoning": 5, "cache": {"read": 300, "write": 40}},
+            }}})
+        };
+        // Streaming updates before completion and a repeated final update record nothing more.
+        spend.apply(&message(None, 3));
+        spend.apply(&message(Some(2), 20));
+        spend.apply(&message(Some(2), 20));
+        spend.apply(&json!({"type": "message.updated", "properties": {"info": {"id": "msg-u", "role": "user", "time": {"completed": 2}, "tokens": {"input": 1}}}}));
+        let record = crate::harness_timeline::read(&crate::harness_timeline::timeline_path(
+            directory.path(),
+        ))
+        .unwrap();
+        let usage = record
+            .operations
+            .iter()
+            .filter(|op| op.entry_type == "usage")
+            .map(|op| &op.body)
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0]["driver"], "opencode");
+        assert_eq!(usage[0]["model"], "model-example");
+        assert_eq!(usage[0]["output_tokens"], 25);
+        assert_eq!(usage[0]["reasoning_tokens"], 5);
+        assert_eq!(usage[0]["cached_tokens"], 300);
+        assert_eq!(usage[0]["cache_write_tokens"], 40);
+        assert_eq!(usage[0]["total_tokens"], 377);
+        assert_eq!(usage[0]["cost"], 0.004);
+        assert_eq!(record.incarnation_id, "incarnation-1");
     }
 }

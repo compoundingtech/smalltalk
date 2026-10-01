@@ -66,6 +66,11 @@ jobs:
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Prepare the historical messaging channel
+        if: runner.os == 'Linux'
+        run: |
+          binary=$(timeout 10m bash scripts/messaging-compat-binary)
+          printf 'ST3_MESSAGING_COMPAT_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Prepare provider component fixtures
         run: |
           system=$(nix eval --impure --raw --expr builtins.currentSystem)

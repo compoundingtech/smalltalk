@@ -148,9 +148,13 @@ class Node:
         self.env = {**env, "HOME": str(self.root / "home"),
                     "XDG_STATE_HOME": str(self.root / "home/state"),
                     "XDG_CONFIG_HOME": str(self.root / "home/config"),
-                    "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", str(self.root / "run")),
                     "ST3_ENDPOINT": str(self.endpoint), "ST3_DAEMON_WAIT": "0",
                     "PATH": f"{self.root / 'bin'}:{env['PATH']}"}
+        # Only inherit an actual user manager. A synthetic runtime directory makes
+        # systemd-run attempt scopes on runners that have no user bus.
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime_dir and (Path(runtime_dir) / "bus").is_socket():
+            self.env["XDG_RUNTIME_DIR"] = runtime_dir
         # Historical daemons rebuild PATH from a login shell. Pin that shell's
         # fixture executables too, so it cannot launch an installed real provider.
         profile = "export PATH=" + shlex.quote(self.env["PATH"]) + "\n"
