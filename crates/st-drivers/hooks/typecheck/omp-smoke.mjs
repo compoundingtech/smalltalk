@@ -171,8 +171,7 @@ await handlers.get("tool_result")({ toolName: "read", toolCallId: "unrelated" },
 await new Promise((resolve) => setTimeout(resolve, 50));
 let askStates = readFrames()
   .filter((frame) => frame.type === "state")
-  .slice(beforeAsk)
-  .filter((frame) => frame.blockedOn === "human");
+  .slice(beforeAsk);
 assert.deepStrictEqual(askStates, [
   {
     type: "state",

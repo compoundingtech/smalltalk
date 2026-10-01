@@ -733,6 +733,12 @@ pub struct Agent {
     pub driver: Option<String>,
     #[serde(default)]
     pub harness_state: Option<String>,
+    #[serde(default)]
+    pub blocked_on: Option<String>,
+    #[serde(default)]
+    pub ask: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
     pub host_id: Option<String>,
     pub last_activity_at: Option<String>,
     pub silent_since: Option<String>,
