@@ -447,6 +447,91 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
     assert!(!log.contains("st3 up"), "{log}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_omp_ask_clears_without_poisoning_the_next_incarnation() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/human-omp";
+    let incarnation = "human-1";
+    let mut daemon = Daemon::new(root);
+    let source = r#"
+version 2
+agent "human-omp" { workspace "/tmp"; harness "omp" {} }
+"#;
+    let intent = st3::parse_intent(source, "restart-node").unwrap();
+    let plan = daemon.store.mission(&intent, st3::model::IntentInput {
+        kdl: source.into(),
+        source_name: None,
+    }).unwrap();
+    daemon.store.apply(&intent, &plan.subject_tokens, "human-omp-source").unwrap();
+    daemon.observe_running(seat, incarnation);
+    daemon.start().await;
+    let client = st3::client::Client::unix(&daemon.socket);
+    let mut channel = seat_command(root, &daemon.socket)
+        .arg("--catalog").arg(root.join("catalog"))
+        .args(["driver", "omp-channel", "--identity", "human-omp"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let mut input = channel.stdin.take().unwrap();
+
+    writeln!(input, "{}", json!({
+        "type": "state", "state": "active", "blockedOn": "human",
+        "ask": "question", "reason": "Which deployment target?",
+    })).unwrap();
+    input.flush().unwrap();
+    wait_until("the channel publishes the ask", Duration::from_secs(10), || {
+        daemon.harness_states(seat, incarnation) == ["working"]
+    }).await;
+    let status: st3::model::StatusResponse =
+        client.get(&format!("/v1/status?subject={seat}")).await.unwrap();
+    let blocked = status.subjects.into_iter().find(|status| status.subject == seat)
+        .unwrap().harness.unwrap();
+    assert_eq!(blocked.state, "working");
+    assert_eq!(blocked.blocked_on.as_deref(), Some("human"));
+    assert_eq!(blocked.ask.as_deref(), Some("question"));
+    assert_eq!(blocked.reason.as_deref(), Some("Which deployment target?"));
+
+    // These are the producer's frames after the matching ask result. The producer's smoke
+    // scenario proves that an unrelated result emits only timeline data, never this state.
+    writeln!(input, "{}", json!({
+        "type": "timeline", "event": "tool_result", "payload": {"toolCallId": "ask-1"},
+    })).unwrap();
+    writeln!(input, "{}", json!({"type": "state", "state": "active"})).unwrap();
+    input.flush().unwrap();
+    wait_until("the channel publishes the answered state", Duration::from_secs(10), || {
+        daemon.harness_states(seat, incarnation) == ["working", "working"]
+    }).await;
+    let status: st3::model::StatusResponse =
+        client.get(&format!("/v1/status?subject={seat}")).await.unwrap();
+    let answered = status.subjects.into_iter().find(|status| status.subject == seat)
+        .unwrap().harness.unwrap();
+    assert_eq!(answered.state, "working");
+    assert!(answered.blocked_on.is_none());
+    assert!(answered.ask.is_none());
+    assert!(answered.reason.is_none());
+    assert!(stop(channel).is_empty());
+
+    // A delayed ask from the old channel must not block a resumed runtime's fresh idle proof.
+    daemon.observe_running(seat, "human-2");
+    daemon.append(seat, "harness.observed", json!({
+        "state": "idle", "driver": "omp", "incarnation_id": "human-2",
+        "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+    }));
+    daemon.append(seat, "harness.observed", json!({
+        "state": "working", "driver": "omp", "incarnation_id": incarnation,
+        "blocked_on": "human", "ask": "question", "reason": "An obsolete question",
+    }));
+    let status: st3::model::StatusResponse =
+        client.get(&format!("/v1/status?subject={seat}")).await.unwrap();
+    let resumed = status.subjects.into_iter().find(|status| status.subject == seat)
+        .unwrap().harness.unwrap();
+    assert_eq!(resumed.state, "idle");
+    assert_eq!(resumed.incarnation_id, "human-2");
+    assert!(resumed.blocked_on.is_none());
+    assert!(resumed.ask.is_none());
+    assert!(resumed.reason.is_none());
+}
+
 #[test]
 fn a_cli_command_says_the_daemon_is_unreachable_and_never_to_start_it() {
     let root = tempfile::tempdir().unwrap();
