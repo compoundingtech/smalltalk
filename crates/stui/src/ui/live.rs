@@ -87,6 +87,8 @@ enum Fetched {
     /// A send finished: the pending token and st's message id, or why it failed and whether st's
     /// answer is unknown.
     Sent(String, Result<Option<String>, (String, bool)>),
+    /// st started an agent asked for here.
+    AgentStarted(String),
     /// st answered a glass write: the glass, the write's key, and the revision it accepted.
     GlassSaved {
         id: String,
@@ -379,6 +381,7 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Machines(machines) => model.machines = machines,
                 Fetched::Devices(devices) => model.devices = devices,
                 Fetched::GlassSaved { id, key, outcome } => ui.glass_saved(&id, &key, outcome),
+                Fetched::AgentStarted(id) => ui.agent_started(id),
             }
             changed = true;
         }
@@ -647,6 +650,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 other => (other, None, None),
             };
+            let started = matches!(effect, Effect::CreateAgent { .. });
             let client = client.clone();
             let tx = fetched_tx.clone();
             let person = person.clone();
@@ -665,6 +669,9 @@ pub fn run(context: Context) -> Result<()> {
                             (error.to_string(), unconfirmed)
                         }),
                     ));
+                }
+                if started && let Ok((_, Some(agent))) = &outcome {
+                    let _ = tx.send(Fetched::AgentStarted(agent.clone()));
                 }
                 let _ = tx.send(Fetched::Notice(match outcome {
                     Ok((notice, _)) => notice,
@@ -823,6 +830,44 @@ async fn perform(
         // Glass writes and retries never reach here: the loop handles them itself.
         Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } => {
             Ok((String::new(), None))
+        }
+        Effect::CreateAgent {
+            name,
+            harness,
+            model,
+            effort,
+            host,
+            message,
+        } => {
+            let snapshot = client.capabilities().await?.snapshot.id;
+            let (id, idem) = crate::action_pair();
+            let result = client
+                .agent_create(
+                    id,
+                    idem,
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    st3_client::AgentCreateParameters {
+                        name: name.clone(),
+                        harness,
+                        host,
+                        model,
+                        effort,
+                        workspace: None,
+                        description: None,
+                        message,
+                    },
+                )
+                .await?;
+            // The new agent's id, so its conversation opens in place of the form.
+            let agent = result
+                .value
+                .affected_ids
+                .into_iter()
+                .find(|id| id.starts_with("agent/"));
+            Ok((format!("Starting {name}"), agent))
         }
         Effect::Attention { id, action, reason } => {
             crate::attention_action(client, person, &id, &action, reason)
