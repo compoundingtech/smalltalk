@@ -3306,7 +3306,39 @@ struct ManagedTranscript {
     /// placed beside it in the timeline, so it moves forward when the observation changes.
     anchor: ClaimRecord,
     /// The seat's exact native session, or why st3 could not bind one.
-    transcript: Result<crate::external_sessions::ExternalSession, String>,
+    transcript: Result<crate::external_sessions::ExternalSession, Missing>,
+}
+
+/// Why a seat's transcript is not shown. `not_yet` means the harness has not written one for
+/// this incarnation: the seat has said nothing since it started, which is not a failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Missing {
+    reason: String,
+    not_yet: bool,
+}
+
+impl Missing {
+    fn not_yet(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            not_yet: true,
+        }
+    }
+}
+
+impl From<String> for Missing {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            not_yet: false,
+        }
+    }
+}
+
+impl From<&str> for Missing {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
 }
 
 /// Bind a managed seat to its exact native transcript, when its harness keeps one st3 reads.
@@ -3334,7 +3366,9 @@ fn managed_transcript(
         return Ok(None);
     }
     let transcript = if fields["incarnation_id"] != incarnation {
-        Err("the harness has not reported on the seat's current incarnation yet".to_owned())
+        Err(Missing::not_yet(
+            "the harness has not reported on the seat's current incarnation yet",
+        ))
     } else {
         let evidence = fields["evidence_incarnation"].as_str();
         match driver.as_str() {
@@ -3356,8 +3390,13 @@ fn managed_transcript(
 fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
     let anchor = &managed.anchor;
     let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id });
-    if let Ok(external) = &managed.transcript {
-        details["transcript"] = Value::String(external.transcript.display().to_string());
+    match &managed.transcript {
+        Ok(external) => {
+            details["transcript"] = Value::String(external.transcript.display().to_string());
+        }
+        // Nothing has gone wrong: the seat has said nothing since it started.
+        Err(missing) if missing.not_yet => details["not_yet"] = Value::Bool(true),
+        Err(_) => {}
     }
     let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
     let digest = hex::encode(Sha256::digest(
@@ -3391,7 +3430,7 @@ fn managed_codex_transcript(
     state: &AppState,
     owner: &str,
     evidence: Option<&str>,
-) -> Result<crate::external_sessions::ExternalSession, String> {
+) -> Result<crate::external_sessions::ExternalSession, Missing> {
     let Some(home) = state.native_session_home.as_deref() else {
         return Err("this daemon has no home directory to read native sessions from".into());
     };
@@ -3446,14 +3485,16 @@ fn managed_codex_transcript(
                     && session.native_id == native_id
             }),
     };
-    bound.ok_or_else(|| format!("Codex thread {native_id} has no rollout file yet"))
+    bound.ok_or_else(|| {
+        Missing::not_yet(format!("Codex thread {native_id} has no rollout file yet"))
+    })
 }
 
 fn managed_claude_transcript(
     state: &AppState,
     owner: &str,
     evidence: Option<&str>,
-) -> Result<crate::external_sessions::ExternalSession, String> {
+) -> Result<crate::external_sessions::ExternalSession, Missing> {
     let Some(home) = state.native_session_home.as_deref() else {
         return Err("this daemon has no home directory to read native sessions from".into());
     };
@@ -3496,12 +3537,10 @@ fn managed_claude_transcript(
         &native_id,
     ) {
         Ok(Some(session)) => Ok(session),
-        Ok(None) => Err(format!(
+        Ok(None) => Err(Missing::not_yet(format!(
             "Claude session {native_id} has no transcript file yet"
-        )),
-        Err(error) => Err(format!(
-            "finding Claude session {native_id} failed: {error:#}"
-        )),
+        ))),
+        Err(error) => Err(format!("finding Claude session {native_id} failed: {error:#}").into()),
     }
 }
 
@@ -3509,7 +3548,7 @@ fn managed_omp_transcript(
     state: &AppState,
     owner: &str,
     incarnation: &str,
-) -> Result<crate::external_sessions::ExternalSession, String> {
+) -> Result<crate::external_sessions::ExternalSession, Missing> {
     let started_at = incarnation
         .split_once(':')
         .and_then(|(_, started_at)| chrono::DateTime::parse_from_rfc3339(started_at).ok())
@@ -3533,10 +3572,13 @@ fn managed_omp_transcript(
                 native_id,
             ) {
                 Ok(Some(session)) => Ok(session),
-                Ok(None) => Err(format!("the imported OMP session {native_id} is not readable")),
+                Ok(None) => {
+                    Err(format!("the imported OMP session {native_id} is not readable").into())
+                }
                 Err(error) => Err(format!(
                     "reading the imported OMP session {native_id} failed: {error:#}"
-                )),
+                )
+                .into()),
             };
         }
     }
@@ -3555,10 +3597,10 @@ fn managed_omp_transcript(
         (started_at.timestamp_millis().max(0) as u128).saturating_sub(2_000),
     ) {
         Ok(Some(session)) => Ok(session),
-        Ok(None) => Err("OMP has not saved a session for this incarnation yet".into()),
-        Err(error) => Err(format!(
-            "reading the OMP session directory failed: {error:#}"
+        Ok(None) => Err(Missing::not_yet(
+            "OMP has not saved a session for this incarnation yet",
         )),
+        Err(error) => Err(format!("reading the OMP session directory failed: {error:#}").into()),
     }
 }
 
@@ -3632,7 +3674,7 @@ pub(super) fn timeline_value(
         let read = managed
             .transcript
             .as_ref()
-            .map_err(String::clone)
+            .map_err(|missing| missing.reason.clone())
             .and_then(|external| {
                 crate::external_sessions::normalized_timeline(external)
                     .map_err(|error| format!("the transcript could not be read: {error:#}"))
@@ -10478,6 +10520,31 @@ mission "example/zero-run" state="ready" {
             }
             std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+        // A thread that has not written its rollout yet is not a failure: the seat has said
+        // nothing since it started, and the notice says so.
+        std::fs::write(
+            directory.join("binding.json"),
+            serde_json::to_vec(&json!({"agent":"managed-codex","runtimeIncarnation":provider_incarnation,"threadId":"native-managed-codex-unwritten"})).unwrap(),
+        )
+        .unwrap();
+        let quiet = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        let notice = quiet["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["body"]["code"] == "transcript-not-bound")
+            .cloned()
+            .expect("a seat with no rollout yet says so");
+        assert_eq!(notice["body"]["details"]["not_yet"], true, "{notice:#}");
+        assert!(notice["body"]["details"].get("transcript").is_none());
         std::fs::write(
             directory.join("binding.json"),
             serde_json::to_vec(
@@ -10491,7 +10558,7 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         assert_eq!(
             stale.transcript.unwrap_err(),
-            "the Codex binding belongs to a different runtime"
+            Missing::from("the Codex binding belongs to a different runtime")
         );
         let unbound = timeline_value(
             &state,
@@ -10595,7 +10662,10 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .transcript
             .unwrap_err();
-        assert!(stale.contains("does not name a driver process"), "{stale}");
+        assert!(
+            stale.reason.contains("does not name a driver process") && !stale.not_yet,
+            "{stale:?}"
+        );
     }
 
     #[test]
