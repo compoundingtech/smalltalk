@@ -224,7 +224,7 @@ fn prepare_st3_channel_argv(
         return Ok(argv);
     }
     match crate::claude_channel::verify_st3_installed() {
-        Ok(()) => Ok(argv),
+        Ok(()) => select_st3_channel_plugin(argv, true),
         Err(error) => {
             eprintln!(
                 "warning: the approved st3 Claude channel plugin is unavailable: {error:#}\n\
@@ -232,9 +232,25 @@ fn prepare_st3_channel_argv(
             );
             let executable = std::env::current_exe()
                 .context("resolving the st3 executable for the Claude development channel")?;
+            let argv = select_st3_channel_plugin(argv, false)?;
             development_st3_channel_argv(argv, &executable, catalog_root, identity)
         }
     }
+}
+
+/// Only the selected channel may own this seat's mailbox fence. User/project settings and
+/// older fleet declarations can still enable the previous st3 plugins after an upgrade.
+fn select_st3_channel_plugin(mut argv: Vec<String>, packaged: bool) -> Result<Vec<String>> {
+    argv.extend([
+        "--settings".into(),
+        serde_json::json!({"enabledPlugins": {
+            "st-channel@st": packaged,
+            "st3-channel@st3": false,
+            "st3-channel@st2": false
+        }})
+        .to_string(),
+    ]);
+    merge_claude_json_settings(argv)
 }
 
 fn merge_claude_json_settings(argv: Vec<String>) -> Result<Vec<String>> {
@@ -1846,6 +1862,52 @@ mod tests {
         );
         assert_eq!(settings["enabledPlugins"]["st3-channel@st3"], true);
         assert_eq!(merge_claude_json_settings(merged.clone()).unwrap(), merged);
+    }
+
+    #[test]
+    fn st3_channel_selection_overrides_old_plugins_and_preserves_other_settings() {
+        let authored = serde_json::json!({
+            "enabledPlugins": {
+                "st-channel@st": false,
+                "st3-channel@st3": true,
+                "st3-channel@st2": true,
+                "st2-channel@st2": true,
+                "bridge@tools": true
+            },
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "observe"}]}]}
+        });
+        let argv = vec![
+            "claude".into(),
+            "--channels".into(),
+            crate::claude_channel::ST3_CHANNEL.into(),
+            "--settings".into(),
+            authored.to_string(),
+            "boot prompt".into(),
+        ];
+        for packaged in [true, false] {
+            let selected = select_st3_channel_plugin(argv.clone(), packaged).unwrap();
+            assert_eq!(selected.last().map(String::as_str), Some("boot prompt"));
+            assert_eq!(selected.iter().filter(|arg| *arg == "--settings").count(), 1);
+            let position = selected.iter().position(|arg| arg == "--settings").unwrap();
+            let settings: serde_json::Value = serde_json::from_str(&selected[position + 1]).unwrap();
+            assert_eq!(settings["enabledPlugins"]["st-channel@st"], packaged);
+            assert_eq!(settings["enabledPlugins"]["st3-channel@st3"], false);
+            assert_eq!(settings["enabledPlugins"]["st3-channel@st2"], false);
+            assert_eq!(settings["enabledPlugins"]["st2-channel@st2"], true);
+            assert_eq!(settings["enabledPlugins"]["bridge@tools"], true);
+            assert_eq!(settings["hooks"], authored["hooks"]);
+            assert_eq!(select_st3_channel_plugin(selected.clone(), packaged).unwrap(), selected);
+        }
+    }
+
+    #[test]
+    fn st3_channel_selection_adds_overrides_without_authored_settings() {
+        let selected = select_st3_channel_plugin(vec!["claude".into()], true).unwrap();
+        assert_eq!(selected.len(), 3);
+        let settings: serde_json::Value = serde_json::from_str(&selected[2]).unwrap();
+        assert_eq!(settings["enabledPlugins"]["st-channel@st"], true);
+        assert_eq!(settings["enabledPlugins"]["st3-channel@st3"], false);
+        assert_eq!(settings["enabledPlugins"]["st3-channel@st2"], false);
     }
 
     #[test]
