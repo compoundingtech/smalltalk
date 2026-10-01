@@ -399,7 +399,7 @@ The v0 action discriminators are:
 | Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
-| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation and terminal sequence |
+| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; input and resize also require the screen sequence |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
 `runtime.stop` publishes a stop for the selected member. `runtime.restart` terminates the current
@@ -548,7 +548,11 @@ A screen carries the runtime incarnation, `rows` and `columns`, the cursor (`row
 `visible`, `style` of `block`, `underline`, or `bar`, and `blinking`), the title, the input `modes` a
 client needs to encode keys and pastes (`alternate_screen`, `application_cursor`,
 `application_keypad`, `bracketed_paste`, `focus_events`, `mouse_tracking`, `mouse_encoding`), one
-line per row, and `next_sequence`, the fence for input and resize. `revision` digests the rest of
+line per row, and `next_sequence`, an opaque numeric screen fence for input and resize. Compare
+it for equality; it is not a graph index or an ordered event counter. Unrelated graph writes do
+not change it. A terminal action may use an older snapshot from the same host, while incarnation
+and explicit revision fences still apply. Attach/detach do not require a screen sequence fence.
+`revision` digests the rest of
 the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
 
 Each line keeps its plain `text`, without trailing spaces, and adds `runs`: styled text from column
