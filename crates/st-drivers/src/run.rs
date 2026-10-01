@@ -3301,7 +3301,8 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
             id = cl.pty_id
         ),
     };
-    let from = format!("st.{this_host}"); // the runner is the sender
+    // This legacy catalog runner's sender is durable bus identity shared with its history.
+    let from = format!("st2.{this_host}");
     let tags = ["crash-loop".to_string()];
     if let Err(e) = message::send_to_inbox(
         &message::inbox_dir(&agent_dir),
