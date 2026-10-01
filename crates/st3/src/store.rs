@@ -1,13 +1,16 @@
 mod glasses;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(test)]
 use std::fs;
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context as _, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -152,48 +155,12 @@ pub struct AgentWorkQueue {
 
 const AGENT_WORK_PREVIEW_LIMIT: usize = 5;
 
+/// smalltalk's projection tables, and the indexes its folds read the claim log through. The
+/// graph creates its own tables first; see `smallclaims::store::SCHEMA`.
 const SCHEMA: &str = r#"
-PRAGMA journal_mode = WAL;
-PRAGMA busy_timeout = 5000;
-PRAGMA synchronous = FULL;
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS batches (
-    id TEXT PRIMARY KEY,
-    origin TEXT NOT NULL,
-    replica_sequence INTEGER NOT NULL,
-    previous_hash TEXT,
-    hash TEXT NOT NULL,
-    accepted_at_unix_ms TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS batches_writer_sequence
-ON batches(origin, replica_sequence);
-
-CREATE TABLE IF NOT EXISTS claims (
-    store_index INTEGER PRIMARY KEY AUTOINCREMENT,
-    id TEXT NOT NULL UNIQUE,
-    batch_id TEXT NOT NULL REFERENCES batches(id),
-    subject TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    origin TEXT NOT NULL,
-    actor TEXT,
-    body TEXT NOT NULL,
-    predecessors TEXT NOT NULL,
-    accepted_at_unix_ms TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
-CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
 CREATE INDEX IF NOT EXISTS claims_terminal_history_index ON claims(store_index)
 WHERE kind IN ('mission-run.state','step-run.state','work.failed')
   AND json_extract(body,'$.fields.status') IN ('failed','cancelled','completed');
-CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, store_index);
-CREATE INDEX IF NOT EXISTS claims_subject_kind_accepted_index
-ON claims(subject, kind, length(accepted_at_unix_ms), accepted_at_unix_ms);
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -206,9 +173,6 @@ WHERE kind IN ('work.progress', 'work.submitted');
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
-CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);
-CREATE INDEX IF NOT EXISTS claims_accepted_order_index
-ON claims(length(accepted_at_unix_ms), accepted_at_unix_ms, store_index);
 CREATE INDEX IF NOT EXISTS claims_subscription_finished_request_index
 ON claims(subject, json_extract(body, '$.fields.request'))
 WHERE kind IN (
@@ -231,9 +195,6 @@ WHERE kind='subscription.mission-deferred';
 CREATE INDEX IF NOT EXISTS claims_schedule_started_request_index
 ON claims(subject, json_extract(body, '$.fields.request'))
 WHERE kind='schedule.work-started';
-CREATE INDEX IF NOT EXISTS claims_operation_index
-ON claims(json_extract(body, '$._operation.id'))
-WHERE json_extract(body, '$._operation.id') IS NOT NULL;
 -- The newest message to a recipient, found by one seek instead of a scan of every message.
 CREATE INDEX IF NOT EXISTS claims_message_to_order_index
 ON claims(json_extract(body, '$.fields.to'), store_index)
@@ -267,36 +228,6 @@ ON claims(
 )
 WHERE json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
     THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS operations (
-    id TEXT PRIMARY KEY,
-    request_digest TEXT NOT NULL,
-    canonical_claim_id TEXT NOT NULL REFERENCES claims(id),
-    state TEXT NOT NULL CHECK(state IN ('active','conflict'))
-);
-CREATE INDEX IF NOT EXISTS operations_conflict_index ON operations(id) WHERE state='conflict';
-
-CREATE TABLE IF NOT EXISTS blobs (
-    hash TEXT PRIMARY KEY,
-    bytes BLOB NOT NULL,
-    size INTEGER NOT NULL
-);
--- Uploaded bytes become shared authority only when a durable claim references them.
-CREATE TABLE IF NOT EXISTS local_blobs (
-    hash TEXT PRIMARY KEY,
-    bytes BLOB NOT NULL,
-    size INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS documents (
-    name TEXT NOT NULL,
-    hash TEXT NOT NULL REFERENCES blobs(hash),
-    created_index INTEGER NOT NULL,
-    binding_claim_id TEXT NOT NULL DEFAULT '',
-    binding_key BLOB NOT NULL DEFAULT x'',
-    PRIMARY KEY(name, hash)
-);
-CREATE INDEX IF NOT EXISTS document_latest ON documents(name, created_index DESC);
 
 CREATE TABLE IF NOT EXISTS desired (
     subject TEXT PRIMARY KEY,
@@ -339,13 +270,6 @@ CREATE TABLE IF NOT EXISTS mission_run_requests (
     request_hash TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS events (
-    store_index INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    body TEXT NOT NULL
-);
-
 -- Every message this node holds claims for: its first claim's store index, and whether a claim
 -- closed it. The claim log alone decides it, through the triggers below, so listing the open
 -- messages reads the open messages rather than every lifecycle claim of every message.
@@ -372,86 +296,6 @@ BEGIN
     SELECT subject, MIN(store_index), MAX(kind = 'message.closed')
     FROM claims WHERE subject = OLD.subject GROUP BY subject;
 END;
-
-CREATE TABLE IF NOT EXISTS peer_cursors (
-    peer TEXT PRIMARY KEY,
-    accepted_through INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS peer_replica_cursors (
-    peer TEXT NOT NULL,
-    origin TEXT NOT NULL,
-    accepted_through INTEGER NOT NULL,
-    PRIMARY KEY(peer, origin)
-);
-
-CREATE TABLE IF NOT EXISTS replica_envelopes (
-    writer TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    envelope_hash TEXT NOT NULL,
-    previous_hash TEXT,
-    accepted_at_unix_ms TEXT NOT NULL,
-    payload BLOB NOT NULL,
-    batch_id TEXT,
-    relay TEXT NOT NULL,
-    receipt_state TEXT NOT NULL CHECK(receipt_state IN ('pending','validated','degraded')),
-    validation_error TEXT,
-    received_at_unix_ms TEXT NOT NULL,
-    PRIMARY KEY(writer, sequence, envelope_hash)
-);
-CREATE INDEX IF NOT EXISTS replica_envelopes_state
-ON replica_envelopes(receipt_state, writer, sequence);
-CREATE INDEX IF NOT EXISTS replica_envelopes_batch
-ON replica_envelopes(batch_id);
-
-CREATE TABLE IF NOT EXISTS replica_records (
-    record_ref TEXT PRIMARY KEY,
-    writer TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    envelope_hash TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    raw BLOB NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('pending','valid','unknown','invalid','repaired')),
-    claim_id TEXT,
-    subject_hint TEXT,
-    kind_hint TEXT,
-    error_code TEXT,
-    error_message TEXT,
-    replacement_claim_id TEXT,
-    updated_at_unix_ms TEXT NOT NULL,
-    UNIQUE(writer, sequence, envelope_hash, position)
-);
-CREATE INDEX IF NOT EXISTS replica_records_state
-ON replica_records(state, writer, sequence);
-CREATE INDEX IF NOT EXISTS replica_records_claim
-ON replica_records(claim_id, position);
-
-CREATE TABLE IF NOT EXISTS projection_health (
-    aggregate TEXT PRIMARY KEY,
-    status TEXT NOT NULL CHECK(status IN ('healthy','stale','indeterminate')),
-    last_good_store_index INTEGER NOT NULL DEFAULT 0,
-    error_code TEXT,
-    error_message TEXT,
-    updated_at_unix_ms TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS replication_peers (
-    peer TEXT PRIMARY KEY,
-    status TEXT NOT NULL CHECK(status IN ('unknown','up','down','auth-failed')),
-    last_success_at_unix_ms TEXT,
-    last_error TEXT,
-    schema_digest TEXT,
-    authority_digest TEXT,
-    graph_digest TEXT,
-    updated_at_unix_ms TEXT NOT NULL
-);
-
--- Direct route policy is local cache state, outside the replicated claim vocabulary.
-CREATE TABLE IF NOT EXISTS replication_refusals (
-    peer TEXT PRIMARY KEY,
-    reason TEXT NOT NULL,
-    updated_at_unix_ms TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS capabilities (
     secret_hash TEXT PRIMARY KEY,
@@ -703,88 +547,6 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
-
-CREATE TABLE IF NOT EXISTS graph_generation (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    value INTEGER NOT NULL
-);
-INSERT OR IGNORE INTO graph_generation(id, value) VALUES (1, 0);
-
-CREATE TABLE IF NOT EXISTS replica_envelope_signatures (
-    writer TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    envelope_hash TEXT NOT NULL,
-    member_key TEXT NOT NULL,
-    signature TEXT NOT NULL,
-    stored_at_unix_ms TEXT NOT NULL,
-    PRIMARY KEY(writer, sequence, envelope_hash, member_key)
-);
-
-CREATE TABLE IF NOT EXISTS fleet_invite_tokens (
-    invite_id TEXT PRIMARY KEY,
-    token TEXT,
-    expires_at_unix_ms TEXT NOT NULL,
-    name TEXT,
-    migrate INTEGER NOT NULL DEFAULT 0,
-    bound_key TEXT,
-    bound_name TEXT,
-    failures INTEGER NOT NULL DEFAULT 0,
-    admitted_claim TEXT,
-    writer_floor INTEGER,
-    created_by TEXT
-);
-
-CREATE TABLE IF NOT EXISTS replica_envelope_holds (
-    writer TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    envelope_hash TEXT NOT NULL,
-    reason TEXT NOT NULL CHECK(reason IN ('unsigned','fenced')),
-    updated_at_unix_ms TEXT NOT NULL,
-    PRIMARY KEY(writer, sequence, envelope_hash)
-);
-
--- A dropped envelope's identity. See `store/checkpoint.rs`.
-CREATE TABLE IF NOT EXISTS checkpoint_envelopes (
-    writer TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    envelope_hash TEXT NOT NULL,
-    accepted_at_unix_ms INTEGER NOT NULL,
-    checkpoint TEXT NOT NULL,
-    PRIMARY KEY(writer, sequence, envelope_hash)
-);
--- A dropped claim: what evidence checks, ancestry walks and idempotent retries still read.
-CREATE TABLE IF NOT EXISTS checkpoint_claims (
-    id TEXT PRIMARY KEY,
-    writer TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    envelope_hash TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    actor TEXT,
-    predecessors TEXT NOT NULL,
-    operation_id TEXT,
-    request_digest TEXT,
-    accepted_at_unix_ms INTEGER NOT NULL,
-    checkpoint TEXT NOT NULL
-);
--- The checkpoints this node sealed, verified, trimmed or adopted. `seal_rowid` is the
--- `replica_envelopes` high water of the set it sealed or verified, so it can read exactly that
--- set again. Every write this node makes is dated at or after the highest cut here.
-CREATE TABLE IF NOT EXISTS checkpoints (
-    id TEXT PRIMARY KEY,
-    cut_unix_ms INTEGER NOT NULL,
-    state TEXT NOT NULL,
-    seal_rowid INTEGER,
-    sealed_digest TEXT,
-    drop_digest TEXT,
-    graph_digest TEXT,
-    detail TEXT NOT NULL DEFAULT '{}',
-    updated_at_unix_ms INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
-CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
-ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
-PRAGMA user_version = 15;
 "#;
 
 /// How many threads one large status projection splits across.
@@ -1729,109 +1491,27 @@ fn backfill_message_index(connection: &Connection) -> Result<()> {
 
 impl Store {
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
-        let origin = origin.into();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut connection = Connection::open(path)
-            .with_context(|| format!("open st database {}", path.display()))?;
-        projection_digest::register(&connection)?;
-        connection.profile(Some(record_sqlite_time));
-        connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        // Keep the hot graph and replication index pages in SQLite's bounded
-        // page cache. The default (~2 MiB per connection) churns against the
-        // large durable claim store during otherwise quiet replication.
-        connection.execute_batch("PRAGMA cache_size = -32768;")?;
-        reject_old_schema(&connection)?;
-        migrate_schema(&connection)?;
-        connection.execute_batch(SCHEMA)?;
-        document_index::initialize(&connection)?;
-        backfill_message_index(&connection)?;
-        connection.execute_batch(WRITE_CLOCK)?;
-        create_graph_generation_triggers(&connection, &GRAPH_DIGEST_TABLES)?;
-        projection_digest::initialize(&connection, PROJECTION_DIGEST_TABLES)?;
-        separate_staged_blobs(&mut connection)?;
-        {
-            let transaction = connection.transaction()?;
-            let upgraded: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='canonical_shared_projection_rules' AND value='2')",
-                [],
-                |row| row.get(0),
-            )?;
-            if !upgraded {
-                replay_graph_from_nothing_tx(&transaction)?;
-                transaction.execute(
-                    "INSERT OR REPLACE INTO meta(key,value) VALUES('derived_tables_version',?1)",
-                    [DERIVED_TABLES_VERSION],
-                )?;
-                transaction.execute(
-                    "INSERT OR REPLACE INTO meta(key,value) VALUES('canonical_shared_projection_rules','2')",
-                    [],
-                )?;
-            } else {
-                rebuild_derived_tables_once_tx(&transaction)?;
-            }
-            seed_replica_envelopes_tx(&transaction, &origin, None)?;
-            transaction.commit()?;
-        }
-        let readers = ReadPool::new(path, false)?;
         let smalltalk = Arc::new(SmalltalkRuntime::default());
-        Ok(Self {
-            graph: GraphStore::from_connection(
-                connection,
-                readers,
-                origin,
-                path.to_path_buf(),
-                false,
-                smalltalk.clone(),
-            )?,
-            smalltalk,
-        })
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut graph = GraphStore::open(path, origin, smalltalk.clone())?;
+        // Heals replay without waiting in this crate's tests.
+        #[cfg(test)]
+        {
+            graph.heal_replay_backoff_ms = 0;
+        }
+        Ok(Self { graph, smalltalk })
     }
 
     pub fn open_memory(origin: impl Into<String>) -> Result<Self> {
-        let origin = origin.into();
-        let uri = PathBuf::from(format!(
-            "file:st3-{}?mode=memory&cache=shared",
-            Uuid::now_v7().simple()
-        ));
-        let mut connection = Connection::open_with_flags(
-            &uri,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_URI,
-        )?;
-        projection_digest::register(&connection)?;
-        connection.profile(Some(record_sqlite_time));
-        connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        reject_old_schema(&connection)?;
-        migrate_schema(&connection)?;
-        connection.execute_batch(SCHEMA)?;
-        document_index::initialize(&connection)?;
-        backfill_message_index(&connection)?;
-        connection.execute_batch(WRITE_CLOCK)?;
-        create_graph_generation_triggers(&connection, &GRAPH_DIGEST_TABLES)?;
-        projection_digest::initialize(&connection, PROJECTION_DIGEST_TABLES)?;
-        {
-            let transaction = connection.transaction()?;
-            rebuild_operations_tx(&transaction)?;
-            rebuild_planning_tx(&transaction)?;
-            seed_replica_envelopes_tx(&transaction, &origin, None)?;
-            transaction.commit()?;
-        }
-        let readers = ReadPool::new(&uri, true)?;
         let smalltalk = Arc::new(SmalltalkRuntime::default());
-        Ok(Self {
-            graph: GraphStore::from_connection(
-                connection,
-                readers,
-                origin,
-                uri,
-                true,
-                smalltalk.clone(),
-            )?,
-            smalltalk,
-        })
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut graph = GraphStore::open_memory(origin, smalltalk.clone())?;
+        // Heals replay without waiting in this crate's tests.
+        #[cfg(test)]
+        {
+            graph.heal_replay_backoff_ms = 0;
+        }
+        Ok(Self { graph, smalltalk })
     }
 
     /// Simulate a different build's registry on this node.

@@ -34,7 +34,7 @@ use crate::hash::{
 use crate::replication::*;
 use crate::sqlite::{
     PINNED_READER, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS, SQLITE_NANOS,
-    WriterConnection,
+    STATEMENT_CACHE_CAPACITY, WriterConnection, record_sqlite_time,
 };
 
 pub mod canonical;
@@ -65,6 +65,256 @@ pub use checkpoint_agreement::{
     first_verifications, newest_seals, participants as checkpoint_participants, stable_checkpoints,
 };
 pub use checkpoint_trim::{CheckpointManifestNeed, TRIM_CHUNK_ENVELOPES, TrimFault};
+
+/// The graph's tables: the claim log and its batches, operations, documents and blobs, replica
+/// envelopes and records, peers, fleet invites and checkpoints. A runtime adds its own.
+pub const SCHEMA: &str = r#"
+PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA synchronous = FULL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS batches (
+    id TEXT PRIMARY KEY,
+    origin TEXT NOT NULL,
+    replica_sequence INTEGER NOT NULL,
+    previous_hash TEXT,
+    hash TEXT NOT NULL,
+    accepted_at_unix_ms TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS batches_writer_sequence
+ON batches(origin, replica_sequence);
+
+CREATE TABLE IF NOT EXISTS claims (
+    store_index INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    batch_id TEXT NOT NULL REFERENCES batches(id),
+    subject TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    actor TEXT,
+    body TEXT NOT NULL,
+    predecessors TEXT NOT NULL,
+    accepted_at_unix_ms TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
+CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_subject_kind_accepted_index
+ON claims(subject, kind, length(accepted_at_unix_ms), accepted_at_unix_ms);
+CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);
+CREATE INDEX IF NOT EXISTS claims_accepted_order_index
+ON claims(length(accepted_at_unix_ms), accepted_at_unix_ms, store_index);
+CREATE INDEX IF NOT EXISTS claims_operation_index
+ON claims(json_extract(body, '$._operation.id'))
+WHERE json_extract(body, '$._operation.id') IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS operations (
+    id TEXT PRIMARY KEY,
+    request_digest TEXT NOT NULL,
+    canonical_claim_id TEXT NOT NULL REFERENCES claims(id),
+    state TEXT NOT NULL CHECK(state IN ('active','conflict'))
+);
+CREATE INDEX IF NOT EXISTS operations_conflict_index ON operations(id) WHERE state='conflict';
+
+CREATE TABLE IF NOT EXISTS blobs (
+    hash TEXT PRIMARY KEY,
+    bytes BLOB NOT NULL,
+    size INTEGER NOT NULL
+);
+-- Uploaded bytes become shared authority only when a durable claim references them.
+CREATE TABLE IF NOT EXISTS local_blobs (
+    hash TEXT PRIMARY KEY,
+    bytes BLOB NOT NULL,
+    size INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS documents (
+    name TEXT NOT NULL,
+    hash TEXT NOT NULL REFERENCES blobs(hash),
+    created_index INTEGER NOT NULL,
+    binding_claim_id TEXT NOT NULL DEFAULT '',
+    binding_key BLOB NOT NULL DEFAULT x'',
+    PRIMARY KEY(name, hash)
+);
+CREATE INDEX IF NOT EXISTS document_latest ON documents(name, created_index DESC);
+
+CREATE TABLE IF NOT EXISTS events (
+    store_index INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS peer_cursors (
+    peer TEXT PRIMARY KEY,
+    accepted_through INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS peer_replica_cursors (
+    peer TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    accepted_through INTEGER NOT NULL,
+    PRIMARY KEY(peer, origin)
+);
+
+CREATE TABLE IF NOT EXISTS replica_envelopes (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    previous_hash TEXT,
+    accepted_at_unix_ms TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    batch_id TEXT,
+    relay TEXT NOT NULL,
+    receipt_state TEXT NOT NULL CHECK(receipt_state IN ('pending','validated','degraded')),
+    validation_error TEXT,
+    received_at_unix_ms TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash)
+);
+CREATE INDEX IF NOT EXISTS replica_envelopes_state
+ON replica_envelopes(receipt_state, writer, sequence);
+CREATE INDEX IF NOT EXISTS replica_envelopes_batch
+ON replica_envelopes(batch_id);
+
+CREATE TABLE IF NOT EXISTS replica_records (
+    record_ref TEXT PRIMARY KEY,
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    raw BLOB NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','valid','unknown','invalid','repaired')),
+    claim_id TEXT,
+    subject_hint TEXT,
+    kind_hint TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    replacement_claim_id TEXT,
+    updated_at_unix_ms TEXT NOT NULL,
+    UNIQUE(writer, sequence, envelope_hash, position)
+);
+CREATE INDEX IF NOT EXISTS replica_records_state
+ON replica_records(state, writer, sequence);
+CREATE INDEX IF NOT EXISTS replica_records_claim
+ON replica_records(claim_id, position);
+
+CREATE TABLE IF NOT EXISTS projection_health (
+    aggregate TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK(status IN ('healthy','stale','indeterminate')),
+    last_good_store_index INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    error_message TEXT,
+    updated_at_unix_ms TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS replication_peers (
+    peer TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK(status IN ('unknown','up','down','auth-failed')),
+    last_success_at_unix_ms TEXT,
+    last_error TEXT,
+    schema_digest TEXT,
+    authority_digest TEXT,
+    graph_digest TEXT,
+    updated_at_unix_ms TEXT NOT NULL
+);
+
+-- Direct route policy is local cache state, outside the replicated claim vocabulary.
+CREATE TABLE IF NOT EXISTS replication_refusals (
+    peer TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    updated_at_unix_ms TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graph_generation (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO graph_generation(id, value) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS replica_envelope_signatures (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    member_key TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    stored_at_unix_ms TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash, member_key)
+);
+
+CREATE TABLE IF NOT EXISTS fleet_invite_tokens (
+    invite_id TEXT PRIMARY KEY,
+    token TEXT,
+    expires_at_unix_ms TEXT NOT NULL,
+    name TEXT,
+    migrate INTEGER NOT NULL DEFAULT 0,
+    bound_key TEXT,
+    bound_name TEXT,
+    failures INTEGER NOT NULL DEFAULT 0,
+    admitted_claim TEXT,
+    writer_floor INTEGER,
+    created_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS replica_envelope_holds (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason IN ('unsigned','fenced')),
+    updated_at_unix_ms TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash)
+);
+
+-- A dropped envelope's identity. See `store/checkpoint.rs`.
+CREATE TABLE IF NOT EXISTS checkpoint_envelopes (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    accepted_at_unix_ms INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash)
+);
+-- A dropped claim: what evidence checks, ancestry walks and idempotent retries still read.
+CREATE TABLE IF NOT EXISTS checkpoint_claims (
+    id TEXT PRIMARY KEY,
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT,
+    predecessors TEXT NOT NULL,
+    operation_id TEXT,
+    request_digest TEXT,
+    accepted_at_unix_ms INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL
+);
+-- The checkpoints this node sealed, verified, trimmed or adopted. `seal_rowid` is the
+-- `replica_envelopes` high water of the set it sealed or verified, so it can read exactly that
+-- set again. Every write this node makes is dated at or after the highest cut here.
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id TEXT PRIMARY KEY,
+    cut_unix_ms INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    seal_rowid INTEGER,
+    sealed_digest TEXT,
+    drop_digest TEXT,
+    graph_digest TEXT,
+    detail TEXT NOT NULL DEFAULT '{}',
+    updated_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
+CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
+ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
+"#;
+
+/// The store's schema version, set once the graph's and the runtime's tables exist.
+pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 15;";
 
 /// The graph half of a store. A runtime's store wraps it and derefs to it, so the runtime's
 /// projections read and write through the same connections.
@@ -97,11 +347,90 @@ pub struct Store {
     /// transaction. Only tests change them.
     pub trim_fault: Mutex<Option<checkpoint_trim::TrimFault>>,
     pub trim_chunk_envelopes: AtomicUsize,
+    /// The shortest wait between two replays for heals. A runtime's own tests set it to zero.
+    pub heal_replay_backoff_ms: u128,
     /// The runtime whose projections this store keeps.
     pub runtime: Arc<dyn Runtime>,
 }
 
 impl Store {
+    /// Open the store at `path`, creating it when it does not exist, with `runtime`'s tables
+    /// and projections beside the graph's.
+    pub fn open(path: &Path, origin: impl Into<String>, runtime: Arc<dyn Runtime>) -> Result<Self> {
+        let origin = origin.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut connection = Connection::open(path)
+            .with_context(|| format!("open st database {}", path.display()))?;
+        projection_digest::register(&connection)?;
+        connection.profile(Some(record_sqlite_time));
+        connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        // Keep the hot graph and replication index pages in SQLite's bounded
+        // page cache. The default (~2 MiB per connection) churns against the
+        // large durable claim store during otherwise quiet replication.
+        connection.execute_batch("PRAGMA cache_size = -32768;")?;
+        Self::create_schema(&connection, &*runtime)?;
+        separate_staged_blobs(&mut connection)?;
+        {
+            let transaction = connection.transaction()?;
+            runtime.open_projections(&transaction, false)?;
+            seed_replica_envelopes_tx(&transaction, &origin, None)?;
+            transaction.commit()?;
+        }
+        let readers = ReadPool::new(path, false)?;
+        Self::from_connection(
+            connection,
+            readers,
+            origin,
+            path.to_path_buf(),
+            false,
+            runtime,
+        )
+    }
+
+    /// Open a new store in shared memory, as tests and short-lived tools use.
+    pub fn open_memory(origin: impl Into<String>, runtime: Arc<dyn Runtime>) -> Result<Self> {
+        let origin = origin.into();
+        let uri = PathBuf::from(format!(
+            "file:st3-{}?mode=memory&cache=shared",
+            Uuid::now_v7().simple()
+        ));
+        let mut connection = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        projection_digest::register(&connection)?;
+        connection.profile(Some(record_sqlite_time));
+        connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        Self::create_schema(&connection, &*runtime)?;
+        {
+            let transaction = connection.transaction()?;
+            runtime.open_projections(&transaction, true)?;
+            seed_replica_envelopes_tx(&transaction, &origin, None)?;
+            transaction.commit()?;
+        }
+        let readers = ReadPool::new(&uri, true)?;
+        Self::from_connection(connection, readers, origin, uri, true, runtime)
+    }
+
+    /// Check and migrate the schema, then create the graph's tables, the runtime's, and the
+    /// triggers that keep digests current.
+    fn create_schema(connection: &Connection, runtime: &dyn Runtime) -> Result<()> {
+        reject_old_schema(connection)?;
+        runtime.migrate_schema(connection)?;
+        connection.execute_batch(SCHEMA)?;
+        runtime.create_schema(connection)?;
+        connection.execute_batch(SCHEMA_VERSION)?;
+        document_index::initialize(connection)?;
+        connection.execute_batch(WRITE_CLOCK)?;
+        create_graph_generation_triggers(connection, runtime.legacy_digest_tables())?;
+        projection_digest::initialize(connection, runtime.digest_tables())?;
+        Ok(())
+    }
+
     /// Wrap an opened, initialized writer connection and its read pool.
     pub fn from_connection(
         connection: Connection,
@@ -132,6 +461,7 @@ impl Store {
             shared_memory,
             trim_fault: Mutex::new(None),
             trim_chunk_envelopes: AtomicUsize::new(checkpoint_trim::TRIM_CHUNK_ENVELOPES),
+            heal_replay_backoff_ms: heal::HEAL_REPLAY_BACKOFF_MS,
             runtime,
         })
     }

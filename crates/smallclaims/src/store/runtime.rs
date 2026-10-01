@@ -25,6 +25,17 @@ pub type LegacyDigestTable = (
 
 /// A runtime's claim kinds and projections.
 pub trait Runtime: Send + Sync {
+    /// Migrate an older store's tables before any table is created. The graph has checked that
+    /// the schema version is one it supports.
+    fn migrate_schema(&self, connection: &Connection) -> Result<()>;
+
+    /// Create the runtime's tables and its indexes on the claim log, once the graph's exist.
+    fn create_schema(&self, connection: &Connection) -> Result<()>;
+
+    /// Bring the runtime's projections up to date as the store opens: a store in shared memory
+    /// is new, and a store on disk may need a replay after an upgrade.
+    fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()>;
+
     /// The digest of the claim kinds and fields this build knows. Peers whose digests differ may
     /// project the same claims differently, so they compare their logs instead of their graphs.
     fn schema_digest(&self) -> String;

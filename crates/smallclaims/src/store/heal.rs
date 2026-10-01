@@ -38,7 +38,7 @@ pub const HEAL_BACKOFF_MAX_MS: u128 = 60 * 60 * 1000;
 /// A replay from nothing holds the store for as long as it takes, 41 seconds on a 2 GB store, so
 /// a node replays for heals at most this often, and half as often after each replay that did not
 /// make the graphs agree.
-pub const HEAL_REPLAY_BACKOFF_MS: u128 = if cfg!(test) { 0 } else { 10 * 60 * 1000 };
+pub const HEAL_REPLAY_BACKOFF_MS: u128 = 10 * 60 * 1000;
 pub const HEAL_REPLAY_BACKOFF_MAX_MS: u128 = 24 * 60 * 60 * 1000;
 
 /// The claims a projection reads: every claim with its batch, except repaired originals.
@@ -543,7 +543,7 @@ impl Store {
         report.unresolved = if healed { None } else { unresolved };
         if healed {
             let mut state = self.heal.lock().unwrap_or_else(PoisonError::into_inner);
-            state.replay_backoff_ms = HEAL_REPLAY_BACKOFF_MS;
+            state.replay_backoff_ms = self.heal_replay_backoff_ms;
         }
         self.replication_sync
             .lock()
@@ -584,7 +584,7 @@ impl Store {
         {
             let state = self.heal.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(at) = state.replayed_at_unix_ms
-                && now.saturating_sub(at) < state.replay_backoff_ms.max(HEAL_REPLAY_BACKOFF_MS)
+                && now.saturating_sub(at) < state.replay_backoff_ms.max(self.heal_replay_backoff_ms)
             {
                 return Ok(false);
             }
@@ -592,8 +592,8 @@ impl Store {
         self.replay_replication_graph()?;
         let mut state = self.heal.lock().unwrap_or_else(PoisonError::into_inner);
         state.replayed_at_unix_ms = Some(now);
-        state.replay_backoff_ms = (state.replay_backoff_ms.max(HEAL_REPLAY_BACKOFF_MS) * 2)
-            .clamp(HEAL_REPLAY_BACKOFF_MS, HEAL_REPLAY_BACKOFF_MAX_MS);
+        state.replay_backoff_ms = (state.replay_backoff_ms.max(self.heal_replay_backoff_ms) * 2)
+            .clamp(self.heal_replay_backoff_ms, HEAL_REPLAY_BACKOFF_MAX_MS);
         Ok(true)
     }
 

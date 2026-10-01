@@ -30,6 +30,42 @@ impl SmalltalkRuntime {
 }
 
 impl Runtime for SmalltalkRuntime {
+    fn migrate_schema(&self, connection: &Connection) -> Result<()> {
+        migrate_schema(connection)
+    }
+
+    fn create_schema(&self, connection: &Connection) -> Result<()> {
+        connection.execute_batch(SCHEMA)?;
+        backfill_message_index(connection)
+    }
+
+    fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()> {
+        if shared_memory {
+            rebuild_operations_tx(transaction)?;
+            rebuild_planning_tx(transaction)?;
+            return Ok(());
+        }
+        let upgraded: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='canonical_shared_projection_rules' AND value='2')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !upgraded {
+            replay_graph_from_nothing_tx(transaction)?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('derived_tables_version',?1)",
+                [DERIVED_TABLES_VERSION],
+            )?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('canonical_shared_projection_rules','2')",
+                [],
+            )?;
+        } else {
+            rebuild_derived_tables_once_tx(transaction)?;
+        }
+        Ok(())
+    }
+
     fn schema_digest(&self) -> String {
         self.claim_registry().digest()
     }
