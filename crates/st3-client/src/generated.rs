@@ -1542,6 +1542,12 @@ pub enum ActionType {
     WorkRetry,
     #[serde(rename = "work.publish-mission")]
     WorkPublishMission,
+    #[serde(rename = "agent.create")]
+    AgentCreate,
+    #[serde(rename = "terminal.create")]
+    TerminalCreate,
+    #[serde(rename = "terminal.end")]
+    TerminalEnd,
     #[serde(rename = "agent.queue-move")]
     AgentQueueMove,
     #[serde(rename = "lane.join")]
@@ -1607,6 +1613,20 @@ impl ActionRequest {
             fence,
             parameters: serde_json::to_value(parameters)?,
         })
+    }
+    pub fn agent_create(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentCreateParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::AgentCreate,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
     }
     pub fn agent_queue_move(
         id: impl Into<String>,
@@ -2042,6 +2062,20 @@ impl ActionRequest {
             &parameters,
         )
     }
+    pub fn terminal_create(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: TerminalCreateParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::TerminalCreate,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
     pub fn terminal_detach(
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
@@ -2051,6 +2085,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::TerminalDetach,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn terminal_end(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: TargetParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::TerminalEnd,
             idempotency_key,
             fence,
             &parameters,
@@ -2346,6 +2394,37 @@ pub struct WorkPublishMissionParameters {
     pub target_id: String,
     pub name: String,
     pub mission: Value,
+}
+
+/// Declare and start a harness seat as the authenticated person.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCreateParameters {
+    pub name: String,
+    pub harness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Start an interactive shell without an agent or harness.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalCreateParameters {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

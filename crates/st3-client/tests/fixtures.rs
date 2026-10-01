@@ -380,3 +380,22 @@ fn authority_error_codes_are_typed_and_round_trip() {
         );
     }
 }
+
+#[test]
+fn creation_actions_round_trip_typed_parameters() {
+    for name in ["agent-create.json", "terminal-create.json", "terminal-end.json"] {
+        let action: ActionRequest = decode(name);
+        let mut expected: serde_json::Value = decode(name);
+        let fence: Fence = serde_json::from_value(expected["fence"].clone()).unwrap();
+        expected["fence"] = serde_json::to_value(fence).unwrap();
+        assert_eq!(serde_json::to_value(action).unwrap(), expected);
+    }
+    let action: ActionRequest = decode("agent-create.json");
+    assert_eq!(action.action_type(), &ActionType::AgentCreate);
+    let value: serde_json::Value = decode("agent-create.json");
+    let parameters: AgentCreateParameters = serde_json::from_value(value["parameters"].clone()).unwrap();
+    assert_eq!(parameters.name, "worker"); assert!(parameters.message.as_deref().unwrap().starts_with("--First"));
+    let generated = ActionRequest::agent_create("action/agent-create", "fixture-agent-create-0001",
+        serde_json::from_value(value["fence"].clone()).unwrap(), parameters).unwrap();
+    assert_eq!(serde_json::to_value(generated).unwrap(), serde_json::to_value(action).unwrap());
+}
