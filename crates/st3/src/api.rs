@@ -3885,16 +3885,10 @@ pub fn start_operation_report(state: &AppState) {
 }
 
 /// Read the headers of this host's native session transcripts off the request path as the
-/// daemon starts. Discovery keeps each transcript's header until the file changes, so the first
-/// session list after a start reads what changed instead of every header, over a second on a
-/// host with a couple of thousand transcripts.
+/// daemon starts. Saved-history session lists and session reads use this background inventory
+/// instead of walking the transcript trees, so a cold tree cannot hold those requests.
 pub fn start_native_session_discovery(state: &AppState) {
-    let home = state.native_session_home.clone();
-    std::thread::spawn(move || {
-        if let Err(error) = crate::external_sessions::discover(home.as_deref(), true) {
-            eprintln!("st3: reading native session transcripts at start failed: {error:#}");
-        }
-    });
+    crate::external_sessions::start_history_inventory(state.native_session_home.as_deref());
 }
 
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of

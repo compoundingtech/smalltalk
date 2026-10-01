@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,6 +26,9 @@ const MAX_TIMELINE_BYTES: u64 = 32 * 1024 * 1024;
 // when every native entry contains a large tool payload.
 const MAX_TIMELINE_VALUE_BYTES: usize = 8 * 1024;
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
+/// How long a saved-history request waits for a background transcript read before it answers
+/// with the last complete inventory.
+const HISTORY_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -149,22 +152,129 @@ pub(crate) fn discover(home: Option<&Path>, include_history: bool) -> Result<Ext
         LazyLock::new(|| Mutex::new(None));
     let cached = {
         let cache = CACHE.lock().expect("external session cache mutex poisoned");
-        cache.as_ref().and_then(|(cached_home, cached_history, created, discovery)| {
-            (cached_home == home
-                && *cached_history == include_history
-                && created.elapsed() <= DISCOVERY_CACHE_TTL)
-                .then(|| discovery.clone())
-        })
+        cache
+            .as_ref()
+            .and_then(|(cached_home, cached_history, created, discovery)| {
+                (cached_home == home
+                    && *cached_history == include_history
+                    && created.elapsed() <= DISCOVERY_CACHE_TTL)
+                    .then(|| discovery.clone())
+            })
     };
     if let Some(discovery) = cached {
         return Ok(discovery);
     }
     // A historical inventory may be waiting on cold storage. Do not make native-only
     // requests wait behind it by holding the cache mutex while discovering files.
-    let discovery = discover_uncached(home, None, include_history)?;
-    *CACHE.lock().expect("external session cache mutex poisoned") =
-        Some((home.to_owned(), include_history, Instant::now(), discovery.clone()));
+    let discovery = if include_history {
+        // Live transcripts are read now; saved history comes from the background inventory,
+        // so a cold history tree never holds a request past HISTORY_WAIT.
+        let candidates = platform_processes()?;
+        let mut files = discover_files(home, false, &candidates)?;
+        let live = files
+            .iter()
+            .map(|item| (item.transcript.clone(), item.native_id.clone()))
+            .collect::<BTreeSet<_>>();
+        files.extend(
+            historical_files(home)?
+                .iter()
+                .filter(|item| !live.contains(&(item.transcript.clone(), item.native_id.clone())))
+                .cloned(),
+        );
+        assemble_discovery(files, candidates, None, true)?
+    } else {
+        discover_uncached(home, None, false)?
+    };
+    *CACHE.lock().expect("external session cache mutex poisoned") = Some((
+        home.to_owned(),
+        include_history,
+        Instant::now(),
+        discovery.clone(),
+    ));
     Ok(discovery)
+}
+
+#[derive(Default)]
+struct HistoryInventory {
+    files: Option<(Instant, Arc<Vec<SessionMetadata>>)>,
+    error: Option<String>,
+    refreshing: bool,
+    completed: u64,
+}
+
+/// Saved transcript metadata per native home, read by a background thread. A daemon has one
+/// home; tests use one per temporary directory.
+static HISTORY: LazyLock<(Mutex<HashMap<PathBuf, HistoryInventory>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+
+/// Start reading saved transcripts off the request path, unless a read is already running.
+pub(crate) fn start_history_inventory(home: Option<&Path>) {
+    if let Some(home) = home {
+        let mut inventories = HISTORY.0.lock().expect("history inventory mutex poisoned");
+        start_history_refresh(inventories.entry(home.to_owned()).or_default(), home);
+    }
+}
+
+fn start_history_refresh(inventory: &mut HistoryInventory, home: &Path) {
+    if inventory.refreshing {
+        return;
+    }
+    inventory.refreshing = true;
+    let home = home.to_owned();
+    std::thread::spawn(move || {
+        let result = discover_files(&home, true, &[]);
+        let (lock, ready) = &*HISTORY;
+        let mut inventories = lock.lock().expect("history inventory mutex poisoned");
+        let inventory = inventories.entry(home).or_default();
+        inventory.refreshing = false;
+        inventory.completed += 1;
+        match result {
+            Ok(files) => {
+                inventory.files = Some((Instant::now(), Arc::new(files)));
+                inventory.error = None;
+            }
+            Err(error) => inventory.error = Some(format!("{error:#}")),
+        }
+        ready.notify_all();
+    });
+}
+
+/// Return saved transcript metadata within HISTORY_WAIT. An inventory older than the cache TTL
+/// is refreshed in the background; if that refresh does not finish in time, the last complete
+/// inventory is returned. Only before any inventory completes does a request fail, with an
+/// error that says to retry.
+fn historical_files(home: &Path) -> Result<Arc<Vec<SessionMetadata>>> {
+    let (lock, ready) = &*HISTORY;
+    let mut inventories = lock.lock().expect("history inventory mutex poisoned");
+    let inventory = inventories.entry(home.to_owned()).or_default();
+    if let Some((read_at, files)) = &inventory.files
+        && read_at.elapsed() <= DISCOVERY_CACHE_TTL
+    {
+        return Ok(files.clone());
+    }
+    start_history_refresh(inventory, home);
+    let completed = inventory.completed;
+    let deadline = Instant::now() + HISTORY_WAIT;
+    while inventories[home].completed == completed {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        inventories = ready
+            .wait_timeout(inventories, remaining)
+            .expect("history inventory mutex poisoned")
+            .0;
+    }
+    let inventory = &inventories[home];
+    match (&inventory.files, &inventory.error) {
+        (Some((_, files)), _) => Ok(files.clone()),
+        (None, Some(error)) => {
+            anyhow::bail!("reading saved native session transcripts failed: {error}")
+        }
+        (None, None) => anyhow::bail!(
+            "st is still reading saved native session transcripts in the background; retry shortly"
+        ),
+    }
 }
 
 pub(crate) fn discover_fresh(
@@ -183,11 +293,17 @@ fn discover_uncached(
     include_history: bool,
 ) -> Result<ExternalDiscovery> {
     let candidates = platform_processes()?;
-    let mut metadata = resolve_duplicate_sessions(
-        discover_files(home, include_history, &candidates)?,
-        &candidates,
-        strict_id,
-    )?;
+    let files = discover_files(home, include_history, &candidates)?;
+    assemble_discovery(files, candidates, strict_id, include_history)
+}
+
+fn assemble_discovery(
+    files: Vec<SessionMetadata>,
+    candidates: Vec<ProcessCandidate>,
+    strict_id: Option<&str>,
+    include_history: bool,
+) -> Result<ExternalDiscovery> {
+    let mut metadata = resolve_duplicate_sessions(files, &candidates, strict_id)?;
     metadata.sort_by(|left, right| {
         right
             .updated_at_unix_ms
@@ -425,7 +541,8 @@ pub(crate) fn claude_session_of_managed_driver(
     driver_token: &str,
 ) -> std::result::Result<String, String> {
     // A seat without a wrapper names Claude's own session in its evidence token.
-    if let Some(session) = driver_token.strip_prefix(st_drivers::harness_state::WRAPPERLESS_PREFIX) {
+    if let Some(session) = driver_token.strip_prefix(st_drivers::harness_state::WRAPPERLESS_PREFIX)
+    {
         return if is_uuid(session) {
             Ok(session.to_owned())
         } else {
@@ -1111,16 +1228,18 @@ fn discover_files(
     // client deadline even when no historical sessions are requested. Processes with no exact
     // transcript path remain visible as unresolved processes.
     if !include_history {
-        let mut found = if candidates
-            .iter()
-            .any(|candidate| candidate.driver == ExternalDriver::OpenCode && !candidate.managed_by_st3)
-        {
+        let mut found = if candidates.iter().any(|candidate| {
+            candidate.driver == ExternalDriver::OpenCode && !candidate.managed_by_st3
+        }) {
             discover_opencode_sessions(home).unwrap_or_default()
         } else {
             Vec::new()
         };
         let mut seen = BTreeSet::new();
-        for candidate in candidates.iter().filter(|candidate| !candidate.managed_by_st3) {
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| !candidate.managed_by_st3)
+        {
             for token in candidate.process.command.split_whitespace() {
                 let token = token.trim_matches(['"', '\'']);
                 let token = if token.starts_with('-') {
@@ -1129,7 +1248,9 @@ fn discover_files(
                     token
                 };
                 let path = Path::new(token);
-                if path.extension().is_none_or(|extension| extension != "jsonl")
+                if path
+                    .extension()
+                    .is_none_or(|extension| extension != "jsonl")
                     || !path.is_absolute()
                 {
                     continue;
@@ -1147,10 +1268,12 @@ fn discover_files(
                     let Ok(canonical_path) = fs::canonicalize(path) else {
                         return false;
                     };
-                    canonical_path.strip_prefix(canonical_root).is_ok_and(|relative| {
-                        let depth = relative.components().count();
-                        depth >= 2 && (*driver != ExternalDriver::Omp || depth == 2)
-                    })
+                    canonical_path
+                        .strip_prefix(canonical_root)
+                        .is_ok_and(|relative| {
+                            let depth = relative.components().count();
+                            depth >= 2 && (*driver != ExternalDriver::Omp || depth == 2)
+                        })
                 });
                 if in_session_root
                     && seen.insert(path.to_owned())
@@ -2816,9 +2939,11 @@ mod tests {
         let found = discover_files(home.path(), true, &[]).unwrap();
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|item| item.native_id == "session-id"));
-        assert!(found
-            .iter()
-            .all(|item| item.transcript.file_name().unwrap() != "tool.jsonl"));
+        assert!(
+            found
+                .iter()
+                .all(|item| item.transcript.file_name().unwrap() != "tool.jsonl")
+        );
     }
 
     #[test]
@@ -2920,9 +3045,11 @@ mod tests {
                 exact_session: false,
             },
         };
-        assert!(discover_files(home.path(), false, &[candidate])
-            .unwrap()
-            .is_empty());
+        assert!(
+            discover_files(home.path(), false, &[candidate])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2935,10 +3062,54 @@ mod tests {
             "{\"type\":\"session\",\"id\":\"saved-only-case\"}\n",
         )
         .unwrap();
-        assert!(discover(Some(home.path()), false).unwrap().sessions.is_empty());
+        assert!(
+            discover(Some(home.path()), false)
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
         let saved = discover(Some(home.path()), true).unwrap();
         assert_eq!(saved.sessions.len(), 1);
         assert_eq!(saved.sessions[0].native_id, "saved-only-case");
+    }
+
+    #[test]
+    fn saved_history_request_does_not_wait_past_bound_for_a_stuck_transcript_read() {
+        let home = tempfile::tempdir().unwrap();
+        let saved = SessionMetadata {
+            driver: ExternalDriver::Omp,
+            native_id: "saved-before-stall".into(),
+            transcript: home.path().join("saved.jsonl"),
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            revision: "1".into(),
+        };
+        // A background read that never finishes, as on cold, seek-saturated storage.
+        let stall = |files| {
+            HISTORY.0.lock().unwrap().insert(
+                home.path().to_owned(),
+                HistoryInventory {
+                    files,
+                    refreshing: true,
+                    ..HistoryInventory::default()
+                },
+            );
+        };
+
+        stall(None);
+        let started = Instant::now();
+        let error = historical_files(home.path()).unwrap_err().to_string();
+        assert!(error.contains("retry shortly"), "{error}");
+        assert!(started.elapsed() < HISTORY_WAIT + Duration::from_secs(1));
+
+        let expired = Instant::now().checked_sub(DISCOVERY_CACHE_TTL * 2).unwrap();
+        stall(Some((expired, Arc::new(vec![saved]))));
+        let started = Instant::now();
+        let files = historical_files(home.path()).unwrap();
+        assert_eq!(files[0].native_id, "saved-before-stall");
+        assert!(started.elapsed() < HISTORY_WAIT + Duration::from_secs(1));
     }
 
     #[test]
@@ -3014,10 +3185,12 @@ mod tests {
         let other = root.path().join("other");
         fs::create_dir_all(&other).unwrap();
         let ambiguous = vec![metadata(&active, 10), metadata(&other, 10)];
-        assert!(resolve_duplicate_sessions(ambiguous.clone(), &[], Some(&id))
-            .unwrap_err()
-            .to_string()
-            .contains("refusing ambiguous import"));
+        assert!(
+            resolve_duplicate_sessions(ambiguous.clone(), &[], Some(&id))
+                .unwrap_err()
+                .to_string()
+                .contains("refusing ambiguous import")
+        );
         assert_eq!(
             resolve_duplicate_sessions(ambiguous, &[], None)
                 .unwrap()
@@ -3046,13 +3219,21 @@ mod tests {
             .unwrap()
             .unwrap();
         let timeline = normalized_timeline(&bound).unwrap();
-        assert!(timeline
-            .iter()
-            .any(|item| item["type"] == "content" && item["body"]["text"] == "resumed context"));
-        assert!(!timeline.iter().any(|item| item["body"]["text"] == "stale context"));
-        assert!(find_imported_omp_transcript(&stale, "wrong-id")
-            .unwrap()
-            .is_none());
+        assert!(
+            timeline
+                .iter()
+                .any(|item| item["type"] == "content" && item["body"]["text"] == "resumed context")
+        );
+        assert!(
+            !timeline
+                .iter()
+                .any(|item| item["body"]["text"] == "stale context")
+        );
+        assert!(
+            find_imported_omp_transcript(&stale, "wrong-id")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

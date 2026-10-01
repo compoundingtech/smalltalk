@@ -332,11 +332,13 @@ st conversations timeline SESSION
 ```
 
 `import ls` reads exact transcript paths named by live harness commands without scanning saved
-history; `import ls --all` inventories saved transcripts as well. `import show` gives the harness,
-native session ID, workspace, and process, if one is running. A running harness whose command line
-does not name its exact transcript is listed as blocked; exit it, then import its saved session from
-`import ls --all`. Check the workspace before importing: do not import a session already run by a
-seat.
+history; `import ls --all` lists saved transcripts as well. The daemon reads saved transcripts in
+the background, starting when it starts; `import ls --all` and `import show` answer from the
+latest complete read within two seconds. Right after a daemon start on slow storage, they may ask
+you to retry. `import show` gives the harness, native session ID, workspace, and process, if one is
+running. A running harness whose command line does not name its exact transcript is listed as
+blocked; exit it, then import its saved session from `import ls --all`. Check the workspace before
+importing: do not import a session already run by a seat.
 
 For omp, the inventory reads only session transcripts, not JSONL tool logs within a session's
 attachment directory. If several transcript copies have the same native ID, st prefers a copy
