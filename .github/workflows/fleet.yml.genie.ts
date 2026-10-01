@@ -74,12 +74,13 @@ export default githubWorkflow({
     // GitHub's merge queue runs the required checks on each queued entry; without this trigger the
     // queue never receives them and merges freeze.
     merge_group: {},
-    // Main CI is off until Nathan says to turn it back on: restore `push: { branches: ['main'] },` here.
+    push: { branches: ['main'] },
     workflow_dispatch: {},
   },
   permissions: { contents: 'read' },
   concurrency: {
-    group: 'workspace-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}',
+    // PR updates replace stale checks; every other run has its own group so pending pushes survive.
+    group: 'workspace-${{ github.event.pull_request.number || github.run_id }}-${{ github.event_name }}',
     'cancel-in-progress': '${{ github.event_name == \'pull_request\' }}',
   },
   // actionlint must know the Namespace shape label the stage jobs use.
