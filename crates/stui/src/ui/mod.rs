@@ -11,6 +11,7 @@ mod contract;
 pub mod conversation;
 pub mod demo;
 pub mod doc;
+mod glass;
 pub mod live;
 pub mod pane;
 pub mod screens;
@@ -213,6 +214,8 @@ pub struct Ui {
     revoke: Option<String>,
     /// Home items put off until later. Demo only: kept in memory on this machine.
     snoozed: HashSet<String>,
+    /// `stui --glasses`: tabs of panes and a palette in place of the sidebar layout.
+    pub(crate) glass: Option<glass::Glass>,
 }
 
 impl Ui {
@@ -251,6 +254,7 @@ impl Ui {
             new_mission: None,
             revoke: None,
             snoozed: HashSet::new(),
+            glass: None,
         }
     }
 
@@ -338,12 +342,38 @@ impl Ui {
             );
             return;
         }
-        self.top_bar(buf, Rect { height: 1, ..area });
-        let body = Rect {
-            y: area.y + 1,
-            height: area.height - 2,
-            ..area
-        };
+        if self.glass.is_some() {
+            self.render_glass(buf, area);
+        } else {
+            self.top_bar(buf, Rect { height: 1, ..area });
+            self.draw_body(
+                buf,
+                Rect {
+                    y: area.y + 1,
+                    height: area.height - 2,
+                    ..area
+                },
+            );
+            self.footer(
+                buf,
+                Rect {
+                    y: area.y + area.height - 1,
+                    height: 1,
+                    ..area
+                },
+            );
+        }
+        if let Some(subject) = &self.popover {
+            self.draw_popover(buf, area, subject);
+        }
+        if self.help {
+            self.draw_help(buf, area);
+        }
+    }
+
+    /// The sidebar and the main area under the top bar.
+    fn draw_body(&self, buf: &mut Buffer, body: Rect) {
+        let area = body;
         let side = if self.sidebar && area.width >= 70 {
             (area.width * 3 / 10).clamp(30, 46)
         } else {
@@ -369,20 +399,6 @@ impl Ui {
             ..body
         };
         self.draw_main(buf, main);
-        self.footer(
-            buf,
-            Rect {
-                y: area.y + area.height - 1,
-                height: 1,
-                ..area
-            },
-        );
-        if let Some(subject) = &self.popover {
-            self.draw_popover(buf, area, subject);
-        }
-        if self.help {
-            self.draw_help(buf, area);
-        }
     }
 
     /// One pane alone, filling the frame: how a glass will draw each of its panes.
@@ -566,7 +582,11 @@ impl Ui {
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
         } else {
-            let mut hints = vec![("1-4", "tabs"), ("↑↓", "select")];
+            let mut hints = match &self.glass {
+                Some(_) if !self.on_home() => vec![("ctrl+k", "open"), ("ctrl+w", "close")],
+                Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
+                None => vec![("1-4", "tabs"), ("↑↓", "select")],
+            };
             match self.tab {
                 0 => hints.extend([("keys", "on the card"), ("c", "write")]),
                 1 => hints.extend([
@@ -1558,6 +1578,9 @@ impl Ui {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        if self.glass_key(key) {
+            return;
+        }
         // An attached terminal gets every key first, Ctrl-C included.
         if self.terminal.is_some() && self.tab == 1 {
             let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2387,6 +2410,9 @@ impl Ui {
 
     fn click(&mut self, hit: Hit) {
         match hit {
+            Hit::Palette => self.open_palette(None),
+            Hit::GlassTab(index) => self.show_tab(index),
+            Hit::PaletteChoice(index) => self.open_choice(Some(index), false),
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
             Hit::Key(key) if self.popover.is_some() => {
@@ -2713,7 +2739,9 @@ fn copy(text: &str) {
 
 // ------------------------------------------------------------------------ run
 
-struct Guard;
+struct Guard {
+    enhanced: bool,
+}
 
 /// How many of a terminal's rows to skip so it fits the pane. A terminal taller than the pane
 /// shows its bottom, where the prompt usually is, unless that would hide the cursor; then the
@@ -2740,18 +2768,41 @@ fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
 }
 
 impl Guard {
-    fn enter() -> Result<Self> {
+    /// `keys`: ask the terminal to report modifiers it usually keeps, such as Cmd on macOS,
+    /// where it can (kitty's keyboard protocol). Only glasses ask, for Cmd+K.
+    fn enter(keys: bool) -> Result<Self> {
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-        Ok(Self)
+        let enhanced = keys && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        if enhanced {
+            execute!(
+                io::stdout(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            )?;
+        }
+        Ok(Self { enhanced })
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        if self.enhanced {
+            let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
+}
+
+/// The glass `stui --glasses` or `stui --glass NAME` asks for; plain stui asks for none.
+pub fn glass_name(args: &[String]) -> Option<String> {
+    arg(args, "--glass").or_else(|| {
+        args.iter()
+            .any(|arg| arg == "--glasses")
+            .then(|| "main".to_owned())
+    })
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -2766,10 +2817,12 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     if args.iter().any(|arg| arg == "--dump") {
         return dump(args);
     }
-    let _guard = Guard::enter()?;
+    let glass = glass_name(args);
+    let _guard = Guard::enter(glass.is_some())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let mut ui = Ui::new(demo::loading());
+    ui.glass = glass.map(glass::Glass::new);
     ui.demo = Some(Demo {
         started: Instant::now(),
         loaded: false,
@@ -2833,15 +2886,26 @@ fn dump(args: &[String]) -> Result<()> {
     } else {
         demo::world()
     });
+    ui.glass = glass_name(args).map(glass::Glass::new);
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
-    // Keys: each character is a key; "\n" is Enter, "<esc>", "<end>", "<pgdn>", "<pgup>", "<down>".
+    // Keys: each character is a key; "\n" is Enter, "<esc>", "<end>", "<pgdn>", "<pgup>", "<down>";
+    // "<c-k>" is Ctrl+K and "<a-1>" Alt+1.
     if let Some(keys) = arg(args, "--keys") {
         let mut rest = keys.as_str();
         while !rest.is_empty() {
             terminal.draw(|frame| ui.render(frame))?;
+            let mut modifiers = KeyModifiers::NONE;
             let (code, len) =
                 if let Some(end) = rest.strip_prefix('<').and_then(|tail| tail.find('>')) {
-                    let name = &rest[1..=end];
+                    let mut name = &rest[1..=end];
+                    for (prefix, modifier) in
+                        [("c-", KeyModifiers::CONTROL), ("a-", KeyModifiers::ALT)]
+                    {
+                        if let Some(key) = name.strip_prefix(prefix) {
+                            modifiers |= modifier;
+                            name = key;
+                        }
+                    }
                     let code = match name {
                         "esc" => KeyCode::Esc,
                         "end" => KeyCode::End,
@@ -2851,6 +2915,8 @@ fn dump(args: &[String]) -> Result<()> {
                         "up" => KeyCode::Up,
                         "enter" => KeyCode::Enter,
                         "tab" => KeyCode::Tab,
+                        "bs" => KeyCode::Backspace,
+                        _ if name.chars().count() == 1 => KeyCode::Char(name.chars().next().unwrap()),
                         _ => KeyCode::Null,
                     };
                     (code, end + 2)
@@ -2858,7 +2924,7 @@ fn dump(args: &[String]) -> Result<()> {
                     let character = rest.chars().next().unwrap_or(' ');
                     (KeyCode::Char(character), character.len_utf8())
                 };
-            ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+            ui.key(KeyEvent::new(code, modifiers));
             rest = &rest[len..];
         }
     }

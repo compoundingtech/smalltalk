@@ -113,7 +113,7 @@ fn step_style(state: StepState, spinner: &'static str) -> (&'static str, Color, 
     }
 }
 
-fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
+pub fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
     match kind {
         AttentionKind::Review { .. }
         | AttentionKind::Feedback { .. }
@@ -1572,7 +1572,7 @@ pub fn fleet_list(world: &World) -> Listing {
     }
 }
 
-fn reach_style(reach: Reach) -> (&'static str, Color) {
+pub fn reach_style(reach: Reach) -> (&'static str, Color) {
     match reach {
         Reach::Here | Reach::Direct => ("●", theme::GREEN),
         Reach::Indirect => ("◐", theme::SAPPHIRE),
