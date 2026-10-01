@@ -120,6 +120,9 @@ pub async fn run(
                             let Ok(body) = body(client, message).await else { continue; };
                             let envelope = st_drivers::ding::st3_notification_text(&message.subject, &message.from, &message.to,
                                 message.title.as_deref(), &body, &st_drivers::ding::st3_body_sha256(&body));
+                            // A body can become available after reexec has already scanned the native
+                            // transcript for other messages. Revisit retained proof once for this identity.
+                            transcript.body_available(state.attempted.contains(&message.subject));
                             content.insert(message.subject.clone(), envelope.clone());
                             envelope
                         };
@@ -218,6 +221,12 @@ struct Transcript {
     lines: st_drivers::reexec::LineBuffer,
 }
 impl Transcript {
+    fn body_available(&mut self, uncertain: bool) {
+        if uncertain {
+            self.offset = 0;
+            self.lines = Default::default();
+        }
+    }
     fn appended(&mut self, path: &Path) -> Result<Vec<Value>> {
         use std::io::{Read as _, Seek as _};
         let mut file = std::fs::File::open(path)?;
@@ -362,6 +371,34 @@ mod tests {
         let rebound = root.path().join("next-native.jsonl");
         std::fs::write(&rebound, b"{\"type\":\"user\"}\n").unwrap();
         assert_eq!(transcript.appended(&rebound).unwrap().len(), 1);
+        assert!(!root.path().join("resources").exists());
+    }
+
+    #[test]
+    fn claude_revisits_native_proof_when_an_uncertain_body_becomes_available() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        let envelope = st_drivers::ding::st3_notification_text(
+            "message/quartz",
+            "person/eval",
+            "agent/eval.worker",
+            None,
+            "QUARTZ SIGNAL",
+            &st_drivers::ding::st3_body_sha256("QUARTZ SIGNAL"),
+        );
+        let record = json!({"type":"user","message":{"role":"user","content":envelope}});
+        std::fs::write(&path, format!("{record}\n")).unwrap();
+        let mut transcript = Transcript::default();
+        // A different available message caused the initial scan after reexec.
+        transcript.appended(&path).unwrap();
+        assert!(transcript.appended(&path).unwrap().is_empty());
+        transcript.body_available(true);
+        assert!(native_receipt(
+            &transcript.appended(&path).unwrap()[0],
+            &envelope
+        ));
+        transcript.body_available(false);
+        assert!(transcript.appended(&path).unwrap().is_empty());
         assert!(!root.path().join("resources").exists());
     }
 

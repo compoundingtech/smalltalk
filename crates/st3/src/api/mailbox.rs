@@ -99,8 +99,13 @@ async fn stream(state: AppState, fence: Fence, mut socket: WebSocket) {
                     .into_iter()
                     .next();
                 let messages = if binding.component == "delivery" {
-                    store.messages(Some(&binding.subject), false)?.into_iter()
-                        .filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")).collect()
+                    store
+                        .messages(Some(&binding.subject), false)?
+                        .into_iter()
+                        .filter(|message| {
+                            matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+                        })
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -113,8 +118,7 @@ async fn stream(state: AppState, fence: Fence, mut socket: WebSocket) {
                     let frame = Frame::Fenced {
                         reason: format!("subscription no longer owns this seat: {error:?}"),
                     };
-                    let _ = send(&mut socket, &frame).await;
-                    let _ = socket.close().await;
+                    finish_fenced(&mut socket, &frame).await;
                     return;
                 }
             };
@@ -161,13 +165,31 @@ async fn stream(state: AppState, fence: Fence, mut socket: WebSocket) {
             },
             _ = heartbeat.tick() => {
                 if state.store.check_mailbox(&fence).is_err() {
-                    let _ = send(&mut socket, &Frame::Fenced { reason: "subscription replaced".into() }).await;
+                    finish_fenced(&mut socket, &Frame::Fenced { reason: "subscription replaced".into() }).await;
                     return;
                 }
                 if socket.send(WsMessage::Ping(Vec::new().into())).await.is_err() { return; }
             },
         }
     }
+}
+
+async fn finish_fenced(socket: &mut WebSocket, frame: &Frame) {
+    if send(socket, frame).await.is_err() {
+        return;
+    }
+    // Keep the read side alive through the close handshake: the peer may still be
+    // answering an already queued heartbeat before it sees the fencing frame.
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        socket.send(WsMessage::Close(None)).await?;
+        while let Some(message) = socket.recv().await {
+            if matches!(message, Ok(WsMessage::Close(_)) | Err(_)) {
+                break;
+            }
+        }
+        Ok::<(), axum::Error>(())
+    })
+    .await;
 }
 
 async fn send(socket: &mut WebSocket, frame: &Frame) -> anyhow::Result<()> {
@@ -248,6 +270,11 @@ mod tests {
                                     && injection.swap(false, std::sync::atomic::Ordering::SeqCst);
                                 let response = next.run(request).await;
                                 if lost {
+                                    if !response.status().is_success() {
+                                        let status = response.status();
+                                        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                                        panic!("receipt must commit before losing its response: {status} {}", String::from_utf8_lossy(&body));
+                                    }
                                     Response::new(axum::body::Body::empty())
                                 } else {
                                     response
@@ -337,11 +364,26 @@ mod tests {
                 state.store.message(&send.subject).unwrap().unwrap().status,
                 "read"
             );
-            let settled = Receipt { fence:fence.clone(),message:send.subject.clone(),lifecycle:"delivered".into() };
+            let settled = Receipt {
+                fence: fence.clone(),
+                message: send.subject.clone(),
+                lifecycle: "delivered".into(),
+            };
             let _: ClaimRecord = client.post("/v1/mailbox/receipts", &settled).await.unwrap();
-            assert_eq!(state.store.claims_for(&send.subject, Some("message.delivered")).unwrap().len(), 1);
+            assert_eq!(
+                state
+                    .store
+                    .claims_for(&send.subject, Some("message.delivered"))
+                    .unwrap()
+                    .len(),
+                1
+            );
             let predecessor = tokio::spawn(async move {
-                loop { if matches!(next(&mut socket).await, Frame::Fenced { .. }) { break; } }
+                loop {
+                    if matches!(next(&mut socket).await, Frame::Fenced { .. }) {
+                        break;
+                    }
+                }
             });
             tokio::task::yield_now().await;
             let replacement = Fence {
