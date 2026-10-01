@@ -54,7 +54,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_mailbox_bindings` | Local | Stable binding request tokens mapped to daemon-allocated epochs. Lost acknowledgements retry the same binding; retired tokens cannot allocate a successor. Excluded from replicated projection digests. |
 | `local_observations` | Local | Local-retention observations and their local frontier/id; never replicated. |
 | `local_subscription_mission_deferrals` | Local | Local reconciler capacity backoff/retry scheduling. |
-| `local_usage_totals` | Local | Local provider usage accumulation before publication. |
+| `local_usage_spend` | Local | Local provider usage and cost accumulation before publication. |
 | `local_usage_seen` | Local | Local usage-input deduplication. |
 | `local_latest_slots` | Local | Local latest-retention publication slots and pending local observation pointers. |
 | `revision_proposals` | Shared projection | Shared candidate/source generation, reviewers/approvals, cutover/compatibility, status/preview/successor and durable timestamps. |
