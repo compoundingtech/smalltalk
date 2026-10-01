@@ -489,6 +489,111 @@ async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() 
 }
 
 #[tokio::test]
+async fn attention_socket_evicts_completed_sources_and_reconnects_without_cached_cards() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("client.sock");
+    let state = test_state(root.path());
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        state.store.origin(),
+    )
+    .unwrap();
+    state
+        .store
+        .apply_internal(&intent, "socket-person-asker")
+        .unwrap();
+    let ask = state
+        .store
+        .ask_person(&st3::model::PersonAskRequest {
+            legacy_request: None,
+            person: "person/avery".into(),
+            title: "Choose date".into(),
+            reason: "Release needs a date".into(),
+            actor: format!("agent/{}.asker", state.store.origin()),
+            step: None,
+            new_run: Some("choose-date".into()),
+            incarnation: None,
+            idempotency_key: "socket-ask".into(),
+        })
+        .unwrap();
+    let server_state = state.clone();
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(server_state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let client = st3_client::Client::unix(&socket);
+    let mut stream = client.collection_stream().await.unwrap();
+    stream
+        .subscribe("attention", "attention", 20, None, None)
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let card = first["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["source_id"] == ask.subject)
+        .unwrap();
+    let card_id = card["id"].clone();
+    let revision = card["revision"].clone();
+    let app = st3::api::router(state.clone());
+    let action = serde_json::json!({"api_version":"st3.client.v0", "id":"action/socket-done", "type":"work.done",
+        "idempotency_key":"socket-done-00000001", "fence":{"snapshot_id":first["snapshot"]["id"], "subject_revisions":{(card_id.as_str().unwrap()):revision}},
+        "parameters":{"target_id":ask.subject, "episode":card["episode"], "summary":"Friday", "evidence":[]}});
+    let (status, response) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "person/avery",
+        action.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let change = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(change["kind"], "changes");
+    assert!(
+        change["removes"].as_array().unwrap().contains(&card_id),
+        "{change}"
+    );
+    let mut stale = action;
+    stale["id"] = "action/stale-done".into();
+    stale["idempotency_key"] = "stale-done-00000001".into();
+    let (status, response) =
+        client_post_json_person(app, "/v1/client/actions", "person/avery", stale).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(response["code"], "stale-fence");
+    stream.close().await;
+    let mut replacement = client.collection_stream().await.unwrap();
+    replacement
+        .subscribe("attention", "attention", 20, None, None)
+        .await
+        .unwrap();
+    let fresh = tokio::time::timeout(std::time::Duration::from_secs(5), replacement.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh["kind"], "snapshot");
+    assert!(fresh["items"].as_array().unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
 async fn missions_first_page_stays_under_100ms_with_thousands_of_definitions() {
     let root = tempfile::tempdir().unwrap();
     let db = root.path().join("large.sqlite");
@@ -1085,25 +1190,31 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
     std::fs::create_dir(&workspace).unwrap();
     let state = test_state(root.path());
     let store = state.store.clone();
-    for (subject, reviewer) in [
-        ("attention/ada-paired", "person/ada"),
-        ("attention/alex-paired", "person/alex"),
-    ] {
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        store.origin(),
+    )
+    .unwrap();
+    store
+        .apply_internal(&intent, "paired-person-asker")
+        .unwrap();
+    let ask = |person: &str| {
         store
-            .request_attention(
-                subject,
-                &st3::model::AttentionRequest {
-                    reviewer: reviewer.into(),
-                    title: format!("Attention for {reviewer}"),
-                    reason: "Paired authority conformance".into(),
-                    severity: "error".into(),
-                    targets: vec!["mission/paired-proof".into()],
-                    actor: "daemon/runtime".into(),
-                    idempotency_key: format!("paired-{subject}"),
-                },
-            )
-            .unwrap();
-    }
+            .ask_person(&st3::model::PersonAskRequest {
+                legacy_request: None,
+                person: person.into(),
+                title: format!("Decision for {person}"),
+                reason: "Reply with the release date.".into(),
+                actor: format!("agent/{}.asker", store.origin()),
+                step: None,
+                new_run: Some(person.into()),
+                incarnation: None,
+                idempotency_key: format!("paired-{person}"),
+            })
+            .unwrap()
+    };
+    let ada_step = ask("person/ada");
+    let alex_step = ask("person/alex");
     let local = st3::api::router(state.clone());
     let fabric = st3::api::fabric_router(state.clone());
 
@@ -1148,7 +1259,8 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
             .as_str()
             .unwrap()
     };
-    assert_eq!(capability_state("attention.resolve"), "granted");
+    assert_eq!(capability_state("attention.resolve"), "unavailable");
+    assert_eq!(capability_state("work.done"), "granted");
     assert_eq!(capability_state("review.approve"), "granted");
     assert_eq!(capability_state("mission.cancel-revision"), "ungranted");
     assert_eq!(capability_state("launch.create"), "granted");
@@ -1162,22 +1274,22 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|item| item["id"] == id)
+            .find(|item| item["source_id"] == id)
             .unwrap()
     };
-    let ada = item("attention/ada-paired");
-    assert_eq!(ada["attention_kind"], "fault");
-    assert_eq!(ada["source_id"], "attention/ada-paired");
+    let ada = item(&ada_step.subject);
+    assert_eq!(ada["attention_kind"], "person-step");
+    assert_eq!(ada["source_id"], ada_step.subject);
     assert_eq!(ada["person_id"], "person/ada");
-    assert_eq!(ada["actions"], serde_json::json!(["attention.resolve"]));
+    assert_eq!(ada["actions"], serde_json::json!(["work.done"]));
     let resolve = serde_json::json!({
         "api_version": "st3.client.v0", "id": "action/paired-attention-ada",
-        "type": "attention.resolve", "idempotency_key": "paired-attention-ada-0001",
+        "type": "work.done", "idempotency_key": "paired-attention-ada-0001",
         "fence": {
             "snapshot_id": attention["snapshot"]["id"],
-            "subject_revisions": { "attention/ada-paired": ada["revision"] }
+            "subject_revisions": { (ada["id"].as_str().unwrap()): ada["revision"] }
         },
-        "parameters": { "attention_id": "attention/ada-paired", "outcome": "resolved" }
+        "parameters": { "target_id": ada_step.subject, "summary": "Friday", "episode": ada["episode"] }
     });
     let (status, resolved) =
         client_post_json_auth(fabric.clone(), "/v1/client/actions", credential, resolve).await;
@@ -1189,7 +1301,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|item| item["id"] != "attention/alex-paired")
+            .all(|item| item["source_id"] != alex_step.subject)
     );
     let (status, cross_person_read) = client_json_auth(
         fabric.clone(),
@@ -1199,7 +1311,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{cross_person_read}");
     let alex_revision = store
-        .claims_for("attention/alex-paired", None)
+        .claims_for(&alex_step.subject, None)
         .unwrap()
         .last()
         .unwrap()
@@ -1207,28 +1319,25 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
         .clone();
     let cross_attention = serde_json::json!({
         "api_version": "st3.client.v0", "id": "action/paired-attention-alex",
-        "type": "attention.resolve", "idempotency_key": "paired-attention-alex-000001",
+        "type": "work.done", "idempotency_key": "paired-attention-alex-000001",
         "fence": {
             "snapshot_id": attention["snapshot"]["id"],
-            "subject_revisions": { "attention/alex-paired": alex_revision }
+            "subject_revisions": { (alex_step.subject.clone()): alex_revision }
         },
-        "parameters": { "attention_id": "attention/alex-paired", "outcome": "resolved" }
+        "parameters": { "target_id": alex_step.subject, "summary": "Friday", "episode": alex_revision }
     });
-    // The credential cannot read another person's queue, but any person can close any
-    // item. The close is recorded as the credential's own person.
-    let (status, closed) = client_post_json_auth(
+    let (status, denied) = client_post_json_auth(
         fabric.clone(),
         "/v1/client/actions",
         credential,
         cross_attention,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{closed}");
-    let resolution = store
-        .latest_claim("attention/alex-paired", Some("attention.resolved"))
-        .unwrap()
-        .expect("the item was closed");
-    assert_eq!(resolution.actor.as_deref(), Some("person/ada"));
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert_eq!(
+        store.step_run(&alex_step.subject).unwrap().unwrap().status,
+        "ready"
+    );
 
     let (_, current) =
         client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;
@@ -1659,6 +1768,188 @@ mission "client-action-demo" state="ready" {
 }
 
 #[tokio::test]
+async fn mission_cancel_agent_authority_is_path_scoped_current_and_generation_fenced() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let source = r#"version 2
+agent "example/operator" { workspace "."; command "true"; mission-authority { cancel "example/jobs/*" } }
+agent "example/publisher" { workspace "."; command "true"; mission-authority { publish "example/jobs/*" } }
+agent "fleet/fixture-cancel/standing/operator" { workspace "."; command "true" }
+mission "example/jobs/one" state="ready" { concurrent-runs; goal "Wait for cancellation."; step "wait" { agentless } }
+mission "example/other/one" state="ready" { goal "Stay outside the cancel grant."; step "wait" { agentless } }
+"#;
+    let intent = st3::graph::parse_intent(source, store.origin()).unwrap();
+    let preview = store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply_as(
+            &intent,
+            &preview.subject_tokens,
+            "cancel-authority-source",
+            Some("person/operator"),
+        )
+        .unwrap();
+    let start = |mission: &str, key: &str| {
+        store
+            .create_mission_run(&st3::model::MissionRunRequest {
+                mission: mission.into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: Some("run".into()),
+                inputs: Default::default(),
+                idempotency_key: key.into(),
+            })
+            .unwrap()
+    };
+    let granted = start("example/jobs/one", "cancel-granted-run");
+    let outside = start("example/other/one", "cancel-outside-run");
+    let app = st3::api::router(state.clone());
+    let (_, capabilities) = client_json_person(
+        app.clone(),
+        "/v1/client/capabilities",
+        "agent/example/operator",
+    )
+    .await;
+    let capability_state = |id: &str| {
+        capabilities["value"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capability| capability["id"] == id)
+            .unwrap()["state"]
+            .as_str()
+            .unwrap()
+    };
+    assert_eq!(capability_state("mission.cancel"), "granted");
+    assert_eq!(capability_state("mission.start"), "ungranted");
+    assert_eq!(capability_state("mission.approve-revision"), "ungranted");
+    let cancel = |run: &st3::model::MissionRunView,
+                  generation: &str,
+                  snapshot: &Value,
+                  key: &str| {
+        serde_json::json!({
+            "api_version": "st3.client.v0", "id": format!("action/{key}"), "type": "mission.cancel", "idempotency_key": format!("cancel-authority-{key}"),
+            "fence": { "snapshot_id": snapshot["snapshot"]["id"], "mission_generation": generation },
+            "parameters": { "target_id": run.subject, "reason": "The work was superseded." }
+        })
+    };
+    for (actor, run, code) in [
+        (
+            "agent/example/publisher",
+            &granted,
+            "mission-authority-denied",
+        ),
+        (
+            "agent/example/undeclared",
+            &granted,
+            "missing-agent-mission-authority",
+        ),
+        (
+            "agent/example/operator",
+            &outside,
+            "mission-authority-denied",
+        ),
+        (
+            "agent/fleet/fixture-cancel/standing/operator",
+            &granted,
+            "mission-authority-denied",
+        ),
+    ] {
+        let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+        let (status, body) = client_post_json_person(
+            app.clone(),
+            "/v1/client/actions",
+            actor,
+            cancel(run, &run.generation, &snapshot, actor),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{actor}: {body}");
+        assert_eq!(body["code"], "forbidden", "{actor} ({code}): {body}");
+        assert_eq!(
+            store.mission_run(&run.subject).unwrap().unwrap().phase,
+            run.phase
+        );
+    }
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let (status, body) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "agent/example/operator",
+        cancel(&granted, "run-generation/stale", &snapshot, "stale"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let request = cancel(&granted, &granted.generation, &snapshot, "allowed");
+    let (status, body) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "agent/example/operator",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        store.mission_run(&granted.subject).unwrap().unwrap().phase,
+        "cleanup-cancelled"
+    );
+    let (status, repeated) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "agent/example/operator",
+        request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(body["affected_ids"], repeated["affected_ids"]);
+    // The new transport scope permits cancellation only; it does not grant other mission actions.
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let (status, body) = client_post_json_person(app.clone(), "/v1/client/actions", "agent/example/operator", serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/cancel-cannot-start", "type": "mission.start", "idempotency_key": "cancel-authority-cannot-start",
+        "fence": { "snapshot_id": snapshot["snapshot"]["id"] },
+        "parameters": { "mission_id": "example/jobs/one", "workspace": root.path().display().to_string(), "inputs": {} }
+    })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let later = start("example/jobs/one", "cancel-after-revoke");
+    let revoked = st3::graph::parse_intent(
+        "version 2\nagent \"example/operator\" { workspace \".\"; command \"true\" }\n",
+        store.origin(),
+    )
+    .unwrap();
+    store
+        .apply_internal(&revoked, "revoke-cancel-authority")
+        .unwrap();
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let (status, body) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "agent/example/operator",
+        cancel(&later, &later.generation, &snapshot, "revoked"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "forbidden");
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let (status, body) = client_post_json_person(
+        app,
+        "/v1/client/actions",
+        "person/operator",
+        cancel(&outside, &outside.generation, &snapshot, "person"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn launch_revise_and_cancel_are_revision_fenced() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());
@@ -1998,11 +2289,12 @@ async fn step_states_in_every_client_projection_belong_to_the_contract() {
 }
 
 #[tokio::test]
-async fn client_work_projection_exposes_external_blocker_and_reopens_after_resolution() {
+async fn client_work_projection_waits_for_person_and_resumes_after_response() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());
     let source = r#"
 version 2
+agent "ios-owner" { workspace "/tmp"; command "true" }
 mission "ios-proof" state="ready" {
   goal "Run the physical simulator proof."
   step "automated-proof" { assigned-to "agent/ios-owner" }
@@ -2049,31 +2341,20 @@ mission "ios-proof" state="ready" {
         .store
         .work_action(&subject, "claim", &request("client-blocker-claim", None))
         .unwrap();
-    let attention = state
+    let ask = state
         .store
-        .request_attention(
-            "attention/client-example-mac-xcode",
-            &st3::model::AttentionRequest {
-                reviewer: "person/alex".into(),
-                title: "ExampleMac needs its Xcode simulator components updated".into(),
-                reason: "CoreSimulator is unavailable.".into(),
-                severity: "error".into(),
-                targets: vec!["host/example-mac".into(), subject.clone()],
-                actor: "agent/client-v0-baseline.ios-owner".into(),
-                idempotency_key: "client-example-mac-xcode".into(),
-            },
-        )
+        .ask_person(&st3::model::PersonAskRequest {
+            legacy_request: None,
+            person: "person/alex".into(),
+            title: "Repair simulator components".into(),
+            reason: "Repair before automated proof.".into(),
+            actor: "agent/client-v0-baseline.ios-owner".into(),
+            step: Some(subject.clone()),
+            new_run: None,
+            incarnation: Some("ios-owner-one".into()),
+            idempotency_key: "client-simulator-question".into(),
+        })
         .unwrap();
-    let reason = "ExampleMac requires a privileged Xcode first-launch repair.";
-    state
-        .store
-        .work_action(
-            &subject,
-            "release",
-            &request("client-blocker-release", Some(reason)),
-        )
-        .unwrap();
-
     let app = st3::api::router(state.clone());
     let (status, response) = client_json(app.clone(), "/v1/client/work").await;
     assert_eq!(status, StatusCode::OK, "{response}");
@@ -2083,27 +2364,22 @@ mission "ios-proof" state="ready" {
         .iter()
         .find(|item| item["id"] == subject)
         .unwrap();
-    assert_eq!(item["state"], "blocked");
-    assert_eq!(item["blocked_reason"], reason);
-    assert_eq!(item["blockers"], serde_json::json!([attention.subject]));
+    assert_eq!(item["state"], "waiting-person");
+    assert_eq!(item["blocked_reason"], ask.subject);
+    assert_eq!(item["blockers"], serde_json::json!([ask.subject]));
     assert_eq!(item["operational"]["actionable"], false);
-    assert!(
-        item["operational"]["reasons"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::String("external-blocker".into()))
-    );
-
     state
         .store
-        .resolve_attention(
-            "attention/client-example-mac-xcode",
-            &st3::model::AttentionResolveRequest {
-                outcome: "resolved".into(),
-                reason: Some("The simulator runtime is available.".into()),
+        .finish_person_step(
+            &st3::model::PersonStepResponse {
+                subject: ask.subject,
                 actor: "person/alex".into(),
-                idempotency_key: "client-example-mac-resolved".into(),
+                summary: "Simulator repaired".into(),
+                evidence: vec![],
+                episode: None,
+                idempotency_key: "client-simulator-response".into(),
             },
+            false,
         )
         .unwrap();
     let (_, response) = client_json(app, "/v1/client/work").await;
@@ -2558,4 +2834,70 @@ mission "example/merge-train" state="ready" {
 
     let (status, absent) = client_json(app, "/v1/client/lanes/lane/absent/app").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{absent}");
+}
+
+#[tokio::test]
+async fn native_agent_person_asks_use_source_authority_and_reject_malformed_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        state.store.origin(),
+    )
+    .unwrap();
+    state
+        .store
+        .apply_internal(&intent, "native-person-asker")
+        .unwrap();
+    let actor = format!("agent/{}.asker", state.store.origin());
+    let app = st3::api::router(state.clone());
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/attention").await;
+    let ask = serde_json::json!({"api_version":"st3.client.v0", "id":"action/native-ask", "type":"work.ask",
+        "idempotency_key":"native-ask-00000001", "fence":{"snapshot_id":snapshot["snapshot"]["id"]}, "parameters":{"person_id":"person/avery",
+        "title":"Choose date", "reason":"Release needs a date", "new_run":"release-date"}});
+    let (status, response) =
+        client_post_json_person(app.clone(), "/v1/client/actions", &actor, ask.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (status, repeated) =
+        client_post_json_person(app.clone(), "/v1/client/actions", &actor, ask).await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(response["affected_ids"], repeated["affected_ids"]);
+    let card = state
+        .store
+        .attention_items(Some("person/avery"))
+        .unwrap()
+        .pop()
+        .unwrap();
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/attention").await;
+    let done = serde_json::json!({"api_version":"st3.client.v0", "id":"action/native-done", "type":"work.done",
+        "idempotency_key":"native-done-00000001", "fence":{"snapshot_id":snapshot["snapshot"]["id"]}, "parameters":{"target_id":card.subject,
+        "episode":card.episode, "summary":"Friday", "evidence":[17]}});
+    let (status, rejected) =
+        client_post_json_person(app.clone(), "/v1/client/actions", "person/avery", done).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+    assert_eq!(
+        state.store.step_run(&card.subject).unwrap().unwrap().status,
+        "ready"
+    );
+    let cancel = serde_json::json!({"api_version":"st3.client.v0", "id":"action/native-cancel", "type":"work.cancel-ask",
+        "idempotency_key":"native-cancel-00000001", "fence":{"snapshot_id":snapshot["snapshot"]["id"]}, "parameters":{"target_id":card.subject,
+        "episode":card.episode, "summary":"The release was withdrawn", "evidence":[]}});
+    let (status, rejected) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "person/robin",
+        cancel.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{rejected}");
+    let (status, response) =
+        client_post_json_person(app, "/v1/client/actions", &actor, cancel).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(
+        state
+            .store
+            .attention_items(Some("person/avery"))
+            .unwrap()
+            .is_empty()
+    );
 }

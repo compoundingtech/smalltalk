@@ -145,6 +145,14 @@ pub(crate) fn runtime_proof_variables(
     variables
 }
 
+/// Authority kinds carried by one agent declaration.
+pub type AgentAuthorityGrants = (
+    crate::model::MissionAuthority,
+    crate::model::QueueAuthority,
+    crate::model::SeatAuthority,
+    crate::model::AgentAuthority,
+);
+
 /// The authority granted to agents declared inside a mission, in its own declarations, its
 /// steps' declarations, or any nested mission, keyed by the agent subject of a proof run. Only a
 /// person grants authority, so an agent may not publish or revise a mission whose grants exceed
@@ -152,28 +160,11 @@ pub(crate) fn runtime_proof_variables(
 pub fn mission_declared_authority_grants(
     mission: &crate::model::MissionSpec,
     default_host: &str,
-) -> Result<
-    BTreeMap<
-        String,
-        (
-            crate::model::MissionAuthority,
-            crate::model::QueueAuthority,
-            crate::model::SeatAuthority,
-        ),
-    >,
-    St3Error,
-> {
+) -> Result<BTreeMap<String, AgentAuthorityGrants>, St3Error> {
     fn visit(
         mission: &crate::model::MissionSpec,
         default_host: &str,
-        grants: &mut BTreeMap<
-            String,
-            (
-                crate::model::MissionAuthority,
-                crate::model::QueueAuthority,
-                crate::model::SeatAuthority,
-            ),
-        >,
+        grants: &mut BTreeMap<String, AgentAuthorityGrants>,
     ) -> Result<(), St3Error> {
         let variables = runtime_proof_variables(mission);
         let sources = mission.declarations_kdl.iter().chain(
@@ -193,6 +184,7 @@ pub fn mission_declared_authority_grants(
                             agent_mission_authority(&desired.desired),
                             agent_queue_authority(&desired.desired),
                             agent_seat_authority(&desired.desired),
+                            agent_declaration_authority(&desired.desired),
                         ),
                     );
                 }
@@ -272,7 +264,7 @@ fn parse_intent_with_owner(
     let mut document: KdlDocument = source
         .parse::<KdlDocument>()
         .map_err(|error| St3Error::new("invalid-kdl", error.to_string()))?;
-    st2::kdl_version::ensure_st3_version(&document)
+    st_drivers::kdl_version::ensure_st3_version(&document)
         .map_err(|error| St3Error::new("unsupported-kdl-version", error.to_string()))?;
     let mut deprecated_syntax = BTreeSet::new();
     canonicalize_terminal_declarations(&mut document, &mut deprecated_syntax);
@@ -2128,7 +2120,7 @@ fn driver_member(
         // native channel. `dev-channels #true` is retained only so declarations written before
         // the channel became intrinsic continue to parse; opting out would create an agent that
         // cannot receive graph messages, so false is rejected below.
-        provider.extend(["--channels".into(), st2::claude_channel::ST3_CHANNEL.into()]);
+        provider.extend(["--channels".into(), st_drivers::claude_channel::ST3_CHANNEL.into()]);
         // The channel wakes the real TUI, while Claude's own lifecycle hooks externalize the
         // resulting turn. Supplying the canonical registration as an additional native settings
         // source keeps arbitrary user workspaces untouched and gives every typed st seat the
@@ -2393,6 +2385,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "mission-authority",
         "queue-authority",
         "seat-authority",
+        "agent-authority",
         "pty",
         "exec",
     ];
@@ -2428,6 +2421,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "mission-authority",
         "queue-authority",
         "seat-authority",
+        "agent-authority",
     ] {
         unique_child(document, child)?;
     }
@@ -2438,7 +2432,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
             authority,
             AuthorityBlock {
                 name: "mission-authority",
-                verbs: &["publish", "start", "revise"],
+                verbs: &["publish", "start", "revise", "cancel"],
                 empty: "empty-mission-authority",
                 duplicate: "duplicate-mission-authority",
                 pattern: validate_mission_authority_pattern,
@@ -2468,6 +2462,19 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
                 empty: "empty-seat-authority",
                 duplicate: "duplicate-seat-authority",
                 pattern: validate_queue_authority_pattern,
+            },
+            owner,
+        )?;
+    }
+    if let Some(authority) = unique_child(document, "agent-authority")? {
+        validate_authority_block(
+            authority,
+            AuthorityBlock {
+                name: "agent-authority",
+                verbs: &["apply"],
+                empty: "empty-agent-authority",
+                duplicate: "duplicate-agent-authority",
+                pattern: validate_agent_authority_pattern,
             },
             owner,
         )?;
@@ -2609,6 +2616,13 @@ fn validate_queue_authority_pattern(pattern: &str) -> Result<(), St3Error> {
     validate_name(seat, false).map_err(|_| invalid())
 }
 
+fn validate_agent_authority_pattern(pattern: &str) -> Result<(), St3Error> {
+    validate_queue_authority_pattern(pattern).map_err(|_| St3Error::new(
+        "invalid-agent-authority-pattern",
+        "agent authority needs an exact agent identity or a terminal `/*` namespace, without `agent/`",
+    ))
+}
+
 /// Whether `mission-authority "none"` withholds all mission authority, including the default
 /// of a top-level project seat. Any other value is refused; a block of rules is not a value.
 fn declares_no_mission_authority(authority: &KdlNode) -> Result<bool, St3Error> {
@@ -2673,7 +2687,7 @@ fn validate_authority_block(
 }
 
 /// The `VERB "PATTERN"` rules of one authority block in a desired agent declaration.
-fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str)> {
+pub(crate) fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str)> {
     let Some(children) = desired.get("children").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -2702,7 +2716,12 @@ fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str
 
 /// Whether a desired agent declaration grants authority.
 pub fn declares_authority(desired: &Value) -> bool {
-    ["mission-authority", "queue-authority", "seat-authority"]
+    [
+        "mission-authority",
+        "queue-authority",
+        "seat-authority",
+        "agent-authority",
+    ]
         .iter()
         .any(|block| !authority_rules(desired, block).is_empty())
 }
@@ -2714,6 +2733,7 @@ pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthorit
             "publish" => authority.publish.push(pattern.to_owned()),
             "start" => authority.start.push(pattern.to_owned()),
             "revise" => authority.revise.push(pattern.to_owned()),
+            "cancel" => authority.cancel.push(pattern.to_owned()),
             _ => {}
         }
     }
@@ -2768,6 +2788,7 @@ pub fn effective_agent_mission_authority(
                     publish: namespace.clone(),
                     start: namespace.clone(),
                     revise: namespace,
+                    cancel: Vec::new(),
                 },
             }
         }
@@ -2795,6 +2816,16 @@ pub fn agent_seat_authority(desired: &Value) -> crate::model::SeatAuthority {
         }
     }
     authority
+}
+
+pub fn agent_declaration_authority(desired: &Value) -> crate::model::AgentAuthority {
+    crate::model::AgentAuthority {
+        apply: authority_rules(desired, "agent-authority")
+            .into_iter()
+            .filter(|(verb, _)| *verb == "apply")
+            .map(|(_, pattern)| pattern.to_owned())
+            .collect(),
+    }
 }
 
 fn validate_task_body(
@@ -4245,6 +4276,105 @@ fn insert_subject(context: &mut ParseContext, subject: DesiredSubject) -> Result
     Ok(())
 }
 
+/// Render a normalized desired tree rather than the original authored source.
+pub fn render_agent_desired_kdl(desired: &Value) -> Result<String, St3Error> {
+    if desired.get("name").and_then(Value::as_str) != Some("agent") {
+        return Err(St3Error::new(
+            "invalid-declaration",
+            "expected an agent root",
+        ));
+    }
+    let mut document = KdlDocument::new();
+    let mut version = KdlNode::new("version");
+    version.entries_mut().push(kdl::KdlEntry::new(2_i128));
+    document.nodes_mut().push(version);
+    document.nodes_mut().push(render_desired_node(desired)?);
+    document.autoformat();
+    Ok(document.to_string())
+}
+
+/// Preserve environment names while hiding values in a declaration read.
+pub fn redact_agent_env_values(tree: &mut Value) {
+    let is_env = tree.get("name").and_then(Value::as_str) == Some("env");
+    if let Some(children) = tree.get_mut("children").and_then(Value::as_array_mut) {
+        for child in children {
+            if is_env {
+                if let Some(arguments) = child.get_mut("arguments").and_then(Value::as_array_mut) {
+                    for value in arguments {
+                        *value = Value::String("<redacted>".into());
+                    }
+                }
+                if let Some(properties) = child.get_mut("properties").and_then(Value::as_object_mut)
+                {
+                    for value in properties.values_mut() {
+                        *value = Value::String("<redacted>".into());
+                    }
+                }
+            } else {
+                redact_agent_env_values(child);
+            }
+        }
+    }
+}
+
+fn render_desired_node(tree: &Value) -> Result<KdlNode, St3Error> {
+    let invalid = || St3Error::new("invalid-declaration", "malformed desired KDL node tree");
+    let object = tree.as_object().ok_or_else(invalid)?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let mut node = KdlNode::new(name);
+    if let Some(arguments) = object.get("arguments") {
+        for value in arguments.as_array().ok_or_else(invalid)? {
+            node.entries_mut()
+                .push(kdl::KdlEntry::new(render_desired_value(value)?));
+        }
+    }
+    if let Some(properties) = object.get("properties") {
+        for (name, value) in properties.as_object().ok_or_else(invalid)? {
+            node.entries_mut().push(kdl::KdlEntry::new_prop(
+                name.as_str(),
+                render_desired_value(value)?,
+            ));
+        }
+    }
+    if let Some(children) = object.get("children") {
+        let mut document = KdlDocument::new();
+        for child in children.as_array().ok_or_else(invalid)? {
+            document.nodes_mut().push(render_desired_node(child)?);
+        }
+        if !document.nodes().is_empty() {
+            node.set_children(document);
+        }
+    }
+    Ok(node)
+}
+
+fn render_desired_value(value: &Value) -> Result<KdlValue, St3Error> {
+    match value {
+        Value::Null => Ok(KdlValue::Null),
+        Value::Bool(value) => Ok(KdlValue::Bool(*value)),
+        Value::String(value) => Ok(KdlValue::String(value.clone())),
+        Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Ok(KdlValue::Integer(integer.into()))
+            } else if let Some(float) = value.as_f64() {
+                Ok(KdlValue::Float(float))
+            } else {
+                Err(St3Error::new(
+                    "invalid-declaration",
+                    "desired KDL number is outside the supported range",
+                ))
+            }
+        }
+        _ => Err(St3Error::new(
+            "invalid-declaration",
+            "desired KDL entries must be scalar",
+        )),
+    }
+}
+
 fn canonical_node(node: &KdlNode) -> Result<Value, St3Error> {
     let mut properties = BTreeMap::<String, Value>::new();
     let mut arguments = Vec::new();
@@ -4720,6 +4850,37 @@ fn valid_field_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_agent_tree_round_trips_through_canonical_kdl() {
+        for source in [
+            r#"version 2
+agent "dotfiles/steward" {
+    host "dev3"
+    workspace "/srv/work"
+    env { TOKEN "private"; MODE "ready" }
+    harness "omp" {
+        model "openai-codex/gpt-6-sol"
+        args "--foo" "--bar"
+    }
+}"#,
+            "version 2\nagent \"fleet/cos/standing/cos\" { command \"true\" }",
+        ] {
+            let parsed = parse_intent(source, "node").unwrap();
+            let (subject, desired) = parsed
+                .subjects
+                .iter()
+                .find(|(_, desired)| desired.kind == "agent")
+                .unwrap();
+            let rendered = render_agent_desired_kdl(&desired.desired).unwrap();
+            let reparsed = parse_intent(&rendered, "node").unwrap();
+            assert_eq!(reparsed.subjects[subject].desired, desired.desired);
+            assert_eq!(
+                render_agent_desired_kdl(&reparsed.subjects[subject].desired).unwrap(),
+                rendered
+            );
+        }
+    }
 
     #[test]
     fn an_agent_checkout_needs_a_workspace_and_git_ref_names() {
@@ -5206,7 +5367,7 @@ version 2
         assert!(argv.iter().any(|arg| arg == "claude"));
         assert!(
             argv.windows(2)
-                .any(|pair| pair == ["--channels", st2::claude_channel::ST3_CHANNEL])
+                .any(|pair| pair == ["--channels", st_drivers::claude_channel::ST3_CHANNEL])
         );
         let settings = argv
             .windows(2)

@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 
 /// Each file in the set, by name. The pi and omp channel extensions are the same assets st2
 /// embeds, so the library's pi-family launcher finds its exact extension here.
-pub const FILES: [(&str, &[u8]); 10] = [
+pub const FILES: [(&str, &[u8]); 4] = [
     (
         "claude-observe.sh",
         include_bytes!("../hooks/claude-observe.sh"),
@@ -26,38 +26,17 @@ pub const FILES: [(&str, &[u8]); 10] = [
         include_bytes!("../hooks/claude-statusline.sh"),
     ),
     (
-        "claude-session-start.sh",
-        include_bytes!("../hooks/claude-session-start.sh"),
-    ),
-    (
-        "claude-pre-compact.sh",
-        include_bytes!("../hooks/claude-pre-compact.sh"),
-    ),
-    (
-        "claude-stop-failure.sh",
-        include_bytes!("../hooks/claude-stop-failure.sh"),
-    ),
-    (
-        "codex-session-start.sh",
-        include_bytes!("../hooks/codex-session-start.sh"),
-    ),
-    (
-        "codex-pre-compact.sh",
-        include_bytes!("../hooks/codex-pre-compact.sh"),
-    ),
-    ("codex-stop.sh", include_bytes!("../hooks/codex-stop.sh")),
-    (
         "pi-channel.ts",
-        include_bytes!("../../../hooks/pi-channel.ts"),
+        include_bytes!("../../st-drivers/hooks/pi-channel.ts"),
     ),
     (
         "omp-channel.ts",
-        include_bytes!("../../../hooks/omp-channel.ts"),
+        include_bytes!("../../st-drivers/hooks/omp-channel.ts"),
     ),
 ];
 
 /// The file that makes a directory an st3 hook set. st2 skips an `$ST_HOOKS` that holds it.
-pub const MANIFEST: &str = st2::hooks::ST3_SET_MARKER;
+pub const MANIFEST: &str = st_drivers::hooks::ST3_SET_MARKER;
 const SETS_DIR: &str = "sets";
 
 fn sha256(bytes: &[u8]) -> String {
@@ -92,6 +71,29 @@ pub fn root(state_dir: &Path) -> PathBuf {
 /// This binary's set directory beneath `root`. Resolving it changes nothing.
 pub fn set_dir(root: &Path) -> PathBuf {
     root.join(SETS_DIR).join(set_id())
+}
+
+/// Whether an older immutable set contains this hook. Running harnesses retain `ST_HOOKS`
+/// across binary replacement; only their already-published scripts may use retired aliases.
+pub(crate) fn older_set_contains_hook(dir: &Path, name: &str) -> bool {
+    let Ok(bytes) = fs::read(dir.join(MANIFEST)) else {
+        return false;
+    };
+    let identity = format!("sha256-{}", sha256(&bytes));
+    if identity == set_id() || dir.file_name().and_then(|part| part.to_str()) != Some(&identity) {
+        return false;
+    }
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    if manifest["schema"] != 1 || manifest["owner"] != "st3" {
+        return false;
+    }
+    let file = format!("{name}.sh");
+    let Ok(script) = fs::read(dir.join(&file)) else {
+        return false;
+    };
+    manifest["files"][&file].as_str() == Some(&format!("sha256:{}", sha256(&script)))
 }
 
 /// Check that `dir` holds this binary's exact, executable set.
@@ -289,7 +291,7 @@ mod tests {
     fn st2_does_not_mistake_an_st3_set_for_its_hook_root() {
         let root = tempfile::tempdir().unwrap();
         let set = ensure_installed(root.path()).unwrap();
-        assert!(set.join(st2::hooks::ST3_SET_MARKER).is_file());
+        assert!(set.join(st_drivers::hooks::ST3_SET_MARKER).is_file());
         assert!(!set.join("manifest.json").exists());
     }
 
@@ -322,7 +324,7 @@ mod tests {
         assert!(mentions_st2_surface(
             "/home/example/.local/state/st2/hooks/sets/x"
         ));
-        assert!(!mentions_st2_surface("ST2_CLAUDE_SESSION=abc"));
+        assert!(!mentions_st2_surface("ST_CLAUDE_SESSION=abc"));
         assert!(!mentions_st2_surface(
             "\"$ST3_BIN\" driver-hook claude-observe"
         ));

@@ -136,6 +136,10 @@ pub fn install(mut config: Config) -> Result<()> {
         "st service install needs a working systemd user manager and transient user scopes"
     );
     let exe = env::current_exe().context("resolve the current st executable")?;
+    #[cfg(target_os = "macos")]
+    let exe = exe
+        .canonicalize()
+        .context("resolve the installed macOS app executable")?;
     let current = env::current_dir().context("resolve the service install directory")?;
     config.state_dir = absolute_from(&current, &config.state_dir);
     config.socket = absolute_from(&current, &config.socket);
@@ -204,7 +208,10 @@ pub fn permissions(open: bool) -> Result<()> {
 pub fn permissions_guidance() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
-        let executable = env::current_exe().context("resolve the current st executable")?;
+        let executable = env::current_exe()
+            .context("resolve the current st executable")?
+            .canonicalize()
+            .context("resolve the installed macOS app executable")?;
         Ok(macos_permission_guidance(&executable))
     }
     #[cfg(not(target_os = "macos"))]

@@ -1,0 +1,27 @@
+{
+  "body": {
+    "name": "Main workspace",
+    "tabs": [
+      {
+        "title": "Home",
+        "layout": {
+          "pane": "home:"
+        }
+      },
+      {
+        "layout": {
+          "split": "right",
+          "children": [
+            {
+              "pane": "agent:agent/example/worker"
+            },
+            {
+              "pane": "mission:mission/example/review"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "base_revision": null
+}

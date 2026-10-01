@@ -9,7 +9,7 @@ use alacritty_terminal::{
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use st3::{
     api::AppState,
-    model::{AttentionClosing, AttentionRequest},
+    model::PersonAskRequest,
     store::Store,
 };
 use st3_client::{Client, PairingBegin};
@@ -145,27 +145,16 @@ fn state(root: &Path, node: &str) -> AppState {
         planner_default: Default::default(),
     }
 }
-fn attention(state: &AppState, name: &str, title: &str) {
-    state
-        .store
-        .request_attention_closing(
-            &format!("attention/{name}"),
-            &AttentionRequest {
-                reviewer: "person/avery".into(),
-                title: title.into(),
-                reason: "Confirm on the remote member".into(),
-                severity: "warning".into(),
-                targets: vec![],
-                actor: "daemon/runtime".into(),
-                idempotency_key: name.into(),
-            },
-            &AttentionClosing {
-                closed_by: Some("person".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    state.event_notify.send_modify(|index| *index += 1);
+fn person_ask(state: &AppState, name: &str, title: &str) -> String {
+    let intent = st3::graph::parse_intent("version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }", state.store.origin()).unwrap();
+    state.store.apply_internal(&intent, "tui-person-asker").unwrap();
+    let step = state.store.ask_person(&PersonAskRequest {
+        legacy_request: None, person: "person/avery".into(), title: title.into(),
+        reason: "Confirm on the remote member".into(), actor: format!("agent/{}.asker", state.store.origin()),
+        step: None, new_run: Some(name.into()), incarnation: None, idempotency_key: name.into(),
+    }).unwrap();
+    state.event_notify.send_modify(|index| *index = state.store.index().unwrap());
+    step.subject
 }
 
 // The production-like carrier forwards the paired-only socket, never the trusted socket.
@@ -279,13 +268,13 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     let route = carrier(listener, gateway.clone());
     assert!(Client::fabric_pairing(&url).capabilities().await.is_err());
     pair(device.path(), &local, &url).await;
-    attention(&state, "online-proof", "Online proof");
+    let online_step = person_ask(&state, "online-proof", "Online proof");
     let mut tui = Tui::start(device.path());
     tui.wait("paired live view", |screen| {
         screen.contains("live") && screen.contains("Online proof") && screen.contains("avery")
     })
     .await;
-    tui.send("ry");
+    tui.send("cConfirmed on the remote member\r");
     tui.wait("confirmed remote action", |screen| {
         !screen.contains("Online proof")
     })
@@ -293,14 +282,14 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     assert_eq!(
         state
             .store
-            .attention_request("attention/online-proof")
+            .step_run(&online_step)
             .unwrap()
             .unwrap()
             .status,
-        "resolved"
+        "completed"
     );
 
-    attention(&state, "offline-proof", "Retained proof");
+    let offline_step = person_ask(&state, "offline-proof", "Retained proof");
     tui.wait("new data", |screen| screen.contains("Retained proof"))
         .await;
     route.abort();
@@ -312,7 +301,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     })
     .await;
     let before = state.store.index().unwrap();
-    tui.send("ry");
+    tui.send("cConfirmed on the remote member\r");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         state.store.index().unwrap(),
@@ -347,19 +336,19 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     assert_eq!(
         state
             .store
-            .attention_request("attention/offline-proof")
+            .step_run(&offline_step)
             .unwrap()
             .unwrap()
             .status,
-        "pending",
+        "ready",
         "recovery must not replay offline input"
     );
-    tui.send("ry");
+    tui.send("cConfirmed on the remote member\r");
     tui.wait("remote action after recovery", |screen| {
         !screen.contains("Retained proof")
     })
     .await;
-    attention(&state, "blackhole-proof", "Blackhole proof");
+    let _blackhole_step = person_ask(&state, "blackhole-proof", "Blackhole proof");
     tui.wait("data before a silent outage", |screen| {
         screen.contains("Blackhole proof")
     })
@@ -376,7 +365,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
         screen.contains("live") && screen.contains("Blackhole proof")
     })
     .await;
-    tui.send("ry");
+    tui.send("cConfirmed on the remote member\r");
     tui.wait("remote action after blackhole recovery", |screen| {
         !screen.contains("Blackhole proof")
     })
@@ -415,7 +404,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     .await;
     route.abort();
     let _ = route.await;
-    attention(&alternate, "alternate-proof", "Alternate proof");
+    let alternate_step = person_ask(&alternate, "alternate-proof", "Alternate proof");
     let mut tui = Tui::start(device.path());
     tui.wait("another reachable member", |screen| {
         screen.contains("live")
@@ -423,7 +412,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
             && screen.contains("member-willow")
     })
     .await;
-    tui.send("ry");
+    tui.send("cConfirmed on the remote member\r");
     tui.wait("action on alternate", |screen| {
         !screen.contains("Alternate proof")
     })
@@ -431,14 +420,14 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     assert_eq!(
         alternate
             .store
-            .attention_request("attention/alternate-proof")
+            .step_run(&alternate_step)
             .unwrap()
             .unwrap()
             .status,
-        "resolved"
+        "completed"
     );
     // Fail over while the UI is running; actions must follow its new selected member.
-    attention(&state, "return-proof", "Returned member proof");
+    let return_step = person_ask(&state, "return-proof", "Returned member proof");
     let route = carrier(TcpListener::bind(address).await.unwrap(), gateway);
     alternate_route.abort();
     let _ = alternate_route.await;
@@ -448,7 +437,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
             && screen.contains("member-cedar")
     })
     .await;
-    tui.send("ry");
+    tui.send("cConfirmed on the remote member\r");
     tui.wait("action after live failover", |screen| {
         !screen.contains("Returned member proof")
     })
@@ -456,11 +445,11 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     assert_eq!(
         state
             .store
-            .attention_request("attention/return-proof")
+            .step_run(&return_step)
             .unwrap()
             .unwrap()
             .status,
-        "resolved"
+        "completed"
     );
     drop(tui);
     for server in [

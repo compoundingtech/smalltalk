@@ -47,6 +47,7 @@ pub enum ErrorCode {
     NotFound,
     Forbidden,
     UnsupportedCapability,
+    AttentionMigrated,
     ValidationFailed,
     IdempotencyConflict,
     StaleFence,
@@ -85,6 +86,10 @@ pub struct Limits {
     pub max_event_items: usize,
     pub max_response_bytes: usize,
     pub max_wait_ms: u64,
+    pub max_glass_body_bytes: Option<usize>,
+    pub max_glasses: Option<usize>,
+    pub max_glass_depth: Option<usize>,
+    pub max_glass_nodes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -239,6 +244,12 @@ pub struct Operational {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Attention {
+    #[serde(default)]
+    pub episode: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub action_parameters: BTreeMap<String, Value>,
     #[serde(flatten)]
     pub header: ResourceHeader,
     #[serde(flatten)]
@@ -283,6 +294,39 @@ pub struct DocumentContent {
     pub reference: String,
     pub bytes: Vec<u8>,
 }
+
+/// A normalized KDL node. Empty optional collections are omitted just as in the stored AST.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CanonicalNode {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<CanonicalNode>,
+}
+
+/// Applied desired state, not the original declaration file or a proposed mission revision.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SubjectDefinition {
+    pub kind: String,
+    pub subject: String,
+    pub desired: CanonicalNode,
+    pub kdl: String,
+    pub desired_revision: String,
+    pub desired_token: String,
+    pub conflicts: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentDeclaration {
+    pub id: String,
+    pub revision: String,
+    pub tree: Value,
+    pub kdl: String,
+    pub revisions: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct LaunchPreview {
     pub goal: String,
@@ -735,7 +779,7 @@ pub struct AgentDelivery {
     #[serde(default)]
     pub transport: Option<String>,
 }
-/// The missions an agent may publish, start, and revise, and where that authority comes from:
+/// The missions an agent may publish, start, revise, and cancel, and where that authority comes from:
 /// `declared` (its `mission-authority`), `default` (a person-declared top-level seat
 /// `fleet/PROJECT/...` holds `fleet/PROJECT/*`), or `none`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -747,6 +791,8 @@ pub struct AgentMissionAuthority {
     pub start: Vec<String>,
     #[serde(default)]
     pub revise: Vec<String>,
+    #[serde(default)]
+    pub cancel: Vec<String>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -1031,6 +1077,7 @@ pub enum Resource {
     Operation(Operation),
     History(History),
     Session(Session),
+    Glass(Glass),
 }
 
 impl Resource {
@@ -1054,6 +1101,7 @@ impl Resource {
             Self::Operation(v) => &v.header,
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,
+            Self::Glass(v) => &v.header,
         }
     }
 }
@@ -1483,6 +1531,12 @@ pub enum ActionType {
     MissionCancel,
     #[serde(rename = "session.import")]
     SessionImport,
+    #[serde(rename = "work.ask")]
+    WorkAsk,
+    #[serde(rename = "work.done")]
+    WorkDone,
+    #[serde(rename = "work.cancel-ask")]
+    WorkCancelAsk,
     #[serde(rename = "work.claim")]
     WorkClaim,
     #[serde(rename = "work.renew")]
@@ -1568,6 +1622,17 @@ impl ActionRequest {
     // @st3-codegen:rust-action-constructors
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PersonAskParameters {
+    pub person_id: String, pub title: String, pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")] pub step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub new_run: Option<String>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PersonStepParameters {
+    pub target_id: String, pub summary: String, pub episode: String,
+    #[serde(default)] pub evidence: Vec<String>,
+}
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct TargetParameters {
     pub target_id: String,
@@ -1874,3 +1939,27 @@ pub struct TerminalScreen {
     pub next_sequence: u64,
     pub truncated: bool,
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum GlassLayout {
+    Pane { pane: String },
+    Split { split: GlassSplit, children: [Box<GlassLayout>; 2] },
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all="lowercase")]
+pub enum GlassSplit { Right, Below }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassTab { #[serde(skip_serializing_if="Option::is_none")] pub title: Option<String>, pub layout: GlassLayout }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassBody { pub name: String, pub tabs: Vec<GlassTab> }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Glass {
+    #[serde(flatten)] pub header: ResourceHeader,
+    pub body: Option<GlassBody>, pub deleted: bool,
+    pub base_revision: Option<String>, pub replaced_revision: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassPut { pub body: GlassBody, pub base_revision: Option<String> }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassDelete { pub base_revision: Option<String> }
