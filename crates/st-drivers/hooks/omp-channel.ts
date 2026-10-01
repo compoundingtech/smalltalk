@@ -1,13 +1,13 @@
-// st2 native message delivery for the omp harness.
+// st native message delivery for the omp harness.
 //
 // Forked from pi-channel.ts: omp is pi-family and loads the same extension shape, but the two
 // diverge where it matters (measured 2026-08-25, omp v18.0.3 — see
 // docs/vrs/06-omp-driver/.experiments/). omp has no `agent_settled` event, so terminal
 // `agent_end` uses a bounded `ctx.isIdle()` poll; structured `ask` tool events and approval events
 // carry the blocked-on-human axis pi cannot express; and a failed turn carries omp's own typed
-// error classification, which this asset forwards raw because st2 — not the asset — decides what
+// error classification, which this asset forwards raw because st — not the asset — decides what
 // a rejected provider credential is. Like the pi asset this file holds no delivery
-// policy: st2 decides which message is delivered, how, and what a starting session is told. The
+// policy: st decides which message is delivered, how, and what a starting session is told. The
 // one omp-specific choice here is timing: a message that arrives during a running turn is handed
 // to omp at the tool-batch boundary where omp would inject it anyway (see `HOLD_MAX_MS`). It
 // fails open in both directions — an unmanaged omp session loads this extension and does nothing;
@@ -21,16 +21,23 @@ import type {
 
 const PROTOCOL = 1;
 
-const BIN = "ST2_OMP_CHANNEL_BIN";
-const CATALOG = "ST2_OMP_CHANNEL_CATALOG";
-const IDENTITY = "ST2_OMP_CHANNEL_IDENTITY";
-const RUNTIME_ID = "ST2_OMP_CHANNEL_RUNTIME_ID";
-const SESSION = "ST2_OMP_CHANNEL_SESSION";
-const SEQ = "ST2_OMP_CHANNEL_SEQ";
-const EXPECTED_NATIVE_SESSION = "ST2_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
-const RESUME_GENERATION = "ST2_OMP_CHANNEL_RESUME_GENERATION";
+const legacyName = (name: string) => `ST2_${name.slice(3)}`;
+const readEnv = (name: string) => process.env[name] ?? process.env[legacyName(name)];
+const removeEnv = (name: string) => {
+  delete process.env[name];
+  delete process.env[legacyName(name)];
+};
 
-// omp starts the session even if st2 is slow to answer. Restored context is worth a short wait
+const BIN = "ST_OMP_CHANNEL_BIN";
+const CATALOG = "ST_OMP_CHANNEL_CATALOG";
+const IDENTITY = "ST_OMP_CHANNEL_IDENTITY";
+const RUNTIME_ID = "ST_OMP_CHANNEL_RUNTIME_ID";
+const SESSION = "ST_OMP_CHANNEL_SESSION";
+const SEQ = "ST_OMP_CHANNEL_SEQ";
+const EXPECTED_NATIVE_SESSION = "ST_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
+const RESUME_GENERATION = "ST_OMP_CHANNEL_RESUME_GENERATION";
+
+// omp starts the session even if st is slow to answer. Restored context is worth a short wait
 // and never worth a hung agent.
 const HELLO_TIMEOUT_MS = 5000;
 
@@ -91,7 +98,7 @@ type Stash = {
    * The last assistant message's `usage.cost.total`.
    *
    * Cost rides only the message-bearing events, but a context frame may be emitted from an event
-   * that carries none (`agent_end`, `session_start`). st2's record replaces a reading's fields
+   * that carries none (`agent_end`, `session_start`). st's record replaces a reading's fields
    * WHOLESALE — deliberately, so a withheld number is never fabricated from a previous one — so a
    * frame omitting the cost would erase the published one on the very next turn boundary.
    */
@@ -114,7 +121,7 @@ type Stash = {
 
 /**
  * Withhold rather than coerce (HC-R03). A non-finite or absent value is not a reading, and
- * substituting zero, the previous number, or a division st2 could have done itself is exactly the
+ * substituting zero, the previous number, or a division st could have done itself is exactly the
  * fabrication HC-R03 forbids.
  */
 const finiteOrNull = (value: unknown): number | null =>
@@ -142,7 +149,7 @@ type AgentEndFrame = {
  * omp's own words for the provider error that ended a turn.
  *
  * `errorId` is omp's error-classification BITFIELD, assigned onto the assistant message at the
- * provider-stream boundary beside `errorStatus` and `errorMessage`. It travels raw: st2 owns the
+ * provider-stream boundary beside `errorStatus` and `errorMessage`. It travels raw: st owns the
  * verdict, exactly as it owns delivery policy, so this asset never decides what an auth failure
  * is. `errorStatus` is deliberately not carried — the status code classifies nothing (three of
  * the four measured 403s are not credential rejections) and omp already prefixes it to the prose.
@@ -203,35 +210,37 @@ void pinnedTelemetrySurface;
 /**
  * Read the channel configuration once and unexport it.
  *
- * Every ST2_OMP_CHANNEL_* value is stashed and unexported: a leaked runtime id or session token
+ * Every ST_OMP_CHANNEL_* value is stashed and unexported: a leaked runtime id or session token
  * would hand a nested harness child this seat's registry key and record ownership. The values
  * cannot live in module scope because a second instantiation would find them already deleted and
  * silently run as an unmanaged session; the stash outlives re-instantiation, the environment does
  * not.
  */
 const stash = (): Stash => {
-  const globals = globalThis as { __st2OmpChannel?: Stash };
-  if (!globals.__st2OmpChannel) {
-    globals.__st2OmpChannel = {
-      bin: process.env[BIN],
-      catalog: process.env[CATALOG],
-      identity: process.env[IDENTITY],
-      runtimeId: process.env[RUNTIME_ID],
-      session: process.env[SESSION],
-      seq: process.env[SEQ],
-      expectedNativeSession: process.env[EXPECTED_NATIVE_SESSION],
-      resumeGeneration: process.env[RESUME_GENERATION],
+  const globals = globalThis as { __stOmpChannel?: Stash; __st2OmpChannel?: Stash };
+  // Reuse an older loaded extension's ownership before considering the process environment.
+  globals.__stOmpChannel ??= globals.__st2OmpChannel;
+  if (!globals.__stOmpChannel) {
+    globals.__stOmpChannel = {
+      bin: readEnv(BIN),
+      catalog: readEnv(CATALOG),
+      identity: readEnv(IDENTITY),
+      runtimeId: readEnv(RUNTIME_ID),
+      session: readEnv(SESSION),
+      seq: readEnv(SEQ),
+      expectedNativeSession: readEnv(EXPECTED_NATIVE_SESSION),
+      resumeGeneration: readEnv(RESUME_GENERATION),
     };
-    delete process.env[BIN];
-    delete process.env[CATALOG];
-    delete process.env[IDENTITY];
-    delete process.env[RUNTIME_ID];
-    delete process.env[SESSION];
-    delete process.env[SEQ];
-    delete process.env[EXPECTED_NATIVE_SESSION];
-    delete process.env[RESUME_GENERATION];
   }
-  return globals.__st2OmpChannel;
+  removeEnv(BIN);
+  removeEnv(CATALOG);
+  removeEnv(IDENTITY);
+  removeEnv(RUNTIME_ID);
+  removeEnv(SESSION);
+  removeEnv(SEQ);
+  removeEnv(EXPECTED_NATIVE_SESSION);
+  removeEnv(RESUME_GENERATION);
+  return globals.__stOmpChannel;
 };
 
 /**
@@ -284,7 +293,7 @@ export default function (pi: ExtensionAPI) {
       // Refuse rather than degrade. Without a positive idle proof this extension cannot choose
       // between an idle send and a steer, and guessing would deliver into a running turn.
       ctx.ui?.notify?.(
-        "st2: this omp build exposes no ctx.isIdle(); refusing to open the st2 channel",
+        "st: this omp build exposes no ctx.isIdle(); refusing to open the st channel",
         "error",
       );
       return Promise.resolve("");
@@ -292,7 +301,7 @@ export default function (pi: ExtensionAPI) {
     const nativeSessionId = ctx.sessionManager.getSessionId();
     if (typeof nativeSessionId !== "string" || nativeSessionId.trim() === "") {
       ctx.ui?.notify?.(
-        "st2: omp reported no native session id; refusing to open the st2 channel",
+        "st: omp reported no native session id; refusing to open the st channel",
         "error",
       );
       return Promise.resolve("");
@@ -378,7 +387,7 @@ export default function (pi: ExtensionAPI) {
           if (frame.protocol !== PROTOCOL) {
             closeChild(child);
             ctx.ui?.notify?.(
-              `st2: omp channel protocol ${frame.protocol} is not understood by this extension (expected ${PROTOCOL}); reinstall st2's hook set`,
+              `st: omp channel protocol ${frame.protocol} is not understood by this extension (expected ${PROTOCOL}); reinstall st's hook set`,
             );
             settle("");
             return;
@@ -401,7 +410,7 @@ export default function (pi: ExtensionAPI) {
             // identity into the next turn instead of silently dropping the late hello.
             try {
               pi.sendMessage(
-                { customType: "st2-session-start", content: context, display: true },
+                { customType: "st-session-start", content: context, display: true },
                 { deliverAs: "nextTurn" },
               );
             } catch { /* session shutdown may have begun */ }
@@ -449,7 +458,7 @@ export default function (pi: ExtensionAPI) {
     state.reconnectTimer.unref?.();
   };
 
-  // Frames are observational — st2 decides what becomes of them — and a closed channel drops
+  // Frames are observational — st decides what becomes of them — and a closed channel drops
   // them silently.
   const sendFrame = (frame: Record<string, unknown>) => {
     const child = state.child;
@@ -639,7 +648,7 @@ export default function (pi: ExtensionAPI) {
   // The call is present and working on 18.0.3 as well as 18.0.9 (35 occurrences in each binary);
   // the older capture's "ctx exposes {ui} only" was a probe artifact, not a version fact.
   //
-  // As on pi, this asset holds no cadence policy — st2's write guard quantizes to 1% of the
+  // As on pi, this asset holds no cadence policy — st's write guard quantizes to 1% of the
   // window — and every pull is guarded, because an observability call must never take a turn down.
   const modelId = (ctx: ExtensionContext): string | null => {
     try {
@@ -681,7 +690,7 @@ export default function (pi: ExtensionAPI) {
   /**
    * The harness-durable compaction count (HC-R12) — omp's own session store, through the same
    * `getEntries()` path as pi's, measured going 0 → 1 across the event. `null` when the store
-   * cannot be read, which makes st2 count the edge itself: a weaker, incarnation-scoped answer
+   * cannot be read, which makes st count the edge itself: a weaker, incarnation-scoped answer
    * and never a wrong one.
    */
   const durableCompactions = (ctx: ExtensionContext): number | null => {
@@ -746,7 +755,7 @@ export default function (pi: ExtensionAPI) {
     }
     // The typed turn result, on every turn that ACTUALLY ended and in both directions. It is one
     // frame rather than two because the credential edge and the categorical state are the same
-    // observation seen from two axes, and correlating them across frames would be a race st2
+    // observation seen from two axes, and correlating them across frames would be a race st
     // cannot win. An ordinary end carries no error and asserts no state: the sampled idle below
     // still owns that edge.
     const error = terminalProviderError(end);
@@ -773,7 +782,7 @@ export default function (pi: ExtensionAPI) {
     });
   }
   // omp's `session_compact` carries NO `reason` and no `willRetry` — pi 0.84.2 has both — so the
-  // trigger is withheld here and st2 records `unknown`. omp does name its auto-compaction "idle"
+  // trigger is withheld here and st records `unknown`. omp does name its auto-compaction "idle"
   // and "threshold" internally, but those words are not projected onto the event, and inventing
   // one would be a claim no capture supports. Unlike pi, omp's `getContextUsage()` still answers
   // inside this handler (8,100 measured, not null), so the frame carries a real post-compaction
@@ -902,7 +911,7 @@ export default function (pi: ExtensionAPI) {
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own.
       pi.sendMessage(
-        { customType: "st2-session-start", content: restored, display: true },
+        { customType: "st-session-start", content: restored, display: true },
         { deliverAs: "nextTurn" },
       );
     }

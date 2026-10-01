@@ -132,7 +132,7 @@ impl CatalogDeclarationWatcher {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!("st2: catalog-declaration watcher error: {error}");
+                    tracing::warn!("st: catalog-declaration watcher error: {error}");
                     let _ = tx.send(());
                 }
             })?;
@@ -226,7 +226,7 @@ impl CatalogDeclarationWatcher {
                     drop(watched);
                     if self.failed.insert(added.clone()) {
                         tracing::warn!(
-                            "st2: cannot watch catalog declaration directory '{}': {error}; immediate changes below it are unavailable, continuing with timer polling.",
+                            "st: cannot watch catalog declaration directory '{}': {error}; immediate changes below it are unavailable, continuing with timer polling.",
                             added.display()
                         );
                     }
@@ -283,7 +283,7 @@ impl CatalogReconcileWatcher {
             self.generation_identity = None;
             if !self.generation_install_failed {
                 tracing::warn!(
-                    "st2: catalog control directory was replaced; reinstalling the catalog-generation watcher."
+                    "st: catalog control directory was replaced; reinstalling the catalog-generation watcher."
                 );
             }
             self.generation_install_failed = true;
@@ -300,7 +300,7 @@ impl CatalogReconcileWatcher {
                 Err(error) => {
                     if !self.generation_install_failed {
                         tracing::warn!(
-                            "st2: cannot watch the catalog generation: {error}; completed catalog transactions depend on declaration watches or timer polling."
+                            "st: cannot watch the catalog generation: {error}; completed catalog transactions depend on declaration watches or timer polling."
                         );
                     }
                     self.generation_install_failed = true;
@@ -318,7 +318,7 @@ impl CatalogReconcileWatcher {
                 Err(error) => {
                     if !self.declaration_install_failed {
                         tracing::warn!(
-                            "st2: cannot watch catalog declarations: {error}; direct declaration changes depend on catalog-generation wakeups or timer polling."
+                            "st: cannot watch catalog declarations: {error}; direct declaration changes depend on catalog-generation wakeups or timer polling."
                         );
                     }
                     self.declaration_install_failed = true;
@@ -346,7 +346,7 @@ fn watch_catalog_generation(
         }
         Ok(_) => {}
         Err(error) => {
-            tracing::warn!("st2: catalog-generation watcher error: {error}");
+            tracing::warn!("st: catalog-generation watcher error: {error}");
             let _ = tx.send(());
         }
     })?;

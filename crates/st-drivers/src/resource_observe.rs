@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use crate::park::SupervisorScope;
 use crate::resource_profile::{BindingId, RegistrationToken, RuntimeOwner, SnapshotDigest};
 
-pub const OBSERVE_REQUEST_SCHEMA: &str = "st2.resource-observe-request.v1";
-pub const OBSERVE_RECEIPT_SCHEMA: &str = "st2.resource-observe-receipt.v1";
+pub const OBSERVE_REQUEST_SCHEMA: &str = "st.resource-observe-request.v1";
+pub const OBSERVE_RECEIPT_SCHEMA: &str = "st.resource-observe-receipt.v1";
 pub const MAX_PENDING_OBSERVE_REQUESTS: usize = 256;
 pub const MAX_OBSERVE_RECEIPTS: usize = 256;
 const MAX_CONTROL_RECORD_BYTES: u64 = 64 * 1024;
@@ -97,7 +97,7 @@ impl ObserveRequest {
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.schema == OBSERVE_REQUEST_SCHEMA,
+            crate::contracts::schema_matches(&self.schema, OBSERVE_REQUEST_SCHEMA),
             "unsupported observe request schema {:?}",
             self.schema
         );
@@ -215,7 +215,7 @@ impl ObserveReceipt {
 
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.schema == OBSERVE_RECEIPT_SCHEMA,
+            crate::contracts::schema_matches(&self.schema, OBSERVE_RECEIPT_SCHEMA),
             "unsupported observe receipt schema {:?}",
             self.schema
         );

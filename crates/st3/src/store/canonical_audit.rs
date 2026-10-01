@@ -124,6 +124,9 @@ fn shared_folds_never_order_by_local_arrival() {
         "try_project_simple_replication_tx",
         "export_replication_for_heads",
         "seed_replica_envelopes_tx",
+        // Bounded mailbox pages expose local cursors, then complete readers sort source keys.
+        "messages_page",
+        "work_wake_messages_for_reconcile",
     ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = vec![root.join("store.rs")];
@@ -159,7 +162,14 @@ fn shared_folds_never_order_by_local_arrival() {
                 .split(';')
                 .next()
                 .unwrap();
-            if !order.contains("store_index") {
+            // A marker explicitly orders the fold canonically. With window functions the
+            // rest of the same SQL literal may contain a snapshot bound after this clause.
+            if order.trim_start().starts_with("CANONICAL_ASC(")
+                || order.trim_start().starts_with("CANONICAL_DESC(")
+            {
+                continue;
+            }
+            if !order.contains("store_index") && !order.contains("created_index") {
                 continue;
             }
             let scope = source[..offset]
@@ -215,8 +225,10 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                 .iter()
                 .filter(|name| !local_columns.contains(&name.as_str()))
                 .map(|name| {
-                    if *table == "blobs" && name == "bytes" {
-                        "hex(bytes)".to_owned()
+                    if (*table == "blobs" && name == "bytes")
+                        || (*table == "documents" && name == "binding_key")
+                    {
+                        format!("hex({name})")
                     } else {
                         name.clone()
                     }
@@ -257,6 +269,11 @@ fn table_digest(rows: &[String]) -> String {
 }
 
 fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mut Vec<String>) {
+    if expected.glasses("person/ada", i64::MAX as u64).unwrap()
+        != actual.glasses("person/ada", i64::MAX as u64).unwrap()
+    {
+        mismatches.push(format!("{phase}: glass bodies/revision sources"));
+    }
     let expected_rows = shared_rows(expected);
     for (table, rows) in shared_rows(actual) {
         let wanted = &expected_rows[&table];
@@ -295,6 +312,88 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
         != actual.document_bindings(&documents).unwrap()
     {
         mismatches.push(format!("{phase}: selected document bindings"));
+    }
+    let document_views = |store: &Store| {
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            let page = store
+                .list_documents_page(
+                    Some("doc/audit"),
+                    None,
+                    true,
+                    after
+                        .as_ref()
+                        .map(|(name, index): &(String, u64)| (name.as_str(), *index)),
+                    1,
+                )
+                .unwrap();
+            let Some(version) = page.first() else {
+                break;
+            };
+            after = Some((version.name.clone(), version.created_index));
+            let mut view = serde_json::to_value(version).unwrap();
+            view.as_object_mut().unwrap().remove("created_index");
+            all.push(view);
+        }
+        let latest = store.list_documents(Some("doc/audit"), false, 10).unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].hash, hex::encode(Sha256::digest(b"second")));
+        all
+    };
+    if document_views(expected) != document_views(actual) {
+        mismatches.push(format!("{phase}: document flags and paged versions"));
+    }
+    let messages = |store: &Store| {
+        let mut value = serde_json::to_value(
+            store
+                .operational_messages(Some("person/avery"), false)
+                .unwrap(),
+        )
+        .unwrap();
+        for message in value.as_array_mut().unwrap() {
+            message.as_object_mut().unwrap().remove("created_index");
+        }
+        value
+    };
+    if messages(expected) != messages(actual) {
+        mismatches.push(format!("{phase}: selected person messages and reminders"));
+    }
+    let proposal_views = |store: &Store| {
+        let connection = store.readers.get();
+        let runs = connection
+            .prepare("SELECT DISTINCT run_id FROM revision_proposals ORDER BY run_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        runs.into_iter()
+            .map(|run| {
+                serde_json::to_value(store.revision_proposal_for_run(&run).unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    if proposal_views(expected) != proposal_views(actual) {
+        mismatches.push(format!("{phase}: selected equal-time revision proposals"));
+    }
+    // Time evaluation and recipient filtering are shared only at identical explicit contexts.
+    for person in [
+        None,
+        Some("person/avery"),
+        Some("person/robin"),
+        Some("person/operator"),
+    ] {
+        for as_of in [2_000_000_000_000_u128, 2_000_000_600_000_u128] {
+            let attention = |store: &Store| {
+                serde_json::to_value(store.attention_snapshot(person, as_of).unwrap()).unwrap()
+            };
+            if attention(expected) != attention(actual) {
+                mismatches.push(format!(
+                    "{phase}: attention snapshot at {as_of} for {person:?}"
+                ));
+            }
+        }
     }
     let message_state = |store: &Store| {
         store
@@ -353,6 +452,21 @@ fn write_audit_history(source: &Store) {
         ),
         "audit-desired",
     );
+    source.append_claim(&ClaimInput {
+        subject:"glass/person/ada/019a0000-0000-7000-8000-000000000001".into(), kind:"glass.upserted".into(), actor:Some("person/ada".into()),
+        fields: serde_json::from_value(json!({"body":{"name":"Audit workspace","tabs":[{"layout":{"pane":"home:"}}]}, "base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None,
+    }).unwrap();
+    let declared_message = r#"version 2
+message "audit-declared" {
+  from "agent/alder.worker"
+  to "person/avery"
+  content "Read this declarative message."
+}
+"#;
+    let intent = crate::graph::parse_test_intent(declared_message, "alder").unwrap();
+    source
+        .apply_internal(&intent, "audit-declared-message")
+        .unwrap();
     let failed = failed_takeover_run(source, &["deploy-check"]);
     source
         .put_document("doc/audit", b"first", &None, "audit-document-first")
@@ -365,6 +479,43 @@ fn write_audit_history(source: &Store) {
             "audit-document-second",
         )
         .unwrap();
+    // Repeated immutable bindings must select the same canonical representative even when
+    // a later copy arrives first. The latest distinct version must remain the second one.
+    {
+        let mut connection = source.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let (name, kind, body): (String, String, String) = transaction
+            .query_row(
+                "SELECT subject,kind,body FROM claims WHERE kind='mission.published' LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        append_claim_tx(
+            &transaction,
+            &source.origin,
+            &name,
+            &kind,
+            None,
+            &serde_json::from_str::<Value>(&body).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let hash = hex::encode(Sha256::digest(b"first"));
+        append_claim_tx(
+            &transaction,
+            &source.origin,
+            "doc/audit",
+            "doc.bound",
+            None,
+            &json!({"name":"doc/audit","hash":hash,"size":5}),
+            &[],
+            None,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+    }
     // Equal acceptance times require the writer/sequence/position parts of the total order.
     source
         .connection
@@ -415,6 +566,15 @@ fn write_audit_history(source: &Store) {
                 "run":failed.subject,"source_generation":failed.generation,"candidate_revision":failed.revision,
                 "reason":"Check two independent reviewers.","status":"pending-approval","cutover":"restart-active",
                 "compatible_steps":[],"reviewers":["person/avery","person/robin"],"preview_hash":"audit-preview"
+            }),
+        ),
+        (
+            "revision-proposal/audit-other",
+            "revision-proposal.created",
+            json!({
+                "run":failed.subject,"source_generation":failed.generation,"candidate_revision":failed.revision,
+                "reason":"Compare an equal-time proposal.","status":"pending-approval","cutover":"restart-active",
+                "compatible_steps":[],"reviewers":["person/avery","person/robin"],"preview_hash":"audit-other-preview"
             }),
         ),
         (
@@ -476,6 +636,26 @@ fn write_audit_history(source: &Store) {
             "message/audit",
             "message.closed",
             json!({"status": "closed"}),
+        ),
+        (
+            "message/audit-person-one",
+            "message.sent",
+            json!({"from":"agent/alder.worker","to":"person/avery","content":"First unread item.","status":"sent"}),
+        ),
+        (
+            "message/audit-person-two",
+            "message.sent",
+            json!({"from":"agent/alder.worker","to":"person/avery","content":"Second unread item.","status":"sent"}),
+        ),
+        (
+            "message/audit-reminder-one",
+            "message.sent",
+            json!({"from":"agent/alder.worker","to":"person/avery","content":"Old reminder.","status":"sent","tags":["reminder:audit","version:1"]}),
+        ),
+        (
+            "message/audit-reminder-two",
+            "message.sent",
+            json!({"from":"agent/alder.worker","to":"person/avery","content":"Current reminder.","status":"sent","tags":["reminder:audit","version:2"]}),
         ),
         (
             "observer/audit",
@@ -559,6 +739,34 @@ fn write_audit_history(source: &Store) {
             .append_claim_outcome(&harness_state("agent/alder.worker", state, observed_at))
             .unwrap();
     }
+    source.replay_replication_graph().unwrap();
+    source
+        .ask_person(&crate::model::PersonAskRequest {
+            legacy_request: None,
+            person: "person/avery".into(),
+            title: "Choose the release date".into(),
+            reason: "Reply with a date.".into(),
+            actor: "agent/alder.worker".into(),
+            step: None,
+            new_run: Some("audit-person-ask".into()),
+            incarnation: None,
+            idempotency_key: "audit-person-ask".into(),
+        })
+        .unwrap();
+    source
+        .record_operational_failure(
+            "audit-disk-episode",
+            &AttentionRequest {
+                reviewer: "person/avery".into(),
+                title: "Disk space is low".into(),
+                reason: "Free disk space.".into(),
+                severity: "warning".into(),
+                targets: vec!["daemon/alder".into()],
+                actor: "daemon/runtime".into(),
+                idempotency_key: "audit-disk-episode".into(),
+            },
+        )
+        .unwrap();
     source.replay_replication_graph().unwrap();
 }
 
@@ -959,4 +1167,142 @@ fn comparable_peers_name_differing_tables_and_legacy_peers_keep_their_digest() {
     assert!(
         matches!(target.heal_next("alder",answer).unwrap(),ReplicationHealStep::Done{report} if report.healed)
     );
+}
+
+#[test]
+fn pending_local_claims_do_not_report_divergence_at_equal_sealed_inventory() {
+    let source = Store::open_memory("alder").unwrap();
+    let target = Store::open_memory("birch").unwrap();
+    let exchange = exchange_from(&source, &ReplicationInventory::default());
+    receive_and_project(&target, "alder", &exchange);
+    target
+        .append_claim(&ClaimInput {
+            subject: "observer/audit-pending".into(),
+            kind: "observer.state".into(),
+            actor: None,
+            fields: BTreeMap::from([("state".into(), json!("unreachable"))]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: Some("audit-pending".into()),
+        })
+        .unwrap();
+    let status = target
+        .replication_status_sealed(true, Some(TEST_FLEET), &["alder".into()])
+        .unwrap();
+    assert_eq!(
+        target
+            .sealed_replication_snapshot()
+            .unwrap()
+            .inventory
+            .digest,
+        exchange.inventory.digest
+    );
+    assert_ne!(status.projection_digests, exchange.projection_digests);
+    assert!(status.peers[0].differing_tables.is_empty());
+}
+
+#[test]
+fn proposal_phase_dates_match_source_replay_and_replication() {
+    for reviewed in [false, true] {
+        let source = Store::open_memory("alder").unwrap();
+        source.set_write_clock_at(now_ms() + 10_000).unwrap();
+        let publish = |goal: &str, key: &str| {
+            let reviewers = if reviewed {
+                "revisions=\"human-only\" revision-reviewer=\"person/robin\""
+            } else {
+                ""
+            };
+            let kdl = format!(
+                r#"
+version 2
+mission "audit-phase" state="ready" revision-cutover="when-idle" {reviewers} {{
+  goal "Compare proposal phases."
+  agent "owner" {{ workspace "."; command "true" }}
+  step "work" {{ goal {goal:?} }}
+}}
+"#
+            );
+            publish_mission(&source, &kdl, key)
+        };
+        let first = publish("First goal.", "audit-phase-one");
+        let run = source
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
+                revision: None,
+                workspace: "/tmp/audit".into(),
+                requester: Some("person/avery".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "audit-phase-run".into(),
+            })
+            .unwrap();
+        let second = publish("Second goal.", "audit-phase-two");
+        let target = Store::open_memory("birch").unwrap();
+        let check = |phase: &str| {
+            let before = shared_rows(&source);
+            source.replay_replication_graph().unwrap();
+            assert_eq!(before, shared_rows(&source), "{phase}: source/replay");
+            target
+                .import_replication("alder", &source.export_replication(0).unwrap())
+                .unwrap();
+            assert_eq!(before, shared_rows(&target), "{phase}: replica");
+            assert_eq!(
+                projection_digest::tables(&source.readers.get()).unwrap(),
+                projection_digest::tables(&target.readers.get()).unwrap(),
+                "{phase}: cached digests"
+            );
+        };
+        let proposal = source
+            .create_revision_proposal(
+                &run.id,
+                &second,
+                "person/avery",
+                "Compare admission with replay.",
+                "audit-phase-create",
+            )
+            .unwrap();
+        check("created");
+        if reviewed {
+            source
+                .approve_revision_proposal(
+                    &proposal.id,
+                    "person/robin",
+                    proposal.preview_hash.as_deref().unwrap(),
+                    "audit-phase-approve",
+                )
+                .unwrap();
+            check("approved/draining");
+        }
+        source
+            .cancel_revision_proposal(
+                &proposal.id,
+                "person/avery",
+                Some("Try another cutover."),
+                "audit-phase-cancel",
+            )
+            .unwrap();
+        check("cancelled");
+        let replacement = source
+            .create_revision_proposal(
+                &run.id,
+                &second,
+                "person/avery",
+                "Apply the idle replacement.",
+                "audit-phase-replace",
+            )
+            .unwrap();
+        if reviewed {
+            source
+                .approve_revision_proposal(
+                    &replacement.id,
+                    "person/robin",
+                    replacement.preview_hash.as_deref().unwrap(),
+                    "audit-phase-reapprove",
+                )
+                .unwrap();
+        }
+        check("replacement/draining");
+        assert!(source.apply_drained_revision(&run.id).unwrap().is_some());
+        check("applied");
+    }
 }

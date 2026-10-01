@@ -10,6 +10,7 @@ on:
       - '.github/workflows/release-smalltalk.yml'
       - 'scripts/release-smalltalk*'
       - 'scripts/install-release*'
+      - 'scripts/install-macos*'
       - 'docs/st3/binary-releases.md'
       - 'flake.lock'
 
@@ -21,6 +22,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  installer:
+    name: installer (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test install entry points and isolated app transactions
+        run: |
+          scripts/install-test
+          scripts/install-release-test
+          python3 scripts/install-macos-test
+
   build:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.deleted == false) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     name: release-build (${{ matrix.target }})
@@ -46,7 +65,9 @@ jobs:
         with:
           version: 0.15.2
       - name: Test installer
-        run: scripts/install-release-test
+        run: |
+          scripts/install-release-test
+          python3 scripts/install-macos-test
       - name: Build, package, and test extracted tools
         run: scripts/release-smalltalk '${{ matrix.target }}' dist
       - uses: actions/upload-artifact@v4
@@ -57,7 +78,7 @@ jobs:
 
   assemble:
     name: release-assemble
-    needs: build
+    needs: [build, installer]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

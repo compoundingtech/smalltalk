@@ -2482,6 +2482,9 @@ fn normalize_subject(value: &str, kind: &str) -> String {
 }
 
 fn normalize_assignee(value: &str, default_host: &str) -> String {
+    if value.starts_with("person/") {
+        return value.to_owned();
+    }
     let identity = value.strip_prefix("agent/").unwrap_or(value);
     if identity.contains('.') || identity.contains("${") {
         format!("agent/{identity}")
@@ -3834,6 +3837,27 @@ mission "bad" state="ready" { goal "Reject an internal wildcard."; agent "bad" {
 mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { workspace "."; command "true"; mission-authority { publish "work/*"; publish "work/*" } } }"#,
         ] {
             assert!(crate::graph::parse_intent(source, "node").is_err());
+        }
+    }
+
+    #[test]
+    fn agent_authority_and_mission_cancel_reject_invalid_rules() {
+        for block in [
+            "agent-authority { }",
+            "agent-authority { start \"example/*\" }",
+            "agent-authority { apply \"agent/example/*\" }",
+            "agent-authority { apply \"example/*/bad\" }",
+            "agent-authority { apply \"example/*\"; apply \"example/*\" }",
+            "mission-authority { cancel \"mission/example/*\" }",
+            "mission-authority { cancel \"example/*\"; cancel \"example/*\" }",
+        ] {
+            let source = format!(
+                "version 2\nagent \"example/operator\" {{ workspace \".\"; command \"true\"; {block} }}\n"
+            );
+            assert!(
+                crate::graph::parse_intent(&source, "node").is_err(),
+                "{block}"
+            );
         }
     }
 

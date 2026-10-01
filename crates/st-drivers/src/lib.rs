@@ -21,6 +21,7 @@ pub mod claude_mcp;
 pub mod claude_session;
 pub mod codex_app_server;
 pub mod context;
+pub mod contracts;
 pub mod delivery_ledger;
 pub mod ding;
 pub mod direct_actor;

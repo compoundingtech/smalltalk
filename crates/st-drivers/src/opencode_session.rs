@@ -100,7 +100,7 @@ pub fn run(
             let supported = version_is_supported(&version);
             if !supported {
                 tracing::warn!(
-                    "st2 opencode-session: version {version} is unverified (supported minors: {}); native delivery disabled",
+                    "st opencode-session: version {version} is unverified (supported minors: {}); native delivery disabled",
                     harness_version::series_display(&SUPPORTED_OPENCODE_MINORS)
                 );
             }
@@ -116,7 +116,7 @@ pub fn run(
             )
         }
         Err(error) => {
-            tracing::warn!("st2 opencode-session: cannot read opencode version: {error:#}");
+            tracing::warn!("st opencode-session: cannot read opencode version: {error:#}");
             (
                 false,
                 None,
@@ -179,7 +179,7 @@ pub fn run(
                 Ok(producer) => Some(producer),
                 Err(error) => {
                     tracing::warn!(
-                        "st2 opencode-session: no context record for this seat: {error:#}"
+                        "st opencode-session: no context record for this seat: {error:#}"
                     );
                     None
                 }
@@ -381,7 +381,7 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
                             DiagnosticReason::IncompatibleApi,
                             DiagnosticSource::OpenApiDocument,
                         );
-                        tracing::warn!("st2 opencode-session: API gate failed: {error:#}");
+                        tracing::warn!("st opencode-session: API gate failed: {error:#}");
                         // A failed shape check is terminal for this launch: the surface will not
                         // change until the binary does. Stop probing; run presence-only.
                         next_gate_attempt = Instant::now() + Duration::from_secs(3600);
@@ -1239,9 +1239,7 @@ impl ContextProducer {
                 if let Err(error) = self.writer.compacted(harness_context::Compaction::new(
                     harness_context::CompactionTrigger::Unknown,
                 )) {
-                    tracing::warn!(
-                        "st2 opencode-session: recording a compaction failed: {error:#}"
-                    );
+                    tracing::warn!("st opencode-session: recording a compaction failed: {error:#}");
                 }
                 false
             }
@@ -1329,7 +1327,7 @@ impl ContextProducer {
                 }
             }
             Err(error) => {
-                tracing::warn!("st2 opencode-session: reading model windows failed: {error:#}");
+                tracing::warn!("st opencode-session: reading model windows failed: {error:#}");
             }
         }
     }
@@ -1388,9 +1386,7 @@ impl ContextProducer {
         match self.writer.observe(self.reading()) {
             Ok(landed) => landed,
             Err(error) => {
-                tracing::warn!(
-                    "st2 opencode-session: writing the context record failed: {error:#}"
-                );
+                tracing::warn!("st opencode-session: writing the context record failed: {error:#}");
                 false
             }
         }
@@ -1544,7 +1540,7 @@ impl Delivery {
         diagnostics: Option<&mut DiagnosticPublisher>,
     ) {
         if let Err(error) = self.pump_inner(client, diagnostics) {
-            tracing::warn!("st2 opencode-session: delivery: {error:#}");
+            tracing::warn!("st opencode-session: delivery: {error:#}");
         }
     }
 
@@ -1601,7 +1597,7 @@ impl Delivery {
         // operator-visible surface is the existing typed boundary — the transport is unavailable —
         // and the raw reason stays in tracing, so no unbounded prose reaches the record.
         if let Some(reason) = self.ledger.quarantined() {
-            tracing::warn!("st2 opencode-session: delivery ledger is quarantined: {reason}");
+            tracing::warn!("st opencode-session: delivery ledger is quarantined: {reason}");
             if let Some(diagnostics) = diagnostics.as_deref_mut() {
                 diagnostics.publish(
                     DiagnosticStage::Delivery,

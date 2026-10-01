@@ -1063,7 +1063,7 @@ fn cli_json_is_well_formed() {
     )]);
     let out = run_validate(&[c.path().as_os_str(), std::ffi::OsStr::new("--json")]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    assert_eq!(v["schema"], "st2.validate.v2");
+    assert_eq!(v["schema"], "st.validate.v2");
     assert_eq!(v["policyProfile"], "st2.core+catalog.v1");
     let revision = v["agentSpecRevision"]
         .as_str()

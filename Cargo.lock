@@ -3244,10 +3244,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "st2-resource-protocol",
+ "st-resource-protocol",
+ "st-wire",
  "st2-resource-providers",
  "st2-resource-wasip2",
- "st2-wire",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
@@ -3255,6 +3255,15 @@ dependencies = [
  "tracing-subscriber",
  "tungstenite 0.30.0",
  "wat",
+]
+
+[[package]]
+name = "st-resource-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -3270,6 +3279,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "st-wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3292,10 +3309,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "st-drivers",
- "st2-resource-protocol",
+ "st-resource-protocol",
+ "st-wire",
  "st2-resource-providers",
  "st2-resource-wasip2",
- "st2-wire",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
@@ -3336,15 +3353,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "st2-resource-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "st2-resource-providers"
 version = "0.1.0"
 dependencies = [
@@ -3355,7 +3363,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "st2-resource-protocol",
+ "st-resource-protocol",
  "st2-resource-wasip2",
  "tempfile",
  "tokio",
@@ -3370,7 +3378,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "st2-resource-protocol",
+ "st-resource-protocol",
  "tempfile",
  "wasmtime",
  "wat",
@@ -3384,14 +3392,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "wit-bindgen",
-]
-
-[[package]]
-name = "st2-wire"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -3442,6 +3442,8 @@ dependencies = [
  "tokio-tungstenite 0.27.0",
  "toml 0.9.12+spec-1.1.0",
  "tower",
+ "tracing",
+ "tracing-subscriber",
  "urlencoding",
  "uuid",
  "walkdir",

@@ -5,8 +5,17 @@
 
 set -u
 
+# Older running providers retain their original environment across binary replacement.
+for name in ST_CLAUDE_IDENTITY ST_CLAUDE_RUNTIME_ID ST_CLAUDE_SESSION ST_CLAUDE_SESSION_SEQ ST_CLAUDE_EXPECTED_NATIVE_SESSION ST_CLAUDE_RESUME_GENERATION; do
+  legacy="ST2_${name#ST_}"
+  if [[ ${!name+x} != x && ${!legacy+x} == x ]]; then
+    printf -v "$name" '%s' "${!legacy}"
+    export "$name"
+  fi
+done
+
 event="${1:-}"
-identity="${ST2_CLAUDE_IDENTITY:-${ST_AGENT:-}}"
+identity="${ST_CLAUDE_IDENTITY:-${ST_AGENT:-}}"
 # CATALOG-first, deliberately diverging from the sibling hooks' ST_ROOT-first order: their
 # ST_ROOT is a bus root for message writes, while --catalog here resolves the agent DECLARATION —
 # with a custom bus root (ST_ROOT != CATALOG) declaration resolution under ST_ROOT finds nothing
@@ -14,9 +23,9 @@ identity="${ST2_CLAUDE_IDENTITY:-${ST_AGENT:-}}"
 root="${CATALOG:-${ST_ROOT:-}}"
 mandatory_binding=""
 if [[ "$event" == "SessionStart" ]]; then
-  mandatory_binding="${ST2_CLAUDE_RESUME_GENERATION:-}${ST2_CLAUDE_EXPECTED_NATIVE_SESSION:-}"
+  mandatory_binding="${ST_CLAUDE_RESUME_GENERATION:-}${ST_CLAUDE_EXPECTED_NATIVE_SESSION:-}"
 fi
-runtime_id="${ST2_CLAUDE_RUNTIME_ID:-$identity}"
+runtime_id="${ST_CLAUDE_RUNTIME_ID:-$identity}"
 if [[ -z "$event" || -z "$identity" || -z "$root" ]] || ! command -v st2 >/dev/null 2>&1; then
   [[ -n "$mandatory_binding" ]] && exit 1
   exit 0

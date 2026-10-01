@@ -10,7 +10,7 @@ GitHub release is published. Each release contains:
   source commit, target, Rust compiler version, and PTY runtime revision.
 
 Each archive has `bin/st3`, `bin/st` (a relative symlink to `st3`), `bin/stui`, `bin/st3-migrate`,
-and `bin/pty`, plus `install.sh`, `BUILD.json`, and this guide. PTY is built from the exact
+and `bin/pty`, plus `install.sh`, `install-macos.py`, `BUILD.json`, and this guide. PTY is built from the exact
 `flake.lock` runtime revision; this is distinct from the `pty-core` library dependency. These
 archives need neither Nix nor Rust installed. Harness CLIs and their logins remain separate.
 
@@ -32,7 +32,7 @@ tar -xzf "$archive"
 
 Put the chosen bin directory on `PATH`. The installer stages all four tools and the `st` link,
 then replaces each by rename; existing processes retain their old executable. It does not restart
-anything, change configuration, or erase state. Keep the previous archive to roll back using the
+anything or erase state. On macOS it installs `st3` and `stui` in the fixed `~/Applications/SmallTalk.app` bundle, registers it with Launch Services, and updates existing daemon/replication LaunchAgent paths. Configure `ST_MACOS_SIGNING_IDENTITY` and optionally `ST_MACOS_SIGNING_TEAM` for persistent signing; no identity uses ad-hoc signing. A configured missing identity fails rather than falling back. See [macOS installation and signing](macos-installation.md). Keep the previous archive to roll back using the
 same procedure. A first daemon install uses `st service install`. For an existing daemon, schedule
 `st service restart` after installation and verify `st doctor --strict` and peer health. Restarting
 invalidates an ongoing continuous soak window, so coordinate that separately from downloading or

@@ -95,12 +95,12 @@ const CLASSIFIED_CODEX_THREAD_ITEMS: &[&str] = &[
     "userMessage",
     "webSearch",
 ];
-const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
-const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
-const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
-const RESIDENCY_CHECKPOINT_SCHEMA: &str = "st2.codex-residency-checkpoint.v1";
+const RUNTIME_SCHEMA: &str = "st.codex-runtime.v1";
+const BINDING_SCHEMA: &str = "st.codex-thread-binding.v1";
+const CONTROL_STATE_SCHEMA: &str = "st.codex-control-state.v1";
+const RESIDENCY_CHECKPOINT_SCHEMA: &str = "st.codex-residency-checkpoint.v1";
 const RESIDENCY_CHECKPOINT_FILE: &str = "residency-checkpoint.json";
-const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st2.codex-wrapper-diagnostic.v1";
+const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st.codex-wrapper-diagnostic.v1";
 const CONTROL_TUI_LOADED_REQUEST_ID: u64 = 0;
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
 const FIRST_DELIVERY_REQUEST_ID: u64 = 2;
@@ -231,7 +231,7 @@ pub struct CodexThreadBinding {
 impl CodexThreadBinding {
     fn new(runtime: &CodexRuntime, thread_id: String) -> Self {
         Self {
-            schema: BINDING_SCHEMA.to_string(),
+            schema: crate::contracts::schema_for_owner(&runtime.schema, BINDING_SCHEMA),
             agent: runtime.agent.clone(),
             runtime_id: runtime.runtime_id.clone(),
             runtime_incarnation: runtime.incarnation.clone(),
@@ -441,7 +441,7 @@ impl CodexObservedState {
     /// Driver-side projection into the generic observed-harness-state vocabulary (#162). `Held` is
     /// a delivery predicate — the complement of steerable — and never leaks into the published
     /// record: holds Codex positively reported as work project to `active` (with the human-blocking
-    /// ones setting the blocked axis), while holds that only mean "st2 cannot currently prove
+    /// ones setting the blocked axis), while holds that only mean "st cannot currently prove
     /// anything" project to `None`, the indeterminate observation that writes nothing.
     pub fn harness_observation(&self) -> Option<harness_state::Observation> {
         use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
@@ -563,19 +563,20 @@ impl CodexDeliveryConfig {
     fn report_protocol_rejection(&self, codex: &str, error: &anyhow::Error) {
         let Some(supervisor) = self.supervisor.as_deref() else {
             eprintln!(
-                "st2 codex: agent '{}' has no supervisor for a protocol rejection report",
+                "st codex: agent '{}' has no supervisor for a protocol rejection report",
                 self.identity
             );
             return;
         };
         let subject = format!("Codex protocol rejected: {}", self.identity);
         let body = format!(
-            "st2 rejected the installed Codex app-server protocol for agent '{}'. Native delivery did not start. Codex executable: '{}'. Error: {error:#}",
+            "st rejected the installed Codex app-server protocol for agent '{}'. Native delivery did not start. Codex executable: '{}'. Error: {error:#}",
             self.identity, codex
         );
         let mut key_hash = Sha256::new();
         key_hash.update(b"st2.codex-protocol-rejection.v1");
-        key_hash.update(body.as_bytes());
+        // Hash the original report wording so an upgrade does not publish the same failure twice.
+        key_hash.update(body.replacen("st rejected", "st2 rejected", 1).as_bytes());
         let idempotency_key = format!("st2.codex-protocol-rejection.v1:{:x}", key_hash.finalize());
         let tags = ["codex-protocol".to_string(), "launch-rejected".to_string()];
         // Both endpoints are declaration keys, never routes: this runtime names itself by exact
@@ -595,7 +596,7 @@ impl CodexDeliveryConfig {
             Ok(endpoints) => endpoints,
             Err(resolve_error) => {
                 eprintln!(
-                    "st2 codex: failed to resolve the endpoints of agent '{}' protocol rejection report: {resolve_error:#}",
+                    "st codex: failed to resolve the endpoints of agent '{}' protocol rejection report: {resolve_error:#}",
                     self.identity
                 );
                 return;
@@ -614,7 +615,7 @@ impl CodexDeliveryConfig {
             None,
         ) {
             eprintln!(
-                "st2 codex: failed to report agent '{}' protocol rejection to supervisor '{}': {report_error:#}",
+                "st codex: failed to report agent '{}' protocol rejection to supervisor '{}': {report_error:#}",
                 self.identity, supervisor
             );
         }
@@ -744,7 +745,8 @@ impl CodexInboxDelivery {
             &config.identity,
             runtime.runtime_id(),
             |thread, filename| stable_client_user_message_id(&identity, thread, filename),
-        );
+        )
+        .with_owner_schema(&runtime.schema);
         // The pty session whose liveness vouches for the record is the wrapper's task: the
         // runtime ID names the pty registry entry, and only aliases the identity on
         // driver-expanded seats — a hand-authored seat may declare a different task ID.
@@ -771,7 +773,7 @@ impl CodexInboxDelivery {
                 Ok(claimed_seq) => writer.with_ownership(runtime.incarnation(), claimed_seq),
                 Err(error) => {
                     tracing::warn!(
-                        "st2 codex: observed-state claim failed; degrading to token-only: {error:#}"
+                        "st codex: observed-state claim failed; degrading to token-only: {error:#}"
                     );
                     writer.with_session(runtime.incarnation())
                 }
@@ -792,7 +794,7 @@ impl CodexInboxDelivery {
             )),
             Err(error) => {
                 tracing::warn!(
-                    "st2 codex: harness-context writer unavailable; context stays unpublished: {error:#}"
+                    "st codex: harness-context writer unavailable; context stays unpublished: {error:#}"
                 );
                 None
             }
@@ -905,7 +907,7 @@ impl CodexInboxDelivery {
                     Ok(Some(model)) => self.timeline.remember_turn_model(turn_id, &model),
                     Ok(None) => {}
                     Err(error) => {
-                        tracing::debug!("st2 codex: bounded turn model read failed: {error:#}")
+                        tracing::debug!("st codex: bounded turn model read failed: {error:#}")
                     }
                 }
             }
@@ -914,13 +916,13 @@ impl CodexInboxDelivery {
             if let Err(error) =
                 crate::harness_timeline::observe_codex(&mut self.timeline, message, thread_id)
             {
-                tracing::warn!("st2 codex: harness-timeline write failed: {error:#}");
+                tracing::warn!("st codex: harness-timeline write failed: {error:#}");
             }
         }
         if let Some(context) = self.context.as_mut()
             && let Err(error) = context.observe(message, thread_id)
         {
-            tracing::warn!("st2 codex: harness-context write failed: {error:#}");
+            tracing::warn!("st codex: harness-context write failed: {error:#}");
         }
     }
 
@@ -942,17 +944,17 @@ impl CodexInboxDelivery {
                     && let Err(error) = context.observe_transcript(&frames, thread_id)
                 {
                     tracing::warn!(
-                        "st2 codex: transcript harness-context recovery failed: {error:#}"
+                        "st codex: transcript harness-context recovery failed: {error:#}"
                     );
                 }
                 if let Err(error) = self.accept_transcript_receipts(&frames, thread_id) {
                     tracing::warn!(
-                        "st2 codex: transcript delivery receipt recovery failed: {error:#}"
+                        "st codex: transcript delivery receipt recovery failed: {error:#}"
                     );
                 }
             }
             Err(error) => {
-                tracing::warn!("st2 codex: bounded transcript context discovery failed: {error:#}")
+                tracing::warn!("st codex: bounded transcript context discovery failed: {error:#}")
             }
             _ => {}
         }
@@ -1122,7 +1124,7 @@ impl CodexInboxDelivery {
                     codex_error_info = codex_word,
                     will_retry = will_retry,
                     reason = reason.as_str(),
-                    "st2 codex: the provider failed this turn"
+                    "st codex: the provider failed this turn"
                 );
             }
             "turn/completed" => {
@@ -1277,7 +1279,7 @@ impl CodexInboxDelivery {
         // unavailable — and the raw reason stays in tracing, so no unbounded prose reaches the
         // record. Restating it is coalesced by the publisher, so a held pass costs no write.
         if let Some(reason) = self.ledger.quarantined().map(str::to_string) {
-            tracing::warn!("st2 codex: delivery ledger is quarantined: {reason}");
+            tracing::warn!("st codex: delivery ledger is quarantined: {reason}");
             self.diagnostics.publish(
                 driver_diagnostic::Stage::Delivery,
                 driver_diagnostic::Reason::DeliveryUnavailable,
@@ -1481,7 +1483,7 @@ impl CodexInboxDelivery {
             match observed_from_thread_snapshot(message, state.thread_id(), &state.observed) {
                 Ok(observed) => observed,
                 Err(error) => {
-                    tracing::warn!("st2 codex: invalid thread/read response; retrying: {error:#}");
+                    tracing::warn!("st codex: invalid thread/read response; retrying: {error:#}");
                     self.finish_failed_snapshot(pending, state, "was invalid");
                     return Ok(true);
                 }
@@ -1499,7 +1501,7 @@ impl CodexInboxDelivery {
         reason: &str,
     ) {
         tracing::warn!(
-            "st2 codex: thread/read request {} {reason} (attempt {}/{}); delivery remains fenced until retry or bounded fallback",
+            "st codex: thread/read request {} {reason} (attempt {}/{}); delivery remains fenced until retry or bounded fallback",
             pending.request_id,
             self.snapshot_attempts,
             SNAPSHOT_REQUEST_ATTEMPTS,
@@ -1835,7 +1837,7 @@ enum SubscriptionAcceptance {
 impl CodexControlState {
     fn new(runtime: &CodexRuntime, thread_id: String) -> Self {
         Self {
-            schema: CONTROL_STATE_SCHEMA.to_string(),
+            schema: crate::contracts::schema_for_owner(&runtime.schema, CONTROL_STATE_SCHEMA),
             agent: runtime.agent.clone(),
             runtime_id: runtime.runtime_id.clone(),
             runtime_incarnation: runtime.incarnation.clone(),
@@ -3714,7 +3716,7 @@ fn record_safe_fallback(
         }),
     )?;
     eprintln!(
-        "st2 codex: declared launch arguments were rejected; booting once with known-safe flags (declared options: {})",
+        "st codex: declared launch arguments were rejected; booting once with known-safe flags (declared options: {})",
         if declared_options.is_empty() {
             "none".to_string()
         } else {
@@ -4309,8 +4311,8 @@ fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>
             "id": 0,
             "params": {
                 "clientInfo": {
-                    "name": "st2",
-                    "title": "st2",
+                    "name": "st",
+                    "title": "st",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": { "experimentalApi": true }
@@ -4652,7 +4654,7 @@ fn pump_control(
                     {
                         safe_fallback_active.store(true, Ordering::SeqCst);
                         eprintln!(
-                            "st2 codex: app-server rejected the declared resume permission policy; continuing once with the provider-safe policy"
+                            "st codex: app-server rejected the declared resume permission policy; continuing once with the provider-safe policy"
                         );
                         let _ = events.send(ControlEvent::SafeFallbackActivated {
                             cause: "resumePermissionProjectionRejected",
@@ -4676,7 +4678,7 @@ fn pump_control(
                         } else {
                             safe_fallback_active.store(true, Ordering::SeqCst);
                             eprintln!(
-                                "st2 codex: resumed thread did not report the declared permission policy; continuing in degraded provider-safe mode"
+                                "st codex: resumed thread did not report the declared permission policy; continuing in degraded provider-safe mode"
                             );
                             let _ = events.send(ControlEvent::SafeFallbackActivated {
                                 cause: "resumePermissionProjectionMismatch",
@@ -5299,14 +5301,14 @@ fn socket_path(catalog_root: &Path, identity: &str) -> Result<PathBuf> {
     let preferred = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .map(|base| base.join("st2-codex").join(format!("{key}.sock")));
+        .map(|base| base.join("st-codex").join(format!("{key}.sock")));
     if let Some(path) = preferred
         && path.as_os_str().as_bytes().len() <= SOCKET_PATH_BUDGET
     {
         return Ok(path);
     }
     let path = PathBuf::from("/tmp")
-        .join(format!("st2-{}", unsafe { libc::geteuid() }))
+        .join(format!("st-{}", unsafe { libc::geteuid() }))
         .join("codex")
         .join(format!("{key}.sock"));
     anyhow::ensure!(
@@ -5392,7 +5394,7 @@ fn load_runtime(path: &Path, agent: &str, runtime_id: &str) -> Result<CodexRunti
         fs::read(path).with_context(|| format!("reading Codex runtime {}", path.display()))?;
     let runtime: CodexRuntime = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        runtime.schema == RUNTIME_SCHEMA,
+        crate::contracts::schema_matches(&runtime.schema, RUNTIME_SCHEMA),
         "unsupported Codex runtime schema"
     );
     anyhow::ensure!(
@@ -5430,7 +5432,7 @@ fn load_current_control_state(
     };
     let state: CodexControlState = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        state.schema == CONTROL_STATE_SCHEMA,
+        crate::contracts::schema_matches(&state.schema, CONTROL_STATE_SCHEMA),
         "unsupported Codex control-state schema"
     );
     anyhow::ensure!(
@@ -5477,7 +5479,7 @@ pub fn checkpoint_residency(
     let binding = load_current_binding(&state_dir.join("binding.json"), &runtime)?
         .with_context(|| format!("Codex runtime {runtime_id:?} has no native thread binding"))?;
     let checkpoint = CodexResidencyCheckpoint {
-        schema: RESIDENCY_CHECKPOINT_SCHEMA.to_owned(),
+        schema: crate::contracts::schema_for_owner(&runtime.schema, RESIDENCY_CHECKPOINT_SCHEMA),
         source_generation,
         resume_generation,
         binding,
@@ -5546,7 +5548,7 @@ fn load_residency_checkpoint(
         .with_context(|| format!("reading Codex residency checkpoint {}", path.display()))?;
     let checkpoint: CodexResidencyCheckpoint = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        checkpoint.schema == RESIDENCY_CHECKPOINT_SCHEMA,
+        crate::contracts::schema_matches(&checkpoint.schema, RESIDENCY_CHECKPOINT_SCHEMA),
         "unsupported Codex residency checkpoint schema"
     );
     anyhow::ensure!(
@@ -5555,7 +5557,7 @@ fn load_residency_checkpoint(
         "Codex residency checkpoint belongs to a different generation"
     );
     anyhow::ensure!(
-        checkpoint.binding.schema == BINDING_SCHEMA
+        crate::contracts::schema_matches(&checkpoint.binding.schema, BINDING_SCHEMA)
             && checkpoint.binding.agent == agent
             && checkpoint.binding.runtime_id == runtime_id,
         "Codex residency checkpoint belongs to a different agent runtime"
@@ -5580,7 +5582,7 @@ fn load_thread_binding(
     };
     let binding: CodexThreadBinding = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        binding.schema == BINDING_SCHEMA,
+        crate::contracts::schema_matches(&binding.schema, BINDING_SCHEMA),
         "unsupported Codex binding schema"
     );
     anyhow::ensure!(

@@ -1,8 +1,9 @@
 # st data authority
 
-This document classifies each SQLite table in schema version 13.
+This document classifies each SQLite table in schema version 15.
 
-Schema version 13 upgrades schema versions 10, 11, and 12 in place.
+Schema version 15 upgrades schema versions 10 through 14 in place. Document bindings gain a
+shared canonical `binding_key` and an index; existing keys are backfilled once from claims.
 
 The claim log and immutable blobs are the durable graph authority.
 
@@ -43,7 +44,7 @@ queries subtract the last rollup before a period from the last rollup inside it.
 
 ```toml
 [observations.otlp]
-endpoint = "http://127.0.0.1:4318"             # OTLP/HTTP; logs go to /v1/logs
+endpoint = "http://127.0.0.1:4318"             # OTLP/HTTP JSON base URL
 headers_file = "/absolute/path/otlp-headers.toml" # optional, for example x-api-key = "..."
 ```
 
@@ -52,10 +53,25 @@ Each local observation becomes one OTLP log record in OTLP/HTTP JSON:
 - the record's timestamp is the observation time, and its body holds the fields;
 - its attributes are `st3.subject`, `st3.kind`, `st3.actor`, `st3.incarnation_id` and
   `st3.local_id`;
-- the resource names `service.name = st3` and `st3.node`.
+- the resource names `service.name = st` and `st3.node`; the scope is `st.observations`.
+
+Claude event hooks submit `harness.telemetry` observations to their local daemon. They retain
+the counter recorded at the shared hook's actual application point, bounded warning/error logs,
+operation times and the hook exit code. No collector or SDK exporter runs in a hook. Submission
+is best effort with a 250 ms daemon deadline and cannot change the hook result. The timer-driven
+status line stays local-only; an undeclared application produces no invocation count. Driver
+diagnostics and native session/resume binding keep their existing state and diagnostic paths.
+
+The daemon exports the captured warnings as correlated log records, `hook_invocations_total`
+as monotonic delta points on `/v1/metrics`, and one `st.hook.claude-observe` operation span on
+`/v1/traces`. Metric labels remain the bounded hook/event vocabulary; subject and incarnation
+identities appear only in logs and spans. Span IDs are stable when a batch is retried. Collector
+configuration lives in `[observations.otlp]`; `OTEL_EXPORTER_OTLP_*` in a native seat no longer
+controls an exporter in its hooks. The legacy st2 product's exporter remains separately testable.
 
 The exporter keeps its cursor in `meta` and moves it only after the collector accepts a batch of
-at most 512 observations, so delivery is at least once. A collector that is down delays export
+at most 512 observations, including every log/metric/trace request that batch needs. Delivery is
+at least once: partial acceptance can repeat logs, delta points or spans on retry. A collector that is down delays export
 with backoff up to five minutes and never blocks a write. Observations trimmed before export are
 counted in the daemon log.
 

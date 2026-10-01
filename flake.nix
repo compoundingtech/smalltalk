@@ -825,7 +825,7 @@
               hash = "sha256-ATysqeRVcLEeqPuz+LnjJ0NpNrNiiAZAtZ+f4qz93sk=";
             };
           in
-          pkgs.runCommand "st2-pi-extension-types-${version}" {
+          pkgs.runCommand "st-pi-extension-types-${version}" {
             nativeBuildInputs = [
               pkgs.gnutar
               pkgs.nodejs
@@ -880,6 +880,7 @@
                 --outfile=hooks/typecheck/smoke-out/st-$harness-channel.mjs
               ${pkgs.nodejs}/bin/node hooks/typecheck/st-smoke.mjs $harness hooks/typecheck/smoke-out/st-$harness-channel.mjs
             done
+            ${pkgs.nodejs}/bin/node hooks/typecheck/environment-smoke.mjs
             touch $out
           '';
 

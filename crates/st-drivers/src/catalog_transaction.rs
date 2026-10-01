@@ -16,15 +16,15 @@ use sha2::{Digest as _, Sha256};
 
 use crate::catalog_lock::{APPLY_MARKER, CONTROL_DIR, CatalogLock};
 
-const SNAPSHOT_SCHEMA: &str = "st2.catalog-snapshot.v1";
-const DIFF_SCHEMA: &str = "st2.catalog-diff.v1";
-const BOOTSTRAP_SCHEMA: &str = "st2.catalog-bootstrap.v1";
-const APPLY_SCHEMA: &str = "st2.catalog-apply.v1";
-const MARKER_SCHEMA: &str = "st2.catalog-apply-incomplete.v1";
-const RAW_SNAPSHOT_SCHEMA: &str = "st2.catalog-raw-preimage-snapshot.v1";
-const RAW_APPLY_SCHEMA: &str = "st2.catalog-raw-preimage-apply.v1";
-const RAW_MARKER_SCHEMA: &str = "st2.catalog-raw-preimage-apply-incomplete.v1";
-const DIGEST_SCHEMA: &str = "st2.catalog-digest.v1";
+const SNAPSHOT_SCHEMA: &str = "st.catalog-snapshot.v1";
+const DIFF_SCHEMA: &str = "st.catalog-diff.v1";
+const BOOTSTRAP_SCHEMA: &str = "st.catalog-bootstrap.v1";
+const APPLY_SCHEMA: &str = "st.catalog-apply.v1";
+const MARKER_SCHEMA: &str = "st.catalog-apply-incomplete.v1";
+const RAW_SNAPSHOT_SCHEMA: &str = "st.catalog-raw-preimage-snapshot.v1";
+const RAW_APPLY_SCHEMA: &str = "st.catalog-raw-preimage-apply.v1";
+const RAW_MARKER_SCHEMA: &str = "st.catalog-raw-preimage-apply-incomplete.v1";
+const DIGEST_SCHEMA: &str = "st.catalog-digest.v1";
 const HASH_DOMAIN: &[u8] = b"st2.catalog-declaration-root.v1\0";
 const RAW_HASH_DOMAIN: &[u8] = b"st2.catalog-raw-preimage-root.v1\0";
 const STAGE_PREFIX: &str = "catalog-apply-stage-";
@@ -1597,7 +1597,8 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
                     marker.prepared_root_sha256,
                     staged.root_sha256
                 );
-                let raw_preimage = marker.schema == RAW_MARKER_SCHEMA;
+                let raw_preimage =
+                    crate::contracts::schema_matches(&marker.schema, RAW_MARKER_SCHEMA);
                 (
                     None,
                     marker.expected_root_sha256.clone(),
@@ -2928,7 +2929,8 @@ fn read_marker_optional(path: &Path) -> Result<Option<ApplyMarker>> {
 
 fn validate_marker(marker: &ApplyMarker) -> Result<()> {
     anyhow::ensure!(
-        matches!(marker.schema.as_str(), MARKER_SCHEMA | RAW_MARKER_SCHEMA),
+        crate::contracts::schema_matches(&marker.schema, MARKER_SCHEMA)
+            || crate::contracts::schema_matches(&marker.schema, RAW_MARKER_SCHEMA),
         "unsupported catalog apply marker schema '{}'",
         marker.schema
     );

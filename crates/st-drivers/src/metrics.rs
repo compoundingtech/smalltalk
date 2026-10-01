@@ -1,15 +1,17 @@
-//! RED-minimal metric set for st2, per the interview Q5 decision recorded in
+//! Shared RED metric set, per the interview Q5 decision recorded in
 //! `docs/vrs/06-observability/open-questions.md`.
 //!
 //! Every label value comes from a bounded enum (`result`, `driver`, hook registry name +
 //! normalized event); identifiers never become metric labels — those live in span attributes.
 //!
-//! Zero-overhead no-op unless a real meter provider is installed by
+//! Recording is allocation-free unless a real meter provider is installed by
 //! [`crate::telemetry::Telemetry::init`]: every record function checks [`enabled`] first and
 //! returns before touching any instrument or allocating a label string. With no provider
 //! installed, `opentelemetry::global` hands out a silent no-op meter anyway — this early-out
-//! just keeps the disabled case allocation-free.
+//! just keeps the disabled case allocation-free. An explicitly scoped invocation capture
+//! records the hook's application point for st's daemon exporter without an SDK provider.
 
+use std::cell::RefCell;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -19,6 +21,34 @@ use opentelemetry::metrics::{Counter, Histogram, Meter};
 
 use crate::driver_diagnostic::{Driver, Reason, Source, Stage, Support};
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// An invocation at the shared hook's application point. A caller can collect these without
+/// installing an SDK provider, then hand them to its own asynchronous telemetry pipeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookInvocation {
+    pub hook: &'static str,
+    pub event: &'static str,
+}
+
+thread_local! {
+    static HOOK_INVOCATIONS_CAPTURE: RefCell<Option<Vec<HookInvocation>>> = const { RefCell::new(None) };
+}
+
+/// Capture only this thread's invocations, restoring an enclosing capture even during unwind.
+pub fn capture_hook_invocations<T>(run: impl FnOnce() -> T) -> (T, Vec<HookInvocation>) {
+    struct Restore(Option<Vec<HookInvocation>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HOOK_INVOCATIONS_CAPTURE.with(|capture| capture.replace(self.0.take()));
+        }
+    }
+    let restore =
+        Restore(HOOK_INVOCATIONS_CAPTURE.with(|capture| capture.replace(Some(Vec::new()))));
+    let result = run();
+    let invocations = HOOK_INVOCATIONS_CAPTURE.with(|capture| capture.take().unwrap_or_default());
+    drop(restore);
+    (result, invocations)
+}
 
 /// Whether a real meter provider is installed. False → recording is a free no-op.
 pub fn enabled() -> bool {
@@ -30,7 +60,7 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("st2"));
+static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("st"));
 
 static RECONCILE_PASSES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -152,6 +182,18 @@ pub fn record_task_reap(driver: &'static str) {
 /// One lifecycle-hook invocation reached its single in-process application point.
 /// Unknown event names collapse to `other` so the label stays bounded.
 pub fn record_hook_invocation(hook: &'static str, event: &str) {
+    HOOK_INVOCATIONS_CAPTURE.with(|capture| {
+        if let Some(invocations) = capture
+            .borrow_mut()
+            .as_mut()
+            .filter(|invocations| invocations.len() < 16)
+        {
+            invocations.push(HookInvocation {
+                hook,
+                event: normalize_hook_event(event),
+            });
+        }
+    });
     if !enabled() {
         return;
     }
@@ -262,7 +304,8 @@ fn normalize_resource_observe_outcome(outcome: &str) -> &'static str {
 }
 
 /// The bounded Claude hook-event vocabulary st2 applies; anything else is `other`.
-fn normalize_hook_event(event: &str) -> &'static str {
+/// The bounded event vocabulary shared by SDK instruments and st's observation exporter.
+pub fn normalize_hook_event(event: &str) -> &'static str {
     match event {
         "SessionStart" => "SessionStart",
         "UserPromptSubmit" => "UserPromptSubmit",
@@ -282,6 +325,62 @@ fn normalize_hook_event(event: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_invocations_preserve_the_application_point_and_bounded_vocabulary() {
+        let ((), outer) = capture_hook_invocations(|| {
+            record_hook_invocation("claude-observe", "SessionStart");
+            let ((), inner) = capture_hook_invocations(|| {
+                record_hook_invocation("claude-observe", "new-event");
+            });
+            assert_eq!(
+                inner,
+                vec![HookInvocation {
+                    hook: "claude-observe",
+                    event: "other"
+                }]
+            );
+            let other_thread = std::thread::spawn(|| {
+                record_hook_invocation("claude-observe", "Stop");
+            });
+            other_thread.join().unwrap();
+            record_hook_invocation("claude-observe", "PreToolUse");
+        });
+        assert_eq!(
+            outer,
+            vec![
+                HookInvocation {
+                    hook: "claude-observe",
+                    event: "SessionStart"
+                },
+                HookInvocation {
+                    hook: "claude-observe",
+                    event: "PreToolUse"
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scoped_invocations_restore_their_enclosing_capture_during_unwind() {
+        let ((), outer) = capture_hook_invocations(|| {
+            let panic = std::panic::catch_unwind(|| {
+                capture_hook_invocations(|| {
+                    record_hook_invocation("claude-observe", "Stop");
+                    panic!("example capture fault");
+                });
+            });
+            assert!(panic.is_err());
+            record_hook_invocation("claude-observe", "PostToolUse");
+        });
+        assert_eq!(
+            outer,
+            vec![HookInvocation {
+                hook: "claude-observe",
+                event: "PostToolUse"
+            }]
+        );
+    }
 
     #[test]
     fn disabled_by_default_and_recording_is_a_no_op() {
