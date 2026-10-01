@@ -214,7 +214,7 @@ fn display(identity: &BuildIdentity, now: u64) -> String {
 
 /// `commit_ts` (unix seconds) relative to `now`, coarse-grained. `None` when the
 /// timestamp is unknown (0) or in the future.
-fn relative_time(commit_ts: u64, now: u64) -> Option<String> {
+pub(crate) fn relative_time(commit_ts: u64, now: u64) -> Option<String> {
     if commit_ts == 0 || now < commit_ts {
         return None;
     }
