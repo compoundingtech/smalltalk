@@ -914,7 +914,7 @@ impl ClientSession {
             authority_actor: person.into(),
             transport: "unix",
             scopes: if person.starts_with("agent/") {
-                ["read.projections", "control.work"]
+                ["read.projections", "control.work", "control.missions"]
                     .into_iter()
                     .map(str::to_owned)
                     .collect()
@@ -6909,6 +6909,7 @@ async fn dispatch_action(
             if request.fence.mission_generation.as_deref() != Some(current.generation.as_str()) {
                 return Err(stale("the mission generation fence is stale"));
             }
+            require_agent_mission_authority(state, authority_actor, "cancel", &current.mission)?;
             let reason = p
                 .get("reason")
                 .and_then(Value::as_str)
@@ -7269,8 +7270,9 @@ pub(super) async fn action(
         && !session.authority_actor.starts_with("person/")
         && !(session.transport == "unix"
             && session.authority_actor.starts_with("agent/")
-            && request.action_type.starts_with("work.")
-            && request.action_type != "work.done")
+            && ((request.action_type.starts_with("work.")
+                && request.action_type != "work.done")
+                || request.action_type == "mission.cancel"))
     {
         return Err(forbidden(
             "client mutations require explicit concrete person authority",

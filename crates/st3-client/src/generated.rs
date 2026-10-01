@@ -755,7 +755,7 @@ pub struct AgentDelivery {
     #[serde(default)]
     pub transport: Option<String>,
 }
-/// The missions an agent may publish, start, and revise, and where that authority comes from:
+/// The missions an agent may publish, start, revise, and cancel, and where that authority comes from:
 /// `declared` (its `mission-authority`), `default` (a person-declared top-level seat
 /// `fleet/PROJECT/...` holds `fleet/PROJECT/*`), or `none`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -767,6 +767,8 @@ pub struct AgentMissionAuthority {
     pub start: Vec<String>,
     #[serde(default)]
     pub revise: Vec<String>,
+    #[serde(default)]
+    pub cancel: Vec<String>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

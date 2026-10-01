@@ -624,12 +624,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["source"],
-      "description": "Missions the agent may publish, start, and revise. Patterns are exact mission IDs or terminal `/*` namespaces without `mission/`.",
+      "description": "Missions the agent may publish, start, revise, and cancel. Patterns are exact mission IDs or terminal `/*` namespaces without `mission/`.",
       "properties": {
         "source": { "enum": ["declared", "default", "none"], "description": "`declared`: the declaration's `mission-authority`. `default`: a person-declared top-level seat `fleet/PROJECT/...` holds `fleet/PROJECT/*`. `none`: neither." },
         "publish": { "type": "array", "items": { "type": "string" } },
         "start": { "type": "array", "items": { "type": "string" } },
-        "revise": { "type": "array", "items": { "type": "string" } }
+        "revise": { "type": "array", "items": { "type": "string" } },
+        "cancel": { "type": "array", "items": { "type": "string" } }
       }
     },
     "AgentDelivery": {

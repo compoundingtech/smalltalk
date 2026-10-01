@@ -522,6 +522,8 @@ pub struct MissionAuthority {
     pub start: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revise: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancel: Vec<String>,
 }
 
 impl MissionAuthority {
@@ -530,6 +532,7 @@ impl MissionAuthority {
             "publish" => &self.publish,
             "start" => &self.start,
             "revise" => &self.revise,
+            "cancel" => &self.cancel,
             _ => return false,
         };
         patterns
@@ -593,6 +596,29 @@ impl SeatAuthority {
             .iter()
             .any(|pattern| authority_pattern_matches(pattern, seat))
     }
+}
+
+/// Agent declarations a seat may apply (including starting and stopping them).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentAuthority {
+    pub apply: Vec<String>,
+}
+
+impl AgentAuthority {
+    pub fn allows_apply(&self, agent: &str) -> bool {
+        let agent = agent.strip_prefix("agent/").unwrap_or(agent);
+        self.apply
+            .iter()
+            .any(|pattern| authority_pattern_matches(pattern, agent))
+    }
+}
+
+/// Whether every ID covered by `requested` is also covered by `held`.
+pub fn authority_pattern_contains(held: &str, requested: &str) -> bool {
+    held == requested
+        || held
+            .strip_suffix("/*")
+            .is_some_and(|prefix| requested.starts_with(&format!("{prefix}/")))
 }
 
 /// An authority pattern is an exact ID or a terminal `/*` namespace.
