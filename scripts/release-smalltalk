@@ -79,7 +79,7 @@ tar -C "$work" -czf "$archive" "$package"
 mkdir "$work/extracted"
 tar -C "$work/extracted" -xzf "$archive"
 mkdir -p "$work/install-home"
-HOME="$work/install-home" ST_MACOS_APP_PATH="$work/installed/SmallTalk.app" \
+ST_MACOS_INSTALL_HOME="$work/install-home" ST_MACOS_APP_PATH="$work/installed/SmallTalk.app" \
   "$work/extracted/$package/install.sh" --bin-dir "$work/installed"
 "$work/installed/st3" --help >/dev/null
 "$work/installed/st" --help >/dev/null

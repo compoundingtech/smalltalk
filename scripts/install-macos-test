@@ -179,6 +179,22 @@ class Installer(unittest.TestCase):
             m.restore(self.home, second_job, had_app)
             self.assertEqual({name: m.sha(path) for name, path in m.binaries(m.fixed(self.home)).items()}, first)
 
+    def test_explicit_installation_home_isolates_plists_and_locks(self):
+        service = self.home / 'Library/LaunchAgents' / (m.SERVICES[0] + '.plist')
+        service.parent.mkdir(parents=True)
+        service.write_bytes(plistlib.dumps({'ProgramArguments': ['previous-st3', 'daemon', '--socket', 'keep.sock']}))
+        argv = ['install-macos', '--from', str(self.source), '--home', str(self.home), '--job', str(self.job)]
+        with patch.object(sys, 'argv', argv), \
+                patch.object(Path, 'home', side_effect=AssertionError('must not use real user home')), \
+                patch.object(m, 'command', side_effect=self.command), \
+                patch.object(m, 'exchange', side_effect=self.exchange), \
+                contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+        self.assertTrue(m.fixed(self.home).is_dir())
+        self.assertEqual(plistlib.loads(service.read_bytes())['ProgramArguments'],
+                         [str(m.binaries(m.fixed(self.home))['st3']), 'daemon', '--socket', 'keep.sock'])
+        self.assertTrue(list((self.home / '.local/state/st3/macos-installs').glob('*.lock')))
+
     def test_both_wrappers_delegate_macos_tools_without_replacing_the_links(self):
         repo = Path(__file__).resolve().parent.parent
         fakebin = self.home / 'fakebin'; fakebin.mkdir()

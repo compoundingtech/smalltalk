@@ -258,6 +258,8 @@ def main():
     global CERTIFICATE, TEAM, APP, BIN_DIR, IDENTIFIER
     parser = argparse.ArgumentParser(description='Install macOS tools as a fixed signed app without restarting services.')
     parser.add_argument('--from', dest='source', type=Path)
+    parser.add_argument('--home', type=Path, default=os.environ.get('ST_MACOS_INSTALL_HOME'),
+                        help='installation home for isolated staging/tests (default: user home)')
     parser.add_argument('--bin-dir', default=BIN_DIR)
     parser.add_argument('--app', default=APP)
     parser.add_argument('--identity', default=CERTIFICATE)
@@ -272,7 +274,7 @@ def main():
     modes.add_argument('--restore-app', action='store_true')
     args = parser.parse_args()
     CERTIFICATE, TEAM, APP, BIN_DIR, IDENTIFIER = args.identity or None, args.team_id or None, args.app, args.bin_dir, args.identifier
-    home = Path.home()
+    home = args.home.expanduser().absolute() if args.home is not None else Path.home()
     lock_root = home / '.local/state/st3/macos-installs'
     lock_root.mkdir(parents=True, exist_ok=True)
     with open(lock_root / (hashlib.sha256(str(fixed(home)).encode()).hexdigest() + '.lock'), 'a') as lock:

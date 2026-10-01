@@ -46,7 +46,9 @@ filesystem. The installer keeps the prior app, CLI links/files and service plist
 
 Automation can use the helper's explicit transaction modes (`--prepare-only`,
 `--backup-only`, `--install-app APP`, `--verify-app APP`, `--restore-app`) with a
-persistent `--job DIRECTORY`. Back up before `--install-app`, and keep the directory
+persistent `--job DIRECTORY`. Isolated staging/tests can set `--home DIRECTORY`
+(or `ST_MACOS_INSTALL_HOME`) so app metadata, service plists and locks stay outside
+the real user installation. Back up before `--install-app`, and keep the directory
 until deployment health checks pass. Artifact verification/install with a configured full
 certificate fingerprint checks the embedded signature without requiring its private key
 on the receiving machine. Building/signing a candidate still requires the explicitly
