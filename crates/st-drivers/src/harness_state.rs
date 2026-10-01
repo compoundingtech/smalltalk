@@ -32,7 +32,7 @@ pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// Maximum accepted positive difference between the writer's UTC clock and the reader's clock.
 pub const HARNESS_STATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 
-const SCHEMA: &str = "st2.harness-state.v1";
+const SCHEMA: &str = "st.harness-state.v1";
 /// The claim-sequence floor sidecar, beside the record: claims stay monotonic even across a
 /// record this version cannot parse.
 const SEQ_FLOOR_NAME: &str = ".harness-state.seq";
@@ -399,7 +399,7 @@ impl Writer {
         // supersedes an unsupported schema.
         if on_disk
             .as_ref()
-            .is_some_and(|current| current.schema != SCHEMA)
+            .is_some_and(|current| !crate::contracts::schema_matches(&current.schema, SCHEMA))
         {
             return Ok(false);
         }
@@ -411,9 +411,10 @@ impl Writer {
         // replaces it wholesale (one logical owner per record), continuing the counter for
         // byte-distinctness. Timestamps deliberately play no part: a same-millisecond takeover
         // and a lingering predecessor writer are both real and both ambiguous by clock.
-        let own_record = on_disk
-            .as_ref()
-            .filter(|current| current.schema == SCHEMA && current.incarnation == self.session);
+        let own_record = on_disk.as_ref().filter(|current| {
+            crate::contracts::schema_matches(&current.schema, SCHEMA)
+                && current.incarnation == self.session
+        });
         if skip_if_ended
             && own_record.is_some_and(|current| {
                 // Only a REAL terminal record from this session suppresses queued live frames:
@@ -467,7 +468,7 @@ impl Writer {
             ),
         };
         let record = Record {
-            schema: SCHEMA.to_string(),
+            schema: own_record.map_or_else(|| SCHEMA.to_owned(), |current| current.schema.clone()),
             agent: self.agent.clone(),
             harness: self.harness.to_string(),
             state: observation.state,
@@ -505,7 +506,7 @@ impl Writer {
         // lingering predecessor re-stamping its successor's record would keep a dead seat's
         // state alive for cross-host readers, and a successor re-stamping a predecessor's would
         // resurrect history. Token equality decides, in both directions.
-        if current.schema != SCHEMA
+        if !crate::contracts::schema_matches(&current.schema, SCHEMA)
             || current.state == Activity::Ended
             || current.incarnation != self.session
         {
@@ -621,7 +622,7 @@ fn read_raw_at(
     let harness = Some(record.harness.clone());
     // The discriminator gates interpretation: a future schema's words may be spelled like this
     // version's while meaning something else, so nothing definite may be derived from them.
-    if record.schema != SCHEMA {
+    if !crate::contracts::schema_matches(&record.schema, SCHEMA) {
         return Observed::indeterminate("unsupported-schema", harness);
     }
     if record.written_at_ms > now_ms {
@@ -798,7 +799,9 @@ pub(crate) fn with_current_ownership<T>(
     let _lock = lock_exclusive(&agent_dir.join(LOCK_NAME))?;
     let current = read_record(&path).context("current harness ownership record is unavailable")?;
     anyhow::ensure!(
-        current.schema == SCHEMA && current.incarnation == incarnation && current.seq == seq,
+        crate::contracts::schema_matches(&current.schema, SCHEMA)
+            && current.incarnation == incarnation
+            && current.seq == seq,
         "harness ownership was superseded"
     );
     action()
@@ -833,7 +836,13 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     let now_ms = crate::message::now_ms();
     let written_at_ms = next_stamp(on_disk.as_deref(), now_ms);
     let record = Record {
-        schema: SCHEMA.to_string(),
+        schema: on_disk
+            .as_ref()
+            .filter(|record| {
+                crate::contracts::schema_matches(&record.schema, SCHEMA)
+                    && record.incarnation == token
+            })
+            .map_or_else(|| SCHEMA.to_owned(), |record| record.schema.clone()),
         agent: writer.agent.clone(),
         harness: writer.harness.to_string(),
         state: Activity::Ended,
@@ -867,7 +876,7 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
         && let Err(error) = crate::harness_context::remove(agent_dir)
     {
         tracing::warn!(
-            "st2 harness-state: clearing the harness-context record for {} failed: {error}",
+            "st harness-state: clearing the harness-context record for {} failed: {error}",
             agent_dir.display()
         );
     }
@@ -896,7 +905,7 @@ fn persist_floor(record_path: &Path, seq: u64) {
         crate::fsatomic::Durability::Rename,
     ) {
         tracing::warn!(
-            "st2 harness-state: writing the sequence floor {} failed: {error}",
+            "st harness-state: writing the sequence floor {} failed: {error}",
             floor_path.display()
         );
     }

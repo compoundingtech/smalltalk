@@ -312,14 +312,11 @@ pub fn read_presence(agent_dir: &Path) -> Option<ChannelPresence> {
 }
 
 fn st3_initialized_writer(agent_dir: &Path, identity: &str) -> Option<Writer> {
-    let runtime_id = std::env::var(crate::claude_session::RUNTIME_ID_ENV)
-        .ok()
+    let runtime_id = crate::contracts::env(crate::claude_session::RUNTIME_ID_ENV)
         .filter(|value| !value.is_empty())?;
-    let session = std::env::var(crate::claude_session::SESSION_ENV)
-        .ok()
+    let session = crate::contracts::env(crate::claude_session::SESSION_ENV)
         .filter(|value| !value.is_empty())?;
-    let seq = std::env::var(crate::claude_session::SESSION_SEQ_ENV)
-        .ok()?
+    let seq = crate::contracts::env(crate::claude_session::SESSION_SEQ_ENV)?
         .parse::<u64>()
         .ok()?;
     Some(initialized_writer(

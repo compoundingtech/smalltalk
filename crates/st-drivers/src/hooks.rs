@@ -1205,7 +1205,7 @@ mod tests {
                 .env("ST_AGENT", "h.worker")
                 .env("CATALOG", temp.path());
             if mandatory {
-                command.env("ST2_CLAUDE_RESUME_GENERATION", "2");
+                command.env("ST_CLAUDE_RESUME_GENERATION", "2");
             }
             command.status().unwrap()
         };

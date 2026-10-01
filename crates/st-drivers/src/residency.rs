@@ -11,7 +11,7 @@ use agent_spec::{AgentDesiredState, ResidencyPolicy, SessionDriver};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-pub const LEDGER_SCHEMA: &str = "st2.residency-ledger.v1";
+pub const LEDGER_SCHEMA: &str = "st.residency-ledger.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation(pub u64);
@@ -166,7 +166,7 @@ impl Ledger {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.schema != LEDGER_SCHEMA {
+        if !crate::contracts::schema_matches(&self.schema, LEDGER_SCHEMA) {
             return Err(ValidationError::UnsupportedSchema(self.schema.clone()));
         }
         if self.agent_id.is_empty() {
@@ -580,7 +580,9 @@ pub fn load(
 
 pub fn store(path: &Path, ledger: &Ledger) -> Result<(), LoadError> {
     ledger.validate().map_err(LoadError::Invalid)?;
-    atomic_json(path, ledger).map_err(LoadError::Io)
+    let mut current = ledger.clone();
+    current.schema = LEDGER_SCHEMA.to_owned();
+    atomic_json(path, &current).map_err(LoadError::Io)
 }
 
 pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {

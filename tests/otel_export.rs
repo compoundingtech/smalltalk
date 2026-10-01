@@ -154,7 +154,7 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
     let all_spans: Vec<serde_json::Value> = traces.lines().flat_map(span_records).collect();
     let reconcile_spans: Vec<&serde_json::Value> = all_spans
         .iter()
-        .filter(|span| span["name"].as_str() == Some("st2.reconcile_pass"))
+        .filter(|span| span["name"].as_str() == Some("st.reconcile_pass"))
         .collect();
     assert_eq!(
         reconcile_spans.len(),
@@ -162,8 +162,8 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
         "one invocation must export exactly one reconcile pass span:\n{traces}"
     );
     assert!(
-        traces.contains("st2-cli"),
-        "service.name st2-cli missing from capture:\n{traces}"
+        traces.contains("st-cli"),
+        "service.name st-cli missing from capture:\n{traces}"
     );
     let reconcile_span = reconcile_spans[0];
 
@@ -181,11 +181,11 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
         .as_str()
         .expect("reconcile root traceId");
     let expected_children = [
-        ("st2.catalog.lock", "shared"),
-        ("st2.catalog.discover", "catalog"),
-        ("st2.catalog.materialize", "catalog"),
-        ("st2.runtime.observe", "all sessions"),
-        ("st2.reconcile.execute", "apply plan"),
+        ("st.catalog.lock", "shared"),
+        ("st.catalog.discover", "catalog"),
+        ("st.catalog.materialize", "catalog"),
+        ("st.runtime.observe", "all sessions"),
+        ("st.reconcile.execute", "apply plan"),
     ];
     let children: Vec<&serde_json::Value> = all_spans
         .iter()
@@ -210,7 +210,7 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
         assert_eq!(
             child["parentSpanId"].as_str(),
             Some(root_span_id),
-            "{name} must be parented directly to st2.reconcile_pass:\n{child}"
+            "{name} must be parented directly to st.reconcile_pass:\n{child}"
         );
         assert_eq!(
             child["traceId"].as_str(),

@@ -52,7 +52,7 @@ pub(crate) fn reap_detached(child: std::process::Child) {
             // Thread-spawn exhaustion is the only failure mode; panicking here surfaces it at the
             // call site instead of silently leaking unreaped children.
             std::thread::Builder::new()
-                .name("st2-child-reaper".to_string())
+                .name("st-child-reaper".to_string())
                 .spawn(move || {
                     for mut child in receiver {
                         let _ = child.wait();
@@ -266,7 +266,7 @@ pub(super) fn run_captured(
     for (stream, name) in [(&stdout_stream, "stdout"), (&stderr_stream, "stderr")] {
         if stream.truncated() {
             eprintln!(
-                "st2: truncated {name} capture of `{program}`: keeping last {} of {} bytes (cap {CAPTURE_CAP_BYTES})",
+                "st: truncated {name} capture of `{program}`: keeping last {} of {} bytes (cap {CAPTURE_CAP_BYTES})",
                 stream.bytes.len(),
                 stream.total,
             );

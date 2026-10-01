@@ -27,11 +27,11 @@ use crate::catalog_lock::CONTROL_DIR;
 use crate::catalog_transaction::sync_dir;
 use crate::run::Runner as _;
 
-pub const ARCHIVE_SCHEMA: &str = "st2.catalog-archive.v1";
-pub const UNARCHIVE_SCHEMA: &str = "st2.catalog-unarchive.v1";
-pub const TOMBSTONE_SCHEMA: &str = "st2.catalog-archive-tombstone.v1";
-pub const RETIRED_LEDGER_SCHEMA: &str = "st2.catalog-retired-observed.v1";
-pub const DIRECT_DEAD_LEDGER_SCHEMA: &str = "st2.catalog-direct-dead-observed.v1";
+pub const ARCHIVE_SCHEMA: &str = "st.catalog-archive.v1";
+pub const UNARCHIVE_SCHEMA: &str = "st.catalog-unarchive.v1";
+pub const TOMBSTONE_SCHEMA: &str = "st.catalog-archive-tombstone.v1";
+pub const RETIRED_LEDGER_SCHEMA: &str = "st.catalog-retired-observed.v1";
+pub const DIRECT_DEAD_LEDGER_SCHEMA: &str = "st.catalog-direct-dead-observed.v1";
 
 /// Archive root child of the catalog control directory.
 const ARCHIVE_DIR: &str = "archive";
@@ -1096,7 +1096,10 @@ fn read_ledger(catalog: &Path, ledger: &Ledger) -> ObservationLedger {
         return empty();
     };
     match serde_json::from_slice::<ObservationLedger>(&body) {
-        Ok(read) if read.schema == ledger.schema => read,
+        Ok(mut read) if crate::contracts::schema_matches(&read.schema, ledger.schema) => {
+            read.schema = ledger.schema.to_owned();
+            read
+        }
         _ => empty(),
     }
 }
@@ -1236,7 +1239,7 @@ fn read_tombstone(path: &Path) -> Result<Option<Tombstone>> {
         fs::read(path).with_context(|| format!("read archive tombstone {}", path.display()))?;
     let tombstone: Tombstone = serde_json::from_slice(&bytes).context("parse archive tombstone")?;
     anyhow::ensure!(
-        tombstone.schema == TOMBSTONE_SCHEMA,
+        crate::contracts::schema_matches(&tombstone.schema, TOMBSTONE_SCHEMA),
         "unknown archive tombstone schema '{}'",
         tombstone.schema
     );
