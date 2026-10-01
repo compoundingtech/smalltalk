@@ -4,7 +4,8 @@
 #
 #   ST_ISOLATION_ARCHIVE    nextest archive of st2's integration test binary and the st2 binary
 #   ST_ISOLATION_WORKSPACE  the checkout the archive was built in; the test binary's compiled-in
-#                           st2 path lies below it, so the archive is extracted at the same path
+#                           st2 path lies below it, so the archive is extracted at the same path.
+#                           nextest also requires the workspace manifest there.
 #   ST_ISOLATION_TIMINGS    JSON file that receives the boot and test durations
 #
 # The VM compiles nothing. KVM is required; there is no emulation fallback.
@@ -18,6 +19,7 @@ let
       --archive-file /tmp/isolation.tar.zst \
       --workspace-remap "$1" \
       --extract-to "$1" \
+      --extract-overwrite \
       --no-tests=fail \
       -E 'package(=st2) and binary(=integration) and test(/^transport_isolation::/)'
   '';
@@ -58,6 +60,7 @@ pkgs.testers.runNixOSTest {
 
     machine.copy_from_host(archive, "/tmp/isolation.tar.zst")
     machine.succeed(f"mkdir -p {workspace} && chown ${user} {workspace}")
+    machine.copy_from_host(f"{workspace}/Cargo.toml", f"{workspace}/Cargo.toml")
     # A transient service of the user's own manager: the tests start their scopes inside the
     # user's delegated cgroup subtree, as st2 does under a fleet seat.
     started = time.monotonic()
