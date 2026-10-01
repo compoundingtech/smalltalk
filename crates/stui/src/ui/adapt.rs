@@ -511,6 +511,11 @@ fn agents(model: &Model) -> Vec<Agent> {
                 ("failed", _) => AgentState::Fault,
                 ("running", Some("working")) => AgentState::Working,
                 ("running", _) => AgentState::Idle,
+                ("waiting", Some("ready" | "working" | "idle"))
+                    if agent.blocked_on.as_deref() == Some("human") =>
+                {
+                    AgentState::NeedsYou
+                }
                 ("waiting", Some("unauthenticated" | "blocked")) => AgentState::NeedsYou,
                 ("waiting" | "starting" | "desired", _) => AgentState::Starting,
                 ("stopped", _) => AgentState::Stopped,
@@ -2398,6 +2403,25 @@ mod tests {
                 assert_eq!(missions[0].word, Word::Working, "{state}");
             }
         }
+    }
+
+    #[test]
+    fn a_waiting_human_ask_needs_you_even_while_the_harness_activity_is_working() {
+        let mut model = Model::default();
+        let resource = |state: &str, activity: &str, blocked_on: Option<&str>| serde_json::json!({
+            "id": "agent/human-omp", "kind": "agent", "revision": "r1",
+            "updated_at": "2026-09-30T12:00:00Z", "name": "human-omp",
+            "state": state, "reachability": "local", "harness_state": activity,
+            "blocked_on": blocked_on, "runtime_ids": [], "under": [],
+        });
+        model.agents = window(vec![resource("waiting", "working", Some("human"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::NeedsYou);
+        model.agents = window(vec![resource("running", "working", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::Working);
+        model.agents = window(vec![resource("failed", "working", Some("human"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Fault);
+        model.agents = window(vec![resource("waiting", "indeterminate", Some("human"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::Starting);
     }
 
     #[test]
