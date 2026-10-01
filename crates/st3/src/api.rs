@@ -5164,7 +5164,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         Ok(replication) if !replication.configured => checks.push(DoctorCheck {
             name: "replication".into(),
             status: "pass".into(),
-            message: "this node is intentionally local-only".into(),
+            message: if state.state_dir.join("left-fleet.json").is_file() {
+                "this node is intentionally local-only after leaving its fleet".into()
+            } else {
+                "no fleet is configured; use st fleet create or st fleet join to connect this node"
+                    .into()
+            },
         }),
         Ok(replication) => {
             let unavailable = replication
@@ -11976,6 +11981,37 @@ mod tests {
             native_session_home: None,
             planner_default: PlannerSpec::default(),
         }
+    }
+
+    #[test]
+    fn doctor_distinguishes_no_fleet_from_explicitly_leaving_a_fleet() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let replication_check = || {
+            doctor_report(&state)
+                .unwrap()
+                .0
+                .checks
+                .into_iter()
+                .find(|check| check.name == "replication")
+                .unwrap()
+        };
+        let check = replication_check();
+        assert_eq!(check.status, "pass");
+        assert!(check.message.contains("no fleet is configured"));
+        assert!(check.message.contains("st fleet create"));
+        assert!(check.message.contains("st fleet join"));
+        assert!(!check.message.contains("intentionally"));
+
+        fs::write(
+            root.path().join("left-fleet.json"),
+            r#"{"fleet_id":"previous-fleet","offline":true,"confirmed_by":null}"#,
+        )
+        .unwrap();
+        let check = replication_check();
+        assert_eq!(check.status, "pass");
+        assert!(check.message.contains("intentionally local-only"));
+        assert!(check.message.contains("after leaving its fleet"));
     }
 
     #[tokio::test]

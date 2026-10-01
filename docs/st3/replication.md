@@ -1,6 +1,9 @@
 # st fleet replication
 
 Fleet replication is optional. A node outside a fleet is a complete local-only st system.
+`st doctor` reports this default as `pass` with “no fleet is configured” and points to
+`st fleet create` or `st fleet join`. It reports “intentionally local-only after leaving its
+fleet” only when `st fleet leave` has recorded that explicit decision in `left-fleet.json`.
 
 A laptop running only stui can instead be a [paired client device](client-only.md), with no daemon
 or replica. Devices read and act through a member's client gateway and are not sync peers.
