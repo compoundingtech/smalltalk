@@ -7,10 +7,10 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
-use st2::exec_backend::ExecBackend;
-use st2::host_lock::process_alive;
-use st2::reconcile::{TaskLaunch, TaskTarget};
-use st2::spec::TaskKind;
+use st_drivers::exec_backend::ExecBackend;
+use st_drivers::host_lock::process_alive;
+use st_drivers::reconcile::{TaskLaunch, TaskTarget};
+use st_drivers::spec::TaskKind;
 
 fn exec_target(id: &str, command: &str) -> TaskTarget {
     TaskTarget {

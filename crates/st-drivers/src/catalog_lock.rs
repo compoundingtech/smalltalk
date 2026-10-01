@@ -349,7 +349,8 @@ impl CatalogLock {
         &self.root
     }
 
-    pub(crate) fn begin_generation_commit(&self) -> Result<GenerationCommit<'_>> {
+    #[doc(hidden)]
+    pub fn begin_generation_commit(&self) -> Result<GenerationCommit<'_>> {
         let control = crate::catalog_transaction::retained_dir_path(&self.control)?;
         let intent = control.join(GENERATION_INTENT_FILE);
         let mut file = OpenOptions::new()
@@ -366,7 +367,8 @@ impl CatalogLock {
         Ok(GenerationCommit { lock: self })
     }
 
-    pub(crate) fn control(&self) -> &File {
+    #[doc(hidden)]
+    pub fn control(&self) -> &File {
         &self.control
     }
 
@@ -405,12 +407,14 @@ fn test_lock_held_checkpoint() {
 #[cfg(not(debug_assertions))]
 fn test_lock_held_checkpoint() {}
 
-pub(crate) struct GenerationCommit<'a> {
+#[doc(hidden)]
+pub struct GenerationCommit<'a> {
     lock: &'a CatalogLock,
 }
 
 impl GenerationCommit<'_> {
-    pub(crate) fn commit(self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn commit(self) -> Result<()> {
         #[cfg(debug_assertions)]
         if std::env::var_os("ST2_TEST_GENERATION_FAIL_AFTER_COMMIT").is_some() {
             anyhow::bail!("injected post-commit generation failure");
