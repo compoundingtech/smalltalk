@@ -250,6 +250,13 @@ const idleProof = (ctx: ExtensionContext): boolean => {
   }
 };
 
+// Managed seats show `label[short]`. The launcher exports the persona short code; the
+// declared name may carry terminal control characters, which never reach the title.
+const seatLabel = (label: string): string => {
+  const short = process.env.AGENT_PERSONA_SHORT?.trim();
+  return (short ? `${label}[${short}]` : label).replace(/\p{Cc}/gu, "");
+};
+
 export default function (pi: ExtensionAPI) {
   const state = stash();
   const applyLabel = async (ctx: ExtensionContext) => {
@@ -404,8 +411,7 @@ export default function (pi: ExtensionAPI) {
           const seat = frame.seat;
           const label = seat.desired?.display_name ?? seat.member?.display_name ?? seat.subject?.replace(/^agent\//u, "");
           if (typeof label === "string") {
-            const persona = seat.member?.tags?.persona;
-            state.label = persona ? `${label} [${persona}]` : label;
+            state.label = seatLabel(label);
             await applyLabel(ctx);
           }
           return;
