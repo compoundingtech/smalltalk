@@ -401,6 +401,54 @@ await pause(1500);
 assert.ok(sessionMessages.some(({ message }) => message.content === "late seat context"));
 fs.rmSync(delayedHelloPath, { force: true });
 
+// omp loads this extension into every in-process subagent, as a second instance sharing the
+// process-wide stash (compoundingtech/smalltalk#852). A subagent's lifecycle must leave the seat's
+// channel alone: no channel of its own, no frames from its turns, and its shutdown does not close
+// the seat's channel. Mail that arrives afterwards still reaches the top-level session.
+const subHandlers = new Map();
+const subHandedOver = [];
+mod.default({
+  on: (name, handler) => subHandlers.set(name, handler),
+  sendUserMessage: (content) => subHandedOver.push(content),
+  sendMessage: () => {},
+});
+const subCtx = {
+  ...fullCtx,
+  isIdle: () => false,
+  agent: { kind: "sub", id: "0-Review", name: "task", depth: 1, parentId: "Main" },
+  sessionManager: { getSessionId: () => "session-subagent", getEntries: () => [] },
+};
+const pidsBeforeSubagent = fs.readFileSync(pidPath, "utf8");
+const framesBeforeSubagent = readFrames().length;
+await subHandlers.get("session_start")({}, subCtx);
+await subHandlers.get("agent_start")({}, subCtx);
+await subHandlers.get("tool_call")({ toolName: "bash", toolCallId: "sub-call", input: {} }, subCtx);
+await subHandlers.get("message_end")(messageEvent, subCtx);
+await subHandlers.get("agent_end")(successfulEnd, subCtx);
+await subHandlers.get("session_shutdown")({}, subCtx);
+await pause(300);
+assert.strictEqual(fs.readFileSync(pidPath, "utf8"), pidsBeforeSubagent, "a subagent opens no channel");
+assert.deepStrictEqual(readFrames().slice(framesBeforeSubagent), [], "a subagent's events reach no channel");
+// Still mid-turn from the subagent's point of view; the seat's session is idle, so mail goes now.
+fs.appendFileSync(outboxPath, JSON.stringify({
+  type: "message",
+  deliverAs: "steer",
+  content: "after a subagent",
+  meta: { messageId: "message/after-subagent" },
+}) + "\n");
+await pause(300);
+assert.deepStrictEqual(handedOver.at(-1), { content: "after a subagent" }, "the seat's session gets the mail");
+assert.deepStrictEqual(subHandedOver, [], "the subagent never gets the seat's mail");
+assert.ok(acknowledged().includes("message/after-subagent"));
+// The top-level session names itself `main` on omp 18.3.2 and later; its events still flow.
+const mainCtx = { ...fullCtx, agent: { kind: "main", id: "Main", name: "main", depth: 0 } };
+const framesBeforeMain = readFrames().length;
+await handlers.get("agent_start")({}, mainCtx);
+await pause(50);
+assert.deepStrictEqual(readFrames().slice(framesBeforeMain), [{ type: "state", state: "active" }]);
+await handlers.get("agent_end")(successfulEnd, mainCtx);
+fs.rmSync(outboxPath, { force: true });
+
 // `session_shutdown` has no reason field upstream and always denotes process exit. Closing must
 // make a later observational frame a no-op.
 const beforeShutdown = readFrames().filter((frame) => frame.type === "state").length;

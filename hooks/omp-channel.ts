@@ -246,6 +246,29 @@ const idleProof = (ctx: ExtensionContext): boolean => {
   }
 };
 
+/**
+ * Whether an event comes from a subagent session rather than the seat's own.
+ *
+ * omp loads this extension into every in-process subagent it starts (the `task` tool, eval
+ * `agent()`, `/tan` clones), and each copy shares the process-wide stash. A subagent that ran the
+ * lifecycle below would close the seat's channel and rebind it to itself: the seat's mail is then
+ * delivered into the subagent, its turns drive the seat's observed state, and the channel dies
+ * with the subagent (compoundingtech/smalltalk#852). So the channel belongs to the top-level
+ * session alone, and a subagent's events are ignored entirely.
+ *
+ * omp names the running agent as `ctx.agent.kind` since 18.3.2; omp says to check it, not
+ * `depth`, because a `/tan` clone is a subagent at depth 0. The pinned pi typings do not declare
+ * it, hence the widened read. An omp without it reads as top-level, the behaviour before the
+ * field existed.
+ */
+const isSubagentSession = (ctx: ExtensionContext | undefined): boolean => {
+  try {
+    return (ctx as { agent?: { kind?: unknown } } | undefined)?.agent?.kind === "sub";
+  } catch {
+    return false;
+  }
+};
+
 export default function (pi: ExtensionAPI) {
   const state = stash();
   const { bin, catalog, identity, runtimeId, session, seq } = state;
@@ -714,15 +737,29 @@ export default function (pi: ExtensionAPI) {
     if (typeof total === "number" && Number.isFinite(total)) state.lastCostUsd = total;
   };
 
+  // Every handler is registered through `on`, which drops a subagent session's events before they
+  // touch the process-wide channel state (see `isSubagentSession`). The pinned pi typings do not
+  // know omp's extra events, so this is also the widened view of `pi.on`.
+  const widenedOn = pi.on.bind(pi) as unknown as (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
+  ) => void;
+  const on = (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
+  ) =>
+    widenedOn(event, (payload, ctx) =>
+      isSubagentSession(ctx) ? undefined : handler(payload, ctx));
+
   // Registered only now that every helper above is initialized: a use-before-declaration in this
   // file is the defect class that once shipped green through the type gate.
-  pi.on("agent_start", async () => {
+  on("agent_start", async () => {
     cancelSettle();
     state.running = true;
     toolCallsInFlight().clear();
     sendFrame({ type: "state", state: "active" });
   });
-  pi.on("agent_end", async (event, ctx) => {
+  on("agent_end", async (event, ctx) => {
     captureCost(event);
     sendContext(ctx);
     const end = event as AgentEndFrame;
@@ -754,14 +791,10 @@ export default function (pi: ExtensionAPI) {
     watchSettle(ctx);
   });
 
-  const onWidened = pi.on.bind(pi) as unknown as (
-    event: string,
-    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
-  ) => void;
   // The finest boundary that carries a fresh reading. Turn-boundary-only observation was measured
   // at 92% of pre-compaction warnings missed, because the wedge case is a single long turn.
   for (const name of ["message_end", "turn_end"]) {
-    onWidened(name, async (event, ctx) => {
+    on(name, async (event, ctx) => {
       captureCost(event);
       sendContext(ctx);
       if (name === "message_end") sendTimeline(name, event);
@@ -774,7 +807,7 @@ export default function (pi: ExtensionAPI) {
   // one would be a claim no capture supports. Unlike pi, omp's `getContextUsage()` still answers
   // inside this handler (8,100 measured, not null), so the frame carries a real post-compaction
   // reading alongside the durable count.
-  onWidened("session_compact", async (_event, ctx) => {
+  on("session_compact", async (_event, ctx) => {
     sendContext(ctx, { trigger: null, count: durableCompactions(ctx) });
   });
 
@@ -808,7 +841,7 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   };
 
-  onWidened("tool_call", async (rawEvent) => {
+  on("tool_call", async (rawEvent) => {
     // Pinned pi declarations do not know OMP's tool events; the handler validates fields below.
     const event = rawEvent as ToolCallFrame;
     sendTimeline("tool_call", rawEvent);
@@ -828,7 +861,7 @@ export default function (pi: ExtensionAPI) {
       reason: question,
     });
   });
-  onWidened("tool_result", async (rawEvent, ctx) => {
+  on("tool_result", async (rawEvent, ctx) => {
     const event = rawEvent as ToolResultFrame;
     sendTimeline("tool_result", rawEvent);
     if (typeof event.toolCallId === "string") {
@@ -856,7 +889,7 @@ export default function (pi: ExtensionAPI) {
   // Approval events are an independent human-blocking surface. omp's pinned pi typings do not
   // declare them, so register through the same widened `on` view.
   type ApprovalFrame = { toolName?: unknown };
-  onWidened("tool_approval_requested", async (rawEvent) => {
+  on("tool_approval_requested", async (rawEvent) => {
     if (state.pendingAskToolCallId) return;
     const event = rawEvent as ApprovalFrame;
     const tool = typeof event.toolName === "string" ? event.toolName : "unknown";
@@ -869,7 +902,7 @@ export default function (pi: ExtensionAPI) {
       reason: tool,
     });
   });
-  onWidened("tool_approval_resolved", async (_event, ctx) => {
+  on("tool_approval_resolved", async (_event, ctx) => {
     if (state.pendingAskToolCallId) return;
     if (idleProof(ctx)) {
       sendFrame({ type: "state", state: "idle" });
@@ -879,13 +912,13 @@ export default function (pi: ExtensionAPI) {
     watchSettle(ctx);
   });
 
-  onWidened("session_before_compact", async () => {
+  on("session_before_compact", async () => {
     // Rust owns the durable context path and the write-if-blank policy. The extension carries only
     // the observed edge, so it cannot accidentally overwrite authored state itself.
     sendFrame({ type: "pre_compact" });
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  on("session_start", async (_event, ctx) => {
     // Awaited before the session's first turn, which is what makes restored context reach the boot
     // prompt rather than the turn after it.
     const restored = await open(ctx);
@@ -911,7 +944,7 @@ export default function (pi: ExtensionAPI) {
   // Upstream's `session_shutdown` payload has no reason: source defines it as process exit only.
   // Replacement is a separate session-switch lifecycle and remains handled by `open()` closing
   // the named predecessor.
-  pi.on("session_shutdown", async () => {
+  on("session_shutdown", async () => {
     state.shuttingDown = true;
     if (state.reconnectTimer !== undefined) clearTimeout(state.reconnectTimer);
     state.reconnectTimer = undefined;
