@@ -67,7 +67,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Mount Rust and Nix caches
+      - name: Mount Rust and CI caches
         id: cache
         if: runner.os == 'Linux'
         uses: namespacelabs/nscloud-cache-action@v1
@@ -75,7 +75,7 @@ jobs:
           cache: rust
           path: |
             ${{ github.workspace }}/target
-            /nix
+            ~/.cache/st-ci
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -91,7 +91,7 @@ jobs:
       - name: Isolate test home and XDG state
         run: |
           # The cached Cargo registry lives under the real HOME; tests get the isolated one.
-          printf 'CARGO_HOME=%s\n' "${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CARGO_HOME:-$HOME/.cargo}" "$HOME/.cache/st-ci" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
@@ -143,7 +143,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Mount Rust and Nix caches
+      - name: Mount Rust and CI caches
         id: cache
         if: runner.os == 'Linux'
         uses: namespacelabs/nscloud-cache-action@v1
@@ -151,7 +151,7 @@ jobs:
           cache: rust
           path: |
             ${{ github.workspace }}/target
-            /nix
+            ~/.cache/st-ci
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -167,7 +167,7 @@ jobs:
       - name: Isolate test home and XDG state
         run: |
           # The cached Cargo registry lives under the real HOME; tests get the isolated one.
-          printf 'CARGO_HOME=%s\n' "${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CARGO_HOME:-$HOME/.cargo}" "$HOME/.cache/st-ci" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
@@ -205,7 +205,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Mount Rust and Nix caches
+      - name: Mount Rust and CI caches
         id: cache
         if: runner.os == 'Linux'
         uses: namespacelabs/nscloud-cache-action@v1
@@ -213,7 +213,7 @@ jobs:
           cache: rust
           path: |
             ${{ github.workspace }}/target
-            /nix
+            ~/.cache/st-ci
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -229,7 +229,7 @@ jobs:
       - name: Isolate test home and XDG state
         run: |
           # The cached Cargo registry lives under the real HOME; tests get the isolated one.
-          printf 'CARGO_HOME=%s\n' "${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CARGO_HOME:-$HOME/.cargo}" "$HOME/.cache/st-ci" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"

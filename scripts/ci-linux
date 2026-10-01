@@ -10,11 +10,28 @@ mkdir -p "$logs"
 fleet_compat() {
   local baseline
   baseline=$(jq -er .commit .github/fleet-compat-baseline.json) || return
-  # The pinned baseline never changes, so its Nix output stays in the cached /nix store: it is
-  # built once and every later run finds it there.
+  # The pinned baseline never changes. Its closure is exported once into the cache volume, keyed on
+  # the baseline commit, and imported before the build: Nix then finds the output already valid and
+  # builds nothing. (/nix itself cannot be cached; see .github/workflows/workspace-ci.ts.)
+  local archive=""
+  if [ -n "${CI_CACHE_DIR:-}" ]; then
+    mkdir -p "$CI_CACHE_DIR"
+    archive="$CI_CACHE_DIR/fleet-compat-baseline-$baseline.nar"
+    if [ -s "$archive" ]; then
+      echo "baseline cache hit: importing $archive"
+      nix-store --import < "$archive" > /dev/null || echo "baseline import failed; building it" >&2
+    else
+      echo "baseline cache miss: building the pinned baseline"
+    fi
+  fi
   BASELINE="$baseline" nix build --impure --out-link "$RUNNER_TEMP/baseline" --print-build-logs --expr '
     ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
       .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })' || return
+  if [ -n "$archive" ] && [ ! -s "$archive" ]; then
+    # shellcheck disable=SC2046
+    nix-store --export $(nix-store --query --requisites "$RUNNER_TEMP/baseline") > "$archive.tmp" \
+      && mv "$archive.tmp" "$archive"
+  fi
   export ST3_COMPAT_BIN="$RUNNER_TEMP/baseline/bin/st3"
   test -x "$ST3_COMPAT_BIN" || return
   if "$ST3_COMPAT_BIN" fleet --help > /dev/null 2>&1; then
