@@ -13,6 +13,9 @@ pub struct Target<H = crate::PaneIntent> {
 pub struct Doc<H = crate::PaneIntent> {
     pub lines: Vec<Line<'static>>,
     pub targets: Vec<Target<H>>,
+    /// Canonical messages whose body occupies these document lines. A client acknowledges only
+    /// spans that intersect its rendered viewport, never a fetched page or a message header.
+    pub messages: Vec<(String, std::ops::Range<usize>)>,
 }
 
 impl<H> Doc<H> {
@@ -34,6 +37,12 @@ impl<H> Doc<H> {
     /// Append another document, shifting its lines and targets.
     pub fn append(&mut self, other: Doc<H>, indent: u16) {
         let base = self.lines.len();
+        self.messages.extend(
+            other
+                .messages
+                .into_iter()
+                .map(|(id, range)| (id, range.start + base..range.end + base)),
+        );
         for target in other.targets {
             self.targets.push(Target {
                 line: base + target.line,
@@ -59,6 +68,7 @@ impl<H> Default for Doc<H> {
         Self {
             lines: Vec::new(),
             targets: Vec::new(),
+            messages: Vec::new(),
         }
     }
 }
