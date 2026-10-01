@@ -910,7 +910,7 @@ impl Ui {
             );
             return;
         }
-        let hints: Vec<(&str, &str)> = if self.terminal.is_some() && self.tab == 1 {
+        let hints: Vec<(&str, &str)> = if self.terminal_focused() {
             vec![
                 ("ctrl+\\", "return"),
                 ("keys", "go to the agent"),
@@ -1673,23 +1673,15 @@ impl Ui {
                 && !agent.unmanaged
                 && self.composing(&agent.id)
             {
-                let label = " ■ stop · ctrl+c ";
+                let label = " working · ctrl+c twice stops it ";
                 buf.set_stringn(
                     area.x + 2,
                     y,
                     label,
                     area.width.saturating_sub(4) as usize,
-                    theme::strong(theme::RED),
+                    theme::dim(),
                 );
-                self.hit(
-                    Rect {
-                        x: area.x + 2,
-                        y,
-                        width: text::width(label) as u16,
-                        height: 1,
-                    },
-                    Hit::Key('S'),
-                );
+                // Not clickable: it sits where a click focuses the box (Nathan, 2026-10-01).
             }
             // How fresh the conversation is, on the rule above the box: st pushes changes to
             // the conversations on screen, and one that is not followed says so.
@@ -1901,7 +1893,7 @@ impl Ui {
             buf.set_stringn(
                 area.x,
                 area.y + 1,
-                " Not attached. Enter attaches the terminal; Ctrl+\\ leaves it.",
+                " Not attached. Ctrl+] attaches the terminal; Ctrl+\\ leaves it.",
                 area.width as usize,
                 theme::dim(),
             );
@@ -2236,8 +2228,8 @@ impl Ui {
         if self.glass_key(key) {
             return;
         }
-        // An attached terminal gets every key first, Ctrl-C included.
-        if self.terminal.is_some() && self.tab == 1 {
+        // A focused, attached terminal gets every key first, Ctrl-C included.
+        if self.terminal_focused() {
             let control = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 // Terminals send Ctrl+\\ as 0x1c, which crossterm reports as Ctrl+4.
@@ -2409,7 +2401,12 @@ impl Ui {
         }
         if let Some(action) = self.confirm {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
+                // Enter is how a message is sent; it never confirms stopping an agent.
+                KeyCode::Char('y') => {
+                    self.confirm = None;
+                    self.act(action);
+                }
+                KeyCode::Enter if action != 's' => {
                     self.confirm = None;
                     self.act(action);
                 }
@@ -2475,7 +2472,13 @@ impl Ui {
                     "Grouped view · t for the tree"
                 });
             }
-            KeyCode::Enter if self.tab == 1 => self.open_terminal(),
+            // Ctrl+] attaches the agent's terminal, beside Ctrl+\ that leaves it; terminals send
+            // it as 0x1d, which crossterm reports as Ctrl+5. Enter was too easy to hit by mistake.
+            KeyCode::Char(']' | '5')
+                if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.open_terminal()
+            }
             KeyCode::Char('n') if self.tab == 1 => self.open_new_agent(None),
             KeyCode::Char('n') if self.tab == 2 => {
                 self.new_mission = Some((Default::default(), 0));
@@ -2672,7 +2675,8 @@ impl Ui {
             if self.focused_pane() == Some(Pane::Terminal(agent.id.clone())) {
                 self.attach_terminal(&agent.id);
             } else {
-                self.open_in_glass(Pane::Terminal(agent.id), glass::Open::Tab);
+                self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab);
+                self.attach_terminal(&agent.id);
             }
             return;
         }
@@ -3123,7 +3127,7 @@ impl Ui {
 
     /// The agent whose conversation is shown, by name, while it is working.
     fn working_agent(&self) -> Option<String> {
-        if self.tab != 1 || self.agent_form || self.terminal.is_some() {
+        if self.tab != 1 || self.agent_form || self.terminal_focused() {
             return None;
         }
         let id = self.selected_id()?;
@@ -4519,10 +4523,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_an_agents_terminal_and_ctrl_backslash_returns() {
+    fn ctrl_bracket_opens_an_agents_terminal_and_ctrl_backslash_returns() {
         let mut ui = Ui::new(demo::world());
         ui.tab = 1;
         press(&mut ui, KeyCode::Enter);
+        assert!(ui.terminal.is_none(), "Enter alone never attaches");
+        ui.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
         assert!(ui.terminal.is_some());
         let screen = frame(&ui, 120, 30).join("\n");
         assert!(screen.contains("Return"), "{screen}");
