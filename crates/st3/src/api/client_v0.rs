@@ -53,9 +53,12 @@ const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
 /// read together; a new subscription is still read at once.
 const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
+// Observer grace periods and checkpoint waits can enter attention without a new claim.
+const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
+    if collection == "glasses" { return !kind.starts_with("glass."); }
     matches!(kind, "daemon.diagnostic" | "transport.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
@@ -94,7 +97,7 @@ async fn collection_items(
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
-        "missions" | "attention" | "agents" | "work"
+        "missions" | "attention" | "agents" | "work" | "glasses"
     ) {
         return Err(validation("unknown collection subscription"));
     }
@@ -105,7 +108,12 @@ async fn collection_items(
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
         return Err(validation("collection limit must be 1 through 200"));
     }
-    let person = if request.collection == "attention" {
+    let person = if request.collection == "glasses" {
+        if request.person.is_some() || request.actor.is_some() {
+            return Err(validation("glasses select the session person"));
+        }
+        Some(glass_person(session, false)?)
+    } else if request.collection == "attention" {
         person_filter(session, request.person.as_deref())?
     } else {
         None
@@ -123,10 +131,14 @@ async fn collection_items(
                 "missions" => {
                     let mut ids =
                         store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
-                    let has_more = ids.len() > limit;
+                    let mut has_more = ids.len() > limit;
                     ids.truncate(limit);
-                    let items = mission_resources_filtered(&store, index, false, None, Some(&ids))?;
+                    let mut items = mission_list_cards(&store, &ids)?;
+                    has_more |= bound_mission_cards(&mut items)?;
                     return Ok((snapshot, items, has_more));
+                }
+                "glasses" => {
+                    store.glasses(person.as_deref().expect("authenticated glass owner"), index)?
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
                 "agents" => client_agent_resources(&store, false, &at, index)?,
@@ -416,15 +428,15 @@ async fn follow_conversation(
     let failed = |error: ApiError| json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
     loop {
         // The cursor first, so nothing that lands while the page is read is lost.
-        let start =
-            match conversation_changes_value(&state, &session, &session_id, remote, None, 0).await
-            {
-                Ok(start) => start,
-                Err(error) => {
-                    let _ = outbox.send((id.clone(), failed(error)));
-                    return;
-                }
-            };
+        let start = match conversation_changes_value(&state, &session, &session_id, remote, None, 0)
+            .await
+        {
+            Ok(start) => start,
+            Err(error) => {
+                let _ = outbox.send((id.clone(), failed(error)));
+                return;
+            }
+        };
         let page = match conversation_page(&state, &session, &session_id, remote).await {
             Ok(page) => page,
             Err(error) => {
@@ -435,7 +447,9 @@ async fn follow_conversation(
         let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":true, "items":page["items"], "has_more":page["page"]["has_more"]});
         // A page of long tool output can outgrow one frame: keep its newest entries.
         while frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
-            let Some(items) = frame["items"].as_array_mut().filter(|items| items.len() > 1)
+            let Some(items) = frame["items"]
+                .as_array_mut()
+                .filter(|items| items.len() > 1)
             else {
                 break;
             };
@@ -521,6 +535,8 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
     // The commits already weighed for a reread, whether one is due, and when the last ran.
+    let mut attention_clock = tokio::time::interval(ATTENTION_CLOCK_INTERVAL);
+    attention_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
@@ -605,7 +621,8 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
                 let index = state.store.index().unwrap_or(weighed);
                 if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
-                    reread_due |= claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                    let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
+                    reread_due |= glasses_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
                         claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
                     });
                     weighed = index;
@@ -615,6 +632,9 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
             }
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
                 refresh.extend(subscriptions.keys().cloned());
+            }
+            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "attention") => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "attention").map(|(id, _)| id.clone()));
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -671,6 +691,47 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
 }
 
 #[derive(Deserialize)]
+pub(super) struct AgentDeclarationQuery {
+    revision: Option<String>,
+    #[serde(default)]
+    show_env_values: bool,
+}
+
+/// Both redacted and explicit environment-value reads require declaration scope.
+pub(super) async fn agent_declaration(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<AgentDeclarationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.declarations")?;
+    let subject = format!("agent/{}", id.trim_start_matches("agent/"));
+    let lookup_subject = subject.clone();
+    let store = state.store.clone();
+    let revision = query.revision;
+    let (declaration, revisions) = blocking_store(move || {
+        let declaration = store.agent_declaration(&lookup_subject, revision.as_deref())?;
+        let revisions = store.agent_declaration_revisions(&lookup_subject)?;
+        Ok((declaration, revisions))
+    })
+    .await?;
+    let Some((revision, mut tree)) = declaration else {
+        return Err(ApiError::not_found("managed agent declaration not found"));
+    };
+    if !query.show_env_values {
+        crate::graph::redact_agent_env_values(&mut tree);
+    }
+    let kdl = crate::graph::render_agent_desired_kdl(&tree).map_err(ApiError::bad)?;
+    Ok(Json(json!({
+        "id": subject,
+        "revision": revision,
+        "tree": tree,
+        "kdl": kdl,
+        "revisions": revisions,
+    })))
+}
+
+#[derive(Deserialize)]
 pub(super) struct ClientDocumentQuery {
     name: String,
 }
@@ -702,8 +763,86 @@ pub(super) async fn document_get(
     Ok(Json(json!({ "reference": query.name, "bytes": bytes })))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SubjectDefinitionQuery {
+    subject: String,
+    #[serde(default)]
+    show_env_values: bool,
+}
+
+/// One agent's applied definition, reconstructed from its selected desired claim, not authored
+/// source. Missions are published as compiled revisions and keep no canonical declaration AST.
+/// Environment values are redacted unless the caller asks for them and holds declaration scope.
+pub(super) async fn subject_definition(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<SubjectDefinitionQuery>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "read.projections")?;
+    if query.show_env_values {
+        require_scope(&session, "read.declarations")?;
+    }
+    if !query.subject.starts_with("agent/") {
+        return Err(ApiError::bad(St3Error::new(
+            "validation-failed",
+            "a definition subject must start with `agent/`; missions are published revisions \
+             without a canonical declaration",
+        )));
+    }
+    let subject = query.subject.clone();
+    let show_env_values = query.show_env_values;
+    let result = blocking_store(move || {
+        let store = state.store.clone();
+        store.read_snapshot(|index| {
+            let status = store.status_at(Some(&subject), None, Some(index))?;
+            let Some(status) = status.subjects.into_iter().find(|item| item.subject == subject)
+            else {
+                return Ok(None);
+            };
+            let Some(mut desired) = status.desired else {
+                return Ok(None);
+            };
+            if !show_env_values {
+                crate::graph::redact_agent_env_values(&mut desired);
+            }
+            let kdl = crate::graph::render_agent_desired_kdl(&desired)?;
+            let revision = status.desired_revision
+                .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired revision"))?;
+            let token = status.desired_token
+                .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired token"))?;
+            let value = json!({
+                "kind": "subject-definition",
+                "subject": subject,
+                "desired": desired,
+                "kdl": kdl,
+                "desired_revision": revision,
+                "desired_token": token,
+                "conflicts": status.conflicts,
+            });
+            Ok(Some((client_snapshot_at(&state, index), value)))
+        })
+    }).await?;
+    let (snapshot, value) = result.ok_or_else(|| ApiError::not_found(
+        format!("subject `{}` has no applied definition", query.subject),
+    ))?;
+    // Reserve space for the snapshot and response envelope. Definitions are never truncated.
+    if serde_json::to_vec(&value).map_err(ApiError::internal)?.len()
+        > CLIENT_MAX_RESPONSE_BYTES - 4096
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "validation-failed",
+            "the applied definition exceeds the client response limit",
+        )));
+    }
+    Ok((Extension(snapshot), Json(value)))
+}
+
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
+    "read.declarations",
+    "read.glasses",
+    "control.glasses",
     "terminal.read",
     "terminal.control",
     "control.attention",
@@ -716,6 +855,8 @@ const ALL_SCOPES: &[&str] = &[
 ];
 const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "read.projections",
+    "read.glasses",
+    "control.glasses",
     "terminal.read",
     "control.attention",
     "control.launches",
@@ -739,6 +880,9 @@ const ACTIONS: &[&str] = &[
     "mission.cancel-revision",
     "mission.cancel",
     "session.import",
+    "work.ask",
+    "work.done",
+    "work.cancel-ask",
     "work.claim",
     "work.renew",
     "work.progress",
@@ -765,7 +909,6 @@ const ACTIONS: &[&str] = &[
     "pairing.revoke",
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
-    "attention.resolve",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -782,6 +925,9 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "mission.cancel-revision",
     "mission.cancel",
     "session.import",
+    "work.ask",
+    "work.done",
+    "work.cancel-ask",
     "work.claim",
     "work.renew",
     "work.progress",
@@ -820,10 +966,11 @@ pub(super) struct ClientSession {
 impl ClientSession {
     fn local(person: Option<&str>) -> Result<Self, ApiError> {
         if person.is_some_and(|person| {
-            !person.starts_with("person/") || person.matches('/').count() != 1
+            !(person.starts_with("person/") && person.matches('/').count() == 1
+                || person.starts_with("agent/"))
         }) {
             return Err(forbidden(
-                "the trusted Unix client must identify one concrete person",
+                "the trusted Unix client must identify one concrete person or agent",
             ));
         }
         let Some(person) = person else {
@@ -841,7 +988,14 @@ impl ClientSession {
             actor: person.into(),
             authority_actor: person.into(),
             transport: "unix",
-            scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
+            scopes: if person.starts_with("agent/") {
+                ["read.projections", "control.work", "control.missions"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            } else {
+                ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect()
+            },
         })
     }
 
@@ -860,7 +1014,9 @@ impl ClientSession {
 }
 
 fn session_claim_actor(session: &ClientSession) -> String {
-    if session.authority_actor.starts_with("person/") {
+    if session.authority_actor.starts_with("person/")
+        || session.authority_actor.starts_with("agent/")
+    {
         session.authority_actor.clone()
     } else {
         "requester".into()
@@ -878,11 +1034,16 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"glasses", "version":0, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
-        } else if session.allows(scope) {
+        } else if session.allows(scope)
+            && !(session.authority_actor.starts_with("agent/")
+                && scope == "control.missions"
+                && *action != "mission.cancel")
+        {
             "granted"
         } else {
             "ungranted"
@@ -1018,7 +1179,13 @@ pub(super) fn authenticate(
         scopes,
     };
     if request.method() == axum::http::Method::GET {
-        let scope = if request.uri().path().starts_with("/v1/client/terminals/") {
+        let scope = if request
+            .uri()
+            .path()
+            .starts_with("/v1/client/agent-declarations/")
+        {
+            "read.declarations"
+        } else if request.uri().path().starts_with("/v1/client/terminals/") {
             "terminal.read"
         } else {
             "read.projections"
@@ -1104,6 +1271,102 @@ pub(super) fn mission_resources(
     selected_id: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     mission_resources_filtered(store, snapshot_index, history, selected_id, None)
+}
+
+/// Collection cards keep only three run headers, regardless of a mission's history size.
+/// Full run and step detail stays on the detail endpoint.
+fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value>> {
+    let attention = store.human_attention_runs()?;
+    let definitions = store
+        .mission_definitions_for_ids(ids)?
+        .into_iter()
+        .map(|d| (d.mission.subject.clone(), d))
+        .collect::<BTreeMap<_, _>>();
+    ids.iter().map(|id| {
+        let overview = store.mission_overview(id, 3)?;
+        let newest = overview["newest"].as_array().expect("overview previews");
+        let latest = newest.first();
+        let definition = definitions.get(id);
+        let state = if overview["counts"]["running"].as_u64().unwrap_or(0)>0 {"running"}
+            else if overview["counts"]["standing"].as_u64().unwrap_or(0)>0 {"standing"}
+            else if definition.is_some_and(|d| d.mission.state==crate::model::MissionState::Retired) {"retired"}
+            else if let Some(run)=latest {run["status"].as_str().unwrap_or("ready")}
+            else {match definition.map(|d| &d.mission.state) {
+                Some(crate::model::MissionState::Draft)=>"draft",
+                Some(crate::model::MissionState::Retired)=>"retired", _=>"ready"}};
+        let updated = latest.and_then(|r| r["updated_at_unix_ms"].as_u64()).map(u128::from)
+            .or_else(|| definition.map(|d| d.updated_at_unix_ms)).unwrap_or(0);
+        let revision = latest.and_then(|r| r["revision"].as_str())
+            .or_else(|| definition.map(|d| d.mission.revision.as_str())).unwrap_or("unknown");
+        let active = overview["counts"].as_object().unwrap().iter()
+            .filter(|(state,_)| !matches!(state.as_str(),"completed"|"failed"|"cancelled"))
+            .map(|(_,count)| count.as_u64().unwrap_or(0)).sum::<u64>();
+        let details = newest.iter().rev().map(|run| {
+            let run_id=run["id"].as_str().expect("run header id");
+            let (total,done,steps)=store.mission_step_preview(run_id)?;
+            let terminal=matches!(run["status"].as_str(),Some("completed"|"failed"|"cancelled"));
+            let must_act=if terminal {"nobody"} else if attention.contains(run_id) {"you"}
+                else if steps.iter().any(|s| matches!(s.status.as_str(),"ready"|"claimed"|"working")
+                    && (s.assigned_to.is_some() || s.claimant.is_some() || !s.available_to.is_empty())) {"agent"}
+                else if steps.iter().any(|s| s.status=="blocked") {"blocked"} else {"system"};
+            let shown=steps.iter().map(|step| json!({
+                "id":step.subject,"path":step.step,"title":step.title,"state":client_work_state(&step.status),
+                "attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,
+                "agentless":step.agentless,"since":client_timestamp(step.updated_at_unix_ms),
+                "blocked_reason":step.blocked_reason,"blockers":step.blockers,
+                "goals":step.goals,"constraints":step.constraints
+            })).collect::<Vec<_>>();
+            let current=shown.iter().filter(|s| matches!(s["state"].as_str(),Some("ready"|"claimed"|"verifying"|"blocked")))
+                .map(|s| json!({"id":s["id"],"title":s["title"],"assignee":s["assignee"],"claimant":s["claimant"],"state":s["state"],"since":s["since"]})).collect::<Vec<_>>();
+            Ok::<Value,anyhow::Error>(json!({
+                "id":run["id"],"generation_id":run["generation_id"],"requester":run["requester"],
+                "status":run["status"],"phase":run["phase"],"progress":{"done":done,"total":total},
+                "current_steps":current,"must_act":must_act,
+                "state_since":client_timestamp(run["updated_at_unix_ms"].as_u64().unwrap_or(0) as u128),
+                "steps":shown
+            }))
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        let must_act=["you","agent","blocked","system"].into_iter()
+            .find(|kind| details.iter().any(|run| run["must_act"]==*kind)).unwrap_or(if active>0 {"system"} else {"nobody"});
+        let generations=newest.iter().map(|r| (r["id"].as_str().unwrap().to_owned(),r["generation_id"].clone()))
+            .collect::<serde_json::Map<_,_>>();
+        let historical = matches!(state,"completed"|"failed"|"cancelled"|"retired");
+        Ok(json!({"id":id,"kind":"mission","revision":revision,"updated_at":client_timestamp(updated),
+            "title":id.trim_start_matches("mission/"),"state":state,"mission_revision":revision,
+            "runs":newest.iter().rev().map(|r| r["id"].clone()).collect::<Vec<_>>(),
+            "run_details":details,"active_runs":active,"total_runs":overview["total_runs"],
+            "run_counts":overview["counts"],"runs_truncated":overview["total_runs"].as_u64().unwrap_or(0)>newest.len() as u64,
+            "run_generations":generations,"must_act":must_act,
+            "operational":{"layer":if historical {"history"} else {"current"},"actionable":!historical,"reasons":[]}}))
+    }).collect()
+}
+
+fn bound_mission_cards(items: &mut Vec<Value>) -> anyhow::Result<bool> {
+    // Reserve room for the envelope, continuation cursor and fleet sync notice.
+    let budget = CLIENT_MAX_RESPONSE_BYTES.saturating_sub(128_000);
+    let mut used = 0;
+    let mut keep = 0;
+    for item in items.iter_mut() {
+        let mut bytes = serde_json::to_vec(item)?.len() + 1;
+        if keep == 0 && bytes > budget {
+            item["runs"] = json!([]);
+            item["run_details"] = json!([]);
+            item["runs_truncated"] = json!(true);
+            bytes = serde_json::to_vec(item)?.len() + 1;
+        }
+        if used + bytes > budget {
+            break;
+        }
+        used += bytes;
+        keep += 1;
+    }
+    let truncated = keep < items.len();
+    items.truncate(keep);
+    anyhow::ensure!(
+        !truncated || keep > 0,
+        "a mission identifier exceeds the response budget"
+    );
+    Ok(truncated)
 }
 
 fn mission_resources_filtered(
@@ -2282,9 +2545,10 @@ pub(super) async fn missions(
                 client_snapshot_at(&reader, index)
             };
             let mut ids = store.mission_collection_ids(history, offset, limit.saturating_add(1))?;
-            let has_more = ids.len() > limit;
+            let mut has_more = ids.len() > limit;
             ids.truncate(limit);
-            let items = mission_resources_filtered(&store, index, history, None, Some(&ids))?;
+            let mut items = mission_list_cards(&store, &ids)?;
+            has_more |= bound_mission_cards(&mut items)?;
             Ok(Some((snapshot, items, has_more)))
         })
     })
@@ -3195,7 +3459,7 @@ fn managed_claude_transcript(
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
         .join("catalog")
         .join("agents")
-        .join(st2::run::detect_host())
+        .join(st_drivers::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
     // The current wrapper's SessionStart hook binds the Claude session it started. A previous
     // provider's binding can survive a restart, so it counts only when it names the same
@@ -3251,7 +3515,7 @@ fn managed_omp_transcript(
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
         .join("catalog")
         .join("agents")
-        .join(st2::run::detect_host())
+        .join(st_drivers::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
         .join("provider-sessions");
     match crate::external_sessions::find_managed_omp_transcript(
@@ -5957,6 +6221,9 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
+    if action == "work.done" {
+        return Some("control.attention");
+    }
     Some(match action.split_once('.')?.0 {
         "attention" => "control.attention",
         "review" => "control.attention",
@@ -6279,7 +6546,13 @@ fn validate_fence(
         ));
     }
     for (subject, revision) in &fence.subject_revisions {
-        let current = if let Some(id) = subject.strip_prefix("launch/") {
+        let current = if subject.starts_with("attention/") {
+            client_attention_resources(&state.store, None, false)
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .find(|item| item["id"] == *subject)
+                .and_then(|item| item["revision"].as_str().map(str::to_owned))
+        } else if let Some(id) = subject.strip_prefix("launch/") {
             state
                 .store
                 .planning_session(id)
@@ -6337,38 +6610,71 @@ async fn dispatch_action(
             .0;
             Ok(vec![result.subject])
         }
-        "attention.resolve" => {
-            // Any person can close any item; the store records who closed it.
-            let target = parameter_string(p, "attention_id")?;
-            let known = state
-                .store
-                .attention_request(&target)
-                .map_err(ApiError::internal)?
-                .is_some()
-                || (target.starts_with("attention/subscription-failure-")
-                    && state
-                        .store
-                        .attention_items(None)
-                        .map_err(ApiError::internal)?
-                        .iter()
-                        .any(|item| item.subject == target));
-            if !known {
-                return Err(ApiError::not_found(format!(
-                    "attention `{target}` does not exist"
-                )));
+        "attention.resolve" => Err(ApiError::bad(St3Error::new(
+            "attention-migrated",
+            "attention is a view; complete or remedy its source",
+        ))),
+        "work.ask" => {
+            if let Some(step) = p.get("step_id").and_then(Value::as_str) {
+                validate_work_fence(state, step, &request.fence)?;
             }
-            let result = resolve_attention(
-                State(state.clone()),
-                AxumPath(target),
-                Json(AttentionResolveRequest {
-                    outcome: parameter_string(p, "outcome")?,
-                    reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
+            let result = state
+                .store
+                .ask_person(&PersonAskRequest {
+                    legacy_request: None,
+                    person: parameter_string(p, "person_id")?,
+                    title: parameter_string(p, "title")?,
+                    reason: parameter_string(p, "reason")?,
                     actor: authority_actor.clone(),
+                    step: p
+                        .get("step_id")
+                        .map(|_| parameter_string(p, "step_id"))
+                        .transpose()?,
+                    new_run: p
+                        .get("new_run")
+                        .map(|_| parameter_string(p, "new_run"))
+                        .transpose()?,
+                    incarnation: request.fence.runtime_incarnation.clone(),
                     idempotency_key: request.idempotency_key.clone(),
-                }),
-            )
-            .await?
-            .0;
+                })
+                .map_err(ApiError::bad)?;
+            signal_changed(state);
+            Ok(vec![result.subject])
+        }
+        action @ ("work.done" | "work.cancel-ask") => {
+            let target = parameter_string(p, "target_id")?;
+            let result = state
+                .store
+                .finish_person_step(
+                    &PersonStepResponse {
+                        subject: target,
+                        actor: authority_actor.clone(),
+                        summary: parameter_string(p, "summary")?,
+                        evidence: p
+                            .get("evidence")
+                            .map(|value| {
+                                serde_json::from_value::<Vec<String>>(value.clone()).map_err(|_| {
+                                    ApiError::bad(St3Error::new(
+                                        "validation-failed",
+                                        "evidence must be an array of strings",
+                                    ))
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
+                        episode: Some(parameter_string(p, "episode")?),
+                        idempotency_key: request.idempotency_key.clone(),
+                    },
+                    action == "work.cancel-ask",
+                )
+                .map_err(|error| {
+                    if error.code == "forbidden" {
+                        forbidden(error.message)
+                    } else {
+                        ApiError::bad(error)
+                    }
+                })?;
+            signal_changed(state);
             Ok(vec![result.subject])
         }
         "message.send" => {
@@ -6682,6 +6988,7 @@ async fn dispatch_action(
             if request.fence.mission_generation.as_deref() != Some(current.generation.as_str()) {
                 return Err(stale("the mission generation fence is stale"));
             }
+            require_agent_mission_authority(state, authority_actor, "cancel", &current.mission)?;
             let reason = p
                 .get("reason")
                 .and_then(Value::as_str)
@@ -7025,6 +7332,12 @@ pub(super) async fn action(
             "client actions cannot select an actor, credential, or fleet secret",
         ));
     }
+    if request.action_type == "attention.resolve" {
+        return Err(ApiError::bad(St3Error::new(
+            "attention-migrated",
+            "attention is a view; complete or remedy its source",
+        )));
+    }
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
     require_scope(&session, scope)?;
@@ -7032,7 +7345,14 @@ pub(super) async fn action(
         request.action_type.as_str(),
         "terminal.attach" | "terminal.detach"
     );
-    if !read_only_terminal_lifecycle && !session.authority_actor.starts_with("person/") {
+    if !read_only_terminal_lifecycle
+        && !session.authority_actor.starts_with("person/")
+        && !(session.transport == "unix"
+            && session.authority_actor.starts_with("agent/")
+            && ((request.action_type.starts_with("work.")
+                && request.action_type != "work.done")
+                || request.action_type == "mission.cancel"))
+    {
         return Err(forbidden(
             "client mutations require explicit concrete person authority",
         ));
@@ -7319,8 +7639,114 @@ mod tests {
         assert!(!error.message.contains("does not exist"));
     }
 
+    #[test]
+    fn applied_definition_kdl_preserves_kdl_scalars_and_identifiers() {
+        let desired = json!({
+            "name": "agent",
+            "arguments": ["example/worker"],
+            "children": [{
+                "name": "name with spaces",
+                "arguments": ["λ \"quoted\"\\\n", i64::MIN, i64::MAX, 1.0, 1.25, true, false, null],
+                "properties": { "property with spaces": "\"\\\nλ" },
+                "children": [{ "name": "child", "arguments": [null] }],
+            }],
+        });
+        let rendered = crate::graph::render_agent_desired_kdl(&desired).unwrap();
+        let document = rendered.parse::<kdl::KdlDocument>().unwrap();
+        assert_eq!(document.nodes()[0].name().value(), "version");
+        assert_eq!(document.nodes()[1].name().value(), "agent");
+        let node = &document.nodes()[1].children().unwrap().nodes()[0];
+        assert_eq!(node.name().value(), "name with spaces");
+        let values = node.entries().iter().filter(|entry| entry.name().is_none())
+            .map(|entry| entry.value().clone()).collect::<Vec<_>>();
+        assert_eq!(values, vec![
+            kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
+            kdl::KdlValue::Integer(i128::from(i64::MIN)),
+            kdl::KdlValue::Integer(i128::from(i64::MAX)),
+            kdl::KdlValue::Float(1.0),
+            kdl::KdlValue::Float(1.25),
+            kdl::KdlValue::Bool(true),
+            kdl::KdlValue::Bool(false),
+            kdl::KdlValue::Null,
+        ]);
+        let property = node.entries().iter().find(|entry| entry.name().is_some()).unwrap();
+        assert_eq!(property.name().unwrap().value(), "property with spaces");
+        assert_eq!(property.value(), &kdl::KdlValue::String("\"\\\nλ".into()));
+        let child = &node.children().unwrap().nodes()[0];
+        assert_eq!(child.name().value(), "child");
+        assert_eq!(child.entries()[0].value(), &kdl::KdlValue::Null);
+    }
+
     fn test_state(root: &Path) -> AppState {
         test_state_named(root, "terminal-test")
+    }
+
+    #[tokio::test]
+    async fn fleet_operational_commands_are_bounded_and_report_slow_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.seed_operational_fleet();
+        // The old card's complete run array would exceed the negotiated one-megabyte limit.
+        let app = super::super::router(state.clone());
+        let read = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                    panic!("{status}: {error}: {}", String::from_utf8_lossy(&bytes))
+                });
+                assert_eq!(status, StatusCode::OK, "{value}");
+                value
+            }
+        };
+        let missions = read("/v1/client/missions?history=true&limit=50".into()).await;
+        let item = &missions["value"]["items"][0];
+        assert_eq!(item["total_runs"], 2401);
+        assert_eq!(item["active_runs"], 601);
+        assert_eq!(item["runs"].as_array().unwrap().len(), 3);
+        assert_eq!(item["runs_truncated"], true);
+        let mut large = vec![item.clone(); 200];
+        for card in &mut large {
+            for run in card["run_details"].as_array_mut().unwrap() {
+                run["requester"] = json!(format!("person/{}", "x".repeat(1990)));
+            }
+        }
+        assert!(bound_mission_cards(&mut large).unwrap());
+        assert!(!large.is_empty() && large.len() < 200);
+        assert!(serde_json::to_vec(&large).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES - 120_000);
+        let overview = read("/v1/mission-overview?mission=mission%2Fexample%2Ffleet".into()).await;
+        assert_eq!(overview["value"]["total_runs"], 2401);
+        for collection in ["missions", "work"] {
+            let page = read(format!(
+                "/v1/outcome-history?collection={collection}&since=0&status=failed&limit=50"
+            ))
+            .await;
+            assert_eq!(page["value"]["items"].as_array().unwrap().len(), 50);
+            assert_eq!(page["value"]["has_more"], true);
+        }
+        // The SQL hook sees a real fleet-scale query, without file profiling or diagnostic claims.
+        let index = state.store.index().unwrap();
+        let _ = state
+            .store
+            .claims_page(None, None, 0, None, false, 500)
+            .unwrap();
+        let report = read("/v1/performance".into()).await;
+        assert_eq!(report["value"]["window_seconds"], 300);
+        assert!(!report["value"]["queries"].as_array().unwrap().is_empty());
+        assert!(!report["value"]["requests"].as_array().unwrap().is_empty());
+        assert_eq!(
+            state.store.index().unwrap(),
+            index,
+            "operational samples never write graph claims"
+        );
+        assert!(!report.to_string().contains("person/operator"));
     }
 
     fn test_state_named(root: &Path, node: &str) -> AppState {
@@ -7337,6 +7763,99 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_declarations_require_sensitive_scope_and_select_exact_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let publish = |source: &str| {
+            let intent = crate::graph::parse_intent(source, "terminal-test").unwrap();
+            let planned = state
+                .store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            assert!(planned.blockers.is_empty(), "{:?}", planned.blockers);
+            state
+                .store
+                .apply(&intent, &planned.subject_tokens, source)
+                .unwrap();
+        };
+        publish(
+            "version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"old-secret\" } }",
+        );
+        let original = state
+            .store
+            .agent_declaration_revisions("agent/dotfiles/steward")
+            .unwrap()[0]
+            .clone();
+        publish(
+            "version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"new-secret\" } }",
+        );
+        let read = |revision, show_env_values| {
+            agent_declaration(
+                State(state.clone()),
+                Extension(ClientSession::local(Some("person/test")).unwrap()),
+                AxumPath("dotfiles/steward".into()),
+                Query(AgentDeclarationQuery {
+                    revision,
+                    show_env_values,
+                }),
+            )
+        };
+        for (revision, secret) in [(None, "new-secret"), (Some(original.clone()), "old-secret")] {
+            let redacted = read(revision.clone(), false).await.unwrap().0;
+            let kdl = redacted["kdl"].as_str().unwrap();
+            let parsed = crate::graph::parse_intent(kdl, "terminal-test").unwrap();
+            assert_eq!(
+                parsed.subjects["agent/dotfiles/steward"].desired,
+                redacted["tree"]
+            );
+            let env = redacted["tree"]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["name"] == "env")
+                .unwrap();
+            assert_eq!(env["children"][0]["name"], "TOKEN");
+            assert_eq!(env["children"][0]["arguments"][0], "<redacted>");
+            assert!(!redacted.to_string().contains(secret));
+            let visible = read(revision, true).await.unwrap().0;
+            assert!(
+                visible["kdl"].as_str().unwrap().contains(secret),
+                "{visible}"
+            );
+            assert!(visible["tree"].to_string().contains(secret), "{visible}");
+            assert_eq!(visible["revision"], redacted["revision"]);
+            assert_eq!(visible["revisions"].as_array().unwrap().len(), 2);
+            if secret == "old-secret" {
+                assert_eq!(visible["revision"], original);
+            }
+        }
+        assert!(read(Some("not-a-revision".into()), false).await.is_err());
+        for revision in [None, Some(original)] {
+            for show_env_values in [false, true] {
+                assert!(
+                    agent_declaration(
+                        State(state.clone()),
+                        Extension(ClientSession::local(None).unwrap()),
+                        AxumPath("dotfiles/steward".into()),
+                        Query(AgentDeclarationQuery {
+                            revision: revision.clone(),
+                            show_env_values,
+                        }),
+                    )
+                    .await
+                    .is_err()
+                );
+            }
         }
     }
 
@@ -8066,10 +8585,7 @@ subscription "watch/source" {
                 actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("pairing_id".into(), Value::String("pairing/named".into())),
-                    (
-                        "device_name".into(),
-                        Value::String("Alex's iPhone".into()),
-                    ),
+                    ("device_name".into(), Value::String("Alex's iPhone".into())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -9917,7 +10433,7 @@ mission "example/zero-run" state="ready" {
             .join("drivers")
             .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
             .join("catalog/agents")
-            .join(st2::run::detect_host())
+            .join(st_drivers::run::detect_host())
             .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
@@ -10115,7 +10631,7 @@ mission "example/zero-run" state="ready" {
             .join("drivers")
             .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
             .join("catalog/agents")
-            .join(st2::run::detect_host())
+            .join(st_drivers::run::detect_host())
             .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
             .join("provider-sessions");
         std::fs::create_dir_all(&directory).unwrap();
@@ -11201,4 +11717,164 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["terminal_access"]["read"], "unavailable");
         assert_eq!(indeterminate["operational"]["actionable"], false);
     }
+}
+
+fn glass_person(session: &ClientSession, write: bool) -> Result<String, ApiError> {
+    require_scope(
+        session,
+        if write {
+            "control.glasses"
+        } else {
+            "read.glasses"
+        },
+    )?;
+    let person = &session.authority_actor;
+    if !person.starts_with("person/") || person.matches('/').count() != 1 {
+        return Err(forbidden("glasses require the session's concrete person"));
+    }
+    Ok(person.clone())
+}
+
+fn glass_subject(person: &str, id: &str) -> Result<String, ApiError> {
+    if !st3_schema::glasses::valid_uuid(id) {
+        return Err(validation("a glass ID must be a canonical lowercase UUID"));
+    }
+    Ok(format!("glass/{person}/{id}"))
+}
+
+pub(super) async fn glasses_list(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let person = glass_person(&session, false)?;
+    if query.person.is_some() || query.actor.is_some() || query.history {
+        return Err(validation(
+            "glasses always select the session person and current state",
+        ));
+    }
+    let store = state.store.clone();
+    let through = snapshot.store_index;
+    let items = blocking_store(move || store.glasses(&person, through)).await?;
+    Ok(Json(client_page(
+        &state, &snapshot, "glasses", items, &query,
+    )?))
+}
+
+pub(super) async fn glass_get(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let person = glass_person(&session, false)?;
+    let subject = glass_subject(&person, &id)?;
+    let store = state.store.clone();
+    let through = snapshot.store_index;
+    blocking_store(move || store.glasses(&person, through))
+        .await?
+        .into_iter()
+        .find(|glass| glass["id"].as_str() == Some(&subject))
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::not_found("the glass is absent, retired, or outside the current quota")
+        })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GlassPut {
+    body: Value,
+    #[serde(deserialize_with = "glass_base_revision")]
+    base_revision: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GlassDelete {
+    #[serde(deserialize_with = "glass_base_revision")]
+    base_revision: Option<String>,
+}
+fn glass_base_revision<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
+}
+
+async fn glass_write(
+    state: AppState,
+    session: ClientSession,
+    id: String,
+    headers: HeaderMap,
+    body: Option<Value>,
+    base_revision: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    let person = glass_person(&session, true)?;
+    let subject = glass_subject(&person, &id)?;
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|h| h.to_str().ok())
+        .filter(|key| !key.is_empty() && key.len() <= 200)
+        .ok_or_else(|| validation("glass writes require a bounded Idempotency-Key header"))?;
+    let idempotency_key = format!("glass:{}:{key}", session.actor);
+    let mut fields = BTreeMap::from([("base_revision".into(), json!(base_revision))]);
+    let kind = if let Some(body) = body {
+        st3_schema::glasses::validate_body(&body).map_err(|e| validation(e.message))?;
+        fields.insert("body".into(), body);
+        "glass.upserted"
+    } else {
+        "glass.deleted"
+    };
+    let store = state.store.clone();
+    let claim = blocking_store(move || {
+        Ok(store.append_claim(&ClaimInput {
+            subject,
+            kind: kind.into(),
+            actor: Some(person),
+            fields,
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: Some(idempotency_key),
+        }))
+    })
+    .await?
+    .map_err(|error| {
+        let is_idempotency = matches!(error.code, "idempotency-mismatch" | "idempotency-conflict");
+        let mut error = ApiError::bad(error);
+        if is_idempotency { error.code = "idempotency-conflict".into(); error.status = StatusCode::CONFLICT; }
+        error
+    })?;
+    signal_changed(&state);
+    Ok(Json(
+        json!({"id":claim.subject, "kind":"glass", "revision":claim.id,
+        "body":claim.body["fields"]["body"], "deleted":claim.kind == "glass.deleted",
+        "base_revision":claim.body["fields"]["base_revision"],
+        "replaced_revision":claim.body["fields"]["replaced_revision"],
+        "updated_at":client_timestamp(claim.accepted_at_unix_ms)}),
+    ))
+}
+
+pub(super) async fn glass_put(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<GlassPut>,
+) -> Result<Json<Value>, ApiError> {
+    glass_write(
+        state,
+        session,
+        id,
+        headers,
+        Some(request.body),
+        request.base_revision,
+    )
+    .await
+}
+pub(super) async fn glass_delete(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<GlassDelete>,
+) -> Result<Json<Value>, ApiError> {
+    glass_write(state, session, id, headers, None, request.base_revision).await
 }

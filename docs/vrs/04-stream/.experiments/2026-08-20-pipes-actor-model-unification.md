@@ -251,7 +251,7 @@ Every axis is flat or down against today, and every axis is down against the dif
 | `src/request.rs` | **deleted.** `publish_once`, `record_path`, `atomic_create`, `RequestEnvelope`, `ReplyEnvelope`, `PublicationRecord`, and the hardcoded subject all go. `discover_principals` and `ServicePrincipal` (~100 lines) relocate to `src/actor.rs`; the remaining ~400 lines are deleted outright. |
 | `src/ding/mod.rs` | `RelationshipResolver` gains `services`; `relationship_marker` gains the `»` branch *after* the fail-closed validity check. |
 | `src/main.rs` | `RequestCmd` deleted; `MessageCmd::Status` added; `--kind` on send. |
-| `crates/st2-wire/src/message.rs` | `MessageRow.kind` / `SentMessageRow.kind`, optional, no `deny_unknown_fields` (unchanged policy). |
+| `crates/st-wire/src/message.rs` | `MessageRow.kind` / `SentMessageRow.kind`, optional, no `deny_unknown_fields` (unchanged policy). |
 | `crates/agent-spec/src/spec.rs`, `kdl_format.rs`, `declared.rs` | `serves` + `source` on the principal declaration; source-task synthesis. No `pipe` node on the agent. |
 | `src/reconcile.rs` | Extend the "unsupported derived task" gate to source companions — one arm, exactly as the lifecycle prototype measured. |
 | `src/eval_run.rs` | Declare a service actor instead of provisioning an `ExternalInbox`. |
@@ -457,7 +457,7 @@ Stated so the design is not credited with coverage it lacks:
 through them. So a new field in the request envelope is a **hard parse failure** in an older binary,
 not a tolerated addition. In-place evolution of the request wire is therefore not available.
 
-The message wire is the opposite: `crates/st2-wire` documents that no type uses
+The message wire is the opposite: `crates/st-wire` documents that no type uses
 `deny_unknown_fields`, and `parse_message` ignores unknown frontmatter keys outright. Adding `kind`
 is safe in both directions.
 

@@ -25,7 +25,7 @@ use tokio_tungstenite::{
     tungstenite::{Message as WsMessage, client::IntoClientRequest as _},
 };
 
-const HARD_MAX_RESPONSE_BYTES: usize = 1_048_576;
+const HARD_MAX_RESPONSE_BYTES: usize = 8 * 1_048_576;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(35);
 const STREAM_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -138,6 +138,9 @@ pub struct CollectionStream {
 }
 
 impl CollectionStream {
+    pub async fn subscribe_glasses(&mut self, id: &str) -> Result<(), ClientError> {
+        self.subscribe(id, "glasses", 100, None, None).await
+    }
     pub async fn subscribe(
         &mut self,
         id: &str,
@@ -647,7 +650,9 @@ impl Client {
         collection: &str,
         id: &str,
     ) -> Result<Envelope<Resource>, ClientError> {
-        let id = if collection == "launches" {
+        let id = if collection == "glasses" {
+            id.rsplit('/').next().unwrap_or(id)
+        } else if collection == "launches" {
             id.strip_prefix("launch/").unwrap_or(id)
         } else {
             id
@@ -776,6 +781,57 @@ impl Client {
     ) -> Result<Envelope<ActionResult>, ClientError> {
         self.post("/v1/client/actions", request).await
     }
+    pub async fn list_glasses(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal("glasses", cursor, limit, false).await
+    }
+    pub async fn get_glass(&self, id: &str) -> Result<Envelope<Glass>, ClientError> {
+        self.get(&format!(
+            "/v1/client/glasses/{}",
+            percent_encode(id.rsplit('/').next().unwrap_or(id))
+        ))
+        .await
+    }
+    pub async fn put_glass(
+        &self,
+        id: &str,
+        request: &GlassPut,
+        idempotency_key: &str,
+    ) -> Result<Envelope<Glass>, ClientError> {
+        self.glass_write(id, request, Method::PUT, idempotency_key)
+            .await
+    }
+    pub async fn delete_glass(
+        &self,
+        id: &str,
+        request: &GlassDelete,
+        idempotency_key: &str,
+    ) -> Result<Envelope<Glass>, ClientError> {
+        self.glass_write(id, request, Method::DELETE, idempotency_key)
+            .await
+    }
+    async fn glass_write(
+        &self,
+        id: &str,
+        value: &impl Serialize,
+        method: Method,
+        key: &str,
+    ) -> Result<Envelope<Glass>, ClientError> {
+        let body = serde_json::to_vec(value).map_err(|e| ClientError::Protocol(e.to_string()))?;
+        self.request_with_key(
+            method,
+            &format!(
+                "/v1/client/glasses/{}",
+                percent_encode(id.rsplit('/').next().unwrap_or(id))
+            ),
+            Some(body),
+            Some(key),
+        )
+        .await
+    }
     pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {
         self.capabilities_internal().await
     }
@@ -783,6 +839,17 @@ impl Client {
         self.get(&format!(
             "/v1/client/documents/content?name={}",
             percent_encode(name)
+        ))
+        .await
+    }
+    pub async fn subject_definition(
+        &self,
+        subject: &str,
+        show_env_values: bool,
+    ) -> Result<Envelope<SubjectDefinition>, ClientError> {
+        self.get(&format!(
+            "/v1/client/subject-definition?subject={}&show_env_values={show_env_values}",
+            percent_encode(subject)
         ))
         .await
     }
@@ -903,6 +970,23 @@ impl Client {
     }
     pub async fn agents_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("agents", id).await
+    }
+    pub async fn agent_declaration_get(
+        &self,
+        id: &str,
+        revision: Option<&str>,
+        show_env_values: bool,
+    ) -> Result<Envelope<AgentDeclaration>, ClientError> {
+        let path = format!(
+            "/v1/client/agent-declarations/{}?show_env_values={show_env_values}",
+            percent_encode(id)
+        );
+        let path = if let Some(revision) = revision {
+            format!("{path}&revision={}", percent_encode(revision))
+        } else {
+            path
+        };
+        self.get(&path).await
     }
     pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {
         self.agent_queue_internal(agent_id).await
@@ -1026,6 +1110,17 @@ impl Client {
         terminal_id: &str,
     ) -> Result<Envelope<TerminalScreen>, ClientError> {
         self.terminal_screen_internal(terminal_id).await
+    }
+    pub async fn glasses_list(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal("glasses", cursor, limit, history).await
+    }
+    pub async fn glasses_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("glasses", id).await
     }
     pub async fn agent_queue_move(
         &self,
@@ -1403,6 +1498,28 @@ impl Client {
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
+    pub async fn work_ask(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PersonAskParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::work_ask(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn work_cancel_ask(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PersonStepParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::work_cancel_ask(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
     pub async fn work_claim(
         &self,
         id: impl Into<String>,
@@ -1422,6 +1539,17 @@ impl Client {
         parameters: TargetParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::work_complete(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn work_done(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PersonStepParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::work_done(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
@@ -1798,11 +1926,23 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<T, ClientError> {
+        self.request_with_key(method, path, body, None).await
+    }
+    async fn request_with_key<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        key: Option<&str>,
+    ) -> Result<T, ClientError> {
         let started = tokio::time::Instant::now();
         let mut pause = Duration::from_millis(100);
         let mut announced = false;
         loop {
-            match self.request_once(method.clone(), path, body.clone()).await {
+            match self
+                .request_once(method.clone(), path, body.clone(), key)
+                .await
+            {
                 Err(ClientError::Unreachable(mut outage)) if !self.outage_wait.is_zero() => {
                     let waited = started.elapsed();
                     if waited >= self.outage_wait {
@@ -1829,6 +1969,7 @@ impl Client {
         method: Method,
         path: &str,
         body: Option<Vec<u8>>,
+        key: Option<&str>,
     ) -> Result<T, ClientError> {
         let limit = self.response_limit();
         let request = async {
@@ -1842,11 +1983,15 @@ impl Client {
                         self.credential.as_deref(),
                         self.local_person.as_deref(),
                         limit,
+                        key,
                     )
                     .await
                 }
                 Endpoint::FabricLoopback(base) => {
                     let mut request = self.http.request(method, format!("{base}{path}"));
+                    if let Some(key) = key {
+                        request = request.header("idempotency-key", key);
+                    }
                     if let Some(credential) = &self.credential {
                         request = request.bearer_auth(credential);
                     }
@@ -1939,6 +2084,7 @@ fn request_has_page_cursor(path: &str) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn unix_request(
     socket: &Path,
     method: Method,
@@ -1947,6 +2093,7 @@ async fn unix_request(
     credential: Option<&str>,
     local_person: Option<&str>,
     limit: usize,
+    key: Option<&str>,
 ) -> Result<(u16, Vec<u8>), ClientError> {
     let stream = tokio::net::UnixStream::connect(socket)
         .await
@@ -1963,6 +2110,9 @@ async fn unix_request(
         .header("host", "localhost");
     if let Some(credential) = credential {
         builder = builder.header("authorization", format!("Bearer {credential}"));
+    }
+    if let Some(key) = key {
+        builder = builder.header("idempotency-key", key);
     }
     if let Some(person) = local_person {
         builder = builder.header("x-st3-person", person);

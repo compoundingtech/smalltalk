@@ -79,8 +79,6 @@ for a in sup base relay hub; do
   # Codex's persona is explicit and inspectable, but gitignored so the agent never commits it.
   cp "$SB/personas/$a.md" "$SB/$a/AGENTS.md"
   test -s "$SB/$a/AGENTS.md"
-  mkdir -p "$SB/$a/.codex"
-  cp "$SB/harness/codex-hooks.json" "$SB/$a/.codex/hooks.json"
 done
 
 echo

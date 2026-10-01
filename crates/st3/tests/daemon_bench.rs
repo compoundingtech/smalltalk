@@ -42,8 +42,7 @@ use serde_json::{Map, Value, json};
 use st3::api::AppState;
 use st3::client::Client;
 use st3::model::{
-    AttentionRequest, AttentionResolveRequest, ClaimInput, IntentInput, MissionRunRequest,
-    WorkRequest,
+    ClaimInput, IntentInput, MissionRunRequest, PersonAskRequest, PersonStepResponse, WorkRequest,
 };
 use st3::store::Store;
 use st3_schema::ValueType;
@@ -1297,30 +1296,33 @@ fn generate(store: &Store, prefix: &str, scale: f64) {
             &format!("bench-{prefix}-document-{document}"),
         );
     }
+    let asker = format!("agent/bench/{prefix}/standing-0");
     for request in 0..scaled(SAMPLED.attention, scale) {
-        let subject = format!("attention/bench/{prefix}-{request}");
-        let posted = store.request_attention(
-            &subject,
-            &AttentionRequest {
-                reviewer: "person/bench-operator".into(),
-                title: format!("Invented question {request}"),
-                reason: "An invented decision needs a person.".into(),
-                severity: "normal".into(),
-                targets: Vec::new(),
-                actor: "agent/bench/seat-0".into(),
-                idempotency_key: format!("bench-{prefix}-attention-{request}"),
-            },
-        );
-        if posted.is_ok() && request % 50 != 0 {
-            let _ = store.resolve_attention(
-                &subject,
-                &AttentionResolveRequest {
-                    outcome: "answered".into(),
-                    reason: None,
-                    actor: "person/bench-operator".into(),
-                    idempotency_key: format!("bench-{prefix}-resolve-{request}"),
-                },
-            );
+        let posted = store.ask_person(&PersonAskRequest {
+            legacy_request: None,
+            person: "person/bench-operator".into(),
+            title: format!("Invented question {request}"),
+            reason: "An invented decision needs a person.".into(),
+            actor: asker.clone(),
+            step: None,
+            new_run: Some(format!("question-{request}")),
+            incarnation: None,
+            idempotency_key: format!("bench-{prefix}-person-ask-{request}"),
+        });
+        if let Ok(posted) = posted {
+            if request % 50 != 0 {
+                let _ = store.finish_person_step(
+                    &PersonStepResponse {
+                        subject: posted.subject,
+                        actor: "person/bench-operator".into(),
+                        summary: "The invented decision is made".into(),
+                        evidence: Vec::new(),
+                        episode: None,
+                        idempotency_key: format!("bench-{prefix}-person-done-{request}"),
+                    },
+                    false,
+                );
+            }
         }
     }
     let registry = st3_schema::registry();

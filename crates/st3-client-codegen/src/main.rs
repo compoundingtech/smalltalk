@@ -193,6 +193,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {{ self.capabilities_internal().await }}"
             )?;
+        } else if id == "subject.definition" {
+            writeln!(
+                out,
+                "    pub async fn subject_definition(&self, subject: &str, show_env_values: bool) -> Result<Envelope<SubjectDefinition>, ClientError> {{ self.get(&format!(\"/v1/client/subject-definition?subject={{}}&show_env_values={{show_env_values}}\", percent_encode(subject))).await }}"
+            )?;
         } else if id == "document.get" {
             writeln!(
                 out,
@@ -222,6 +227,11 @@ fn rust_operation_methods(
             writeln!(
                 out,
                 "    pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {{ self.agent_queue_internal(agent_id).await }}"
+            )?;
+        } else if id == "agent-declaration.get" {
+            writeln!(
+                out,
+                "    pub async fn agent_declaration_get(&self, id: &str, revision: Option<&str>, show_env_values: bool) -> Result<Envelope<AgentDeclaration>, ClientError> {{ let path = format!(\"/v1/client/agent-declarations/{{}}?show_env_values={{show_env_values}}\", percent_encode(id)); let path = if let Some(revision) = revision {{ format!(\"{{path}}&revision={{}}\", percent_encode(revision)) }} else {{ path }}; self.get(&path).await }}"
             )?;
         } else if id.ends_with(".get") {
             let collection = path
@@ -287,6 +297,16 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func documentGet(name: String) async throws -> Envelope<DocumentContent> {{ try await get(\"v1/client/documents/content\", query: [.init(name: \"name\", value: name)]) }}"
+            )?;
+        } else if id == "agent-declaration.get" {
+            writeln!(
+                out,
+                "    public func agentDeclarationGet(id: String, revision: String? = nil, showEnvValues: Bool = false) async throws -> Envelope<AgentDeclaration> {{ var query: [URLQueryItem] = [.init(name: \"show_env_values\", value: showEnvValues ? \"true\" : \"false\")]; if let revision {{ query.append(.init(name: \"revision\", value: revision)) }}; return try await get(\"v1/client/agent-declarations/\\(id)\", query: query) }}"
+            )?;
+        } else if id == "subject.definition" {
+            writeln!(
+                out,
+                "    public func subjectDefinition(subject: String, showEnvValues: Bool = false) async throws -> Envelope<SubjectDefinition> {{ try await get(\"v1/client/subject-definition\", query: [.init(name: \"subject\", value: subject), .init(name: \"show_env_values\", value: showEnvValues ? \"true\" : \"false\")]) }}"
             )?;
         } else if id.ends_with(".get") {
             let collection = path
@@ -450,6 +470,9 @@ fn validate_surfaces(
     for definition in [
         "AttentionTargetState",
         "DocumentContent",
+        "AgentDeclaration",
+        "CanonicalNode",
+        "SubjectDefinition",
         "LaunchPreview",
         "MissionRunSummary",
         "AgentQueue",
@@ -954,6 +977,16 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
+            )?;
+        } else if id == "agent-declaration.get" {
+            writeln!(
+                out,
+                "    async {method}(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query({{ revision, show_env_values: showEnvValues }})); }}"
+            )?;
+        } else if id == "subject.definition" {
+            writeln!(
+                out,
+                "    async subjectDefinition(subject: string, showEnvValues = false): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ subject, show_env_values: showEnvValues }})); }}"
             )?;
         } else if id == "conversation.changes" {
             writeln!(

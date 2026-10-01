@@ -3,7 +3,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, type Attention, type Capabilities, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client, type Attention, type Capabilities, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { isSnapshotChurn, listSessionPages, type Conversation, type SessionView } from './sessionView';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
 import { listCollectionPages } from './collectionPages';
@@ -24,6 +24,8 @@ export type Status = 'setup' | 'connecting' | 'online' | 'offline';
 export type Planner = 'codex' | 'claude' | 'pi' | 'omp' | 'opencode';
 
 const URL_KEY = 'st3.gateway.url', ORDER_KEY = 'st3.tabs.order', CREDENTIAL_KEY = 'st3.device.credential';
+// Glasses are an experiment (mission fleet/stui/glass): off unless the person turns them on here.
+const GLASSES_KEY = 'st3.experiments.glasses';
 
 export function errorText(error: unknown): string {
   return error instanceof ClientError ? `${error.response.code}: ${error.message}` : error instanceof Error ? error.message : String(error);
@@ -54,6 +56,8 @@ function useAppStore() {
   // The Agents tab shows a list or a tree, as stui's `t` toggles. Debug links can set it, and ask
   // the visible screen to scroll for screenshots.
   const [treeView, setTreeView] = useState(false);
+  const [glassesOn, setGlassesOn] = useState(false);
+  const [glasses, setGlasses] = useState<Glass[]>([]), [glassesIssue, setGlassesIssue] = useState('');
   const [scrollRequest, setScrollRequest] = useState<{ y: number; at: number } | null>(null);
   const cachedActor = useRef(''), cacheSavedAt = useRef(0), cacheGeneration = useRef(0);
   const conversationCache = useRef(new Map<string, Conversation<TimelineEntry>>()), draftCache = useRef(new Map<string, string>());
@@ -125,6 +129,15 @@ function useAppStore() {
     const subscription = AppState.addEventListener('change', state => foreground.current.update(state));
     return () => subscription.remove();
   }, []);
+
+  // Glasses: followed on the feed's socket while the experiment is on and the gateway grants them.
+  useEffect(() => { void AsyncStorage.getItem(GLASSES_KEY).then(value => setGlassesOn(value === '1')).catch(() => {}); }, []);
+  const glassesGranted = caps?.capabilities.some(capability => capability.id === 'glasses' && capability.state === 'granted') ?? false;
+  useEffect(() => {
+    if (!feed || !glassesOn || !glassesGranted) { setGlasses([]); return; }
+    const follow = feed.followGlasses({ onGlasses: setGlasses, onIssue: setGlassesIssue });
+    return () => follow.close();
+  }, [feed, glassesOn, glassesGranted]);
   // Keep the last data for an offline start, saved at most every 10 s while it changes.
   useEffect(() => {
     if (!hasSynced || !snapshot || !caps) return;
@@ -200,9 +213,9 @@ function useAppStore() {
       await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await clearCachedProjection();
       setCredential(null); setCaps(null); setPairingIssue(''); setHistoricalSessions([]); setStatus('setup');
     },
-    async resolve(item: Attention) {
+    async done(item: Attention, summary: string) {
       if (!client) return false;
-      return runAction(() => { const id = actionId(); return client.attentionResolve({ id, idempotency_key: id, fence: fence({ [item.id]: item.revision }), parameters: { attention_id: item.id, outcome: 'resolved' } }); });
+      return runAction(() => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary } }); });
     },
     /** Send Small Talk to an agent, as stui does: fenced to a fresh snapshot, once more if it moved. */
     async send(to: string, content: string, sessionId?: string): Promise<string | null> {
@@ -281,6 +294,10 @@ function useAppStore() {
       void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated));
     },
     reconnect() { feed?.reconnect(); },
+    setGlassesOn(on: boolean) {
+      setGlassesOn(on);
+      void AsyncStorage.setItem(GLASSES_KEY, on ? '1' : '0').catch(() => {});
+    },
   };
 
   const knownHostId = snapshot?.host_id ?? cachedHostId;
@@ -293,6 +310,7 @@ function useAppStore() {
     error, setError, pairingIssue, setPairingIssue, busy, historicalSessions, conversationCache, draftCache, client,
     gatewayMachineId, gatewayHost, canControlTerminal, loadLists, actions,
     treeView, setTreeView, scrollRequest, requestScroll: (y: number) => setScrollRequest({ y, at: Date.now() }),
+    glassesOn, glassesGranted, glasses, glassesIssue,
   };
 }
 

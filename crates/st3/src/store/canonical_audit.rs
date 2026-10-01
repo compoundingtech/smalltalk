@@ -44,6 +44,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "capabilities",
         "local_work_lease_renewals",
         "local_observations",
+        "local_blobs",
         "local_subscription_mission_deferrals",
         "local_usage_totals",
         "local_usage_seen",
@@ -52,6 +53,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "projection_digest_state",
         "projection_digest_generation",
         "projection_digest_operation_rows",
+        "projection_digest_repaired_claims",
         "replica_envelope_signatures",
         "fleet_invite_tokens",
         "replica_envelope_holds",
@@ -104,6 +106,8 @@ fn shared_folds_never_order_by_local_arrival() {
         "claims_for_subject_kind_at",
         "timeline_claim_rows_for_incarnation_at",
         "claims_for_kind_at",
+        // Node-local terminal history pagination; reason selection remains canonical.
+        "outcome_history",
         "agent_last_activity_at",
         "try_project_simple_replication_tx",
         "export_replication_for_heads",
@@ -146,6 +150,13 @@ fn shared_folds_never_order_by_local_arrival() {
                 .split(';')
                 .next()
                 .unwrap();
+            // A marker explicitly orders the fold canonically. With window functions the
+            // rest of the same SQL literal may contain a snapshot bound after this clause.
+            if order.trim_start().starts_with("CANONICAL_ASC(")
+                || order.trim_start().starts_with("CANONICAL_DESC(")
+            {
+                continue;
+            }
             if !order.contains("store_index") && !order.contains("created_index") {
                 continue;
             }
@@ -198,17 +209,20 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
-            let columns = columns
+            let mut columns = columns
                 .iter()
                 .filter(|name| !local_columns.contains(&name.as_str()))
                 .map(|name| {
-                    if *table == "blobs" && name == "bytes" {
-                        "hex(bytes)".to_owned()
+                    if (*table == "blobs" && name == "bytes")
+                        || (*table == "documents" && name == "binding_key")
+                    {
+                        format!("hex({name})")
                     } else {
                         name.clone()
                     }
                 })
                 .collect::<Vec<_>>();
+            columns.sort();
             let query = if *table == "operations" {
                 format!(
                     "SELECT * FROM ({}) ORDER BY 1",
@@ -243,6 +257,11 @@ fn table_digest(rows: &[String]) -> String {
 }
 
 fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mut Vec<String>) {
+    if expected.glasses("person/ada", i64::MAX as u64).unwrap()
+        != actual.glasses("person/ada", i64::MAX as u64).unwrap()
+    {
+        mismatches.push(format!("{phase}: glass bodies/revision sources"));
+    }
     let expected_rows = shared_rows(expected);
     for (table, rows) in shared_rows(actual) {
         let wanted = &expected_rows[&table];
@@ -328,14 +347,6 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
     if messages(expected) != messages(actual) {
         mismatches.push(format!("{phase}: selected person messages and reminders"));
     }
-    // This implementation has no clock-dependent expiry. Freeze the recipient so source
-    // filtering and episode onset are compared independently of host overlays.
-    let attention = |store: &Store| {
-        serde_json::to_value(store.attention_items(Some("person/avery")).unwrap()).unwrap()
-    };
-    if attention(expected) != attention(actual) {
-        mismatches.push(format!("{phase}: derived person attention"));
-    }
     let proposal_views = |store: &Store| {
         let connection = store.readers.get();
         let runs = connection
@@ -353,6 +364,24 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
     };
     if proposal_views(expected) != proposal_views(actual) {
         mismatches.push(format!("{phase}: selected equal-time revision proposals"));
+    }
+    // Time evaluation and recipient filtering are shared only at identical explicit contexts.
+    for person in [
+        None,
+        Some("person/avery"),
+        Some("person/robin"),
+        Some("person/operator"),
+    ] {
+        for as_of in [2_000_000_000_000_u128, 2_000_000_600_000_u128] {
+            let attention = |store: &Store| {
+                serde_json::to_value(store.attention_snapshot(person, as_of).unwrap()).unwrap()
+            };
+            if attention(expected) != attention(actual) {
+                mismatches.push(format!(
+                    "{phase}: attention snapshot at {as_of} for {person:?}"
+                ));
+            }
+        }
     }
     let message_state = |store: &Store| {
         store
@@ -411,6 +440,10 @@ fn write_audit_history(source: &Store) {
         ),
         "audit-desired",
     );
+    source.append_claim(&ClaimInput {
+        subject:"glass/person/ada/019a0000-0000-7000-8000-000000000001".into(), kind:"glass.upserted".into(), actor:Some("person/ada".into()),
+        fields: serde_json::from_value(json!({"body":{"name":"Audit workspace","tabs":[{"layout":{"pane":"home:"}}]}, "base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None,
+    }).unwrap();
     let declared_message = r#"version 2
 message "audit-declared" {
   from "agent/alder.worker"
@@ -695,6 +728,34 @@ message "audit-declared" {
             .unwrap();
     }
     source.replay_replication_graph().unwrap();
+    source
+        .ask_person(&crate::model::PersonAskRequest {
+            legacy_request: None,
+            person: "person/avery".into(),
+            title: "Choose the release date".into(),
+            reason: "Reply with a date.".into(),
+            actor: "agent/alder.worker".into(),
+            step: None,
+            new_run: Some("audit-person-ask".into()),
+            incarnation: None,
+            idempotency_key: "audit-person-ask".into(),
+        })
+        .unwrap();
+    source
+        .record_operational_failure(
+            "audit-disk-episode",
+            &AttentionRequest {
+                reviewer: "person/avery".into(),
+                title: "Disk space is low".into(),
+                reason: "Free disk space.".into(),
+                severity: "warning".into(),
+                targets: vec!["daemon/alder".into()],
+                actor: "daemon/runtime".into(),
+                idempotency_key: "audit-disk-episode".into(),
+            },
+        )
+        .unwrap();
+    source.replay_replication_graph().unwrap();
 }
 
 fn trim_for_audit(store: &Store, cut: u128) {
@@ -854,6 +915,72 @@ fn equal_time_writers_choose_the_same_shared_source() {
     assert_eq!(
         serde_json::to_value(ordered.latest_actual_value("observer/audit").unwrap()).unwrap(),
         serde_json::to_value(reversed.latest_actual_value("observer/audit").unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn fresh_and_additively_migrated_column_orders_have_identical_full_digests() {
+    let temp = tempfile::tempdir().unwrap();
+    let fresh = Store::open_memory("alder").unwrap();
+    write_audit_history(&fresh);
+    let before = projection_digest::tables(&fresh.readers.get()).unwrap();
+    let path = temp.path().join("upgraded.sqlite3");
+    let original_columns: Vec<String> = fresh
+        .readers
+        .get()
+        .prepare("PRAGMA table_info(planning_sessions)")
+        .unwrap()
+        .query_map([], |r| r.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    fresh
+        .connection
+        .lock()
+        .unwrap()
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER projection_digest_planning_sessions_insert;
+        DROP TRIGGER projection_digest_planning_sessions_update;
+        DROP TRIGGER projection_digest_planning_sessions_delete;
+        CREATE TABLE saved_planner_specs AS SELECT id,planner_spec_json FROM planning_sessions;
+        ALTER TABLE planning_sessions DROP COLUMN planner_spec_json;
+        PRAGMA user_version=12;",
+        )
+        .unwrap();
+    drop(connection);
+    let upgraded = Store::open(&path, "alder").unwrap();
+    {
+        let connection = upgraded.connection.lock().unwrap();
+        connection.execute_batch("UPDATE planning_sessions SET planner_spec_json=(
+            SELECT planner_spec_json FROM saved_planner_specs WHERE saved_planner_specs.id=planning_sessions.id);
+            DROP TABLE saved_planner_specs;").unwrap();
+    }
+    let connection = upgraded.readers.get();
+    let upgraded_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(planning_sessions)")
+        .unwrap()
+        .query_map([], |r| r.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_ne!(
+        original_columns, upgraded_columns,
+        "exercise an actual physical column reorder"
+    );
+    assert_eq!(before, projection_digest::tables(&connection).unwrap());
+    assert_eq!(before, projection_digest::oracle(&connection).unwrap());
+    drop(connection);
+    assert_eq!(shared_rows(&fresh), shared_rows(&upgraded));
+    drop(upgraded);
+    let reopened = Store::open(&path, "alder").unwrap();
+    assert_eq!(shared_rows(&fresh), shared_rows(&reopened));
+    assert_eq!(
+        before,
+        projection_digest::tables(&reopened.readers.get()).unwrap()
     );
 }
 

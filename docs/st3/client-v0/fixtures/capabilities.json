@@ -13,19 +13,57 @@
     "session_actor": "person/alex/session/device-7",
     "transport": "fabric-loopback",
     "capabilities": [
-      { "id": "read.projections", "version": 0, "state": "granted" },
-      { "id": "terminal.read", "version": 0, "state": "granted" },
-      { "id": "terminal.control", "version": 0, "state": "ungranted" },
-      { "id": "control.launches", "version": 0, "state": "ungranted" }
+      {
+        "id": "read.projections",
+        "version": 0,
+        "state": "granted"
+      },
+      {
+        "id": "terminal.read",
+        "version": 0,
+        "state": "granted"
+      },
+      {
+        "id": "terminal.control",
+        "version": 0,
+        "state": "ungranted"
+      },
+      {
+        "id": "control.launches",
+        "version": 0,
+        "state": "ungranted"
+      },
+      {
+        "id": "glasses",
+        "version": 0,
+        "state": "granted"
+      },
+      {
+        "id": "read.glasses",
+        "version": 0,
+        "state": "granted"
+      },
+      {
+        "id": "control.glasses",
+        "version": 0,
+        "state": "granted"
+      }
     ],
     "limits": {
       "max_page_items": 200,
       "max_event_items": 500,
-      "max_response_bytes": 1048576,
-      "max_wait_ms": 30000
+      "max_response_bytes": 8388608,
+      "max_wait_ms": 30000,
+      "max_glass_body_bytes": 65536,
+      "max_glasses": 100,
+      "max_glass_depth": 32,
+      "max_glass_nodes": 1024
     },
     "event_cursor": "event-cursor/epoch-a/91",
     "oldest_event_cursor": "event-cursor/epoch-a/40",
-    "schemas": ["../schemas/client-v0.schema.json", "../schemas/operations.json"]
+    "schemas": [
+      "../schemas/client-v0.schema.json",
+      "../schemas/operations.json"
+    ]
   }
 }
