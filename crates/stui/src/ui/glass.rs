@@ -5,7 +5,7 @@
 //! The focused pane points stui's own tab and selection at its subject, so every key and action
 //! the sidebar layout has works the same inside a glass.
 
-use super::glass_store::{self, Stored, StoredGlass};
+use super::glass_store::{self, Stored, StoredGlass, StoredView};
 use super::layout::{Group, Layout, Side, Tab};
 use super::*;
 use ratatui::style::Color;
@@ -131,6 +131,33 @@ impl Glass {
         }
     }
 
+    /// Where this window is in the glass, for this device to remember.
+    fn view(&self) -> StoredView {
+        StoredView {
+            focus: self.focus,
+            current: self
+                .layout
+                .groups()
+                .iter()
+                .map(|group| group.current)
+                .collect(),
+        }
+    }
+
+    /// The glass as this device last left it, where its structure still allows.
+    fn viewed(mut self, view: Option<StoredView>) -> Self {
+        let Some(view) = view else { return self };
+        let count = self.layout.groups().len();
+        for (index, current) in view.current.into_iter().enumerate().take(count) {
+            let shown = self.count(index);
+            if let Some(group) = self.layout.group_mut(index) {
+                group.current = current.min(shown.saturating_sub(1));
+            }
+        }
+        self.focus = view.focus.min(count.saturating_sub(1));
+        self
+    }
+
     /// How many tabs group `index`'s strip shows, Home included.
     fn count(&self, index: usize) -> usize {
         self.layout
@@ -193,16 +220,19 @@ impl Glasses {
         let mut all = stored
             .glasses
             .into_iter()
-            .map(|glass| Glass {
-                id: if glass.id.is_empty() {
-                    new_id()
-                } else {
-                    glass.id
-                },
-                revision: glass.revision,
-                name: glass.name,
-                layout: glass.layout,
-                focus: 0,
+            .map(|glass| {
+                Glass {
+                    id: if glass.id.is_empty() {
+                        new_id()
+                    } else {
+                        glass.id
+                    },
+                    revision: glass.revision,
+                    name: glass.name,
+                    layout: glass.layout,
+                    focus: 0,
+                }
+                .viewed(glass.view)
             })
             .collect::<Vec<_>>();
         let name = wanted.or(stored.last).unwrap_or_else(|| "main".to_owned());
@@ -266,6 +296,7 @@ impl Glasses {
                     revision: glass.revision.clone(),
                     name: glass.name.clone(),
                     layout: glass.layout.clone(),
+                    view: Some(glass.view()),
                 })
                 .collect(),
         };
@@ -308,6 +339,9 @@ struct Palette {
     section: Option<usize>,
     /// What Enter does: Ctrl+T opens the palette to make a tab.
     enter: Open,
+    /// The first row shown once the wheel moved the list, as content scrolls; `None` keeps the
+    /// selection in view, as keys do.
+    top: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1001,7 +1035,11 @@ impl Ui {
             .iter()
             .position(|(index, _)| *index == Some(palette.selected))
             .unwrap_or(0);
-        let top = selected_row.saturating_sub(list_height.saturating_sub(1));
+        let top = palette
+            .top
+            .unwrap_or_else(|| selected_row.saturating_sub(list_height.saturating_sub(1)))
+            .min(rows.len().saturating_sub(list_height));
+        self.frame.borrow_mut().palette_top = top;
         for (offset, (index, line)) in rows.iter().skip(top).take(list_height).enumerate() {
             let y = rect.y + 2 + offset as u16;
             buf.set_line(rect.x + 1, y, line, rect.width - 2);
@@ -1035,6 +1073,7 @@ impl Ui {
         let command = key.modifiers.contains(KeyModifiers::SUPER);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         if let Some(palette) = glasses.palette.as_mut() {
+            palette.top = None;
             match key.code {
                 KeyCode::Esc => glasses.palette = None,
                 KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
@@ -1114,20 +1153,18 @@ impl Ui {
             .is_some_and(|glasses| glasses.palette.is_some())
     }
 
-    /// One wheel step moves the palette's selection a row, and the list follows it.
+    /// The wheel scrolls the palette's list as content, three rows a step; the selection
+    /// stays where it is until a key moves it.
     pub(crate) fn scroll_palette(&mut self, up: bool) {
+        let shown = self.frame.borrow().palette_top;
         if let Some(palette) = self
             .glasses
             .as_mut()
             .and_then(|glasses| glasses.palette.as_mut())
         {
-            palette.selected = if up {
-                palette.selected.saturating_sub(1)
-            } else {
-                palette.selected + 1
-            };
+            let top = palette.top.unwrap_or(shown);
+            palette.top = Some(if up { top.saturating_sub(3) } else { top + 3 });
         }
-        self.clamp_palette();
     }
 
     pub(crate) fn open_palette(&mut self, section: Option<usize>, enter: Open) {
@@ -1489,6 +1526,8 @@ impl Ui {
             shown.current = tab;
         }
         glass.focus = group;
+        // Where the person is, remembered on this device for the next start.
+        glasses.save();
         self.show_focused();
     }
 
@@ -1496,8 +1535,27 @@ impl Ui {
         self.show_in(group, usize::MAX);
     }
 
+    /// Bring stui's own tab and selection back to the focused pane's subject when they drifted:
+    /// at start, before the lists arrive, the subject cannot be selected yet.
+    pub(crate) fn resync_focus(&mut self) {
+        let Some(pane) = self
+            .glasses
+            .as_ref()
+            .and_then(|glasses| glasses.glass().focused())
+            .and_then(Pane::parse)
+        else {
+            return;
+        };
+        let Some((tab, subject)) = pane_subject(&pane) else {
+            return;
+        };
+        if self.tab != tab || subject.is_some_and(|subject| self.selected_id() != Some(subject)) {
+            self.focus_pane(&pane);
+        }
+    }
+
     /// Point stui's own tab and selection at what the focused group shows.
-    fn show_focused(&mut self) {
+    pub(crate) fn show_focused(&mut self) {
         let Some(glasses) = self.glasses.as_ref() else {
             return;
         };
@@ -1648,16 +1706,8 @@ impl Ui {
 
     /// Point stui's own tab and selection at a pane's subject, so its keys act on it.
     fn focus_pane(&mut self, pane: &Pane) {
-        let (tab, subject) = match pane {
-            Pane::Home(id) => (0, id.clone()),
-            Pane::Agent(id) => (1, id.clone()),
-            Pane::Mission(id) | Pane::Declaration(id) => (2, id.clone()),
-            Pane::Machine(id) => (
-                3,
-                id.as_deref()
-                    .map(|id| id.trim_start_matches("machine/").to_owned()),
-            ),
-            _ => return,
+        let Some((tab, subject)) = pane_subject(pane) else {
+            return;
         };
         self.tab = tab;
         self.terminal = self.terminal.take().filter(|_| tab == 1);
@@ -1681,6 +1731,21 @@ impl Ui {
             self.selected[tab] = position;
         }
     }
+}
+
+/// The sidebar tab and the selected id a pane's subject is, where it has one.
+fn pane_subject(pane: &Pane) -> Option<(usize, Option<String>)> {
+    Some(match pane {
+        Pane::Home(id) => (0, id.clone()),
+        Pane::Agent(id) => (1, id.clone()),
+        Pane::Mission(id) | Pane::Declaration(id) => (2, id.clone()),
+        Pane::Machine(id) => (
+            3,
+            id.as_deref()
+                .map(|id| id.trim_start_matches("machine/").to_owned()),
+        ),
+        _ => return None,
+    })
 }
 
 /// A layout as st's client types spell it. stui splits two at a time; a longer split nests.
@@ -2113,15 +2178,24 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             })
         };
-        screen(&ui);
+        let before = screen(&ui);
         wheel(&mut ui, MouseEventKind::ScrollDown);
         wheel(&mut ui, MouseEventKind::ScrollDown);
         let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
-        assert_eq!(palette.selected, 2);
+        assert_eq!(
+            (palette.selected, palette.top),
+            (0, Some(6)),
+            "content scrolls"
+        );
+        assert_ne!(screen(&ui), before);
         wheel(&mut ui, MouseEventKind::ScrollUp);
         let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
-        assert_eq!(palette.selected, 1);
+        assert_eq!(palette.top, Some(3));
         assert_eq!(ui.list_top.borrow()[0], 0, "the list behind did not scroll");
+        // A key brings the selection back into view.
+        press(&mut ui, KeyCode::Down, KeyModifiers::NONE);
+        let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
+        assert_eq!((palette.selected, palette.top), (1, None));
     }
 
     #[test]
@@ -2178,10 +2252,12 @@ mod tests {
         assert_eq!(ui.glasses.as_ref().unwrap().glass().name, "main");
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
 
-        // Another window on this device opens the last glass used, with its tabs.
+        // Another window on this device opens the last glass used, with its tabs, on the tab
+        // it was showing.
         let again = Glasses::open(None, Some(store.clone()));
         assert_eq!(again.glass().name, "main");
         assert_eq!(again.all.len(), 2);
+        assert_eq!(again.glass().focused(), Some(ATLAS));
         assert_eq!(again.glass().layout.groups()[0].tabs, [Tab::pane(ATLAS)]);
         assert_eq!(
             Glasses::open(Some("review".into()), Some(store))

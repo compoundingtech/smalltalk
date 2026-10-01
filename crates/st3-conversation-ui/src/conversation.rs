@@ -203,6 +203,23 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     bg,
                 ));
             }
+            // An open long call folds from the same place it opened, as well as from its end.
+            if open && total > COLLAPSED_TOOL_LINES {
+                doc.targets.push(Target {
+                    line: doc.lines.len(),
+                    column: 0,
+                    width: width as u16,
+                    hit: PaneIntent::Expand(entry.id.clone()),
+                });
+                doc.line(pad(
+                    Line::from(Span::styled(
+                        "   ▴ collapse",
+                        Style::default().fg(theme.overlay0).bg(bg),
+                    )),
+                    width,
+                    bg,
+                ));
+            }
             doc.lines(rows.into_iter().skip(hidden));
             if open && total > COLLAPSED_TOOL_LINES {
                 doc.targets.push(Target {
@@ -213,7 +230,7 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 });
                 doc.line(pad(
                     Line::from(Span::styled(
-                        "   collapse",
+                        "   ▴ collapse",
                         Style::default().fg(theme.overlay0).bg(bg),
                     )),
                     width,
@@ -246,7 +263,14 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 std::slice::from_ref(&bar),
                 None,
             ));
-            for line in text::markdown(body, inner.saturating_sub(2), theme.soft(), theme) {
+            // Mail to the person reads as plainly as anything they read; mail between others
+            // stays quieter.
+            let style = if to == "you" {
+                theme.text()
+            } else {
+                theme.soft()
+            };
+            for line in text::markdown(body, inner.saturating_sub(2), style, theme) {
                 let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
                 spans.extend(line.spans);
                 doc.line(Line::from(spans));

@@ -172,6 +172,8 @@ pub fn run(context: Context) -> Result<()> {
     ui.glasses = glass.map(|name| {
         super::glass::Glasses::open(name, super::glass_store::path(&person))
     });
+    // A glass opens where this device left it.
+    ui.show_focused();
 
     let _guard = Guard::enter(ui.glasses.is_some())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -283,6 +285,7 @@ pub fn run(context: Context) -> Result<()> {
                     changed = true;
                 }
                 feed::Update::ConversationFailed { target, message } => {
+                    ui.conversation_failed(&target, &message);
                     failed.insert(target, message);
                     changed = true;
                 }
@@ -793,20 +796,9 @@ fn conversations(
             {
                 Load::Failed(reason)
             }
-            (Some(timeline), error) => {
-                let mut entries = adapt::conversation(&timeline.items, &names);
-                // Never hide a failure behind what loaded before it.
-                if let Some(error) = error {
-                    entries.push(super::view::Entry {
-                        id: format!("failed:{target}"),
-                        at: String::new(),
-                        body: super::view::Body::Event(format!(
-                            "Could not load newer entries: {error}"
-                        )),
-                    });
-                }
-                Load::Ready(entries)
-            }
+            // A failure after the conversation loaded is said on the rule above its message
+            // box, where it clears once st catches up; the feed retries on its own.
+            (Some(timeline), _) => Load::Ready(adapt::conversation(&timeline.items, &names)),
             (None, Some(error)) => {
                 Load::Failed(format!("Could not load this conversation: {error}"))
             }
