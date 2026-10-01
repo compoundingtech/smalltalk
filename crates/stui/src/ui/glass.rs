@@ -41,6 +41,8 @@ pub(crate) struct Glasses {
     /// The focused split fills the glass for now (Ctrl+O), as tmux zooms a pane; this window
     /// only, never stored.
     zoomed: bool,
+    /// Home is open over the glass (⌂ in the top bar).
+    home: bool,
     /// The glass made at start only because this device had none by the name asked for. If it
     /// is still empty when st first sends the person's glasses, st's glass of that name is
     /// shown instead of keeping both.
@@ -87,15 +89,15 @@ struct Glass {
     /// The graph's revision this glass last matched; `None` until st has kept it.
     revision: Option<String>,
     name: String,
-    /// Each group's `current` counts Home in group 0: there, 0 is Home.
     layout: Layout,
     /// The focused group.
     focus: usize,
 }
 
-/// Where a group's tabs start among what its strip shows: group 0 shows Home first.
-fn offset(group: usize) -> usize {
-    usize::from(group == 0)
+/// Where a group's tabs start among what its strip shows. Home is no longer a tab (it opens
+/// over the glass from the top bar), so every strip starts with its own first tab.
+fn offset(_group: usize) -> usize {
+    0
 }
 
 impl Glass {
@@ -192,8 +194,12 @@ impl Glass {
         self.shown(self.focus).map(|tab| tab.pane.as_str())
     }
 
+    /// Home fills a glass with nothing open.
     fn on_home(&self) -> bool {
-        self.focus == 0 && self.layout.groups()[0].current == 0
+        self.layout
+            .groups()
+            .iter()
+            .all(|group| group.tabs.is_empty())
     }
 
     /// Where a pane key already shows: (group, tab as its strip counts it).
@@ -267,6 +273,7 @@ impl Glasses {
             store,
             graph: false,
             zoomed: false,
+            home: false,
             pending: BTreeMap::new(),
             placeholder,
         }
@@ -379,6 +386,8 @@ enum Action {
     CloseGlass,
     /// The new agent form, with what it should do when the query says it.
     NewAgent(Option<String>),
+    /// Home, over the glass.
+    Home,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
 }
@@ -440,7 +449,7 @@ impl Ui {
     pub(crate) fn on_home(&self) -> bool {
         self.glasses
             .as_ref()
-            .is_some_and(|glasses| glasses.glass().on_home())
+            .is_some_and(|glasses| glasses.home || glasses.glass().on_home())
     }
 
     /// Whether the glass is split into more than one group.
@@ -502,6 +511,18 @@ impl Ui {
                 Pane::Machine(Some(format!("machine/{}", machine.name))),
             );
         }
+        // Home, over the glass.
+        choices.insert(
+            0,
+            Choice {
+                section: 0,
+                glyph: ("⌂", theme::ACCENT),
+                label: "Home".into(),
+                detail: "what needs you".into(),
+                search: "home".into(),
+                action: Action::Home,
+            },
+        );
         // Starting things: an agent from the query, or the empty form.
         let name = query.trim();
         let start = |label: String, detail: &str, search: String, action| Choice {
@@ -725,6 +746,9 @@ impl Ui {
             self.tab_strip(buf, Rect { height: 1, ..*rect }, glass, index);
             self.draw_group(buf, *content, glass, index);
         }
+        if glasses.home {
+            self.draw_home_popover(buf, body);
+        }
         self.footer(
             buf,
             Rect {
@@ -738,13 +762,76 @@ impl Ui {
         }
     }
 
+    /// Home over the glass: its list and cards, as large as the glass allows, keys and all.
+    fn draw_home_popover(&self, buf: &mut Buffer, body: Rect) {
+        let rect = Rect {
+            x: body.x + 2,
+            y: body.y + 1,
+            width: body.width.saturating_sub(4),
+            height: body.height.saturating_sub(2),
+        };
+        if rect.width < 30 || rect.height < 8 {
+            return;
+        }
+        buf.set_style(rect, Style::default().bg(theme::BASE).fg(theme::TEXT));
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                buf[(x, y)].set_symbol(" ");
+            }
+        }
+        let edge = Style::default().fg(theme::ACCENT).bg(theme::BASE);
+        for x in rect.x..rect.x + rect.width {
+            buf[(x, rect.y)].set_symbol("─").set_style(edge);
+            buf[(x, rect.y + rect.height - 1)]
+                .set_symbol("─")
+                .set_style(edge);
+        }
+        for y in rect.y..rect.y + rect.height {
+            buf[(rect.x, y)].set_symbol("│").set_style(edge);
+            buf[(rect.x + rect.width - 1, y)]
+                .set_symbol("│")
+                .set_style(edge);
+        }
+        for (x, y, corner) in [
+            (rect.x, rect.y, "╭"),
+            (rect.x + rect.width - 1, rect.y, "╮"),
+            (rect.x, rect.y + rect.height - 1, "╰"),
+            (rect.x + rect.width - 1, rect.y + rect.height - 1, "╯"),
+        ] {
+            buf[(x, y)].set_symbol(corner).set_style(edge);
+        }
+        buf.set_stringn(
+            rect.x + 2,
+            rect.y,
+            " ⌂ Home · esc closes ",
+            rect.width.saturating_sub(4) as usize,
+            theme::strong(theme::ACCENT).bg(theme::BASE),
+        );
+        let inner = Rect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(2),
+            height: rect.height.saturating_sub(2),
+        };
+        self.launcher_bar(buf, Rect { height: 1, ..inner });
+        self.draw_body(
+            buf,
+            Rect {
+                y: inner.y + 1,
+                height: inner.height.saturating_sub(1),
+                ..inner
+            },
+        );
+        self.frame.borrow_mut().home = Some(rect);
+    }
+
     /// What group `index` shows: Home, its shown tab's pane, or how to fill it.
     fn draw_group(&self, buf: &mut Buffer, area: Rect, glass: &Glass, index: usize) {
         let focused = index == glass.focus;
         let Some(tab) = glass.shown(index) else {
-            if glass.layout.groups()[index].current == 0 && index == 0 {
-                // Home is today's Home under a bar for starting things: its list and the
-                // selected card.
+            if index == 0 && glass.on_home() {
+                // A glass with nothing open shows Home under a bar for starting things: its
+                // list and the selected card.
                 self.launcher_bar(buf, Rect { height: 1, ..area });
                 let area = Rect {
                     y: area.y + 1,
@@ -896,6 +983,29 @@ impl Ui {
             format!("{glyph} {word}"),
             bar(theme::fg(color)),
         ));
+        // Home lives here, opening over the glass, rather than squeezed into a split.
+        spans.push(Span::styled(" · ", bar(theme::dim())));
+        let x = area.x + Line::from(spans.clone()).width() as u16;
+        let home = self.glasses.as_ref().is_some_and(|glasses| glasses.home);
+        spans.push(Span::styled(
+            " ⌂ ",
+            if home {
+                Style::default()
+                    .fg(theme::CRUST)
+                    .bg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                bar(theme::strong(theme::ACCENT))
+            },
+        ));
+        self.hit(
+            Rect {
+                x,
+                width: 3,
+                ..area
+            },
+            Hit::Home,
+        );
         let need = self
             .world
             .attention
@@ -917,7 +1027,7 @@ impl Ui {
                 width: text::width(&need_text) as u16,
                 ..area
             },
-            Hit::PaletteSection(0),
+            Hit::Home,
         );
         spans.push(if need > 0 {
             Span::styled(need_text, bar(theme::strong(theme::PERSON)))
@@ -943,6 +1053,33 @@ impl Ui {
             Hit::PaletteSection(1),
         );
         spans.push(Span::styled(working_text, bar(theme::fg(theme::WORKING))));
+        // Missions with work open: running, waiting their turn, or waiting on someone.
+        let active = screens::mission_order(&self.world, false)
+            .iter()
+            .filter(|mission| {
+                matches!(
+                    mission.word,
+                    Word::Working
+                        | Word::Queued
+                        | Word::Decision
+                        | Word::Stalled
+                        | Word::Unstaffed
+                        | Word::Unclaimed
+                )
+            })
+            .count();
+        spans.push(Span::styled(" · ", bar(theme::dim())));
+        x = area.x + Line::from(spans.clone()).width() as u16;
+        let active_text = format!("◇ {active} active");
+        self.hit(
+            Rect {
+                x,
+                width: text::width(&active_text) as u16,
+                ..area
+            },
+            Hit::PaletteSection(2),
+        );
+        spans.push(Span::styled(active_text, bar(theme::fg(theme::SAPPHIRE))));
         let machines = self.world.machines.items();
         let machines_shown = !machines.is_empty();
         if machines_shown {
@@ -1008,7 +1145,6 @@ impl Ui {
             buf.set_stringn(area.x, area.y, "▌", 1, theme::fg(theme::ACCENT).bg(strip));
         }
         let mut x = area.x + 1;
-        let home = (index == 0).then(|| ("Home".to_owned(), false));
         let tabs = group.tabs.iter().map(|tab| {
             let pane = Pane::parse(&tab.pane);
             let title = tab.title.clone().unwrap_or_else(|| {
@@ -1019,7 +1155,7 @@ impl Ui {
             let needs = pane.is_some_and(|pane| self.pane_needs_person(&pane));
             (title, needs)
         });
-        for (shown, (title, needs)) in home.into_iter().chain(tabs).enumerate() {
+        for (shown, (title, needs)) in tabs.enumerate() {
             let label = format!(" {}{title} ", if needs { "◆ " } else { "" });
             let label = text::truncate(&label, 28);
             let style = match (shown == group.current, focused) {
@@ -1331,6 +1467,20 @@ impl Ui {
             self.clamp_palette();
             return true;
         }
+        // Home over the glass takes the keys, as Home does; Esc closes it and Ctrl+K still opens
+        // the palette.
+        if glasses.home
+            && !self.editing
+            && self.confirm.is_none()
+            && self.chat.as_ref().is_none_or(|chat| !chat.editing)
+        {
+            match key.code {
+                KeyCode::Esc => self.close_home(),
+                KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
+                _ => return false,
+            }
+            return true;
+        }
         // While the person types, every editing key is the input's (Ctrl+W deletes a word);
         // Esc leaves the input and glasses keys work again.
         if self.editing
@@ -1431,6 +1581,30 @@ impl Ui {
         }
     }
 
+    /// Open Home over the glass: stui's own tab moves to Home, so its keys act there.
+    pub(crate) fn open_home(&mut self) {
+        if let Some(glasses) = self.glasses.as_mut() {
+            glasses.home = true;
+            glasses.palette = None;
+        }
+        self.tab = 0;
+        self.terminal = None;
+        self.kdl = false;
+        self.agent_form = false;
+    }
+
+    /// Close Home; stui's own tab follows the focused split again.
+    pub(crate) fn close_home(&mut self) {
+        if let Some(glasses) = self.glasses.as_mut() {
+            glasses.home = false;
+        }
+        self.show_focused();
+    }
+
+    pub(crate) fn home_open(&self) -> bool {
+        self.glasses.as_ref().is_some_and(|glasses| glasses.home)
+    }
+
     pub(crate) fn palette_open(&self) -> bool {
         self.glasses
             .as_ref()
@@ -1500,6 +1674,7 @@ impl Ui {
             Action::Open(pane) => self.open_in_glass(pane, how),
             Action::ShowGlass(index) => self.show_glass(index),
             Action::NewAgent(task) => self.open_new_agent(task),
+            Action::Home => self.open_home(),
             Action::Name(naming) => {
                 let query = match naming {
                     Naming::Rename => glasses.glass().name.clone(),
@@ -1563,6 +1738,9 @@ impl Ui {
     /// Show `pane` in this glass: where it already shows, else as `how` says. Home stays Home,
     /// so what opens from Home gets its own tab, and a Home item opens on Home itself.
     pub(crate) fn open_in_glass(&mut self, pane: Pane, how: Open) {
+        if let Some(glasses) = self.glasses.as_mut() {
+            glasses.home = false;
+        }
         let title = self.pane_title(&pane);
         let Some(glasses) = self.glasses.as_mut() else {
             return;
@@ -1842,6 +2020,11 @@ impl Ui {
     /// Bring stui's own tab and selection back to the focused pane's subject when they drifted:
     /// at start, before the lists arrive, the subject cannot be selected yet.
     pub(crate) fn resync_focus(&mut self) {
+        // Home over the glass owns stui's tab until it closes; a graph update must not turn it
+        // back into the focused split's subject.
+        if self.home_open() {
+            return;
+        }
         let Some(pane) = self
             .glasses
             .as_ref()
@@ -1920,6 +2103,20 @@ impl Ui {
     /// A click inside a group that is not focused focuses it, and does nothing else. While the
     /// palette is open, only its rows take clicks; a click elsewhere closes it.
     pub(crate) fn glass_click(&mut self, column: u16, row: u16) -> bool {
+        // Home over the glass takes clicks inside it; a click outside closes it, except on the
+        // top bar, whose ⌂ toggles it.
+        if self.home_open() && !self.palette_open() {
+            let inside = self
+                .frame
+                .borrow()
+                .home
+                .is_some_and(|rect| contains(rect, column, row));
+            if inside || row == 0 {
+                return false;
+            }
+            self.close_home();
+            return true;
+        }
         if self.palette_open() {
             let on_palette = self.frame.borrow().hits.iter().any(|(rect, hit)| {
                 matches!(hit, Hit::PaletteChoice(_)) && contains(*rect, column, row)
@@ -1970,8 +2167,8 @@ impl Ui {
             return;
         };
         let glass = glasses.glass_mut();
-        if glass.on_home() {
-            self.flash("Home stays open");
+        if glass.on_home() && glass.layout.groups().len() == 1 {
+            self.flash("Nothing open to close");
             return;
         }
         let focus = glass.focus;
@@ -1987,10 +2184,10 @@ impl Ui {
             }
             _ => {}
         }
-        if group.tabs.is_empty() && focus > 0 && count > 1 {
+        if group.tabs.is_empty() && count > 1 {
             let layout = std::mem::take(&mut glass.layout);
             glass.layout = layout.remove(focus).unwrap_or_default();
-            glass.focus = focus - 1;
+            glass.focus = focus.saturating_sub(1);
         }
         let id = glass.id.clone();
         self.glass_changed(&id);
@@ -2007,24 +2204,6 @@ impl Ui {
         glasses.shown = index;
         glasses.save();
         self.show_focused();
-    }
-
-    fn next_glass(&mut self) {
-        let Some(glasses) = self.glasses.as_ref() else {
-            return;
-        };
-        if glasses.all.len() < 2 {
-            self.flash("One glass so far: ctrl+k, type a name, “New glass”");
-            return;
-        }
-        let next = (glasses.shown + 1) % glasses.all.len();
-        self.show_glass(next);
-        let name = self
-            .glasses
-            .as_ref()
-            .map(|glasses| glasses.glass().name.clone())
-            .unwrap_or_default();
-        self.flash(format!("Glass “{name}”"));
     }
 
     /// Point stui's own tab and selection at a pane's subject, so its keys act on it.
@@ -2234,20 +2413,22 @@ mod tests {
             first.contains("need you") && first.contains("working") && first.contains("main"),
             "{first}"
         );
-        assert!(shown.lines().nth(1).unwrap().contains("Home"));
+        assert!(first.contains("⌂") && first.contains("active"), "{first}");
+        // A glass with nothing open shows Home, under a bar for starting things.
+        assert!(shown.contains("New agent ctrl+n"), "{shown}");
         assert!(shown.contains("ctrl+k open"));
         let plain = screen(&Ui::new(demo::world()));
         assert!(!plain.contains("ctrl+k") && !plain.lines().next().unwrap().contains("need you"));
     }
 
     #[test]
-    fn the_palette_opens_subjects_in_tabs_and_home_stays() {
+    fn the_palette_opens_subjects_in_tabs_and_home_opens_over_them() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
         assert!(screen(&ui).contains("╭─ open"));
         typed(&mut ui, "atlas builder");
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(tabs(&ui), (0, 1, vec![vec![ATLAS.to_owned()]]));
+        assert_eq!(tabs(&ui), (0, 0, vec![vec![ATLAS.to_owned()]]));
         // The tab points stui's own selection at the agent, so its keys act on it.
         assert_eq!(
             (ui.tab, ui.selected_id().as_deref()),
@@ -2276,7 +2457,7 @@ mod tests {
         ctrl(&mut ui, 'k');
         typed(&mut ui, "atlas builder");
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(tabs(&ui).1, 1);
+        assert_eq!(tabs(&ui).1, 0);
         assert_eq!(tabs(&ui).2[0].len(), 2);
 
         // Ctrl+K never replaces what is shown: it adds a tab too.
@@ -2291,10 +2472,16 @@ mod tests {
         assert_eq!(tabs(&ui).2[0], [ATLAS, WEEKLY, "machine:machine/harbor"]);
         ctrl(&mut ui, 'w');
 
+        // Home opens over the glass from ⌂, with Home's keys; Esc puts the tab back in charge.
+        ui.open_home();
+        assert!(screen(&ui).contains("⌂ Home · esc closes"));
+        assert_eq!(ui.tab, 0);
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!ui.home_open());
+        assert_eq!(ui.tab, 2, "back on the weekly release mission");
+
         press(&mut ui, KeyCode::Char('1'), KeyModifiers::ALT);
-        assert_eq!((tabs(&ui).1, ui.tab), (0, 0));
-        ctrl(&mut ui, 'w');
-        assert_eq!(tabs(&ui).2[0].len(), 2, "Home cannot be closed");
+        assert_eq!(tabs(&ui).1, 0);
         typed(&mut ui, "]");
         assert_eq!(tabs(&ui).1, 1);
         typed(&mut ui, "[");
@@ -2302,7 +2489,7 @@ mod tests {
         press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
-        assert_eq!(tabs(&ui).2, vec![vec![WEEKLY.to_owned()]]);
+        assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
     }
 
     #[test]
@@ -2322,7 +2509,9 @@ mod tests {
         let shown = screen(&ui);
         let strip = shown.lines().nth(1).unwrap();
         assert!(
-            strip.contains("Home") && strip.contains("Weekly release") && strip.contains("▌"),
+            strip.contains("Atlas Builder")
+                && strip.contains("Weekly release")
+                && strip.contains("▌"),
             "each split has its own strip, the focused one marked: {strip}"
         );
         assert!(shown.contains("│"), "a divider between the splits");
@@ -2375,7 +2564,7 @@ mod tests {
         assert_eq!(tabs(&ui).0, 1);
         ctrl(&mut ui, 'w');
         ctrl(&mut ui, 'w');
-        assert_eq!(tabs(&ui), (0, 1, vec![vec![ATLAS.to_owned()]]));
+        assert_eq!(tabs(&ui), (0, 0, vec![vec![ATLAS.to_owned()]]));
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui), (0, 0, vec![vec![]]));
     }
@@ -2518,24 +2707,51 @@ mod tests {
         assert_eq!(section(&ui), Some(2));
         press(&mut ui, KeyCode::Char('3'), KeyModifiers::CONTROL);
         assert_eq!(section(&ui), None, "the same again shows every section");
-        // The status line's counts open the palette at what they count.
+        // "need you" in the top bar opens Home; the other counts open the palette there.
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         screen(&ui);
-        let need = ui
-            .frame
-            .borrow()
-            .hits
-            .iter()
-            .find(|(_, hit)| matches!(hit, Hit::PaletteSection(0)))
-            .map(|(rect, _)| *rect)
-            .unwrap();
-        ui.mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: need.x + 1,
-            row: need.y,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(section(&ui), Some(0));
+        let hit_at = |ui: &Ui, wanted: Hit| {
+            ui.frame
+                .borrow()
+                .hits
+                .iter()
+                .filter(|(_, hit)| *hit == wanted)
+                .map(|(rect, _)| *rect)
+                .last()
+                .unwrap()
+        };
+        let click = |ui: &mut Ui, rect: Rect| {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let active = hit_at(&ui, Hit::PaletteSection(2));
+        click(&mut ui, active);
+        assert_eq!(section(&ui), Some(2), "active opens the missions");
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        screen(&ui);
+        let need = hit_at(&ui, Hit::Home);
+        click(&mut ui, need);
+        assert!(ui.home_open());
+    }
+
+    #[test]
+    fn home_stays_home_when_the_world_updates() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_home();
+        assert_eq!(ui.tab, 0);
+        ui.set_world(demo::world());
+        assert!(ui.home_open());
+        assert_eq!(ui.tab, 0, "a world update kept Home");
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(ui.tab, 1, "closing Home shows the focused agent again");
     }
 
     #[test]
@@ -2791,6 +3007,41 @@ mod tests {
         typed(&mut ui, "work");
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(ui.glasses.as_ref().unwrap().glass().name, "work");
+    }
+
+    #[test]
+    fn ctrl_c_twice_stops_a_working_agent_and_quits_elsewhere() {
+        let mut ui = glass();
+        ui.live = true;
+        let working = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|agent| agent.state == AgentState::Working && !agent.unmanaged)
+            .map(|agent| agent.id.clone())
+            .unwrap();
+        ui.open_in_glass(Pane::Agent(Some(working.clone())), Open::Tab);
+        assert!(screen(&ui).contains("■ stop · ctrl+c"));
+        ctrl(&mut ui, 'c');
+        assert!(!ui.quit && ui.effects.is_empty(), "the first asks");
+        ctrl(&mut ui, 'c');
+        assert_eq!(
+            std::mem::take(&mut ui.effects),
+            [Effect::StopAgent { agent: working }]
+        );
+        assert!(!ui.quit);
+        // Esc keeps it working.
+        ctrl(&mut ui, 'c');
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(ui.effects.is_empty() && !ui.quit);
+        // Anywhere else, Ctrl+C quits as before.
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Tab,
+        );
+        ctrl(&mut ui, 'c');
+        assert!(ui.quit);
     }
 
     #[test]

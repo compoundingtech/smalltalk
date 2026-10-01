@@ -949,6 +949,32 @@ async fn perform(
         Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } => {
             Ok((String::new(), None))
         }
+        Effect::StopAgent { agent } => {
+            let runtime = model
+                .agents()
+                .find(|candidate| candidate.header.id == agent)
+                .and_then(|candidate| candidate.runtime_ids.first().cloned())
+                .ok_or_else(|| anyhow::anyhow!("that agent is not running"))?;
+            let Resource::Runtime(runtime) = client.runtimes_get(&runtime).await?.value else {
+                anyhow::bail!("that agent's runtime is gone");
+            };
+            let terminal = runtime
+                .terminal_id
+                .ok_or_else(|| anyhow::anyhow!("that agent has no terminal to stop it through"))?;
+            let incarnation = client
+                .terminal_screen(&terminal)
+                .await?
+                .value
+                .runtime_incarnation;
+            crate::send_terminal_key(
+                client,
+                &terminal,
+                &incarnation,
+                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Esc),
+            )
+            .await?;
+            Ok(("Stopped its turn".into(), None))
+        }
         Effect::CreateAgent {
             name,
             harness,

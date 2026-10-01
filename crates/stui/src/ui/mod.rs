@@ -77,6 +77,8 @@ struct FrameInfo {
     sidebar_height: usize,
     /// Glasses: where each group's content was drawn, in group order.
     glass_leaves: Vec<Rect>,
+    /// Glasses: where Home was drawn over the glass, while it is open.
+    home: Option<Rect>,
     read_messages: HashSet<String>,
     /// The focused agent's pane was too narrow for details beside its conversation.
     agent_narrow: bool,
@@ -142,6 +144,10 @@ pub enum Effect {
     },
     /// Keep a glass in st, or delete it there.
     SaveGlass(glass::GlassWrite),
+    /// Interrupt an agent's turn, as Esc does in its harness's own TUI.
+    StopAgent {
+        agent: String,
+    },
     /// Start a new agent; its first message is what the person asked of it.
     CreateAgent {
         name: String,
@@ -1653,6 +1659,30 @@ impl Ui {
                     theme::SURFACE0
                 }),
             );
+            // A working agent can be stopped from here, as with Ctrl+C.
+            if self.live
+                && agent.state == AgentState::Working
+                && !agent.unmanaged
+                && self.composing(&agent.id)
+            {
+                let label = " ■ stop · ctrl+c ";
+                buf.set_stringn(
+                    area.x + 2,
+                    y,
+                    label,
+                    area.width.saturating_sub(4) as usize,
+                    theme::strong(theme::RED),
+                );
+                self.hit(
+                    Rect {
+                        x: area.x + 2,
+                        y,
+                        width: text::width(label) as u16,
+                        height: 1,
+                    },
+                    Hit::Key('S'),
+                );
+            }
             // How fresh the conversation is, on the rule above the box: st pushes changes to
             // the conversations on screen, and one that is not followed says so.
             if self.live {
@@ -2224,6 +2254,15 @@ impl Ui {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             if self.editing {
                 self.editing = false;
+            } else if self.confirm == Some('s') {
+                // The second Ctrl+C stops the agent, as a harness's own TUI would.
+                self.confirm = None;
+                self.act('s');
+            } else if let Some(name) = self.working_agent() {
+                self.confirm = Some('s');
+                self.flash(format!(
+                    "Stop {name}? Ctrl+C again or y stops it · Esc keeps it working"
+                ));
             } else {
                 self.quit = true;
             }
@@ -2563,6 +2602,14 @@ impl Ui {
                 }
             }
             1 if key == 'i' => self.toggle_details(),
+            1 if key == 'S' => {
+                if let Some(name) = self.working_agent() {
+                    self.confirm = Some('s');
+                    self.flash(format!(
+                        "Stop {name}? Ctrl+C again or y stops it · Esc keeps it working"
+                    ));
+                }
+            }
             1 if key == 'c'
                 && self.world.agents.items().iter().any(|agent| {
                     Some(&agent.id) == self.selected_id().as_ref() && !agent.unmanaged
@@ -3043,7 +3090,34 @@ impl Ui {
         }
     }
 
+    /// The agent whose conversation is shown, by name, while it is working.
+    fn working_agent(&self) -> Option<String> {
+        if self.tab != 1 || self.agent_form || self.terminal.is_some() {
+            return None;
+        }
+        let id = self.selected_id()?;
+        self.world
+            .agents
+            .items()
+            .iter()
+            .find(|agent| agent.id == id && agent.state == AgentState::Working && !agent.unmanaged)
+            .map(|agent| agent.name.clone())
+    }
+
     fn act(&mut self, action: char) {
+        if action == 's' {
+            // Stop the agent's turn: its harness gets Esc, as in its own TUI.
+            let Some(agent) = self.selected_id().filter(|_| self.tab == 1) else {
+                return;
+            };
+            if self.live {
+                self.effects.push(Effect::StopAgent { agent });
+                self.flash("Stopping…");
+            } else {
+                self.flash("Stopped · demo: nothing was sent");
+            }
+            return;
+        }
         if action == 'v' {
             if let Some(id) = self.revoke.take() {
                 if self.live {
@@ -3285,6 +3359,8 @@ impl Ui {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::NewAgent => self.open_new_agent(None),
+            Hit::Home if self.home_open() => self.close_home(),
+            Hit::Home => self.open_home(),
             // The terminal may be on another machine than stui (over SSH or fabric): the
             // clipboard is the person's, so the link lands where their browser is.
             Hit::Link(url) => {

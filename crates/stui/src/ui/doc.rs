@@ -36,6 +36,8 @@ pub enum Hit {
     PaletteSection(usize),
     /// Open the new agent form.
     NewAgent,
+    /// Glasses: open or close Home over the glass.
+    Home,
     /// A link: copied to the person's clipboard, wherever their terminal is.
     Link(String),
     /// Glasses: split the focused group, to the right (`true`) or below.
