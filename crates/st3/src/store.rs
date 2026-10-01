@@ -8678,6 +8678,89 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Publish a presentation-only revision of a seat through the normal durable intent log.
+    pub fn rename_agent(
+        &self,
+        subject: &str,
+        name: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ApplyResponse, St3Error> {
+        if name == Some("") {
+            return Err(St3Error::new("invalid-agent-name", "a seat label must be a non-empty string"));
+        }
+        let (mut desired, heads, writer) = {
+            let connection = self.readers.get();
+            let transaction = connection.unchecked_transaction().map_err(internal)?;
+            let desired = transaction
+                .query_row(
+                    "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                            desired.owner_run, desired.owner_generation, desired.owner_step, claims.actor
+                     FROM desired LEFT JOIN claims ON claims.id=desired.claim_id
+                     WHERE desired.subject=?1 AND desired.kind='agent'",
+                    [subject],
+                    |row| Ok((
+                        desired_from_row(row)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(3)?,
+                    )),
+                )
+                .optional()
+                .map_err(internal)?
+                .ok_or_else(|| St3Error::new("missing-agent", format!("no agent `{subject}`")))?;
+            // Republishing a member this build cannot read would erase it for every peer.
+            if desired.2.is_some() && desired.0.member.is_none() {
+                return Err(St3Error::new(
+                    "unreadable-agent-member",
+                    format!("agent `{subject}` has a launch this build cannot read"),
+                ));
+            }
+            let heads = intent_leaves_tx(&transaction, subject).map_err(internal)?;
+            (desired.0, heads, desired.1)
+        };
+        desired.set_display_name(name)?;
+        let normalized = json!({ "agent": subject, "display_name": name });
+        let intent = NormalizedIntent {
+            schema: "st3.v1".into(),
+            source_hash: canonical_hash(&normalized).map_err(internal)?,
+            subjects: BTreeMap::from([(subject.to_owned(), desired)]),
+            missions: BTreeMap::new(),
+            mission_runs: BTreeMap::new(),
+            planning_sessions: BTreeMap::new(),
+            resource_refreshes: Vec::new(),
+            replica_repairs: Vec::new(),
+            document_refs: BTreeSet::new(),
+            deprecated_syntax: BTreeSet::new(),
+            normalized,
+        };
+        self.apply_as(
+            &intent,
+            &BTreeMap::from([(subject.to_owned(), heads)]),
+            idempotency_key,
+            writer.as_deref(),
+        )
+    }
+
+    /// The current desired declaration of `subject` and the actor its claim records. A
+    /// declaration from before claims recorded their writer, or the daemon's own, has none.
+    pub fn desired_subject_with_writer(
+        &self,
+        subject: &str,
+    ) -> Result<Option<(DesiredSubject, Option<String>)>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                        desired.owner_run, desired.owner_generation, desired.owner_step,
+                        claims.actor
+                 FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
+                 WHERE desired.subject = ?1",
+                [subject],
+                |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Among `subjects`, each declaration whose member this build cannot read, with the reason.
     /// `desired_subjects` gives such a declaration no member at all.
     pub fn unreadable_members(&self, subjects: &[&str]) -> Result<Vec<(String, String)>> {
@@ -10080,6 +10163,14 @@ impl Store {
     pub fn selected_desired_token(&self, subject: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.claim_id))
+    }
+
+    /// The selected desired revision of `subject`, then each predecessor that differs from it
+    /// only in presentation. The last entry is the revision that still defines the launch, so
+    /// launch records, restart budgets, and crash-loop parking follow a rename.
+    pub fn launch_lineage(&self, subject: &str) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        launch_lineage_tx(&connection, subject)
     }
 
     /// `selected_desired_token` of each of `subjects` that has a declaration, in one statement.
@@ -13249,7 +13340,10 @@ fn reset_declared_runtime_tx(
         "runtime.restart-window-reset",
         None,
         &json!({"fields": {
-            "desired_token": desired.claim_id,
+            "desired_token": launch_lineage_tx(transaction, runtime)
+                .map_err(internal)?
+                .pop()
+                .unwrap_or(desired.claim_id),
             "incarnation_id": incarnation,
             "reason": operation.reason,
         }}),
@@ -14987,6 +15081,49 @@ fn claim_by_id_tx(connection: &Connection, id: &str) -> Result<Option<ClaimRecor
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<String>> {
+    let Some(row) = current_desired_row(connection, subject)? else {
+        return Ok(Vec::new());
+    };
+    let mut lineage = vec![row.claim_id.clone()];
+    let mut current = row.claim_id;
+    while let Some(claim) = claim_by_id_tx(connection, &current)? {
+        // A claim that merges concurrent revisions has one predecessor per fork; follow the
+        // first one that is still the same launch.
+        let mut next = None;
+        for predecessor in &claim.predecessors {
+            if lineage.contains(predecessor) {
+                continue;
+            }
+            if let Some(previous) = claim_by_id_tx(connection, predecessor)?
+                && previous.kind == "intent.desired"
+                && previous.subject == subject
+                && presentation_only_change(&previous.body, &claim.body)
+            {
+                next = Some(previous.id);
+                break;
+            }
+        }
+        let Some(next) = next else {
+            break;
+        };
+        current.clone_from(&next);
+        lineage.push(next);
+    }
+    Ok(lineage)
+}
+
+/// Two agent declarations that differ only in their human label share one launch.
+fn presentation_only_change(previous: &Value, next: &Value) -> bool {
+    let parse = |body: &Value| {
+        let mut desired = serde_json::from_value::<DesiredSubject>(body.clone()).ok()?;
+        (desired.kind == "agent").then_some(())?;
+        desired.set_display_name(None).ok()?;
+        Some(desired)
+    };
+    matches!((parse(previous), parse(next)), (Some(previous), Some(next)) if previous == next)
 }
 
 /// The version of the rules that derive `operations` from claims. Every write and projection
@@ -24723,6 +24860,114 @@ mod tests {
     mod canonical_audit {
         use super::*;
         include!("store/canonical_audit.rs");
+    }
+
+    #[test]
+    fn seat_rename_persists_across_a_real_store_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let original = {
+            let store = Store::open(&path, "node").unwrap();
+            let intent = parse_intent(r#"version 2
+agent "test/worker" { workspace "."; command "true"; name "Initial" }
+"#, "node").unwrap();
+            let preview = store.mission(&intent, IntentInput {
+                kdl: String::new(), source_name: None,
+            }).unwrap();
+            store.apply_as(&intent, &preview.subject_tokens, "initial", Some("person/operator")).unwrap();
+            let original = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
+            store.rename_agent("agent/test/worker", Some("Renamed"), "rename").unwrap();
+            original
+        };
+        let store = Store::open(&path, "node").unwrap();
+        let (mut renamed, writer) = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
+        assert_eq!(writer, original.1);
+        assert_eq!(renamed.member.as_ref().unwrap().display_name.as_deref(), Some("Renamed"));
+        renamed.set_display_name(Some("Initial")).unwrap();
+        assert_eq!(renamed, original.0);
+        store.rename_agent("agent/test/worker", None, "clear").unwrap();
+        drop(store);
+        let store = Store::open(&path, "node").unwrap();
+        let cleared = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap().0;
+        assert_eq!(crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)), "test/worker");
+        assert_eq!(cleared.member.unwrap().display_name, None);
+    }
+
+    #[test]
+    fn a_rename_that_merges_concurrent_renames_keeps_the_launch_revision() {
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        let intent = parse_intent(r#"version 2
+agent "test/worker" { command "true"; name "A" }
+"#, "left").unwrap();
+        let preview = left.mission(&intent, IntentInput {
+            kdl: String::new(), source_name: None,
+        }).unwrap();
+        left.apply(&intent, &preview.subject_tokens, "a").unwrap();
+        let launch = left.selected_desired_token("agent/test/worker").unwrap().unwrap();
+        receive_and_project(&right, "left", &exchange_from(&left, &ReplicationInventory::default()));
+        // Two hosts relabel the same seat concurrently, then one relabels the merged fork.
+        left.rename_agent("agent/test/worker", Some("R1"), "r1").unwrap();
+        right.rename_agent("agent/test/worker", Some("R2"), "r2").unwrap();
+        receive_and_project(&right, "left", &exchange_from(&left, &right.replication_inventory().unwrap()));
+        receive_and_project(&left, "right", &exchange_from(&right, &left.replication_inventory().unwrap()));
+        left.rename_agent("agent/test/worker", Some("R3"), "r3").unwrap();
+        let merged = left.selected_desired_token("agent/test/worker").unwrap().unwrap();
+        assert_eq!(left.claim_by_id(&merged).unwrap().unwrap().predecessors.len(), 2);
+        let lineage = left.launch_lineage("agent/test/worker").unwrap();
+        assert_eq!(lineage.first(), Some(&merged));
+        assert_eq!(lineage.last(), Some(&launch), "{lineage:?}");
+    }
+
+    #[test]
+    fn seat_rename_refuses_an_unreadable_member_and_an_empty_label() {
+        let store = Store::open_memory("node").unwrap();
+        let intent = parse_intent(r#"version 2
+agent "test/worker" { command "true"; name "Initial" }
+"#, "node").unwrap();
+        let preview = store.mission(&intent, IntentInput {
+            kdl: String::new(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &preview.subject_tokens, "initial").unwrap();
+        let before = store.selected_desired_token("agent/test/worker").unwrap();
+        assert_eq!(
+            store.rename_agent("agent/test/worker", Some(""), "empty").unwrap_err().code,
+            "invalid-agent-name"
+        );
+        // A launch published by a newer peer stays until a build that can read it takes it up.
+        store.replace_desired_member_for_test("agent/test/worker", r#"{"future":true}"#);
+        assert_eq!(
+            store.rename_agent("agent/test/worker", Some("Renamed"), "unreadable").unwrap_err().code,
+            "unreadable-agent-member"
+        );
+        assert_eq!(store.selected_desired_token("agent/test/worker").unwrap(), before);
+        let connection = store.readers.get();
+        let member: String = connection
+            .query_row("SELECT member FROM desired WHERE subject='agent/test/worker'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(member, r#"{"future":true}"#);
+    }
+
+    #[test]
+    fn seat_rename_accepts_an_empty_body_and_rejects_a_non_array_body() {
+        let store = Store::open_memory("node").unwrap();
+        let mut intent = parse_intent(r#"version 2
+agent "test/empty" { command "true" }
+"#, "node").unwrap();
+        // An empty canonical KDL body has no children key. Exercise that stored shape
+        // independently of launch validation, which requires a command for new seats.
+        let empty = intent.subjects.get_mut("agent/test/empty").unwrap();
+        empty.desired.as_object_mut().unwrap().remove("children");
+        empty.member = None;
+        let preview = store.mission(&intent, IntentInput {
+            kdl: String::new(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &preview.subject_tokens, "empty").unwrap();
+        store.rename_agent("agent/test/empty", Some("Empty seat"), "rename-empty").unwrap();
+        let mut desired = store.desired_subject_with_writer("agent/test/empty").unwrap().unwrap().0;
+        assert_eq!(crate::model::effective_agent_name("agent/test/empty", Some(&desired.desired)), "Empty seat");
+        desired.desired["children"] = json!({});
+        assert_eq!(desired.set_display_name(Some("Invalid")).unwrap_err().code, "invalid-agent-declaration");
     }
 
     #[test]
