@@ -12058,7 +12058,7 @@ async fn drive_st2_native(
         identity,
         runtime_id,
     } = paths.clone();
-    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state);
+    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
@@ -12972,6 +12972,7 @@ async fn run_pi_channel(
     if push_mailbox_enabled() && state.pending.fence.is_none() {
         state.pending.fence = Some(st3::mailbox::Fence::new(subject, &incarnation, "delivery"));
     }
+    if let Some(fence) = &mut state.pending.fence { fence.bind(client).await?; }
     let mut subscription = state.pending.fence.as_ref().map(|fence| {
         let mut report: Value =
             serde_json::from_str(&native_delivery_report(&transport, None)).unwrap_or_default();
@@ -13579,7 +13580,7 @@ async fn drive_codex_native(
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
-    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state);
+    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state).await?;
     if push_mailbox_enabled() {
         st_drivers::push_mailbox::register(&agent_dir);
     }
@@ -14251,22 +14252,26 @@ struct NativeMailbox {
     replayed: bool,
 }
 impl NativeMailbox {
-    fn start(
+    async fn start(
         client: &Client,
         subject: &str,
         incarnation: &str,
         driver: &str,
         state: &mut NativeLoopState,
-    ) -> Self {
+    ) -> Result<Self> {
         let component = if matches!(driver, "codex" | "opencode") {
             "delivery"
         } else {
             "title"
         };
-        let fence = state
+        let mut fence = state
             .mailbox_fence
             .get_or_insert_with(|| st3::mailbox::Fence::new(subject, incarnation, component))
             .clone();
+        if push_mailbox_enabled() {
+            fence.bind(client).await?;
+            state.mailbox_fence = Some(fence.clone());
+        }
         let transport = if driver == "codex" {
             "app-server"
         } else {
@@ -14276,13 +14281,13 @@ impl NativeMailbox {
             serde_json::from_str(&native_delivery_report(transport, None)).unwrap_or_default();
         let subscription = push_mailbox_enabled()
             .then(|| st3::mailbox::Subscription::start(client.clone(), fence.clone(), report));
-        Self {
+        Ok(Self {
             subscription,
             fence,
             messages: Vec::new(),
             queued: BTreeMap::new(),
             replayed: false,
-        }
+        })
     }
     async fn recv(&mut self) -> Option<st3::mailbox::Frame> {
         match &mut self.subscription {
@@ -15372,6 +15377,124 @@ mod tests {
         assert!(!resumed.delivered.contains("message/one"));
     }
 
+    #[tokio::test]
+    async fn pi_family_pending_read_survives_daemon_outage_and_reexec_under_its_fence() {
+        use axum::{Json, Router, routing::post};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("daemon.sock");
+        let client = Client::new(st3::client::Endpoint::Unix(path.clone()));
+        let mut fence = st3::mailbox::Fence::new("agent/eval.worker", "session-1", "delivery");
+        fence.epoch = 7; // The daemon's already-allocated binding, carried through exec.
+        let mut state = PiChannelResume {
+            incarnation: "session-1".into(),
+            session: "native-session".into(),
+            pending: PiFamilyReports {
+                fence: Some(fence.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.accept_frame(r#"{"type":"read","meta":{"messageId":"message/native"}}"#);
+        assert!(
+            state
+                .pending
+                .publish(
+                    &client,
+                    &fence.subject,
+                    "omp",
+                    &fence.incarnation,
+                    "native-session"
+                )
+                .await
+                .is_err()
+        );
+        assert!(state.pending.reads.contains("message/native"));
+        assert!(state.pending.acknowledgements.contains("message/native"));
+        let resume_path =
+            st_drivers::reexec::write_state(root.path(), "channel-resume", &state).unwrap();
+        let mut resumed: PiChannelResume = st_drivers::reexec::read_state(&resume_path).unwrap();
+        assert_eq!(
+            serde_json::to_value(resumed.pending.fence.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&fence).unwrap()
+        );
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = received.clone();
+        let expected = serde_json::to_value(&fence).unwrap();
+        let store = std::sync::Arc::new(
+            st3::store::Store::open(&root.path().join("graph.db"), "node").unwrap(),
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/native".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/eval".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("person/eval")),
+                    ("to".into(), json!(fence.subject)),
+                    ("content".into(), json!("QUARTZ SIGNAL")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("read-resume-send".into()),
+            })
+            .unwrap();
+        let graph = store.clone();
+        let app = Router::new().route(
+            "/v1/mailbox/receipts",
+            post(move |Json(receipt): Json<st3::mailbox::Receipt>| {
+                let received = captured.clone();
+                let expected = expected.clone();
+                let store = graph.clone();
+                async move {
+                    assert_eq!(serde_json::to_value(&receipt.fence).unwrap(), expected);
+                    received.lock().unwrap().push(receipt.lifecycle.clone());
+                    let record = store
+                        .append_claim(&ClaimInput {
+                            subject: receipt.message,
+                            kind: format!("message.{}", receipt.lifecycle),
+                            actor: Some(receipt.fence.subject),
+                            fields: BTreeMap::from([("status".into(), json!(receipt.lifecycle))]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: None,
+                        })
+                        .unwrap();
+                    Json(json!({"api_version":"st3.v1", "value":record}))
+                }
+            }),
+        );
+        let server_path = path.clone();
+        let server = tokio::spawn(async move {
+            st3::api::serve_unix(&server_path, app).await.unwrap();
+        });
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        resumed
+            .pending
+            .publish(
+                &client,
+                &fence.subject,
+                "omp",
+                &fence.incarnation,
+                "native-session",
+            )
+            .await
+            .unwrap();
+        assert!(resumed.pending.reads.is_empty());
+        assert!(resumed.pending.acknowledgements.is_empty());
+        assert_eq!(*received.lock().unwrap(), vec!["delivered", "read"]);
+        assert_eq!(
+            store.message("message/native").unwrap().unwrap().status,
+            "read"
+        );
+        assert!(!root.path().join("resources").exists());
+        server.abort();
+    }
     #[test]
     fn repeated_negative_handoffs_keep_retrying_and_resume_the_backoff() {
         let mut state = PiChannelResume::default();

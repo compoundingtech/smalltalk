@@ -12,10 +12,22 @@ pub(super) async fn subscribe(
     authorize(&fence, peer.as_ref().map(|p| &p.0))?;
     let store = state.store.clone();
     let binding = fence.clone();
-    blocking_action(move || store.bind_mailbox(&binding)).await?;
+    blocking_action(move || store.check_mailbox(&binding)).await?;
     // Wake the predecessor immediately, even when no graph content changed.
     signal_local_change(&state);
     Ok(websocket.on_upgrade(move |socket| stream(state, fence, socket)))
+}
+
+pub(super) async fn bind(
+    State(state): State<AppState>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
+    Json(request): Json<Fence>,
+) -> Result<Json<Fence>, ApiError> {
+    authorize(&request, peer.as_ref().map(|p| &p.0))?;
+    let store = state.store.clone();
+    let bound = blocking_action(move || store.bind_mailbox(&request)).await?;
+    signal_local_change(&state);
+    Ok(Json(bound))
 }
 
 fn authorize(fence: &Fence, peer: Option<&NativeDeliveryPeer>) -> Result<(), ApiError> {
@@ -79,7 +91,37 @@ pub(super) async fn receipt(
     Ok(Json(record))
 }
 
-async fn stream(state: AppState, fence: Fence, mut socket: WebSocket) {
+type Snapshot = (
+    Option<crate::model::DesiredSubject>,
+    Vec<crate::model::MessageView>,
+);
+
+fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
+    store.check_mailbox(binding).map_err(anyhow::Error::new)?;
+    let seat = store
+        .desired_subjects_named(std::slice::from_ref(&binding.subject))?
+        .into_iter()
+        .next();
+    let messages = if binding.component == "delivery" {
+        store
+            .messages(Some(&binding.subject), false)?
+            .into_iter()
+            .filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok((seat, messages))
+}
+
+async fn stream(state: AppState, fence: Fence, socket: WebSocket) {
+    stream_with_reader(state, fence, socket, snapshot).await;
+}
+
+async fn stream_with_reader<F>(state: AppState, fence: Fence, mut socket: WebSocket, read: F)
+where
+    F: Fn(&Store, &Fence) -> anyhow::Result<Snapshot> + Clone + Send + 'static,
+{
     // Subscribe before reading to close the replay-to-live race. Watch coalesces writes; every
     // wake recomputes the durable state, so lag needs no lossy event cursor.
     let mut changed = state.event_notify.subscribe();
@@ -92,35 +134,28 @@ async fn stream(state: AppState, fence: Fence, mut socket: WebSocket) {
             changed.borrow_and_update();
             let store = state.store.clone();
             let binding = fence.clone();
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                store.check_mailbox(&binding).map_err(anyhow::Error::new)?;
-                let seat = store
-                    .desired_subjects_named(std::slice::from_ref(&binding.subject))?
-                    .into_iter()
-                    .next();
-                let messages = if binding.component == "delivery" {
-                    store
-                        .messages(Some(&binding.subject), false)?
-                        .into_iter()
-                        .filter(|message| {
-                            matches!(message.status.as_str(), "sent" | "staged" | "delivered")
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                Ok((seat, messages))
-            })
-            .await;
+            let read = read.clone();
+            let result = tokio::task::spawn_blocking(move || read(&store, &binding)).await;
             let (seat, messages) = match result {
                 Ok(Ok(snapshot)) => snapshot,
-                error => {
-                    let frame = Frame::Fenced {
-                        reason: format!("subscription no longer owns this seat: {error:?}"),
-                    };
-                    finish_fenced(&mut socket, &frame).await;
+                Ok(Err(error)) => {
+                    if error
+                        .downcast_ref::<St3Error>()
+                        .is_some_and(|error| error.code == "stale-mailbox-session")
+                    {
+                        finish_fenced(
+                            &mut socket,
+                            &Frame::Fenced {
+                                reason: error.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    // Transient reads and join failures close only this connection. The current
+                    // owner reconnects under the same epoch and replays without a receipt.
                     return;
                 }
+                Err(_) => return,
             };
             if let Some(seat) = seat {
                 let bytes = serde_json::to_vec(&seat).unwrap_or_default();
@@ -164,8 +199,10 @@ async fn stream(state: AppState, fence: Fence, mut socket: WebSocket) {
                 _ => return,
             },
             _ = heartbeat.tick() => {
-                if state.store.check_mailbox(&fence).is_err() {
-                    finish_fenced(&mut socket, &Frame::Fenced { reason: "subscription replaced".into() }).await;
+                if let Err(error) = state.store.check_mailbox(&fence) {
+                    if error.code == "stale-mailbox-session" {
+                        finish_fenced(&mut socket, &Frame::Fenced { reason: error.to_string() }).await;
+                    }
                     return;
                 }
                 if socket.send(WsMessage::Ping(Vec::new().into())).await.is_err() { return; }
@@ -269,7 +306,7 @@ mod tests {
                         move |request: axum::extract::Request, next: axum::middleware::Next| {
                             let injection = injection.clone();
                             async move {
-                                let lost = request.uri().path() == "/v1/mailbox/receipts"
+                                let lost = matches!(request.uri().path(), "/v1/mailbox/receipts" | "/v1/mailbox/bind")
                                     && injection.swap(false, std::sync::atomic::Ordering::SeqCst);
                                 let response = next.run(request).await;
                                 if lost {
@@ -297,7 +334,16 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            let fence = Fence::new("agent/eval.worker", "session-1", "delivery");
+            let request = Fence::new("agent/eval.worker", "session-1", "delivery");
+            lose_response.store(true, std::sync::atomic::Ordering::SeqCst);
+            let lost_bind: anyhow::Result<Fence> = client.post("/v1/mailbox/bind", &request).await;
+            assert!(
+                lost_bind.is_err(),
+                "the binding committed but its response was discarded"
+            );
+            let fence: Fence = client.post("/v1/mailbox/bind", &request).await.unwrap();
+            let retry: Fence = client.post("/v1/mailbox/bind", &request).await.unwrap();
+            assert_eq!(retry.epoch, fence.epoch);
             let mut socket = client.open_mailbox(&fence).await.unwrap();
             assert!(matches!(next(&mut socket).await, Frame::Seat { .. }));
             assert!(
@@ -389,16 +435,39 @@ mod tests {
                 }
             });
             tokio::task::yield_now().await;
-            let replacement = Fence {
-                epoch: fence.epoch + 1,
-                ..fence.clone()
-            };
+            let replacement: Fence = client
+                .post(
+                    "/v1/mailbox/bind",
+                    &Fence::new("agent/eval.worker", "session-1", "delivery"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replacement.epoch, fence.epoch + 1);
             let mut successor = client.open_mailbox(&replacement).await.unwrap();
             assert!(matches!(next(&mut successor).await, Frame::Seat { .. }));
             assert!(
                 matches!(next(&mut successor).await, Frame::Mailbox { messages } if messages.is_empty())
             );
             predecessor.await.unwrap();
+            let retired: anyhow::Result<Fence> = client.post("/v1/mailbox/bind", &request).await;
+            assert!(
+                retired.is_err(),
+                "a lost initial response cannot let a predecessor allocate another epoch"
+            );
+            // A new owner may replay staged after delivered/read, even with a different key.
+            let late_stage = Receipt {
+                fence: replacement.clone(),
+                message: send.subject.clone(),
+                lifecycle: "staged".into(),
+            };
+            let _: ClaimRecord = client
+                .post("/v1/mailbox/receipts", &late_stage)
+                .await
+                .unwrap();
+            assert_eq!(
+                state.store.message(&send.subject).unwrap().unwrap().status,
+                "read"
+            );
             assert!(
                 client.open_mailbox(&fence).await.is_err(),
                 "the predecessor cannot reconnect"
@@ -419,6 +488,99 @@ mod tests {
             task.abort();
         }
     }
+    #[tokio::test]
+    async fn current_owner_reconnects_and_replays_after_an_injected_snapshot_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        let input = ClaimInput {
+            subject: "message/transient".into(),
+            kind: "message.sent".into(),
+            actor: Some("person/eval".into()),
+            fields: BTreeMap::from([
+                ("status".into(), json!("sent")),
+                ("from".into(), json!("person/eval")),
+                ("to".into(), json!("agent/eval.worker")),
+                ("content".into(), json!("QUARTZ SIGNAL")),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("transient-send".into()),
+        };
+        state.store.append_claim(&input).unwrap();
+        let fence = state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let injected = calls.clone();
+        let app = Router::new()
+            .route(
+                "/v1/mailbox",
+                get(
+                    move |State(state): State<AppState>,
+                          Query(fence): Query<Fence>,
+                          websocket: WebSocketUpgrade| {
+                        let calls = injected.clone();
+                        async move {
+                            state.store.check_mailbox(&fence).unwrap();
+                            websocket.on_upgrade(move |socket| {
+                                stream_with_reader(state, fence, socket, move |store, fence| {
+                                    let call =
+                                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    match call {
+                                        0 => Err(anyhow::Error::new(St3Error::new(
+                                            "internal",
+                                            "injected SQLITE_BUSY",
+                                        ))),
+                                        1 => Err(anyhow::anyhow!(
+                                            "injected seat/message snapshot read failure"
+                                        )),
+                                        2 => panic!("injected snapshot worker join failure"),
+                                        _ => snapshot(store, fence),
+                                    }
+                                })
+                            })
+                        }
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        let path = root.path().join("daemon.sock");
+        let server_path = path.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_path, app).await.unwrap();
+        });
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut subscription = crate::mailbox::Subscription::start(
+            Client::new(Endpoint::Unix(path)),
+            fence.clone(),
+            json!({}),
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(6), subscription.receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(frame, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == input.subject)
+        );
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 4);
+        state.store.check_mailbox(&fence).unwrap();
+        assert_eq!(
+            state.store.message(&input.subject).unwrap().unwrap().status,
+            "sent",
+            "reconnect writes no receipt"
+        );
+        assert!(!root.path().join("resources").exists());
+        server.abort();
+    }
+
     #[test]
     fn mailbox_authority_refuses_remote_and_foreign_subscriptions() {
         let fence = Fence::new("agent/eval.worker", "session-1", "delivery");

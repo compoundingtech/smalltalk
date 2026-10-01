@@ -25,10 +25,22 @@ after a daemon restart. Socket loss creates no delivered or read receipt. Native
 uncertain handoffs, and successful handoffs retry lost receipt acknowledgements with stable IDs.
 No push component projects message bodies into `resources/inbox` or `resources/archive`.
 
+Epochs are allocated by the daemon, independently of wall-clock time. An initial bind has a stable
+request token; a lost acknowledgement retries that same epoch, and retired tokens cannot allocate
+another epoch after replacement. Reexec carries the returned epoch and token. Only an explicit
+`stale-mailbox-session` ends a subscription as fenced. Store/read worker failures close its socket
+and the current owner reconnects and replays after one second without creating a receipt.
+
 Already-running seats keep the legacy delivery path when their binary follows a deploy. The new
 transport starts at the next ordinary seat restart; deploys do not force providers to restart.
 The compatibility paths and legacy marketplace entry remain until operations has switched the
 seat declarations. New Claude declarations use `plugin:st-channel@st`, from `plugins/claude`.
+
+Rollback to a binary from before push delivery requires restarting seats that started with `push`.
+The historical resume format does not negotiate these new fence and pending-read fields; an older
+image cannot safely adopt their channel state. Keep the push-capable binary installed for those
+live seats until operations coordinates their restart into the rollback version. Forward upgrades
+and seats that were already running on the legacy path continue to use ordinary adoption.
 
 Seat updates carry `desired.display_name` and the member record, including the persona suffix.
 They update the PTY title and pi/omp session name on reconnect, `session_start`, and `session_switch`.
@@ -123,6 +135,11 @@ retry indefinitely with a delay capped at five seconds; the third failure record
 without stopping retries. The channel reports the rejected handoff as stale until native
 acceptance or an authoritative delivery/read/close receipt settles it. This never authorizes
 repeating a handoff already accepted by the native transport.
+
+Rejected-attempt counts survive channel reexec in the same incarnation and appear in its presence
+and diagnostics. They are not durable `message.attempt` claims and reset on a new seat incarnation.
+Recording failure history and per-attempt tokens in the shared graph is a follow-up to the fenced
+receipt transport; the current lifecycle idempotency keys identify acknowledgements, not attempts.
 
 `st conversations status MESSAGE` shows delivery/read progress without changing its lifecycle.
 The client message view carries the same `delivery` assessment, including the local recipient

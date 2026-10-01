@@ -57,6 +57,7 @@ pub async fn run(
             ..State::default()
         }
     };
+    state.fence.bind(client).await?;
     let report = || {
         json!({"transport":"claude-channel", "pid":std::process::id(),
         "image":st_drivers::reexec::running_identity().map(|i| i.token()),

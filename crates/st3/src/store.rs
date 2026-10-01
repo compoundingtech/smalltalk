@@ -507,6 +507,13 @@ CREATE TABLE IF NOT EXISTS local_mailbox_owners (
     epoch INTEGER NOT NULL,
     PRIMARY KEY(subject, component)
 );
+CREATE TABLE IF NOT EXISTS local_mailbox_bindings (
+    token TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    epoch INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
     subject TEXT PRIMARY KEY,
     attempt INTEGER NOT NULL,
@@ -9063,7 +9070,7 @@ impl Store {
                         return Err(St3Error::new("wrong-message-recipient", "receipt belongs to another seat"));
                     }
                     matches!((input.kind.as_str(), message.status.as_str()),
-                        ("message.delivered", "read" | "closed") | ("message.read", "closed"))
+                        ("message.staged", "delivered" | "read" | "closed") | ("message.delivered", "read" | "closed") | ("message.read", "closed"))
                 } else { false };
                 if let Some((operation_id, request_digest)) = &operation
                     && let Some((stored_digest, canonical_claim, state)) =
@@ -13590,26 +13597,75 @@ impl Store {
     }
 
     /// Local subscription ownership survives a daemon outage; an older channel cannot retake it.
-    pub(crate) fn bind_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
+    pub(crate) fn bind_mailbox(
+        &self,
+        request: &crate::mailbox::Fence,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
         let mut connection = self.connection.write();
         let tx = connection.transaction().map_err(internal)?;
-        check_mailbox_incarnation(&tx, fence)?;
-        let existing: Option<(String, u64)> = tx.query_row(
-            "SELECT incarnation, epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
-            params![fence.subject, fence.component], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).optional().map_err(internal)?;
-        if existing.is_some_and(|(incarnation, epoch)| {
-            incarnation == fence.incarnation && epoch > fence.epoch
-        }) {
+        check_mailbox_incarnation(&tx, request)?;
+        if request.epoch != 0 {
+            check_mailbox_fence(&tx, request)?;
+            return Ok(request.clone());
+        }
+        if request.token.is_empty() || request.token.len() > 128 {
             return Err(St3Error::new(
-                "stale-mailbox-session",
-                "a newer channel owns this seat",
+                "invalid-mailbox-token",
+                "binding requires a stable request token",
             ));
         }
+        let prior: Option<(String, String, String, u64)> = tx.query_row(
+            "SELECT subject, component, incarnation, epoch FROM local_mailbox_bindings WHERE token=?1",
+            [&request.token], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional().map_err(internal)?;
+        let mut bound = request.clone();
+        if let Some((subject, component, incarnation, epoch)) = prior {
+            if (subject, component, incarnation)
+                != (
+                    request.subject.clone(),
+                    request.component.clone(),
+                    request.incarnation.clone(),
+                )
+            {
+                return Err(St3Error::new(
+                    "invalid-mailbox-token",
+                    "binding token belongs to another session",
+                ));
+            }
+            bound.epoch = epoch;
+            // Retired tokens cannot allocate another epoch and retake their successor's mailbox.
+            check_mailbox_fence(&tx, &bound)?;
+            return Ok(bound);
+        }
+        let previous: Option<u64> = tx
+            .query_row(
+                "SELECT epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
+                params![request.subject, request.component],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        bound.epoch = previous
+            .unwrap_or(0)
+            .checked_add(1)
+            .filter(|epoch| *epoch <= i64::MAX as u64)
+            .ok_or_else(|| St3Error::new("internal", "mailbox epoch exhausted"))?;
+        tx.execute(
+            "INSERT INTO local_mailbox_bindings VALUES (?1,?2,?3,?4,?5)",
+            params![
+                bound.token,
+                bound.subject,
+                bound.component,
+                bound.incarnation,
+                bound.epoch
+            ],
+        )
+        .map_err(internal)?;
         tx.execute("INSERT INTO local_mailbox_owners VALUES (?1,?2,?3,?4)
             ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation, epoch=excluded.epoch",
-            params![fence.subject, fence.component, fence.incarnation, fence.epoch]).map_err(internal)?;
-        tx.commit().map_err(internal)
+            params![bound.subject, bound.component, bound.incarnation, bound.epoch]).map_err(internal)?;
+        tx.commit().map_err(internal)?;
+        Ok(bound)
     }
 
     pub(crate) fn check_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
@@ -19798,13 +19854,29 @@ fn check_mailbox_incarnation(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
 ) -> Result<(), St3Error> {
-    let harness = current_harness_at(connection, &fence.subject, None).map_err(internal)?;
-    if !harness.is_some_and(|h| h.incarnation_id == fence.incarnation && h.state != "ended") {
+    let runtime: Option<String> = connection
+        .prepare_cached(&format!(
+            "{} LIMIT 1",
+            newest_claims_of_kind_query("claims.body", "runtime.observed")
+        ))
+        .map_err(internal)?
+        .query_row(params![fence.subject, i64::MAX], |row| row.get(0))
+        .optional()
+        .map_err(internal)?;
+    let runtime: Value = serde_json::from_str(&runtime.unwrap_or_default()).unwrap_or(Value::Null);
+    let fields = runtime.get("fields").unwrap_or(&runtime);
+    let live = fields.get("status").and_then(Value::as_str) == Some("running")
+        && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
+    let ended = current_harness_at(connection, &fence.subject, None)
+        .map_err(internal)?
+        .is_some_and(|harness| harness.state == "ended");
+    if !live || ended {
         return Err(St3Error::new(
             "stale-mailbox-session",
             "this is not the seat's live incarnation",
         ));
     }
+
     Ok(())
 }
 
@@ -19815,8 +19887,12 @@ fn check_mailbox_fence(
     check_mailbox_incarnation(connection, fence)?;
     let owner: Option<(String, u64)> = connection
         .query_row(
-            "SELECT incarnation, epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
-            params![fence.subject, fence.component],
+            "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner
+             JOIN local_mailbox_bindings binding ON binding.token=?3
+               AND binding.subject=owner.subject AND binding.component=owner.component
+               AND binding.incarnation=owner.incarnation AND binding.epoch=owner.epoch
+             WHERE owner.subject=?1 AND owner.component=?2",
+            params![fence.subject, fence.component, fence.token],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()

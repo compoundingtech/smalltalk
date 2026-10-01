@@ -5,7 +5,6 @@ use anyhow::{Context as _, Result};
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Fence {
@@ -13,18 +12,41 @@ pub struct Fence {
     pub incarnation: String,
     pub component: String,
     pub epoch: u64,
+    pub token: String,
 }
 
 impl Fence {
     pub fn new(subject: &str, incarnation: &str, component: &str) -> Self {
+        let mut token = [0_u8; 16];
+        getrandom::fill(&mut token).expect("creating a mailbox binding token");
         Self {
             subject: subject.into(),
             incarnation: incarnation.into(),
             component: component.into(),
-            epoch: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
+            epoch: 0,
+            token: hex::encode(token),
+        }
+    }
+    /// Initial allocation is idempotent under this random request token. Reexec and reconnect
+    /// carry the returned epoch; neither the client's clock nor a lost response changes ownership.
+    pub async fn bind(&mut self, client: &crate::client::Client) -> Result<()> {
+        if self.epoch != 0 {
+            return Ok(());
+        }
+        loop {
+            match client.post("/v1/mailbox/bind", &*self).await {
+                Ok(bound) => {
+                    *self = bound;
+                    return Ok(());
+                }
+                Err(error)
+                    if crate::client::api_error_code(&error)
+                        .is_some_and(|code| code != "internal") =>
+                {
+                    return Err(error);
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+            }
         }
     }
 }
@@ -177,19 +199,40 @@ pub(crate) mod tests {
             .unwrap();
     }
     #[test]
+    fn mailbox_can_bind_before_the_native_provider_reports_ready() {
+        let store = Store::open_memory("node").unwrap();
+        store
+            .append_claim(&claim(
+                "agent/eval.worker",
+                "runtime.observed",
+                json!({"status":"running","runtime_id":"eval.worker","incarnation_id":"session-1"}),
+                "runtime:session-1",
+            ))
+            .unwrap();
+        assert!(
+            store
+                .current_harness("agent/eval.worker")
+                .unwrap()
+                .is_none()
+        );
+        let bound = store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        assert_eq!(bound.epoch, 1);
+        ready(&store, "session-2");
+        assert_eq!(
+            store.check_mailbox(&bound).unwrap_err().code,
+            "stale-mailbox-session"
+        );
+    }
+
+    #[test]
     fn mailbox_replacement_fences_reconnect_and_receipts_after_daemon_restart() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("graph.db");
-        let old = Fence {
-            subject: "agent/eval.worker".into(),
-            incarnation: "session-1".into(),
-            component: "delivery".into(),
-            epoch: 1,
-        };
-        let new = Fence {
-            epoch: 2,
-            ..old.clone()
-        };
+        let request = Fence::new("agent/eval.worker", "session-1", "delivery");
+        let replacement = Fence::new("agent/eval.worker", "session-1", "delivery");
+        let (old, new);
         {
             let store = Store::open(&path, "node").unwrap();
             ready(&store, "session-1");
@@ -198,18 +241,34 @@ pub(crate) mod tests {
                     "message/native",
                     "message.sent",
                     json!({"status":"sent",
-                "from":"person/eval","to":old.subject,"content":"QUARTZ SIGNAL"}),
+                "from":"person/eval","to":request.subject,"content":"QUARTZ SIGNAL"}),
                     "send",
                 ))
                 .unwrap();
-            store.bind_mailbox(&old).unwrap();
-            store.bind_mailbox(&new).unwrap();
+            old = store.bind_mailbox(&request).unwrap();
+            assert_eq!(
+                store.bind_mailbox(&request).unwrap().epoch,
+                old.epoch,
+                "lost bind acknowledgement retries the same epoch"
+            );
+            new = store.bind_mailbox(&replacement).unwrap();
+            assert_eq!(new.epoch, old.epoch + 1, "the daemon owns epoch ordering");
+            assert_eq!(
+                store.bind_mailbox(&request).unwrap_err().code,
+                "stale-mailbox-session",
+                "a retired initial request cannot reallocate"
+            );
             assert_eq!(
                 store.bind_mailbox(&old).unwrap_err().code,
                 "stale-mailbox-session"
             );
         }
         let store = Store::open(&path, "node").unwrap();
+        assert_eq!(
+            store.bind_mailbox(&request).unwrap_err().code,
+            "stale-mailbox-session",
+            "retired binding tokens survive daemon restart"
+        );
         assert_eq!(
             store.bind_mailbox(&old).unwrap_err().code,
             "stale-mailbox-session"
@@ -258,11 +317,52 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn staged_replay_after_delivered_is_settled_without_a_backward_claim() {
+        let store = Store::open_memory("node").unwrap();
+        ready(&store, "session-1");
+        let fence = store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        store.append_claim(&claim("message/native", "message.sent",
+            json!({"status":"sent","from":"person/eval","to":fence.subject,"content":"QUARTZ SIGNAL"}), "send")).unwrap();
+        let delivered = claim(
+            "message/native",
+            "message.delivered",
+            json!({"status":"delivered"}),
+            "delivered",
+        );
+        let committed = store.append_mailbox_receipt(&delivered, &fence).unwrap();
+        let staged = claim(
+            "message/native",
+            "message.staged",
+            json!({"status":"staged","recipient":fence.subject,"transport":"omp-channel"}),
+            "late-staged",
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                store.append_mailbox_receipt(&staged, &fence).unwrap().id,
+                committed.id
+            );
+            assert_eq!(
+                store.message("message/native").unwrap().unwrap().status,
+                "delivered"
+            );
+        }
+        assert!(
+            store
+                .claims_for("message/native", Some("message.staged"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn mailbox_receipts_cannot_mutate_another_recipients_message() {
         let store = Store::open_memory("node").unwrap();
         ready(&store, "session-1");
-        let fence = Fence::new("agent/eval.worker", "session-1", "delivery");
-        store.bind_mailbox(&fence).unwrap();
+        let fence = store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
         store
             .append_claim(&claim(
                 "message/foreign",

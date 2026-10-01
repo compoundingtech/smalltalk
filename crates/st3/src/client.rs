@@ -431,11 +431,12 @@ impl Client {
         };
         let stream = tokio::net::UnixStream::connect(path).await?;
         let url = format!(
-            "ws://localhost/v1/mailbox?subject={}&incarnation={}&component={}&epoch={}",
+            "ws://localhost/v1/mailbox?subject={}&incarnation={}&component={}&epoch={}&token={}",
             urlencoding::encode(&fence.subject),
             urlencoding::encode(&fence.incarnation),
             urlencoding::encode(&fence.component),
-            fence.epoch
+            fence.epoch,
+            urlencoding::encode(&fence.token)
         );
         let (socket, _) = tokio::time::timeout(
             self.deadlines.terminal_handshake,
