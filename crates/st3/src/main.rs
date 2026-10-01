@@ -7129,6 +7129,40 @@ fn render_performance(view: &Value) -> String {
             }
         }
     }
+    if let Some(count) = view["request_count"].as_u64() {
+        let seconds = view["sampled_seconds"].as_u64().unwrap_or(300).max(1);
+        let _ = writeln!(
+            out,
+            "REQUESTS BY CLIENT  {count} requests in {seconds} s ({:.1}/s) · sorted by count",
+            count as f64 / seconds as f64
+        );
+    }
+    for (key, title) in [
+        ("clients", "CLIENTS  count · total ms · CPU ms · client"),
+        (
+            "client_requests",
+            "CLIENT REQUESTS  count · total ms · CPU ms · client · kind",
+        ),
+    ] {
+        let Some(rows) = view[key].as_array() else {
+            continue;
+        };
+        let _ = writeln!(out, "{title}");
+        for row in rows {
+            let _ = write!(
+                out,
+                "  {}  {:.1}  {:.1}  {}",
+                row["count"],
+                row["total_ms"].as_f64().unwrap_or(0.0),
+                row["cpu_ms"].as_f64().unwrap_or(0.0),
+                row["client"].as_str().unwrap_or("?")
+            );
+            if let Some(kind) = row["kind"].as_str() {
+                let _ = write!(out, "  {kind}");
+            }
+            out.push('\n');
+        }
+    }
     if let Some(note) = view["query_time_note"].as_str() {
         let _ = writeln!(out, "{note}");
     }
