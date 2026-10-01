@@ -404,7 +404,7 @@ impl Store {
     }
 
     /// Start this node's first sync: it ends at the first exchange at which this node holds the
-    /// same envelopes as a peer, and it checks that both project the same graph.
+    /// same envelopes as a peer. Matching registries check the graph; mixed builds check the log.
     pub fn begin_first_sync(&self, sponsor: &str) -> Result<()> {
         let connection = self.connection.write();
         save_first_sync(
@@ -416,6 +416,33 @@ impl Store {
                 ..Default::default()
             },
         )
+    }
+
+    /// End a mixed-build first sync at a verified equal wire log. Projection equality is
+    /// deliberately left unasserted until both members have the same registry.
+    pub(super) fn observe_first_sync_log(
+        &self,
+        peer: &str,
+        envelopes: u64,
+        authority_digest: &str,
+    ) -> Result<()> {
+        let connection = self.connection.write();
+        let Some(mut first) = first_sync_tx(&connection)? else {
+            return Ok(());
+        };
+        if matches!(first.state.as_str(), "syncing" | "failed") {
+            first.state = "verified".into();
+            first.ended_at_unix_ms = Some(now_ms());
+            first.peer = Some(peer.to_owned());
+            first.envelopes = Some(envelopes);
+            first.graph_digest = None;
+            first.peer_graph_digest = None;
+            first.authority_digest = Some(authority_digest.to_owned());
+            first.healed = false;
+            first.message = Some("projection comparison waits for matching builds".into());
+            save_first_sync(&connection, &first)?;
+        }
+        Ok(())
     }
 
     /// Record one graph comparison with `peer` for the first sync. Returns true when the graphs
@@ -432,6 +459,12 @@ impl Store {
         let Some(mut first) = first_sync_tx(&connection)? else {
             return Ok(false);
         };
+        // Once builds match, replace a log-only verification with the graph comparison.
+        if first.authority_digest.take().is_some() {
+            first.state = "syncing".into();
+            first.ended_at_unix_ms = None;
+            first.message = None;
+        }
         match (first.state.as_str(), equal) {
             ("syncing" | "failed", true) => {
                 first.healed |= first.state == "failed";

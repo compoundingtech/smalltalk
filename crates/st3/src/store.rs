@@ -1614,6 +1614,9 @@ pub(crate) struct MissionGateRunner {
 }
 
 pub struct Store {
+    /// Simulate different build registries on isolated nodes in compatibility tests.
+    #[cfg(test)]
+    pub(crate) claim_registry: Option<st3_schema::Registry>,
     connection: WriterConnection,
     readers: ReadPool,
     committed_index: Arc<AtomicU64>,
@@ -2763,6 +2766,8 @@ impl Store {
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
         let readers = ReadPool::new(path, false)?;
         Ok(Self {
+            #[cfg(test)]
+            claim_registry: None,
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
             committed_index,
@@ -2823,6 +2828,8 @@ impl Store {
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
         let readers = ReadPool::new(&uri, true)?;
         Ok(Self {
+            #[cfg(test)]
+            claim_registry: None,
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
             committed_index,
@@ -2847,6 +2854,14 @@ impl Store {
             trim_fault: Mutex::new(None),
             trim_chunk_envelopes: AtomicUsize::new(checkpoint_trim::TRIM_CHUNK_ENVELOPES),
         })
+    }
+
+    fn claim_registry(&self) -> &st3_schema::Registry {
+        #[cfg(test)]
+        if let Some(registry) = &self.claim_registry {
+            return registry;
+        }
+        st3_schema::registry()
     }
 
     pub fn origin(&self) -> &str {
@@ -14109,7 +14124,7 @@ impl Store {
         Ok(ReplicationExchange {
             peer: self.origin.clone(),
             fleet_id: fleet_id.to_owned(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: self.claim_registry().digest(),
             authority_digest: snapshot.authority_digest.clone(),
             graph_digest: snapshot.legacy_graph_digest.clone(),
             projection_digests: snapshot.projection_digests.clone(),
@@ -14168,7 +14183,7 @@ impl Store {
             return Ok(ReplicationExchange {
                 peer: self.origin.clone(),
                 fleet_id: fleet_id.to_owned(),
-                schema_digest: st3_schema::registry().digest(),
+                schema_digest: self.claim_registry().digest(),
                 authority_digest: snapshot.authority_digest.clone(),
                 graph_digest: snapshot.legacy_graph_digest.clone(),
                 projection_digests: snapshot.projection_digests.clone(),
@@ -14210,7 +14225,7 @@ impl Store {
         Ok(ReplicationExchange {
             peer: self.origin.clone(),
             fleet_id: fleet_id.to_owned(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: self.claim_registry().digest(),
             authority_digest: snapshot.authority_digest.clone(),
             graph_digest: snapshot.legacy_graph_digest.clone(),
             projection_digests: snapshot.projection_digests.clone(),
@@ -14450,13 +14465,54 @@ impl Store {
                 projection_digest::root(&input.projection_digests),
             )
         };
-        let graph_equal = (!input.inventory.digest.is_empty()
+        // Registries from different builds may legitimately produce different projections.
+        // Their complete wire logs remain comparable through the authority digest.
+        let same_registry = input.schema_digest == self.claim_registry().digest();
+        let waiting: bool = self
+            .readers
+            .get()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM replica_records WHERE state='unknown')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        let graph_equal = (same_registry
+            && !waiting
+            && !input.inventory.digest.is_empty()
             && input.inventory.digest == snapshot.inventory.digest
             && !input.graph_digest.is_empty()
             && received == 0
             && signatures == 0
             && !self.replication_projection_deferred())
         .then(|| remote_graph == local_graph);
+        if !same_registry
+            && input.inventory.digest == snapshot.inventory.digest
+            && received == 0
+            && signatures == 0
+            && !self.replication_projection_deferred()
+        {
+            // Pending, invalid and signature-held envelopes cannot complete admission. Unknown
+            // kinds alone are validated envelopes and can complete a mixed-build log sync.
+            let unvalidated: bool = self
+                .readers
+                .get()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM replica_envelopes
+                     WHERE receipt_state IN ('pending','degraded'))",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if !unvalidated {
+                self.observe_first_sync_log(
+                    relay,
+                    snapshot.inventory.envelopes.len() as u64,
+                    &snapshot.authority_digest,
+                )
+                .map_err(internal)?;
+            }
+        }
         // A first sync ends at its first comparison, and a difference there heals at once.
         let first_sync_differs = match graph_equal {
             Some(equal) => self
@@ -14477,6 +14533,12 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner);
         let progress = sync.entry(relay.to_owned()).or_default();
         progress.observe(received, difference, now);
+        if !same_registry || waiting {
+            // Retire a comparison from before a rolling upgrade or a newly waiting claim.
+            progress.graph_compared_at_unix_ms = None;
+            progress.graph_differs_since_unix_ms = None;
+            progress.heal = None;
+        }
         let heal = match graph_equal {
             Some(equal) => {
                 progress.compare_graphs(equal, now);
@@ -14569,7 +14631,12 @@ impl Store {
                     continue;
                 }
                 let mut savepoint = pass.savepoint()?;
-                let result = validate_and_admit_envelope_tx(&savepoint, &envelope, &mut outcome);
+                let result = validate_and_admit_envelope_tx(
+                    &savepoint,
+                    &envelope,
+                    self.claim_registry(),
+                    &mut outcome,
+                );
                 match result {
                     Ok(()) => {
                         savepoint.execute(
@@ -15382,6 +15449,8 @@ impl Store {
                 |row| row.get(0),
             )?)
         };
+        let waiting_claims = count("unknown")?;
+        let registry_digest = self.claim_registry().digest();
         let sync = self.replication_peer_sync(configured_peers);
         let mut peers = Vec::new();
         for peer in configured_peers {
@@ -15405,6 +15474,7 @@ impl Store {
                             graph_digest: row.get(5)?,
                             projection_digests: BTreeMap::new(),
                             differing_tables: Vec::new(),
+                            projection_comparison_waiting: false,
                             sync: None,
                         })
                     },
@@ -15421,6 +15491,7 @@ impl Store {
                     graph_digest: None,
                     projection_digests: BTreeMap::new(),
                     differing_tables: Vec::new(),
+                    projection_comparison_waiting: false,
                     sync: None,
                 });
             if matches!(
@@ -15474,6 +15545,9 @@ impl Store {
                 if peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str())
                     && !self.replication_projection_deferred()
                     && !unsealed_local
+                    && status.schema_digest.as_deref()
+                        == Some(registry_digest.as_str())
+                    && waiting_claims == 0
                 {
                     status.differing_tables = projection_digest::differing(
                         &snapshot.projection_digests,
@@ -15481,6 +15555,8 @@ impl Store {
                     );
                 }
             }
+            status.projection_comparison_waiting = waiting_claims != 0
+                || status.schema_digest.as_deref().is_some_and(|digest| digest != registry_digest);
             peers.push(status);
         }
         Ok(ReplicationStatus {
@@ -15496,7 +15572,8 @@ impl Store {
             )?,
             pending_records: count("pending")?,
             valid_records: count("valid")?,
-            unknown_records: count("unknown")?,
+            unknown_records: waiting_claims,
+            waiting_claims,
             invalid_records: count("invalid")?,
             repaired_records: count("repaired")?,
             unsigned_envelopes: connection.query_row(
@@ -23669,6 +23746,153 @@ mod fleet_admission_tests {
     }
 
     #[test]
+    fn mixed_builds_keep_signed_unknown_claims_and_project_them_after_upgrade() {
+        let anchor_key = key();
+        let older_key = key();
+        let current = node("current", Some(&anchor_key), Some(&anchor_key));
+        admit(&current, "current", &anchor_key, "anchor", None);
+        admit(&current, "older", &older_key, "invite", None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("older.sqlite3");
+        let mut older = Store::open(&path, "older").unwrap();
+        older.bind_fleet(FLEET).unwrap();
+        older.pin_fleet_anchor(anchor_key.public()).unwrap();
+        older.set_member_key(Some(older_key.clone())).unwrap();
+        let mut registry = st3_schema::registry().clone();
+        registry.claims.remove("doc.bound").unwrap();
+        older.claim_registry = Some(registry);
+        sync(&current, &older);
+        older.begin_first_sync("current").unwrap();
+
+        let first = current
+            .put_document("doc/release", b"first", &None, "first")
+            .unwrap();
+        current
+            .put_document(
+                "doc/release",
+                b"second",
+                &Some(first.binding_claim_id),
+                "second",
+            )
+            .unwrap();
+        let later = note(&current, "A known claim after the unknown claims");
+        let mut exchange = current
+            .export_replication_exchange(FLEET, &older.replication_inventory().unwrap())
+            .unwrap();
+        assert!(
+            exchange
+                .envelopes
+                .iter()
+                .all(|envelope| envelope.signature.is_some())
+        );
+        // Receipt order must not choose the winning document, including during upgrade replay.
+        exchange.envelopes.reverse();
+        older
+            .receive_replication_exchange("current", FLEET, &exchange)
+            .unwrap();
+        let summary = current.export_replication_summary(FLEET).unwrap();
+        older
+            .receive_replication_exchange_asking("current", FLEET, &summary, true)
+            .unwrap();
+        assert_eq!(older.first_sync().unwrap().unwrap().state, "syncing");
+        let admission = older.validate_replication_backlog().unwrap();
+        assert_eq!(admission.unknown, 2);
+        assert_eq!(admission.invalid, 0);
+        assert!(older.project_replication_backlog().unwrap());
+        assert!(admitted(&older, &later));
+        assert!(
+            older
+                .list_documents(Some("doc/release"), false, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let local = note(&older, "The older member still writes and syncs");
+        sync(&older, &current);
+        assert!(admitted(&current, &local));
+
+        // Equal wire logs from different registries are not projection divergence and never heal.
+        for (from, to) in [(&current, &older), (&older, &current)] {
+            let exchange = from.export_replication_summary(FLEET).unwrap();
+            let receipt = to
+                .receive_replication_exchange_asking(&from.origin, FLEET, &exchange, true)
+                .unwrap();
+            assert!(!receipt.heal);
+            let status = to
+                .replication_status(true, Some(FLEET), std::slice::from_ref(&from.origin))
+                .unwrap();
+            assert!(status.peers[0].differing_tables.is_empty());
+            assert!(status.peers[0].projection_comparison_waiting);
+            assert!(!status.peers[0].sync.as_ref().unwrap().diverged);
+            assert_eq!(status.unhealthy_projections, 0);
+        }
+        let before = older.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert_eq!(before.waiting_claims, 2);
+        assert_eq!(before.invalid_records, 0);
+        let first_sync = before.first_sync.as_ref().unwrap();
+        assert_eq!(first_sync.state, "verified");
+        assert_eq!(
+            first_sync.authority_digest.as_deref(),
+            Some(before.authority_digest.as_str())
+        );
+        assert!(first_sync.graph_digest.is_none());
+        let source = current.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert_eq!(before.authority_digest, source.authority_digest);
+        assert_ne!(before.graph_digest, source.graph_digest);
+        // Unknown records are retained as authenticated, validated envelopes, not degradation.
+        assert_eq!(
+            older
+                .readers
+                .get()
+                .query_row(
+                    "SELECT COUNT(*) FROM replica_envelopes WHERE receipt_state<>'validated'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(older);
+
+        // The daemon startup path retries with the new registry, then canonically replays.
+        let upgraded = Store::open(&path, "older").unwrap();
+        upgraded.set_member_key(Some(older_key)).unwrap();
+        let admission = upgraded.validate_replication_backlog().unwrap();
+        assert_eq!(admission.unknown, 0);
+        assert!(admission.changed);
+        upgraded.apply_replication_repairs().unwrap();
+        assert!(upgraded.project_replication_backlog().unwrap());
+        let after = upgraded.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert_eq!(after.waiting_claims, 0);
+        assert_eq!(after.authority_digest, before.authority_digest);
+        assert_eq!(after.graph_digest, source.graph_digest);
+        assert_eq!(after.projection_digests, source.projection_digests);
+        assert_eq!(
+            upgraded
+                .list_documents(Some("doc/release"), false, 10)
+                .unwrap()[0]
+                .hash,
+            current
+                .list_documents(Some("doc/release"), false, 10)
+                .unwrap()[0]
+                .hash
+        );
+        let exchange = current.export_replication_summary(FLEET).unwrap();
+        let receipt = upgraded
+            .receive_replication_exchange_asking("current", FLEET, &exchange, true)
+            .unwrap();
+        assert!(!receipt.heal);
+        let first_sync = upgraded.first_sync().unwrap().unwrap();
+        assert_eq!(first_sync.state, "verified");
+        assert!(first_sync.authority_digest.is_none());
+        assert_eq!(first_sync.graph_digest, first_sync.peer_graph_digest);
+        assert!(
+            upgraded.replication_peer_sync(&["current".into()])["current"]
+                .graph_compared_at_unix_ms
+                .is_some()
+        );
+    }
+
+    #[test]
     fn a_member_leaves_once_and_a_second_leave_writes_nothing() {
         let anchor_key = key();
         let laptop_key = key();
@@ -26042,6 +26266,7 @@ fn ensure_claim_blobs(transaction: &Connection, claim: &ClaimRecord) -> Result<(
 fn validate_and_admit_envelope_tx(
     transaction: &Connection,
     envelope: &ReplicaEnvelope,
+    registry: &st3_schema::Registry,
     outcome: &mut ReplicationAdmission,
 ) -> Result<(), St3Error> {
     let started = std::time::Instant::now();
@@ -26199,7 +26424,8 @@ fn validate_and_admit_envelope_tx(
             .optional()
             .map_err(internal)?;
         let started = std::time::Instant::now();
-        let classification = validate_replicated_claim(transaction, batch, claim);
+        let classification =
+            validate_replicated_claim_with_registry(transaction, batch, claim, registry);
         outcome.verify += started.elapsed();
         match classification {
             Ok(ReplicatedClaimAdmission::Valid) => {
@@ -26250,7 +26476,6 @@ fn validate_and_admit_envelope_tx(
                 classification @ (ReplicatedClaimAdmission::UnknownKind
                 | ReplicatedClaimAdmission::UnknownField),
             ) => {
-                degraded = true;
                 let (error_code, error_message) = match classification {
                     ReplicatedClaimAdmission::UnknownKind => (
                         "unknown-claim-kind",
@@ -26334,10 +26559,20 @@ fn verify_replica_batch_header(batch: &ReplicaBatch) -> Result<(), St3Error> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_replicated_claim(
     transaction: &Connection,
     batch: &ReplicaBatch,
     claim: &ClaimRecord,
+) -> Result<ReplicatedClaimAdmission, St3Error> {
+    validate_replicated_claim_with_registry(transaction, batch, claim, st3_schema::registry())
+}
+
+fn validate_replicated_claim_with_registry(
+    transaction: &Connection,
+    batch: &ReplicaBatch,
+    claim: &ClaimRecord,
+    registry: &st3_schema::Registry,
 ) -> Result<ReplicatedClaimAdmission, St3Error> {
     if claim.batch_id != batch.id || claim.origin != batch.origin {
         return Err(St3Error::new(
@@ -26354,7 +26589,8 @@ fn validate_replicated_claim(
             format!("replicated claim `{}` failed verification", claim.id),
         ));
     }
-    if !known_replicated_claim_kind(&claim.kind) {
+    if !registry.claims.contains_key(&claim.kind) && !st3_schema::is_custom_claim_kind(&claim.kind)
+    {
         return Ok(ReplicatedClaimAdmission::UnknownKind);
     }
     let fields = schema_fields_for_body(&claim.kind, &claim.body).map_err(|error| {
@@ -26366,8 +26602,7 @@ fn validate_replicated_claim(
             ),
         )
     })?;
-    if let Err(error) = st3_schema::registry().validate_claim(&claim.subject, &claim.kind, &fields)
-    {
+    if let Err(error) = registry.validate_claim(&claim.subject, &claim.kind, &fields) {
         // A peer may already publish a field introduced by a newer schema. Keep
         // that authenticated record retryable so an upgrade can admit the
         // original claim without replacing or rewriting it.
@@ -37499,79 +37734,86 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     }
 
     #[test]
-    fn one_invalid_claim_does_not_block_its_valid_sibling_or_later_envelopes() {
-        let source = Store::open_memory("source").unwrap();
-        let valid = source
-            .append_claim(&ClaimInput {
-                subject: "host/source".into(),
-                kind: "transport.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("valid-sibling".into()),
-            })
-            .unwrap();
-        let mut exchange = exchange_from(&source, &ReplicationInventory::default());
-        let candidate = rewrite_envelope(&exchange.envelopes[0], |payload| {
-            let mut invalid = payload.batch.claims[0].clone();
-            invalid.body["fields"]["status"] = Value::Bool(true);
-            invalid.id = claim_hash(
-                &invalid.batch_id,
-                &invalid.subject,
-                &invalid.kind,
-                &invalid.origin,
-                invalid.actor.as_deref(),
-                &invalid.body,
-                &invalid.predecessors,
-            )
-            .unwrap();
-            payload.batch.claims.push(invalid);
-        });
-        exchange.envelopes = vec![candidate.clone()];
-        exchange.inventory.envelopes = vec![ReplicaEnvelopeId {
-            writer: candidate.writer.clone(),
-            sequence: candidate.sequence,
-            hash: candidate.hash.clone(),
-        }];
+    fn one_invalid_or_unknown_claim_does_not_block_its_valid_sibling_or_later_envelopes() {
+        for unknown_kind in [false, true] {
+            let source = Store::open_memory("source").unwrap();
+            let valid = source
+                .append_claim(&ClaimInput {
+                    subject: "host/source".into(),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some("valid-sibling".into()),
+                })
+                .unwrap();
+            let mut exchange = exchange_from(&source, &ReplicationInventory::default());
+            let candidate = rewrite_envelope(&exchange.envelopes[0], |payload| {
+                let mut invalid = payload.batch.claims[0].clone();
+                if unknown_kind {
+                    invalid.kind = "future.transport-observed".into();
+                } else {
+                    invalid.body["fields"]["status"] = Value::Bool(true);
+                }
+                invalid.id = claim_hash(
+                    &invalid.batch_id,
+                    &invalid.subject,
+                    &invalid.kind,
+                    &invalid.origin,
+                    invalid.actor.as_deref(),
+                    &invalid.body,
+                    &invalid.predecessors,
+                )
+                .unwrap();
+                payload.batch.claims.push(invalid);
+            });
+            exchange.envelopes = vec![candidate.clone()];
+            exchange.inventory.envelopes = vec![ReplicaEnvelopeId {
+                writer: candidate.writer.clone(),
+                sequence: candidate.sequence,
+                hash: candidate.hash.clone(),
+            }];
 
-        let target = Store::open_memory("target").unwrap();
-        let admission = receive_and_project(&target, "source", &exchange);
-        assert_eq!(admission.valid, 1);
-        assert_eq!(admission.invalid, 1);
-        assert_eq!(
-            target
-                .latest_claim("host/source", Some("transport.observed"))
-                .unwrap()
-                .unwrap()
-                .id,
-            valid.id
-        );
-        assert_eq!(
-            target.status(Some("host/source")).unwrap().subjects[0].reachability,
-            "indeterminate"
-        );
+            let target = Store::open_memory("target").unwrap();
+            let admission = receive_and_project(&target, "source", &exchange);
+            assert_eq!(admission.valid, 1);
+            assert_eq!(admission.invalid, usize::from(!unknown_kind));
+            assert_eq!(admission.unknown, usize::from(unknown_kind));
+            assert_eq!(
+                target
+                    .latest_claim("host/source", Some("transport.observed"))
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                valid.id
+            );
+            assert_eq!(
+                target.status(Some("host/source")).unwrap().subjects[0].reachability,
+                "indeterminate"
+            );
 
-        source
-            .append_claim(&ClaimInput {
-                subject: "host/later".into(),
-                kind: "transport.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("later-envelope".into()),
-            })
-            .unwrap();
-        let later = exchange_from(&source, &target.replication_inventory().unwrap());
-        receive_and_project(&target, "source", &later);
-        assert!(
-            target
-                .latest_claim("host/later", Some("transport.observed"))
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(target.replica_records(true).unwrap().len(), 1);
+            source
+                .append_claim(&ClaimInput {
+                    subject: "host/later".into(),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some("later-envelope".into()),
+                })
+                .unwrap();
+            let later = exchange_from(&source, &target.replication_inventory().unwrap());
+            receive_and_project(&target, "source", &later);
+            assert!(
+                target
+                    .latest_claim("host/later", Some("transport.observed"))
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(target.replica_records(true).unwrap().len(), 1);
+        }
     }
 
     #[test]
