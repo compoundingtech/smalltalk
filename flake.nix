@@ -6,11 +6,8 @@
     flake-utils.url = "github:numtide/flake-utils";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
-    # pty-rust main, with pty-client (#51) and the Darwin link fix for the
-    # pty binary (#52). The `pty` binary st3 starts sessions with comes from
-    # the same commit as the pty-core and pty-client crates it reads and
-    # controls them through (Cargo.lock).
-    pty.url = "github:compoundingtech/pty-rust/06c303f708a49a8110a5eb640194deab0561fa3a";
+    # The runtime, Rust crates and native terminal library share one producer revision.
+    pty.url = "github:compoundingtech/pty/aa4999f2e9c3db05b4222f719807b43ae3ce9c16";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared CI generators and the `otelite` collector used by release-integration.
     # Re-pin to effect-utils main once the Rust helpers and repo-settings PRs merge.
@@ -106,12 +103,19 @@
           "fish"
         ];
 
-        # pty's own test suite runs in pty-rust's CI. Running it again inside this build only
+        # pty's own test suite runs in pty's CI. Running it again inside this build only
         # imported that suite's timing-sensitive tests as failures here (a proctable test on
         # Linux and a registry test on macOS, 2026-09-27) and cost CI time on every run.
         ptyPackage = pty.packages.${system}.default.overrideAttrs (_: {
           doCheck = false;
         });
+        libghosttyVT =
+          let
+            bindings = (builtins.fromTOML (builtins.readFile ./crates/st3/Cargo.toml)).dependencies;
+          in
+          assert bindings.libghostty-vt == "=${pty.lib.libghosttyContract.rustBindingsVersion}";
+          assert bindings.libghostty-vt-sys.version == "=${pty.lib.libghosttyContract.rustBindingsVersion}";
+          pty.packages.${system}.libghostty-vt;
 
         # buildRustPackage compiles the workspace once per derivation, so a gate that differs from
         # an existing derivation only by test selection is folded into that derivation's check
@@ -378,7 +382,9 @@
           nativeBuildInputs = [
             pkgs.git
             pkgs.installShellFiles
+            pkgs.pkg-config
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.mold ];
+          buildInputs = [ libghosttyVT ];
           # The daemon survival suite exercises the packaged PTY boundary. The client code
           # generator formats the Rust client it checks with rustfmt.
           nativeCheckInputs = [
@@ -1042,11 +1048,13 @@
             pkgs.git
             pkgs.sccache
             pkgs.cargo-nextest
+            pkgs.pkg-config
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.mold ] ++ [
             # wasm guest modules (resource-profile resolvers) link with lld; nixpkgs rustc does
             # not bundle rust-lld the way the rustup toolchain does.
             pkgs.lld
             ptyPackage
+            libghosttyVT
             # Local runs of the OTLP export integration gate
             # (`cargo test --test integration otel_export::`) need the same collector the
             # Nix check pins; `ST2_OTELITE_BIN` points at it.

@@ -37,7 +37,15 @@ This installs `st3`, the `st` symlink, the `stui` terminal app, `st3-migrate`, a
 this package. The previous generation is built and tested separately as `.#st2`;
 install it explicitly with `nix profile install .#st2`.
 
-Without Nix, build and install from a checkout with a Rust toolchain:
+Client terminal screens use `pty-terminal` and the same pinned `libghostty-vt` artifact as
+the PTY runtime. Styled runs carry terminal-cell widths (including wide characters), soft-wrap
+continuations, strikethrough and admitted OSC 8 links; keyboard modes include kitty flags.
+The Nix package and developer shell link the shared static library through pkg-config, so
+building Small Talk does not require Zig or a Ghostty source checkout.
+
+Without Nix, build and install from a checkout with a Rust toolchain and the matching
+`libghostty-vt` artifact. Set `PKG_CONFIG_PATH` to its `share/pkgconfig` directory;
+`pkg-config --static --libs libghostty-vt-static` must resolve before building:
 
 ```sh
 scripts/install                  # into ~/.local/bin

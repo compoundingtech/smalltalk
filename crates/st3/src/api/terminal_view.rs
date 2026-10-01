@@ -15,7 +15,7 @@ use libghostty_vt::render::{CursorVisualStyle, RenderState};
 use libghostty_vt::screen::{Cell, CellContentTag, CellWide, GridRef};
 use libghostty_vt::style::{Style as GhosttyStyle, StyleColor, Underline};
 use libghostty_vt::terminal::{Mode, Point, PointCoordinate};
-use pty_terminal::{GraphicsOptions, PlacementPosition, TerminalActor, TerminalEvent};
+use pty_terminal::{TerminalActor, TerminalEvent};
 use pty_core::protocol::{MessageType, PacketReader, decode_geometry, encode_peek};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -375,8 +375,6 @@ impl Title {
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 /// End of a synchronized update.
 const SYNC_END: &[u8] = b"\x1b[?2026l";
-/// The kitty image storage one watched terminal may hold.
-const GRAPHICS_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// libghostty, through pty-terminal: the emulator the pty daemon and Fractal run, so every client
 /// sees the same cells, widths, and modes. Its terminal is `!Send`; see [`EMULATION`].
@@ -390,11 +388,7 @@ pub(super) struct Emulator {
 
 impl Emulator {
     fn new(rows: u16, columns: u16, title: Title) -> Self {
-        let mut actor = TerminalActor::new(rows.max(1), columns.max(1), 0);
-        actor.enable_graphics(GraphicsOptions {
-            storage_bytes: GRAPHICS_STORAGE_BYTES,
-            ..GraphicsOptions::DEFAULT
-        });
+        let actor = TerminalActor::new(rows.max(1), columns.max(1), 0);
         Self {
             actor,
             render: RenderState::new().ok().map(RefCell::new),
@@ -462,6 +456,7 @@ impl Emulator {
         let mut lines = Vec::with_capacity(rows.min(TERMINAL_MAX_LINES));
         let mut graphemes = vec![char::default(); 16];
         let mut uri = vec![0_u8; 256];
+        let mut text = String::new();
         for row in 0..rows {
             if row == TERMINAL_MAX_LINES {
                 truncated = true;
@@ -492,9 +487,9 @@ impl Emulator {
                     .flatten();
                 let style = Style::of(&pen, cell, link);
                 if pen.invisible {
-                    line.push(style, &" ".repeat(cells), cells);
+                    line.push(style, if cells == 2 { "  " } else { " " }, cells);
                 } else {
-                    let text = read_text(&cell_ref, &mut graphemes);
+                    read_text(&cell_ref, &mut graphemes, &mut text);
                     line.push(style, &text, cells);
                 }
             }
@@ -524,7 +519,7 @@ impl Emulator {
         } else {
             "default"
         };
-        let mut body = json!({
+        let body = json!({
             "rows": rows,
             "columns": columns,
             "cursor": {
@@ -548,10 +543,6 @@ impl Emulator {
             "lines": lines,
             "truncated": truncated,
         });
-        let graphics = self.graphics();
-        if !graphics.is_empty() {
-            body["graphics"] = graphics.into();
-        }
         let Value::Object(body) = body else {
             unreachable!("the screen body is an object")
         };
@@ -560,59 +551,9 @@ impl Emulator {
         );
         Screen { body, revision }
     }
-
-    /// Kitty placements visible in the viewport. Pixels stay on the server; a client fetches
-    /// an image by `image.id` at `image.generation`.
-    fn graphics(&self) -> Vec<Value> {
-        let state = self.actor.graphics_state(0);
-        state
-            .placements
-            .iter()
-            .filter_map(|placement| {
-                let image = state.image(placement.image_id)?;
-                let (row, column, rows, columns, virtual_) = match placement.position {
-                    PlacementPosition::Offscreen => return None,
-                    PlacementPosition::Direct {
-                        col,
-                        row,
-                        cols,
-                        rows,
-                    } => (row, col, rows, cols, false),
-                    PlacementPosition::Placeholder(rect) => (
-                        i32::from(rect.row),
-                        i32::from(rect.col),
-                        u32::from(rect.rows),
-                        u32::from(rect.cols),
-                        true,
-                    ),
-                };
-                Some(json!({
-                    "image": {
-                        "id": image.id,
-                        "generation": image.generation,
-                        "width": image.width,
-                        "height": image.height,
-                    },
-                    "placement_id": placement.placement_id,
-                    "z": placement.z,
-                    "row": row,
-                    "column": column,
-                    "rows": rows,
-                    "columns": columns,
-                    "virtual": virtual_,
-                    "source": {
-                        "x": placement.source.x,
-                        "y": placement.source.y,
-                        "width": placement.source.width,
-                        "height": placement.source.height,
-                    },
-                }))
-            })
-            .collect()
-    }
 }
 
-fn read_text(cell: &GridRef<'_>, buffer: &mut Vec<char>) -> String {
+fn read_text(cell: &GridRef<'_>, buffer: &mut Vec<char>, text: &mut String) {
     let count = match cell.graphemes(buffer) {
         Ok(count) => count,
         Err(libghostty_vt::error::Error::OutOfSpace { required }) => {
@@ -621,11 +562,11 @@ fn read_text(cell: &GridRef<'_>, buffer: &mut Vec<char>) -> String {
         }
         Err(_) => 0,
     };
-    let text: String = buffer[..count].iter().collect();
+    text.clear();
+    text.extend(buffer[..count].iter());
     if text.is_empty() || text.starts_with('\0') {
-        " ".to_owned()
-    } else {
-        text
+        text.clear();
+        text.push(' ');
     }
 }
 
@@ -804,13 +745,10 @@ impl ScreenLine {
                 break;
             }
         }
-        self.text = self
-            .runs
-            .iter()
-            .map(|run| run.text.as_str())
-            .collect::<String>()
-            .trim_end_matches(' ')
-            .to_owned();
+        for run in &self.runs {
+            self.text.push_str(&run.text);
+        }
+        self.text.truncate(self.text.trim_end_matches(' ').len());
         self
     }
 
