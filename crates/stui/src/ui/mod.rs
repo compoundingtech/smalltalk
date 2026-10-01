@@ -12,6 +12,8 @@ pub mod conversation;
 pub mod demo;
 pub mod doc;
 mod glass;
+mod glass_store;
+pub mod layout;
 pub mod live;
 pub mod pane;
 pub mod screens;
@@ -78,6 +80,8 @@ struct FrameInfo {
     sidebar: Rect,
     sidebar_lines: usize,
     sidebar_height: usize,
+    /// Glasses: where each pane of the shown tab was drawn, in leaf order.
+    glass_leaves: Vec<Rect>,
 }
 
 #[derive(Clone)]
@@ -214,8 +218,9 @@ pub struct Ui {
     revoke: Option<String>,
     /// Home items put off until later. Demo only: kept in memory on this machine.
     snoozed: HashSet<String>,
-    /// `stui --glasses`: tabs of panes and a palette in place of the sidebar layout.
-    pub(crate) glass: Option<glass::Glass>,
+    /// `stui --glasses`: named glasses of tabs and split panes, and a palette, in place of the
+    /// sidebar layout.
+    pub(crate) glasses: Option<glass::Glasses>,
 }
 
 impl Ui {
@@ -254,7 +259,7 @@ impl Ui {
             new_mission: None,
             revoke: None,
             snoozed: HashSet::new(),
-            glass: None,
+            glasses: None,
         }
     }
 
@@ -342,7 +347,7 @@ impl Ui {
             );
             return;
         }
-        if self.glass.is_some() {
+        if self.glasses.is_some() {
             self.render_glass(buf, area);
         } else {
             self.top_bar(buf, Rect { height: 1, ..area });
@@ -582,7 +587,12 @@ impl Ui {
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
         } else {
-            let mut hints = match &self.glass {
+            let mut hints = match &self.glasses {
+                Some(_) if self.split_shown() => vec![
+                    ("ctrl+k", "open"),
+                    ("alt+←→↑↓", "panes"),
+                    ("ctrl+w", "close"),
+                ],
                 Some(_) if !self.on_home() => vec![("ctrl+k", "open"), ("ctrl+w", "close")],
                 Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
                 None => vec![("1-4", "tabs"), ("↑↓", "select")],
@@ -1527,6 +1537,13 @@ impl Ui {
     }
 
     fn open(&mut self, id: &str) {
+        // Inside a glass, a subject opens as its own tab rather than moving a sidebar.
+        if self.glasses.is_some()
+            && let Some(pane) = glass::pane_for(id)
+        {
+            self.open_in_glass(pane, glass::Open::Tab);
+            return;
+        }
         let tab = if id.starts_with("attention/") {
             0
         } else if id.starts_with("mission/") {
@@ -2310,6 +2327,9 @@ impl Ui {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.glass_click(mouse.column, mouse.row) {
+                    return;
+                }
                 let hit = {
                     let info = self.frame.borrow();
                     info.hits
@@ -2410,9 +2430,10 @@ impl Ui {
 
     fn click(&mut self, hit: Hit) {
         match hit {
-            Hit::Palette => self.open_palette(None),
+            Hit::Palette => self.open_palette(None, glass::Open::Here),
+            Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::GlassTab(index) => self.show_tab(index),
-            Hit::PaletteChoice(index) => self.open_choice(Some(index), false),
+            Hit::PaletteChoice(index) => self.open_choice(Some(index), glass::Open::Here),
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
             Hit::Key(key) if self.popover.is_some() => {
@@ -2796,13 +2817,13 @@ impl Drop for Guard {
     }
 }
 
-/// The glass `stui --glasses` or `stui --glass NAME` asks for; plain stui asks for none.
-pub fn glass_name(args: &[String]) -> Option<String> {
-    arg(args, "--glass").or_else(|| {
-        args.iter()
-            .any(|arg| arg == "--glasses")
-            .then(|| "main".to_owned())
-    })
+/// Whether glasses are asked for, and which: `stui --glass NAME` names one, `stui --glasses`
+/// opens the last one used on this device (`Some(None)`); plain stui asks for none.
+pub fn glass_request(args: &[String]) -> Option<Option<String>> {
+    match arg(args, "--glass") {
+        Some(name) => Some(Some(name)),
+        None => args.iter().any(|arg| arg == "--glasses").then_some(None),
+    }
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -2817,12 +2838,13 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     if args.iter().any(|arg| arg == "--dump") {
         return dump(args);
     }
-    let glass = glass_name(args);
+    let glass = glass_request(args);
     let _guard = Guard::enter(glass.is_some())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let mut ui = Ui::new(demo::loading());
-    ui.glass = glass.map(glass::Glass::new);
+    // The demo keeps its glasses in memory only.
+    ui.glasses = glass.map(|name| glass::Glasses::open(name, None));
     ui.demo = Some(Demo {
         started: Instant::now(),
         loaded: false,
@@ -2886,7 +2908,7 @@ fn dump(args: &[String]) -> Result<()> {
     } else {
         demo::world()
     });
-    ui.glass = glass_name(args).map(glass::Glass::new);
+    ui.glasses = glass_request(args).map(|name| glass::Glasses::open(name, None));
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     // Keys: each character is a key; "\n" is Enter, "<esc>", "<end>", "<pgdn>", "<pgup>", "<down>";
     // "<c-k>" is Ctrl+K and "<a-1>" Alt+1.
