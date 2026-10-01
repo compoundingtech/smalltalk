@@ -10416,55 +10416,74 @@ impl Store {
     pub(crate) fn mission_gate_runners(&self) -> Result<Vec<MissionGateRunner>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
-            "WITH runners AS (
-               SELECT DISTINCT subject, origin AS host,
-                      json_extract(body, '$.fields.owner') AS owner
-               FROM claims request WHERE kind='gate.requested'
-                 AND (json_extract(body, '$.fields.runner') IN ('exec','loop-metric')
-                      OR json_extract(body, '$.fields.model') IS NOT NULL)
-                 AND NOT EXISTS (
-                   SELECT 1 FROM claims stopped
-                   WHERE stopped.subject=request.subject AND stopped.kind='runtime.observed'
-                     AND json_extract(stopped.body, '$.fields.status')='stopped'
-                 )
-             )
-             SELECT DISTINCT runners.subject, runners.host, 'mission-run/' || run.id,
+            "SELECT DISTINCT subject, origin,
+                    COALESCE(json_extract(body, '$.fields.owner'),
+                      'legacy:' || substr(subject, 16, instr(substr(subject, 16), '/')-1))
+             FROM claims request WHERE kind='gate.requested'
+               AND (json_extract(body, '$.fields.runner') IN ('exec','loop-metric')
+                    OR json_extract(body, '$.fields.model') IS NOT NULL)
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims stopped
+                 WHERE stopped.subject=request.subject AND stopped.kind='runtime.observed'
+                   AND json_extract(stopped.body, '$.fields.status')='stopped'
+               )",
+        )?;
+        let mut requests = BTreeMap::<String, Vec<(String, String)>>::new();
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (subject, host, owner) = row?;
+            requests.entry(owner).or_default().push((subject, host));
+        }
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Match by a map rather than an OR/prefix SQL join. That join visits every step
+        // for every historical gate request and stalls reconciliation as runs accumulate.
+        let mut owners = connection.prepare(
+            "SELECT step.subject, 'mission-run/' || run.id,
                     step.status IN ('completed','failed','cancelled')
                     OR generation.status IN ('completed','failed','cancelled','superseded')
                     OR run.phase='terminal' OR run.phase LIKE 'cleanup-%'
                     OR root.phase='terminal' OR root.phase LIKE 'cleanup-%'
-             FROM runners
-             JOIN step_runs step ON runners.owner=step.subject
-               OR (runners.owner IS NULL AND
-                   substr(runners.subject, 1, length(step.subject)+16)=
-                     'gate-operation/' || replace(step.subject, '/', '.') || '/')
+             FROM step_runs step
              JOIN mission_runs run ON run.id=step.run_id
              JOIN mission_runs root ON root.id=run.root_run_id
              JOIN run_generations generation ON generation.id=step.generation_id
-             UNION
-             SELECT DISTINCT runners.subject, runners.host, 'mission-run/' || run.id,
+             UNION ALL
+             SELECT 'mission-run/' || run.id, 'mission-run/' || run.id,
                     run.phase IN ('final-cancelled','terminal') OR run.phase LIKE 'cleanup-%'
                     OR run.status IN ('completed','failed','cancelled')
                     OR root.phase='terminal' OR root.phase LIKE 'cleanup-%'
-             FROM runners
-             JOIN mission_runs run ON runners.owner='mission-run/' || run.id
-               OR (runners.owner IS NULL AND
-                   substr(runners.subject, 1, length(run.id)+28)=
-                     'gate-operation/mission-run.' || run.id || '/')
-             JOIN mission_runs root ON root.id=run.root_run_id
-             ORDER BY 1",
+             FROM mission_runs run
+             JOIN mission_runs root ON root.id=run.root_run_id",
         )?;
-        statement
-            .query_map([], |row| {
-                Ok(MissionGateRunner {
-                    subject: row.get(0)?,
-                    host: row.get(1)?,
-                    owner_run: row.get(2)?,
-                    retired: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        let mut runners = Vec::new();
+        for row in owners.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })? {
+            let (owner, owner_run, retired) = row?;
+            for key in [owner.clone(), format!("legacy:{}", owner.replace('/', "."))] {
+                if let Some(requests) = requests.get(&key) {
+                    runners.extend(requests.iter().map(|(subject, host)| MissionGateRunner {
+                        subject: subject.clone(),
+                        host: host.clone(),
+                        owner_run: owner_run.clone(),
+                        retired,
+                    }));
+                }
+            }
+        }
+        runners.sort_by(|left, right| left.subject.cmp(&right.subject));
+        Ok(runners)
     }
 
     /// Observers, subscriptions, and schedules whose owner run is terminal or whose owner
