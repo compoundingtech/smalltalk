@@ -26,7 +26,7 @@
     },
     {
       "id": "attention", "task": "Review and resolve person-authorized decisions", "model": "attention.v0", "cli": "st3 attention ls --as person/NAME",
-      "sections": ["counts", "inbox", "detail"], "actions": ["attention.resolve", "review.approve", "review.reject", "message.read"]
+      "sections": ["counts", "inbox", "detail"], "actions": ["work.done", "review.approve", "review.reject", "message.read"]
     },
     {
       "id": "launch", "task": "Author, compare, approve, and launch a mission", "model": "launch.v0", "cli": "st3 launch show ID",

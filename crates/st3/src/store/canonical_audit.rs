@@ -335,14 +335,6 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
     if messages(expected) != messages(actual) {
         mismatches.push(format!("{phase}: selected person messages and reminders"));
     }
-    // This implementation has no clock-dependent expiry. Freeze the recipient so source
-    // filtering and episode onset are compared independently of host overlays.
-    let attention = |store: &Store| {
-        serde_json::to_value(store.attention_items(Some("person/avery")).unwrap()).unwrap()
-    };
-    if attention(expected) != attention(actual) {
-        mismatches.push(format!("{phase}: derived person attention"));
-    }
     let proposal_views = |store: &Store| {
         let connection = store.readers.get();
         let runs = connection
@@ -360,6 +352,24 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
     };
     if proposal_views(expected) != proposal_views(actual) {
         mismatches.push(format!("{phase}: selected equal-time revision proposals"));
+    }
+    // Time evaluation and recipient filtering are shared only at identical explicit contexts.
+    for person in [
+        None,
+        Some("person/avery"),
+        Some("person/robin"),
+        Some("person/operator"),
+    ] {
+        for as_of in [2_000_000_000_000_u128, 2_000_000_600_000_u128] {
+            let attention = |store: &Store| {
+                serde_json::to_value(store.attention_snapshot(person, as_of).unwrap()).unwrap()
+            };
+            if attention(expected) != attention(actual) {
+                mismatches.push(format!(
+                    "{phase}: attention snapshot at {as_of} for {person:?}"
+                ));
+            }
+        }
     }
     let message_state = |store: &Store| {
         store
@@ -701,6 +711,34 @@ message "audit-declared" {
             .append_claim_outcome(&harness_state("agent/alder.worker", state, observed_at))
             .unwrap();
     }
+    source.replay_replication_graph().unwrap();
+    source
+        .ask_person(&crate::model::PersonAskRequest {
+            legacy_request: None,
+            person: "person/avery".into(),
+            title: "Choose the release date".into(),
+            reason: "Reply with a date.".into(),
+            actor: "agent/alder.worker".into(),
+            step: None,
+            new_run: Some("audit-person-ask".into()),
+            incarnation: None,
+            idempotency_key: "audit-person-ask".into(),
+        })
+        .unwrap();
+    source
+        .record_operational_failure(
+            "audit-disk-episode",
+            &AttentionRequest {
+                reviewer: "person/avery".into(),
+                title: "Disk space is low".into(),
+                reason: "Free disk space.".into(),
+                severity: "warning".into(),
+                targets: vec!["daemon/alder".into()],
+                actor: "daemon/runtime".into(),
+                idempotency_key: "audit-disk-episode".into(),
+            },
+        )
+        .unwrap();
     source.replay_replication_graph().unwrap();
 }
 

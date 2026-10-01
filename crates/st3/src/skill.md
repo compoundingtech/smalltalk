@@ -32,12 +32,15 @@ what happened to a claimed step, each with `--as "$ST_AGENT"`. The seat's driver
 lease while the seat runs. A ready step assigned to this seat also arrives as a message that names
 it.
 
-## Attention
+## Person work
 
-`"$ST3_BIN" attention request --for PERSON --title TEXT --reason TEXT --as "$ST_AGENT"` puts an
-item in that person's `st now`. It closes on its own when the step this seat has claimed ends,
-unless it names a `--target` that can end or another way `attention request --help` lists.
-`attention withdraw ATTENTION --reason TEXT --as "$ST_AGENT"` removes it once it no longer applies.
+`"$ST3_BIN" work ask --for PERSON --title TEXT --reason TEXT --step STEP --idempotency-key KEY --as "$ST_AGENT"`
+creates a person-assigned step in the same generation. The asking step waits without a worker
+lease; the person's response resumes it. `--new-run NAME` creates a minimal ask run when the
+seat has no claimed work. The ask ends with its requester, originating attempt or owner.
+`work done PERSON_STEP --as PERSON --summary TEXT` records the response.
+`work cancel-ask PERSON_STEP --as "$ST_AGENT" --reason TEXT` cancels the requester's ask.
+`st now` and `attention ls/show` display current source work; attention has no separate close action.
 
 ## Other agents' terminals
 

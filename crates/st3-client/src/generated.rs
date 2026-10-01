@@ -47,6 +47,7 @@ pub enum ErrorCode {
     NotFound,
     Forbidden,
     UnsupportedCapability,
+    AttentionMigrated,
     ValidationFailed,
     IdempotencyConflict,
     StaleFence,
@@ -239,6 +240,12 @@ pub struct Operational {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Attention {
+    #[serde(default)]
+    pub episode: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub action_parameters: BTreeMap<String, Value>,
     #[serde(flatten)]
     pub header: ResourceHeader,
     #[serde(flatten)]
@@ -1492,6 +1499,12 @@ pub enum ActionType {
     MissionCancel,
     #[serde(rename = "session.import")]
     SessionImport,
+    #[serde(rename = "work.ask")]
+    WorkAsk,
+    #[serde(rename = "work.done")]
+    WorkDone,
+    #[serde(rename = "work.cancel-ask")]
+    WorkCancelAsk,
     #[serde(rename = "work.claim")]
     WorkClaim,
     #[serde(rename = "work.renew")]
@@ -2050,6 +2063,28 @@ impl ActionRequest {
             &parameters,
         )
     }
+    pub fn work_ask(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PersonAskParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(id, ActionType::WorkAsk, idempotency_key, fence, &parameters)
+    }
+    pub fn work_cancel_ask(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PersonStepParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::WorkCancelAsk,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
     pub fn work_claim(
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
@@ -2073,6 +2108,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::WorkComplete,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn work_done(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PersonStepParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::WorkDone,
             idempotency_key,
             fence,
             &parameters,
@@ -2164,6 +2213,24 @@ impl ActionRequest {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PersonAskParameters {
+    pub person_id: String,
+    pub title: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_run: Option<String>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PersonStepParameters {
+    pub target_id: String,
+    pub summary: String,
+    pub episode: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct TargetParameters {
     pub target_id: String,
