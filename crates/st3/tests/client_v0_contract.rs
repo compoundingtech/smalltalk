@@ -1768,6 +1768,188 @@ mission "client-action-demo" state="ready" {
 }
 
 #[tokio::test]
+async fn mission_cancel_agent_authority_is_path_scoped_current_and_generation_fenced() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let source = r#"version 2
+agent "example/operator" { workspace "."; command "true"; mission-authority { cancel "example/jobs/*" } }
+agent "example/publisher" { workspace "."; command "true"; mission-authority { publish "example/jobs/*" } }
+agent "fleet/fixture-cancel/standing/operator" { workspace "."; command "true" }
+mission "example/jobs/one" state="ready" { concurrent-runs; goal "Wait for cancellation."; step "wait" { agentless } }
+mission "example/other/one" state="ready" { goal "Stay outside the cancel grant."; step "wait" { agentless } }
+"#;
+    let intent = st3::graph::parse_intent(source, store.origin()).unwrap();
+    let preview = store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply_as(
+            &intent,
+            &preview.subject_tokens,
+            "cancel-authority-source",
+            Some("person/operator"),
+        )
+        .unwrap();
+    let start = |mission: &str, key: &str| {
+        store
+            .create_mission_run(&st3::model::MissionRunRequest {
+                mission: mission.into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: Some("run".into()),
+                inputs: Default::default(),
+                idempotency_key: key.into(),
+            })
+            .unwrap()
+    };
+    let granted = start("example/jobs/one", "cancel-granted-run");
+    let outside = start("example/other/one", "cancel-outside-run");
+    let app = st3::api::router(state.clone());
+    let (_, capabilities) = client_json_person(
+        app.clone(),
+        "/v1/client/capabilities",
+        "agent/example/operator",
+    )
+    .await;
+    let capability_state = |id: &str| {
+        capabilities["value"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capability| capability["id"] == id)
+            .unwrap()["state"]
+            .as_str()
+            .unwrap()
+    };
+    assert_eq!(capability_state("mission.cancel"), "granted");
+    assert_eq!(capability_state("mission.start"), "ungranted");
+    assert_eq!(capability_state("mission.approve-revision"), "ungranted");
+    let cancel = |run: &st3::model::MissionRunView,
+                  generation: &str,
+                  snapshot: &Value,
+                  key: &str| {
+        serde_json::json!({
+            "api_version": "st3.client.v0", "id": format!("action/{key}"), "type": "mission.cancel", "idempotency_key": format!("cancel-authority-{key}"),
+            "fence": { "snapshot_id": snapshot["snapshot"]["id"], "mission_generation": generation },
+            "parameters": { "target_id": run.subject, "reason": "The work was superseded." }
+        })
+    };
+    for (actor, run, code) in [
+        (
+            "agent/example/publisher",
+            &granted,
+            "mission-authority-denied",
+        ),
+        (
+            "agent/example/undeclared",
+            &granted,
+            "missing-agent-mission-authority",
+        ),
+        (
+            "agent/example/operator",
+            &outside,
+            "mission-authority-denied",
+        ),
+        (
+            "agent/fleet/fixture-cancel/standing/operator",
+            &granted,
+            "mission-authority-denied",
+        ),
+    ] {
+        let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+        let (status, body) = client_post_json_person(
+            app.clone(),
+            "/v1/client/actions",
+            actor,
+            cancel(run, &run.generation, &snapshot, actor),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{actor}: {body}");
+        assert_eq!(body["code"], "forbidden", "{actor} ({code}): {body}");
+        assert_eq!(
+            store.mission_run(&run.subject).unwrap().unwrap().phase,
+            run.phase
+        );
+    }
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let (status, body) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "agent/example/operator",
+        cancel(&granted, "run-generation/stale", &snapshot, "stale"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let request = cancel(&granted, &granted.generation, &snapshot, "allowed");
+    let (status, body) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "agent/example/operator",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        store.mission_run(&granted.subject).unwrap().unwrap().phase,
+        "cleanup-cancelled"
+    );
+    let (status, repeated) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "agent/example/operator",
+        request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(body["affected_ids"], repeated["affected_ids"]);
+    // The new transport scope permits cancellation only; it does not grant other mission actions.
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let (status, body) = client_post_json_person(app.clone(), "/v1/client/actions", "agent/example/operator", serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/cancel-cannot-start", "type": "mission.start", "idempotency_key": "cancel-authority-cannot-start",
+        "fence": { "snapshot_id": snapshot["snapshot"]["id"] },
+        "parameters": { "mission_id": "example/jobs/one", "workspace": root.path().display().to_string(), "inputs": {} }
+    })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let later = start("example/jobs/one", "cancel-after-revoke");
+    let revoked = st3::graph::parse_intent(
+        "version 2\nagent \"example/operator\" { workspace \".\"; command \"true\" }\n",
+        store.origin(),
+    )
+    .unwrap();
+    store
+        .apply_internal(&revoked, "revoke-cancel-authority")
+        .unwrap();
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let (status, body) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "agent/example/operator",
+        cancel(&later, &later.generation, &snapshot, "revoked"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "forbidden");
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let (status, body) = client_post_json_person(
+        app,
+        "/v1/client/actions",
+        "person/operator",
+        cancel(&outside, &outside.generation, &snapshot, "person"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn launch_revise_and_cancel_are_revision_fenced() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());

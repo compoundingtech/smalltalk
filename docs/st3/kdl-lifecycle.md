@@ -248,12 +248,16 @@ mission-authority {
   publish "project/generated/*"
   start "project/generated/*"
   revise "project/generated/*"
+  cancel "project/generated/*"
 }
 ```
 
 Use exact mission IDs or terminal `/*` namespaces without the `mission/` prefix. Name narrower
 rules than the default, such as `publish "fleet/website/docs/*"`, or withhold all mission authority
-with `mission-authority "none"`. Only a person writes either form into a top-level seat.
+with `mission-authority "none"`. Cancellation needs an explicit `cancel` rule; the project default
+continues to grant only `publish`, `start`, and `revise`. Use `st missions cancel RUN --as agent/PATH
+--reason TEXT` to cancel a run of a mission under a granted path. The daemon checks the current
+grant and the run generation before cancellation.
 
 An agent publishing a generated nested mission needs `publish` authority, a claimed producing step,
 and an exact `produces-mission` match. Use `st work publish-mission` for that case.
@@ -321,9 +325,33 @@ recorded with the agent as its actor. The daemon reads the grant from the agent'
 declaration when the move arrives, as it does for mission authority. [Agent seat
 queues](seat-queue.md) describes the queue and the move.
 
-Only a person grants authority in a top-level agent declaration. When an agent publishes a
-top-level agent declaration that carries `mission-authority` or `queue-authority`, for itself or
-for another seat, the daemon refuses it with `agent-authority-grant-denied`.
+## Agent declaration authority
+
+A person can authorize a seat to apply, start, and stop agent declarations under named paths:
+
+```kdl
+agent-authority {
+  apply "fleet/example/operations/*"
+  apply "fleet/example/ci/*"
+}
+```
+
+Each `apply` rule names an exact agent identity or a terminal `/*` namespace without `agent/`.
+The seat uses its own identity with `st agents apply FILE --as agent/PATH`, `st agents start`,
+and `st agents stop`. Existing `seat-authority { declare PATH; stop PATH }` rules still work.
+
+An agent with `agent-authority` may also delegate authority in a top-level declaration it applies.
+Every proposed rule must have the same authority kind and verb as a rule the caller currently
+holds, over the same or a narrower path. This covers `mission-authority`, `queue-authority`,
+`seat-authority`, and `agent-authority` itself. An exact rule cannot delegate a namespace, and
+`project/*` does not cover `project` or `project-other/*`. A wider path, extra verb, or different
+kind is refused with `agent-authority-grant-denied`, which names the refused rule. The candidate
+cannot grant itself permission: checks read the caller's current declaration before applying it.
+Delegated seats have no implicit project mission authority; their explicit rules are the grant.
+
+Mission publication and revision retain their existing guard: authority in agents declared
+inside a mission, step, or nested mission must match authority already published for that agent.
+This includes `agent-authority`; publishing a mission cannot bypass declaration grants.
 
 ## Planning a new mission
 

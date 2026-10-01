@@ -4,8 +4,9 @@ version 2
 //
 // A seat has no authority over any queue by default, including its own. `queue-authority` lets
 // this agent move runs in the queues it names: an exact seat identity or a terminal `/*`
-// namespace, without the `agent/` prefix. Only a person can grant it. st refuses a top-level
-// declaration that an agent publishes when it carries `queue-authority` or `mission-authority`.
+// namespace, without the `agent/` prefix. A person grants it, or an authorized agent delegates it.
+// st refuses a top-level
+// delegation unless the caller has `agent-authority` and holds every proposed rule.
 //
 // Apply it as a person, after one of the worker seat files beside it:
 //
