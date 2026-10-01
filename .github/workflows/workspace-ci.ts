@@ -27,7 +27,7 @@ export const commonSetupSteps = [
   { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
   // actions/cache is served by Namespace's accelerated cache backend and is keyed, not tied to a node.
   // Namespace cache volumes are per node and replicate in the background, so a job on another node
-  // starts empty. /nix itself cannot be cached (see scripts/ci-nix-cache); ~/.cache/st-ci holds a
+  // starts empty. /nix itself cannot be cached (see scripts/ci-nix-cache); RUNNER_TEMP/st-ci-cache holds a
   // local Nix binary cache instead. Linux only: the key names the job, so each stage keeps its own.
   {
     name: 'Restore the Cargo target and registry',
@@ -35,7 +35,7 @@ export const commonSetupSteps = [
     if: "runner.os == 'Linux'",
     uses: 'actions/cache@v4',
     with: {
-      path: '${{ github.workspace }}/target\n~/.cargo/registry\n~/.cargo/git',
+      path: '${{ github.workspace }}/target\n${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git',
       key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
       'restore-keys': 'cargo-${{ github.job }}-${{ runner.os }}-',
     },
@@ -46,7 +46,7 @@ export const commonSetupSteps = [
     if: "runner.os == 'Linux'",
     uses: 'actions/cache@v4',
     with: {
-      path: '~/.cache/st-ci',
+      path: '${{ runner.temp }}/st-ci-cache',
       key: "nix-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}",
       'restore-keys': 'nix-${{ github.job }}-${{ runner.os }}-',
     },
@@ -54,8 +54,9 @@ export const commonSetupSteps = [
   ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
   {
     name: 'Isolate test home and XDG state',
-    run: `# The cached Cargo registry lives under the real HOME; tests get the isolated one.
-printf 'CARGO_HOME=%s\\nCI_CACHE_DIR=%s\\n' "\${CARGO_HOME:-$HOME/.cargo}" "$HOME/.cache/st-ci" >> "$GITHUB_ENV"
+    run: `# Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
+# and actions/cache expands `~` against the HOME of the step that runs it.
+printf 'CARGO_HOME=%s\\nCI_CACHE_DIR=%s\\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
 home="$RUNNER_TEMP/test-home"
 mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
 printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_STATE_HOME=%s/.local/state\\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"`,
