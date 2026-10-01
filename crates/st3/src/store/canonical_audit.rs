@@ -879,8 +879,9 @@ fn fresh_and_additively_migrated_column_orders_have_identical_full_digests() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     fresh
-        .readers
-        .get()
+        .connection
+        .lock()
+        .unwrap()
         .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
         .unwrap();
     let connection = Connection::open(&path).unwrap();
