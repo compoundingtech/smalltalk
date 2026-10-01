@@ -543,13 +543,24 @@ export default function (pi: ExtensionAPI) {
     const usage = message.usage && typeof message.usage === "object"
       ? message.usage as Record<string, unknown>
       : undefined;
+    // Per-response spend: the provider's disjoint token buckets, its model, and the cost the
+    // harness itself computed. Nothing else about the request leaves the harness.
+    const cost = usage?.cost && typeof usage.cost === "object"
+      ? usage.cost as Record<string, unknown>
+      : undefined;
     return { message: {
       id: boundedTimelineString(message.id, 256),
       role: boundedTimelineString(message.role, 32),
       content,
+      model: boundedTimelineString(message.model, 128),
+      provider: boundedTimelineString(message.provider, 64),
       usage: usage ? {
         input: finiteOrNull(usage.input ?? usage.inputTokens),
         output: finiteOrNull(usage.output ?? usage.outputTokens),
+        cacheRead: finiteOrNull(usage.cacheRead),
+        cacheWrite: finiteOrNull(usage.cacheWrite),
+        totalTokens: finiteOrNull(usage.totalTokens),
+        cost: cost ? finiteOrNull(cost.total) : null,
       } : undefined,
     } };
   };

@@ -14504,12 +14504,19 @@ async fn drive_codex_native(
                         &mut last_usage_fingerprint,
                     )
                     .await?;
+                    // The Codex runtime stamps its timeline with its own incarnation, which
+                    // outlives st's runtime incarnation when a resident Codex is adopted.
+                    let codex_incarnation = st_drivers::codex_app_server::current_runtime_incarnation(
+                        &state_dir,
+                        &identity,
+                        &runtime_id,
+                    );
                     publish_harness_timeline(
                         client,
                         subject,
                         "codex",
                         &incarnation,
-                        Some(&incarnation),
+                        codex_incarnation.as_deref(),
                         &agent_dir,
                         &mut loop_state.published_timeline,
                     )
