@@ -5,17 +5,18 @@ import {
 } from '../../repos/effect-utils/genie/external.ts'
 import { buildEnv, macosRunner, workspacePreparationSteps } from './workspace-ci.ts'
 
-// Optional and never required. A separate workflow lets label changes start macOS without
+// Optional on PRs and never required. A separate workflow lets label changes start macOS without
 // restarting the required Linux gate.
 export default githubWorkflow({
   name: 'macOS CI',
   on: {
     pull_request: { types: ['opened', 'synchronize', 'reopened', 'labeled'] },
-    // Main CI is off until Nathan says to turn it back on: restore `push: { branches: ['main'] },` here.
+    push: { branches: ['main'] },
   },
   permissions: { contents: 'read' },
   concurrency: {
-    group: 'macos-${{ github.event.pull_request.number || github.ref }}',
+    // Main pushes run independently, including while earlier runs are still pending.
+    group: 'macos-${{ github.event.pull_request.number || github.run_id }}',
     'cancel-in-progress': '${{ github.event_name == \'pull_request\' }}',
   },
   actionlint: defaultActionlintConfig,

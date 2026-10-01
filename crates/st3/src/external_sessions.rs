@@ -840,10 +840,14 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::new(file);
     let mut read_error = None;
+    // Where each line starts in the file: an entry's identity, which must not change as the
+    // read window slides along a growing transcript.
+    let mut offset = start;
     if start != 0 {
         let mut partial = Vec::new();
-        if let Err(error) = reader.read_until(b'\n', &mut partial) {
-            read_error = Some(error);
+        match reader.read_until(b'\n', &mut partial) {
+            Ok(count) => offset += count as u64,
+            Err(error) => read_error = Some(error),
         }
     }
     // Each line keeps whether it ended with a newline: only the final, unterminated line can be
@@ -859,7 +863,12 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
                     lines.pop_front();
                 }
                 // A line that is not UTF-8 is read lossily rather than ending the transcript.
-                lines.push_back((String::from_utf8_lossy(&buffer).into_owned(), terminated));
+                lines.push_back((
+                    String::from_utf8_lossy(&buffer).into_owned(),
+                    terminated,
+                    offset,
+                ));
+                offset += buffer.len() as u64;
                 if !terminated {
                     break;
                 }
@@ -886,14 +895,18 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
     // the timeline is merged by time with Small Talk messages.
     let mut last_timestamp = timestamp(session.updated_at_unix_ms);
     let mut next_free_sequence = 0_u64;
-    for (line_index, (line, terminated)) in lines.into_iter().enumerate() {
+    for (line_index, (line, terminated, line_start)) in lines.into_iter().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        // A line normally owns sixteen sequence numbers. A record with more parts than that
-        // pushes the following lines later instead of colliding with their entry IDs.
-        let sequence = ((line_index as u64).saturating_add(1))
+        // A line's entries are numbered from where it starts in the file, so an entry keeps its
+        // ID however the read window slides; numbered by position in the window, every entry
+        // was renumbered as the transcript grew, and clients saw each one again as new. A line
+        // owns sixteen numbers per byte; a record with more parts than that pushes the
+        // following lines later instead of colliding with their entry IDs.
+        let sequence = line_start
+            .saturating_add(1)
             .saturating_mul(16)
             .max(next_free_sequence);
         let first_new = items.len();
@@ -3737,6 +3750,52 @@ mod tests {
                 .all(|item| item["role"] == "system" && item["type"] == "error")
         );
         assert_unique_ids(&timeline);
+    }
+
+    #[test]
+    fn entries_keep_their_ids_as_the_read_window_slides_along_a_growing_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let line = |index: usize| {
+            claude_line(
+                "assistant",
+                &format!("2026-09-30T10:{:02}:{:02}Z", index / 60 % 60, index % 60),
+                &format!("entry {index}"),
+            )
+        };
+        let mut transcript = (0..MAX_TIMELINE_LINES)
+            .map(|index| format!("{}\n", line(index)))
+            .collect::<String>();
+        fs::write(&path, &transcript).unwrap();
+        let session = transcript_session(ExternalDriver::Claude, &path);
+        let before = normalized_timeline(&session).unwrap();
+        // Ten more lines push the oldest ten out of the window.
+        for index in MAX_TIMELINE_LINES..MAX_TIMELINE_LINES + 10 {
+            transcript.push_str(&format!("{}\n", line(index)));
+        }
+        fs::write(&path, &transcript).unwrap();
+        let after = normalized_timeline(&session).unwrap();
+        let ids = |timeline: &[Value]| {
+            timeline
+                .iter()
+                .filter_map(|item| {
+                    Some((
+                        item["body"]["text"].as_str()?.to_owned(),
+                        item["id"].clone(),
+                    ))
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let (before, after) = (ids(&before), ids(&after));
+        let kept = before
+            .iter()
+            .filter(|(text, _)| after.contains_key(*text))
+            .collect::<Vec<_>>();
+        assert!(kept.len() > MAX_TIMELINE_LINES - 20, "{}", kept.len());
+        for (text, id) in kept {
+            assert_eq!(&after[text], id, "{text} was renumbered");
+        }
+        assert_unique_ids(&normalized_timeline(&session).unwrap());
     }
 
     #[test]

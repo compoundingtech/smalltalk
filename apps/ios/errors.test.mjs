@@ -3,7 +3,7 @@ import { ClientError, isTransient, isTransientCode, notApplied, plainError, plai
 
 // st's errors read as sentences, as in the Rust client: no codes reach a person.
 assert.equal(plainMessage('stale-fence', 'the client snapshot changed before the action was submitted'), 'st changed while this was on its way, so it was not applied');
-assert.equal(plainMessage('remote-unavailable', 'owner host/Silber is temporarily unavailable; cached data remains usable'), 'Silber cannot be reached right now');
+assert.equal(plainMessage('remote-unavailable', 'owner host/Juniper is temporarily unavailable; cached data remains usable'), 'Juniper cannot be reached right now');
 assert.equal(plainMessage('not-found', 'agent `agent/x` does not exist'), 'it is gone: agent `agent/x` does not exist');
 assert.equal(plainMessage(undefined, 'invalid subscription'), 'invalid subscription');
 const refused = code => new ClientError({ api_version: 'st3.client.v0', error_version: 'st3.client.error.v0', request_id: 'request/x', code, message: 'm', retryable: false, details: {} }, 409);

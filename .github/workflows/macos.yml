@@ -6,12 +6,14 @@ name: macOS CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: "macos-${{ github.event.pull_request.number || github.ref }}"
+  group: "macos-${{ github.event.pull_request.number || github.run_id }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

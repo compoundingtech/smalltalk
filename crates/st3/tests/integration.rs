@@ -7,6 +7,7 @@ mod client_creation;
 mod client_glasses;
 mod client_v0_cli;
 mod client_v0_contract;
+mod codex_bootstrap;
 mod command_recorder;
 mod convergence;
 mod daemon_bench;

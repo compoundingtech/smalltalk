@@ -2364,6 +2364,8 @@ enum AgentsCommand {
     Start(AgentStartArgs),
     /// Stop one exact durable seat.
     Stop(AgentStopArgs),
+    /// Change only a seat's human label, without restarting its harness.
+    Rename(AgentRenameArgs),
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
     /// The show form is also available as `st missions queued AGENT`.
     Queue(AgentQueueArgs),
@@ -2384,6 +2386,23 @@ struct AgentHoldArgs {
     #[arg(long = "as")]
     actor: Option<String>,
 }
+
+#[derive(Args)]
+struct AgentRenameArgs {
+    subject: String,
+    #[arg(
+        required_unless_present = "clear",
+        conflicts_with = "clear",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    label: Option<String>,
+    /// Restore the subject-derived presentation label.
+    #[arg(long)]
+    clear: bool,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
 #[derive(Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct AgentQueueArgs {
@@ -3002,6 +3021,9 @@ struct MessageSendArgs {
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+    /// Reuse this key with the same message when retrying an unconfirmed send.
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -3043,6 +3065,9 @@ struct MessageReplyArgs {
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+    /// Reuse this key with the same message when retrying an unconfirmed send.
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -3490,6 +3515,9 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness delivery hold needs explicit --as {own}")
+            })?),
+            AgentsCommand::Rename(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness rename needs explicit --as {own}")
             })?),
             AgentsCommand::Queue(args) => match &args.command {
                 Some(AgentQueueCommand::Move(args)) => Some(args.actor.as_deref().ok_or_else(|| {
@@ -8635,6 +8663,21 @@ async fn run_agents(
             );
             Ok(())
         }
+        AgentsCommand::Rename(args) => {
+            let actor = args.actor.as_deref().or(configured_person).context(
+                "st3 agents rename needs --as ACTOR or a configured person",
+            )?;
+            let response: Value = cli_client(endpoint).post(
+                "/v1/agents/rename",
+                &json!({
+                    "subject": normalize_agent_subject(&args.subject),
+                    "name": args.label,
+                    "actor": actor,
+                    "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                }),
+            ).await?;
+            print_value(&response, json_output)
+        }
         AgentsCommand::Queue(args) => {
             run_agent_queue(endpoint, configured_person, args, json_output).await
         }
@@ -9276,6 +9319,7 @@ async fn run_agent_inspection(
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
+        | AgentsCommand::Rename(_)
         | AgentsCommand::Queue(_)
         | AgentsCommand::Hold(_) => {
             unreachable!("agent mutation and queue commands return before inspection")
@@ -11455,6 +11499,7 @@ async fn run_message(
                     tags: Vec::new(),
                     from: args.from,
                     print_kdl: args.print_kdl,
+                    idempotency_key: args.idempotency_key,
                 },
             )
             .await?;
@@ -11605,18 +11650,17 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<M
         return Ok(None);
     }
     client
-        .post(
-            "/v1/messages",
-            &MessageSendRequest {
-                idempotency_key: format!("st3-message-send:{id}"),
-                from,
-                to,
-                content: args.body,
-                title: args.subject,
-                in_reply_to: args.in_reply_to,
-                tags: args.tags,
-            },
-        )
+        .send_message(&MessageSendRequest {
+            idempotency_key: args
+                .idempotency_key
+                .unwrap_or_else(|| format!("st3-message-send:{id}")),
+            from,
+            to,
+            content: args.body,
+            title: args.subject,
+            in_reply_to: args.in_reply_to,
+            tags: args.tags,
+        })
         .await
         .map(Some)
 }
@@ -14107,6 +14151,20 @@ fn legacy_delivery_hold(
 async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the Codex driver argv is empty");
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
+    // The local PTY can publish before reconciliation records runtime.running. Like the
+    // other native drivers, publish startup evidence before binding the mailbox: that bind
+    // must wait for the exact running incarnation instead of treating this fresh seat as stale.
+    retry_while_daemon_unreachable(subject, || {
+        publish_harness_state(
+            client,
+            subject,
+            "codex",
+            "starting",
+            Some(&incarnation),
+            None,
+        )
+    })
+    .await?;
     drive_codex_native(
         client,
         subject,
@@ -14971,8 +15029,19 @@ impl NativeMailbox {
                     mailbox_receipt(client, &self.fence, &view.subject, "read").await?;
                     return Ok(());
                 }
+                // Delivery is durable handoff evidence, including mail handed to the legacy
+                // provider turn before the push ledger used graph subjects as its keys.
+                if view.status == "delivered" {
+                    self.queued.remove(&view.subject);
+                    return Ok(());
+                }
                 if view.status == "sent" {
-                    mailbox_receipt(client, &self.fence, &view.subject, "staged").await?;
+                    let staged =
+                        mailbox_receipt_claim(client, &self.fence, &view.subject, "staged").await?;
+                    if staged.kind != "message.staged" {
+                        self.queued.remove(&view.subject);
+                        return Ok(());
+                    }
                 }
                 if !self.queued.contains_key(&view.subject) {
                     let body = message_content(client, view).await?;
@@ -16049,6 +16118,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_mailbox_upgrade_does_not_queue_legacy_delivered_mail_or_acknowledge_it_as_read()
+    {
+        // The two providers share this pump but load their own native receipt ledgers.
+        for driver in ["codex", "opencode"] {
+            let root = tempfile::tempdir().unwrap();
+            let agent_dir = root.path().join("agent");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            st_drivers::push_mailbox::register(&agent_dir);
+            let client = Client::new(Endpoint::Unix(root.path().join("absent-daemon.sock")));
+            let mut view = MessageView {
+                subject: "message/legacy".into(),
+                from: "person/eval".into(),
+                to: "agent/eval.worker".into(),
+                content: "doc/unavailable@hash".into(),
+                status: "delivered".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                created_index: 1,
+            };
+            let mut mailbox = NativeMailbox {
+                subscription: None,
+                fence: st3::mailbox::Fence::new(&view.to, "new-incarnation", "delivery"),
+                messages: vec![view.clone()],
+                queued: BTreeMap::new(),
+                replayed: true,
+            };
+            // Even a previously cached body must leave the fresh-handoff queue when delivery lands.
+            mailbox.queued.insert(
+                view.subject.clone(),
+                native_queued_message(&view, "Cached signal".into()),
+            );
+            view.subject = "message/pending".into();
+            view.status = "staged".into();
+            view.content = "Fresh signal".into();
+            mailbox.messages.push(view.clone());
+            for _ in 0..3 {
+                let receipts = if driver == "codex" {
+                    NativeDeliveryReceipts::Codex {
+                        state_dir: root.path(),
+                        identity: "eval.worker",
+                        runtime_id: "worker",
+                    }
+                } else {
+                    NativeDeliveryReceipts::OpenCode {
+                        catalog_root: root.path(),
+                        identity: "eval.worker",
+                        runtime_id: "worker",
+                    }
+                };
+                // An absent daemon makes any accidental body fetch, staging or fabricated read fail.
+                mailbox.pump(&client, &agent_dir, receipts).await.unwrap();
+                let queued = st_drivers::push_mailbox::messages(
+                    &agent_dir,
+                    &agent_dir.join("resources/inbox"),
+                )
+                .unwrap();
+                assert_eq!(queued.len(), 1, "{driver}");
+                assert_eq!(queued[0].filename, "message/pending");
+                assert!(st_drivers::push_mailbox::is_unread(
+                    &agent_dir,
+                    "message/legacy",
+                    &queued
+                ));
+            }
+            assert!(!agent_dir.join("resources").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn pi_family_pending_read_survives_daemon_outage_and_reexec_under_its_fence() {
         use axum::{Json, Router, routing::post};
         let root = tempfile::tempdir().unwrap();
@@ -16233,6 +16372,7 @@ mod tests {
         let back: DriverResume =
             serde_json::from_slice(&serde_json::to_vec(&resume).unwrap()).unwrap();
         assert_eq!(back.session, resume.session);
+        assert_eq!(back.incarnation, resume.incarnation);
         assert!(back.loop_state.ready);
         assert_eq!(back.loop_state.delivery_episode, 2);
         assert_eq!(
@@ -18203,6 +18343,50 @@ mod tests {
     }
 
     #[test]
+    fn message_send_and_reply_accept_a_key_for_unconfirmed_retries() {
+        let send = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "send",
+            "agent/example/worker",
+            "--from",
+            "person/ada",
+            "--body",
+            "Hello",
+            "--idempotency-key",
+            "retry-a-send",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Send(send),
+        } = send.command
+        else {
+            panic!("send did not parse");
+        };
+        assert_eq!(send.idempotency_key.as_deref(), Some("retry-a-send"));
+        let reply = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "reply",
+            "message/example",
+            "--from",
+            "person/ada",
+            "--body",
+            "Hello",
+            "--idempotency-key",
+            "retry-a-reply",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Reply(reply),
+        } = reply.command
+        else {
+            panic!("reply did not parse");
+        };
+        assert_eq!(reply.idempotency_key.as_deref(), Some("retry-a-reply"));
+    }
+
+    #[test]
     fn message_replies_route_to_the_other_participant() {
         let original = MessageView {
             subject: "message/original".into(),
@@ -18432,6 +18616,22 @@ mod tests {
                 command: AgentsCommand::Stop(_)
             }
         ));
+    }
+
+    #[test]
+    fn agent_rename_needs_a_nonempty_label_or_clear() {
+        let rename = |label: &[&str]| {
+            Cli::try_parse_from(
+                ["st3", "agents", "rename", "agent/worker"]
+                    .into_iter()
+                    .chain(label.iter().copied())
+                    .chain(["--as", "person/alex"]),
+            )
+        };
+        assert!(rename(&["Garden"]).is_ok());
+        assert!(rename(&["--clear"]).is_ok());
+        assert!(rename(&[""]).is_err());
+        assert!(rename(&[]).is_err());
     }
 
     fn agent_new_args(arguments: &[&str]) -> AgentNewArgs {
