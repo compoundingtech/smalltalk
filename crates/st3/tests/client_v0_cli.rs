@@ -2336,6 +2336,78 @@ async fn serve_creation_api(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_start_accepts_explicit_identity_and_rejects_doubled_prefixes() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, server) = serve_creation_api(root.path(), None).await;
+    for (identity, subject) in [
+        ("example/worker", "agent/example/worker"),
+        ("agent/example/worker", "agent/example/worker"),
+        ("worker", "agent/placement.worker"),
+        ("agent/other.worker", "agent/other.worker"),
+    ] {
+        let output = run_cli(
+            &socket,
+            &[
+                "agents",
+                "start",
+                identity,
+                "--host",
+                "placement",
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await;
+        let applied = value(&output);
+        assert!(
+            applied["subject_tokens"].get(subject).is_some(),
+            "{identity}: {applied}"
+        );
+        let preview = run_cli(
+            &socket,
+            &[
+                "agents",
+                "start",
+                identity,
+                "--host",
+                "placement",
+                "--as",
+                "person/avery",
+                "--print-kdl",
+            ],
+        )
+        .await;
+        assert!(preview.status.success());
+        let kdl = String::from_utf8(preview.stdout).unwrap();
+        let intent = st3::parse_intent(&kdl, "client-v0-cli").unwrap();
+        assert!(intent.subjects.contains_key(subject), "{kdl}");
+    }
+    for preview in [false, true] {
+        let mut args = vec![
+            "agents",
+            "start",
+            "agent/agent/example/accidental",
+            "--as",
+            "person/avery",
+        ];
+        if preview {
+            args.push("--print-kdl");
+        }
+        let output = run_cli(&socket, &args).await;
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("agent/agent/"), "{error}");
+        assert!(error.contains("ID or agent/ID"), "{error}");
+    }
+    let agents = value(&run_cli(&socket, &["agents", "ls", "--all"]).await);
+    assert!(
+        !agents.to_string().contains("accidental"),
+        "rejected identity created a seat: {agents}"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json() {
     for (harness, json) in [
         (None, false),
