@@ -26,6 +26,31 @@
         "created_at": { "$ref": "#/$defs/Timestamp" }
       }
     },
+    "CanonicalNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "arguments": { "type": "array", "items": { "type": ["string", "number", "boolean", "null"] } },
+        "properties": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean", "null"] } },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/CanonicalNode" } }
+      }
+    },
+    "SubjectDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "subject", "desired", "kdl", "desired_revision", "desired_token", "conflicts"],
+      "properties": {
+        "kind": { "const": "subject-definition" },
+        "subject": { "type": "string", "pattern": "^agent/[^\\s]+$" },
+        "desired": { "$ref": "#/$defs/CanonicalNode" },
+        "kdl": { "type": "string" },
+        "desired_revision": { "$ref": "#/$defs/Revision" },
+        "desired_token": { "type": "string", "minLength": 1 },
+        "conflicts": { "type": "array", "items": { "type": "string" } }
+      }
+    },
     "PageInfo": {
       "type": "object",
       "additionalProperties": false,
@@ -49,6 +74,7 @@
           "oneOf": [
             { "$ref": "#/$defs/Capabilities" },
             { "$ref": "#/$defs/DocumentContent" },
+            { "$ref": "#/$defs/SubjectDefinition" },
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
