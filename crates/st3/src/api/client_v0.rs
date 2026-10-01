@@ -417,15 +417,15 @@ async fn follow_conversation(
     let failed = |error: ApiError| json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
     loop {
         // The cursor first, so nothing that lands while the page is read is lost.
-        let start =
-            match conversation_changes_value(&state, &session, &session_id, remote, None, 0).await
-            {
-                Ok(start) => start,
-                Err(error) => {
-                    let _ = outbox.send((id.clone(), failed(error)));
-                    return;
-                }
-            };
+        let start = match conversation_changes_value(&state, &session, &session_id, remote, None, 0)
+            .await
+        {
+            Ok(start) => start,
+            Err(error) => {
+                let _ = outbox.send((id.clone(), failed(error)));
+                return;
+            }
+        };
         let page = match conversation_page(&state, &session, &session_id, remote).await {
             Ok(page) => page,
             Err(error) => {
@@ -436,7 +436,9 @@ async fn follow_conversation(
         let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":true, "items":page["items"], "has_more":page["page"]["has_more"]});
         // A page of long tool output can outgrow one frame: keep its newest entries.
         while frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
-            let Some(items) = frame["items"].as_array_mut().filter(|items| items.len() > 1)
+            let Some(items) = frame["items"]
+                .as_array_mut()
+                .filter(|items| items.len() > 1)
             else {
                 break;
             };
@@ -1158,6 +1160,7 @@ pub(super) fn mission_resources(
 /// Collection cards keep only three run headers, regardless of a mission's history size.
 /// Full run and step detail stays on the detail endpoint.
 fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value>> {
+    let attention = store.human_attention_runs()?;
     let definitions = store
         .mission_definitions_for_ids(ids)?
         .into_iter()
@@ -1177,24 +1180,47 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
                 Some(crate::model::MissionState::Retired)=>"retired", _=>"ready"}};
         let updated = latest.and_then(|r| r["updated_at_unix_ms"].as_u64()).map(u128::from)
             .or_else(|| definition.map(|d| d.updated_at_unix_ms)).unwrap_or(0);
-        let revision = definition.map(|d| d.mission.revision.as_str()).unwrap_or("unknown");
+        let revision = latest.and_then(|r| r["revision"].as_str())
+            .or_else(|| definition.map(|d| d.mission.revision.as_str())).unwrap_or("unknown");
         let active = overview["counts"].as_object().unwrap().iter()
             .filter(|(state,_)| !matches!(state.as_str(),"completed"|"failed"|"cancelled"))
             .map(|(_,count)| count.as_u64().unwrap_or(0)).sum::<u64>();
-        let details = newest.iter().rev().map(|run| json!({
-            "id":run["id"],"generation_id":run["generation_id"],"requester":run["requester"],
-            "status":run["status"],"phase":run["phase"],"progress":null,
-            "current_steps":[],"must_act":if active>0 {"system"} else {"nobody"},
-            "state_since":client_timestamp(run["updated_at_unix_ms"].as_u64().unwrap_or(0) as u128),
-            "reason":run["reason"],"steps":null
-        })).collect::<Vec<_>>();
+        let details = newest.iter().rev().map(|run| {
+            let run_id=run["id"].as_str().expect("run header id");
+            let (total,done,steps)=store.mission_step_preview(run_id)?;
+            let terminal=matches!(run["status"].as_str(),Some("completed"|"failed"|"cancelled"));
+            let must_act=if terminal {"nobody"} else if attention.contains(run_id) {"you"}
+                else if steps.iter().any(|s| matches!(s.status.as_str(),"ready"|"claimed"|"working")
+                    && (s.assigned_to.is_some() || s.claimant.is_some() || !s.available_to.is_empty())) {"agent"}
+                else if steps.iter().any(|s| s.status=="blocked") {"blocked"} else {"system"};
+            let shown=steps.iter().map(|step| json!({
+                "id":step.subject,"path":step.step,"title":step.title,"state":client_work_state(&step.status),
+                "attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,
+                "agentless":step.agentless,"since":client_timestamp(step.updated_at_unix_ms),
+                "blocked_reason":step.blocked_reason,"blockers":step.blockers,
+                "goals":step.goals,"constraints":step.constraints
+            })).collect::<Vec<_>>();
+            let current=shown.iter().filter(|s| matches!(s["state"].as_str(),Some("ready"|"claimed"|"verifying"|"blocked")))
+                .map(|s| json!({"id":s["id"],"title":s["title"],"assignee":s["assignee"],"claimant":s["claimant"],"state":s["state"],"since":s["since"]})).collect::<Vec<_>>();
+            Ok::<Value,anyhow::Error>(json!({
+                "id":run["id"],"generation_id":run["generation_id"],"requester":run["requester"],
+                "status":run["status"],"phase":run["phase"],"progress":{"done":done,"total":total},
+                "current_steps":current,"must_act":must_act,
+                "state_since":client_timestamp(run["updated_at_unix_ms"].as_u64().unwrap_or(0) as u128),
+                "steps":shown
+            }))
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        let must_act=["you","agent","blocked","system"].into_iter()
+            .find(|kind| details.iter().any(|run| run["must_act"]==*kind)).unwrap_or(if active>0 {"system"} else {"nobody"});
+        let generations=newest.iter().map(|r| (r["id"].as_str().unwrap().to_owned(),r["generation_id"].clone()))
+            .collect::<serde_json::Map<_,_>>();
         let historical = matches!(state,"completed"|"failed"|"cancelled"|"retired");
         Ok(json!({"id":id,"kind":"mission","revision":revision,"updated_at":client_timestamp(updated),
             "title":id.trim_start_matches("mission/"),"state":state,"mission_revision":revision,
             "runs":newest.iter().rev().map(|r| r["id"].clone()).collect::<Vec<_>>(),
             "run_details":details,"active_runs":active,"total_runs":overview["total_runs"],
             "run_counts":overview["counts"],"runs_truncated":overview["total_runs"].as_u64().unwrap_or(0)>newest.len() as u64,
-            "run_generations":{},"must_act":if active>0 {"system"} else {"nobody"},
+            "run_generations":generations,"must_act":must_act,
             "operational":{"layer":if historical {"history"} else {"current"},"actionable":!historical,"reasons":[]}}))
     }).collect()
 }
@@ -7476,15 +7502,15 @@ mod tests {
         assert_eq!(item["active_runs"], 601);
         assert_eq!(item["runs"].as_array().unwrap().len(), 3);
         assert_eq!(item["runs_truncated"], true);
-        let mut large=vec![item.clone();200];
+        let mut large = vec![item.clone(); 200];
         for card in &mut large {
             for run in card["run_details"].as_array_mut().unwrap() {
-                run["requester"]=json!(format!("person/{}","x".repeat(1990)));
+                run["requester"] = json!(format!("person/{}", "x".repeat(1990)));
             }
         }
         assert!(bound_mission_cards(&mut large).unwrap());
-        assert!(!large.is_empty() && large.len()<200);
-        assert!(serde_json::to_vec(&large).unwrap().len()<CLIENT_MAX_RESPONSE_BYTES-120_000);
+        assert!(!large.is_empty() && large.len() < 200);
+        assert!(serde_json::to_vec(&large).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES - 120_000);
         let overview = read("/v1/mission-overview?mission=mission%2Fexample%2Ffleet".into()).await;
         assert_eq!(overview["value"]["total_runs"], 2401);
         for collection in ["missions", "work"] {
@@ -8349,10 +8375,7 @@ subscription "watch/source" {
                 actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("pairing_id".into(), Value::String("pairing/named".into())),
-                    (
-                        "device_name".into(),
-                        Value::String("Alex's iPhone".into()),
-                    ),
+                    ("device_name".into(), Value::String("Alex's iPhone".into())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,

@@ -1,6 +1,8 @@
 # Operational queries
 
-Mission lists page mission IDs and return compact cards with at most three recent run headers.
+Mission lists page mission IDs and return compact cards with at most three recent runs and
+twenty step previews per run. Progress counts cover every step; a larger total signals an
+incomplete step preview.
 `active_runs`, `total_runs`, and `run_counts` count the entire history. `runs_truncated` says when
 the preview is incomplete. A page also respects a byte budget; its cursor resumes after the last
 returned mission. Full step details remain available by exact run subject.

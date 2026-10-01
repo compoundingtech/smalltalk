@@ -3967,9 +3967,10 @@ where
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
     let profile = crate::profile::current();
+    let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        operation()
+        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -3984,9 +3985,10 @@ where
     F: FnOnce() -> Result<T, ApiError> + Send + 'static,
 {
     let profile = crate::profile::current();
+    let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        operation()
+        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
     })
     .await
     .map_err(ApiError::internal)?

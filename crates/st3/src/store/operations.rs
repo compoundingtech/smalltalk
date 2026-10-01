@@ -21,10 +21,11 @@ impl Store {
         let mut previews = Vec::new();
         for failed in [false, true] {
             let mut statement = connection.prepare(
-                "SELECT id, current_generation_id, requester, status, phase, created_at_unix_ms,
-                        updated_at_unix_ms FROM mission_runs
-                 WHERE mission_id=?1 AND (NOT ?2 OR status='failed')
-                 ORDER BY created_at_unix_ms DESC, id DESC LIMIT ?3",
+                "SELECT r.id, r.current_generation_id, r.requester, r.status, r.phase, r.created_at_unix_ms,
+                        r.updated_at_unix_ms,COALESCE(g.revision,r.initial_revision) FROM mission_runs r
+                 LEFT JOIN run_generations g ON g.id=r.current_generation_id
+                 WHERE r.mission_id=?1 AND (NOT ?2 OR r.status='failed')
+                 ORDER BY r.created_at_unix_ms DESC, r.id DESC LIMIT ?3",
             )?;
             let mut items = Vec::new();
             for row in statement.query_map(params![mission, failed, limit.clamp(1, 20)], |row| {
@@ -36,9 +37,10 @@ impl Store {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             })? {
-                let (id, generation, requester, status, phase, created, updated) = row?;
+                let (id, generation, requester, status, phase, created, updated, revision) = row?;
                 let subject = format!("mission-run/{id}");
                 let reason: Option<String> = connection
                     .query_row(
@@ -53,17 +55,44 @@ impl Store {
                     )
                     .optional()?
                     .flatten();
-                items.push(json!({"id": subject, "generation_id": generation,
+                items.push(
+                    json!({"id": subject, "generation_id": format!("run-generation/{generation}"),
                     "requester": short(&requester), "status": status, "phase": phase,
+                    "revision":revision,
                     "created_at_unix_ms": created.parse::<u128>()?,
                     "updated_at_unix_ms": updated.parse::<u128>()?,
-                    "reason": reason.as_deref().map(short)}));
+                    "reason": reason.as_deref().map(short)}),
+                );
             }
             previews.push(items);
         }
         Ok(json!({"mission": format!("mission/{mission}"),
             "total_runs": counts.values().sum::<u64>(), "counts": counts,
             "newest": previews[0], "failed": previews[1], "preview_limit": limit.clamp(1,20)}))
+    }
+
+    /// A run card's progress counts cover every step; only its first twenty steps are hydrated.
+    pub fn mission_step_preview(&self, run: &str) -> Result<(u64, u64, Vec<StepRunView>)> {
+        let run = run.trim_start_matches("mission-run/");
+        let connection = self.readers.get();
+        let (total, done) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(s.status='completed'),0)
+             FROM step_runs s JOIN mission_runs r ON r.id=s.run_id
+             WHERE r.id=?1 AND s.generation_id=r.current_generation_id",
+            [run],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+        )?;
+        let mut statement=connection.prepare(
+            "SELECT subject,run_id,step_path,definition_hash,status,attempt,assignee,available_to,agentless,title,goals,worker_reported,
+                    lease_owner,lease_incarnation,lease_expires_at_unix_ms,blocked_reason,not_before_unix_ms,created_at_unix_ms,updated_at_unix_ms,readiness_epoch,constraints
+             FROM step_runs WHERE run_id=?1 AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)
+             ORDER BY created_at_unix_ms,step_path LIMIT 20",
+        )?;
+        let mut steps = statement
+            .query_map([run], step_run_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        apply_step_states_tx(&connection, &mut steps, false)?;
+        Ok((total, done, steps))
     }
 
     /// Terminal transitions in a stable claim-index window. A retry does not erase a failure.
