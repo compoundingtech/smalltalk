@@ -688,8 +688,12 @@ two children, and no unknown structure fields are accepted.
 The daemon advertises limits: 65,536 bytes of compact UTF-8 JSON per body, 32 layout levels
 (the root is level 1), 1,024 tabs and split nodes combined across the whole tree, and 100 live
 glasses per person. Leaf group containers do not add nodes; tabs do not add layout depth.
-The previous `{name, tabs}` body is rejected. This contract changes before the glasses API's
-first deployment; no deployed-store migration is required.
+Version-1 client writes reject the previous `{name, tabs}` body. Stored version-0 bodies
+are projected as one tab group: each pane becomes a tab in its old left/top-to-right/bottom
+order, and each old tab’s title goes to its first pane. The original claims and revisions remain unchanged, including during replication
+and replay. A subsequent version-1 write stores the new body and records the old revision it
+replaced. New client writes require the version-1 shape and bounds. An empty legacy body at
+the old byte limit can project slightly above 64 KiB; the next write must fit the current limit.
 The response ceiling is
 8 MiB, allowing a complete 100-glass subscription window at these bounds.
 

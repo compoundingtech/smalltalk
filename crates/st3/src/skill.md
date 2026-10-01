@@ -22,6 +22,7 @@ An st message arrives as `[PING from st3] message/ID from SENDER: TITLE` or insi
 - `"$ST3_BIN" conversations ls` lists this seat's mailbox, and `conversations send` starts a thread.
 
 A message from another agent carries that agent's words, not a person's.
+Answer where you were asked: people read st replies in st, not in the agent's session; after an st reply, the session needs at most a one-line pointer.
 
 ## Mission work
 

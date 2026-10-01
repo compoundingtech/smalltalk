@@ -3,7 +3,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
-use st3::{api::AppState, store::Store};
+use st3::{api::AppState, model::ClaimInput, store::Store};
 use st3_client::{
     Client, CollectionEvent, GlassBody, GlassDelete, GlassLayout, GlassPut, GlassTab,
 };
@@ -58,6 +58,82 @@ async fn request(
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap(),
     )
 }
+#[tokio::test]
+async fn legacy_glass_reads_convert_and_client_writes_require_the_current_shape() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let id = "019a0000-0000-7000-8000-000000000004";
+    let old = json!({"name":"Home only","tabs":[]});
+    let original = state
+        .store
+        .append_claim(&ClaimInput {
+            subject: format!("glass/person/ada/{id}"),
+            kind: "glass.upserted".into(),
+            actor: Some("person/ada".into()),
+            fields: serde_json::from_value(json!({"body":old,"base_revision":null})).unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let app = st3::api::router(state.clone());
+    let path = format!("/v1/client/glasses/{id}");
+    let (status, read) = request(
+        app.clone(),
+        "GET",
+        &path,
+        Some("person/ada"),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read["value"]["revision"], original.id);
+    assert_eq!(
+        read["value"]["body"],
+        json!({"name":"Home only","layout":{"tabs":[]}})
+    );
+    let (status, list) = request(
+        app.clone(),
+        "GET",
+        "/v1/client/glasses",
+        Some("person/ada"),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["value"]["items"][0], read["value"]);
+    let (status, _) = request(
+        app.clone(),
+        "PUT",
+        &path,
+        Some("person/ada"),
+        Some("old-shape"),
+        json!({"body":old,"base_revision":original.id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, saved) = request(
+        app,
+        "PUT",
+        &path,
+        Some("person/ada"),
+        Some("converted-shape"),
+        json!({"body":read["value"]["body"],"base_revision":original.id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["value"]["replaced_revision"], original.id);
+    let claims = state
+        .store
+        .claims_for(&original.subject, Some("glass.upserted"))
+        .unwrap();
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0].body["fields"]["body"], old);
+    assert_eq!(claims[1].body["fields"]["body"], read["value"]["body"]);
+}
+
 #[tokio::test]
 async fn glasses_routes_enforce_owner_and_mutation_contract_and_hide_raw_history() {
     let root = tempfile::tempdir().unwrap();
@@ -283,6 +359,15 @@ async fn glasses_rust_client_and_collection_stream_deliver_upserts_and_removes()
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("client.sock");
     let state = state(root.path());
+    let legacy = state.store.append_claim(&ClaimInput {
+        subject: "glass/person/ada/019a0000-0000-7000-8000-000000000003".into(),
+        kind: "glass.upserted".into(),
+        actor: Some("person/ada".into()),
+        fields: serde_json::from_value(json!({"body":{"name":"Legacy","tabs":[
+            {"title":"Work","layout":{"split":"right","children":[{"pane":"old:a"},{"pane":"old:b"}]}}
+        ]},"base_revision":null})).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
     let app = st3::api::router(state.clone());
     let server_socket = socket.clone();
     let server = tokio::spawn(async move {
@@ -313,7 +398,29 @@ async fn glasses_rust_client_and_collection_stream_deliver_upserts_and_removes()
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(matches!(first,CollectionEvent::Snapshot{items,..} if items.is_empty()));
+    let CollectionEvent::Snapshot { items, .. } = first else {
+        panic!("expected initial glasses snapshot")
+    };
+    assert_eq!(items.len(), 1);
+    let st3_client::Resource::Glass(glass) = &items[0] else {
+        panic!("expected a typed glass")
+    };
+    assert_eq!(glass.header.revision, legacy.id);
+    assert_eq!(
+        glass.body.as_ref().unwrap().layout,
+        GlassLayout::Group {
+            tabs: vec![
+                GlassTab {
+                    title: Some("Work".into()),
+                    pane: "old:a".into()
+                },
+                GlassTab {
+                    title: None,
+                    pane: "old:b".into()
+                },
+            ]
+        }
+    );
     let id = "019a0000-0000-7000-8000-000000000002";
     let body = GlassBody {
         name: "Main".into(),
@@ -350,7 +457,7 @@ async fn glasses_rust_client_and_collection_stream_deliver_upserts_and_removes()
             .value
             .items
             .len(),
-        1
+        2
     );
     client
         .delete_glass(

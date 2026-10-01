@@ -110,10 +110,157 @@ pub fn validate_body(body: &Value) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Durable version-0 claims remain valid history. Client version-1 writes use
+/// `validate_body`; projections translate old tabs of split panes without rewriting claims.
+pub fn body_for_read(body: &Value) -> Result<Value, ValidationError> {
+    if validate_body(body).is_ok() {
+        return Ok(body.clone());
+    }
+    validate_legacy_body(body)?;
+    let mut tabs = Vec::new();
+    for tab in body["tabs"].as_array().expect("validated legacy tabs") {
+        let mut title = tab.get("title").cloned();
+        let mut stack = vec![&tab["layout"]];
+        while let Some(layout) = stack.pop() {
+            if let Some(pane) = layout.get("pane") {
+                let mut tab = serde_json::json!({"pane": pane});
+                if let Some(title) = title.take() {
+                    tab["title"] = title;
+                }
+                tabs.push(tab);
+            } else {
+                let children = layout["children"]
+                    .as_array()
+                    .expect("validated binary split");
+                // Stack visits left/top before right/bottom, preserving pane order.
+                stack.push(&children[1]);
+                stack.push(&children[0]);
+            }
+        }
+    }
+    Ok(serde_json::json!({"name": body["name"], "layout": {"tabs": tabs}}))
+}
+
+fn validate_legacy_body(body: &Value) -> Result<(), ValidationError> {
+    let invalid = || {
+        error(
+            "invalid-glass-body",
+            "a glass needs a name and bounded tabs of opaque panes or binary splits",
+        )
+    };
+    if serde_json::to_vec(body).map_err(|_| invalid())?.len() > MAX_BODY_BYTES {
+        return Err(error(
+            "glass-body-too-large",
+            "a glass body must be at most 64 KiB",
+        ));
+    }
+    let obj = body.as_object().ok_or_else(invalid)?;
+    if obj.len() != 2
+        || !obj
+            .get("name")
+            .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+    {
+        return Err(invalid());
+    }
+    let tabs = obj
+        .get("tabs")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid)?;
+    if tabs.len() > MAX_NODES {
+        return Err(invalid());
+    }
+    let mut stack = Vec::new();
+    for tab in tabs {
+        let tab = tab.as_object().ok_or_else(invalid)?;
+        if tab.keys().any(|k| k != "layout" && k != "title")
+            || tab.get("title").is_some_and(|v| !v.is_string())
+        {
+            return Err(invalid());
+        }
+        stack.push((tab.get("layout").ok_or_else(invalid)?, 1));
+    }
+    let mut nodes = 0;
+    while let Some((layout, depth)) = stack.pop() {
+        nodes += 1;
+        if nodes > MAX_NODES || depth > MAX_DEPTH {
+            return Err(invalid());
+        }
+        let obj = layout.as_object().ok_or_else(invalid)?;
+        if obj.len() == 1
+            && obj
+                .get("pane")
+                .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        {
+            continue;
+        }
+        if obj.len() != 2
+            || !obj
+                .get("split")
+                .is_some_and(|v| matches!(v.as_str(), Some("right" | "below")))
+        {
+            return Err(invalid());
+        }
+        let children = obj
+            .get("children")
+            .and_then(Value::as_array)
+            .ok_or_else(invalid)?;
+        if children.len() != 2 {
+            return Err(invalid());
+        }
+        for child in children {
+            stack.push((child, depth + 1));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn legacy_bodies_project_all_panes_in_order_and_keep_titles_on_first_panes() {
+        let old = json!({"name":"Main","tabs":[
+            {"title":"Work","layout":{"split":"right","children":[
+                {"pane":"agent:a"}, {"split":"below","children":[{"pane":"agent:b"},{"pane":"agent:c"}]}
+            ]}},
+            {"layout":{"pane":"agent:d"}},
+            {"title":"","layout":{"pane":"agent:e"}}
+        ]});
+        let expected = json!({"name":"Main","layout":{"tabs":[
+            {"title":"Work","pane":"agent:a"},{"pane":"agent:b"},{"pane":"agent:c"},
+            {"pane":"agent:d"},{"title":"","pane":"agent:e"}
+        ]}});
+        assert_eq!(body_for_read(&old).unwrap(), expected);
+        assert_eq!(body_for_read(&expected).unwrap(), expected);
+        assert!(
+            validate_body(&old).is_err(),
+            "new clients must write the new shape"
+        );
+        assert_eq!(
+            body_for_read(&json!({"name":"Empty","tabs":[]})).unwrap(),
+            json!({"name":"Empty","layout":{"tabs":[]}})
+        );
+        for invalid in [
+            json!({"name":"Main","tabs":[{"title":null,"layout":{"pane":"agent:a"}}]}),
+            json!({"name":"Main","tabs":[{"layout":{"split":"right","children":[{"pane":"agent:a"}]}}]}),
+            json!({"name":"Main","tabs":[],"layout":{"tabs":[]}}),
+        ] {
+            assert!(body_for_read(&invalid).is_err());
+        }
+        let mut deep = json!({"pane":"a"});
+        for _ in 1..MAX_DEPTH {
+            deep = json!({"split":"right","children":[{"pane":"b"},deep]});
+        }
+        body_for_read(&json!({"name":"Depth limit","tabs":[{"layout":deep}]})).unwrap();
+        let too_deep = json!({"split":"right","children":[{"pane":"b"},deep]});
+        assert!(body_for_read(&json!({"name":"Too deep","tabs":[{"layout":too_deep}]})).is_err());
+        let mut large = json!({"name":"x".repeat(MAX_BODY_BYTES),"tabs":[]});
+        assert!(body_for_read(&large).is_err());
+        large["name"] = json!("x".repeat(MAX_BODY_BYTES - 21));
+        assert_eq!(serde_json::to_vec(&large).unwrap().len(), MAX_BODY_BYTES);
+        body_for_read(&large).unwrap();
+    }
     fn body(layout: Value) -> Value {
         json!({"name":"Main", "layout":layout})
     }

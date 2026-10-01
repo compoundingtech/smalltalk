@@ -175,6 +175,21 @@ impl Glasses {
     pub(crate) fn palette_open(&self) -> bool {
         self.palette.is_some()
     }
+    /// The agents whose conversations show in the shown glass: each group's shown tab, the
+    /// focused group first.
+    pub(crate) fn shown_agents(&self) -> Vec<String> {
+        let glass = self.glass();
+        let count = glass.layout.groups().len();
+        std::iter::once(glass.focus)
+            .chain((0..count).filter(|index| *index != glass.focus))
+            .filter_map(|index| glass.shown(index))
+            .filter_map(|tab| match Pane::parse(&tab.pane) {
+                Some(Pane::Agent(Some(id))) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Open `wanted` (or the last glass used here, or `main`) from what this device keeps.
     pub(crate) fn open(wanted: Option<String>, store: Option<PathBuf>) -> Self {
         let stored = store.as_deref().map(glass_store::load).unwrap_or_default();
@@ -1028,8 +1043,8 @@ impl Ui {
                 KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
                 KeyCode::Down => palette.selected += 1,
                 KeyCode::Backspace if palette.query.is_empty() => palette.section = None,
-                KeyCode::Backspace => {
-                    palette.query.pop();
+                KeyCode::Backspace | KeyCode::Char('w' | 'u') => {
+                    super::edit_text(&mut palette.query, key);
                     palette.selected = 0;
                 }
                 KeyCode::Enter => {
@@ -1049,6 +1064,14 @@ impl Ui {
             }
             self.clamp_palette();
             return true;
+        }
+        // While the person types, every editing key is the input's (Ctrl+W deletes a word);
+        // Esc leaves the input and glasses keys work again.
+        if self.editing
+            || self.new_mission.is_some()
+            || self.chat.as_ref().is_some_and(|chat| chat.editing)
+        {
+            return false;
         }
         // In an attached terminal every key is the agent's; Ctrl+\ leaves it first.
         if self.terminal.is_some() && self.tab == 1 {
@@ -1086,6 +1109,28 @@ impl Ui {
             _ => return false,
         }
         true
+    }
+
+    pub(crate) fn palette_open(&self) -> bool {
+        self.glasses
+            .as_ref()
+            .is_some_and(|glasses| glasses.palette.is_some())
+    }
+
+    /// One wheel step moves the palette's selection a row, and the list follows it.
+    pub(crate) fn scroll_palette(&mut self, up: bool) {
+        if let Some(palette) = self
+            .glasses
+            .as_mut()
+            .and_then(|glasses| glasses.palette.as_mut())
+        {
+            palette.selected = if up {
+                palette.selected.saturating_sub(1)
+            } else {
+                palette.selected + 1
+            };
+        }
+        self.clamp_palette();
     }
 
     pub(crate) fn open_palette(&mut self, section: Option<usize>, enter: Open) {
@@ -1506,8 +1551,18 @@ impl Ui {
         }
     }
 
-    /// A click inside a group that is not focused focuses it, and does nothing else.
+    /// A click inside a group that is not focused focuses it, and does nothing else. While the
+    /// palette is open, only its rows take clicks; a click elsewhere closes it.
     pub(crate) fn glass_click(&mut self, column: u16, row: u16) -> bool {
+        if self.palette_open() {
+            let on_palette = self.frame.borrow().hits.iter().any(|(rect, hit)| {
+                matches!(hit, Hit::PaletteChoice(_)) && contains(*rect, column, row)
+            });
+            if !on_palette && let Some(glasses) = self.glasses.as_mut() {
+                glasses.palette = None;
+            }
+            return !on_palette;
+        }
         let Some(focus) = self.glasses.as_ref().map(|glasses| glasses.glass().focus) else {
             return false;
         };
@@ -1519,8 +1574,12 @@ impl Ui {
             .position(|rect| contains(*rect, column, row));
         match group {
             Some(group) if group != focus => {
+                // A click on another split's message box focuses the split and the box.
+                let composer = self.frame.borrow().hits.iter().rev().any(|(rect, hit)| {
+                    matches!(hit, Hit::Composer) && contains(*rect, column, row)
+                });
                 self.focus_group(group);
-                true
+                !composer
             }
             _ => false,
         }
@@ -1930,6 +1989,142 @@ mod tests {
         assert_eq!(tabs(&ui), (0, 1, vec![vec![ATLAS.to_owned()]]));
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui), (0, 0, vec![vec![]]));
+    }
+
+    #[test]
+    fn typing_owns_the_editing_keys_and_enter_keeps_the_input() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.live = true;
+        typed(&mut ui, "c");
+        assert!(ui.editing);
+        typed(&mut ui, "ship it now");
+        ctrl(&mut ui, 'w');
+        assert_eq!(
+            tabs(&ui).2,
+            vec![vec![ATLAS.to_owned()]],
+            "Ctrl+W kept the tab"
+        );
+        let draft = |ui: &Ui| {
+            ui.conversation_state
+                .drafts
+                .get("agent/example/atlas/builder")
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(draft(&ui), "ship it ");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(ui.editing, "a send keeps the input focused");
+        assert_eq!(draft(&ui), "");
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        ctrl(&mut ui, 'w');
+        assert_eq!(
+            tabs(&ui).2,
+            vec![Vec::<String>::new()],
+            "after Esc, Ctrl+W closes"
+        );
+    }
+
+    #[test]
+    fn every_agent_on_screen_is_followed_and_only_the_focused_box_takes_keys() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Right,
+        );
+        assert_eq!(ui.live_conversations(), ["agent/example/atlas/builder"]);
+        let other = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .map(|agent| agent.id.clone())
+            .find(|id| id != "agent/example/atlas/builder")
+            .unwrap();
+        ui.open_in_glass(Pane::Agent(Some(other.clone())), Open::Below);
+        assert_eq!(
+            ui.live_conversations(),
+            [other.clone(), "agent/example/atlas/builder".to_owned()],
+            "the focused one first"
+        );
+        ui.live = true;
+        typed(&mut ui, "c");
+        let shown = screen(&ui);
+        assert_eq!(shown.matches("c or click").count(), 0, "{shown}");
+        assert_eq!(shown.matches('█').count(), 1, "one cursor: {shown}");
+        assert!(
+            shown.contains("· click"),
+            "the other box says how to reach it"
+        );
+    }
+
+    #[test]
+    fn a_message_that_did_not_arrive_can_be_sent_again_or_cleared() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.live = true;
+        if let Some(Load::Ready(entries)) = ui
+            .world
+            .conversations
+            .get_mut("agent/example/atlas/builder")
+        {
+            entries.push(Entry {
+                id: "pending:token-1".into(),
+                at: "17:35".into(),
+                body: Body::Pending {
+                    text: "hello".into(),
+                    failed: Some("deadline exceeded".into()),
+                    unconfirmed: true,
+                },
+            });
+        }
+        assert!(screen(&ui).contains("unconfirmed, st did not answer"));
+        typed(&mut ui, "r");
+        typed(&mut ui, "x");
+        assert_eq!(
+            std::mem::take(&mut ui.effects),
+            [
+                Effect::Resend {
+                    entry: "pending:token-1".into()
+                },
+                Effect::Forget {
+                    entry: "pending:token-1".into()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn the_wheel_moves_the_palette_and_nothing_behind_it() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        let wheel = |ui: &mut Ui, kind| {
+            ui.mouse(MouseEvent {
+                kind,
+                column: 60,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        screen(&ui);
+        wheel(&mut ui, MouseEventKind::ScrollDown);
+        wheel(&mut ui, MouseEventKind::ScrollDown);
+        let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
+        assert_eq!(palette.selected, 2);
+        wheel(&mut ui, MouseEventKind::ScrollUp);
+        let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
+        assert_eq!(palette.selected, 1);
+        assert_eq!(ui.list_top.borrow()[0], 0, "the list behind did not scroll");
     }
 
     #[test]

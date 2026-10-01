@@ -50,7 +50,7 @@ use st3_conversation_ui::pane::order;
 use st3_conversation_ui::{PaneIntent, PaneState, Selection};
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, Write},
     rc::Rc,
     time::{Duration, Instant},
@@ -137,6 +137,14 @@ pub enum Effect {
     },
     /// Keep a glass in st, or delete it there.
     SaveGlass(glass::GlassWrite),
+    /// Send a failed or unconfirmed message again, as the same request.
+    Resend {
+        entry: String,
+    },
+    /// Drop a failed or unconfirmed message from the conversation.
+    Forget {
+        entry: String,
+    },
 }
 
 /// An agent's live terminal screen, drawn in place of its conversation.
@@ -208,6 +216,11 @@ pub struct Ui {
     /// `stui --glasses`: named glasses of tabs and split panes, and a palette, in place of the
     /// sidebar layout.
     pub(crate) glasses: Option<glass::Glasses>,
+    /// The footer names this build (version, revision, age); off in tests, whose screens must
+    /// not change with every commit.
+    pub(crate) build: bool,
+    /// When st last sent each conversation something, shown above its message box.
+    updated: HashMap<String, Instant>,
 }
 
 impl Ui {
@@ -257,6 +270,8 @@ impl Ui {
             revoke: None,
             snoozed: HashSet::new(),
             glasses: None,
+            build: false,
+            updated: HashMap::new(),
         }
     }
 
@@ -278,6 +293,80 @@ impl Ui {
             }
         }
         self.tab = tab;
+    }
+
+    /// The conversations to keep live, the focused one first: the selected agent's in the
+    /// sidebar layout; in a glass, every agent pane on screen, as many as st follows at once.
+    pub(crate) fn live_conversations(&self) -> Vec<String> {
+        let mut targets = Vec::new();
+        if self.tab == 1
+            && let Some(id) = self.selected_id()
+        {
+            targets.push(id);
+        }
+        if let Some(glasses) = &self.glasses {
+            for id in glasses.shown_agents() {
+                if !targets.contains(&id) {
+                    targets.push(id);
+                }
+            }
+        }
+        targets.truncate(crate::feed::MAX_CONVERSATIONS);
+        targets
+    }
+
+    pub(crate) fn conversation_updated(&mut self, target: &str) {
+        self.updated.insert(target.to_owned(), Instant::now());
+    }
+
+    /// The agent whose message box has the keyboard: the selected agent while the Agents tab
+    /// is the focused one.
+    fn composing(&self, agent: &str) -> bool {
+        self.tab == 1 && self.selected_id().as_deref() == Some(agent)
+    }
+
+    /// ` ● live · updated 12s ago `, or paused when st is not following it.
+    fn freshness(&self, agent: &str) -> Span<'static> {
+        let age = self.updated.get(agent).map(|at| {
+            let seconds = at.elapsed().as_secs();
+            match seconds {
+                0..60 => format!("{seconds}s ago"),
+                60..3600 => format!("{}m ago", seconds / 60),
+                _ => format!("{}h ago", seconds / 3600),
+            }
+        });
+        let live = self.live_conversations().iter().any(|id| id == agent);
+        let (text, color) = match (live, age) {
+            (true, Some(age)) => (format!(" ● live · updated {age} "), theme::OVERLAY1),
+            (true, None) => (" ● live · waiting for st ".to_owned(), theme::OVERLAY1),
+            (false, Some(age)) => (
+                format!(" ○ paused · updated {age} · focus to follow "),
+                theme::YELLOW,
+            ),
+            (false, None) => (" ○ paused · focus to follow ".to_owned(), theme::YELLOW),
+        };
+        Span::styled(text, theme::fg(color))
+    }
+
+    /// The selected agent's newest message that failed or went unconfirmed, by entry id.
+    fn undelivered(&self) -> Option<String> {
+        let agent = self.selected_id()?;
+        let Some(Load::Ready(entries)) = self.world.conversations.get(&agent) else {
+            return None;
+        };
+        entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                matches!(
+                    &entry.body,
+                    Body::Pending {
+                        failed: Some(_),
+                        ..
+                    }
+                )
+            })
+            .map(|entry| entry.id.clone())
     }
 
     /// The tab and the id selected in it.
@@ -580,7 +669,12 @@ impl Ui {
                 ("esc", "cancel"),
             ]
         } else if self.editing {
-            vec![("enter", "send"), ("esc", "stop editing"), ("⌫", "delete")]
+            vec![
+                ("enter", "send"),
+                ("esc", "stop editing"),
+                ("ctrl+w", "delete word"),
+                ("ctrl+u", "clear"),
+            ]
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
         } else {
@@ -609,11 +703,19 @@ impl Ui {
             hints.extend([("?", "help"), ("q", "quit")]);
             hints
         };
+        // The build, always at the right edge; the hints give way to it.
+        let build = self
+            .build
+            .then(|| format!(" {} ", crate::version::short(crate::version::now())));
+        let reserved = build
+            .as_deref()
+            .map_or(0, |build| text::width(build) as u16 + 1);
         let mut x = area.x + 1;
         for (key, label) in hints {
             let key_text = format!("{key} ");
             let label_text = format!("{label}   ");
-            if x + (text::width(&key_text) + text::width(&label_text)) as u16 > area.x + area.width
+            if x + (text::width(&key_text) + text::width(&label_text)) as u16 + reserved
+                > area.x + area.width
             {
                 break;
             }
@@ -633,6 +735,17 @@ impl Ui {
                 Style::default().fg(theme::OVERLAY1).bg(theme::CRUST),
             );
             x += text::width(&label_text) as u16;
+        }
+        if let Some(build) = &build
+            && x + reserved <= area.x + area.width
+        {
+            buf.set_stringn(
+                area.x + area.width - reserved,
+                area.y,
+                build,
+                reserved as usize,
+                Style::default().fg(theme::OVERLAY0).bg(theme::CRUST),
+            );
         }
         if let Some((message, _)) = &self.flash {
             let message = format!(" {message} ");
@@ -1162,12 +1275,26 @@ impl Ui {
                 y,
                 "─".repeat(area.width as usize),
                 area.width as usize,
-                theme::fg(if self.editing {
+                theme::fg(if self.editing && self.composing(&agent.id) {
                     theme::ACCENT
                 } else {
                     theme::SURFACE0
                 }),
             );
+            // How fresh the conversation is, on the rule above the box: st pushes changes to
+            // the conversations on screen, and one that is not followed says so.
+            if self.live {
+                let label = self.freshness(&agent.id);
+                let width = text::width(&label.content) as u16;
+                if width + 4 < area.width {
+                    buf.set_line(
+                        area.x + area.width - width - 2,
+                        y,
+                        &Line::from(vec![label]),
+                        width,
+                    );
+                }
+            }
             for (offset, line) in composer.iter().enumerate() {
                 buf.set_line(area.x, y + 1 + offset as u16, line, area.width);
             }
@@ -1395,13 +1522,21 @@ impl Ui {
             .get(&agent.id)
             .cloned()
             .unwrap_or_default();
-        if draft.is_empty() && !self.editing {
+        // Only the focused pane's box takes keys; the others show their draft, and how to reach
+        // them by click.
+        let editing = self.editing && self.composing(&agent.id);
+        if draft.is_empty() && !editing {
+            let hint = if self.composing(&agent.id) {
+                format!("Message {} · c or click", agent.name)
+            } else {
+                format!("Message {} · click", agent.name)
+            };
             return vec![Line::from(vec![
                 Span::styled("› ", theme::dim()),
-                Span::styled(format!("Message {} · c or click", agent.name), theme::dim()),
+                Span::styled(hint, theme::dim()),
             ])];
         }
-        let style = if self.editing {
+        let style = if editing {
             theme::text()
         } else {
             theme::soft()
@@ -1410,13 +1545,13 @@ impl Ui {
         let paragraphs = draft.split('\n').collect::<Vec<_>>();
         for (index, paragraph) in paragraphs.iter().enumerate() {
             let mut runs = vec![text::run(paragraph.to_string(), style)];
-            if self.editing && index == paragraphs.len() - 1 {
+            if editing && index == paragraphs.len() - 1 {
                 runs.push(text::run("█", theme::fg(theme::ACCENT)));
             }
             let first = if index == 0 {
                 text::run(
                     "› ",
-                    if self.editing {
+                    if editing {
                         theme::strong(theme::ACCENT)
                     } else {
                         theme::dim()
@@ -1659,16 +1794,9 @@ impl Ui {
                 }
                 KeyCode::Enter if focus_now < 3 => *focus = focus_now + 1,
                 KeyCode::Enter => self.create_launch(),
-                KeyCode::Backspace => {
-                    fields[focus_now].pop();
+                _ => {
+                    edit_text(&mut fields[focus_now], key);
                 }
-                KeyCode::Char(character) => {
-                    fields[focus_now].push(character);
-                    if focus_now == 0 && fields[2].is_empty() {
-                        // Suggest a mission id from the title as it is typed.
-                    }
-                }
-                _ => {}
             }
             return;
         }
@@ -1681,20 +1809,12 @@ impl Ui {
                     }
                 }
                 KeyCode::Enter => self.submit_chat(),
-                KeyCode::Backspace => {
-                    self.conversation_state
-                        .drafts
-                        .entry(key_id)
-                        .or_default()
-                        .pop();
+                _ => {
+                    edit_text(
+                        self.conversation_state.drafts.entry(key_id).or_default(),
+                        key,
+                    );
                 }
-                KeyCode::Char(character) => self
-                    .conversation_state
-                    .drafts
-                    .entry(key_id)
-                    .or_default()
-                    .push(character),
-                _ => {}
             }
             return;
         }
@@ -1729,20 +1849,12 @@ impl Ui {
             match key.code {
                 KeyCode::Esc => self.editing = false,
                 KeyCode::Enter => self.submit(),
-                KeyCode::Backspace => {
-                    self.conversation_state
-                        .drafts
-                        .entry(key_id)
-                        .or_default()
-                        .pop();
+                _ => {
+                    edit_text(
+                        self.conversation_state.drafts.entry(key_id).or_default(),
+                        key,
+                    );
                 }
-                KeyCode::Char(character) => self
-                    .conversation_state
-                    .drafts
-                    .entry(key_id)
-                    .or_default()
-                    .push(character),
-                _ => {}
             }
             return;
         }
@@ -1781,6 +1893,13 @@ impl Ui {
             KeyCode::Char('s') => self.sidebar = !self.sidebar,
             KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
             KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
+            KeyCode::Char(letter @ ('r' | 'x')) if self.tab == 1 && self.live => {
+                match self.undelivered() {
+                    Some(entry) if letter == 'r' => self.effects.push(Effect::Resend { entry }),
+                    Some(entry) => self.effects.push(Effect::Forget { entry }),
+                    None => {}
+                }
+            }
             KeyCode::Char('i') if self.tab == 1 => self.details = !self.details,
             KeyCode::Char('t') if matches!(self.tab, 1 | 2) => {
                 let id = self.selected_id();
@@ -2105,9 +2224,6 @@ impl Ui {
         };
         let title = format!("About: {}", item.title);
         self.conversation_state.drafts.remove(&key);
-        if let Some(state) = &mut self.chat {
-            state.editing = false;
-        }
         if self.live {
             let mut context = format!("{text}\n\n---\nThis is about {} ({}", item.title, item.id);
             if let Some(mission) = &item.mission {
@@ -2154,7 +2270,7 @@ impl Ui {
             self.flash("Write something first");
             return;
         };
-        self.editing = false;
+        // The input stays focused after a send; Esc leaves it.
         if self.live {
             let effect = match self.tab {
                 1 => Some(Effect::Send {
@@ -2427,6 +2543,10 @@ impl Ui {
                     }
                 }
             }
+            // The palette, while open, takes the wheel: nothing behind it moves.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.palette_open() => {
+                self.scroll_palette(matches!(mouse.kind, MouseEventKind::ScrollUp));
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                     -3
@@ -2698,11 +2818,51 @@ impl Ui {
         }
         if cos > 8.0 && !demo.mail {
             demo.mail = true;
-            if let Some(Load::Ready(entries)) = self.world.conversations.get_mut("agent/example/cos")
+            if let Some(Load::Ready(entries)) =
+                self.world.conversations.get_mut("agent/example/cos")
             {
                 entries.push(demo::late_mail());
             }
         }
+    }
+}
+
+/// Terminal text editing on a draft, which is edited at its end: typing, Backspace, and the
+/// readline keys people expect (Ctrl+W and Alt+Backspace delete a word, Ctrl+U the line).
+/// Returns whether the key belonged to the text; a typing key never reaches anything else.
+fn edit_text(text: &mut String, key: KeyEvent) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Backspace if control || alt => delete_word(text),
+        KeyCode::Backspace | KeyCode::Char('h') if key.code == KeyCode::Backspace || control => {
+            text.pop();
+        }
+        KeyCode::Char('w') if control && !alt => delete_word(text),
+        KeyCode::Char('u') if control && !alt => {
+            let start = text.rfind('\n').map_or(0, |index| index + 1);
+            text.truncate(start);
+        }
+        // Cursor keys have nowhere to go at the end of the draft; they still belong to it.
+        KeyCode::Char('a' | 'e' | 'k' | 'b' | 'f' | 'd') if control && !alt => {}
+        // AltGr arrives as Ctrl+Alt on some terminals: that is typing too.
+        KeyCode::Char(character) if control == alt => text.push(character),
+        _ => return false,
+    }
+    true
+}
+
+/// Readline's word delete: the blanks before the end, then the word before them.
+fn delete_word(text: &mut String) {
+    let before = text.len();
+    while text.ends_with([' ', '\t']) {
+        text.pop();
+    }
+    while text.ends_with(|character: char| !character.is_whitespace()) {
+        text.pop();
+    }
+    if text.len() == before && text.ends_with('\n') {
+        text.pop();
     }
 }
 
@@ -3017,6 +3177,29 @@ fn dump(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drafts_take_the_terminal_editing_keys() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let mut text = "look at the  ".to_owned();
+        assert!(edit_text(
+            &mut text,
+            key(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        ));
+        assert_eq!(text, "look at ");
+        edit_text(&mut text, key(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(text, "look ");
+        edit_text(&mut text, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(text, "look ", "a control key never types its letter");
+        edit_text(&mut text, key(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert_eq!(text, "look X");
+        let mut lines = "first\nsecond line".to_owned();
+        edit_text(&mut lines, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(lines, "first\n");
+        edit_text(&mut lines, key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(lines, "first");
+        assert!(!edit_text(&mut lines, key(KeyCode::Up, KeyModifiers::NONE)));
+    }
 
     fn frame(ui: &Ui, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
