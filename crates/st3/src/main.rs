@@ -5388,9 +5388,24 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
+    let gateway = if config.client_web.is_some() || config.usage.is_some() {
+        let web = st3::api::client_web::ClientWeb::new_with_usage(
+            config.client_web.clone(),
+            config.usage.clone(),
+            &state,
+        )?;
+        st3::api::fabric_router_with_web(state.clone(), web)
+    } else {
+        fabric_router(state.clone())
+    };
+    let limit = axum::Extension(st3::api::ClientSubscriptionLimit(
+        config.client_subscription_limit,
+    ));
+    let local = router(state.clone()).layer(limit);
+    let gateway = gateway.layer(limit);
     tokio::try_join!(
-        st3::api::serve_unix_bound(&local_socket, &state_socket, router(state.clone())),
-        serve_unix(&client_gateway_socket, fabric_router(state)),
+        st3::api::serve_unix_bound(&local_socket, &state_socket, local),
+        serve_unix(&client_gateway_socket, gateway),
     )?;
     Ok(())
 }
