@@ -158,7 +158,8 @@ queue it again. The merge train (`st lanes join smalltalk`) is retired.
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
 by an administrator and never by CI) requires the three checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
-merge method MERGE, up to five entries build at once, up to five merge together, and a check that
+merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
+up to five merge together, and a check that
 never reports fails its entry after 30 minutes. Repository settings enable native auto-merge and
 branch deletion after merge. Check the live settings against the file with `gh-check-settings`:
 
@@ -172,6 +173,52 @@ pull request has merged through the queue.
 To roll back, restore the previous ruleset (the JSON is in the body of pull request #916) with
 `gh api --method PUT repos/compoundingtech/smalltalk/rulesets/20563764 --input old-main-ruleset.json`,
 then start the train again with `st missions start` on its mission.
+
+## Measured concurrency
+
+The [manual capacity run](https://github.com/compoundingtech/smalltalk/actions/runs/36931429222)
+on 2026-10-01 recorded the workspace limits with `nsc workspace concurrency --output json`:
+
+| Platform | Concurrent vCPUs | Concurrent memory |
+| --- | ---: | ---: |
+| Linux (amd64 and arm64 share a pool) | 320 | 640 GiB |
+| macOS arm64 | 96 | 224 GiB |
+
+Namespace limits CPU and memory per platform; a workflow run is not a fixed unit of capacity.
+Each Workspace CI group initially starts three 16-vCPU/32-GiB stage jobs and two
+8-vCPU/16-GiB profile jobs: 64 vCPUs and 128 GiB at peak. Five complete groups fit the Linux
+limit, which matches `max_entries_to_build: 5` in both the generated and live main rulesets.
+PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
+are available. The `linux-gate` aggregate starts after the three stage jobs finish, so it does
+not add to the initial peak. macOS uses its own pool.
+
+At 21:51:47 UTC, GitHub's job step timestamps showed seven PR, merge-group and main workflow
+runs executing 19 Namespace jobs together. Including the manual capacity run, the overlap was
+eight runs and 24 jobs. These are observed overlaps of runs at different stages, rather than
+eight fully parallel Workspace CI groups. The runs were:
+
+- main: [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36930646852)
+  and [macOS CI](https://github.com/compoundingtech/smalltalk/actions/runs/36930646948) for one commit,
+  with [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36931186016)
+  and [macOS CI](https://github.com/compoundingtech/smalltalk/actions/runs/36931186029) for the next;
+- merge group: [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36930644645);
+- PRs: [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36931199367)
+  and [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36931346163).
+
+The initial jobs in 13 observed CI runs created from 21:30 UTC had a median startup delay of
+18 seconds, a 95th percentile of 187 seconds (nearest rank) and a maximum of 305 seconds (57 jobs). Startup
+delay is measured from workflow creation to the first job step; jobs waiting on dependencies,
+skipped jobs and jobs without a Namespace runner are excluded. Each active job's interval runs
+from its first step to job completion, with unfinished jobs counted through the observation.
+The observation is repository-scoped; the workspace can also have jobs from other repositories.
+
+To refresh the capacity measurement, dispatch Workspace CI on `main`. Its `namespace-capacity`
+job runs only for `workflow_dispatch`, publishes platform limits and current usage to the job
+summary and retains the `namespace-capacity` artifact. It reports no workspace or account identity.
+See Namespace's [resource limits](https://namespace.so/docs/architecture/compute/resource-limits)
+and [profile concurrency controls](https://namespace.so/docs/solutions/github-actions/runner-controls/concurrent-runners)
+for the scheduler's limits, and GitHub's [merge queue settings](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
+for the distinction between build concurrency and merge batch size.
 
 ## Namespace jobs that never start
 
