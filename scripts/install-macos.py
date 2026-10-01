@@ -277,7 +277,13 @@ def main():
     lock_root.mkdir(parents=True, exist_ok=True)
     lock = open(lock_root / (hashlib.sha256(str(fixed(home)).encode()).hexdigest() + '.lock'), 'a')
     fcntl.flock(lock, fcntl.LOCK_EX)
-    resolve_identity()
+    verifying_artifact = args.verify_app or args.install_app or args.backup_only or args.restore_app
+    if verifying_artifact and CERTIFICATE and re.fullmatch(r'[a-fA-F0-9]{40}', CERTIFICATE):
+        # A staged signed bundle carries its certificate. Verification/install
+        # needs no signing private key on the receiving machine.
+        CERTIFICATE = CERTIFICATE.upper()
+    else:
+        resolve_identity()
     if args.verify_app:
         print(json.dumps(verify(args.verify_app), sort_keys=True))
         return

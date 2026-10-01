@@ -47,5 +47,8 @@ filesystem. The installer keeps the prior app, CLI links/files and service plist
 Automation can use the helper's explicit transaction modes (`--prepare-only`,
 `--backup-only`, `--install-app APP`, `--verify-app APP`, `--restore-app`) with a
 persistent `--job DIRECTORY`. Back up before `--install-app`, and keep the directory
-until deployment health checks pass. The helper restores installation files, not
+until deployment health checks pass. Artifact verification/install with a configured full
+certificate fingerprint checks the embedded signature without requiring its private key
+on the receiving machine. Building/signing a candidate still requires the explicitly
+configured keychain identity. The helper restores installation files, not
 application databases; schema compatibility must be checked by the deployment caller.
