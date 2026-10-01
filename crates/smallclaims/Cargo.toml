@@ -1,0 +1,17 @@
+[package]
+name = "smallclaims"
+version = "0.1.0"
+edition = "2024"
+description = "A replicated claims graph: the claim log, its canonical order and digests, and sync between members"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+ciborium = "0.2"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+# Claim bodies keep the writer's field order when they decode, so a claim hashed in insertion
+# order by an old build still verifies (see `hash::claim_id_is_content_hash`). Inside smalltalk
+# another dependency turns this on; the crate asks for it so it behaves the same built alone.
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
