@@ -15967,16 +15967,25 @@ fn check_mailbox_incarnation(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
 ) -> Result<(), St3Error> {
-    let runtime: Option<String> = connection
+    let runtime: Option<(String, String)> = connection
         .prepare_cached(&format!(
             "{} LIMIT 1",
-            newest_claims_of_kind_query("claims.body", "runtime.observed")
+            newest_claims_of_kind_query("claims.id, claims.body", "runtime.observed")
         ))
         .map_err(internal)?
-        .query_row(params![fence.subject, i64::MAX], |row| row.get(0))
+        .query_row(params![fence.subject, i64::MAX], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()
         .map_err(internal)?;
-    let runtime: Value = serde_json::from_str(&runtime.unwrap_or_default()).unwrap_or(Value::Null);
+    let runtime_claim = runtime.as_ref().map(|(claim, _)| claim.as_str());
+    let runtime: Value = serde_json::from_str(
+        runtime
+            .as_ref()
+            .map(|(_, body)| body.as_str())
+            .unwrap_or_default(),
+    )
+    .unwrap_or(Value::Null);
     let fields = runtime.get("fields").unwrap_or(&runtime);
     let live = fields.get("status").and_then(Value::as_str) == Some("running")
         && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
@@ -16017,9 +16026,8 @@ fn check_mailbox_incarnation(
             }
         }
     }
-    let ended = current_harness_at(connection, &fence.subject, None)
-        .map_err(internal)?
-        .is_some_and(|harness| harness.state == "ended");
+    let ended = live
+        && mailbox_harness_ended(connection, fence, runtime_claim.unwrap()).map_err(internal)?;
     if !live || ended {
         return Err(St3Error::new(
             "stale-mailbox-session",
@@ -16028,6 +16036,51 @@ fn check_mailbox_incarnation(
     }
 
     Ok(())
+}
+
+/// Mailbox authorization needs the state, not the optional display fields accumulated by
+/// `current_harness_at`. Sparse observations can leave those fields unknown forever, making
+/// a display fold walk every prior incarnation on every graph wake.
+fn mailbox_harness_ended(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+    runtime_claim: &str,
+) -> Result<bool> {
+    let mut statement = connection.prepare_cached(&newest_claims_of_kind_query(
+        "claims.id, claims.body",
+        "harness.observed",
+    ))?;
+    let mut rows = statement.query(params![fence.subject, i64::MAX])?;
+    let mut runtime_key = None;
+    while let Some(row) = rows.next()? {
+        let claim: String = row.get(0)?;
+        let body: String = row.get(1)?;
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        let belongs = match fields.get("incarnation_id").and_then(Value::as_str) {
+            Some(incarnation) => incarnation == fence.incarnation,
+            None => {
+                let key = match &runtime_key {
+                    Some(key) => key,
+                    None => runtime_key.insert(canonical::claim_key(connection, runtime_claim)?),
+                };
+                canonical::claim_key(connection, &claim)? > *key
+            }
+        };
+        if !belongs {
+            continue;
+        }
+        if let Some(state) = fields.get("state").and_then(Value::as_str) {
+            if state != "ended" {
+                return Ok(false);
+            }
+            // Diagnostics or newer work activity can override an ended observation. Keep
+            // exactly the existing reduction for that exceptional case.
+            return Ok(current_harness_at(connection, &fence.subject, None)?
+                .is_some_and(|harness| harness.state == "ended"));
+        }
+    }
+    Ok(false)
 }
 
 fn check_mailbox_fence(
@@ -33244,6 +33297,162 @@ version 2
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].kind, "harness.diagnostic");
         assert_eq!(store.claims_for("agent/example", None).unwrap().len(), 21);
+    }
+
+    #[test]
+    fn mailbox_state_read_preserves_ended_diagnostic_work_and_legacy_semantics() {
+        let store = Store::open_memory("alder").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let subject = "agent/example";
+        let fence = crate::mailbox::Fence::new(subject, "current", "delivery");
+        let mut sequence = 0;
+        let mut insert = |kind: &str, fields: Value| {
+            sequence += 1;
+            let id = format!("claim-{sequence}");
+            let time = sequence.to_string();
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                 VALUES(?1,'alder',?2,?1,?3)",
+                    params![id, sequence, time],
+                )
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
+                 VALUES(?1,?1,?2,?3,'alder',?2,?4,'[]',?5)",
+                params![id, subject, kind, json!({"fields": fields}).to_string(), time],
+            ).unwrap();
+        };
+        insert(
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"current"}),
+        );
+        for (kind, fields, expected_ended) in [
+            (
+                "harness.observed",
+                json!({"state":"ended","incarnation_id":"prior"}),
+                false,
+            ),
+            (
+                "harness.observed",
+                json!({"state":"idle","incarnation_id":"current"}),
+                false,
+            ),
+            (
+                "harness.observed",
+                json!({"state":"ended","incarnation_id":"current"}),
+                true,
+            ),
+            (
+                "harness.observed",
+                json!({"driver":"claude","incarnation_id":"current"}),
+                true,
+            ),
+            (
+                "harness.diagnostic",
+                json!({"code":"provider-auth-expired","incarnation_id":"current"}),
+                false,
+            ),
+            (
+                "harness.diagnostic",
+                json!({"code":"provider-auth-restored","incarnation_id":"current"}),
+                true,
+            ),
+            (
+                "work.progress",
+                json!({"claim_incarnation":"current"}),
+                false,
+            ),
+            ("harness.observed", json!({"state":"ended"}), true),
+            ("harness.observed", json!({"state":"idle"}), false),
+        ] {
+            insert(kind, fields);
+            let ended = current_harness_at(&transaction, subject, None)
+                .unwrap()
+                .is_some_and(|harness| harness.state == "ended");
+            assert_eq!(ended, expected_ended, "{kind}");
+            assert_eq!(
+                check_mailbox_incarnation(&transaction, &fence).is_err(),
+                ended,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_fence_cost_does_not_grow_with_sparse_prior_incarnations() {
+        let store = Store::open_memory("alder").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let insert = |id: &str, kind: &str, fields: Value, time: &str| {
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                 VALUES(?1,'alder',1,?1,?2)",
+                    params![id, time],
+                )
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                 VALUES(?1,?1,'agent/example',?2,'alder',?3,'[]',?4)",
+                params![id, kind, json!({"fields": fields}).to_string(), time],
+            ).unwrap();
+        };
+        insert(
+            "runtime",
+            "runtime.observed",
+            json!({"status":"running", "incarnation_id":"current"}),
+            "20000",
+        );
+        insert(
+            "current",
+            "harness.observed",
+            json!({"state":"idle", "incarnation_id":"current"}),
+            "20001",
+        );
+        let fence = crate::mailbox::Fence::new("agent/example", "current", "delivery");
+        // Count the actual statements used by the fence, including the previous display fold.
+        // Cached statement reset does not reset SQLite's VM step counter.
+        let queries = [
+            newest_claims_of_kind_query("claims.id, claims.body", "harness.observed"),
+            newest_claims_of_kind_query(
+                "claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms",
+                "harness.observed",
+            ),
+        ];
+        let mut costs = Vec::new();
+        for n in 1..=10_000 {
+            insert(
+                &format!("old-{n}"),
+                "harness.observed",
+                json!({"state":"working", "incarnation_id":"prior"}),
+                &n.to_string(),
+            );
+            if n == 100 || n == 10_000 {
+                for query in &queries {
+                    transaction
+                        .prepare_cached(query)
+                        .unwrap()
+                        .reset_status(rusqlite::StatementStatus::VmStep);
+                }
+                check_mailbox_incarnation(&transaction, &fence).unwrap();
+                let cost: i32 = queries
+                    .iter()
+                    .map(|query| {
+                        transaction
+                            .prepare_cached(query)
+                            .unwrap()
+                            .get_status(rusqlite::StatementStatus::VmStep)
+                    })
+                    .sum();
+                costs.push(cost);
+            }
+        }
+        assert!(
+            costs[1] <= costs[0] * 2 && costs[1] < 1_000,
+            "a live fence must read its state, not its optional display history: {costs:?}"
+        );
     }
 
     /// The reads behind the session list, a mission detail and the missions tree seek or walk an
