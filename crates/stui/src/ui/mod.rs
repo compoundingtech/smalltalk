@@ -7,6 +7,7 @@
 
 pub mod adapt;
 mod attach;
+mod edit;
 #[cfg(test)]
 mod contract;
 pub mod conversation;
@@ -264,6 +265,8 @@ pub struct Ui {
     started: Option<String>,
     /// Images attached to each draft, by its key, until it is sent.
     attachments: HashMap<String, Vec<attach::Attachment>>,
+    /// Where typing goes in the input that has the keyboard.
+    cursor: edit::Cursor,
     /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
     pub(crate) picker: Option<ratatui_image::picker::Picker>,
     /// Each attachment's thumbnail, encoded once so a redraw never sends the image again.
@@ -328,6 +331,7 @@ impl Ui {
             agent_form: false,
             started: None,
             attachments: HashMap::new(),
+            cursor: edit::Cursor::default(),
             picker: None,
             thumbnails: RefCell::new(HashMap::new()),
             updated: HashMap::new(),
@@ -543,7 +547,7 @@ impl Ui {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let first = text.lines().next().unwrap_or("").to_owned();
         if let Some(find) = self.find.as_mut() {
-            find.query.push_str(&first);
+            edit::insert(&mut find.query, &self.cursor, "find", &first);
             find.current = 0;
             find.jump.set(true);
             return;
@@ -552,15 +556,13 @@ impl Ui {
             return;
         }
         if let Some((fields, focus)) = self.new_mission.as_mut() {
-            fields[*focus].push_str(&text);
+            edit::insert(&mut fields[*focus], &self.cursor, &format!("mission:{focus}"), &text);
             return;
         }
         if let Some(chat) = self.chat.clone().filter(|chat| chat.editing) {
-            self.conversation_state
-                .drafts
-                .entry(format!("chat:{}", chat.item))
-                .or_default()
-                .push_str(&text);
+            let input = format!("chat:{}", chat.item);
+            let draft = self.conversation_state.drafts.entry(input.clone()).or_default();
+            edit::insert(draft, &self.cursor, &input, &text);
             return;
         }
         // A paste over an agent's conversation starts a message to it.
@@ -578,11 +580,8 @@ impl Ui {
             self.attachments.entry(key).or_default().push(attachment);
             return;
         }
-        self.conversation_state
-            .drafts
-            .entry(key)
-            .or_default()
-            .push_str(&text);
+        let draft = self.conversation_state.drafts.entry(key.clone()).or_default();
+        edit::insert(draft, &self.cursor, &key, &text);
     }
 
     /// Attach the image on this machine's clipboard to the message being written.
@@ -1291,15 +1290,19 @@ impl Ui {
                 }
                 _ => Vec::new(),
             };
+            let text = self.conversation_state.drafts.get(&chat_key).map(String::as_str).unwrap_or("");
             screens::Chat {
                 to: chat.to_name.clone(),
-                text: self.conversation_state.drafts.get(&chat_key).map(String::as_str).unwrap_or(""),
+                text,
+                cursor: self.cursor.at(&chat_key, text),
                 editing: chat.editing,
                 thread,
             }
         });
+        let text = self.conversation_state.drafts.get(key).map(String::as_str);
         Drafts {
-            text: self.conversation_state.drafts.get(key).map(String::as_str),
+            text,
+            cursor: self.cursor.at(key, text.unwrap_or("")),
             editing: self.editing,
             confirm: self.confirm,
             chat,
@@ -1343,12 +1346,17 @@ impl Ui {
             Pane::NewMission => {
                 let empty = Default::default();
                 let (fields, focus) = self.new_mission.as_ref().unwrap_or(&empty);
-                screens::new_mission_form(fields, *focus, width)
+                screens::new_mission_form(fields, *focus, self.cursor.at(&format!("mission:{focus}"), &fields[*focus]), width)
             }
             Pane::NewAgent => {
                 let empty = Default::default();
                 let form = self.new_agent.as_ref().unwrap_or(&empty);
-                screens::new_agent_form(form, &self.other_hosts(), width)
+                screens::new_agent_form(
+                    form,
+                    &self.other_hosts(),
+                    [self.cursor.at("agent:task", &form.task), self.cursor.at("agent:name", &form.name)],
+                    width,
+                )
             }
             Pane::Declaration(id) => screens::mission_kdl(&self.world, id.as_deref(), width),
             Pane::Mission(id) => {
@@ -1948,16 +1956,24 @@ impl Ui {
             0 => "  no matches".to_owned(),
             count => format!("  {} of {count}", find.current.min(count - 1) + 1),
         };
-        Line::from(vec![
-            Span::styled("/ ", theme::strong(theme::ACCENT)),
-            Span::styled(find.query.clone(), theme::text()),
-            Span::styled("█", theme::fg(theme::ACCENT)),
-            Span::styled(place, theme::fg(theme::YELLOW)),
-            Span::styled(
-                "  · enter older · shift+enter newer · esc close",
-                theme::dim(),
-            ),
-        ])
+        let at = self.cursor.at("find", &find.query);
+        let query = edit::lines(&find.query, Some(at), theme::text())
+            .into_iter()
+            .flatten()
+            .map(|run| Span::styled(run.text, run.style));
+        Line::from(
+            [Span::styled("/ ", theme::strong(theme::ACCENT))]
+                .into_iter()
+                .chain(query)
+                .chain([
+                    Span::styled(place, theme::fg(theme::YELLOW)),
+                    Span::styled(
+                        "  · enter older · shift+enter newer · esc close",
+                        theme::dim(),
+                    ),
+                ])
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// The message box under a conversation, wrapped, newest lines last.
@@ -2030,12 +2046,8 @@ impl Ui {
             theme::soft()
         };
         let mut lines = Vec::new();
-        let paragraphs = draft.split('\n').collect::<Vec<_>>();
-        for (index, paragraph) in paragraphs.iter().enumerate() {
-            let mut runs = vec![text::run(paragraph.to_string(), style)];
-            if editing && index == paragraphs.len() - 1 {
-                runs.push(text::run("█", theme::fg(theme::ACCENT)));
-            }
+        let at = editing.then(|| self.cursor.at(&agent.id, draft));
+        for (index, runs) in edit::lines(draft, at, style).into_iter().enumerate() {
             let first = if index == 0 {
                 text::run(
                     "› ",
@@ -2291,7 +2303,7 @@ impl Ui {
                     find.jump.set(true);
                 }
                 _ => {
-                    if edit_text(&mut find.query, key) {
+                    if edit::edit(&mut find.query, &self.cursor, "find", key) {
                         find.current = 0;
                         find.jump.set(true);
                     }
@@ -2314,12 +2326,12 @@ impl Ui {
                         .modifiers
                         .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
                 {
-                    fields[focus_now].push('\n')
+                    edit::insert(&mut fields[focus_now], &self.cursor, &format!("mission:{focus_now}"), "\n")
                 }
                 KeyCode::Enter if focus_now < 3 => *focus = focus_now + 1,
                 KeyCode::Enter => self.create_launch(),
                 _ => {
-                    edit_text(&mut fields[focus_now], key);
+                    edit::edit(&mut fields[focus_now], &self.cursor, &format!("mission:{focus_now}"), key);
                 }
             }
             return;
@@ -2334,10 +2346,8 @@ impl Ui {
                 }
                 KeyCode::Enter => self.submit_chat(),
                 _ => {
-                    edit_text(
-                        self.conversation_state.drafts.entry(key_id).or_default(),
-                        key,
-                    );
+                    let draft = self.conversation_state.drafts.entry(key_id.clone()).or_default();
+                    edit::edit(draft, &self.cursor, &key_id, key);
                 }
             }
             return;
@@ -2363,11 +2373,8 @@ impl Ui {
                 || (key.code == KeyCode::Char('j')
                     && key.modifiers.contains(KeyModifiers::CONTROL));
             if newline {
-                self.conversation_state
-                    .drafts
-                    .entry(key_id)
-                    .or_default()
-                    .push('\n');
+                let draft = self.conversation_state.drafts.entry(key_id.clone()).or_default();
+                edit::insert(draft, &self.cursor, &key_id, "\n");
                 return;
             }
             let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2394,10 +2401,8 @@ impl Ui {
                     }
                 }
                 _ => {
-                    edit_text(
-                        self.conversation_state.drafts.entry(key_id).or_default(),
-                        key,
-                    );
+                    let draft = self.conversation_state.drafts.entry(key_id.clone()).or_default();
+                    edit::edit(draft, &self.cursor, &key_id, key);
                 }
             }
             return;
@@ -2737,11 +2742,13 @@ impl Ui {
             KeyCode::Left | KeyCode::Right if form.focus >= 2 => {
                 form.cycle(key.code == KeyCode::Right, hosts);
             }
-            KeyCode::Enter if shifted && form.focus == 0 => form.task.push('\n'),
+            KeyCode::Enter if shifted && form.focus == 0 => {
+                edit::insert(&mut form.task, &self.cursor, "agent:task", "\n")
+            }
             KeyCode::Enter => self.start_agent(),
             _ => match form.focus {
                 0 => {
-                    edit_text(&mut form.task, key);
+                    edit::edit(&mut form.task, &self.cursor, "agent:task", key);
                 }
                 1 => {
                     // A name is one word of letters, digits, dots and dashes.
@@ -2751,7 +2758,7 @@ impl Ui {
                     {
                         return;
                     }
-                    edit_text(&mut form.name, key);
+                    edit::edit(&mut form.name, &self.cursor, "agent:name", key);
                 }
                 _ => {}
             },
@@ -3627,29 +3634,9 @@ impl Ui {
     }
 }
 
-/// Terminal text editing on a draft, which is edited at its end: typing, Backspace, and the
-/// readline keys people expect (Ctrl+W and Alt+Backspace delete a word, Ctrl+U the line).
-/// Returns whether the key belonged to the text; a typing key never reaches anything else.
+/// Editing at the text's end, for an input without a cursor of its own (the palette's query).
 fn edit_text(text: &mut String, key: KeyEvent) -> bool {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    match key.code {
-        KeyCode::Backspace if control || alt => delete_word(text),
-        KeyCode::Backspace | KeyCode::Char('h') if key.code == KeyCode::Backspace || control => {
-            text.pop();
-        }
-        KeyCode::Char('w') if control && !alt => delete_word(text),
-        KeyCode::Char('u') if control && !alt => {
-            let start = text.rfind('\n').map_or(0, |index| index + 1);
-            text.truncate(start);
-        }
-        // Cursor keys have nowhere to go at the end of the draft; they still belong to it.
-        KeyCode::Char('a' | 'e' | 'k' | 'b' | 'f' | 'd') if control && !alt => {}
-        // AltGr arrives as Ctrl+Alt on some terminals: that is typing too.
-        KeyCode::Char(character) if control == alt => text.push(character),
-        _ => return false,
-    }
-    true
+    edit::edit(text, &edit::Cursor::default(), "", key)
 }
 
 /// Where `query` shows in a drawn document, case aside: (line, display column, display width).
@@ -3689,19 +3676,6 @@ const THUMBNAIL: ratatui::layout::Size = ratatui::layout::Size {
     height: 4,
 };
 
-/// Readline's word delete: the blanks before the end, then the word before them.
-fn delete_word(text: &mut String) {
-    let before = text.len();
-    while text.ends_with([' ', '\t']) {
-        text.pop();
-    }
-    while text.ends_with(|character: char| !character.is_whitespace()) {
-        text.pop();
-    }
-    if text.len() == before && text.ends_with('\n') {
-        text.pop();
-    }
-}
 
 fn contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height

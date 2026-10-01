@@ -2565,6 +2565,32 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_edits_at_its_cursor_with_the_shell_keys() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        typed(&mut ui, "c");
+        typed(&mut ui, "ship it");
+        ctrl(&mut ui, 'a');
+        typed(&mut ui, "please ");
+        ctrl(&mut ui, 'e');
+        press(&mut ui, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut ui, KeyCode::Left, KeyModifiers::NONE);
+        typed(&mut ui, "out ");
+        let draft = ui.conversation_state.drafts["agent/example/atlas/builder"].clone();
+        assert_eq!(draft, "please ship out it");
+        ctrl(&mut ui, 'k');
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "please ship out "
+        );
+        let shown = screen(&ui);
+        assert!(shown.contains("please ship out █"), "{shown}");
+    }
+
+    #[test]
     fn typing_owns_the_editing_keys_and_enter_keeps_the_input() {
         let mut ui = glass();
         ui.open_in_glass(
