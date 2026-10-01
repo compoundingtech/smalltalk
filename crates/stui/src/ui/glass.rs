@@ -2035,6 +2035,11 @@ impl Ui {
     /// Bring stui's own tab and selection back to the focused pane's subject when they drifted:
     /// at start, before the lists arrive, the subject cannot be selected yet.
     pub(crate) fn resync_focus(&mut self) {
+        // Home over the glass owns stui's tab until it closes; a graph update must not turn it
+        // back into the focused split's subject.
+        if self.home_open() {
+            return;
+        }
         let Some(pane) = self
             .glasses
             .as_ref()
@@ -2830,6 +2835,22 @@ mod tests {
         let need = hit_at(&ui, Hit::Home);
         click(&mut ui, need);
         assert!(ui.home_open());
+    }
+
+    #[test]
+    fn home_stays_home_when_the_world_updates() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_home();
+        assert_eq!(ui.tab, 0);
+        ui.set_world(demo::world());
+        assert!(ui.home_open());
+        assert_eq!(ui.tab, 0, "a world update kept Home");
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(ui.tab, 1, "closing Home shows the focused agent again");
     }
 
     #[test]
