@@ -294,9 +294,22 @@ connects straight to the PTY session, so a busy daemon cannot stall it. If the d
 answer within a second, st attaches to the seat's newest PTY session on that host without it and
 says so.
 
-A running seat keeps its current process when you apply a changed declaration; the change takes
-effect the next time it starts. To use it now, stop the seat and apply again. `st agents stop
+A running seat keeps its current process when you apply a changed declaration; launch changes
+take effect the next time it starts. To use those now, stop the seat and apply again. `st agents stop
 agent/example/worker --as person/ada` stops a seat until you apply its file again.
+
+Human labels are presentation, not launch configuration:
+
+```sh
+st agents rename agent/example/worker "Garden maintenance" --as person/ada
+st agents rename agent/example/worker --clear --as person/ada
+```
+
+Rename publishes only `desired.display_name`, the same durable field as KDL `name`. It does not
+restart the seat or change its identity, and a stopped seat keeps its restart budget and any
+crash-loop hold. The Agent API uses this effective label; clearing it restores `example/worker`.
+The label must be non-empty. Like declaring a seat in free mode, a person or an agent may rename
+any seat. A bound harness must act as itself, and rename preserves the original declaring actor.
 
 [`examples/st3/seats`](examples/st3/seats) has a seat file for each harness.
 
