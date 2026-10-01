@@ -402,6 +402,7 @@ pub fn run(
         &[],
         &RESUME_FENCE_ENV,
         None,
+        true,
     )
 }
 
@@ -422,6 +423,7 @@ pub fn adopt(
         pid,
         session,
         seq,
+        true,
     )
 }
 
@@ -484,6 +486,7 @@ fn run_with_required_resume(
         &residency_env,
         &RESUME_FENCE_ENV,
         Some(required_incarnation),
+        true,
     )
 }
 
@@ -1189,4 +1192,46 @@ mod tests {
         assert!(error.to_string().contains("does not match required resume"));
         assert!(!state.join("binding.json").exists());
     }
+}
+
+/// Launch a native graph-owned session without legacy presence transport.
+pub fn run_native(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    argv: Vec<String>,
+) -> Result<()> {
+    pi_family_session::run_for_with_environment(
+        catalog_root,
+        identity,
+        runtime_id,
+        argv,
+        &OMP_KIND,
+        &[],
+        &RESUME_FENCE_ENV,
+        None,
+        false,
+    )
+}
+
+/// Adopt a native graph-owned session without legacy presence transport.
+#[allow(clippy::too_many_arguments)]
+pub fn adopt_native(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    pid: u32,
+    session: String,
+    seq: u64,
+) -> Result<()> {
+    pi_family_session::adopt_for(
+        catalog_root,
+        identity,
+        runtime_id,
+        &OMP_KIND,
+        pid,
+        session,
+        seq,
+        false,
+    )
 }

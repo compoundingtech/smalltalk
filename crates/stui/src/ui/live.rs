@@ -741,6 +741,10 @@ fn conversations(
         .collect::<BTreeSet<_>>();
     for target in targets {
         let load = match (timelines.get(target), failed.get(target)) {
+            // Half a conversation is worse than none: say why instead.
+            (Some(timeline), _) if let Some(reason) = adapt::unreadable_transcript(timeline) => {
+                Load::Failed(reason)
+            }
             (Some(timeline), error) => {
                 let mut entries = adapt::conversation(timeline, &names);
                 // Never hide a failure behind what loaded before it.
@@ -1015,6 +1019,35 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversation_without_its_transcript_is_one_failure_not_half_a_conversation() {
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(serde_json::json!([
+            {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/one","from":"person/avery","to":"agent/example/harbor/keeper","title":"Status?"}},
+            {"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"How is the audit going?"}},
+            {"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
+             "body":{"code":"transcript-not-bound","message":"transcript not bound: the transcript could not be read: line 12: expected value","retryable":true,
+                     "details":{"driver":"omp","transcript":"/srv/example/omp/sessions/harbor/0190.jsonl"}}},
+        ]))
+        .unwrap();
+        let target = "agent/example/harbor/keeper";
+        let shown = conversations(
+            &Model::default(),
+            "person/avery",
+            &BTreeMap::from([(target.to_owned(), timeline)]),
+            &BTreeMap::new(),
+            Some(target),
+        );
+        match &shown[target] {
+            Load::Failed(reason) => assert!(
+                reason.contains("line 12: expected value") && reason.contains("0190.jsonl"),
+                "{reason}"
+            ),
+            other => panic!("expected one failure, not entries: {other:?}"),
+        }
+    }
 
     fn fixture_screen() -> st3_client::TerminalScreen {
         let text = include_str!("../../../../docs/st3/client-v0/fixtures/terminal-screen.json");

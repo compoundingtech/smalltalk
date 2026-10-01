@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{harness_state, status};
 
+/// Refresh cadence for session-owned observed records.
+pub(crate) const SESSION_REFRESH: Duration = Duration::from_secs(5 * 60);
+
 pub(crate) const PROVIDER_POLL: Duration = Duration::from_millis(250);
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
@@ -391,7 +394,7 @@ pub(crate) fn describe_exit(exit: ExitStatus) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider(
     provider: &str,
-    status_path: &Path,
+    status_path: Option<&Path>,
     argv: &[String],
     env: &[(String, String)],
     refresh_interval: Duration,
@@ -415,7 +418,7 @@ pub(crate) fn run_provider(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider_with_env_removals(
     provider: &str,
-    status_path: &Path,
+    status_path: Option<&Path>,
     argv: &[String],
     env: &[(String, String)],
     removed_env: &[&str],
@@ -443,7 +446,7 @@ pub(crate) fn run_provider_with_env_removals(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn adopt_provider(
     provider: &str,
-    status_path: &Path,
+    status_path: Option<&Path>,
     pid: u32,
     refresh_interval: Duration,
     poll: Duration,
@@ -501,7 +504,7 @@ pub(crate) fn detached_provider(pid: u32, observed: Option<&SessionObserver>) ->
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider_observed(
     provider: &str,
-    status_path: &Path,
+    status_path: Option<&Path>,
     argv: &[String],
     env: &[(String, String)],
     refresh_interval: Duration,
@@ -525,7 +528,7 @@ pub(crate) fn run_provider_observed(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider_observed_with_env_removals(
     provider: &str,
-    status_path: &Path,
+    status_path: Option<&Path>,
     argv: &[String],
     env: &[(String, String)],
     removed_env: &[&str],
@@ -578,7 +581,7 @@ pub(crate) fn run_provider_observed_with_env_removals(
 /// [`adopt_provider`], reporting how the session ended instead of judging it.
 pub(crate) fn adopt_provider_observed(
     provider: &str,
-    status_path: &Path,
+    status_path: Option<&Path>,
     pid: u32,
     refresh_interval: Duration,
     poll: Duration,
@@ -600,7 +603,7 @@ pub(crate) fn adopt_provider_observed(
 #[allow(clippy::too_many_arguments)]
 fn supervise_provider(
     provider: &str,
-    status_path: &Path,
+    status_path: Option<&Path>,
     mut child: ProviderProcess,
     refresh_interval: Duration,
     poll: Duration,
@@ -632,7 +635,9 @@ fn supervise_provider(
         }
         let now = Instant::now();
         if now >= next_refresh {
-            let _ = status::refresh(status_path);
+            if let Some(status_path) = status_path {
+                let _ = status::refresh(status_path);
+            }
             if let Some(observed) = observed {
                 observed.heartbeat();
             }
@@ -720,17 +725,45 @@ pub(crate) fn stop_provider_group(
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_supervision_keeps_observations_without_creating_status() {
+        let root = tempfile::tempdir().unwrap();
+        let observer = SessionObserver::new(root.path(), "h.native", "claude", "native").unwrap();
+        let stop = AtomicBool::new(false);
+        run_provider(
+            "native",
+            None,
+            &["sh".into(), "-c".into(), "sleep 0.05".into()],
+            &[],
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+            &stop,
+            Some(&observer),
+        )
+        .unwrap();
+        assert!(!root.path().join("status").exists());
+        let record =
+            harness_state::read(&harness_state::harness_state_path(root.path()), None).unwrap();
+        assert_eq!(record.state, harness_state::Activity::Ended);
+        assert_eq!(record.exit.as_deref(), Some("exit 0"));
+    }
+
     /// n6: an unspawnable provider is a terminal outcome — the claim placeholder must not stand.
     #[test]
     fn an_unspawnable_provider_writes_a_real_terminal_record() {
         use crate::harness_state::{self, Activity};
         let tmp = tempfile::tempdir().unwrap();
-        let observer =
-            SessionObserver::new(tmp.path(), "example-linux.worker", "claude", "example-linux.worker").unwrap();
+        let observer = SessionObserver::new(
+            tmp.path(),
+            "example-linux.worker",
+            "claude",
+            "example-linux.worker",
+        )
+        .unwrap();
         let stop = AtomicBool::new(false);
         let result = run_provider_observed(
             "test",
-            &crate::status::status_path(tmp.path()),
+            Some(&crate::status::status_path(tmp.path())),
             &["/nonexistent/provider-binary".to_string()],
             &[],
             Duration::from_secs(60),
@@ -788,7 +821,7 @@ mod tests {
         let pid = spawn_sleeper("0.2");
         let outcome = supervise_provider(
             "test",
-            &crate::status::status_path(tmp.path()),
+            Some(&crate::status::status_path(tmp.path())),
             ProviderProcess::adopted(pid),
             Duration::from_millis(20),
             Duration::from_millis(5),
@@ -806,12 +839,17 @@ mod tests {
     #[test]
     fn detaching_releases_a_live_provider_with_its_observed_session() {
         let tmp = tempfile::tempdir().unwrap();
-        let observer =
-            SessionObserver::new(tmp.path(), "example-linux.worker", "claude", "example-linux.worker").unwrap();
+        let observer = SessionObserver::new(
+            tmp.path(),
+            "example-linux.worker",
+            "claude",
+            "example-linux.worker",
+        )
+        .unwrap();
         let pid = spawn_sleeper("30");
         let outcome = supervise_provider(
             "test",
-            &crate::status::status_path(tmp.path()),
+            Some(&crate::status::status_path(tmp.path())),
             ProviderProcess::adopted(pid),
             Duration::from_secs(60),
             Duration::from_millis(5),
@@ -851,7 +889,7 @@ mod tests {
         );
         let outcome = supervise_provider(
             "test",
-            &crate::status::status_path(tmp.path()),
+            Some(&crate::status::status_path(tmp.path())),
             ProviderProcess::adopted(pid),
             Duration::from_secs(60),
             Duration::from_millis(5),

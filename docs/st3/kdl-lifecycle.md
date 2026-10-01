@@ -158,6 +158,17 @@ Use `st agents apply`, or `st agents start ... --print-kdl` followed by the same
 the preview flag. Stop a seat explicitly with `st agents stop`. Mission revisions change mission
 work and generations without changing the seat's identity.
 
+`st agents start EXISTING --as person/NAME` keeps the seat's declaration. Only fields explicitly
+passed through `--host`, `--workspace`, `--harness`, `--model`, `--effort`, or `--arg` are changed;
+unspecified restart, launch, environment, and other settings remain intact. A placement override
+does not rename an existing seat: pass its complete subject when moving it to another host.
+`--model`, `--effort`, and `--arg` require a typed `harness` block and are refused for
+`command`/`argv` declarations. `--harness` alone can explicitly switch the launch style.
+After a stop, start restores the unambiguous prior agent declaration. If none is available,
+apply authored KDL instead. `--print-kdl` reads the daemon's declaration and prints the same
+effective KDL without publishing it. New seats still default to Claude, the current directory,
+and `restart always`.
+
 A seat named `fleet/PROJECT/...` that a person declares may publish, start, and revise its
 project's missions under `fleet/PROJECT/*`, so it can put person-authorized work in the graph
 itself. [Agent mission authority](#agent-mission-authority) describes the default and how a
