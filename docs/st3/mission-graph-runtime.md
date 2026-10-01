@@ -946,7 +946,7 @@ st supplies these exact context names:
 | `ST_GATE` | Gate name in a running gate context. |
 | `ST3_SUBJECT` | Full subject of the current runtime member. |
 | `ST_AGENT` | Full owning agent subject. It is absent for agentless runtimes. |
-| `ST3_BIN` | Absolute path to the exact st executable that started the runtime. |
+| `ST3_BIN` | Absolute path of `STATE_DIR/current/st3`, a link the daemon points at the st executable it runs; see [seat deploys](seat-deploys.md). |
 | `ST_LOOP_ROUND` | Current loop round. It is present in loop child missions. |
 | `ST_LOOP_FEEDBACK` | Exact prior feedback document, or an empty value. |
 

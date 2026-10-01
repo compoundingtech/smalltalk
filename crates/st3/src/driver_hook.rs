@@ -150,6 +150,7 @@ fn live_claude_label(env: &dyn HookEnv, identity: &str) -> Result<String> {
         .var("ST3_SUBJECT")
         .or_else(|| env.var("ST_AGENT"))
         .unwrap_or_else(|| format!("agent/{identity}"));
+    let persona_short = env.var("AGENT_PERSONA_SHORT");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -179,15 +180,18 @@ fn live_claude_label(env: &dyn HookEnv, identity: &str) -> Result<String> {
             .and_then(|child| child.pointer("/arguments/0"))
             .and_then(Value::as_str);
         let desired = serde_json::json!({"display_name": display_name});
-        Ok(crate::mailbox::seat_label(&crate::model::DesiredSubject {
-            subject,
-            kind: "agent".into(),
-            desired,
-            member: None,
-            owner_run: None,
-            owner_generation: None,
-            owner_step: None,
-        }))
+        Ok(crate::mailbox::seat_label(
+            &crate::model::DesiredSubject {
+                subject,
+                kind: "agent".into(),
+                desired,
+                member: None,
+                owner_run: None,
+                owner_generation: None,
+                owner_step: None,
+            },
+            persona_short.as_deref(),
+        ))
     })
 }
 
@@ -422,17 +426,19 @@ mod tests {
             .unwrap();
         let address = listener.local_addr().unwrap();
         let server = runtime.spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let env = BTreeMap::from([
+        let mut env = BTreeMap::from([
             ("ST3_ENDPOINT".into(), format!("http://{address}")),
             ("ST3_SUBJECT".into(), "agent/eval.worker".into()),
         ]);
         assert_eq!(live_claude_label(&env, "eval.worker").unwrap(), "Quartz");
+        env.insert("AGENT_PERSONA_SHORT".into(), "gen".into());
+        assert_eq!(live_claude_label(&env, "eval.worker").unwrap(), "Quartz[gen]");
         desired.lock().unwrap()["children"][0]["arguments"][0] = serde_json::json!("Indigo\u{7}");
-        assert_eq!(live_claude_label(&env, "eval.worker").unwrap(), "Indigo");
+        assert_eq!(live_claude_label(&env, "eval.worker").unwrap(), "Indigo[gen]");
         desired.lock().unwrap()["children"] = serde_json::json!([]);
         assert_eq!(
             live_claude_label(&env, "eval.worker").unwrap(),
-            "eval.worker"
+            "eval.worker[gen]"
         );
         server.abort();
     }

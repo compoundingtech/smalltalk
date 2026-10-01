@@ -2,7 +2,7 @@
 //! relative wire position of legacy batches that predate replica_records.
 use super::*;
 
-pub(super) struct CanonicalOrder(pub bool);
+pub struct CanonicalOrder(pub bool);
 
 impl std::fmt::Display for CanonicalOrder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -10,10 +10,10 @@ impl std::fmt::Display for CanonicalOrder {
     }
 }
 
-pub(super) const CANONICAL_ORDER: CanonicalOrder = CanonicalOrder(false);
-pub(super) const CANONICAL_ORDER_DESC: CanonicalOrder = CanonicalOrder(true);
+pub const CANONICAL_ORDER: CanonicalOrder = CanonicalOrder(false);
+pub const CANONICAL_ORDER_DESC: CanonicalOrder = CanonicalOrder(true);
 
-fn components(alias: &str) -> Vec<String> {
+pub fn components(alias: &str) -> Vec<String> {
     vec![
         format!("length({alias}.accepted_at_unix_ms)"),
         format!("{alias}.accepted_at_unix_ms"),
@@ -29,7 +29,7 @@ fn components(alias: &str) -> Vec<String> {
     ]
 }
 
-pub(super) fn order_sql(alias: &str, descending: bool) -> String {
+pub fn order_sql(alias: &str, descending: bool) -> String {
     let direction = if descending { " DESC" } else { "" };
     components(alias)
         .into_iter()
@@ -38,7 +38,7 @@ pub(super) fn order_sql(alias: &str, descending: bool) -> String {
         .join(", ")
 }
 
-pub(super) fn after_sql(left: &str, right: &str) -> String {
+pub fn after_sql(left: &str, right: &str) -> String {
     format!(
         "({}) > ({})",
         components(left).join(", "),
@@ -46,11 +46,11 @@ pub(super) fn after_sql(left: &str, right: &str) -> String {
     )
 }
 
-pub(super) fn position_sql(alias: &str) -> String {
+pub fn position_sql(alias: &str) -> String {
     components(alias).remove(5)
 }
 
-pub(super) fn key_from_record(
+pub fn key_from_record(
     claim: &ClaimRecord,
     writer: String,
     sequence: u64,
@@ -68,7 +68,7 @@ pub(super) fn key_from_record(
 
 /// Expand explicit canonical ordering markers without introducing joins or ambiguous column
 /// names in the caller's SQL. Aliases are fixed source identifiers, never user input.
-pub(super) fn canonical_sql(query: &str) -> String {
+pub fn canonical_sql(query: &str) -> String {
     let mut query = query.to_owned();
     for alias in ["claims", "request", "created", "sent", "resolution"] {
         for (marker, descending) in [("CANONICAL_ASC", false), ("CANONICAL_DESC", true)] {
@@ -81,11 +81,11 @@ pub(super) fn canonical_sql(query: &str) -> String {
     query
 }
 
-pub(super) type ClaimKey = (u128, String, u64, String, u64, String);
+pub type ClaimKey = (u128, String, u64, String, u64, String);
 
 /// SQLite BLOB ordering equivalent to ClaimKey's total order. Fixed-width numbers sort
 /// numerically; escaped zeroes and a double-zero terminator preserve string prefix ordering.
-pub(super) fn sortable_key(key: &ClaimKey) -> Vec<u8> {
+pub fn sortable_key(key: &ClaimKey) -> Vec<u8> {
     fn string(output: &mut Vec<u8>, value: &str) {
         for byte in value.bytes() {
             output.push(byte);
@@ -104,7 +104,7 @@ pub(super) fn sortable_key(key: &ClaimKey) -> Vec<u8> {
     output
 }
 
-pub(super) fn claim_key(connection: &Connection, id: &str) -> Result<ClaimKey> {
+pub fn claim_key(connection: &Connection, id: &str) -> Result<ClaimKey> {
     let position = position_sql("claims");
     let (time, writer, sequence, batch, position, id) = connection.query_row(
         &format!("SELECT claims.accepted_at_unix_ms, batches.origin, batches.replica_sequence,

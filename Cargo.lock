@@ -3665,16 +3665,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "chrono",
  "ciborium",
  "data-encoding",
  "getrandom 0.3.4",
  "hex",
  "hmac",
+ "libc",
+ "proptest",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "uuid",
 ]
 

@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use smallclaims::Error as St3Error;
 pub use smallclaims::claim::{
-    ClaimInput, ClaimRecord, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
-    ReplicaEnvelopeSignature,
+    ClaimInput, ClaimRecord, ClaimsPage, DocumentVersion, ReplicaBatch, ReplicaEnvelope,
+    ReplicaEnvelopeId, ReplicaEnvelopeSignature,
 };
+#[cfg(test)]
+pub use smallclaims::replication::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 pub use smallclaims::replication::{
     ClaimRange, ClaimRangeDigest, ClaimSubjectDigest, HealClaim, InventoryCheckpoint,
     ReplicaRecordView, ReplicationExchange, ReplicationExportRequest, ReplicationExportResponse,
@@ -1113,20 +1115,6 @@ pub struct DocumentPutRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct DocumentVersion {
-    pub name: String,
-    pub hash: String,
-    pub size: u64,
-    pub created_index: u64,
-    pub latest: bool,
-    pub binding_claim_id: String,
-    #[serde(default)]
-    pub created_at_unix_ms: u128,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DocumentListResponse {
     pub items: Vec<DocumentVersion>,
     pub has_more: bool,
@@ -1144,12 +1132,6 @@ pub struct GateResultRequest {
     #[serde(default)]
     pub evidence: Vec<String>,
     pub idempotency_key: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ClaimsPage {
-    pub claims: Vec<ClaimRecord>,
-    pub next_cursor: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2354,33 +2336,4 @@ pub struct MissionOutputView {
     pub mission: String,
     pub revision: String,
     pub claim_id: String,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReplicationBatch {
-    pub peer: String,
-    #[serde(default)]
-    pub replica_heads: BTreeMap<String, u64>,
-    pub batches: Vec<ReplicaBatch>,
-    pub blobs: BTreeMap<String, Vec<u8>>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReplicationResponse {
-    pub accepted_through: u64,
-    pub missing_sequences: Vec<u64>,
-    #[serde(default)]
-    pub accepted_heads: BTreeMap<String, u64>,
-    #[serde(default)]
-    pub missing_ranges: Vec<ReplicaRange>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReplicaRange {
-    pub origin: String,
-    pub from: u64,
-    pub through: u64,
 }
