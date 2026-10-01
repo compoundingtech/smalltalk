@@ -153,9 +153,8 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     extras.live = true;
                     extras.offline = None;
-                    model.last_connected = Some(
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    );
+                    model.last_connected =
+                        Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
                     changed = true;
                 }
                 feed::Update::Conversation {
@@ -442,11 +441,14 @@ pub fn run(context: Context) -> Result<()> {
                     let runtime_ids = found
                         .map(|candidate| candidate.runtime_ids.clone())
                         .unwrap_or_default();
-                    let name = found.map(crate::agent_label).unwrap_or(agent);
+                    let name = found
+                        .map(crate::agent_label)
+                        .unwrap_or_else(|| agent.clone());
                     attached = None;
                     terminal_runtimes = Some(runtime_ids.clone());
                     if commands.send(Command::Follow { runtime_ids }).is_ok() {
                         ui.terminal = Some(super::TerminalView {
+                            agent: agent.clone(),
                             title: name.clone(),
                             name,
                             lines: Vec::new(),
