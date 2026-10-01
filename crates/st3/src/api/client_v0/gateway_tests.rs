@@ -1,0 +1,550 @@
+mod gateway_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
+
+    fn paired_device(state: &AppState, credential: &str, suffix: &str) {
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: format!("custom/client/pairing-{suffix}"),
+                kind: "custom.client.pairing-completed".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::from([
+                    (
+                        "credential_hash".into(),
+                        json!(credential_digest(credential)),
+                    ),
+                    (
+                        "session_actor".into(),
+                        json!(format!("person/alex/session/{suffix}")),
+                    ),
+                    ("person_id".into(), json!("person/alex")),
+                    (
+                        "scopes".into(),
+                        json!(["read.projections", "terminal.read"]),
+                    ),
+                    (
+                        "expires_at_unix_ms".into(),
+                        json!(client_now_ms() as u64 + 60_000),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn cookie_authentication_preserves_bearer_precedence_and_unix_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        paired_device(&state, "cookie-secret", "cookie");
+        paired_device(&state, "bearer-secret", "bearer");
+        let request = |bearer: Option<&str>, path: &str| {
+            let mut request = Request::builder()
+                .uri(path)
+                .header(axum::http::header::COOKIE, "st3_device=cookie-secret");
+            if let Some(bearer) = bearer {
+                request = request.header(AUTHORIZATION, bearer);
+            }
+            request.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            authenticate(
+                &state,
+                &request(None, "/v1/client/agents"),
+                "fabric-loopback"
+            )
+            .unwrap()
+            .actor,
+            "person/alex/session/cookie"
+        );
+        assert_eq!(
+            authenticate(
+                &state,
+                &request(Some("Bearer bearer-secret"), "/v1/client/agents"),
+                "fabric-loopback"
+            )
+            .unwrap()
+            .actor,
+            "person/alex/session/bearer"
+        );
+        for bearer in ["Bearer unknown", "Basic cookie-secret", "Bearer "] {
+            assert!(
+                authenticate(
+                    &state,
+                    &request(Some(bearer), "/v1/client/agents"),
+                    "fabric-loopback"
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            authenticate(&state, &request(None, "/v1/client/agents"), "unix")
+                .unwrap()
+                .actor,
+            "client/local/read-only"
+        );
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/client/pairing-cookie".into(),
+                kind: "custom.client.pairing-revoked".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(
+            authenticate(
+                &state,
+                &request(None, "/v1/client/agents"),
+                "fabric-loopback"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            authenticate(
+                &state,
+                &request(Some("Bearer bearer-secret"), "/v1/client/agents"),
+                "fabric-loopback"
+            )
+            .unwrap()
+            .actor,
+            "person/alex/session/bearer"
+        );
+        let repair = Request::builder()
+            .method("POST")
+            .uri("/v1/client/pairings/new/complete")
+            .header(axum::http::header::COOKIE, "st3_device=cookie-secret")
+            .body(Body::empty())
+            .unwrap();
+        assert!(authenticate(&state, &repair, "fabric-loopback").is_ok());
+    }
+
+    #[tokio::test]
+    async fn pairing_cookie_delivery_is_secure_secret_free_and_success_only() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let Json(challenge) = pairing_begin(
+            State(state.clone()),
+            Extension(ClientSession::local(Some("person/alex")).unwrap()),
+            Json(PairingBegin {
+                api_version: CLIENT_API_VERSION.into(),
+                device_name: "Browser".into(),
+                person_id: "person/alex".into(),
+                full_control: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let uri = format!(
+            "/v1/client/pairings/{}/complete",
+            challenge["pairing_id"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("pairing/")
+        );
+        let app = crate::api::fabric_router(state.clone());
+        let complete = |code: &str, delivery: Option<&str>| {
+            let mut body = json!({"api_version": CLIENT_API_VERSION, "code": code, "device_public_key": "browser-public-key-01234567890123456789"});
+            if let Some(delivery) = delivery {
+                body["credential_delivery"] = json!(delivery);
+            }
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, "st3_device=expired")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let refused = app
+            .clone()
+            .oneshot(complete("wrong", Some("cookie")))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !refused
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE)
+        );
+        let response = app
+            .clone()
+            .oneshot(complete(
+                challenge["code"].as_str().unwrap(),
+                Some("cookie"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(cookie.starts_with("st3_device="));
+        for flag in [
+            "Path=/v1/client",
+            "HttpOnly",
+            "Secure",
+            "SameSite=Strict",
+            "Max-Age=",
+        ] {
+            assert!(cookie.contains(flag));
+        }
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["value"]["credential_delivery"], "cookie");
+        assert!(body["value"].get("credential").is_none());
+        let authenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/client/capabilities")
+                    .header(
+                        axum::http::header::COOKIE,
+                        cookie.split(';').next().unwrap(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::OK);
+        let reused = app
+            .oneshot(complete(
+                challenge["code"].as_str().unwrap(),
+                Some("cookie"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reused.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !reused
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE)
+        );
+    }
+
+    async fn serve(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, task)
+    }
+
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn connect(address: std::net::SocketAddr, path: &str, protocols: &str) -> TestSocket {
+        let mut request = format!("ws://{address}{path}")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            axum::http::header::COOKIE,
+            "st3_device=viewer-secret".parse().unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, protocols.parse().unwrap());
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
+    async fn next_json(socket: &mut TestSocket) -> Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match socket.next().await.unwrap().unwrap() {
+                    Message::Text(value) => return serde_json::from_str(&value).unwrap(),
+                    Message::Binary(value) => return serde_json::from_slice(&value).unwrap(),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn viewer_attachment(state: &AppState) -> (ClientSession, Value) {
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/terminal-owner".into(),
+                kind: "runtime.observed".into(),
+                actor: Some("agent/terminal-owner".into()),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), json!("terminal-runtime")),
+                    ("incarnation_id".into(), json!("terminal-runtime:i1")),
+                    ("status".into(), json!("running")),
+                    ("terminal".into(), json!(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        paired_device(state, "viewer-secret", "viewer");
+        let auth = Request::builder()
+            .uri("/v1/client/agents")
+            .header(axum::http::header::COOKIE, "st3_device=viewer-secret")
+            .body(Body::empty())
+            .unwrap();
+        let session = authenticate(state, &auth, "fabric-loopback").unwrap();
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/viewer".into(),
+            action_type: "terminal.attach".into(),
+            idempotency_key: "viewer-attachment".into(),
+            fence: Fence {
+                runtime_incarnation: Some("terminal-runtime:i1".into()),
+                ..Fence::default()
+            },
+            parameters: json!({"target_id": "terminal/agent/terminal-owner"}),
+        };
+        let attachment =
+            create_terminal_attachment(state, &session, &request, "viewer-digest").unwrap();
+        (session, attachment)
+    }
+
+    async fn wait_detached(state: &AppState, session: &ClientSession, attachment: &Value) {
+        let mut changed = state.event_notify.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if terminal_attachment_response(
+                    state,
+                    session,
+                    attachment["attachment_id"].as_str().unwrap(),
+                )
+                .unwrap()["state"]
+                    == "detached"
+                {
+                    return;
+                }
+                changed.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_viewer_ends_on_unsubscribe_and_socket_close_while_waiting_for_first_screen() {
+        for mode in ["unsubscribe", "collection-close", "terminal-close"] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state(root.path());
+            let (session, attachment) = viewer_attachment(&state);
+            fs::create_dir_all(&state.pty_root).unwrap();
+            let listener =
+                tokio::net::UnixListener::bind(state.pty_root.join("terminal-runtime.sock"))
+                    .unwrap();
+            let (address, server) = serve(crate::api::fabric_router(state.clone())).await;
+            let capability = attachment["stream_capability"].as_str().unwrap();
+            let mut socket = if mode == "terminal-close" {
+                connect(address, "/v1/client/terminals/agent%2Fterminal-owner/stream?incarnation=terminal-runtime%3Ai1",
+                    &format!("{TERMINAL_SUBPROTOCOL}, {TERMINAL_CAPABILITY_PROTOCOL_PREFIX}{capability}")).await
+            } else {
+                let mut socket = connect(
+                    address,
+                    "/v1/client/collections/stream",
+                    COLLECTION_SUBPROTOCOL,
+                )
+                .await;
+                socket.send(Message::Text(json!({"kind":"subscribe", "id":"viewer", "collection":"terminal", "terminal":"terminal/agent/terminal-owner", "incarnation":"terminal-runtime:i1", "capability":capability}).to_string().into())).await.unwrap();
+                socket
+            };
+            // Holding the PTY without a screen exercises the previously uninterruptible first read.
+            let (_pty, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                terminal_attachment_response(
+                    &state,
+                    &session,
+                    attachment["attachment_id"].as_str().unwrap()
+                )
+                .unwrap()["state"],
+                "consumed"
+            );
+            if mode == "unsubscribe" {
+                socket
+                    .send(Message::Text(
+                        json!({"kind":"unsubscribe", "id":"viewer"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            } else {
+                socket.close(None).await.unwrap();
+            }
+            wait_detached(&state, &session, &attachment).await;
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_websocket_records_query_parent_and_subscription_override() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        paired_device(&state, "viewer-secret", "viewer");
+        let (exports, mut received) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let collector = Router::new().route(
+            "/v1/traces",
+            post(move |Json(body): Json<Value>| {
+                let exports = exports.clone();
+                async move {
+                    exports.send(body).unwrap();
+                    StatusCode::OK
+                }
+            }),
+        );
+        let (collector_address, collector_server) = serve(collector).await;
+        let web = super::super::super::client_web::ClientWeb::new(
+            super::super::super::client_web::ClientWebConfig {
+                static_dir: None,
+                mount: "/app".into(),
+                otlp_endpoint: Some(format!("http://{collector_address}")),
+            },
+            &state,
+        )
+        .unwrap();
+        let (address, server) = serve(crate::api::fabric_router_with_web(state, web)).await;
+        let query_parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        let override_parent = "00-fedcba9876543210fedcba9876543210-fedcba9876543210-01";
+        let mut socket = connect(
+            address,
+            &format!("/v1/client/collections/stream?traceparent={query_parent}"),
+            COLLECTION_SUBPROTOCOL,
+        )
+        .await;
+        for (id, traceparent) in [("override", Some(override_parent)), ("fallback", None)] {
+            socket.send(Message::Text(json!({"kind":"subscribe", "id":id, "collection":"agents", "traceparent":traceparent}).to_string().into())).await.unwrap();
+            assert_eq!(next_json(&mut socket).await["kind"], "snapshot");
+        }
+        let mut spans = Vec::new();
+        for _ in 0..3 {
+            let export = tokio::time::timeout(Duration::from_secs(5), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            spans.push(export["resourceSpans"][0]["scopeSpans"][0]["spans"][0].clone());
+        }
+        let upgrade = spans
+            .iter()
+            .find(|span| span["name"] == "st3.client.collections.upgrade")
+            .unwrap();
+        assert_eq!(upgrade["traceId"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(upgrade["parentSpanId"], "0123456789abcdef");
+        let subscriptions = spans
+            .iter()
+            .filter(|span| span["name"] == "st3.client.collections.subscribe")
+            .collect::<Vec<_>>();
+        assert!(
+            subscriptions
+                .iter()
+                .any(|span| span["traceId"] == "fedcba9876543210fedcba9876543210"
+                    && span["parentSpanId"] == "fedcba9876543210")
+        );
+        assert!(
+            subscriptions
+                .iter()
+                .any(|span| span["traceId"] == "0123456789abcdef0123456789abcdef"
+                    && span["parentSpanId"] == "0123456789abcdef")
+        );
+        socket.close(None).await.unwrap();
+        server.abort();
+        collector_server.abort();
+        let _ = server.await;
+        let _ = collector_server.await;
+    }
+
+    #[tokio::test]
+    async fn collection_limit_is_configurable_and_replacement_does_not_consume_a_slot() {
+        for limit in [2, super::super::ClientSubscriptionLimit::default().0] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state(root.path());
+            paired_device(&state, "viewer-secret", "limit");
+            let app = super::super::fabric_router(state)
+                .layer(Extension(super::super::ClientSubscriptionLimit(limit)));
+            let (address, server) = serve(app).await;
+            let mut socket = connect(
+                address,
+                "/v1/client/collections/stream",
+                COLLECTION_SUBPROTOCOL,
+            )
+            .await;
+            for slot in 0..limit {
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "kind":"subscribe", "id":format!("slot-{slot}"), "collection":"agents"
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let frame = next_json(&mut socket).await;
+                assert_eq!(frame["kind"], "snapshot", "{frame}");
+                assert_eq!(frame["id"], format!("slot-{slot}"));
+            }
+            socket
+                .send(Message::Text(
+                    json!({
+                        "kind":"subscribe", "id":"overflow", "collection":"agents"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = next_json(&mut socket).await;
+            assert_eq!(frame["code"], "subscription-limit");
+            socket
+                .send(Message::Text(
+                    json!({
+                        "kind":"subscribe", "id":"slot-0", "collection":"agents"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(next_json(&mut socket).await["kind"], "snapshot");
+            socket
+                .send(Message::Text(
+                    json!({"kind":"unsubscribe", "id":"slot-0"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "kind":"subscribe", "id":"overflow", "collection":"agents"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(next_json(&mut socket).await["kind"], "snapshot");
+            socket.close(None).await.unwrap();
+            server.abort();
+            let _ = server.await;
+        }
+    }
+}

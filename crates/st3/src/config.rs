@@ -41,6 +41,14 @@ pub struct Config {
     /// What this node does when an account nears its weekly limit. Off unless enabled.
     #[serde(skip_serializing_if = "LimitsConfig::is_default")]
     pub limits: LimitsConfig,
+    /// Optional browser bundle and relays on the paired client gateway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_web: Option<crate::api::client_web::ClientWebConfig>,
+    /// Allowlisted paired-client reads from an OMP Usage endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::api::client_web::UsageConfig>,
+    /// Maximum subscriptions per collection WebSocket.
+    pub client_subscription_limit: usize,
     /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
     #[serde(skip)]
     pub fleet: Option<FleetFile>,
@@ -186,6 +194,9 @@ impl Default for Config {
             observations: ObservationsConfig::default(),
             checkpoint: CheckpointConfig::default(),
             limits: LimitsConfig::default(),
+            client_web: None,
+            usage: None,
+            client_subscription_limit: crate::api::ClientSubscriptionLimit::default().0,
             fleet: None,
         }
     }
@@ -350,6 +361,16 @@ impl Config {
                 "limits needs an operations agent: set limits.notify to agent/... (limits.ask and person never receive raw limit events)"
             );
         }
+        if let Some(web) = &self.client_web {
+            web.validate()?;
+        }
+        if let Some(usage) = &self.usage {
+            usage.validate()?;
+        }
+        anyhow::ensure!(
+            self.client_subscription_limit > 0,
+            "client_subscription_limit must be positive"
+        );
         anyhow::ensure!(
             self.person.as_deref().is_none_or(|person| {
                 person.starts_with("person/")
