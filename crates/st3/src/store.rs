@@ -10258,6 +10258,43 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Read an exact immutable declaration, or the revision selected by the desired projection.
+    pub fn agent_declaration(
+        &self,
+        subject: &str,
+        revision: Option<&str>,
+    ) -> Result<Option<(String, Value)>> {
+        let connection = self.readers.get();
+        let row: Option<(String, String)> = connection
+            .query_row(
+                "SELECT c.id, c.body FROM claims c
+                 WHERE c.subject=?1 AND c.kind='intent.desired'
+                   AND c.id=COALESCE(?2, (SELECT d.claim_id FROM desired d WHERE d.subject=?1))",
+                params![subject, revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(id, body)| {
+            let desired: DesiredSubject = serde_json::from_str(&body)?;
+            if desired.kind != "agent" {
+                anyhow::bail!("declaration `{subject}` is not an agent");
+            }
+            Ok((id, desired.desired))
+        })
+        .transpose()
+    }
+
+    pub fn agent_declaration_revisions(&self, subject: &str) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&format!(
+            "SELECT claims.id FROM claims WHERE claims.subject=?1 AND claims.kind='intent.desired'
+             ORDER BY {CANONICAL_ORDER_DESC}"
+        ))?;
+        let rows = statement.query_map([subject], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// The current desired declaration of `subject` and the actor its claim records. A
     /// declaration from before claims recorded their writer, or the daemon's own, has none.
     pub fn desired_subject_with_writer(

@@ -671,6 +671,47 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
 }
 
 #[derive(Deserialize)]
+pub(super) struct AgentDeclarationQuery {
+    revision: Option<String>,
+    #[serde(default)]
+    show_env_values: bool,
+}
+
+/// Both redacted and explicit environment-value reads require declaration scope.
+pub(super) async fn agent_declaration(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<AgentDeclarationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.declarations")?;
+    let subject = format!("agent/{}", id.trim_start_matches("agent/"));
+    let lookup_subject = subject.clone();
+    let store = state.store.clone();
+    let revision = query.revision;
+    let (declaration, revisions) = blocking_store(move || {
+        let declaration = store.agent_declaration(&lookup_subject, revision.as_deref())?;
+        let revisions = store.agent_declaration_revisions(&lookup_subject)?;
+        Ok((declaration, revisions))
+    })
+    .await?;
+    let Some((revision, mut tree)) = declaration else {
+        return Err(ApiError::not_found("managed agent declaration not found"));
+    };
+    if !query.show_env_values {
+        crate::graph::redact_agent_env_values(&mut tree);
+    }
+    let kdl = crate::graph::render_agent_desired_kdl(&tree).map_err(ApiError::bad)?;
+    Ok(Json(json!({
+        "id": subject,
+        "revision": revision,
+        "tree": tree,
+        "kdl": kdl,
+        "revisions": revisions,
+    })))
+}
+
+#[derive(Deserialize)]
 pub(super) struct ClientDocumentQuery {
     name: String,
 }
@@ -704,6 +745,7 @@ pub(super) async fn document_get(
 
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
+    "read.declarations",
     "terminal.read",
     "terminal.control",
     "control.attention",
@@ -1018,7 +1060,13 @@ pub(super) fn authenticate(
         scopes,
     };
     if request.method() == axum::http::Method::GET {
-        let scope = if request.uri().path().starts_with("/v1/client/terminals/") {
+        let scope = if request
+            .uri()
+            .path()
+            .starts_with("/v1/client/agent-declarations/")
+        {
+            "read.declarations"
+        } else if request.uri().path().starts_with("/v1/client/terminals/") {
             "terminal.read"
         } else {
             "read.projections"
@@ -7337,6 +7385,99 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_declarations_require_sensitive_scope_and_select_exact_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let publish = |source: &str| {
+            let intent = crate::graph::parse_intent(source, "terminal-test").unwrap();
+            let planned = state
+                .store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            assert!(planned.blockers.is_empty(), "{:?}", planned.blockers);
+            state
+                .store
+                .apply(&intent, &planned.subject_tokens, source)
+                .unwrap();
+        };
+        publish(
+            "version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"old-secret\" } }",
+        );
+        let original = state
+            .store
+            .agent_declaration_revisions("agent/dotfiles/steward")
+            .unwrap()[0]
+            .clone();
+        publish(
+            "version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"new-secret\" } }",
+        );
+        let read = |revision, show_env_values| {
+            agent_declaration(
+                State(state.clone()),
+                Extension(ClientSession::local(Some("person/test")).unwrap()),
+                AxumPath("dotfiles/steward".into()),
+                Query(AgentDeclarationQuery {
+                    revision,
+                    show_env_values,
+                }),
+            )
+        };
+        for (revision, secret) in [(None, "new-secret"), (Some(original.clone()), "old-secret")] {
+            let redacted = read(revision.clone(), false).await.unwrap().0;
+            let kdl = redacted["kdl"].as_str().unwrap();
+            let parsed = crate::graph::parse_intent(kdl, "terminal-test").unwrap();
+            assert_eq!(
+                parsed.subjects["agent/dotfiles/steward"].desired,
+                redacted["tree"]
+            );
+            let env = redacted["tree"]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["name"] == "env")
+                .unwrap();
+            assert_eq!(env["children"][0]["name"], "TOKEN");
+            assert_eq!(env["children"][0]["arguments"][0], "<redacted>");
+            assert!(!redacted.to_string().contains(secret));
+            let visible = read(revision, true).await.unwrap().0;
+            assert!(
+                visible["kdl"].as_str().unwrap().contains(secret),
+                "{visible}"
+            );
+            assert!(visible["tree"].to_string().contains(secret), "{visible}");
+            assert_eq!(visible["revision"], redacted["revision"]);
+            assert_eq!(visible["revisions"].as_array().unwrap().len(), 2);
+            if secret == "old-secret" {
+                assert_eq!(visible["revision"], original);
+            }
+        }
+        assert!(read(Some("not-a-revision".into()), false).await.is_err());
+        for revision in [None, Some(original)] {
+            for show_env_values in [false, true] {
+                assert!(
+                    agent_declaration(
+                        State(state.clone()),
+                        Extension(ClientSession::local(None).unwrap()),
+                        AxumPath("dotfiles/steward".into()),
+                        Query(AgentDeclarationQuery {
+                            revision: revision.clone(),
+                            show_env_values,
+                        }),
+                    )
+                    .await
+                    .is_err()
+                );
+            }
         }
     }
 

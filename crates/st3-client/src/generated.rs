@@ -284,6 +284,15 @@ pub struct DocumentContent {
     pub bytes: Vec<u8>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentDeclaration {
+    pub id: String,
+    pub revision: String,
+    pub tree: Value,
+    pub kdl: String,
+    pub revisions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct LaunchPreview {
     pub goal: String,
     pub steps: Vec<Value>,
