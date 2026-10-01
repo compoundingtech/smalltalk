@@ -114,6 +114,11 @@ message / delivered / failed / state / context frames, PROTOCOL constant). Diffe
   old fence. Replacement sessions close their named predecessor in `open()`. Upstream defines
   `session_shutdown` without a `reason` field and fires it on process exit, so every such event
   closes the current channel.
+- **Subagent sessions:** omp loads the extension into every in-process subagent (the `task`
+  tool, eval `agent()`, `/tan` clones), and each copy shares the process-wide stash. Every
+  handler ignores an event whose `ctx.agent.kind` is `"sub"`, so a subagent opens no channel,
+  closes none, emits no frame, and never receives the seat's mail; the channel stays bound to the
+  top-level session. omp exposes `ctx.agent` from 18.3.2; an earlier build reads as top-level.
 - **Restored context:** seeding uses
   `sendMessage({customType:"st2-session-start", …}, {deliverAs:"nextTurn"})`.
 
