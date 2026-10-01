@@ -72,6 +72,11 @@ The temporary tables write_clock, sealed_claims, sealed_envelopes, canonical_ind
 
 Locations below refer to the audited commit, so later line-number changes do not invalidate the inventory. Shared rows must move to the canonical helper, including commutative enumerations whose returned ordering is observable. Local rows may retain arrival order only for the purpose stated.
 
+Added operational reader `outcome_history` is a local raw terminal-claim history page, using
+the serving node's claim index as its continuation cursor. It does not reduce shared state.
+Its recovered reasons and `mission_overview` reasons use canonical claim ordering; a local
+history cursor is not an exception for choosing a shared reason.
+
 | store.rs line | Function / constant | Scope | Reason |
 | --- | --- | --- | --- |
 | 810 | `AGENT_STATUS_INDEX_QUERY` | Local | Local snapshot/cache invalidation frontier; this index names what this node has seen. |

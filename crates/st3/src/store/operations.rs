@@ -44,12 +44,12 @@ impl Store {
                 let subject = format!("mission-run/{id}");
                 let reason: Option<String> = connection
                     .query_row(
-                        "SELECT COALESCE(json_extract(body,'$.fields.reason'),
+                        &canonical_sql("SELECT COALESCE(json_extract(body,'$.fields.reason'),
                                      json_extract(body,'$.fields.summary'))
                      FROM claims WHERE subject=?1 AND kind='mission-run.state'
                        AND COALESCE(json_extract(body,'$.fields.reason'),json_extract(body,'$.fields.summary')) IS NOT NULL
                        AND (json_extract(body,'$.fields.status')=?2 OR json_extract(body,'$.fields.phase') LIKE '%-' || ?2)
-                     ORDER BY store_index DESC LIMIT 1",
+                     ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                         params![subject,status],
                         |row| row.get(0),
                     )
@@ -120,13 +120,15 @@ impl Store {
         } else {
             "c.kind IN ('step-run.state','work.failed')"
         };
-        let reason = "COALESCE(json_extract(c.body,'$.fields.reason'), json_extract(c.body,'$.fields.summary'),
+        let prior = canonical::after_sql("c", "p");
+        let reason_order = canonical::order_sql("p", true);
+        let reason = format!("COALESCE(json_extract(c.body,'$.fields.reason'), json_extract(c.body,'$.fields.summary'),
             (SELECT COALESCE(json_extract(p.body,'$.fields.reason'),json_extract(p.body,'$.fields.summary'))
-             FROM claims p WHERE p.subject=c.subject AND p.kind=c.kind AND p.store_index<c.store_index
+             FROM claims p WHERE p.subject=c.subject AND p.kind=c.kind AND {prior}
                AND COALESCE(json_extract(p.body,'$.fields.reason'),json_extract(p.body,'$.fields.summary')) IS NOT NULL
                AND (json_extract(p.body,'$.fields.status')=json_extract(c.body,'$.fields.status')
                     OR json_extract(p.body,'$.fields.phase') LIKE '%-' || json_extract(c.body,'$.fields.status'))
-             ORDER BY p.store_index DESC LIMIT 1))";
+             ORDER BY {reason_order} LIMIT 1))");
         // The kind index bounds this to lifecycle claims even on graphs dominated by heartbeats.
         let sql = format!(
             "SELECT c.store_index, c.id, c.subject, c.actor, c.body, c.accepted_at_unix_ms,
@@ -271,6 +273,44 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cleanup_reason_recovery_uses_canonical_order_despite_reversed_arrival() {
+        let store = Store::open_memory("fixture").unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute("INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms) VALUES ('reason-batch','fixture',1,'reason-hash','1')", []).unwrap();
+            // Cleanup arrived before the two explanatory claims. The older explanation
+            // arrived last; neither its arrival nor the cleanup's cursor chooses the reason.
+            for (id, at, reason) in [
+                ("cleanup", "30", None),
+                ("newer", "20", Some("newer timeout reason")),
+                ("older", "10", Some("older reason")),
+            ] {
+                connection.execute("INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms) VALUES (?1,'reason-batch','mission-run/example/reason','mission-run.state','fixture',?2,'[]',?3)",
+                    params![id,json!({"fields":{"status":"failed","phase":"terminal","reason":reason}}).to_string(),at]).unwrap();
+            }
+        }
+        let history = store
+            .outcome_history("missions", 0, 100, None, None, u64::MAX, 10)
+            .unwrap();
+        let cleanup = history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "cleanup")
+            .unwrap();
+        assert_eq!(cleanup["reason"], "newer timeout reason");
+        let timed = store
+            .outcome_history("missions", 0, 100, Some("timed-out"), None, u64::MAX, 10)
+            .unwrap();
+        assert!(
+            timed["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "cleanup")
+        );
+    }
     #[test]
     fn fleet_overview_counts_all_runs_but_bounds_previews() {
         let store = Store::open_memory("fixture").unwrap();

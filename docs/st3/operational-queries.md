@@ -37,6 +37,9 @@ Times are the graph claims' accepted timestamps. `--as` on work also filters by 
 actor or step assignment. Pages contain reasons and their claim IDs; the continuation printed
 by the command fixes the original time window. Resume using that command without repeating
 relative time filters. JSON includes `next_cursor`, and an exhausted page has `has_more=false`.
+History cursors and page order are local to the serving daemon, like raw claim-history cursors;
+they are not shared state folds. Reason selection uses canonical claim order, including recovery
+from an earlier transition, so replicated arrival order cannot choose a different reason.
 
 ```sh
 st doctor

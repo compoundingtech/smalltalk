@@ -104,6 +104,8 @@ fn shared_folds_never_order_by_local_arrival() {
         "claims_for_subject_kind_at",
         "timeline_claim_rows_for_incarnation_at",
         "claims_for_kind_at",
+        // Node-local terminal history pagination; reason selection remains canonical.
+        "outcome_history",
         "agent_last_activity_at",
         "try_project_simple_replication_tx",
         "export_replication_for_heads",
