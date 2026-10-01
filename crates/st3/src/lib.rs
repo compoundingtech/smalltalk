@@ -9,6 +9,7 @@ pub mod client;
 pub mod config;
 pub(crate) mod disk;
 /// Answers the hooks an st3 seat's harness runs: `st driver-hook NAME`.
+pub mod delivery_hold;
 pub mod driver_hook;
 pub mod environment;
 pub(crate) mod external_sessions;

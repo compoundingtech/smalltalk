@@ -9102,6 +9102,14 @@ impl Store {
                 if let Some((operation_id, request_digest)) = &operation {
                     checkpointed_operation_outcome(transaction, operation_id, request_digest)?;
                 }
+                // A native adoption may import old DND only before any explicit graph decision.
+                // Check inside the writer transaction so a concurrent release always wins.
+                if input.kind == "delivery.hold"
+                    && input.fields.get("legacy_adoption") == Some(&Value::Bool(true))
+                    && let Some(existing) = latest_claim_of_kind_tx(transaction, &input.subject, "delivery.hold")?
+                {
+                    return Ok((existing, false));
+                }
                 for evidence in &input.evidence {
                     // Evidence may cite a claim that a checkpoint has since dropped.
                     let exists = checkpoint::claim_or_tombstone_exists(transaction, evidence)

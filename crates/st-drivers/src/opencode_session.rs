@@ -1,4 +1,4 @@
-//! Controlled OpenCode launch: presence, observed harness state, and native server delivery.
+//! Controlled OpenCode launch: observed harness state, explicit delivery control, and server delivery.
 //!
 //! OpenCode's interactive TUI is also a server: the wrapper allocates a loopback port and a
 //! per-seat password, launches the TUI bound to them, and speaks plain HTTP to its own child. Two
@@ -41,6 +41,7 @@ use crate::provider_session::{
     DETACH, Detached, DetachedSession, PROVIDER_POLL, ProviderProcess, STOP, completed_provider,
     describe_exit, install_signal_handler,
 };
+use crate::session_control::SessionControl;
 use crate::{delivery_ledger, ding, harness_context, harness_version, message, status};
 
 /// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
@@ -86,6 +87,22 @@ pub fn run(
     identity: String,
     runtime_id: String,
     opencode_argv: Vec<String>,
+) -> Result<()> {
+    run_with_control(
+        catalog_root,
+        identity,
+        runtime_id,
+        opencode_argv,
+        SessionControl::Catalog,
+    )
+}
+
+pub fn run_with_control(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    opencode_argv: Vec<String>,
+    control: SessionControl,
 ) -> Result<()> {
     let this_host = crate::run::detect_host();
     let agent_dir = message::resolve_declared_dir(catalog_root, &identity, &this_host)?
@@ -163,6 +180,7 @@ pub fn run(
             client,
             version_ok,
             status_path: status::status_path(&agent_dir),
+            control: control.clone(),
             // The pty session vouching for the record is the wrapper's task: the runtime ID
             // names the registry entry, and only aliases the identity on driver-expanded seats.
             writer: Writer::new(
@@ -184,7 +202,12 @@ pub fn run(
                     None
                 }
             },
-            delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
+            delivery: {
+                let mut delivery =
+                    Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id);
+                delivery.control = control;
+                delivery
+            },
             diagnostics,
             adoption: Adoption {
                 port,
@@ -230,6 +253,35 @@ pub fn adopt(
     version_ok: bool,
     producer_version: Option<String>,
 ) -> Result<()> {
+    adopt_with_control(
+        catalog_root,
+        identity,
+        runtime_id,
+        pid,
+        session,
+        seq,
+        port,
+        password,
+        version_ok,
+        producer_version,
+        SessionControl::Catalog,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn adopt_with_control(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    pid: u32,
+    session: String,
+    seq: u64,
+    port: u16,
+    password: String,
+    version_ok: bool,
+    producer_version: Option<String>,
+    control: SessionControl,
+) -> Result<()> {
     let this_host = crate::run::detect_host();
     let agent_dir = message::resolve_declared_dir(catalog_root, &identity, &this_host)?
         .with_context(|| format!("opencode driver agent '{identity}' is not declared"))?;
@@ -242,6 +294,7 @@ pub fn adopt(
         client: Client::new(port, &password),
         version_ok,
         status_path: status::status_path(&agent_dir),
+        control: control.clone(),
         writer: Writer::new(
             &agent_dir,
             identity.clone(),
@@ -250,7 +303,12 @@ pub fn adopt(
         )
         .with_ownership(session.clone(), seq),
         context: ContextProducer::new(&agent_dir, &identity, &session).ok(),
-        delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
+        delivery: {
+            let mut delivery =
+                Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id);
+            delivery.control = control;
+            delivery
+        },
         diagnostics: DiagnosticPublisher::new(
             &agent_dir,
             DiagnosticDriver::OpenCode,
@@ -278,6 +336,7 @@ struct Session {
     client: Client,
     version_ok: bool,
     status_path: PathBuf,
+    control: SessionControl,
     writer: Writer,
     /// The numeric axis, `None` only where the record has nowhere safe to stage. Its absence is a
     /// missing advisory number, never a reason to fail a launch that is otherwise healthy.
@@ -299,7 +358,11 @@ struct Adoption {
 fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Path) -> Result<()> {
     let (wake_tx, wake_rx) = mpsc::channel();
     crate::push_mailbox::watch(agent_dir, wake_tx.clone());
-    let _watcher = crate::watch::watch_delivery_inputs(agent_dir, wake_tx);
+    let _watcher = crate::watch::watch_delivery_inputs_with_status(
+        agent_dir,
+        wake_tx,
+        matches!(session.control, SessionControl::Catalog),
+    );
     let (event_tx, event_rx) = mpsc::channel();
     let sse_stop = std::sync::Arc::new(AtomicBool::new(false));
 
@@ -477,11 +540,11 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
 
         let now = Instant::now();
         if now >= next_presence {
-            let _ = status::refresh(&session.status_path);
+            session.control.refresh(&session.status_path);
             if evidence {
                 let _ = session.writer.heartbeat();
             }
-            next_presence = now + status::STATUS_REFRESH;
+            next_presence = now + crate::provider_session::SESSION_REFRESH;
         }
 
         let mut inbox_due = now >= next_inbox;
@@ -1426,6 +1489,7 @@ struct Delivery {
     catalog_root: PathBuf,
     inbox: PathBuf,
     status_path: PathBuf,
+    control: SessionControl,
     this_host: String,
     identity: String,
     ledger: delivery_ledger::Ledger,
@@ -1475,6 +1539,7 @@ impl Delivery {
             catalog_root: catalog_root.to_path_buf(),
             inbox: message::inbox_dir(agent_dir),
             status_path: status::status_path(agent_dir),
+            control: SessionControl::Catalog,
             this_host: this_host.to_string(),
             identity: identity.to_string(),
             ledger,
@@ -1557,7 +1622,11 @@ impl Delivery {
         // file left the inbox releases ownership here; this pump never moves a file itself.
         self.ledger
             .prune(|filename| crate::push_mailbox::is_unread(self.inbox.parent().and_then(Path::parent).unwrap(), filename, &unread))?;
-        if status::read_state(&self.status_path) == status::State::Dnd {
+        // Under graph control, continue receipt read-back for an existing attempt. No new
+        // input can pass `send` while held. Catalog DND retains its historical behavior.
+        if self.control.held(&self.status_path)
+            && (matches!(self.control, SessionControl::Catalog) || self.ledger.entries().is_empty())
+        {
             return Ok(());
         }
         let managed = crate::push_mailbox::managed(self.inbox.parent().and_then(Path::parent).unwrap());
@@ -1688,6 +1757,10 @@ impl Delivery {
         text: &str,
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
+        if matches!(self.control, SessionControl::Graph(_)) && self.control.held(&self.status_path)
+        {
+            return Ok(());
+        }
         self.next_attempt = Instant::now() + DELIVERY_RETRY;
         let payload = json!({
             "messageID": entry.correlation.value,
@@ -2648,6 +2721,55 @@ mod tests {
     }
 
     #[test]
+    fn graph_hold_keeps_receipt_reconciliation_running_without_another_post() {
+        let root = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = root.path().join("state/delivery-ledger.json");
+        let (mut delivery, filename) = delivery_fixture(root.path(), state_path.clone());
+        let gate = crate::session_control::DeliveryGate::default();
+        delivery.control = SessionControl::Graph(gate.clone());
+        gate.update(false, Duration::from_secs(30));
+        server.read_back_error.store(true, Ordering::SeqCst);
+        delivery.pump(&client);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::TransportAccepted)
+        );
+        gate.update(true, Duration::from_secs(30));
+        server.read_back_error.store(false, Ordering::SeqCst);
+        delivery.pump(&client);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Persisted)
+        );
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn graph_hold_and_release_gate_native_post_without_reading_status() {
+        let root = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let (mut delivery, _) =
+            delivery_fixture(root.path(), root.path().join("state/delivery-ledger.json"));
+        let gate = crate::session_control::DeliveryGate::default();
+        delivery.control = SessionControl::Graph(gate.clone());
+        delivery.pump(&client);
+        assert!(server.posts.lock().unwrap().is_empty());
+        assert!(!delivery.status_path.exists());
+        status::set_state(&delivery.status_path, status::State::Dnd).unwrap();
+        let bytes = std::fs::read(&delivery.status_path).unwrap();
+        gate.update(true, Duration::from_secs(30));
+        delivery.pump(&client);
+        assert!(server.posts.lock().unwrap().is_empty());
+        gate.update(false, Duration::from_secs(30));
+        delivery.pump(&client);
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert_eq!(std::fs::read(&delivery.status_path).unwrap(), bytes);
+    }
+
+    #[test]
     fn dnd_suppresses_delivery_and_waiting_mail_opens_the_first_session() {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
@@ -2968,7 +3090,8 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let agent_dir = tmp.path().join("agents").join("example-linux").join("seat");
             std::fs::create_dir_all(&agent_dir).unwrap();
-            let producer = ContextProducer::new(&agent_dir, "example-linux.seat", "incarnation-1").unwrap();
+            let producer =
+                ContextProducer::new(&agent_dir, "example-linux.seat", "incarnation-1").unwrap();
             Self {
                 _tmp: tmp,
                 agent_dir,

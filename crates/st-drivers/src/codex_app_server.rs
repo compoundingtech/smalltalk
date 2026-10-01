@@ -521,6 +521,7 @@ pub struct CodexControlState {
 
 #[derive(Debug, Clone)]
 struct CodexDeliveryConfig {
+    control: crate::session_control::SessionControl,
     catalog_root: PathBuf,
     agent_dir: PathBuf,
     inbox: PathBuf,
@@ -549,6 +550,7 @@ impl CodexDeliveryConfig {
             .find(|spec| spec.path.parent() == Some(agent_dir.as_path()))
             .and_then(|spec| spec.supervisor);
         Ok(Self {
+            control: crate::session_control::SessionControl::Catalog,
             catalog_root: catalog_root.to_path_buf(),
             inbox: message::inbox_dir(&agent_dir),
             agent_dir,
@@ -737,7 +739,14 @@ impl CodexInboxDelivery {
         crate::push_mailbox::watch(&config.agent_dir, wake_tx.clone());
         // Scoped to inbox + status: this pump's own process group writes runtime records (presence
         // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
-        let watcher = crate::watch::watch_delivery_inputs(&config.agent_dir, wake_tx);
+        let watcher = crate::watch::watch_delivery_inputs_with_status(
+            &config.agent_dir,
+            wake_tx,
+            matches!(
+                config.control,
+                crate::session_control::SessionControl::Catalog
+            ),
+        );
         let identity = config.identity.clone();
         let ledger = delivery_ledger::Ledger::open(
             &ledger_path,
@@ -1215,13 +1224,15 @@ impl CodexInboxDelivery {
             self.publish_observation(pending);
         }
         if now >= self.next_presence_refresh {
-            // This wrapper owns the live provider session. It therefore owns the presence lease.
-            // Preserve busy or available, and let dnd age out.
-            let _ = status::refresh(&status::status_path(&self.config.agent_dir));
+            // Session-owned observed state stays fresh only while this wrapper has evidence.
+            // Catalog control also preserves its product's status lease; graph control has no file.
+            self.config
+                .control
+                .refresh(&status::status_path(&self.config.agent_dir));
             if self.harness_evidence {
                 let _ = self.harness_writer.heartbeat();
             }
-            self.next_presence_refresh = now + status::STATUS_REFRESH;
+            self.next_presence_refresh = now + crate::provider_session::SESSION_REFRESH;
         }
         let mut due = now >= self.next_inbox_refresh;
         while self.wake.try_recv().is_ok() {
@@ -1251,10 +1262,22 @@ impl CodexInboxDelivery {
             self.snapshot_attempts = 0;
             self.verified_snapshot = None;
         }
-        self.suppressed =
-            status::read_state(&status::status_path(&self.config.agent_dir)) == status::State::Dnd;
+        self.suppressed = matches!(
+            self.config.control,
+            crate::session_control::SessionControl::Catalog
+        ) && self
+            .config
+            .control
+            .held(&status::status_path(&self.config.agent_dir));
         self.next_inbox_refresh = Instant::now() + INBOX_REFRESH_FALLBACK;
         Ok(())
+    }
+
+    fn delivery_held(&self) -> bool {
+        match &self.config.control {
+            crate::session_control::SessionControl::Catalog => self.suppressed,
+            crate::session_control::SessionControl::Graph(gate) => gate.held(),
+        }
     }
 
     fn maybe_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
@@ -1269,7 +1292,7 @@ impl CodexInboxDelivery {
         if self.pending.is_some()
             || self.pending_snapshot.is_some()
             || !state.subscribed
-            || self.suppressed
+            || self.delivery_held()
         {
             return Ok(None);
         }
@@ -1386,7 +1409,13 @@ impl CodexInboxDelivery {
 
     fn maybe_snapshot_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
         self.refresh_if_due()?;
-        if self.pending.is_some() || !state.subscribed || self.suppressed {
+        // A graph hold blocks input, not a read-only status snapshot. Catalog DND retains
+        // its historical suppression rule.
+        let catalog_held = matches!(
+            self.config.control,
+            crate::session_control::SessionControl::Catalog
+        ) && self.suppressed;
+        if self.pending.is_some() || !state.subscribed || catalog_held {
             return Ok(None);
         }
         if self
@@ -2540,6 +2569,7 @@ pub fn run_controlled_paths(
     identity: String,
     runtime_id: String,
     codex_argv: Vec<String>,
+    gate: crate::session_control::DeliveryGate,
 ) -> Result<()> {
     anyhow::ensure!(
         !codex_argv.is_empty(),
@@ -2557,6 +2587,7 @@ pub fn run_controlled_paths(
         secure_dir(&message::archive_dir(agent_dir))?;
     }
     let delivery = CodexDeliveryConfig {
+        control: crate::session_control::SessionControl::Graph(gate),
         catalog_root: driver_root.to_path_buf(),
         agent_dir: agent_dir.to_path_buf(),
         inbox,
@@ -2624,6 +2655,7 @@ pub fn adopt_controlled_paths(
     owner_write_fd: i32,
     socket_path: PathBuf,
     safe_fallback: bool,
+    gate: crate::session_control::DeliveryGate,
 ) -> Result<()> {
     anyhow::ensure!(
         !codex_argv.is_empty(),
@@ -2641,6 +2673,7 @@ pub fn adopt_controlled_paths(
     let producer_version = ensure_supported_protocol(&codex_argv[0])?;
     let inbox = message::inbox_dir(agent_dir);
     let delivery = CodexDeliveryConfig {
+        control: crate::session_control::SessionControl::Graph(gate),
         catalog_root: driver_root.to_path_buf(),
         agent_dir: agent_dir.to_path_buf(),
         inbox,
