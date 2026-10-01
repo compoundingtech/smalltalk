@@ -312,6 +312,7 @@ export class St3Client {
     async workGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/work/${encodeURIComponent(routedId(id))}`); }
     async agentsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/agents' + query(options)); }
     async agentsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/agents/${encodeURIComponent(routedId(id))}`); }
+    async agentDeclarationGet(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<AgentDeclaration>> { return this.get(`/v1/client/agent-declarations/${encodeURIComponent(routedId(id))}` + query({ revision, show_env_values: showEnvValues })); }
     async agentQueueGet(id: string): Promise<EnvelopeOf<AgentQueue>> { return this.get(`/v1/client/agent-queues/${encodeURIComponent(routedId(id))}`); }
     async runtimesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/runtimes' + query(options)); }
     async runtimesGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/runtimes/${encodeURIComponent(routedId(id))}`); }
