@@ -35,8 +35,11 @@ snapshot's store index, so rows always match their fence. Commits that land
 while a window is read neither tear it nor delay it; they arrive in the next
 `changes` frame.
 
-An `error` frame reports an invalid subscription. A `resync` frame tells the
-client to subscribe again. If the socket closes, including during a daemon
+An `error` frame reports a permanent refusal and ends that subscription. A
+`resync` frame with `retryable: true` reports a temporary read failure; the server
+keeps the subscription and retries after its reread interval, including when the
+first snapshot failed. Clients may resubscribe with the same ID to request a
+fresh snapshot. If the socket closes, including during a daemon
 restart, open a new socket and subscribe again; the new snapshot is authoritative.
 Each socket subscribes to store changes before taking its first snapshot, so a
 write racing that snapshot is visible in the snapshot or a subsequent frame.
@@ -56,8 +59,10 @@ Each `screen` frame carries `id`, `collection` (`terminal`), `snapshot`, and
 the current screen; later ones arrive only when the screen changes, at most
 every 100 ms, and nothing while it is idle. A slow client gets the latest
 screen, never a backlog, and one terminal never holds back the socket's other
-subscriptions. When the incarnation changes or the process exits, an `error`
-frame with code `stale-fence` ends that subscription only. Unsubscribing, or
+subscriptions. An incarnation change ends that subscription with `stale-fence`.
+A process exit returns `terminal-ended` with `retryable: false`. A temporary
+owner, I/O or viewer-idle failure returns `terminal-unavailable` with
+`retryable: true`; clients attach and subscribe again. Unsubscribing, or
 closing the socket, stops following; `terminal.detach` still ends the viewer
 record. After a dropped socket, attach again and subscribe on the new socket.
 
