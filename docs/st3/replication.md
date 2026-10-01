@@ -90,6 +90,14 @@ subscriptions, fleet membership, usage, observer/fault episodes, and attention. 
 answer must still be tested at the same explicit time and recipients. Host-local liveness,
 leases, receipts, cursors, secrets and notification bookkeeping stay outside shared digests.
 
+A repaired original is no longer an admitted projection source. One member may retain its
+old claim row while another rejected it before admission; both exclude it from claim-source
+and operation projections. The original wire bytes remain committed by authenticated envelope
+inventory, and the repair and replacement remain shared claim sources. A local
+`projection_digest_repaired_claims` cache retains the exclusion after receipt cleanup; repair
+record updates and cached source digests commit or roll back together. Registry version 5
+backfills existing repairs once, and operation rules version 2 rebuilds older operation rows.
+
 Operations are logical rows over the hot operation table and operation facts retained in
 checkpoint tombstones. Trimming a claim changes its storage representation, preserving its
 logical operation and claim-source digests. The shuffle test compares that logical union.

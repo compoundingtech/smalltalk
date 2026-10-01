@@ -60,6 +60,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `planning_candidates` | Shared projection | Shared immutable variant/revision/document references, mission revision and submission timestamp. |
 | `planning_previews` | Shared projection | Shared serialized preview claim fields, graph/diff/response/hash and candidate fence. store_index here is an originating claim payload field, not this replica’s admission cursor: identical claim payloads must compare identically. Future cross-node preview fencing should use stable claim/frontier identity. |
 | `graph_generation` | Local | Local cache invalidation counter; same graph can have different mutation counts. |
+| `projection_digest_repaired_claims` | Local | Repair exclusion cache over known original claim identities. Repair meaning and replacements are covered by shared claims; raw originals remain authenticated envelope history and do not contribute to source or operation projections. |
 | `replica_envelope_signatures` | Shared storage, with stated local fields | Shared signed envelope identity/member-key/signature; stored_at is local receipt time. Authority/signature inventory is distinct from outcome projection digests. |
 | `fleet_invite_tokens` | Local | Local invite secret/redemption attempt/authorization bookkeeping; fleet.invite-* lifecycle claims are shared. |
 | `replica_envelope_holds` | Local | Local validation/fencing hold state and observation time. |
