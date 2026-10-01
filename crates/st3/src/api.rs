@@ -5101,7 +5101,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 })
                 .map(|peer| format!("{}={}", peer.peer, peer.status))
                 .collect::<Vec<_>>();
-            let unresolved = replication.invalid_records + replication.unknown_records;
+            let unresolved = replication.invalid_records;
             let diverged = replication
                 .peers
                 .iter()
@@ -5145,7 +5145,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{}{}{} envelopes; {} unresolved records; {} unhealthy projections{}; peers {}",
+                    "{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
                     first_sync_failed
                         .map(|first| format!(
                             "the first sync with {} ended with a different graph, and a heal \
@@ -5165,6 +5165,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                     },
                     replication.received_envelopes,
                     unresolved,
+                    replication.waiting_claims,
                     replication.unhealthy_projections,
                     replication
                         .unhealthy
@@ -13319,6 +13320,57 @@ agent "good" {{ workspace {:?}; command "true" }}
                 .as_str()
                 .unwrap()
                 .contains("cobalt: refused by that member's Fabric grants")
+        );
+    }
+
+    #[test]
+    fn doctor_reports_waiting_claims_without_a_replication_fault() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.fleet_id = Some("fleet/waiting".into());
+        state.configured_peers = vec!["alder".into()];
+        let mut registry = st3_schema::registry().clone();
+        registry.claims.remove("doc.bound").unwrap();
+        Arc::get_mut(&mut state.store).unwrap().claim_registry = Some(registry);
+        state.store.bind_fleet("fleet/waiting").unwrap();
+        let source = Store::open_memory("alder").unwrap();
+        source.bind_fleet("fleet/waiting").unwrap();
+        source
+            .put_document("doc/release", b"release", &None, "release")
+            .unwrap();
+        let exchange = source
+            .export_replication_exchange(
+                "fleet/waiting",
+                &state.store.replication_inventory().unwrap(),
+            )
+            .unwrap();
+        state
+            .store
+            .receive_replication_exchange("alder", "fleet/waiting", &exchange)
+            .unwrap();
+        assert_eq!(
+            state.store.validate_replication_backlog().unwrap().unknown,
+            1
+        );
+        assert!(state.store.project_replication_backlog().unwrap());
+        let exchange = source.export_replication_summary("fleet/waiting").unwrap();
+        state
+            .store
+            .receive_replication_exchange("alder", "fleet/waiting", &exchange)
+            .unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "replication")
+            .unwrap();
+        assert_eq!(check.status, "pass");
+        assert!(check.message.contains("1 claims waiting for a newer build"));
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|check| check.name == "shared-projections")
         );
     }
 
