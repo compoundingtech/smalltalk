@@ -1,0 +1,488 @@
+{
+  "status": "warn",
+  "checks": [
+    {
+      "name": "claim-store",
+      "status": "pass",
+      "message": "the claim store is readable at index 20"
+    },
+    {
+      "name": "operation-projection",
+      "status": "pass",
+      "message": "the operation projection matches the claim log"
+    },
+    {
+      "name": "operational-repair",
+      "status": "pass",
+      "message": "the graph has no repairable operational contradictions"
+    },
+    {
+      "name": "state-directory",
+      "status": "pass",
+      "message": "<eval-root>/cobalt/state is a writable directory"
+    },
+    {
+      "name": "disk-space",
+      "status": "pass",
+      "message": "469.7 GiB of 905.1 GiB free (51.9%) on the filesystem of <eval-root>/cobalt/state"
+    },
+    {
+      "name": "pty-runtime",
+      "status": "pass",
+      "message": "the PTY runtime returned 1 sessions"
+    },
+    {
+      "name": "process-isolation",
+      "status": "pass",
+      "message": "Linux tasks use transient systemd user scopes"
+    },
+    {
+      "name": "runtime-ownership",
+      "status": "pass",
+      "message": "each desired member has a unique runtime ID"
+    },
+    {
+      "name": "claude-hooks",
+      "status": "pass",
+      "message": "no Claude seat runs on this host"
+    },
+    {
+      "name": "graph-references",
+      "status": "pass",
+      "message": "every reference in the ready missions, declarations and active runs resolves"
+    },
+    {
+      "name": "runtime-drift",
+      "status": "pass",
+      "message": "the runtime has no unowned live sessions or indeterminate records"
+    },
+    {
+      "name": "driver-readiness",
+      "status": "pass",
+      "message": "all desired native drivers have a ready current harness incarnation"
+    },
+    {
+      "name": "replication",
+      "status": "pass",
+      "message": "20 envelopes; 0 unresolved records; 0 unhealthy projections; peers amber=up"
+    },
+    {
+      "name": "command-recorder",
+      "status": "pass",
+      "message": "git and gh calls are recorded in <eval-root>/cobalt/state/recorder/commands.jsonl; a call by absolute path is not"
+    },
+    {
+      "name": "message-delivery",
+      "status": "warn",
+      "message": "agent/eval/fault-probe: the provider rejected a native handoff; the channel keeps retrying; 1 current-seat messages older than 10s lack a recipient graph read receipt (0 accepted native handoffs); this does not prove that a legacy channel failed to consume them. Inspect `st conversations status MESSAGE`"
+    },
+    {
+      "name": "attention-age",
+      "status": "pass",
+      "message": "no attention item has been open for more than a day"
+    },
+    {
+      "name": "build-tools",
+      "status": "warn",
+      "message": "a small crate did not link: cargo build exit status: 1: error: rustup could not choose a version of cargo to run, because one wasn't specified explicitly, and no default is configured. | help: run 'rustup default stable' to download the latest stable release of Rust and set it as your default toolchain.; install what is missing, or export its directory from the account's shell startup files"
+    },
+    {
+      "name": "daemon-environment",
+      "status": "pass",
+      "message": "account interactive login shell; refreshed on use every 60 seconds; PATH=<eval-root>/cobalt/bin:<home>/.local/bin:<home>/bin:<home>/.cargo/bin:/usr/local/go/bin:<home>/go/bin:<home>/.nvm/versions/node/v24.18.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:<home>/.codex/tmp/arg0/codex-arg0JJpo7a:<home>/.local/state/st3/recorder/bin:<home>/.local/bin:<home>/bin:<home>/.nvm/versions/node/v24.18.0/bin:<home>/.deno/bin:<home>/.cargo/bin:/usr/local/go/bin:<home>/go/bin:<home>/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/snap/bin:<home>/.local/bin"
+    },
+    {
+      "name": "priority",
+      "status": "warn",
+      "message": "the daemon runs in st3-fleet.smalltalk.daemon-deli.4a1f55fb67a22a8e3c97-3649545-1.scope, outside a service unit; `st service install` runs it at weight 1000"
+    },
+    {
+      "name": "github-observer-auth",
+      "status": "warn",
+      "message": "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; authentication is checked again on the next poll."
+    },
+    {
+      "name": "request-latency//v1/internal/replication/receive",
+      "status": "pass",
+      "message": "12 requests; recent p50 11 ms, p99 72 ms, max 72 ms"
+    },
+    {
+      "name": "request-latency//v1/internal/replication-wake",
+      "status": "pass",
+      "message": "4 requests; recent p50 1 ms, p99 66 ms, max 66 ms"
+    },
+    {
+      "name": "request-latency//v1/internal/replication/export",
+      "status": "pass",
+      "message": "26 requests; recent p50 6 ms, p99 34 ms, max 34 ms"
+    },
+    {
+      "name": "request-latency//v1/messages/{message_id}/claims",
+      "status": "pass",
+      "message": "3 requests; recent p50 18 ms, p99 23 ms, max 23 ms"
+    },
+    {
+      "name": "request-latency//v1/mailbox/receipts",
+      "status": "pass",
+      "message": "3 requests; recent p50 13 ms, p99 18 ms, max 18 ms"
+    },
+    {
+      "name": "request-latency//v1/intent/apply",
+      "status": "pass",
+      "message": "1 requests; recent p50 14 ms, p99 14 ms, max 14 ms"
+    },
+    {
+      "name": "request-latency//v1/mailbox/bind",
+      "status": "pass",
+      "message": "3 requests; recent p50 10 ms, p99 14 ms, max 14 ms"
+    },
+    {
+      "name": "request-latency//v1/claims",
+      "status": "pass",
+      "message": "3 requests; recent p50 12 ms, p99 12 ms, max 12 ms"
+    },
+    {
+      "name": "request-latency//v1/client/agents/{*id}",
+      "status": "pass",
+      "message": "7 requests; recent p50 3 ms, p99 6 ms, max 6 ms"
+    },
+    {
+      "name": "request-latency//v1/intent/mission",
+      "status": "pass",
+      "message": "1 requests; recent p50 3 ms, p99 3 ms, max 3 ms"
+    },
+    {
+      "name": "github-budget",
+      "status": "pass",
+      "message": "this daemon has sent no GitHub request since it started"
+    }
+  ],
+  "performance": {
+    "window_seconds": 300,
+    "requests": [
+      {
+        "kind": "startup open-store",
+        "count": 1,
+        "total_ms": 1276.307,
+        "max_ms": 1276.307,
+        "mean_ms": 1276.307,
+        "cpu_ms": 59.415
+      },
+      {
+        "kind": "task reconcile-pass",
+        "count": 16,
+        "total_ms": 403.233,
+        "max_ms": 230.317,
+        "mean_ms": 25.2020625,
+        "cpu_ms": 71.858
+      },
+      {
+        "kind": "/v1/internal/replication/receive",
+        "count": 12,
+        "total_ms": 358.401,
+        "max_ms": 72.52,
+        "mean_ms": 29.86675,
+        "cpu_ms": 33.552
+      },
+      {
+        "kind": "/v1/internal/replication/export",
+        "count": 26,
+        "total_ms": 272.277,
+        "max_ms": 34.612,
+        "mean_ms": 10.472192307692309,
+        "cpu_ms": 180.799
+      },
+      {
+        "kind": "/v1/internal/replication-wake",
+        "count": 4,
+        "total_ms": 90.136,
+        "max_ms": 66.202,
+        "mean_ms": 22.534,
+        "cpu_ms": 22.604
+      },
+      {
+        "kind": "/v1/messages/{message_id}/claims",
+        "count": 3,
+        "total_ms": 54.585,
+        "max_ms": 23.127,
+        "mean_ms": 18.195,
+        "cpu_ms": 1.85
+      },
+      {
+        "kind": "task checkpoint",
+        "count": 1,
+        "total_ms": 54.563,
+        "max_ms": 54.563,
+        "mean_ms": 54.563,
+        "cpu_ms": 22.15
+      },
+      {
+        "kind": "/v1/mailbox/receipts",
+        "count": 3,
+        "total_ms": 44.696,
+        "max_ms": 18.679,
+        "mean_ms": 14.898666666666664,
+        "cpu_ms": 1.897
+      },
+      {
+        "kind": "/v1/claims",
+        "count": 3,
+        "total_ms": 36.729,
+        "max_ms": 12.711,
+        "mean_ms": 12.243,
+        "cpu_ms": 2.142
+      },
+      {
+        "kind": "task reconcile-deadline",
+        "count": 12,
+        "total_ms": 31.558,
+        "max_ms": 23.087,
+        "mean_ms": 2.6298333333333335,
+        "cpu_ms": 28.129
+      },
+      {
+        "kind": "/v1/client/agents/{*id}",
+        "count": 7,
+        "total_ms": 27.671,
+        "max_ms": 6.934,
+        "mean_ms": 3.953,
+        "cpu_ms": 23.876
+      },
+      {
+        "kind": "/v1/mailbox/bind",
+        "count": 3,
+        "total_ms": 25.865,
+        "max_ms": 14.487,
+        "mean_ms": 8.621666666666666,
+        "cpu_ms": 3.758
+      },
+      {
+        "kind": "/v1/intent/apply",
+        "count": 1,
+        "total_ms": 14.963,
+        "max_ms": 14.963,
+        "mean_ms": 14.963,
+        "cpu_ms": 1.13
+      },
+      {
+        "kind": "/v1/internal/fleet/membership",
+        "count": 16,
+        "total_ms": 13.142,
+        "max_ms": 1.241,
+        "mean_ms": 0.821375,
+        "cpu_ms": 10.636
+      },
+      {
+        "kind": "startup settle-runs",
+        "count": 1,
+        "total_ms": 10.625,
+        "max_ms": 10.625,
+        "mean_ms": 10.625,
+        "cpu_ms": 1.946
+      },
+      {
+        "kind": "startup validate-replication-backlog",
+        "count": 1,
+        "total_ms": 9.906,
+        "max_ms": 9.906,
+        "mean_ms": 9.906,
+        "cpu_ms": 1.129
+      },
+      {
+        "kind": "startup project-replication-backlog",
+        "count": 1,
+        "total_ms": 9.172,
+        "max_ms": 9.172,
+        "mean_ms": 9.172,
+        "cpu_ms": 0.371
+      },
+      {
+        "kind": "/v1/status",
+        "count": 2,
+        "total_ms": 3.536,
+        "max_ms": 1.877,
+        "mean_ms": 1.768,
+        "cpu_ms": 2.935
+      },
+      {
+        "kind": "/v1/intent/mission",
+        "count": 1,
+        "total_ms": 3.456,
+        "max_ms": 3.456,
+        "mean_ms": 3.456,
+        "cpu_ms": 3.175
+      },
+      {
+        "kind": "/v1/mailbox",
+        "count": 2,
+        "total_ms": 2.636,
+        "max_ms": 1.521,
+        "mean_ms": 1.318,
+        "cpu_ms": 2.468
+      }
+    ],
+    "queries": [
+      {
+        "kind": "COMMIT",
+        "count": 115,
+        "total_ms": 543.0,
+        "max_ms": 19.0,
+        "mean_ms": 4.721739130434783,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "(other)",
+        "count": 3127,
+        "total_ms": 102.0,
+        "max_ms": 9.0,
+        "mean_ms": 0.032619123760793095,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE TABLE IF NOT EXISTS local_usage_totals ( subject TEXT NOT NULL, incarnation_id TEXT NOT NULL, model TEXT NOT NULL, owner_run TEXT NOT NULL, owner_step TEXT NOT NULL, host TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT ?, output_tokens INTEGER NOT NULL DEFAULT ?, cache_write_tokens INTEGER NOT NULL DEFAULT ?, cached_tokens INTEGER NOT NULL DEFAULT ?, total_tokens INTEGER NOT NULL DEFAULT ?, observed_at_unix_ms INTEGER NOT NULL, PRIMARY KEY(subject, incarnation_id, model, owner_run,",
+        "count": 1,
+        "total_ms": 18.0,
+        "max_ms": 18.0,
+        "mean_ms": 18.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT NOT NULL );",
+        "count": 1,
+        "total_ms": 18.0,
+        "max_ms": 18.0,
+        "mean_ms": 18.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS step_runs_open_index ON step_runs(created_at_unix_ms, step_path) WHERE status NOT IN (?,?,?);",
+        "count": 1,
+        "total_ms": 13.0,
+        "max_ms": 13.0,
+        "mean_ms": 13.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject);",
+        "count": 1,
+        "total_ms": 11.0,
+        "max_ms": 11.0,
+        "mean_ms": 11.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE TRIGGER IF NOT EXISTS mission_definitions_graph_insert AFTER INSERT ON mission_definitions BEGIN UPDATE graph_generation SET value=value+? WHERE id=?; END;",
+        "count": 1,
+        "total_ms": 11.0,
+        "max_ms": 11.0,
+        "mean_ms": 11.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS checkpoint_claims_operation ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;",
+        "count": 1,
+        "total_ms": 10.0,
+        "max_ms": 10.0,
+        "mean_ms": 10.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS claims_subscription_deferred_request_index ON claims(subject, json_extract(body, ?), store_index) WHERE kind=?;",
+        "count": 1,
+        "total_ms": 10.0,
+        "max_ms": 10.0,
+        "mean_ms": 10.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS document_latest ON documents(name, created_index DESC);",
+        "count": 1,
+        "total_ms": 10.0,
+        "max_ms": 10.0,
+        "mean_ms": 10.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE TABLE IF NOT EXISTS local_mailbox_owners ( subject TEXT NOT NULL, component TEXT NOT NULL, incarnation TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(subject, component) );",
+        "count": 1,
+        "total_ms": 10.0,
+        "max_ms": 10.0,
+        "mean_ms": 10.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "COMMIT;",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS batches_writer_sequence ON batches(origin, replica_sequence);",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS claims_accepted_order_index ON claims(length(accepted_at_unix_ms), accepted_at_unix_ms, store_index);",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS claims_actor_progress_index ON claims(actor, store_index) WHERE kind IN (?, ?);",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS claims_current_view_index ON claims(subject, store_index) WHERE kind=? OR json_extract(body, ?) NOT IN (?, ?, ?) OR json_extract(body, ?) NOT IN (?, ?, ?);",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS claims_generation_revision_index ON claims(json_extract(body, ?)) WHERE kind=?;",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS claims_generation_run_index ON claims(json_extract(body, ?)) WHERE kind=?;",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      }
+    ],
+    "query_time_note": "Statement wall time includes row processing; concurrent times overlap."
+  }
+}

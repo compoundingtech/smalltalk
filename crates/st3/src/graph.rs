@@ -145,26 +145,17 @@ pub(crate) fn runtime_proof_variables(
     variables
 }
 
-/// Authority kinds carried by one agent declaration.
-pub type AgentAuthorityGrants = (
-    crate::model::MissionAuthority,
-    crate::model::QueueAuthority,
-    crate::model::SeatAuthority,
-    crate::model::AgentAuthority,
-);
-
-/// The authority granted to agents declared inside a mission, in its own declarations, its
-/// steps' declarations, or any nested mission, keyed by the agent subject of a proof run. Only a
-/// person grants authority, so an agent may not publish or revise a mission whose grants exceed
-/// the ones already published.
-pub fn mission_declared_authority_grants(
+/// Each agent a mission declares, in its own declarations, its steps' declarations, or any nested
+/// mission, that carries an authority block, keyed by the agent subject of a proof run. Free mode
+/// ignores these blocks, so a preview names them.
+pub fn mission_declared_authority_blocks(
     mission: &crate::model::MissionSpec,
     default_host: &str,
-) -> Result<BTreeMap<String, AgentAuthorityGrants>, St3Error> {
+) -> Result<BTreeMap<String, Vec<&'static str>>, St3Error> {
     fn visit(
         mission: &crate::model::MissionSpec,
         default_host: &str,
-        grants: &mut BTreeMap<String, AgentAuthorityGrants>,
+        blocks: &mut BTreeMap<String, Vec<&'static str>>,
     ) -> Result<(), St3Error> {
         let variables = runtime_proof_variables(mission);
         let sources = mission.declarations_kdl.iter().chain(
@@ -177,29 +168,22 @@ pub fn mission_declared_authority_grants(
             let source = crate::mission::interpolate_kdl(source, &variables)?;
             let runtime = parse_execution_intent(&source, default_host, "migration-proof")?;
             for (subject, desired) in &runtime.subjects {
-                if desired.kind == "agent" && declares_authority(&desired.desired) {
-                    grants.insert(
-                        subject.clone(),
-                        (
-                            agent_mission_authority(&desired.desired),
-                            agent_queue_authority(&desired.desired),
-                            agent_seat_authority(&desired.desired),
-                            agent_declaration_authority(&desired.desired),
-                        ),
-                    );
+                let declared = declared_authority_blocks(&desired.desired);
+                if desired.kind == "agent" && !declared.is_empty() {
+                    blocks.insert(subject.clone(), declared);
                 }
             }
         }
         for step in mission.steps.values() {
             if let Some(nested) = &step.nested_mission {
-                visit(nested, default_host, grants)?;
+                visit(nested, default_host, blocks)?;
             }
         }
         Ok(())
     }
-    let mut grants = BTreeMap::new();
-    visit(mission, default_host, &mut grants)?;
-    Ok(grants)
+    let mut blocks = BTreeMap::new();
+    visit(mission, default_host, &mut blocks)?;
+    Ok(blocks)
 }
 
 pub fn validate_mission_runtimes(
@@ -952,10 +936,10 @@ fn parse_planning_session_declaration(
             ));
         }
         let requester = required_child_string(body, "requester", &subject)?;
-        if !requester.starts_with("person/") {
+        if !(requester.starts_with("person/") || requester.starts_with("agent/")) {
             return Err(St3Error::new(
                 "invalid-planning-requester",
-                "a planning requester must be a person subject",
+                "a planning requester must be a person or agent subject",
             ));
         }
         validate_full_subject(&requester)?;
@@ -2686,146 +2670,28 @@ fn validate_authority_block(
     Ok(())
 }
 
-/// The `VERB "PATTERN"` rules of one authority block in a desired agent declaration.
-pub(crate) fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str)> {
-    let Some(children) = desired.get("children").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let Some(block) = children
-        .iter()
-        .find(|child| child.get("name").and_then(Value::as_str) == Some(block))
-    else {
-        return Vec::new();
-    };
-    block
+/// The authority blocks a desired agent declaration carries, including `mission-authority
+/// "none"`. They still parse, so existing declarations stay valid, but free mode grants every
+/// agent in the fleet what its person may do and ignores them until principals and grants land.
+pub fn declared_authority_blocks(desired: &Value) -> Vec<&'static str> {
+    let children = desired
         .get("children")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|rule| {
-            let verb = rule.get("name").and_then(Value::as_str)?;
-            let pattern = rule
-                .get("arguments")
-                .and_then(Value::as_array)
-                .and_then(|arguments| arguments.first())
-                .and_then(Value::as_str)?;
-            Some((verb, pattern))
-        })
-        .collect()
-}
-
-/// Whether a desired agent declaration grants authority.
-pub fn declares_authority(desired: &Value) -> bool {
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     [
         "mission-authority",
         "queue-authority",
         "seat-authority",
         "agent-authority",
     ]
-        .iter()
-        .any(|block| !authority_rules(desired, block).is_empty())
-}
-
-pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthority {
-    let mut authority = crate::model::MissionAuthority::default();
-    for (verb, pattern) in authority_rules(desired, "mission-authority") {
-        match verb {
-            "publish" => authority.publish.push(pattern.to_owned()),
-            "start" => authority.start.push(pattern.to_owned()),
-            "revise" => authority.revise.push(pattern.to_owned()),
-            "cancel" => authority.cancel.push(pattern.to_owned()),
-            _ => {}
-        }
-    }
-    authority
-}
-
-/// The mission authority a current agent declaration holds. A `mission-authority` block, or
-/// `mission-authority "none"`, is the whole grant. Without one, a top-level seat named
-/// `fleet/PROJECT` or `fleet/PROJECT/...` may publish, start and revise missions under
-/// `fleet/PROJECT/*` while its current declaration is a person's. A mission-scoped seat, or a seat
-/// whose declaration an agent wrote, holds nothing by default: declaring a seat never lends an
-/// agent authority it lacks.
-pub fn effective_agent_mission_authority(
-    desired: &crate::model::DesiredSubject,
-    declared_by_agent: bool,
-) -> crate::model::EffectiveMissionAuthority {
-    use crate::model::{EffectiveMissionAuthority, MissionAuthority, MissionAuthoritySource};
-
-    let none = EffectiveMissionAuthority {
-        source: MissionAuthoritySource::None,
-        authority: MissionAuthority::default(),
-    };
-    if desired.kind != "agent" {
-        return none;
-    }
-    let declared = desired
-        .desired
-        .get("children")
-        .and_then(Value::as_array)
-        .is_some_and(|children| {
-            children
-                .iter()
-                .any(|child| child.get("name").and_then(Value::as_str) == Some("mission-authority"))
-        });
-    if declared {
-        return EffectiveMissionAuthority {
-            source: MissionAuthoritySource::Declared,
-            authority: agent_mission_authority(&desired.desired),
-        };
-    }
-    let project = desired
-        .subject
-        .strip_prefix("agent/fleet/")
-        .and_then(|rest| rest.split('/').next())
-        .filter(|project| !project.is_empty());
-    match project {
-        Some(project) if desired.owner_run.is_none() && !declared_by_agent => {
-            let namespace = vec![format!("fleet/{project}/*")];
-            EffectiveMissionAuthority {
-                source: MissionAuthoritySource::Default,
-                authority: MissionAuthority {
-                    publish: namespace.clone(),
-                    start: namespace.clone(),
-                    revise: namespace,
-                    cancel: Vec::new(),
-                },
-            }
-        }
-        _ => none,
-    }
-}
-
-pub fn agent_queue_authority(desired: &Value) -> crate::model::QueueAuthority {
-    crate::model::QueueAuthority {
-        moves: authority_rules(desired, "queue-authority")
-            .into_iter()
-            .filter(|(verb, _)| *verb == "move")
-            .map(|(_, pattern)| pattern.to_owned())
-            .collect(),
-    }
-}
-
-pub fn agent_seat_authority(desired: &Value) -> crate::model::SeatAuthority {
-    let mut authority = crate::model::SeatAuthority::default();
-    for (verb, pattern) in authority_rules(desired, "seat-authority") {
-        match verb {
-            "declare" => authority.declare.push(pattern.to_owned()),
-            "stop" => authority.stop.push(pattern.to_owned()),
-            _ => {}
-        }
-    }
-    authority
-}
-
-pub fn agent_declaration_authority(desired: &Value) -> crate::model::AgentAuthority {
-    crate::model::AgentAuthority {
-        apply: authority_rules(desired, "agent-authority")
-            .into_iter()
-            .filter(|(verb, _)| *verb == "apply")
-            .map(|(_, pattern)| pattern.to_owned())
-            .collect(),
-    }
+    .into_iter()
+    .filter(|block| {
+        children
+            .iter()
+            .any(|child| child.get("name").and_then(Value::as_str) == Some(*block))
+    })
+    .collect()
 }
 
 fn validate_task_body(

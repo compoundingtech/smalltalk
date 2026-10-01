@@ -500,7 +500,7 @@ fn st3_eval_inventory_has_twenty_two_model_free_and_twenty_one_model_backed_eval
         "network-isolation",
         "network-smoke",
         "mission-inputs",
-        "mission-authority",
+        "free-mode",
         "pty-attach-machine-stream",
         "pty-attach-only",
         "pty-send-peek",

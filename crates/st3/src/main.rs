@@ -1549,7 +1549,7 @@ enum MissionViewCommand {
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
-    /// Publish exact authored mission KDL after preview and authority checks.
+    /// Publish exact authored mission KDL after preview.
     Publish(MissionPublishArgs),
     /// Start one run from the current ready mission revision.
     Start(MissionRunStartArgs),
@@ -1668,7 +1668,7 @@ struct PlanningStartArgs {
     request: Option<PathBuf>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     requester: String,
     #[arg(long, value_parser = ["codex", "claude", "pi", "omp", "opencode"])]
     provider: Option<String>,
@@ -1727,7 +1727,7 @@ struct PlanningProposeArgs {
 struct PlanningReviseArgs {
     session: String,
     feedback: PathBuf,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     /// Print the feedback KDL without storing the feedback or publishing it.
     #[arg(long)]
@@ -1738,7 +1738,7 @@ struct PlanningReviseArgs {
 struct PlanningApproveArgs {
     session: String,
     preview_hash: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -1750,7 +1750,7 @@ struct LaunchApproveAndStartArgs {
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -1761,7 +1761,7 @@ struct LaunchRunArgs {
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -1789,14 +1789,14 @@ struct LaunchAnswerArgs {
     explanation: Option<String>,
     #[arg(long, default_value_t = 1)]
     expected_revision: u32,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct PlanningCancelArgs {
     session: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     #[arg(long)]
     reason: Option<String>,
@@ -1861,14 +1861,14 @@ struct PtySubjectArgs {
 struct PtyScreenArgs {
     subject: String,
     /// Use this concrete person instead of the person configured for trusted local commands.
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
 
 #[derive(Args)]
 struct PtyStreamArgs {
     subject: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     /// The stream capability from `terminals attach-info`; can be set through the environment.
     #[arg(long, env = "ST3_TERMINAL_CAPABILITY")]
@@ -1884,7 +1884,7 @@ struct PtyStreamArgs {
 struct PtyClientInputArgs {
     subject: String,
     value: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     #[arg(long, conflicts_with = "key")]
     raw: bool,
@@ -1898,7 +1898,7 @@ struct PtyClientDetachArgs {
     /// Runtime incarnation returned by `terminals attach-info`.
     #[arg(long)]
     incarnation: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
 
@@ -1910,7 +1910,7 @@ struct PtyAttachArgs {
     force: bool,
     /// The person attaching to a terminal another fleet host owns; defaults to `person` in the st
     /// config. A terminal on this host needs no person.
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
 
@@ -2297,7 +2297,7 @@ enum ImportCommand {
     /// Stop an exactly identified running harness and resume it in a durable st mission.
     Run {
         session: String,
-        #[arg(long = "as", value_parser = parse_person_subject)]
+        #[arg(long = "as", value_parser = parse_actor_subject)]
         person: String,
     },
 }
@@ -2408,8 +2408,8 @@ struct AgentQueueMoveArgs {
     /// Why the order changed; recorded with the move.
     #[arg(long)]
     reason: Option<String>,
-    /// Person or agent making the move; defaults to `person` in the st config. An agent needs
-    /// `queue-authority { move "SEAT" }` for this seat in its declaration.
+    /// Person or agent making the move; defaults to `person` in the st config. Any agent may move
+    /// any seat's queue, its own included.
     #[arg(long = "as", value_parser = parse_queue_move_actor)]
     actor: Option<String>,
 }
@@ -2644,7 +2644,7 @@ enum SchemaCommand {
 #[derive(Args)]
 struct SubscriptionRequestArgs {
     request: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     #[arg(long)]
     reason: String,
@@ -2725,7 +2725,7 @@ struct AttentionResolveArgs {
     outcome: String,
     #[arg(long)]
     reason: Option<String>,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -2933,7 +2933,7 @@ enum MessageCommand {
     Thread(MessageReferenceArgs),
     /// List normalized harness sessions available for native conversation views.
     Sessions {
-        #[arg(long = "as", value_parser = parse_person_subject)]
+        #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long)]
         all: bool,
@@ -2945,7 +2945,7 @@ enum MessageCommand {
     /// Render one normalized session timeline, including tools and usage.
     Timeline {
         session: String,
-        #[arg(long = "as", value_parser = parse_person_subject)]
+        #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -2956,7 +2956,7 @@ enum MessageCommand {
     /// Follow the visible normalized conversation; JSON output is one entry per line.
     Follow {
         session: String,
-        #[arg(long = "as", value_parser = parse_person_subject)]
+        #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -3044,7 +3044,7 @@ struct ReviewArgs {
     target: String,
     #[arg(long)]
     reason: Option<String>,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -3053,7 +3053,7 @@ struct FeedbackReviewArgs {
     target: String,
     #[arg(long)]
     reason: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -3423,6 +3423,17 @@ fn guard_mutating_cli_actor(
             MissionViewCommand::Cancel(args) => Some(args.actor.as_str()),
             MissionViewCommand::Outcome(args) => Some(args.actor.as_str()),
             MissionViewCommand::Retire(args) => Some(args.actor.as_str()),
+            MissionViewCommand::Release(args) | MissionViewCommand::CancelRequest(args) => {
+                Some(args.actor.as_str())
+            }
+            _ => None,
+        },
+        Command::Import {
+            command: ImportCommand::Run { person, .. },
+        } => Some(person.as_str()),
+        Command::Terminals { command } => match command {
+            PtyCommand::InputClient(args) => args.person.as_deref(),
+            PtyCommand::DetachClient(args) => args.person.as_deref(),
             _ => None,
         },
         Command::Agents { command } => match command {
@@ -4466,6 +4477,7 @@ async fn publish_mission_file(
         "{}",
         mission.blockers.join("; ")
     );
+    warn_ignored_authority(&mission);
     let resolved = mission.resolved_intent;
     let response: ApplyResponse = client
         .post(
@@ -4944,6 +4956,15 @@ fn publication_document(node: KdlNode) -> String {
     document.to_string()
 }
 
+/// Free mode ignores authority blocks; say so on stderr when a publication still carries them.
+fn warn_ignored_authority(preview: &MissionResponse) {
+    for warning in &preview.warnings {
+        if let Some(warning) = warning.strip_prefix("free-mode: ") {
+            eprintln!("st: {warning}");
+        }
+    }
+}
+
 async fn publish_text(
     client: &Client,
     kdl: String,
@@ -4978,6 +4999,7 @@ async fn publish_text_with_expected(
         "{}",
         mission.blockers.join("; ")
     );
+    warn_ignored_authority(&mission);
     if let Some((subject, tokens)) = expected {
         anyhow::ensure!(
             mission.subject_tokens.get(subject).map(Vec::as_slice) == Some(tokens),
@@ -5047,7 +5069,7 @@ async fn run_pty(
             }
         }
         PtyCommand::Screen(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals screen",
@@ -5063,7 +5085,7 @@ async fn run_pty(
             }
         }
         PtyCommand::AttachInfo(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals attach-info",
@@ -5091,7 +5113,7 @@ async fn run_pty(
             print_client_value(&response, json_output)
         }
         PtyCommand::Stream(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals stream",
@@ -5118,7 +5140,7 @@ async fn run_pty(
             Ok(())
         }
         PtyCommand::InputClient(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals input-client",
@@ -5159,7 +5181,7 @@ async fn run_pty(
             print_client_value(&response, json_output)
         }
         PtyCommand::DetachClient(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals detach-client",
@@ -5364,7 +5386,7 @@ async fn attach_remote_terminal(
             "{not_local:#}. Attaching to it from this host needs `--as person/NAME` or `person = \"person/NAME\"` in the st config"
         )
     })?;
-    let person = parse_person_subject(person).map_err(anyhow::Error::msg)?;
+    let person = parse_actor_subject(person).map_err(anyhow::Error::msg)?;
     let gateway = generated_client(endpoint, Some(&person))?;
     let unreached = match fabric_route(client, &gateway, subject).await {
         Ok((target, request)) => match st3::terminal_fabric::attach(&target, &request).await? {
@@ -5921,6 +5943,25 @@ async fn run_devices(
             print_client_value(&response, json_output)
         }
     }
+}
+
+/// The actor of a terminal or client-v0 command: an explicit person or agent, else the harness's
+/// own seat, else the configured person. Free mode lets an agent act, always as itself.
+fn configured_actor(
+    explicit: Option<&str>,
+    configured: Option<&str>,
+    command: &str,
+) -> Result<String> {
+    if let Some(explicit) = explicit {
+        return parse_actor_subject(explicit).map_err(anyhow::Error::msg);
+    }
+    if let Some(own) = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|own| own.starts_with("agent/"))
+    {
+        return Ok(own);
+    }
+    configured_human(None, configured, command)
 }
 
 fn configured_human(
@@ -8680,7 +8721,7 @@ fn agent_start_document(
 
 /// The Claude settings the fleet's Claude seats run with: st's own channel plugin on, and the
 /// plugins st2's marketplace shipped off.
-const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":true}}"#;
+const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":false,"st-channel@st":true}}"#;
 
 /// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
 /// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
@@ -9835,13 +9876,6 @@ fn render_client_agent(
     if let Some(owner) = &agent.owner_run_id {
         let _ = writeln!(output, "MISSION      {owner}");
     }
-    if let Some(authority) = &agent.mission_authority {
-        let _ = writeln!(
-            output,
-            "AUTHORITY    {}",
-            render_mission_authority(authority)
-        );
-    }
     if let Some(usage) = &agent.usage {
         let _ = writeln!(output, "USAGE        {}", render_usage(usage));
         if usage.incarnation_count > 0 {
@@ -9895,37 +9929,6 @@ fn render_client_agent(
         let _ = writeln!(output, "RUNTIME      {runtime}");
     }
     output
-}
-
-/// Each mission pattern with the verbs it allows, then where the authority comes from.
-fn render_mission_authority(authority: &st3_client::AgentMissionAuthority) -> String {
-    let mut patterns: Vec<(&str, Vec<&str>)> = Vec::new();
-    for (verb, rules) in [
-        ("publish", &authority.publish),
-        ("start", &authority.start),
-        ("revise", &authority.revise),
-        ("cancel", &authority.cancel),
-    ] {
-        for pattern in rules {
-            match patterns.iter_mut().find(|(known, _)| known == pattern) {
-                Some((_, verbs)) => verbs.push(verb),
-                None => patterns.push((pattern, vec![verb])),
-            }
-        }
-    }
-    let rules = if patterns.is_empty() {
-        "no missions".to_owned()
-    } else {
-        patterns
-            .iter()
-            .map(|(pattern, verbs)| format!("{} mission/{pattern}", verbs.join(", ")))
-            .collect::<Vec<_>>()
-            .join("; ")
-    };
-    match authority.source.as_str() {
-        "none" => rules,
-        source => format!("{rules} ({source})"),
-    }
 }
 
 fn render_client_agents(
@@ -11648,9 +11651,9 @@ async fn stage_message(
     transport: &str,
     runtime_id: Option<&str>,
     idempotency_key: String,
-) -> Result<()> {
+) -> Result<ClaimRecord> {
     let reference = normalize_message_reference(reference);
-    let _: ClaimRecord = client
+    client
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
@@ -11663,8 +11666,7 @@ async fn stage_message(
                 idempotency_key,
             },
         )
-        .await?;
-    Ok(())
+        .await
 }
 
 async fn close_message(client: &Client, reference: &str, actor: &str) -> Result<ClaimRecord> {
@@ -11825,6 +11827,15 @@ fn planning_cancellation_intent(session_id: &str, operation_id: &str, reason: &s
     )
 }
 
+/// A complete `person/NAME` or an agent. Free mode lets an agent do what its person may do, and
+/// the daemon still records the agent itself as the actor.
+fn parse_actor_subject(actor: &str) -> std::result::Result<String, String> {
+    if actor.starts_with("agent/") && actor.len() > "agent/".len() {
+        return Ok(actor.to_owned());
+    }
+    parse_person_subject(actor)
+}
+
 fn parse_person_subject(actor: &str) -> std::result::Result<String, String> {
     if actor.starts_with("agent/") {
         // Agents reached for `now --as "$ST_AGENT"` and read the person-authority refusal as a
@@ -11877,7 +11888,20 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             .subject
             .as_deref()
             .context("the Claude channel has no subject")?;
-        let (catalog, _agent_dir, identity, _runtime_id) = prepare_native_driver(subject)?;
+        let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+        if push_mailbox_enabled() {
+            let incarnation = wait_for_agent_incarnation(client, subject).await?;
+            return st3::claude_channel::run(
+                client,
+                subject,
+                &incarnation,
+                &catalog,
+                &agent_dir,
+                &identity,
+                &runtime_id,
+            )
+            .await;
+        }
         return st_drivers::claude_mcp::run_st3(&catalog, &identity);
     }
     if matches!(args.driver.as_str(), "pi-channel" | "omp-channel") {
@@ -12068,6 +12092,9 @@ fn spawn_st2_provider(
     use st_drivers::provider_session::DetachedSession;
     let paths = paths.clone();
     let driver = driver.to_owned();
+    if push_mailbox_enabled() && driver == "opencode" {
+        st_drivers::push_mailbox::register(&paths.agent_dir);
+    }
     tokio::task::spawn_blocking(move || match start {
         ProviderStart::Launch(argv) => match driver.as_str() {
             "claude" => st_drivers::claude_session::run_controlled_paths(
@@ -12154,6 +12181,8 @@ struct NativeLoopState {
     predecessor_harness_record: Option<Vec<u8>>,
     published_timeline: BTreeSet<String>,
     delivery_episode: u64,
+    #[serde(default)]
+    mailbox_fence: Option<st3::mailbox::Fence>,
 }
 
 /// What a native driver hands its next image across `execve`.
@@ -12341,12 +12370,12 @@ async fn drive_st2_native(
         runtime_id,
         ..
     } = paths.clone();
+    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
-    // Mailbox projection reads the durable message history. A one-second poll
-    // bounds delivery latency without repeatedly walking it four times a
-    // second for every native harness during idle periods.
+    // This tick retries receipts and native handoffs. Push delivery reads its cached mailbox;
+    // only an already-running legacy seat still polls durable history.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -12361,6 +12390,9 @@ async fn drive_st2_native(
     let mut binding_watch = ClaudeBindingWatch::default();
     loop {
         tokio::select! {
+            frame = mailbox.recv() => {
+                mailbox.accept(frame, &runtime_id)?;
+            }
             result = &mut task => {
                 let outcome = result?;
                 if let Some(session) = detached_session(&outcome) {
@@ -12456,6 +12488,14 @@ async fn drive_st2_native(
                 }
                 // Delivery runs first and on its own: a failing observation publish must never
                 // hold back a message.
+                if mailbox.subscription.is_some() {
+                    if driver == "opencode" {
+                        if let Err(error) = mailbox.pump(client, &agent_dir,
+                            NativeDeliveryReceipts::OpenCode { catalog_root: &catalog, identity: &identity, runtime_id: &runtime_id }).await {
+                            note_driver_tick_failure(subject, error, &mut last_control_warning);
+                        }
+                    }
+                } else {
                 if driver == "claude" {
                     delivery.report = Some(native_delivery_report("claude-channel", Some(&agent_dir)));
                     supervise_native_delivery(
@@ -12489,6 +12529,7 @@ async fn drive_st2_native(
                         &mut delivery,
                     )
                     .await;
+                }
                 }
                 let tick: Result<()> = async {
                     if native_file_may_override_channel(driver)
@@ -13221,7 +13262,7 @@ async fn run_pi_channel(
                         "{}\n",
                         serde_json::to_string(&json!({
                             "type": "hello",
-                            "protocol": 1,
+                            "protocol": if push_mailbox_enabled() { 2 } else { 1 },
                             "identity": identity,
                             "sessionContext": session_context,
                         }))?
@@ -13245,6 +13286,17 @@ async fn run_pi_channel(
     let incarnation = state.incarnation.clone();
     let session = state.session.clone();
     let transport = format!("{driver}-channel");
+    if push_mailbox_enabled() && state.pending.fence.is_none() {
+        state.pending.fence = Some(st3::mailbox::Fence::new(subject, &incarnation, "delivery"));
+    }
+    if let Some(fence) = &mut state.pending.fence { fence.bind(client).await?; }
+    let mut subscription = state.pending.fence.as_ref().map(|fence| {
+        let mut report: Value =
+            serde_json::from_str(&native_delivery_report(&transport, None)).unwrap_or_default();
+        report["ready"] = json!(state.first_idle_seen && state.failed_handoffs.is_empty());
+        st3::mailbox::Subscription::start(client.clone(), fence.clone(), report)
+    });
+    let mut pushed_messages: Vec<MessageView> = Vec::new();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
     let spawn_reader = |sender: tokio::sync::mpsc::UnboundedSender<st_drivers::reexec::StdinChunk>| {
         st_drivers::reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
@@ -13259,6 +13311,28 @@ async fn run_pi_channel(
     let mut renewed_minute = None;
     loop {
         tokio::select! {
+            frame = async { match &mut subscription {
+                Some(subscription) => subscription.receiver.recv().await,
+                None => std::future::pending().await,
+            }} => {
+                match frame {
+                    Some(st3::mailbox::Frame::Mailbox { messages }) => {
+                        let active: BTreeSet<_> = messages.iter().map(|message| message.subject.clone()).collect();
+                        state.delivered.retain(|message| active.contains(message));
+                        state.failed_handoffs.retain(|message, _| active.contains(message));
+                        state.retry_after_ms.retain(|message, _| active.contains(message));
+                        state.failed_diagnostics.retain(|message| active.contains(message));
+                        pushed_messages = messages;
+                    },
+                    Some(st3::mailbox::Frame::Seat { seat }) => {
+                        let frame = json!({"type":"seat", "seat":seat});
+                        stdout.write_all(format!("{}\n", serde_json::to_string(&frame)?).as_bytes()).await?;
+                        stdout.flush().await?;
+                    },
+                    Some(st3::mailbox::Frame::Fenced { reason }) => anyhow::bail!("{reason}"),
+                    None => return Ok(()),
+                }
+            }
             chunk = input_rx.recv() => {
                 let mut publish = false;
                 match chunk {
@@ -13325,16 +13399,17 @@ async fn run_pi_channel(
                 // A recipient can read or close a failed handoff through another native
                 // path. Its authoritative receipt settles that retry and its health warning.
                 for message in state.failed_handoffs.keys().cloned().collect::<Vec<_>>() {
-                    if let Ok(view) = read_message(client, &message).await
-                        && matches!(view.status.as_str(), "delivered" | "read" | "closed") {
+                    let view = if subscription.is_some() {
+                        pushed_messages.iter().find(|view| view.subject == message).cloned()
+                    } else { read_message(client, &message).await.ok() };
+                    if view.is_some_and(|view| matches!(view.status.as_str(), "delivered" | "read" | "closed")) {
                         state.failed_handoffs.remove(&message);
                         state.retry_after_ms.remove(&message);
                         state.failed_diagnostics.remove(&message);
                     }
                 }
-                // The first page is polled on every tick, before the first idle too: the poll
-                // carries this channel's delivery report, which is how the daemon knows the
-                // seat's delivery path is live and current.
+                // A push report renews over the subscription even before the first idle proof.
+                // Legacy channels attach the same report to their first mailbox page.
                 let mut report: Value = serde_json::from_str(&native_delivery_report(&transport, None))?;
                 report["ready"] = json!(state.first_idle_seen && state.failed_handoffs.is_empty());
                 if !state.first_idle_seen {
@@ -13343,9 +13418,15 @@ async fn run_pi_channel(
                     report["reason"] = json!("the provider rejected a native handoff; the channel keeps retrying");
                 }
                 let report = report.to_string();
+                if let Some(subscription) = &subscription {
+                    subscription.report(serde_json::from_str(&report)?);
+                }
                 let mut cursor = None;
                 loop {
-                    let page = match message_page_reporting(
+                    let page = if subscription.is_some() {
+                        MessagePage { items: pushed_messages.clone(), has_more: false, next_cursor: None, limit: pushed_messages.len() }
+                    } else {
+                    match message_page_reporting(
                         client,
                         Some(subject),
                         false,
@@ -13356,6 +13437,7 @@ async fn run_pi_channel(
                     {
                         Ok(page) => page,
                         Err(error) => { warn_pi_channel(subject, &error, &mut last_warning); break; }
+                    }
                     };
                     if !state.first_idle_seen {
                         break;
@@ -13377,7 +13459,11 @@ async fn run_pi_channel(
                         }
                     };
                     if message.status == "sent" {
-                        match stage_pi_family_message(client, &message.subject, subject, driver).await {
+                        let staged = match &state.pending.fence {
+                            Some(fence) => mailbox_receipt_claim(client, fence, &message.subject, "staged").await.map(|claim| claim.kind == "message.staged"),
+                            None => stage_pi_family_message(client, &message.subject, subject, driver).await,
+                        };
+                        match staged {
                             Ok(true) => {},
                             Ok(false) => { state.delivered.remove(&message.subject); continue; },
                             Err(error) => {
@@ -13537,6 +13623,14 @@ impl PiChannelResume {
                 self.pending.acknowledgements.insert(message.to_owned());
                 true
             }
+            Some("read") => {
+                let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else {
+                    return false;
+                };
+                self.pending.acknowledgements.insert(message.into());
+                self.pending.reads.insert(message.into());
+                true
+            }
             Some("failed") => {
                 let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else {
                     return false;
@@ -13596,6 +13690,10 @@ struct PiFamilyReports {
     #[serde(default)]
     reason: Option<String>,
     acknowledgements: BTreeSet<String>,
+    #[serde(default)]
+    reads: BTreeSet<String>,
+    #[serde(default)]
+    fence: Option<st3::mailbox::Fence>,
 }
 
 impl PiFamilyReports {
@@ -13655,8 +13753,21 @@ impl PiFamilyReports {
             self.state = None;
         }
         while let Some(message) = self.acknowledgements.first().cloned() {
-            acknowledge_pi_family_delivery(client, subject, &message).await?;
+            match &self.fence {
+                Some(fence) => mailbox_receipt(client, fence, &message, "delivered").await?,
+                None => acknowledge_pi_family_delivery(client, subject, &message).await?,
+            }
             self.acknowledgements.remove(&message);
+        }
+        while let Some(message) = self.reads.first().cloned() {
+            if let Some(fence) = &self.fence {
+                mailbox_receipt(client, fence, &message, "read").await?;
+                use tokio::io::AsyncWriteExt as _;
+                let mut stdout = tokio::io::stdout();
+                stdout.write_all(format!("{}\n", json!({"type":"settled","meta":{"messageId":message}})).as_bytes()).await?;
+                stdout.flush().await?;
+            }
+            self.reads.remove(&message);
         }
         Ok(())
     }
@@ -13678,7 +13789,7 @@ async fn stage_pi_family_message(
     )
     .await
     {
-        Ok(_) => Ok(true),
+        Ok(claim) => Ok(claim.kind == "message.staged"),
         Err(error) => match read_message(client, message).await {
             Ok(view) if view.status == "staged" => Ok(true),
             Ok(view) if matches!(view.status.as_str(), "delivered" | "read" | "closed") => {
@@ -13902,6 +14013,10 @@ async fn drive_codex_native(
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
+    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state).await?;
+    if push_mailbox_enabled() {
+        st_drivers::push_mailbox::register(&agent_dir);
+    }
     if matches!(start, ProviderStart::Adopt(_)) {
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
@@ -13919,6 +14034,8 @@ async fn drive_codex_native(
     let mut replacement = DriverReplacement::new();
     loop {
         tokio::select! {
+            frame = mailbox.recv() => { mailbox.accept(frame, &runtime_id)?; }
+
             result = &mut task => {
                 let outcome = result.context("joining the Codex driver")?;
                 if let Some(session) = detached_session(&outcome) {
@@ -13961,6 +14078,12 @@ async fn drive_codex_native(
                 }
                 // Delivery runs first and on its own: a failing observation publish must never
                 // hold back a message.
+                if mailbox.subscription.is_some() {
+                    if let Err(error) = mailbox.pump(client, &agent_dir,
+                        NativeDeliveryReceipts::Codex { state_dir: &state_dir, identity: &identity, runtime_id: &runtime_id }).await {
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                } else {
                 delivery.report = Some(native_delivery_report("app-server", None));
                 supervise_native_delivery(
                     client,
@@ -13977,6 +14100,7 @@ async fn drive_codex_native(
                     &mut delivery,
                 )
                 .await;
+                }
                 let tick: Result<()> = async {
                     if !loop_state.ready && std::fs::read(state_dir.join("binding.json"))
                         .ok()
@@ -14552,6 +14676,222 @@ async fn report_unforwarded_message(
             },
         )
         .await?;
+    Ok(())
+}
+
+fn push_mailbox_enabled() -> bool {
+    std::env::var("ST3_MAILBOX_TRANSPORT").as_deref() == Ok("push")
+}
+
+struct NativeMailbox {
+    subscription: Option<st3::mailbox::Subscription>,
+    fence: st3::mailbox::Fence,
+    messages: Vec<MessageView>,
+    queued: BTreeMap<String, st_drivers::message::Message>,
+    replayed: bool,
+}
+impl NativeMailbox {
+    async fn start(
+        client: &Client,
+        subject: &str,
+        incarnation: &str,
+        driver: &str,
+        state: &mut NativeLoopState,
+    ) -> Result<Self> {
+        let component = if matches!(driver, "codex" | "opencode") {
+            "delivery"
+        } else {
+            "title"
+        };
+        let mut fence = state
+            .mailbox_fence
+            .get_or_insert_with(|| st3::mailbox::Fence::new(subject, incarnation, component))
+            .clone();
+        if push_mailbox_enabled() {
+            fence.bind(client).await?;
+            state.mailbox_fence = Some(fence.clone());
+        }
+        let transport = if driver == "codex" {
+            "app-server"
+        } else {
+            "opencode-server"
+        };
+        let report: Value =
+            serde_json::from_str(&native_delivery_report(transport, None)).unwrap_or_default();
+        let subscription = push_mailbox_enabled()
+            .then(|| st3::mailbox::Subscription::start(client.clone(), fence.clone(), report));
+        Ok(Self {
+            subscription,
+            fence,
+            messages: Vec::new(),
+            queued: BTreeMap::new(),
+            replayed: false,
+        })
+    }
+    async fn recv(&mut self) -> Option<st3::mailbox::Frame> {
+        match &mut self.subscription {
+            Some(subscription) => subscription.receiver.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+    fn accept(&mut self, frame: Option<st3::mailbox::Frame>, runtime_id: &str) -> Result<()> {
+        match frame {
+            Some(st3::mailbox::Frame::Seat { seat }) => {
+                if let Err(error) = update_native_title(&seat, runtime_id) {
+                    eprintln!("st: could not update seat title: {error:#}");
+                }
+                Ok(())
+            }
+            Some(st3::mailbox::Frame::Mailbox { messages }) => {
+                self.messages = messages;
+                self.replayed = true;
+                Ok(())
+            }
+            Some(st3::mailbox::Frame::Fenced { reason }) => anyhow::bail!("{reason}"),
+            None => anyhow::bail!("native mailbox subscription ended"),
+        }
+    }
+    async fn pump(
+        &mut self,
+        client: &Client,
+        agent_dir: &Path,
+        receipts: NativeDeliveryReceipts<'_>,
+    ) -> Result<()> {
+        if !self.replayed {
+            return Ok(());
+        }
+        let consumed = match receipts {
+            NativeDeliveryReceipts::Codex {
+                state_dir,
+                identity,
+                runtime_id,
+            } => st_drivers::codex_app_server::consumed_delivery_filenames(
+                state_dir, identity, runtime_id,
+            )?,
+            NativeDeliveryReceipts::OpenCode {
+                catalog_root,
+                identity,
+                runtime_id,
+            } => st_drivers::opencode_session::consumed_delivery_filenames(
+                catalog_root,
+                identity,
+                runtime_id,
+            )?,
+            _ => BTreeSet::new(),
+        };
+        let active: BTreeSet<_> = self
+            .messages
+            .iter()
+            .filter(|view| matches!(view.status.as_str(), "sent" | "staged" | "delivered"))
+            .map(|view| view.subject.clone())
+            .collect();
+        self.queued.retain(|key, _| active.contains(key));
+        let mut first_error = None;
+        for view in &self.messages {
+            if !active.contains(&view.subject) {
+                continue;
+            }
+            let result: Result<()> = async {
+                if consumed.contains(&view.subject) {
+                    if view.status != "delivered" {
+                        mailbox_receipt(client, &self.fence, &view.subject, "delivered").await?;
+                    }
+                    mailbox_receipt(client, &self.fence, &view.subject, "read").await?;
+                    return Ok(());
+                }
+                if view.status == "sent" {
+                    mailbox_receipt(client, &self.fence, &view.subject, "staged").await?;
+                }
+                if !self.queued.contains_key(&view.subject) {
+                    let body = message_content(client, view).await?;
+                    self.queued
+                        .insert(view.subject.clone(), native_queued_message(view, body));
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        // Keep uncertain handoffs in the native ledger until their read acknowledgement lands.
+        let mut queued: Vec<_> = self.queued.values().cloned().collect();
+        queued.sort_by(|left, right| (left.ts_ms, &left.filename).cmp(&(right.ts_ms, &right.filename)));
+        st_drivers::push_mailbox::replace_active(agent_dir, queued, active);
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+fn native_queued_message(view: &MessageView, body: String) -> st_drivers::message::Message {
+    let tags = vec![
+        format!("st3-message:{}", view.subject),
+        format!("{}{}", st_drivers::ding::ST3_TO_TAG, view.to),
+        format!(
+            "{}{}",
+            st_drivers::ding::ST3_SHA256_TAG,
+            st_drivers::ding::st3_body_sha256(&body)
+        ),
+    ];
+    st_drivers::message::Message {
+        filename: view.subject.clone(),
+        ts_ms: view.created_index,
+        from: Some(view.from.clone()),
+        subject: view.title.clone(),
+        in_reply_to: view.in_reply_to.clone(),
+        tags,
+        priority: None,
+        idempotency_key: None,
+        stream: None,
+        event_id: None,
+        event_key: None,
+        body,
+    }
+}
+
+async fn mailbox_receipt(
+    client: &Client,
+    fence: &st3::mailbox::Fence,
+    message: &str,
+    lifecycle: &str,
+) -> Result<()> {
+    mailbox_receipt_claim(client, fence, message, lifecycle).await?;
+    Ok(())
+}
+
+async fn mailbox_receipt_claim(
+    client: &Client,
+    fence: &st3::mailbox::Fence,
+    message: &str,
+    lifecycle: &str,
+) -> Result<ClaimRecord> {
+    client
+        .post(
+            "/v1/mailbox/receipts",
+            &st3::mailbox::Receipt {
+                fence: fence.clone(),
+                message: message.into(),
+                lifecycle: lifecycle.into(),
+            },
+        )
+        .await
+}
+
+fn seat_label(seat: &st3::model::DesiredSubject) -> String {
+    st3::mailbox::seat_label(seat)
+}
+fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> Result<()> {
+    let label = seat_label(seat);
+    let result = std::process::Command::new("pty")
+        .args(["rename", runtime_id, &label])
+        .output()?;
+    anyhow::ensure!(
+        result.status.success(),
+        "updating the PTY title failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     Ok(())
 }
 
@@ -15485,6 +15825,124 @@ mod tests {
         assert!(!resumed.delivered.contains("message/one"));
     }
 
+    #[tokio::test]
+    async fn pi_family_pending_read_survives_daemon_outage_and_reexec_under_its_fence() {
+        use axum::{Json, Router, routing::post};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("daemon.sock");
+        let client = Client::new(st3::client::Endpoint::Unix(path.clone()));
+        let mut fence = st3::mailbox::Fence::new("agent/eval.worker", "session-1", "delivery");
+        fence.epoch = 7; // The daemon's already-allocated binding, carried through exec.
+        let mut state = PiChannelResume {
+            incarnation: "session-1".into(),
+            session: "native-session".into(),
+            pending: PiFamilyReports {
+                fence: Some(fence.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.accept_frame(r#"{"type":"read","meta":{"messageId":"message/native"}}"#);
+        assert!(
+            state
+                .pending
+                .publish(
+                    &client,
+                    &fence.subject,
+                    "omp",
+                    &fence.incarnation,
+                    "native-session"
+                )
+                .await
+                .is_err()
+        );
+        assert!(state.pending.reads.contains("message/native"));
+        assert!(state.pending.acknowledgements.contains("message/native"));
+        let resume_path =
+            st_drivers::reexec::write_state(root.path(), "channel-resume", &state).unwrap();
+        let mut resumed: PiChannelResume = st_drivers::reexec::read_state(&resume_path).unwrap();
+        assert_eq!(
+            serde_json::to_value(resumed.pending.fence.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&fence).unwrap()
+        );
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = received.clone();
+        let expected = serde_json::to_value(&fence).unwrap();
+        let store = std::sync::Arc::new(
+            st3::store::Store::open(&root.path().join("graph.db"), "node").unwrap(),
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/native".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/eval".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("person/eval")),
+                    ("to".into(), json!(fence.subject)),
+                    ("content".into(), json!("QUARTZ SIGNAL")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("read-resume-send".into()),
+            })
+            .unwrap();
+        let graph = store.clone();
+        let app = Router::new().route(
+            "/v1/mailbox/receipts",
+            post(move |Json(receipt): Json<st3::mailbox::Receipt>| {
+                let received = captured.clone();
+                let expected = expected.clone();
+                let store = graph.clone();
+                async move {
+                    assert_eq!(serde_json::to_value(&receipt.fence).unwrap(), expected);
+                    received.lock().unwrap().push(receipt.lifecycle.clone());
+                    let record = store
+                        .append_claim(&ClaimInput {
+                            subject: receipt.message,
+                            kind: format!("message.{}", receipt.lifecycle),
+                            actor: Some(receipt.fence.subject),
+                            fields: BTreeMap::from([("status".into(), json!(receipt.lifecycle))]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: None,
+                        })
+                        .unwrap();
+                    Json(json!({"api_version":"st3.v1", "value":record}))
+                }
+            }),
+        );
+        let server_path = path.clone();
+        let server = tokio::spawn(async move {
+            st3::api::serve_unix(&server_path, app).await.unwrap();
+        });
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        resumed
+            .pending
+            .publish(
+                &client,
+                &fence.subject,
+                "omp",
+                &fence.incarnation,
+                "native-session",
+            )
+            .await
+            .unwrap();
+        assert!(resumed.pending.reads.is_empty());
+        assert!(resumed.pending.acknowledgements.is_empty());
+        assert_eq!(*received.lock().unwrap(), vec!["delivered", "read"]);
+        assert_eq!(
+            store.message("message/native").unwrap().unwrap().status,
+            "read"
+        );
+        assert!(!root.path().join("resources").exists());
+        server.abort();
+    }
     #[test]
     fn a_human_ask_survives_channel_replacement_until_an_answered_state_frame() {
         let mut state = PiChannelResume::default();
@@ -15541,6 +15999,7 @@ mod tests {
                 seq: 3,
             },
             loop_state: NativeLoopState {
+                mailbox_fence: None,
                 ready: true,
                 harness_record_started: true,
                 predecessor_harness_record: Some(b"ignored".to_vec()),
@@ -15590,42 +16049,6 @@ mod tests {
         assert!(card.contains(
             "FAULT        render refuses to change tracked file .claude/settings.local.json"
         ));
-    }
-
-    #[test]
-    fn agent_card_shows_mission_authority_and_its_source() {
-        let card = |authority: serde_json::Value| {
-            let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
-                "kind": "agent", "id": "agent/example/website/standing/website", "revision": "one",
-                "updated_at": "2026-09-29T12:00:00Z", "name": "Website",
-                "state": "running", "reachability": "local", "runtime_ids": [],
-                "mission_authority": authority
-            }))
-            .unwrap();
-            render_client_agent(&agent, &[], 0)
-        };
-        let namespace = serde_json::json!(["fleet/website/*"]);
-        assert!(
-            card(serde_json::json!({
-                "source": "default",
-                "publish": namespace, "start": namespace, "revise": namespace
-            }))
-            .contains("AUTHORITY    publish, start, revise mission/fleet/website/* (default)")
-        );
-        assert!(
-            card(serde_json::json!({
-                "source": "declared",
-                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"], "cancel": ["fleet/website/deploy"]
-            }))
-            .contains(
-                "AUTHORITY    publish, start mission/fleet/website/docs/*; start, cancel mission/fleet/website/deploy (declared)"
-            )
-        );
-        assert!(
-            card(serde_json::json!({"source": "declared"}))
-                .contains("AUTHORITY    no missions (declared)")
-        );
-        assert!(card(serde_json::json!({"source": "none"})).contains("AUTHORITY    no missions\n"));
     }
 
     #[test]
@@ -15851,13 +16274,11 @@ mod tests {
             "staged"
         );
 
-        // The late acknowledgement itself is still an invalid transition...
-        assert!(
-            deliver_message(&client, "message/held", seat, "late".into())
-                .await
-                .is_err()
-        );
-        // ...but it must not end the channel.
+        // The recipient's late acknowledgement settles to its existing read evidence.
+        deliver_message(&client, "message/held", seat, "late".into())
+            .await
+            .unwrap();
+        // Receipt replay must not end the channel or cause another handoff.
         acknowledge_pi_family_delivery(&client, seat, "message/held")
             .await
             .unwrap();
@@ -17837,7 +18258,7 @@ mod tests {
         };
         let joined = argv.join(" ");
         for expected in [
-            "--channels plugin:st3-channel@st3",
+            "--channels plugin:st-channel@st",
             "--model claude-opus-5-5",
             "--effort high",
             "--dangerously-skip-permissions",
@@ -18066,7 +18487,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_request_decisions_need_a_person() {
+    fn subscription_request_decisions_take_a_person_or_agent() {
         let cli = Cli::try_parse_from([
             "st3",
             "missions",
@@ -18085,6 +18506,7 @@ mod tests {
             panic!("the missions release command did not parse");
         };
         assert_eq!(args.actor, "person/operator");
+        // Free mode: an agent decides as itself; a bare name is still refused.
         assert!(
             Cli::try_parse_from([
                 "st3",
@@ -18094,7 +18516,20 @@ mod tests {
                 "--as",
                 "agent/node.triage",
                 "--reason",
-                "an agent cannot decide",
+                "an agent decides too",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "cancel-request",
+                "request-id",
+                "--as",
+                "operator",
+                "--reason",
+                "a bare name is not an actor",
             ])
             .is_err()
         );

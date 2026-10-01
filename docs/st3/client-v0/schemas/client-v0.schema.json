@@ -642,25 +642,11 @@
             "next_work": { "oneOf": [{ "$ref": "#/$defs/WorkLabel" }, { "type": "null" }] },
             "upcoming_work": { "type": "array", "items": { "$ref": "#/$defs/WorkLabel" } },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
-            "mission_authority": { "oneOf": [{ "$ref": "#/$defs/AgentMissionAuthority" }, { "type": "null" }] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
             "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present only for a local native seat whose harness can take work; a stale path makes the agent `waiting`." }
           }
         }
       ]
-    },
-    "AgentMissionAuthority": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["source"],
-      "description": "Missions the agent may publish, start, revise, and cancel. Patterns are exact mission IDs or terminal `/*` namespaces without `mission/`.",
-      "properties": {
-        "source": { "enum": ["declared", "default", "none"], "description": "`declared`: the declaration's `mission-authority`. `default`: a person-declared top-level seat `fleet/PROJECT/...` holds `fleet/PROJECT/*`. `none`: neither." },
-        "publish": { "type": "array", "items": { "type": "string" } },
-        "start": { "type": "array", "items": { "type": "string" } },
-        "revise": { "type": "array", "items": { "type": "string" } },
-        "cancel": { "type": "array", "items": { "type": "string" } }
-      }
     },
     "AgentDelivery": {
       "type": "object",

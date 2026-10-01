@@ -1,0 +1,86 @@
+[
+  {
+    "at_unix_ms": 1790866256372,
+    "pid": 2964132,
+    "event": "started"
+  },
+  {
+    "at_unix_ms": 1790866256506,
+    "pid": 2964132,
+    "event": "ready"
+  },
+  {
+    "at_unix_ms": 1790866256562,
+    "pid": 2964132,
+    "event": "seat-title",
+    "label": "eval/fault-probe"
+  },
+  {
+    "at_unix_ms": 1790866258443,
+    "pid": 2964132,
+    "event": "wire-frame",
+    "subject": "message/c73c88663195ac06"
+  },
+  {
+    "at_unix_ms": 1790866258444,
+    "pid": 2964132,
+    "event": "received",
+    "subject": "message/c73c88663195ac06",
+    "content": "<smalltalk-message id=\"c73c88663195ac06\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/c73c88663195ac06\">\nreceipt-token:warmup\n</smalltalk-message>"
+  },
+  {
+    "at_unix_ms": 1790866258478,
+    "pid": 2964132,
+    "event": "delivered",
+    "subject": "message/c73c88663195ac06",
+    "accepted_at_unix_ms": 1790866258453
+  },
+  {
+    "at_unix_ms": 1790866258497,
+    "pid": 2964132,
+    "event": "read",
+    "subject": "message/c73c88663195ac06",
+    "accepted_at_unix_ms": 1790866258481
+  },
+  {
+    "at_unix_ms": 1790866258516,
+    "pid": 2964132,
+    "event": "closed",
+    "subject": "message/c73c88663195ac06",
+    "accepted_at_unix_ms": 1790866258501
+  },
+  {
+    "at_unix_ms": 1790866263538,
+    "pid": 2964132,
+    "event": "wire-frame",
+    "subject": "message/457d5040b62fa33d"
+  },
+  {
+    "at_unix_ms": 1790866263538,
+    "pid": 2964132,
+    "event": "received",
+    "subject": "message/457d5040b62fa33d",
+    "content": "<smalltalk-message id=\"457d5040b62fa33d\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: link-seconds\" sha256=\"6bb75282de05b047fb03a965b364ce486e3286f9daf406fe508945d786acd0c5\" graph=\"message/457d5040b62fa33d\">\nreceipt-token:link-seconds\n</smalltalk-message>"
+  },
+  {
+    "at_unix_ms": 1790866263578,
+    "pid": 2964132,
+    "event": "delivered",
+    "subject": "message/457d5040b62fa33d",
+    "accepted_at_unix_ms": 1790866263559
+  },
+  {
+    "at_unix_ms": 1790866263622,
+    "pid": 2964132,
+    "event": "read",
+    "subject": "message/457d5040b62fa33d",
+    "accepted_at_unix_ms": 1790866263601
+  },
+  {
+    "at_unix_ms": 1790866263664,
+    "pid": 2964132,
+    "event": "closed",
+    "subject": "message/457d5040b62fa33d",
+    "accepted_at_unix_ms": 1790866263642
+  }
+]

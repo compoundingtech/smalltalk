@@ -12,6 +12,10 @@ pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
         TimelineBody::Error(error) if error.code == "transcript-not-bound" => Some(error),
         _ => None,
     })?;
+    // A seat that has said nothing since it started has no transcript yet; that is not a failure.
+    if not_yet(error) {
+        return None;
+    }
     let reason = error
         .message
         .strip_prefix("transcript not bound: ")
@@ -24,6 +28,11 @@ pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
             None => format!("This conversation could not be loaded: {reason}"),
         },
     )
+}
+
+/// st's notice that the seat's harness has written nothing since it started.
+fn not_yet(error: &st3_client::TimelineErrorBody) -> bool {
+    error.details.get("not_yet").and_then(Value::as_bool) == Some(true)
 }
 
 /// One conversation: the harness transcript and Small Talk messages, in time order.
@@ -191,6 +200,9 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     } else {
                         "delivery failing · retrying".into()
                     })
+                }
+                "transcript-not-bound" if not_yet(error) => {
+                    Body::Event("nothing in the harness yet since this seat started".into())
                 }
                 "native-delivery-recovered" => {
                     delivery.insert(entry.id.clone(), true);

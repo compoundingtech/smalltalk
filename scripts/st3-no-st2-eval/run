@@ -241,6 +241,11 @@ agent "no-st2" {{
         channel = [row for row in receipts(node) if row["event"] == "channel"]
         if not any(message in row["content"] for row in channel):
             fail("the message never reached the channel")
+        checks["projected_message_files"] = sum(
+            1 for path in (root / "state").rglob("*")
+            if path.is_file() and any(parent.name in ("inbox", "archive") for parent in path.parents))
+        if checks["projected_message_files"]:
+            fail("the Claude push seat projected inbox/archive message files")
 
         doctor = node.api("/v1/doctor") or {}
         hook_check = next((row for row in doctor.get("checks", []) if row.get("name") == "claude-hooks"), None)

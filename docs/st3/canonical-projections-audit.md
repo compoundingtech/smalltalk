@@ -50,6 +50,8 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `run_generations` | Shared projection | Shared generation identity, revision, predecessor, actor/reason, status and durable timestamps. |
 | `step_runs` | Shared projection | Shared step definition/selector, attempt, worker result, durable claimant/incarnation, readiness/blocking and ownership. lease_expires_at_unix_ms and updated_at_unix_ms currently receive local renewal overlays: split or recover their replicated anchors for hashing; do not hash the effective local overlay. |
 | `local_work_lease_renewals` | Local | Local lease extensions, re-applied after canonical replay. Durable replicated lease anchors remain shared. |
+| `local_mailbox_owners` | Local | This daemon's native socket subscription owner, live runtime incarnation and replacement epoch. Survives daemon restart; excluded from replicated projection digests. |
+| `local_mailbox_bindings` | Local | Stable binding request tokens mapped to daemon-allocated epochs. Lost acknowledgements retry the same binding; retired tokens cannot allocate a successor. Excluded from replicated projection digests. |
 | `local_observations` | Local | Local-retention observations and their local frontier/id; never replicated. |
 | `local_subscription_mission_deferrals` | Local | Local reconciler capacity backoff/retry scheduling. |
 | `local_usage_totals` | Local | Local provider usage accumulation before publication. |

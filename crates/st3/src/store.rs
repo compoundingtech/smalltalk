@@ -499,6 +499,21 @@ WHERE lease_owner IS NOT NULL;
 -- The steps that have not finished, a few of every step a fleet has run.
 CREATE INDEX IF NOT EXISTS step_runs_open_index ON step_runs(created_at_unix_ms, step_path)
 WHERE status NOT IN ('completed','failed','cancelled');
+-- This daemon's native subscription ownership is transport state, outside shared projections.
+CREATE TABLE IF NOT EXISTS local_mailbox_owners (
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    PRIMARY KEY(subject, component)
+);
+CREATE TABLE IF NOT EXISTS local_mailbox_bindings (
+    token TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    epoch INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
     subject TEXT PRIMARY KEY,
     attempt INTEGER NOT NULL,
@@ -4254,9 +4269,7 @@ impl Store {
         let actor = normalize_actor(actor, "agent");
         let old = crate::mission::run_mission(old, current.after.as_deref())?;
         let mission = &crate::mission::run_mission(mission.clone(), current.after.as_deref())?;
-        let variables = mission_run_variables(&current, &mission.revision);
-        let (compatible, reviewers) =
-            analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?;
+        let (compatible, reviewers) = analyze_mission_revision(&old, mission, &current.requester)?;
         let compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
         let cutover = old.revision_cutover.clone();
         let status = if reviewers.is_empty() {
@@ -5329,7 +5342,7 @@ impl Store {
         let (compatible, reviewers) = if protected_approved || retry {
             (compatible_step_paths(&old, mission), BTreeSet::new())
         } else {
-            analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?
+            analyze_mission_revision(&old, mission, &current.requester)?
         };
         let mut compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
         if reopening {
@@ -8428,8 +8441,7 @@ impl Store {
                     }
                     let predecessors = intent_leaves_tx(transaction, subject).map_err(internal)?;
                     let body = serde_json::to_value(desired).map_err(internal)?;
-                    // The writer decides whether a top-level project seat holds default mission
-                    // authority; see `graph::effective_agent_mission_authority`.
+                    // The claim records its writer as its actor.
                     let claim_id = claim_hash(
                         &batch_id,
                         subject,
@@ -8500,12 +8512,13 @@ impl Store {
                     let predecessors =
                         mission_definition_token_tx(transaction, &mission.id).map_err(internal)?;
                     let body = serde_json::to_value(mission).map_err(internal)?;
+                    // The publication records its publisher, as a declaration records its writer.
                     let claim_id = claim_hash(
                         &batch_id,
                         &mission.subject,
                         "mission.published",
                         &self.origin,
-                        None,
+                        actor,
                         &body,
                         &predecessors,
                     )
@@ -8517,7 +8530,7 @@ impl Store {
                         &mission.subject,
                         "mission.published",
                         &self.origin,
-                        None,
+                        actor,
                         &body,
                         &predecessors,
                         now,
@@ -9013,6 +9026,23 @@ impl Store {
         &self,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
+        self.append_claim_fenced_outcome(input, None)
+    }
+
+    pub(crate) fn append_mailbox_receipt(
+        &self,
+        input: &ClaimInput,
+        fence: &crate::mailbox::Fence,
+    ) -> Result<ClaimRecord, St3Error> {
+        self.append_claim_fenced_outcome(input, Some(fence))
+            .map(|(claim, _)| claim)
+    }
+
+    fn append_claim_fenced_outcome(
+        &self,
+        input: &ClaimInput,
+        fence: Option<&crate::mailbox::Fence>,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
         self.validate_claim_input(input)?;
         if local_retention(&input.kind)
             || (input.actor.is_none() && system_local_retention(&input.kind))
@@ -9027,6 +9057,19 @@ impl Store {
         // batch commits.
         self.connection
             .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+                let settled_receipt = if let Some(fence) = fence {
+                    check_mailbox_fence(transaction, fence)?;
+                    let index = transaction.query_row(
+                        "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
+                        [&input.subject], |row| row.get::<_, Option<u64>>(0),
+                    ).map_err(internal)?.ok_or_else(|| St3Error::new("missing-message", "message does not exist"))?;
+                    let message = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
+                    if message.to != fence.subject || input.actor.as_deref() != Some(&fence.subject) {
+                        return Err(St3Error::new("wrong-message-recipient", "receipt belongs to another seat"));
+                    }
+                    matches!((input.kind.as_str(), message.status.as_str()),
+                        ("message.staged", "delivered" | "read" | "closed") | ("message.delivered", "read" | "closed") | ("message.read", "closed"))
+                } else { false };
                 if let Some((operation_id, request_digest)) = &operation
                     && let Some((stored_digest, canonical_claim, state)) =
                         operation_tx(transaction, operation_id).map_err(internal)?
@@ -9109,7 +9152,7 @@ impl Store {
                     );
                     stored_fields = Some(fields);
                 }
-                if validate_message_transition(transaction, input)? {
+                if settled_receipt || validate_message_transition(transaction, input)? {
                     let latest_id = latest_claim_id_tx(transaction, &input.subject)
                         .map_err(internal)?
                         .ok_or_else(|| {
@@ -10315,45 +10358,6 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// The current desired declaration of `subject` and the actor its claim records. A
-    /// declaration from before claims recorded their writer, or the daemon's own, has none.
-    pub fn desired_subject_with_writer(
-        &self,
-        subject: &str,
-    ) -> Result<Option<(DesiredSubject, Option<String>)>> {
-        let connection = self.readers.get();
-        connection
-            .query_row(
-                "SELECT desired.subject, desired.kind, desired.body, desired.member,
-                        desired.owner_run, desired.owner_generation, desired.owner_step,
-                        claims.actor
-                 FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
-                 WHERE desired.subject = ?1",
-                [subject],
-                |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    /// Each current agent declaration with the actor its claim records, as
-    /// `desired_subject_with_writer` reads one.
-    pub fn agent_declarations_with_writers(&self) -> Result<Vec<(DesiredSubject, Option<String>)>> {
-        let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT desired.subject, desired.kind, desired.body, desired.member,
-                    desired.owner_run, desired.owner_generation, desired.owner_step,
-                    claims.actor
-             FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
-             WHERE desired.kind = 'agent'
-             ORDER BY desired.subject",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
     /// Among `subjects`, each declaration whose member this build cannot read, with the reason.
     /// `desired_subjects` gives such a declaration no member at all.
     pub fn unreadable_members(&self, subjects: &[&str]) -> Result<Vec<(String, String)>> {
@@ -11270,16 +11274,13 @@ impl Store {
         } else {
             format!("attention/{subject}")
         };
-        // Any person can close any item, whoever it was routed to, so an item routed to an agent
-        // or to another person never outlives everyone who could close it. The resolution
-        // records who closed it. An agent withdraws its own requests instead.
+        // Any person or agent can close any item, whoever it was routed to, so an item never
+        // outlives everyone who could close it. The resolution records who closed it.
         let actor = normalize_actor(&request.actor, "person");
-        if !actor.starts_with("person/") {
+        if !(actor.starts_with("person/") || actor.starts_with("agent/")) {
             return Err(St3Error::new(
-                "attention-resolver-not-person",
-                format!(
-                    "only a person resolves or dismisses attention request `{subject}`; its requester can withdraw it"
-                ),
+                "invalid-attention-resolver",
+                format!("`{actor}` is neither a person nor an agent"),
             ));
         }
         let current = self
@@ -12435,17 +12436,18 @@ impl Store {
             .collect())
     }
 
-    /// Release a held subscription request, or cancel a pending or held one, as a person.
+    /// Release a held subscription request, or cancel a pending or held one, as a person or an
+    /// agent.
     pub fn decide_subscription_request(
         &self,
         request: &str,
         decision: &str,
         input: &SubscriptionRequestDecision,
     ) -> Result<SubscriptionRequestView, St3Error> {
-        if !input.actor.starts_with("person/") {
+        if !(input.actor.starts_with("person/") || input.actor.starts_with("agent/")) {
             return Err(St3Error::new(
-                "subscription-request-person-only",
-                "only a person may release or cancel a subscription request",
+                "invalid-subscription-request-actor",
+                "a subscription request decision needs a person or agent actor",
             ));
         }
         if input.reason.trim().is_empty() {
@@ -13557,6 +13559,82 @@ impl Store {
         }
         cache.insert(subject.to_owned(), (newest, value.clone()));
         Ok(value)
+    }
+
+    /// Local subscription ownership survives a daemon outage; an older channel cannot retake it.
+    pub(crate) fn bind_mailbox(
+        &self,
+        request: &crate::mailbox::Fence,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        let mut connection = self.connection.write();
+        let tx = connection.transaction().map_err(internal)?;
+        check_mailbox_incarnation(&tx, request)?;
+        if request.epoch != 0 {
+            check_mailbox_fence(&tx, request)?;
+            return Ok(request.clone());
+        }
+        if request.token.is_empty() || request.token.len() > 128 {
+            return Err(St3Error::new(
+                "invalid-mailbox-token",
+                "binding requires a stable request token",
+            ));
+        }
+        let prior: Option<(String, String, String, u64)> = tx.query_row(
+            "SELECT subject, component, incarnation, epoch FROM local_mailbox_bindings WHERE token=?1",
+            [&request.token], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional().map_err(internal)?;
+        let mut bound = request.clone();
+        if let Some((subject, component, incarnation, epoch)) = prior {
+            if (subject, component, incarnation)
+                != (
+                    request.subject.clone(),
+                    request.component.clone(),
+                    request.incarnation.clone(),
+                )
+            {
+                return Err(St3Error::new(
+                    "invalid-mailbox-token",
+                    "binding token belongs to another session",
+                ));
+            }
+            bound.epoch = epoch;
+            // Retired tokens cannot allocate another epoch and retake their successor's mailbox.
+            check_mailbox_fence(&tx, &bound)?;
+            return Ok(bound);
+        }
+        let previous: Option<u64> = tx
+            .query_row(
+                "SELECT epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
+                params![request.subject, request.component],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        bound.epoch = previous
+            .unwrap_or(0)
+            .checked_add(1)
+            .filter(|epoch| *epoch <= i64::MAX as u64)
+            .ok_or_else(|| St3Error::new("internal", "mailbox epoch exhausted"))?;
+        tx.execute(
+            "INSERT INTO local_mailbox_bindings VALUES (?1,?2,?3,?4,?5)",
+            params![
+                bound.token,
+                bound.subject,
+                bound.component,
+                bound.incarnation,
+                bound.epoch
+            ],
+        )
+        .map_err(internal)?;
+        tx.execute("INSERT INTO local_mailbox_owners VALUES (?1,?2,?3,?4)
+            ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation, epoch=excluded.epoch",
+            params![bound.subject, bound.component, bound.incarnation, bound.epoch]).map_err(internal)?;
+        tx.commit().map_err(internal)?;
+        Ok(bound)
+    }
+
+    pub(crate) fn check_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
+        check_mailbox_fence(&self.readers.get(), fence)
     }
 
     pub fn current_harness(
@@ -16454,8 +16532,7 @@ fn adopt_declared_mission_revision_tx(
     let old = crate::mission::run_mission(old, current.after.as_deref())?;
     let next = crate::mission::run_mission(next, current.after.as_deref())?;
     let variables = mission_run_variables(&current, &next.revision);
-    let (compatible, reviewers) =
-        analyze_mission_revision(&old, &next, &actor, &current.requester, &variables)?;
+    let (compatible, reviewers) = analyze_mission_revision(&old, &next, &current.requester)?;
     let compatible = carried_revision_step_paths(&old, &next, &current.steps, compatible);
     if !reviewers.is_empty() || matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
         if operation.cancellation.is_some() {
@@ -19107,6 +19184,25 @@ fn validate_message_transition(
     if requested != "sent" && current == Some(requested) {
         return Ok(true);
     }
+    if matches!(
+        (current, requested),
+        (Some("delivered" | "read" | "closed"), "staged")
+            | (Some("read" | "closed"), "delivered")
+            | (Some("closed"), "read")
+    ) && input.actor.is_some()
+    {
+        let index: Option<u64> = transaction
+            .query_row("SELECT created_index FROM message_index WHERE subject=?1", [&input.subject], |row| row.get(0))
+            .optional().map_err(internal)?;
+        if let Some(index) = index {
+            let message = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
+            if !message.to.is_empty() && input.actor.as_deref() == Some(message.to.as_str()) {
+                // Legacy channels also replay receipts after a lost response/reconnect.
+                // Settle to existing evidence without admitting a backward lifecycle claim.
+                return Ok(true);
+            }
+        }
+    }
     let valid = matches!(
         (current, requested),
         (None, "sent")
@@ -19735,6 +19831,92 @@ fn newest_claims_of_kind_query(columns: &str, kind: &str) -> String {
          WHERE claims.subject=?1 AND claims.kind='{kind}' AND +claims.store_index<=?2
          ORDER BY {CANONICAL_ORDER_DESC}"
     )
+}
+
+fn check_mailbox_incarnation(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+) -> Result<(), St3Error> {
+    let runtime: Option<String> = connection
+        .prepare_cached(&format!(
+            "{} LIMIT 1",
+            newest_claims_of_kind_query("claims.body", "runtime.observed")
+        ))
+        .map_err(internal)?
+        .query_row(params![fence.subject, i64::MAX], |row| row.get(0))
+        .optional()
+        .map_err(internal)?;
+    let runtime: Value = serde_json::from_str(&runtime.unwrap_or_default()).unwrap_or(Value::Null);
+    let fields = runtime.get("fields").unwrap_or(&runtime);
+    let live = fields.get("status").and_then(Value::as_str) == Some("running")
+        && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
+    if !live
+        && matches!(
+            fields.get("status").and_then(Value::as_str),
+            None | Some("starting")
+        )
+    {
+        let harness: Option<String> = connection
+            .prepare_cached(&format!(
+                "{} LIMIT 1",
+                newest_claims_of_kind_query("claims.body", "harness.observed")
+            ))
+            .map_err(internal)?
+            .query_row(params![fence.subject, i64::MAX], |row| row.get(0))
+            .optional()
+            .map_err(internal)?;
+        if let Some(harness) = harness {
+            let harness: Value = serde_json::from_str(&harness).map_err(internal)?;
+            let fields = harness.get("fields").unwrap_or(&harness);
+            if fields.get("state").and_then(Value::as_str) == Some("starting")
+                && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation)
+            {
+                // The provider can start before reconciliation publishes runtime.running.
+                // Retry without allocating ownership or authorizing any mailbox reads/receipts.
+                return Err(St3Error::new(
+                    "mailbox-session-starting",
+                    "waiting for the seat's running incarnation",
+                ));
+            }
+        }
+    }
+    let ended = current_harness_at(connection, &fence.subject, None)
+        .map_err(internal)?
+        .is_some_and(|harness| harness.state == "ended");
+    if !live || ended {
+        return Err(St3Error::new(
+            "stale-mailbox-session",
+            "this is not the seat's live incarnation",
+        ));
+    }
+
+    Ok(())
+}
+
+fn check_mailbox_fence(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+) -> Result<(), St3Error> {
+    check_mailbox_incarnation(connection, fence)?;
+    let owner: Option<(String, u64)> = connection
+        .query_row(
+            "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner
+             JOIN local_mailbox_bindings binding ON binding.token=?3
+               AND binding.subject=owner.subject AND binding.component=owner.component
+               AND binding.incarnation=owner.incarnation AND binding.epoch=owner.epoch
+             WHERE owner.subject=?1 AND owner.component=?2",
+            params![fence.subject, fence.component, fence.token],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    if owner != Some((fence.incarnation.clone(), fence.epoch)) {
+        return Err(St3Error::new(
+            "stale-mailbox-session",
+            "a newer channel owns this seat",
+        ));
+    }
+    Ok(())
 }
 
 fn current_harness_at(
@@ -29203,9 +29385,7 @@ fn interpolate_goals(
 pub(crate) fn analyze_mission_revision(
     old: &MissionSpec,
     new: &MissionSpec,
-    actor: &str,
     requester: &str,
-    variables: &BTreeMap<String, String>,
 ) -> Result<(BTreeSet<String>, BTreeSet<String>), St3Error> {
     let old_hashes = step_hashes(old);
     let new_hashes = step_hashes(new);
@@ -29225,73 +29405,31 @@ pub(crate) fn analyze_mission_revision(
         ));
     }
 
-    let actor = normalize_actor(
-        actor,
-        if actor.starts_with("person/") {
-            "person"
-        } else {
-            "agent"
-        },
-    );
     let requester = normalize_actor(requester, "person");
-    let metadata = revision_metadata(old, &requester, variables)?;
-    // A person may revise any part of a run. Human-only protection still selects its reviewers.
-    if actor != requester && !actor.starts_with("person/") {
-        for path in &changed {
-            let meta = metadata_for_changed_path(&metadata, path);
-            if !meta.owners.contains(&actor) {
-                return Err(St3Error::new(
-                    "revision-outside-graph-location",
-                    format!(
-                        "`{actor}` cannot revise `{}` from its current graph location",
-                        if path.is_empty() {
-                            old.id.as_str()
-                        } else {
-                            path
-                        }
-                    ),
-                ));
-            }
-        }
-    }
+    let metadata = revision_reviewers(old, &requester);
+    // Free mode: a person or an agent may revise any part of a run. Human-only protection still
+    // selects its reviewers.
     let mut reviewers = BTreeSet::new();
     for path in &changed {
-        reviewers.extend(
-            metadata_for_changed_path(&metadata, path)
-                .reviewers
-                .iter()
-                .cloned(),
-        );
+        reviewers.extend(reviewers_for_changed_path(&metadata, path).iter().cloned());
     }
     Ok((compatible_step_paths(old, new), reviewers))
 }
 
-#[derive(Clone, Default)]
-struct RevisionMetadata {
-    owners: BTreeSet<String>,
-    reviewers: BTreeSet<String>,
-}
-
-fn revision_metadata(
+/// The reviewers each mission or step path's human-only revision protection selects.
+fn revision_reviewers(
     mission: &MissionSpec,
     requester: &str,
-    variables: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, RevisionMetadata>, St3Error> {
+) -> BTreeMap<String, BTreeSet<String>> {
     fn collect(
         mission: &MissionSpec,
         requester: &str,
-        variables: &BTreeMap<String, String>,
-        inherited: RevisionMetadata,
-        output: &mut BTreeMap<String, RevisionMetadata>,
-    ) -> Result<(), St3Error> {
-        let mut mission_meta = inherited;
-        for owner in &mission.revision_owners {
-            mission_meta
-                .owners
-                .insert(crate::mission::interpolate(owner, variables)?);
-        }
+        inherited: BTreeSet<String>,
+        output: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        let mut mission_reviewers = inherited;
         if mission.revisions_human_only {
-            mission_meta.reviewers.insert(
+            mission_reviewers.insert(
                 mission
                     .revision_reviewer
                     .as_deref()
@@ -29299,51 +29437,39 @@ fn revision_metadata(
                     .to_owned(),
             );
         }
-        output.insert(String::new(), mission_meta.clone());
+        output.insert(String::new(), mission_reviewers.clone());
         for id in &mission.display_order {
             let step = &mission.steps[id];
-            let mut step_meta = mission_meta.clone();
-            for owner in &step.revision_owners {
-                step_meta
-                    .owners
-                    .insert(crate::mission::interpolate(owner, variables)?);
-            }
+            let mut step_reviewers = mission_reviewers.clone();
             if step.revisions_human_only {
-                step_meta.reviewers.insert(
+                step_reviewers.insert(
                     step.revision_reviewer
                         .as_deref()
                         .unwrap_or(requester)
                         .to_owned(),
                 );
             }
-            output.insert(step.path.clone(), step_meta.clone());
+            output.insert(step.path.clone(), step_reviewers.clone());
             if let Some(nested) = &step.nested_mission {
-                let mut nested_meta = BTreeMap::new();
-                collect(nested, requester, variables, step_meta, &mut nested_meta)?;
-                for (path, meta) in nested_meta {
+                let mut nested_reviewers = BTreeMap::new();
+                collect(nested, requester, step_reviewers, &mut nested_reviewers);
+                for (path, reviewers) in nested_reviewers {
                     if !path.is_empty() {
-                        output.insert(path, meta);
+                        output.insert(path, reviewers);
                     }
                 }
             }
         }
-        Ok(())
     }
     let mut output = BTreeMap::new();
-    collect(
-        mission,
-        requester,
-        variables,
-        RevisionMetadata::default(),
-        &mut output,
-    )?;
-    Ok(output)
+    collect(mission, requester, BTreeSet::new(), &mut output);
+    output
 }
 
-fn metadata_for_changed_path<'a>(
-    metadata: &'a BTreeMap<String, RevisionMetadata>,
+fn reviewers_for_changed_path<'a>(
+    metadata: &'a BTreeMap<String, BTreeSet<String>>,
     path: &str,
-) -> &'a RevisionMetadata {
+) -> &'a BTreeSet<String> {
     metadata
         .iter()
         .filter(|(candidate, _)| {
@@ -44635,7 +44761,7 @@ version 2
     }
 
     #[test]
-    fn assigned_work_does_not_grant_revision_authority() {
+    fn an_agent_revises_outside_its_graph_location_as_itself() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
             let intent = crate::graph::parse_test_intent(source, "node").unwrap();
@@ -44691,16 +44817,19 @@ version 2
 "#,
             "authority-two",
         );
-        let error = store
+        // Free mode: an agent revises any part of a run, and the revision records it as actor.
+        let revised = store
             .adopt_mission_revision(
                 &run.id,
                 &escalated,
                 &worker,
-                "grant authority in the candidate graph",
+                "declare a seat in the candidate graph",
                 "authority-cutover",
             )
-            .unwrap_err();
-        assert_eq!(error.code, "revision-outside-graph-location");
+            .unwrap();
+        assert_ne!(revised.generation, run.generation);
+        let generation = store.run_generation(&revised.generation).unwrap().unwrap();
+        assert_eq!(generation.actor, worker);
     }
 
     const CARRY_SOURCE: &str = r#"
@@ -44741,7 +44870,7 @@ version 2
     }
 
     #[test]
-    fn a_person_can_revise_a_run_from_outside_its_graph_location() {
+    fn a_person_revises_a_run_from_outside_its_graph_location() {
         let store = Store::open_memory("node").unwrap();
         publish_carry(&store, CARRY_SOURCE, "carry-one");
         let run = store
@@ -44761,16 +44890,6 @@ version 2
             "carry-two",
         );
 
-        let agent = store
-            .adopt_mission_revision(
-                &run.id,
-                &revised,
-                "agent/node.worker",
-                "an assigned agent does not own the mission",
-                "agent-revision",
-            )
-            .unwrap_err();
-        assert_eq!(agent.code, "revision-outside-graph-location");
         let adopted = store
             .adopt_mission_revision(
                 &run.id,
@@ -44904,16 +45023,9 @@ version 2
             "assigned-to \"agent/node.one\"",
             "completion { depends-on { step \"work\" completed } }",
         );
-        let variables = BTreeMap::new();
         for candidate in [&selector_changed, &completion_changed] {
-            let (compatible, _) = analyze_mission_revision(
-                &old,
-                candidate,
-                "person/requester",
-                "person/requester",
-                &variables,
-            )
-            .unwrap();
+            let (compatible, _) =
+                analyze_mission_revision(&old, candidate, "person/requester").unwrap();
             if std::ptr::eq(candidate, &selector_changed) {
                 assert!(compatible.is_empty());
             } else {
@@ -46953,24 +47065,24 @@ mission "typecase" state="ready" {
                 .is_empty()
         );
 
-        let agent = AttentionResolveRequest {
+        let unknown = AttentionResolveRequest {
             outcome: "resolved".into(),
             reason: None,
-            actor: "agent/fabric/worker".into(),
-            idempotency_key: "resolve-fabric-agent".into(),
+            actor: "client/unknown".into(),
+            idempotency_key: "resolve-fabric-unknown".into(),
         };
         assert_eq!(
             store
-                .resolve_attention(&first.subject, &agent)
+                .resolve_attention(&first.subject, &unknown)
                 .unwrap_err()
                 .code,
-            "attention-resolver-not-person"
+            "invalid-attention-resolver"
         );
-        // Any person can close an item routed to another person.
+        // Any agent can close an item routed to a person, and is recorded as the resolver.
         let resolution = AttentionResolveRequest {
             outcome: "dismissed".into(),
             reason: Some("The fault is expected during maintenance.".into()),
-            actor: "someone-else".into(),
+            actor: "agent/fabric/other".into(),
             idempotency_key: "resolve-fabric".into(),
         };
         let closed = store
@@ -46984,7 +47096,7 @@ mission "typecase" state="ready" {
                 .unwrap()
                 .actor
                 .as_deref(),
-            Some("person/someone-else")
+            Some("agent/fabric/other")
         );
         assert_eq!(closed.outcome.as_deref(), Some("dismissed"));
         assert!(store.attention_items(None).unwrap().is_empty());
