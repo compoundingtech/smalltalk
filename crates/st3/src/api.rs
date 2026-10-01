@@ -13438,7 +13438,7 @@ agent "good" {{ workspace {:?}; command "true" }}
         state.configured_peers = vec!["alder".into()];
         let mut registry = st3_schema::registry().clone();
         registry.claims.remove("doc.bound").unwrap();
-        Arc::get_mut(&mut state.store).unwrap().claim_registry = Some(registry);
+        state.store.set_claim_registry(registry);
         state.store.bind_fleet("fleet/waiting").unwrap();
         let source = Store::open_memory("alder").unwrap();
         source.bind_fleet("fleet/waiting").unwrap();

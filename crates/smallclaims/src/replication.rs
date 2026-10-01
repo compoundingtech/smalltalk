@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::claim::ReplicaBatch;
 use crate::claim::{ReplicaEnvelope, ReplicaEnvelopeId, ReplicaEnvelopeSignature};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -486,4 +488,33 @@ pub struct ReplicationRepairRequest {
     pub reason: String,
     pub actor: String,
     pub idempotency_key: String,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationBatch {
+    pub peer: String,
+    #[serde(default)]
+    pub replica_heads: BTreeMap<String, u64>,
+    pub batches: Vec<ReplicaBatch>,
+    pub blobs: BTreeMap<String, Vec<u8>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationResponse {
+    pub accepted_through: u64,
+    pub missing_sequences: Vec<u64>,
+    #[serde(default)]
+    pub accepted_heads: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub missing_ranges: Vec<ReplicaRange>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicaRange {
+    pub origin: String,
+    pub from: u64,
+    pub through: u64,
 }

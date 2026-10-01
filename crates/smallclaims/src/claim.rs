@@ -90,3 +90,23 @@ pub struct ReplicaEnvelopePayload {
     pub batch: ReplicaBatch,
     pub blobs: BTreeMap<String, Vec<u8>>,
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DocumentVersion {
+    pub name: String,
+    pub hash: String,
+    pub size: u64,
+    pub created_index: u64,
+    pub latest: bool,
+    pub binding_claim_id: String,
+    #[serde(default)]
+    pub created_at_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClaimsPage {
+    pub claims: Vec<ClaimRecord>,
+    pub next_cursor: Option<u64>,
+}
