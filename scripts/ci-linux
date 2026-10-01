@@ -34,7 +34,13 @@ clippy_and_codegen() {
 start=$SECONDS status=0
 case "$stage" in
   # The nextest --no-run step already compiled the test executables.
-  tests) cargo nextest run --workspace --locked --profile ci 2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  # TRIAL ONLY (Namespace trial copy of #849): skip the messaging fault matrix exactly as st/ci skips it
+  # this week; it returns as parallel tests. Without the skip every case times out in fixture
+  # startup and its 30-second retries keep this job running for tens of minutes. The -E expression
+  # is combined with the ci profile's default-filter. Remove it when the matrix is parallelized.
+  tests) cargo nextest run --workspace --locked --profile ci \
+    -E 'not test(/^messaging_faults::messages_recover_across_transport_and_process_faults$/)' \
+    2>&1 | tee "$logs/$stage.log" || status=$? ;;
   clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   fleet-compat) fleet_compat 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   *) echo "unknown stage: $stage" >&2; exit 2 ;;
