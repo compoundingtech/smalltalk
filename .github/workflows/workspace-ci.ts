@@ -21,10 +21,24 @@ export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG
  */
 export const workspacePreparationSteps = [
   { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
+  // Namespace cache volume: the last committed cache is mounted at these paths for every run.
+  // Needs a cache volume on the runner profile; the step's log says whether one is attached.
+  {
+    name: 'Mount Rust and Nix caches',
+    id: 'cache',
+    if: "runner.os == 'Linux'",
+    uses: 'namespacelabs/nscloud-cache-action@v1',
+    with: {
+      cache: 'rust',
+      path: '${{ github.workspace }}/target\n~/.cache/st-ci\n/nix',
+    },
+  },
   ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
   {
     name: 'Isolate test home and XDG state',
-    run: `home="$RUNNER_TEMP/test-home"
+    run: `# The cached Cargo registry lives under the real HOME; tests get the isolated one.
+printf 'CARGO_HOME=%s\\nCI_CLIPPY_TARGET=%s\\n' "\${CARGO_HOME:-$HOME/.cargo}" "$HOME/.cache/st-ci/clippy-target" >> "$GITHUB_ENV"
+home="$RUNNER_TEMP/test-home"
 mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
 printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_STATE_HOME=%s/.local/state\\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"`,
   },

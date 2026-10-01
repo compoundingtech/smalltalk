@@ -42,7 +42,9 @@ trial_skips+=' | test(/^transport_isolation::(exec|pty)_task_survives_transport_
 trial_skips+=' | test(/^nomad_survival::managed_agent_color_contract_crosses_systemd_scope$/)'
 run_stage test cargo nextest run --workspace --locked --profile ci -E "($ST2_FILTER) and not ($trial_skips)" &
 test_pid=$!
-run_stage clippy env CARGO_TARGET_DIR="$RUNNER_TEMP/clippy-target" cargo clippy --workspace --all-targets --locked &
+# The real HOME's cache directory is mounted from the Namespace cache volume; fall back to the run's temp.
+clippy_target="${CI_CLIPPY_TARGET:-$RUNNER_TEMP/clippy-target}"
+run_stage clippy env CARGO_TARGET_DIR="$clippy_target" cargo clippy --workspace --all-targets --locked &
 clippy_pid=$!
 run_stage codegen cargo run --locked -p st3-client-codegen -- --check &
 codegen_pid=$!
