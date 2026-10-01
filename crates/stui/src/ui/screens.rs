@@ -3,7 +3,7 @@
 //! A screen produces sidebar items and a detail `Doc`. It never draws cells itself; the
 //! shell owns layout, scrolling, selection and clicks.
 
-use super::doc::{Doc, Hit, meter};
+use super::doc::{Doc, DocExt, Hit, meter};
 use super::text::{self, run};
 use super::theme;
 use super::view::*;
