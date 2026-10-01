@@ -141,6 +141,9 @@ WHERE kind='message.sent';
 CREATE INDEX IF NOT EXISTS claims_actor_progress_index
 ON claims(actor, store_index)
 WHERE kind IN ('work.progress', 'work.submitted');
+CREATE INDEX IF NOT EXISTS claims_actor_work_activity_index
+ON claims(actor, json_extract(body, '$.fields.claim_incarnation'), store_index)
+WHERE kind IN ('work.claimed', 'work.progress');
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
@@ -11095,6 +11098,8 @@ impl Store {
 
     pub fn pending_observer_refresh_attempt(&self, observer: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
+        // The observations are listed once, not scanned for each request; see
+        // `pending_subscription_mission_requests`.
         connection
             .query_row(
                 &canonical_sql(
@@ -11102,12 +11107,14 @@ impl Store {
                  FROM claims request
                  WHERE request.subject=?1
                    AND request.kind='observer.refresh-requested'
-                   AND NOT EXISTS (
-                     SELECT 1 FROM claims result
-                     WHERE result.subject=request.subject
-                       AND result.kind IN ('observer.observed', 'observer.state')
-                       AND json_extract(result.body, '$.fields.attempt')=
-                           json_extract(request.body, '$.fields.attempt')
+                   AND (
+                     json_extract(request.body, '$.fields.attempt') IS NULL
+                     OR json_extract(request.body, '$.fields.attempt') NOT IN (
+                       SELECT json_extract(result.body, '$.fields.attempt') FROM claims result
+                       WHERE result.subject=?1
+                         AND result.kind IN ('observer.observed', 'observer.state')
+                         AND json_extract(result.body, '$.fields.attempt') IS NOT NULL
+                     )
                    )
                  ORDER BY CANONICAL_ASC(request)
                  LIMIT 1",
@@ -12531,21 +12538,24 @@ impl Store {
 
     pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
         let connection = self.readers.get();
+        // Every pass asks this for every subscription. The finished requests are listed once, not
+        // scanned for each request: a correlated NOT EXISTS read every finished claim once per
+        // request, 0.4 s a pass for a subscription with hundreds of runs.
         let mut statement = connection.prepare(&canonical_sql(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
              FROM claims AS request
              WHERE request.subject=?1 AND request.kind='subscription.mission-requested'
-               AND NOT EXISTS (
-                 SELECT 1 FROM claims AS finished
-                 WHERE finished.subject=request.subject
+               AND request.id NOT IN (
+                 SELECT json_extract(finished.body, '$.fields.request') FROM claims AS finished
+                 WHERE finished.subject=?1
                    AND finished.kind IN (
                      'subscription.mission-started',
                      'subscription.mission-failed',
                      'subscription.mission-request-cancelled'
                    )
-                   AND json_extract(finished.body, '$.fields.request')=request.id
+                   AND json_extract(finished.body, '$.fields.request') IS NOT NULL
                )
              ORDER BY CANONICAL_ASC(request)",
         ))?;
@@ -12720,11 +12730,11 @@ impl Store {
                     request.predecessors, request.accepted_at_unix_ms
              FROM claims AS request
              WHERE request.subject=?1 AND request.kind='schedule.work-requested'
-               AND NOT EXISTS (
-                 SELECT 1 FROM claims AS closed
-                 WHERE closed.subject=request.subject
+               AND request.id NOT IN (
+                 SELECT json_extract(closed.body, '$.fields.request') FROM claims AS closed
+                 WHERE closed.subject=?1
                    AND closed.kind IN ('schedule.work-started','schedule.work-failed')
-                   AND json_extract(closed.body, '$.fields.request')=request.id
+                   AND json_extract(closed.body, '$.fields.request') IS NOT NULL
                )
              ORDER BY CANONICAL_ASC(request)",
         ))?;
