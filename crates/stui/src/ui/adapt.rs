@@ -916,6 +916,27 @@ pub fn names(model: &Model, person: &str) -> BTreeMap<String, String> {
     names
 }
 
+/// Why a conversation cannot be shown whole, when st could not read the harness's transcript.
+/// st then sends only the Small Talk around it, which reads as a conversation with the agent's
+/// side missing; Nathan's rule (2026-10-01) is to show neither half then, and say why, with the
+/// transcript's path so it can be reported.
+pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
+    let error = timeline.iter().rev().find_map(|entry| match &entry.body {
+        TimelineBody::Error(error) if error.code == "transcript-not-bound" => Some(error),
+        _ => None,
+    })?;
+    let reason = error
+        .message
+        .strip_prefix("transcript not bound: ")
+        .unwrap_or(&error.message);
+    Some(
+        match error.details.get("transcript").and_then(Value::as_str) {
+            Some(path) => format!("This conversation could not be loaded: {reason} (transcript {path})"),
+            None => format!("This conversation could not be loaded: {reason}"),
+        },
+    )
+}
+
 /// One conversation: the harness transcript and Small Talk messages, in time order.
 /// Draw one conversation as st joined it: the harness's turns and the agent's Small Talk, in
 /// the order st sent them.
@@ -1895,6 +1916,33 @@ mod tests {
             matches!(&bodies[..], [Body::User(text), Body::Event(line)]
                 if text == "please look" && line == "delivered to the agent: Tide tables · from example/quay"),
             "{bodies:?}"
+        );
+    }
+
+    #[test]
+    fn half_a_conversation_is_not_shown_and_says_why() {
+        let entries = |notice: Option<Value>| -> Vec<TimelineEntry> {
+            let mut rows = vec![
+                json!({"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
+                    "body":{"message_id":"message/one","from":"person/avery","to":"agent/example/harbor/keeper","title":"Status?"}}),
+                json!({"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"content","final":true,
+                    "body":{"media_type":"text/plain","text":"How is the audit going?"}}),
+            ];
+            rows.extend(notice);
+            serde_json::from_value(Value::Array(rows)).unwrap()
+        };
+        assert_eq!(unreadable_transcript(&entries(None)), None, "a whole conversation shows");
+        let notice = |details: Value| {
+            json!({"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
+                "body":{"code":"transcript-not-bound","message":"transcript not bound: the transcript could not be read: line 12: expected value","retryable":true,"details":details}})
+        };
+        assert_eq!(
+            unreadable_transcript(&entries(Some(notice(json!({"driver":"omp","transcript":"/home/avery/.omp/agent/sessions/harbor/0190.jsonl"}))))).as_deref(),
+            Some("This conversation could not be loaded: the transcript could not be read: line 12: expected value (transcript /home/avery/.omp/agent/sessions/harbor/0190.jsonl)")
+        );
+        assert_eq!(
+            unreadable_transcript(&entries(Some(notice(json!({"driver":"omp"}))))).as_deref(),
+            Some("This conversation could not be loaded: the transcript could not be read: line 12: expected value")
         );
     }
 
