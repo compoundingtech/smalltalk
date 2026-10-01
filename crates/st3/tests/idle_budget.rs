@@ -396,6 +396,15 @@ async fn an_idle_daemon_stays_under_its_cpu_and_request_budget() {
     for (pair, count) in &pairs {
         summary.push_str(&format!("  {count:6}  {pair}\n"));
     }
+    let wake_label = |row: &Value| row["cause"].as_str().unwrap_or("?").to_owned();
+    let wakes = delta(
+        &counts(&report_after, "reconciler_wakes", wake_label),
+        &counts(&report_before, "reconciler_wakes", wake_label),
+    );
+    summary.push_str("reconciler wakes by cause:\n");
+    for (cause, count) in &wakes {
+        summary.push_str(&format!("  {count:6}  {cause}\n"));
+    }
     summary.push_str("requests and tasks by kind:\n");
     for (kind, count) in &kinds {
         summary.push_str(&format!("  {count:6}  {kind}\n"));

@@ -715,7 +715,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                     let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
                         _ = self.notify.notified() => {}
-                        _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                        _ = tokio::time::sleep(Duration::from_millis(delay)) => {
+                            crate::performance::record_wake("deadline", None);
+                        }
                     }
                 }
                 None => self.notify.notified().await,
@@ -3893,6 +3895,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&subject);
+            crate::performance::record_wake("timer restart", None);
             notify.notify_one();
         });
     }
@@ -7943,6 +7946,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let remaining = timeout_remaining.min(lease_remaining).max(1) as u64;
             handle.spawn(async move {
                 tokio::time::sleep(Duration::from_millis(remaining)).await;
+                crate::performance::record_wake("timer step-timeout", None);
                 notify.notify_one();
             });
         }
@@ -9238,6 +9242,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         let remaining = (*duration_ms as u128).saturating_sub(elapsed) as u64;
                         handle.spawn(async move {
                             tokio::time::sleep(Duration::from_millis(remaining)).await;
+                            crate::performance::record_wake("timer gate", None);
                             notify.notify_one();
                         });
                     }
@@ -9510,6 +9515,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             handle.spawn(async move {
                 tokio::time::sleep(GATE_POLL_INTERVAL).await;
                 armed.store(false, Ordering::Release);
+                crate::performance::record_wake("timer gate-poll", None);
                 notify.notify_one();
             });
         }
@@ -9580,6 +9586,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         let notify = self.notify.clone();
                         handle.spawn(async move {
                             tokio::time::sleep(Duration::from_millis(100)).await;
+                            crate::performance::record_wake("timer llm-gate", None);
                             notify.notify_one();
                         });
                     }
@@ -9664,6 +9671,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let remaining = (time_limit_ms as u128).saturating_sub(elapsed) as u64;
                 handle.spawn(async move {
                     tokio::time::sleep(Duration::from_millis(remaining)).await;
+                    crate::performance::record_wake("timer llm-gate", None);
                     notify.notify_one();
                 });
             }
@@ -9966,6 +9974,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&watched_subject);
+                    crate::performance::record_wake("file watch", None);
                     notify.notify_one();
                 }
             })?;
@@ -10462,6 +10471,7 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn signal_changed(reconcile_notify: &Notify, event_notify: &watch::Sender<u64>) {
+    crate::performance::record_wake("reconciler", None);
     reconcile_notify.notify_one();
     event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
 }

@@ -7204,6 +7204,20 @@ fn render_performance(view: &Value) -> String {
             out.push('\n');
         }
     }
+    if let Some(wakes) = view["reconciler_wakes"].as_array() {
+        let _ = writeln!(
+            out,
+            "RECONCILER WAKES  count · cause (a pass can serve several wakes)"
+        );
+        for row in wakes {
+            let _ = writeln!(
+                out,
+                "  {}  {}",
+                row["count"],
+                row["cause"].as_str().unwrap_or("?")
+            );
+        }
+    }
     if let Some(note) = view["query_time_note"].as_str() {
         let _ = writeln!(out, "{note}");
     }
