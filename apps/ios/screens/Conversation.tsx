@@ -60,7 +60,12 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       // Finding in the conversation: only the entries that say it stay, newest first.
       headerSearchBarOptions: {
         placeholder: 'Find in this conversation',
-        hideWhenScrolling: true,
+        // The conversation stays readable and touchable while finding: the default dims and
+        // blocks it, which made a freshly opened conversation look frozen.
+        obscureBackground: false,
+        hideWhenScrolling: false,
+        // A button in the bar, not a field over the conversation, until it is wanted.
+        placement: 'integratedButton',
         autoCapitalize: 'none',
         onChangeText: event => setFind(event.nativeEvent.text),
         onCancelButtonPress: () => setFind(''),
