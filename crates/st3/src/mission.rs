@@ -2482,6 +2482,9 @@ fn normalize_subject(value: &str, kind: &str) -> String {
 }
 
 fn normalize_assignee(value: &str, default_host: &str) -> String {
+    if value.starts_with("person/") {
+        return value.to_owned();
+    }
     let identity = value.strip_prefix("agent/").unwrap_or(value);
     if identity.contains('.') || identity.contains("${") {
         format!("agent/{identity}")

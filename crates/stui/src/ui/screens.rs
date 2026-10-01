@@ -703,9 +703,10 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 card.card("suggested fix", theme::GREEN, false, suggestion, inner);
             }
             card.blank();
-            if !confirm_row(&mut card, drafts, "Mark this fault resolved") {
-                card.buttons(&[("r", "Mark resolved", Hit::Key('r'), theme::GREEN)]);
-            }
+            card.wrap(
+                &text::inline("Act on the source to clear this fault.", theme::soft()),
+                inner,
+            );
         }
         AttentionKind::Request { from, question, .. } => {
             card.line(Line::from(vec![
@@ -718,14 +719,11 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
                 text_box(&mut card, &format!("answer {from}"), drafts, "", inner);
                 card.buttons(&[
-                    ("enter", "Send answer", Hit::Enter, theme::ACCENT),
+                    ("enter", "Complete step", Hit::Enter, theme::ACCENT),
                     ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
                 ]);
             } else if !confirm_row(&mut card, drafts, "Mark this request answered") {
-                card.buttons(&[
-                    ("c", "Answer", Hit::Key('c'), theme::ACCENT),
-                    ("r", "Mark answered", Hit::Key('r'), theme::GREEN),
-                ]);
+                card.buttons(&[("c", "Complete step", Hit::Key('c'), theme::ACCENT)]);
             }
         }
         AttentionKind::Message { from, body } => {

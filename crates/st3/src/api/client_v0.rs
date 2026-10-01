@@ -781,6 +781,9 @@ const ACTIONS: &[&str] = &[
     "mission.cancel-revision",
     "mission.cancel",
     "session.import",
+    "work.ask",
+    "work.done",
+    "work.cancel-ask",
     "work.claim",
     "work.renew",
     "work.progress",
@@ -807,7 +810,6 @@ const ACTIONS: &[&str] = &[
     "pairing.revoke",
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
-    "attention.resolve",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -824,6 +826,9 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "mission.cancel-revision",
     "mission.cancel",
     "session.import",
+    "work.ask",
+    "work.done",
+    "work.cancel-ask",
     "work.claim",
     "work.renew",
     "work.progress",
@@ -862,10 +867,11 @@ pub(super) struct ClientSession {
 impl ClientSession {
     fn local(person: Option<&str>) -> Result<Self, ApiError> {
         if person.is_some_and(|person| {
-            !person.starts_with("person/") || person.matches('/').count() != 1
+            !(person.starts_with("person/") && person.matches('/').count() == 1
+                || person.starts_with("agent/"))
         }) {
             return Err(forbidden(
-                "the trusted Unix client must identify one concrete person",
+                "the trusted Unix client must identify one concrete person or agent",
             ));
         }
         let Some(person) = person else {
@@ -883,7 +889,14 @@ impl ClientSession {
             actor: person.into(),
             authority_actor: person.into(),
             transport: "unix",
-            scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
+            scopes: if person.starts_with("agent/") {
+                ["read.projections", "control.work"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            } else {
+                ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect()
+            },
         })
     }
 
@@ -902,7 +915,9 @@ impl ClientSession {
 }
 
 fn session_claim_actor(session: &ClientSession) -> String {
-    if session.authority_actor.starts_with("person/") {
+    if session.authority_actor.starts_with("person/")
+        || session.authority_actor.starts_with("agent/")
+    {
         session.authority_actor.clone()
     } else {
         "requester".into()
@@ -6005,6 +6020,9 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
+    if action == "work.done" {
+        return Some("control.attention");
+    }
     Some(match action.split_once('.')?.0 {
         "attention" => "control.attention",
         "review" => "control.attention",
@@ -6327,7 +6345,13 @@ fn validate_fence(
         ));
     }
     for (subject, revision) in &fence.subject_revisions {
-        let current = if let Some(id) = subject.strip_prefix("launch/") {
+        let current = if subject.starts_with("attention/") {
+            client_attention_resources(&state.store, None, false)
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .find(|item| item["id"] == *subject)
+                .and_then(|item| item["revision"].as_str().map(str::to_owned))
+        } else if let Some(id) = subject.strip_prefix("launch/") {
             state
                 .store
                 .planning_session(id)
@@ -6385,38 +6409,71 @@ async fn dispatch_action(
             .0;
             Ok(vec![result.subject])
         }
-        "attention.resolve" => {
-            // Any person can close any item; the store records who closed it.
-            let target = parameter_string(p, "attention_id")?;
-            let known = state
-                .store
-                .attention_request(&target)
-                .map_err(ApiError::internal)?
-                .is_some()
-                || (target.starts_with("attention/subscription-failure-")
-                    && state
-                        .store
-                        .attention_items(None)
-                        .map_err(ApiError::internal)?
-                        .iter()
-                        .any(|item| item.subject == target));
-            if !known {
-                return Err(ApiError::not_found(format!(
-                    "attention `{target}` does not exist"
-                )));
+        "attention.resolve" => Err(ApiError::bad(St3Error::new(
+            "attention-migrated",
+            "attention is a view; complete or remedy its source",
+        ))),
+        "work.ask" => {
+            if let Some(step) = p.get("step_id").and_then(Value::as_str) {
+                validate_work_fence(state, step, &request.fence)?;
             }
-            let result = resolve_attention(
-                State(state.clone()),
-                AxumPath(target),
-                Json(AttentionResolveRequest {
-                    outcome: parameter_string(p, "outcome")?,
-                    reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
+            let result = state
+                .store
+                .ask_person(&PersonAskRequest {
+                    legacy_request: None,
+                    person: parameter_string(p, "person_id")?,
+                    title: parameter_string(p, "title")?,
+                    reason: parameter_string(p, "reason")?,
                     actor: authority_actor.clone(),
+                    step: p
+                        .get("step_id")
+                        .map(|_| parameter_string(p, "step_id"))
+                        .transpose()?,
+                    new_run: p
+                        .get("new_run")
+                        .map(|_| parameter_string(p, "new_run"))
+                        .transpose()?,
+                    incarnation: request.fence.runtime_incarnation.clone(),
                     idempotency_key: request.idempotency_key.clone(),
-                }),
-            )
-            .await?
-            .0;
+                })
+                .map_err(ApiError::bad)?;
+            signal_changed(state);
+            Ok(vec![result.subject])
+        }
+        action @ ("work.done" | "work.cancel-ask") => {
+            let target = parameter_string(p, "target_id")?;
+            let result = state
+                .store
+                .finish_person_step(
+                    &PersonStepResponse {
+                        subject: target,
+                        actor: authority_actor.clone(),
+                        summary: parameter_string(p, "summary")?,
+                        evidence: p
+                            .get("evidence")
+                            .map(|value| {
+                                serde_json::from_value::<Vec<String>>(value.clone()).map_err(|_| {
+                                    ApiError::bad(St3Error::new(
+                                        "validation-failed",
+                                        "evidence must be an array of strings",
+                                    ))
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
+                        episode: Some(parameter_string(p, "episode")?),
+                        idempotency_key: request.idempotency_key.clone(),
+                    },
+                    action == "work.cancel-ask",
+                )
+                .map_err(|error| {
+                    if error.code == "forbidden" {
+                        forbidden(error.message)
+                    } else {
+                        ApiError::bad(error)
+                    }
+                })?;
+            signal_changed(state);
             Ok(vec![result.subject])
         }
         "message.send" => {
@@ -7073,6 +7130,12 @@ pub(super) async fn action(
             "client actions cannot select an actor, credential, or fleet secret",
         ));
     }
+    if request.action_type == "attention.resolve" {
+        return Err(ApiError::bad(St3Error::new(
+            "attention-migrated",
+            "attention is a view; complete or remedy its source",
+        )));
+    }
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
     require_scope(&session, scope)?;
@@ -7080,7 +7143,13 @@ pub(super) async fn action(
         request.action_type.as_str(),
         "terminal.attach" | "terminal.detach"
     );
-    if !read_only_terminal_lifecycle && !session.authority_actor.starts_with("person/") {
+    if !read_only_terminal_lifecycle
+        && !session.authority_actor.starts_with("person/")
+        && !(session.transport == "unix"
+            && session.authority_actor.starts_with("agent/")
+            && request.action_type.starts_with("work.")
+            && request.action_type != "work.done")
+    {
         return Err(forbidden(
             "client mutations require explicit concrete person authority",
         ));
@@ -8207,10 +8276,7 @@ subscription "watch/source" {
                 actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("pairing_id".into(), Value::String("pairing/named".into())),
-                    (
-                        "device_name".into(),
-                        Value::String("Alex's iPhone".into()),
-                    ),
+                    ("device_name".into(), Value::String("Alex's iPhone".into())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,

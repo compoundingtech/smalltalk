@@ -407,7 +407,7 @@ async fn a_conversation_thread_pages_through_the_history_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attention_withdraw_removes_an_obsolete_request_from_now() {
+async fn legacy_attention_mutation_requires_source_migration() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
@@ -438,80 +438,39 @@ async fn attention_withdraw_removes_an_obsolete_request_from_now() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert!(socket.exists());
-    let withdrawn = value(
-        &run_cli(
-            &socket,
-            &[
-                "attention",
-                "withdraw",
-                &request.subject,
-                "--reason",
-                "No action needed now",
-                "--as",
-                "agent/typecase/worker",
-            ],
-        )
-        .await,
-    );
-    assert_eq!(withdrawn["status"], "withdrawn");
+    let withdrawn = run_cli(
+        &socket,
+        &[
+            "attention",
+            "withdraw",
+            &request.subject,
+            "--reason",
+            "No action needed now",
+            "--as",
+            "agent/typecase/worker",
+        ],
+    )
+    .await;
+    assert!(!withdrawn.status.success());
+    assert!(String::from_utf8_lossy(&withdrawn.stderr).contains("attention-migrated"));
     let current = value(&run_cli(&socket, &["attention", "ls", "--as", "person/alex"]).await);
     assert!(current["value"]["items"].as_array().unwrap().is_empty());
     server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn now_shows_the_state_of_each_fault_target() {
+async fn cli_person_ask_is_completed_by_its_assigned_person() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
     let store = state.store.clone();
-    let source = r#"version 2
-mission "typecase" state="ready" {
-  goal "Publish a revision."
-  step "publish" { agentless }
-}
-"#;
-    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
-    let planned = store
-        .mission(
-            &intent,
-            IntentInput {
-                kdl: source.into(),
-                source_name: None,
-            },
-        )
-        .unwrap();
-    store
-        .apply(&intent, &planned.subject_tokens, "typecase-source")
-        .unwrap();
-    let run = store
-        .create_mission_run(&MissionRunRequest {
-            mission: "typecase".into(),
-            revision: None,
-            workspace: "/tmp".into(),
-            requester: Some("person/alex".into()),
-            mode: Some("run".into()),
-            inputs: BTreeMap::new(),
-            idempotency_key: "typecase-run".into(),
-        })
-        .unwrap();
-    store
-        .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
-        .unwrap();
-    store
-        .request_attention(
-            "attention/typecase-remote-control",
-            &AttentionRequest {
-                reviewer: "person/alex".into(),
-                title: "Publish Typecase without remote control".into(),
-                reason: "Publish the prepared revision as a person.".into(),
-                severity: "warning".into(),
-                targets: vec!["mission/typecase".into(), "resource/typecase/kdl".into()],
-                actor: "agent/example/st3".into(),
-                idempotency_key: "typecase-remote-control".into(),
-            },
-        )
-        .unwrap();
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        store.origin(),
+    )
+    .unwrap();
+    store.apply_internal(&intent, "cli-person-asker").unwrap();
+    let actor = format!("agent/{}.asker", store.origin());
     let server_socket = socket.clone();
     let server =
         tokio::spawn(
@@ -523,30 +482,67 @@ mission "typecase" state="ready" {
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    assert!(socket.exists());
-
-    let now = run_cli_human(&socket, &["now", "--as", "person/alex"]).await;
-    assert!(
-        now.status.success(),
-        "{}",
-        String::from_utf8_lossy(&now.stderr)
+    let ask_args = [
+        "work",
+        "ask",
+        "--for",
+        "person/avery",
+        "--title",
+        "Choose release date",
+        "--reason",
+        "The release needs a date",
+        "--new-run",
+        "release-date",
+        "--as",
+        &actor,
+        "--idempotency-key",
+        "cli-ask",
+    ];
+    let ask = value(&run_cli(&socket, &ask_args).await);
+    let subject = ask["subject"].as_str().unwrap();
+    assert_eq!(
+        value(&run_cli(&socket, &ask_args).await)["subject"],
+        subject
     );
-    let now = String::from_utf8(now.stdout).unwrap();
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
+    assert_eq!(listed["value"]["items"][0]["source_id"], subject);
+    assert_eq!(listed["value"]["items"][0]["attention_kind"], "person-step");
+    let wrong = run_cli(
+        &socket,
+        &[
+            "work",
+            "done",
+            subject,
+            "--as",
+            "person/robin",
+            "--summary",
+            "Friday",
+        ],
+    )
+    .await;
+    assert!(!wrong.status.success());
+    let done = [
+        "work",
+        "done",
+        subject,
+        "--as",
+        "person/avery",
+        "--summary",
+        "Friday",
+        "--idempotency-key",
+        "cli-done",
+    ];
+    assert_eq!(value(&run_cli(&socket, &done).await)["status"], "completed");
+    assert_eq!(value(&run_cli(&socket, &done).await)["status"], "completed");
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
+    assert!(listed["value"]["items"].as_array().unwrap().is_empty());
     assert!(
-        now.contains("  target mission/typecase: cancelled "),
-        "now did not show the target state:\n{now}"
+        !store
+            .events_after_bounded(0, 200)
+            .unwrap()
+            .iter()
+            .any(|c| c.subject.starts_with("attention/"))
     );
-    assert!(
-        !now.contains("target resource/"),
-        "a resource has no state to show:\n{now}"
-    );
-
-    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/alex"]).await);
-    let states = &listed["value"]["items"][0]["target_states"];
-    assert_eq!(states[0]["id"], "mission/typecase");
-    assert_eq!(states[0]["state"], "cancelled");
-    assert!(states[0]["since"].is_string());
-    assert_eq!(states.as_array().unwrap().len(), 1);
     server.abort();
 }
 
