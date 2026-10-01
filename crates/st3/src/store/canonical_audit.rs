@@ -53,6 +53,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "projection_digest_state",
         "projection_digest_generation",
         "projection_digest_operation_rows",
+        "projection_digest_repaired_claims",
         "replica_envelope_signatures",
         "fleet_invite_tokens",
         "replica_envelope_holds",

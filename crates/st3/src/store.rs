@@ -14805,6 +14805,9 @@ impl Store {
                 }
             }
         }
+        if changed != 0 {
+            rebuild_operations_tx(&transaction)?;
+        }
         transaction.commit()?;
         drop(connection);
         if changed != 0 {
@@ -18600,6 +18603,7 @@ fn expected_operations(
         "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
          FROM claims
          WHERE json_extract(body, '$._operation.id') IS NOT NULL
+           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
          ORDER BY id",
     )?;
     let claims = statement
@@ -18662,7 +18666,7 @@ fn expected_operations(
 /// this rule has opened. Rebuilding it read every claim and held a start for seconds before the
 /// API could answer. The planning tables are small and rebuilt on every start, since a planning
 /// claim written through the generic claim path is projected only by a rebuild.
-const DERIVED_TABLES_VERSION: &str = "1";
+const DERIVED_TABLES_VERSION: &str = "2";
 
 fn rebuild_derived_tables_once_tx(transaction: &Transaction<'_>) -> Result<()> {
     rebuild_planning_tx(transaction)?;
@@ -38792,6 +38796,14 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             target.selected_desired_token("exec/work").unwrap().unwrap(),
             replacement
         );
+        // A build that rejected the original never put it in claims. Keep the raw repaired
+        // record, but model that admission difference explicitly.
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM claims WHERE id=?1", [&repaired_claim])
+            .unwrap();
 
         receive_and_project(
             &source,
@@ -38825,6 +38837,143 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             target_status.authority_digest
         );
         assert_eq!(source_status.graph_digest, target_status.graph_digest);
+    }
+
+    #[test]
+    fn repaired_original_sources_and_operations_ignore_local_retention_and_roll_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let source = Store::open(&path, "alder").unwrap();
+        let target = Store::open_memory("birch").unwrap();
+        let observation = |reason: &str, key: &str| {
+            source
+                .append_claim(&ClaimInput {
+                    subject: "daemon/alder".into(),
+                    kind: "daemon.diagnostic".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("severity".into(), json!("warning")),
+                        ("code".into(), json!("repair-test")),
+                        ("reason".into(), json!(reason)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap()
+        };
+        let original = observation("original", "original");
+        let replacement = observation("replacement", "replacement");
+        receive_and_project(
+            &target,
+            "alder",
+            &exchange_from(&source, &ReplicationInventory::default()),
+        );
+        let record = target
+            .replica_records(false)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.claim_id.as_deref() == Some(&original.id))
+            .unwrap();
+        let before = projection_digest::tables(&source.readers.get()).unwrap();
+        {
+            let mut connection = source.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE replica_records SET state='repaired' WHERE claim_id=?1",
+                    [&original.id],
+                )
+                .unwrap();
+            rebuild_operations_tx(&transaction).unwrap();
+            let current = projection_digest::tables(&transaction).unwrap();
+            assert_ne!(current["claim_sources"], before["claim_sources"]);
+            assert_ne!(current["operations"], before["operations"]);
+            assert_eq!(current, projection_digest::oracle(&transaction).unwrap());
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            before
+        );
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE replica_records SET state='unknown' WHERE record_ref=?1",
+                [&record.record_ref],
+            )
+            .unwrap();
+        target
+            .repair_replica_record(
+                &record.record_ref,
+                &replacement.id,
+                "replace an unsupported original",
+                "person/robin",
+                "repair",
+            )
+            .unwrap();
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM claims WHERE id=?1", [&original.id])
+            .unwrap();
+        receive_and_project(
+            &source,
+            "birch",
+            &exchange_from(&target, &source.replication_inventory().unwrap()),
+        );
+        let expected = projection_digest::tables(&target.readers.get()).unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            expected,
+            projection_digest::oracle(&target.readers.get()).unwrap()
+        );
+        assert!(source.claim_by_id(&original.id).unwrap().is_some());
+        assert!(target.claim_by_id(&original.id).unwrap().is_none());
+        // Receipt cleanup must not make a repaired original a source again.
+        source
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM replica_records WHERE claim_id=?1",
+                [&original.id],
+            )
+            .unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            projection_digest::oracle(&source.readers.get()).unwrap(),
+            expected
+        );
+        // Registry rebuilds and restart retain the repair meaning after receipts were trimmed.
+        source
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value='old-registry' WHERE key='projection_digest_registry'",
+                [],
+            )
+            .unwrap();
+        drop(source);
+        let source = Store::open(&path, "alder").unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            projection_digest::oracle(&source.readers.get()).unwrap(),
+            expected
+        );
     }
 
     proptest! {
