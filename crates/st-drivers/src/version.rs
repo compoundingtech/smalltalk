@@ -7,7 +7,7 @@
 //! reader). It reaches this crate at compile time via `option_env!`:
 //!   - `CLI_BUILD_STAMP` — a **NixStamp** the flake bakes from `self` (the flake
 //!     rev, so a hermetic build still knows its identity). Authoritative.
-//!   - `ST2_BUILD_STAMP_LOCAL` — a **LocalStamp** `build.rs` derives from `git`
+//!   - `ST_BUILD_STAMP_LOCAL` — a **LocalStamp** `build.rs` derives from `git`
 //!     for a plain `cargo build`. A private, second env var so it can never
 //!     collide with / override the Nix stamp; the Nix stamp always wins.
 //!
@@ -18,7 +18,7 @@
 /// NixStamp baked by the flake (`{type:"nix",...}`); authoritative when present.
 const NIX_STAMP: Option<&str> = option_env!("CLI_BUILD_STAMP");
 /// LocalStamp baked by `build.rs` from git (`{type:"local",...}`).
-const LOCAL_STAMP: Option<&str> = option_env!("ST2_BUILD_STAMP_LOCAL");
+const LOCAL_STAMP: Option<&str> = option_env!("ST_BUILD_STAMP_LOCAL");
 /// `baseVersion` from Cargo metadata.
 const BASE: &str = env!("CARGO_PKG_VERSION");
 

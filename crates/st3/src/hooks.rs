@@ -324,7 +324,7 @@ mod tests {
         assert!(mentions_st2_surface(
             "/home/example/.local/state/st2/hooks/sets/x"
         ));
-        assert!(!mentions_st2_surface("ST2_CLAUDE_SESSION=abc"));
+        assert!(!mentions_st2_surface("ST_CLAUDE_SESSION=abc"));
         assert!(!mentions_st2_surface(
             "\"$ST3_BIN\" driver-hook claude-observe"
         ));

@@ -1,8 +1,8 @@
 [package]
-name = "st2-resource-protocol"
+name = "st-resource-protocol"
 version = "0.1.0"
 edition = "2024"
-description = "Resource Profile runtime wire types, framing, and codecs shared by st2 hosts and runtimes."
+description = "Shared resource runtime wire types, framing, and codecs."
 license = "MIT"
 
 [dependencies]

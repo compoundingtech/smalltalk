@@ -57,7 +57,7 @@ fn detect() -> Isolation {
         } else {
             // The old line embedded a manual "WARN" prefix; the facade carries severity now.
             tracing::warn!(
-                "st2: systemd user scopes with opaque argv unavailable (`systemd-run` 254+ and \
+                "st: systemd user scopes with opaque argv unavailable (`systemd-run` 254+ and \
                  $XDG_RUNTIME_DIR are required) — spawning tasks WITHOUT cgroup isolation. A \
                  transport/supervisor restart may cascade-kill them. Upgrade systemd and enable a \
                  user manager (`loginctl enable-linger`) to restore isolation."
@@ -115,7 +115,7 @@ pub fn scope_unit(task_id: &str) -> String {
         })
         .collect();
     let seq = SCOPE_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("st2-{safe}-{}-{seq}.scope", std::process::id())
+    format!("st-{safe}-{}-{seq}.scope", std::process::id())
 }
 
 /// Build the OUTER launch [`Command`] for the inner `program` + `args`, isolated under `unit`.
@@ -159,12 +159,12 @@ mod tests {
         // Keeps the (dotted) id for greppability, gains the st2- prefix, a nonce, and the .scope suffix.
         let u = scope_unit("example-linux.demo.agent");
         assert!(
-            u.starts_with("st2-example-linux.demo.agent-"),
+            u.starts_with("st-example-linux.demo.agent-"),
             "unexpected unit name {u}"
         );
         assert!(u.ends_with(".scope"), "unexpected unit name {u}");
         // Unsafe bytes (space, slash) are replaced so systemd never rejects the unit name.
-        assert!(scope_unit("a b/c").starts_with("st2-a_b_c-"));
+        assert!(scope_unit("a b/c").starts_with("st-a_b_c-"));
         // UNIQUE, not deterministic — two spawns of the same id never collide on the scope name.
         assert_ne!(scope_unit("x"), scope_unit("x"));
     }
@@ -190,7 +190,7 @@ mod tests {
     fn wrap_scope_disables_expansion_and_preserves_dollar_bearing_argv() {
         let cmd = wrap_for_mode(
             Isolation::Scope,
-            "st2-x.scope",
+            "st-x.scope",
             OsStr::new("provider"),
             &[
                 OsStr::new("$HOME"),
@@ -208,7 +208,7 @@ mod tests {
                 OsStr::new("--scope"),
                 OsStr::new("--collect"),
                 OsStr::new("--quiet"),
-                OsStr::new("--unit=st2-x.scope"),
+                OsStr::new("--unit=st-x.scope"),
                 OsStr::new("--expand-environment=no"),
                 OsStr::new("--"),
                 OsStr::new("provider"),

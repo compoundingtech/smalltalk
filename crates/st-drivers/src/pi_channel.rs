@@ -200,26 +200,21 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     let session_context = session_context(&agent_dir, identity);
     // The pty session vouching for the record is the wrapper's task: its runtime ID arrives in
     // the channel environment, and only aliases the identity on driver-expanded seats.
-    let pty_session = std::env::var(kind.runtime_id_env)
-        .ok()
+    let pty_session = crate::contracts::env(kind.runtime_id_env)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| identity.to_string());
     // The wrapper mints the session token; adopting it makes the wrapper's terminal record own
     // this channel's live records and fences a predecessor incarnation.
-    let wrapper_session = std::env::var(kind.session_env)
-        .ok()
-        .filter(|value| !value.is_empty());
+    let wrapper_session = crate::contracts::env(kind.session_env).filter(|value| !value.is_empty());
     let wrapper_seq = if kind.harness == harness_context::Harness::Omp {
         Some(
-            std::env::var(kind.seq_env)
+            crate::contracts::env(kind.seq_env)
                 .context("OMP channel has no wrapper ownership sequence")?
                 .parse::<u64>()
                 .context("OMP channel wrapper ownership sequence is invalid")?,
         )
     } else {
-        std::env::var(kind.seq_env)
-            .ok()
-            .and_then(|seq| seq.parse::<u64>().ok())
+        crate::contracts::env(kind.seq_env).and_then(|seq| seq.parse::<u64>().ok())
     };
     let context_session = wrapper_session
         .clone()
@@ -243,18 +238,17 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         }
     });
     let omp_binding = if kind.harness == harness_context::Harness::Omp {
-        let resume_generation = std::env::var(crate::omp_session::CHANNEL_RESUME_GENERATION)
-            .ok()
-            .map(|value| {
-                value
-                    .parse::<u64>()
-                    .map(crate::residency::Generation)
-                    .context("OMP channel resume generation is invalid")
-            })
-            .transpose()?;
+        let resume_generation =
+            crate::contracts::env(crate::omp_session::CHANNEL_RESUME_GENERATION)
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map(crate::residency::Generation)
+                        .context("OMP channel resume generation is invalid")
+                })
+                .transpose()?;
         let expected_native_session =
-            std::env::var(crate::omp_session::CHANNEL_EXPECTED_NATIVE_SESSION)
-                .ok()
+            crate::contracts::env(crate::omp_session::CHANNEL_EXPECTED_NATIVE_SESSION)
                 .filter(|value| !value.is_empty());
         let state_dir = crate::omp_session::state_dir(catalog_root, identity);
         let native_session_id = bind_omp_channel_session(
@@ -324,7 +318,7 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         Ok(writer) => Some(writer.with_session(context_session.clone())),
         Err(error) => {
             tracing::warn!(
-                "st2 {} channel: harness context is unavailable: {error}",
+                "st {} channel: harness context is unavailable: {error}",
                 kind.label
             );
             None
@@ -434,7 +428,7 @@ fn channel_loop(
                         crate::harness_timeline::observe_channel_frame(timeline_writer, frame)
                 {
                     tracing::warn!(
-                        "st2 {label} channel: recording harness timeline failed: {error:#}"
+                        "st {label} channel: recording harness timeline failed: {error:#}"
                     );
                 }
                 let state = frame.as_ref().and_then(state_observation);
@@ -450,7 +444,7 @@ fn channel_loop(
                     // serializes but does not order their writes.
                     && let Err(error) = writer.observe_unless_ended(observation)
                 {
-                    tracing::warn!("st2 {label} channel: recording observed state failed: {error}");
+                    tracing::warn!("st {label} channel: recording observed state failed: {error}");
                 }
                 // The credential axis is a third record, independent of the numbers and of the
                 // categorical state: a rejection stands until a turn reaches its ordinary end,
@@ -468,16 +462,14 @@ fn channel_loop(
                     && let Some(context_writer) = context_writer.as_deref_mut()
                     && let Err(error) = write_context(context_writer, context)
                 {
-                    tracing::warn!(
-                        "st2 {label} channel: recording harness context failed: {error}"
-                    );
+                    tracing::warn!("st {label} channel: recording harness context failed: {error}");
                 }
                 if frame.as_ref().is_some_and(|frame| {
                     frame.get("type").and_then(Value::as_str) == Some("pre_compact")
                 }) && let Err(error) = ensure_pre_compact_context(agent_dir)
                 {
                     tracing::warn!(
-                        "st2 {label} channel: writing pre-compact context stub failed: {error}"
+                        "st {label} channel: writing pre-compact context stub failed: {error}"
                     );
                     let actionable = harness_state::Observation::new(
                         harness_state::Activity::Active,
@@ -487,7 +479,7 @@ fn channel_loop(
                     .with_reason(PRE_COMPACT_ERROR_REASON);
                     if let Err(state_error) = writer.observe_unless_ended(actionable) {
                         tracing::warn!(
-                            "st2 {label} channel: recording pre-compact recovery failure failed: \
+                            "st {label} channel: recording pre-compact recovery failure failed: \
                              {state_error}"
                         );
                     }
@@ -501,7 +493,7 @@ fn channel_loop(
         let now = Instant::now();
         if now >= next_heartbeat {
             if let Err(error) = writer.heartbeat() {
-                tracing::warn!("st2 {label} channel: refreshing observed state failed: {error}");
+                tracing::warn!("st {label} channel: refreshing observed state failed: {error}");
             }
             next_heartbeat = now + heartbeat_every;
         }

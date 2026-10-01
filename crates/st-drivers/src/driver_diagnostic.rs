@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-const SCHEMA: &str = "st2.driver-diagnostic.v1";
+const SCHEMA: &str = "st.driver-diagnostic.v1";
 const RECOVERY: &str = "clearsOnStageRecovery";
 const FUTURE_SKEW_MS: u64 = 60_000;
 
@@ -443,10 +443,10 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             "replace the malformed driver-diagnostic record by restarting the seat"
         }
         Observed::Indeterminate(InvalidReason::UnsupportedSchema) => {
-            "upgrade this st2 reader or restart the seat with a compatible driver-diagnostic writer"
+            "upgrade this st reader or restart the seat with a compatible driver-diagnostic writer"
         }
         Observed::Indeterminate(InvalidReason::UnknownVocabulary) => {
-            "upgrade this st2 reader; unknown diagnostic vocabulary is not healthy evidence"
+            "upgrade this st reader; unknown diagnostic vocabulary is not healthy evidence"
         }
         Observed::Indeterminate(InvalidReason::FutureSkew) => {
             "correct the writer clock or restart the seat after clock recovery"
@@ -461,7 +461,7 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             Stage::Seed => {
                 "restore readable producer state snapshots; recovery clears this advisory"
             }
-            // The one boundary whose repair is neither an st2-side nor a producer-side restore:
+            // The one boundary whose repair is neither an st-side nor a producer-side restore:
             // nothing in the seat is broken, the account's credential was refused. The text stays
             // generic on purpose — which client owns which credential home is declared outside
             // st2, and no credential knowledge enters this crate (Q12).
@@ -475,9 +475,9 @@ pub fn repair_text(observed: &Observed) -> &'static str {
                 "restore the native prompt transport; the queued message remains retryable"
             }
             Stage::ReadBack => {
-                "restore message read-back; st2 will reconcile without duplicating the prompt"
+                "restore message read-back; st will reconcile without duplicating the prompt"
             }
-            Stage::Unknown => "upgrade this st2 reader; an unknown stage is not healthy evidence",
+            Stage::Unknown => "upgrade this st reader; an unknown stage is not healthy evidence",
         },
     }
 }
@@ -524,7 +524,7 @@ fn read_at(raw: &[u8], now: u64) -> Observed {
         Ok(record) => record,
         Err(_) => return Observed::Indeterminate(InvalidReason::MalformedRecord),
     };
-    if record.schema != SCHEMA || record.recovery != RECOVERY {
+    if !crate::contracts::schema_matches(&record.schema, SCHEMA) || record.recovery != RECOVERY {
         return Observed::Indeterminate(InvalidReason::UnsupportedSchema);
     }
     if record.stage == Stage::Unknown
@@ -578,7 +578,7 @@ impl Publisher {
         {
             tracing::warn!(
                 path = %path.display(),
-                "st2 driver diagnostic malformed predecessor cleanup failed: {error}"
+                "st driver diagnostic malformed predecessor cleanup failed: {error}"
             );
         }
         // Seed the stage set from whatever readable record this seat already carries for THIS
@@ -590,7 +590,7 @@ impl Publisher {
         let mut failures: [Option<Record>; 9] = array::from_fn(|_| None);
         if let Ok(raw) = fs::read(&path)
             && let Ok(record) = serde_json::from_slice::<Record>(&raw)
-            && record.schema == SCHEMA
+            && crate::contracts::schema_matches(&record.schema, SCHEMA)
             && record.recovery == RECOVERY
             && record.driver == driver
             && record.support != Support::Unrecognized
@@ -624,7 +624,7 @@ impl Publisher {
             return;
         }
         let record = Record {
-            schema: SCHEMA.to_string(),
+            schema: crate::contracts::schema_for_agent(self.path.parent().unwrap(), SCHEMA),
             driver: self.driver,
             stage,
             reason,
@@ -662,7 +662,7 @@ impl Publisher {
         let cleared = self.failures[index].take().or_else(|| {
             let raw = fs::read(&self.path).ok()?;
             let record = serde_json::from_slice::<Record>(&raw).ok()?;
-            (record.schema == SCHEMA
+            (crate::contracts::schema_matches(&record.schema, SCHEMA)
                 && record.recovery == RECOVERY
                 && record.driver == self.driver
                 && record.stage == stage)
@@ -703,7 +703,7 @@ impl Publisher {
         if let Err(error) = result {
             tracing::warn!(
                 path = %self.path.display(),
-                "st2 driver diagnostic persistence failed: {error}"
+                "st driver diagnostic persistence failed: {error}"
             );
         }
     }
@@ -786,15 +786,15 @@ fn emit(
 ) {
     let span = crate::telemetry::tracer_export_enabled().then(|| {
         tracing::info_span!(
-            "st2.driver.diagnostic",
+            "st.driver.diagnostic",
             "span.label" = stage.as_str(),
-            "st2.driver.name" = driver.as_str(),
-            "st2.driver.stage" = stage.as_str(),
-            "st2.driver.reason" = reason.as_str(),
-            "st2.driver.source" = source.as_str(),
-            "st2.driver.support" = support.as_str(),
-            "st2.outcome" = outcome,
-            "st2.driver.producer_version" = producer_version,
+            "st.driver.name" = driver.as_str(),
+            "st.driver.stage" = stage.as_str(),
+            "st.driver.reason" = reason.as_str(),
+            "st.driver.source" = source.as_str(),
+            "st.driver.support" = support.as_str(),
+            "st.outcome" = outcome,
+            "st.driver.producer_version" = producer_version,
         )
     });
     let _guard = span.as_ref().map(tracing::Span::enter);
@@ -806,7 +806,7 @@ fn emit(
         support = support.as_str(),
         outcome,
         producer_version,
-        "st2 native driver diagnostic transition"
+        "st native driver diagnostic transition"
     );
 }
 

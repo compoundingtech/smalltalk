@@ -1,5 +1,5 @@
 //! Bake a LocalStamp for `st2 --version` on a plain `cargo build`, per the shared
-//! build-versioning contract. Emitted as `ST2_BUILD_STAMP_LOCAL` — a private var
+//! build-versioning contract. Emitted as `ST_BUILD_STAMP_LOCAL` — a private var
 //! distinct from the fleet's `CLI_BUILD_STAMP`, so the flake's authoritative
 //! NixStamp can never be overridden by this (see src/version.rs). A hermetic Nix
 //! build has no `.git`, so this yields nothing there and the NixStamp is used.
@@ -25,7 +25,7 @@ fn main() {
         // this avoids a build-dependency just to serialize three fields.
         let stamp =
             format!(r#"{{"type":"local","rev":"{rev}","commitTs":{commit_ts},"dirty":{dirty}}}"#);
-        println!("cargo:rustc-env=ST2_BUILD_STAMP_LOCAL={stamp}");
+        println!("cargo:rustc-env=ST_BUILD_STAMP_LOCAL={stamp}");
     }
     // Rebuild the stamp when HEAD moves or the working tree changes (dirty flag).
     // This build script also stamps st-drivers from its crate directory. Git resolves the

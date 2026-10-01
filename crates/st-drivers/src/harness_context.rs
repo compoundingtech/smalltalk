@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::harness_state::{lock_exclusive, write_json_atomic};
 
-const SCHEMA: &str = "st2.harness-context.v1";
+const SCHEMA: &str = "st.harness-context.v1";
 const LOCK_NAME: &str = ".harness-context.lock";
 const TMP_PREFIX: &str = ".harness-context";
 const STAGING_DIR_NAME: &str = "harness-context-staging";
@@ -484,8 +484,10 @@ impl Writer {
         // A record this version cannot interpret — unparseable bytes, another schema, a harness
         // whose arithmetic is unknown — is not coalesced against: it reads as absent to every
         // consumer, so continuing its counters would be continuing something nobody can read.
-        let current = read_record(&self.path)
-            .filter(|record| record.schema == SCHEMA && record.harness != Harness::Unrecognized);
+        let current = read_record(&self.path).filter(|record| {
+            crate::contracts::schema_matches(&record.schema, SCHEMA)
+                && record.harness != Harness::Unrecognized
+        });
         let now_ms = crate::message::now_ms();
         if compaction.is_none()
             && let (Some(current), Some(reading)) = (current.as_ref(), reading.as_ref())
@@ -526,7 +528,19 @@ impl Writer {
             _ => now_ms,
         };
         let record = Record {
-            schema: SCHEMA.to_string(),
+            schema: current
+                .as_ref()
+                .filter(|record| record.incarnation == self.session)
+                .map_or_else(
+                    || {
+                        crate::contracts::schema_for_session(
+                            self.path.parent().unwrap(),
+                            &self.session,
+                            SCHEMA,
+                        )
+                    },
+                    |record| record.schema.clone(),
+                ),
             agent: self.agent.clone(),
             harness: self.harness,
             used_tokens,
@@ -656,7 +670,7 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             tracing::warn!(
-                "st2 harness-context: reading {} failed: {error}",
+                "st harness-context: reading {} failed: {error}",
                 path.display()
             );
             return None;
@@ -664,14 +678,14 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
     };
     let Ok(record) = serde_json::from_slice::<Record>(&raw) else {
         tracing::warn!(
-            "st2 harness-context: {} is not a readable record",
+            "st harness-context: {} is not a readable record",
             path.display()
         );
         return None;
     };
-    if record.schema != SCHEMA {
+    if !crate::contracts::schema_matches(&record.schema, SCHEMA) {
         tracing::warn!(
-            "st2 harness-context: {} carries schema `{}`, not `{SCHEMA}`",
+            "st harness-context: {} carries schema `{}`, not `{SCHEMA}`",
             path.display(),
             record.schema
         );
@@ -679,14 +693,14 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
     }
     if record.harness == Harness::Unrecognized {
         tracing::warn!(
-            "st2 harness-context: {} was written by a harness this version cannot interpret",
+            "st harness-context: {} was written by a harness this version cannot interpret",
             path.display()
         );
         return None;
     }
     if record.observed_at_ms > now_ms.saturating_add(duration_ms(HARNESS_CONTEXT_FUTURE_SKEW)) {
         tracing::warn!(
-            "st2 harness-context: {} is stamped beyond the future-skew bound",
+            "st harness-context: {} is stamped beyond the future-skew bound",
             path.display()
         );
         return None;
@@ -1134,7 +1148,7 @@ mod tests {
                 .unwrap()
         );
         let observed = read(&harness_context_path(&agent_dir)).unwrap();
-        assert_eq!(observed.compactions, 2, "st2 counted the two edges");
+        assert_eq!(observed.compactions, 2, "st counted the two edges");
         assert_eq!(
             observed.used_percent,
             Some(96.7),

@@ -412,7 +412,7 @@ fn predecessor_drains_only_legacy_ding_then_candidate_adopts_provider_and_replac
 
     let strict_raw = fs::read_to_string(fixture.exec_record()).unwrap();
     let strict: Value = serde_json::from_str(&strict_raw).expect("candidate record is not JSON");
-    assert_eq!(strict["schema"], "st2.exec-generation.v1");
+    assert_eq!(strict["schema"], "st.exec-generation.v1");
     let strict_pid = u32::try_from(strict["pid"].as_u64().unwrap()).unwrap();
     let strict_start = strict["startTimeTicks"].as_u64().unwrap();
     assert_ne!(
@@ -449,7 +449,7 @@ fn predecessor_drains_only_legacy_ding_then_candidate_adopts_provider_and_replac
         .unwrap();
     assert_success(&tasks, "strict post-migration inventory");
     let inventory: Value = serde_json::from_slice(&tasks.stdout).unwrap();
-    assert_eq!(inventory["schema"], "st2.task-inventory.v3");
+    assert_eq!(inventory["schema"], "st.task-inventory.v3");
     assert_eq!(inventory["complete"], true);
     assert_eq!(inventory["errors"], serde_json::json!([]));
     let rows = inventory["tasks"].as_array().unwrap();

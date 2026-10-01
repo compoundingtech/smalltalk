@@ -13,7 +13,7 @@ use crate::residency::{
 };
 use crate::{AgentSpec, ResidencyPolicy, Runner, SessionDriver, TaskLifecycle, UpReport};
 
-const WAKE_SCHEMA: &str = "st2.residency-wake.v1";
+const WAKE_SCHEMA: &str = "st.residency-wake.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostPolicy {
@@ -30,7 +30,7 @@ struct WakeRequest {
     requested_at_ms: u64,
 }
 
-const LAUNCH_SCHEMA: &str = "st2.residency-launch.v1";
+const LAUNCH_SCHEMA: &str = "st.residency-launch.v1";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -103,7 +103,7 @@ fn load_launch_attempt(
     };
     let attempt: LaunchAttempt = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        attempt.schema == LAUNCH_SCHEMA
+        crate::contracts::schema_matches(&attempt.schema, LAUNCH_SCHEMA)
             && attempt.agent_id == agent_id
             && attempt.host == host
             && attempt.generation == generation
@@ -145,7 +145,7 @@ pub fn request_wake(catalog: &Path, host: &str, agent_id: &str) -> Result<PathBu
     };
     crate::residency::atomic_json(&path, &request)?;
     tracing::info!(
-        target: "st2",
+        target: "st",
         agent_id,
         host,
         requested_at_ms = request.requested_at_ms,
@@ -163,7 +163,9 @@ fn has_wake_request(catalog: &Path, host: &str, agent_id: &str) -> Result<bool> 
     };
     let request: WakeRequest = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        request.schema == WAKE_SCHEMA && request.agent_id == agent_id && request.host == host,
+        crate::contracts::schema_matches(&request.schema, WAKE_SCHEMA)
+            && request.agent_id == agent_id
+            && request.host == host,
         "residency wake request ownership or schema mismatch"
     );
     Ok(true)
@@ -287,7 +289,7 @@ fn store_event(path: &Path, ledger: &mut Ledger, event: Event) -> Result<()> {
     let transition = next.apply(event);
     crate::residency::store(path, &next).map_err(anyhow::Error::from)?;
     tracing::info!(
-        target: "st2",
+        target: "st",
         agent_id = next.agent_id(),
         host = next.host(),
         generation = next.generation().0,

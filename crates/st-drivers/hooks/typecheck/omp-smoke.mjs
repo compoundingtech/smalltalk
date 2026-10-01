@@ -49,12 +49,12 @@ const readFrames = () =>
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line));
 
-process.env.ST2_OMP_CHANNEL_BIN = recorder;
-process.env.ST2_OMP_CHANNEL_CATALOG = "/tmp/st2-smoke-catalog";
-process.env.ST2_OMP_CHANNEL_IDENTITY = "smoke.worker";
-process.env.ST2_OMP_CHANNEL_RUNTIME_ID = "smoke.worker";
-process.env.ST2_OMP_CHANNEL_SESSION = "smoke-session";
-process.env.ST2_OMP_CHANNEL_SEQ = "1";
+process.env.ST_OMP_CHANNEL_BIN = recorder;
+process.env.ST_OMP_CHANNEL_CATALOG = "/tmp/st2-smoke-catalog";
+process.env.ST_OMP_CHANNEL_IDENTITY = "smoke.worker";
+process.env.ST_OMP_CHANNEL_RUNTIME_ID = "smoke.worker";
+process.env.ST_OMP_CHANNEL_SESSION = "smoke-session";
+process.env.ST_OMP_CHANNEL_SEQ = "1";
 
 const mod = await import("./smoke-out/omp-channel.mjs");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");

@@ -595,7 +595,7 @@ One completed ordinary Agent send or reply represented by a sender-owned row. Th
 is implicit and the row's directional peer is `to`.
 
 Authority: [MESSAGE-R01 and MESSAGE-R02](03-message/requirements.md);
-[`SentMessageRow`](../../crates/st2-wire/src/message.rs)
+[`SentMessageRow`](../../crates/st-wire/src/message.rs)
 
 ### sender history
 
@@ -612,7 +612,7 @@ The explicit proof boundary attached to sender history: `unavailable`, `since`, 
 empty row sequence is a complete empty result only with `since` coverage.
 
 Authority: [MESSAGE-R03](03-message/requirements.md);
-[`SentCoverage`](../../crates/st2-wire/src/message.rs)
+[`SentCoverage`](../../crates/st-wire/src/message.rs)
 
 ### sent commit ledger
 

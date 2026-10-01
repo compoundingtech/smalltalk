@@ -1,8 +1,8 @@
 [package]
-name = "st2-wire"
+name = "st-wire"
 version = "0.1.0"
 edition = "2024"
-description = "The JSON shapes st2's CLI emits, owned once so readers deserialize what st2 serializes."
+description = "Shared JSON shapes for driver and CLI readers."
 license = "MIT"
 
 [dependencies]

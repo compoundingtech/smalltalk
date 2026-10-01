@@ -29,7 +29,7 @@ pub(super) struct CodexProtocolSchemas {
 pub(super) fn ensure_supported_protocol(codex: &str) -> Result<String> {
     let version = codex_version(codex)?;
     let generated = tempfile::Builder::new()
-        .prefix("st2-codex-protocol-")
+        .prefix("st-codex-protocol-")
         .tempdir()
         .context("creating a temporary Codex protocol schema directory")?;
     let output = Command::new(codex)

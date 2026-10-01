@@ -24,7 +24,7 @@ use agent_spec::discovery::{Discovered, discover, discover_strict, path_defaults
 use agent_spec::spec::{AgentSpec, JobType};
 use agent_spec::{DeclaredDiagnosticCode, DeclaredParse, DeclaredSeverity, DeclaredValue};
 
-pub const VALIDATE_RECEIPT_SCHEMA: &str = "st2.validate.v2";
+pub const VALIDATE_RECEIPT_SCHEMA: &str = "st.validate.v2";
 pub const CORE_CATALOG_POLICY_PROFILE: &str = "st2.core+catalog.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -31,7 +31,7 @@ use crate::host_lock::process_alive;
 use crate::reconcile::{Session, TaskLaunch, TaskTarget};
 use crate::run::resolve_task_cwd;
 
-const EXEC_GENERATION_SCHEMA: &str = "st2.exec-generation.v1";
+const EXEC_GENERATION_SCHEMA: &str = "st.exec-generation.v1";
 const RETIRE_TERM_WAIT: Duration = Duration::from_secs(2);
 const RETIRE_KILL_WAIT: Duration = Duration::from_secs(2);
 const RETIRE_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -894,7 +894,7 @@ fn observation_alive_for_reconcile(observation: ExecGenerationObservation) -> bo
 }
 
 fn validate_generation(id: &str, generation: &ExecGeneration) -> Result<(), String> {
-    if generation.schema != EXEC_GENERATION_SCHEMA {
+    if !crate::contracts::schema_matches(&generation.schema, EXEC_GENERATION_SCHEMA) {
         return Err(format!("unsupported schema {:?}", generation.schema));
     }
     if generation.pid == 0 || generation.pid > i32::MAX as u32 {
