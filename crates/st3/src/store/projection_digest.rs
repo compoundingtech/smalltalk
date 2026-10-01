@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS projection_digest_state (
 CREATE TABLE IF NOT EXISTS projection_digest_operation_rows (
     operation_id TEXT PRIMARY KEY, row_json TEXT NOT NULL
 );
+-- Repair meaning outlives receipt rows removed by a checkpoint. This local exclusion cache
+-- is covered by the authenticated record.repaired claims, not by its physical row inventory.
+CREATE TABLE IF NOT EXISTS projection_digest_repaired_claims (id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS projection_digest_generation (
     id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL
 );
@@ -147,7 +150,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         .iter()
         .map(|(table, excluded)| Ok((*table, columns(connection, table, excluded)?)))
         .collect::<Result<Vec<_>>>()?;
-    let signature = serde_json::to_string(&(4, &registry))?;
+    let signature = serde_json::to_string(&(5, &registry))?;
     let previous: Option<String> = connection
         .query_row(
             "SELECT value FROM meta WHERE key='projection_digest_registry'",
@@ -162,7 +165,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
     let trigger_rows: usize=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'projection_digest_%'",[],|row|row.get(0))?;
     if previous.as_deref() == Some(&signature)
         && state_rows == TABLES.len() + 1
-        && trigger_rows == 3 * (TABLES.len() - 1) + 8 + 8
+        && trigger_rows == 3 * (TABLES.len() - 1) + 8 + 8 + 4
     {
         return Ok(());
     }
@@ -174,6 +177,11 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
     for trigger in triggers {
         transaction.execute_batch(&format!("DROP TRIGGER {trigger}"))?;
     }
+    transaction.execute(
+        "INSERT OR IGNORE INTO projection_digest_repaired_claims
+        SELECT claim_id FROM replica_records WHERE state='repaired' AND claim_id IS NOT NULL",
+        [],
+    )?;
     transaction.execute("DELETE FROM projection_digest_state", [])?;
     transaction.execute("DELETE FROM projection_digest_operation_rows", [])?;
     for (table, columns) in &registry {
@@ -225,9 +233,11 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
             "
             CREATE TRIGGER projection_digest_{table}_insert AFTER INSERT ON {table}
             WHEN NOT EXISTS(SELECT 1 FROM {other} WHERE id=NEW.id)
+              AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=NEW.id)
             BEGIN {} END;
             CREATE TRIGGER projection_digest_{table}_delete AFTER DELETE ON {table}
             WHEN NOT EXISTS(SELECT 1 FROM {other} WHERE id=OLD.id)
+              AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=OLD.id)
             BEGIN {} END;",
             change_sql(
                 "claim_sources",
@@ -251,12 +261,14 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         };
         transaction.execute_batch(&format!("CREATE TRIGGER projection_digest_{table}_time_update
             AFTER UPDATE OF accepted_at_unix_ms ON {table}
-            WHEN {visible} AND OLD.accepted_at_unix_ms IS NOT NEW.accepted_at_unix_ms BEGIN {} END;
+            WHEN {visible} AND OLD.accepted_at_unix_ms IS NOT NEW.accepted_at_unix_ms
+              AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=NEW.id) BEGIN {} END;
             CREATE TRIGGER projection_digest_{table}_identity_update BEFORE UPDATE OF id ON {table}
             WHEN OLD.id IS NOT NEW.id BEGIN SELECT RAISE(ABORT,'claim source identity is immutable'); END;",
             change_sql("claim_sources","json_array(OLD.id,CAST(OLD.accepted_at_unix_ms AS TEXT))",
                 "json_array(NEW.id,CAST(NEW.accepted_at_unix_ms AS TEXT))",0)))?;
     }
+    repair_source_triggers(&transaction)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(key,value) VALUES('projection_digest_registry',?1)",
         [&signature],
@@ -274,16 +286,21 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
 fn operation_fallback(operation: &str) -> String {
     format!("(SELECT json_array(operation_id,MIN(request_digest),
         (SELECT MIN(c.id) FROM checkpoint_claims c WHERE c.operation_id={operation}
-          AND c.request_digest=(SELECT MIN(m.request_digest) FROM checkpoint_claims m WHERE m.operation_id={operation})),
+          AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=c.id)
+          AND c.request_digest=(SELECT MIN(m.request_digest) FROM checkpoint_claims m WHERE m.operation_id={operation}
+            AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=m.id))),
         CASE WHEN COUNT(DISTINCT request_digest)>1 THEN 'conflict' ELSE 'active' END)
-        FROM checkpoint_claims WHERE operation_id={operation} GROUP BY operation_id)")
+        FROM checkpoint_claims WHERE operation_id={operation}
+          AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=checkpoint_claims.id)
+        GROUP BY operation_id)")
 }
 
 pub(super) fn operation_rows() -> String {
     format!(
         "SELECT json_array(id,request_digest,canonical_claim_id,state) AS row_json FROM operations
         UNION ALL SELECT {} FROM
-        (SELECT DISTINCT operation_id FROM checkpoint_claims WHERE operation_id IS NOT NULL) dropped
+        (SELECT DISTINCT operation_id FROM checkpoint_claims WHERE operation_id IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=checkpoint_claims.id)) dropped
         WHERE NOT EXISTS(SELECT 1 FROM operations WHERE id=dropped.operation_id)",
         operation_fallback("dropped.operation_id")
     )
@@ -362,7 +379,33 @@ fn source_query() -> &'static str {
     "SELECT json_array(id,accepted_at_unix_ms) FROM (
         SELECT id,accepted_at_unix_ms FROM claims UNION ALL
         SELECT id,CAST(accepted_at_unix_ms AS TEXT) FROM checkpoint_claims
-        WHERE NOT EXISTS(SELECT 1 FROM claims WHERE claims.id=checkpoint_claims.id))"
+        WHERE NOT EXISTS(SELECT 1 FROM claims WHERE claims.id=checkpoint_claims.id)) sources
+        WHERE NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=sources.id)"
+}
+
+fn repair_source_triggers(connection: &Connection) -> Result<()> {
+    for event in ["INSERT", "UPDATE OF state,claim_id"] {
+        let suffix = if event == "INSERT" {
+            "insert"
+        } else {
+            "update"
+        };
+        connection.execute_batch(&format!("CREATE TRIGGER projection_digest_repair_record_{suffix}
+            AFTER {event} ON replica_records WHEN NEW.state='repaired' AND NEW.claim_id IS NOT NULL
+            BEGIN INSERT OR IGNORE INTO projection_digest_repaired_claims VALUES(NEW.claim_id); END;"))?;
+    }
+    for (event, prefix, subtract) in [("INSERT", "NEW", true), ("DELETE", "OLD", false)] {
+        let row=format!("(SELECT json_array(id,CAST(accepted_at_unix_ms AS TEXT)) FROM claims WHERE id={prefix}.id
+            UNION ALL SELECT json_array(id,CAST(accepted_at_unix_ms AS TEXT)) FROM checkpoint_claims
+              WHERE id={prefix}.id AND NOT EXISTS(SELECT 1 FROM claims WHERE id={prefix}.id) LIMIT 1)");
+        let operation=format!("COALESCE((SELECT json_extract(body,'$._operation.id') FROM claims WHERE id={prefix}.id),
+            (SELECT operation_id FROM checkpoint_claims WHERE id={prefix}.id))");
+        connection.execute_batch(&format!("CREATE TRIGGER projection_digest_repaired_claims_{event}
+            AFTER {event} ON projection_digest_repaired_claims WHEN {row} IS NOT NULL BEGIN {} {} END;",
+            if subtract {change_sql("claim_sources",&row,"NULL",-1)} else {change_sql("claim_sources","NULL",&row,1)},
+            refresh_operation(&operation)))?;
+    }
+    Ok(())
 }
 
 fn scan(
