@@ -1583,7 +1583,7 @@ mod tests {
             "{restored}"
         );
         assert!(!restored.contains("<context"), "{restored}");
-        assert!(!restored.contains("st inbox"), "{restored}");
+        assert!(!restored.contains("st2 inbox"), "{restored}");
     }
 
     /// The extension is not allowed to choose how a message lands, so the mode has to be on the
