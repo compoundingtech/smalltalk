@@ -2537,7 +2537,7 @@ impl Ui {
         };
         let tools = entries
             .iter()
-            .filter(|entry| matches!(entry.body, Body::Tool { .. }))
+            .filter(|entry| st3_conversation_ui::conversation::folds(&entry.body))
             .map(|entry| entry.id.clone())
             .collect::<Vec<_>>();
         if tools
