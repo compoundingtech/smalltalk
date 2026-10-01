@@ -17,6 +17,7 @@ mod first_sync;
 mod fleet;
 mod log_diet;
 mod messaging_faults;
+mod mission_cancellation;
 mod no_st2_seat;
 mod operational_state_contract;
 mod recorder_report;

@@ -1218,6 +1218,24 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
+        for runner in self.store.mission_gate_runners()? {
+            if runner.retired && runner.host == self.host {
+                let _ = self.isolate("gate", &runner.subject, || {
+                    let runtime_id = runner.subject.replace('/', ".");
+                    let observation = self.runtime.observe_exec(&runtime_id)?;
+                    self.reconcile_runtime_stop(
+                        &runner.subject,
+                        &runtime_id,
+                        false,
+                        observation
+                            .as_ref()
+                            .and_then(|value| value.incarnation_id.as_deref()),
+                        0,
+                        observation.as_ref(),
+                    )
+                });
+            }
+        }
         let desired_span = crate::profile::span("pass/desired");
         let mut desired = self.store.desired_subjects()?;
         let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
@@ -3979,7 +3997,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             changed |= self.store.set_mission_run_state(
                 &run.id,
                 "running",
-                "cleanup-failed",
+                if run.phase == "final-cancelled" {
+                    "cleanup-cancelled"
+                } else {
+                    "cleanup-failed"
+                },
                 Some(&reason),
             )?;
             return Ok(changed);
@@ -4231,18 +4253,38 @@ impl<R: RuntimeControl> Reconciler<R> {
                         !step.step.is_empty()
                             && matches!(step.status.as_str(), "failed" | "cancelled")
                     });
-                let terminal_status = if final_failed || failed {
-                    "failed"
-                } else if run.phase == "final-cancelled" {
+                let terminal_status = if run.phase == "final-cancelled" {
                     "cancelled"
+                } else if final_failed || failed {
+                    "failed"
                 } else {
                     "completed"
+                };
+                let failure_reason = if final_failed {
+                    Some(format!(
+                        "finally steps failed: {}",
+                        flat.iter()
+                            .filter(|step| step.spec.finally)
+                            .filter_map(|step| views.get(step.spec.path.as_str()))
+                            .filter(|view| view.status == "failed")
+                            .map(|view| format!(
+                                "{}: {}",
+                                view.step,
+                                view.blocked_reason.as_deref().unwrap_or("the step failed")
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ))
+                } else if failed {
+                    Some("one or more mission steps failed".to_owned())
+                } else {
+                    None
                 };
                 changed |= self.store.set_mission_run_state(
                     &run.id,
                     "running",
                     &format!("cleanup-{terminal_status}"),
-                    (final_failed || failed).then_some("one or more mission steps failed"),
+                    failure_reason.as_deref(),
                 )?;
                 return Ok(changed);
             }
@@ -4605,13 +4647,28 @@ impl<R: RuntimeControl> Reconciler<R> {
         } else {
             BTreeSet::from([run.subject.clone()])
         };
-        let owned = owner_runs
+        let mut owned = owner_runs
             .iter()
             .map(|owner| self.store.desired_subjects_for_owner_run(owner))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        owned.extend(
+            self.store
+                .mission_gate_runners()?
+                .into_iter()
+                .filter(|runner| owner_runs.contains(&runner.owner_run))
+                .map(|runner| DesiredSubject {
+                    subject: runner.subject,
+                    kind: "stop".into(),
+                    desired: Value::Null,
+                    member: None,
+                    owner_run: Some(runner.owner_run),
+                    owner_generation: None,
+                    owner_step: None,
+                }),
+        );
         let intake_stopped = self.stop_owned_intake(
             &owned.iter().collect::<Vec<_>>(),
             None,
@@ -4770,9 +4827,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.record_once(&run.subject, "eval.verdict", fields)?;
             changed = true;
         }
-        changed |=
-            self.store
-                .set_mission_run_state(&run.id, status, "terminal", unstopped.as_deref())?;
+        let failure_reason = self
+            .store
+            .latest_claim(&run.subject, Some("mission-run.state"))?
+            .and_then(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        changed |= self.store.set_mission_run_state(
+            &run.id,
+            status,
+            "terminal",
+            unstopped.as_deref().or(failure_reason.as_deref()),
+        )?;
         Ok(changed)
     }
 
@@ -5504,6 +5574,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             BTreeMap::from([
                 ("status".into(), Value::String("requested".into())),
                 ("runner".into(), Value::String("loop-metric".into())),
+                ("owner".into(), Value::String(view.subject.clone())),
             ]),
         )?;
         let member = MemberSpec {
@@ -9346,6 +9417,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             BTreeMap::from([
                 ("status".into(), Value::String("requested".into())),
                 ("runner".into(), Value::String("exec".into())),
+                ("owner".into(), Value::String(stage.subject.clone())),
             ]),
         )?;
         let member = MemberSpec {
@@ -9585,6 +9657,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             BTreeMap::from([
                 ("status".into(), Value::String("requested".into())),
                 ("model".into(), Value::String(model.into())),
+                ("owner".into(), Value::String(stage.subject.clone())),
                 ("token_budget".into(), Value::from(token_budget)),
                 (
                     "tools".into(),
@@ -17101,6 +17174,214 @@ schedule "unready" {{
                 .status,
             "failed"
         );
+    }
+
+    #[test]
+    fn cancellation_recovers_legacy_gates_and_preserves_final_failure() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "orchid/cancel" state="ready" {
+  goal "Cancel all owned runners."
+  step "wait" { agentless }
+  finally { step "report" { agentless } }
+}
+"#,
+            "legacy-cancel-mission",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "orchid/cancel".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "legacy-cancel-run".into(),
+            })
+            .unwrap();
+        let step = run.steps.iter().find(|step| step.step == "wait").unwrap();
+        let final_step = run.steps.iter().find(|step| step.step == "report").unwrap();
+        let legacy_prefix = format!("gate-operation/{}/", step.subject.replace('/', "."));
+        let runtime = Arc::new(FakeRuntime::default());
+        for (subject, fields) in [
+            (
+                format!("{legacy_prefix}mechanical"),
+                serde_json::json!({"runner": "exec"}),
+            ),
+            (
+                format!("{legacy_prefix}llm"),
+                serde_json::json!({"model": "orchid-model"}),
+            ),
+            (
+                format!("gate-operation/{}/baseline", run.subject.replace('/', ".")),
+                serde_json::json!({"runner": "exec"}),
+            ),
+            (
+                "gate-operation/loop-metric/orchid".into(),
+                serde_json::json!({"runner": "loop-metric", "owner": step.subject}),
+            ),
+            (
+                "gate-operation/unrelated/other".into(),
+                serde_json::json!({"runner": "exec"}),
+            ),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "gate.requested".into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let runtime_id = subject.replace('/', ".");
+            runtime.execs.lock().unwrap().insert(
+                runtime_id.clone(),
+                RuntimeObservation {
+                    runtime_id,
+                    terminal: false,
+                    status: "running".into(),
+                    exit_code: None,
+                    incarnation_id: Some(subject),
+                },
+            );
+        }
+        let remote = Store::open_memory("remote").unwrap();
+        remote
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/loop-metric/remote".into(),
+                kind: "gate.requested".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    serde_json::json!({"runner": "loop-metric", "owner": step.subject}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        store
+            .import_replication("remote", &remote.export_replication(0).unwrap())
+            .unwrap();
+        let runners = store.mission_gate_runners().unwrap();
+        assert_eq!(runners.len(), 5);
+        assert!(runners.iter().all(|runner| !runner.retired));
+        store
+            .request_mission_run_cancellation(&run.id, "no longer needed")
+            .unwrap();
+        store
+            .set_step_state(
+                &final_step.subject,
+                "failed",
+                Some("the final status gate failed"),
+            )
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.stops.lock().unwrap().len(), 4);
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().phase,
+            "cleanup-cancelled"
+        );
+        // A live gate keeps cleanup pending, and a resistant gate reaches SIGKILL.
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.kills.lock().unwrap().len(), 4);
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().phase,
+            "cleanup-cancelled"
+        );
+        for observation in runtime.execs.lock().unwrap().values_mut() {
+            observation.status = "exited".into();
+        }
+        reconciler.reconcile_once().unwrap();
+        // The remote runner still needs its owner's stopped observation.
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().phase,
+            "cleanup-cancelled"
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/loop-metric/remote".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("stopped".into()))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let terminal = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            (terminal.status.as_str(), terminal.phase.as_str()),
+            ("cancelled", "terminal")
+        );
+        let state = store
+            .latest_claim(&run.subject, Some("mission-run.state"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            state.body["fields"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("report: the final status gate failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_runs_final_timeout_still_reaches_terminal_cancellation() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "orchid/timeout" state="ready" timeout="1ms" {
+  goal "Bound cancelled final work."
+  step "wait" { agentless }
+  finally { step "report" { agentless } }
+}
+"#,
+            "cancelled-timeout-mission",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "orchid/timeout".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "cancelled-timeout-run".into(),
+            })
+            .unwrap();
+        store
+            .request_mission_run_cancellation(&run.id, "no longer needed")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let terminal = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            (terminal.status.as_str(), terminal.phase.as_str()),
+            ("cancelled", "terminal")
+        );
+        assert!(terminal.steps.iter().all(|step| step.status == "cancelled"));
     }
 
     #[tokio::test]
