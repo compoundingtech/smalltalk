@@ -76,6 +76,7 @@ struct FrameInfo {
     sidebar_height: usize,
     /// Glasses: where each pane of the shown tab was drawn, in leaf order.
     glass_leaves: Vec<Rect>,
+    read_messages: HashSet<String>,
 }
 
 struct Demo {
@@ -210,6 +211,19 @@ pub struct Ui {
 }
 
 impl Ui {
+    /// Call only after the terminal successfully presented this frame.
+    pub(crate) fn visible_messages(&self) -> HashSet<String> {
+        if self.help
+            || self.popover.is_some()
+            || self
+                .glasses
+                .as_ref()
+                .is_some_and(|glasses| glasses.palette_open())
+        {
+            return HashSet::new();
+        }
+        self.frame.borrow().read_messages.clone()
+    }
     pub fn new(world: World) -> Self {
         Self {
             world,
@@ -1184,6 +1198,14 @@ impl Ui {
             *state
         };
         let top = state.top;
+        if area.width > 1 && height > 0 {
+            self.frame.borrow_mut().read_messages.extend(
+                doc.messages
+                    .iter()
+                    .filter(|(_, range)| range.start < top + height && range.end > top)
+                    .map(|(id, _)| id.clone()),
+            );
+        }
         let lines = Rc::new(doc.lines);
         for (offset, line) in lines.iter().skip(top).take(height).enumerate() {
             buf.set_line(

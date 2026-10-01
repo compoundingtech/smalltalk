@@ -172,6 +172,9 @@ impl Glass {
 }
 
 impl Glasses {
+    pub(crate) fn palette_open(&self) -> bool {
+        self.palette.is_some()
+    }
     /// Open `wanted` (or the last glass used here, or `main`) from what this device keeps.
     pub(crate) fn open(wanted: Option<String>, store: Option<PathBuf>) -> Self {
         let stored = store.as_deref().map(glass_store::load).unwrap_or_default();

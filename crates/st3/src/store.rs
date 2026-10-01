@@ -19290,10 +19290,40 @@ fn validate_message_transition(
             | (Some("delivered"), "read")
             | (Some("read"), "closed")
     );
+    // A person's displayed message has no native harness handoff. Its explicit read receipt
+    // is also delivery evidence; only the actual person recipient may skip that boundary.
+    let person_read = if requested == "read"
+        && matches!(current, Some("sent" | "staged"))
+        && input
+            .actor
+            .as_deref()
+            .is_some_and(|actor| actor.starts_with("person/"))
+    {
+        let index: Option<u64> = transaction
+            .query_row(
+                "SELECT created_index FROM message_index WHERE subject=?1",
+                [&input.subject],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        match index {
+            Some(index) => {
+                message_view_tx(transaction, &input.subject, index)
+                    .map_err(internal)?
+                    .to
+                    .as_str()
+                    == input.actor.as_deref().unwrap()
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
     let daemon_withdrawal = matches!(current, Some("sent" | "staged"))
         && requested == "closed"
         && input.actor.as_deref() == Some("daemon/runtime");
-    if !valid && !daemon_withdrawal {
+    if !valid && !person_read && !daemon_withdrawal {
         return Err(St3Error::new(
             "invalid-message-transition",
             format!(
@@ -39771,6 +39801,64 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         };
         append_direct("message.sent", "sent", "direct-sent").unwrap();
         append_direct("message.delivered", "delivered", "direct-delivered").unwrap();
+    }
+
+    #[test]
+    fn only_the_person_recipient_can_read_before_native_delivery() {
+        let store = Store::open_memory("person-read").unwrap();
+        for (id, to) in [
+            ("sent", "person/avery"),
+            ("staged", "person/avery"),
+            ("native", "agent/example/keeper"),
+        ] {
+            let subject = format!("message/{id}");
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "message.sent".into(),
+                    actor: Some("agent/example/sender".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("sent".into())),
+                        ("from".into(), Value::String("agent/example/sender".into())),
+                        ("to".into(), Value::String(to.into())),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let receipt = |actor: &str, status: &str| {
+                store.append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: format!("message.{status}"),
+                    actor: Some(actor.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+            };
+            for actor in ["person/other", "agent/example/sender"] {
+                assert_eq!(
+                    receipt(actor, "read").unwrap_err().code,
+                    "invalid-message-transition"
+                );
+                assert_eq!(store.message(&subject).unwrap().unwrap().status, "sent");
+            }
+            if id == "native" {
+                assert_eq!(
+                    receipt(to, "read").unwrap_err().code,
+                    "invalid-message-transition"
+                );
+                continue;
+            }
+            if id == "staged" {
+                receipt(to, "staged").unwrap();
+            }
+            let first = receipt(to, "read").unwrap();
+            assert_eq!(receipt(to, "read").unwrap().id, first.id);
+            assert_eq!(store.message(&subject).unwrap().unwrap().status, "read");
+        }
     }
 
     #[test]

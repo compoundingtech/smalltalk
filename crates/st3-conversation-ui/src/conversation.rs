@@ -247,10 +247,15 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 std::slice::from_ref(&bar),
                 None,
             ));
+            let start = doc.lines.len();
             for line in text::markdown(body, inner.saturating_sub(2), theme.soft(), theme) {
                 let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
                 spans.extend(line.spans);
                 doc.line(Line::from(spans));
+            }
+            if entry.id.starts_with("message/") && doc.lines.len() > start {
+                doc.messages
+                    .push((entry.id.clone(), start..doc.lines.len()));
             }
         }
         Body::Pending { text: body, failed } => {
