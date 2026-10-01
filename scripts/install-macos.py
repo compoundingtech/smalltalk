@@ -275,7 +275,7 @@ def main():
     home = Path.home()
     lock_root = home / '.local/state/st3/macos-installs'
     lock_root.mkdir(parents=True, exist_ok=True)
-    with open(lock_root / (hashlib.sha256(str(fixed(home)).encode()).hexdigest() + '.lock'), 'a' as lock:
+    with open(lock_root / (hashlib.sha256(str(fixed(home)).encode()).hexdigest() + '.lock'), 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         verifying_artifact = args.verify_app or args.install_app or args.backup_only or args.restore_app
         if verifying_artifact and CERTIFICATE and re.fullmatch(r'[a-fA-F0-9]{40}', CERTIFICATE):
