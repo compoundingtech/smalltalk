@@ -53,6 +53,8 @@ const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
 /// read together; a new subscription is still read at once.
 const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
+// Observer grace periods and checkpoint waits can enter attention without a new claim.
+const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
@@ -521,6 +523,8 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
     // The commits already weighed for a reread, whether one is due, and when the last ran.
+    let mut attention_clock = tokio::time::interval(ATTENTION_CLOCK_INTERVAL);
+    attention_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
@@ -615,6 +619,9 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
             }
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
                 refresh.extend(subscriptions.keys().cloned());
+            }
+            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "attention") => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "attention").map(|(id, _)| id.clone()));
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
