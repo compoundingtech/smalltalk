@@ -510,11 +510,17 @@ CREATE TABLE IF NOT EXISTS local_usage_spend (
     observed_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY(subject, incarnation_id, model, account, owner_run, owner_step, host)
 );
-CREATE TABLE IF NOT EXISTS local_usage_seen (
+-- Each response already counted, with when the harness recorded it. A response is remembered
+-- for `USAGE_RESPONSE_HORIZON_MS`, longer than any harness keeps a response in the record st
+-- replays, and an older response is never counted.
+CREATE TABLE IF NOT EXISTS local_usage_responses (
     subject TEXT NOT NULL,
     source_id TEXT NOT NULL,
+    observed_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY(subject, source_id)
 );
+CREATE INDEX IF NOT EXISTS local_usage_responses_age_index
+ON local_usage_responses(observed_at_unix_ms);
 -- The last replicated observation of each `latest` slot this node wrote, and the newest
 -- local observation of the slot that no replicated claim carries yet.
 CREATE TABLE IF NOT EXISTS local_latest_slots (
@@ -7830,6 +7836,27 @@ impl Store {
         }
     }
 
+    /// Forget the responses counted before `older_than_unix_ms`, in short transactions of at
+    /// most `chunk` rows. Ingest refuses responses that old, so none can be counted twice.
+    pub fn trim_usage_responses(&self, older_than_unix_ms: u128, chunk: usize) -> Result<usize> {
+        let chunk = chunk.max(1).min(i64::MAX as usize) as i64;
+        let mut deleted = 0;
+        loop {
+            let connection = self.connection.write();
+            let removed = connection.execute(
+                "DELETE FROM local_usage_responses WHERE rowid IN (
+                    SELECT rowid FROM local_usage_responses WHERE observed_at_unix_ms < ?1 LIMIT ?2
+                 )",
+                params![older_than_unix_ms.min(i64::MAX as u128) as i64, chunk],
+            )?;
+            drop(connection);
+            deleted += removed;
+            if (removed as i64) < chunk {
+                return Ok(deleted);
+            }
+        }
+    }
+
     pub fn idempotent_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
         connection
@@ -11344,7 +11371,7 @@ impl Store {
                 }
                 Some("response_rollup") => {
                     let group = spend.entry(claim_incarnation.to_owned()).or_default();
-                    let key = ["model", "owner_run", "owner_step", "host"]
+                    let key = ["model", "account", "owner_run", "owner_step", "host"]
                         .iter()
                         .map(|key| fields.get(*key).and_then(Value::as_str).unwrap_or(""))
                         .collect::<Vec<_>>()
@@ -14502,6 +14529,31 @@ fn latest_retention(kind: &str) -> bool {
         .is_some_and(|spec| spec.retention == st3_schema::Retention::Latest)
 }
 
+/// How long st remembers that it counted a response. A harness keeps a bounded record of recent
+/// responses that st replays after a restart; a response older than this is never counted.
+pub const USAGE_RESPONSE_HORIZON_MS: u128 = 30 * 24 * 60 * 60 * 1000;
+
+/// The responses st remembered counting before it recorded when each was made. They become
+/// dated now, so they are forgotten one horizon after this upgrade.
+pub(crate) fn migrate_local_usage_seen(connection: &Connection) -> Result<()> {
+    let legacy: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_usage_seen')",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy {
+        connection.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             INSERT OR IGNORE INTO local_usage_responses(subject, source_id, observed_at_unix_ms)
+             SELECT subject, source_id, {} FROM local_usage_seen;
+             DROP TABLE local_usage_seen;
+             COMMIT;",
+            now_ms()
+        ))?;
+    }
+    Ok(())
+}
+
 /// While a harness works, its usage replicates at most once in this window. Once it stops
 /// working, its newest usage replicates at once.
 const USAGE_PUBLISH_INTERVAL_MS: u128 = 5 * 60 * 1000;
@@ -14703,19 +14755,35 @@ fn insert_local_observation_tx(
             "step_id": if owner_step.is_empty() { None } else { Some(owner_step) },
         });
         body["fields"]["host"] = Value::String(origin.to_owned());
+        // What st charged this response, so the OpenTelemetry history carries the same cost
+        // the graph's totals do.
+        body["fields"]["spend"] = json!({
+            "cost_microusd": cost_microusd,
+            "basis": if reported_cost.is_some() {
+                "reported"
+            } else if estimated_cost.is_some() {
+                "estimated"
+            } else {
+                "unpriced"
+            },
+            "pricing": crate::pricing::PRICING_REVISION,
+        });
         let source_id = input
             .fields
             .get("source_id")
             .and_then(Value::as_str)
             .or_else(|| input.fields.get("entry_id").and_then(Value::as_str))
             .unwrap_or("");
-        let new_response = transaction
-            .execute(
-                "INSERT OR IGNORE INTO local_usage_seen(subject, source_id) VALUES (?1, ?2)",
-                params![input.subject, source_id],
-            )
-            .map_err(internal)?
-            != 0;
+        let new_response = responded_at
+            >= observed_at.saturating_sub(USAGE_RESPONSE_HORIZON_MS)
+            && transaction
+                .execute(
+                    "INSERT OR IGNORE INTO local_usage_responses(subject, source_id, observed_at_unix_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![input.subject, source_id, responded_at as i64],
+                )
+                .map_err(internal)?
+                != 0;
         if new_response {
             transaction.execute(
                 "INSERT INTO local_usage_spend(subject, incarnation_id, model, account, owner_run, owner_step, host,
@@ -36268,6 +36336,72 @@ mission "nested-work" state="ready" {
         // Replayed later, a response from before the step began is not charged to it.
         let before = respond("before", activated - 1);
         assert!(before["step_id"].is_null(), "{before}");
+    }
+
+    #[test]
+    fn counted_responses_are_remembered_for_a_bounded_horizon() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        {
+            let store = Store::open(&path, "host-one").unwrap();
+            // An older build kept every counted response forever, without a date.
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE local_usage_seen (subject TEXT NOT NULL, source_id TEXT NOT NULL,
+                        PRIMARY KEY(subject, source_id));
+                     INSERT INTO local_usage_seen VALUES ('agent/example.worker', 'counted-before');",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path, "host-one").unwrap();
+        let subject = "agent/example.worker";
+        let respond = |entry: &str, at: u128| {
+            let mut claim = timeline_observation(subject, "inc-one", entry);
+            claim
+                .fields
+                .insert("entry_type".into(), Value::String("usage".into()));
+            claim
+                .fields
+                .insert("source_id".into(), Value::String(entry.into()));
+            claim
+                .fields
+                .insert("observed_at_unix_ms".into(), Value::from(at as u64));
+            claim.fields.insert(
+                "body".into(),
+                json!({"semantics": "response", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+            );
+            store.append_claim_outcome(&claim).unwrap();
+        };
+        let now = now_ms();
+        respond("counted-before", now);
+        respond("too-old", now - USAGE_RESPONSE_HORIZON_MS - 60_000);
+        respond("recent", now - 60_000);
+        let total: u64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(total_tokens), 0) FROM local_usage_spend",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2, "only the recent response counts");
+        assert_eq!(store.trim_usage_responses(now - 30_000, 1).unwrap(), 1);
+        let remembered = store
+            .connection
+            .lock()
+            .unwrap()
+            .prepare("SELECT source_id FROM local_usage_responses ORDER BY source_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(remembered, ["counted-before"]);
     }
 
     #[test]

@@ -281,7 +281,9 @@ Token spend across the fleet is available by agent, mission, step, model, accoun
 its API-equivalent cost: what the tokens would cost at the provider's list price, from a pricing
 table built into st. Tokens on a model the table does not price are counted as unpriced, and a
 cost that leaves them out ends in `+`. An account is a short digest of the harness's own login,
-never the login itself. The period ends now:
+never the login itself. The graph keeps hourly usage for about a week and each series' total
+after that; `[observations.otlp]` sends every response to OpenTelemetry for longer history. The
+period ends now:
 
 ```sh
 st usage --hours 24
