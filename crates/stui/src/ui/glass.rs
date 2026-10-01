@@ -202,6 +202,9 @@ impl Glass {
 }
 
 impl Glasses {
+    pub(crate) fn palette_open(&self) -> bool {
+        self.palette.is_some()
+    }
     /// The agents whose conversations show in the shown glass: each group's shown tab, the
     /// focused group first.
     pub(crate) fn shown_agents(&self) -> Vec<String> {

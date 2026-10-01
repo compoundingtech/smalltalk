@@ -9,6 +9,9 @@ use crate::store::Store;
 const PREFIX: &str = "doc/delivery-probes/";
 const FORMAT: &str = "st3.delivery-probes.v1";
 const STALE_MS: u128 = 90_000;
+/// A probe republishes an unchanged report every five minutes (each one is a replicated write),
+/// so a report is stale after three missed heartbeats.
+const HEARTBEAT_STALE_MS: u128 = 15 * 60_000;
 
 #[derive(Deserialize)]
 struct Report {
@@ -110,7 +113,7 @@ pub(super) fn check(
             continue;
         }
         let age = now.saturating_sub(report.updated_at_unix_ms);
-        if age > STALE_MS || report.updated_at_unix_ms > now.saturating_add(5_000) {
+        if age > HEARTBEAT_STALE_MS || report.updated_at_unix_ms > now.saturating_add(5_000) {
             warned = true;
             notes.push(format!(
                 "{}: probe heartbeat is stale or its clock is ahead (age {}s)",
@@ -290,7 +293,13 @@ mod tests {
         let good = check(&store, 2000, &[]).unwrap().unwrap();
         assert_eq!(good.status, "pass");
         assert!(good.message.contains("amber → cobalt: read in 400ms"));
-        assert_eq!(check(&store, 100_000, &[]).unwrap().unwrap().status, "warn");
+        // Ten minutes without a changed report is two missed heartbeats, not yet stale.
+        assert_eq!(check(&store, 602_000, &[]).unwrap().unwrap().status, "pass");
+        let stale = check(&store, 2000 + HEARTBEAT_STALE_MS + 1, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.status, "warn");
+        assert!(stale.message.contains("probe heartbeat is stale"));
         put(&store, "amber", 100_000, "pending", 400);
         let overdue = check(&store, 100_000, &[]).unwrap().unwrap();
         assert!(overdue.message.contains("no read within the deadline"));

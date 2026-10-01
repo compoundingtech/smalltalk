@@ -2,6 +2,22 @@ import XCTest
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testCreationActionFixtures() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        for name in ["agent-create", "terminal-create", "terminal-end"] {
+            let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/\(name).json"))
+            let request = try JSONDecoder().decode(ActionRequest.self, from: data)
+            let roundTrip = try JSONEncoder().encode(request)
+            XCTAssertEqual(try JSONSerialization.jsonObject(with: data) as? NSDictionary,
+                try JSONSerialization.jsonObject(with: roundTrip) as? NSDictionary)
+        }
+        let parameters = AgentCreateParameters(name: "worker", harness: "codex", message: "--literal text")
+        let request = try ActionRequest.agentCreate(id: "action/create", idempotencyKey: "creation-test-key",
+            fence: Fence(snapshotID: "snapshot/test"), parameters: parameters)
+        XCTAssertEqual(request.parameters["message"], .string("--literal text"))
+    }
+
     func testGlassFixtureAndNullCreationBase() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

@@ -2304,7 +2304,10 @@ async fn serve_creation_api(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let store = store.clone();
             async move {
-                let applied = request.uri().path() == "/v1/intent/apply";
+                let applied = matches!(
+                    request.uri().path(),
+                    "/v1/intent/apply" | "/v1/client/actions"
+                );
                 let response = next.run(request).await;
                 // Simulate the observations a newly started process would publish.
                 if applied

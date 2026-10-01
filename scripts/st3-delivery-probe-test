@@ -66,6 +66,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.config = {"agent": "agent/probe/amber", "host": "amber", "binary": "/bin/false",
                        "socket": "/unused", "state_dir": self.directory.name, "reviewer": "person/eval",
+                       "presence_ttl_ms": 0,
                        "peers": [{"host": "cobalt", "agent": "agent/probe/cobalt"}]}
         with patch.dict(os.environ, ST_AGENT=self.config["agent"]):
             self.monitor = probe.Probe(self.config)
@@ -90,6 +91,23 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route["status"], "sending")
         await self.monitor.route(self.target)
         self.assertEqual(sum(path == "/v1/work/ask" for path, _ in self.monitor.api.posts), 1)
+
+    async def test_routes_share_one_replication_status_read_while_it_is_fresh(self):
+        reads = []
+        get = self.monitor.api.get
+        async def counted(path):
+            if path == "/v1/replication/status":
+                reads.append(path)
+            return await get(path)
+        self.monitor.api.get = counted
+        self.monitor.presence_ttl = 15_000
+        self.monitor.peers["agent/probe/indigo"] = "indigo"
+        for _ in range(5):
+            await asyncio.gather(self.monitor.route(self.target), self.monitor.route("agent/probe/indigo"))
+        self.assertEqual(len(reads), 1)
+        self.monitor.presence_reading = (self.monitor.presence_reading[0] - 16, self.monitor.presence_reading[1])
+        await self.monitor.route(self.target)
+        self.assertEqual(len(reads), 2)
 
     async def test_recovery_after_person_completion_does_not_reopen_the_ask(self):
         await self.monitor.route(self.target)

@@ -1,20 +1,16 @@
-//! Fleet membership: member keys, signed envelopes, and the membership fold.
+//! Fleet membership as smalltalk uses it: joining from a config file and reaching peers.
 //!
-//! See `docs/fleet-join.md` for the design. A node without a pinned anchor key treats every
-//! writer as a legacy writer, so nothing here changes how a node that has not joined or
-//! migrated replicates.
+//! Keys, the membership fold and the join handshake live in `smallclaims::fleet`. See
+//! `docs/fleet-join.md` for the design.
 
-pub mod code;
-pub mod handshake;
 pub mod join;
-pub mod keys;
-pub mod membership;
 pub mod transport;
-pub mod view;
 
-pub use keys::{MemberKey, envelope_signature_message, verify_signature};
-pub use membership::{FleetClaim, Incarnation, MemberState, Membership, Window};
-pub use view::{Acceptance, FleetView, MemberView, Refusal, Sender, accept};
+pub use smallclaims::fleet::{code, handshake, keys, membership, view};
+pub use smallclaims::fleet::{
+    Acceptance, FleetClaim, FleetView, Incarnation, MemberKey, MemberState, MemberView, Membership,
+    Refusal, Sender, Window, accept, envelope_signature_message, verify_signature,
+};
 
 use std::sync::Arc;
 

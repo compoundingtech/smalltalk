@@ -85,9 +85,19 @@ pub(super) async fn receipt(
         )),
     };
     let store = state.store.clone();
-    let record =
-        blocking_action(move || store.append_mailbox_receipt(&input, &request.fence)).await?;
-    signal_changed(&state);
+    let kind = input.kind.clone();
+    let (record, work_wake) = blocking_action(move || {
+        let record = store.append_mailbox_receipt(&input, &request.fence)?;
+        // A message this store cannot read is treated as a work wake.
+        let work_wake = store
+            .message(&input.subject)
+            .ok()
+            .flatten()
+            .is_none_or(|message| super::is_work_wake(&message.tags));
+        Ok((record, work_wake))
+    })
+    .await?;
+    super::signal_message_changed(&state, &kind, work_wake);
     Ok(Json(record))
 }
 

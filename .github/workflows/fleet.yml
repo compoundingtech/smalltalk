@@ -1,46 +1,327 @@
-name: Fleet compatibility
+# Generated file - DO NOT EDIT
+# Source: fleet.yml.genie.ts
 
-# Every fork pull request, with no path filter: the fleet join series touches the store,
-# the CLI, the schema, and the worker. st/ci checks our own PRs and main.
+name: Workspace CI
+
 on:
-  pull_request:
+  pull_request: {}
+  merge_group: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 concurrency:
-  group: fleet-${{ github.workflow }}-${{ github.ref }}
+  group: "workspace-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  fleet-compat:
-    if: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
-    name: fleet-compat (${{ matrix.os }})
-    # macOS never runs on GitHub (#632): it is too slow and too expensive there. The fleet
-    # suite runs on macOS in st's own CI on the fleet's Mac.
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04]
-    runs-on: ${{ matrix.os }}
+  genie-freshness:
+    name: genie-freshness
+    timeout-minutes: 20
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Check generated files
+        shell: bash
+        run: "nix develop '.#genie' -c genie --check"
+  linux-tests:
+    name: linux-tests
+    runs-on: [nscloud-ubuntu-24.04-amd64-16x32]
     timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CI_RUN_ID: ${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/determinate-nix-action@v3
-      - name: Build the pinned baseline st3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore the Cargo target and registry
+        id: cargo-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
+          restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Isolate test home and XDG state
         run: |
-          baseline=$(jq -r .commit .github/fleet-compat-baseline.json)
-          test -n "$baseline"
-          # Only the binary: the baseline's own test suite is not what this job checks.
-          BASELINE="$baseline" nix build --impure --out-link baseline --print-build-logs --expr '
-            ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
-              .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })'
-          test -x baseline/bin/st3
-          if baseline/bin/st3 fleet --help > /dev/null 2>&1; then
-            echo "the baseline must predate fleet membership" >&2
+          # Cargo's home lives under RUNNER_TEMP, not HOME: tests get an isolated HOME,
+          # and actions/cache expands a leading tilde against the HOME of the step that runs it.
+          printf 'CARGO_HOME=%s\n' "$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          home="$RUNNER_TEMP/test-home"
+          mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Prepare provider component fixtures
+        run: |
+          system=$(nix eval --impure --raw --expr builtins.currentSystem)
+          components=$(nix build ".#checks.$system.provider-components" --no-link --print-out-paths --print-build-logs)
+          for provider in GITHUB_ISSUE GITHUB_PR PTY_STATS VISTA; do
+            wasm=$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')
+            printf 'ST2_%s_COMPONENT=%s/share/st2/providers/st2_%s_component.component.wasm\n' "$provider" "$components" "$wasm" >> "$GITHUB_ENV"
+          done
+      - name: Install matching rendered hooks
+        shell: bash
+        run: nix develop -c cargo run --locked -p st2 -- hooks install
+      - name: Build workspace tests first (no debug info)
+        shell: bash
+        run: nix develop -c cargo nextest run --workspace --locked --profile ci --no-run
+      - name: Summarize tested revision
+        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
+      - name: Run nextest
+        shell: bash
+        run: nix develop -c bash scripts/ci-linux tests
+      - name: Retain stage logs and timings
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-tests-logs
+          path: |
+            ${{ runner.temp }}/ci-logs/
+            target/messaging-faults/
+          if-no-files-found: ignore
+  linux-clippy:
+    name: linux-clippy
+    runs-on: [nscloud-ubuntu-24.04-amd64-16x32]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore the Cargo target and registry
+        id: cargo-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
+          restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Isolate test home and XDG state
+        run: |
+          # Cargo's home lives under RUNNER_TEMP, not HOME: tests get an isolated HOME,
+          # and actions/cache expands a leading tilde against the HOME of the step that runs it.
+          printf 'CARGO_HOME=%s\n' "$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          home="$RUNNER_TEMP/test-home"
+          mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Summarize tested revision
+        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
+      - name: Run clippy and the generated-client check
+        shell: bash
+        run: nix develop -c bash scripts/ci-linux clippy
+      - name: Retain stage logs and timings
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-clippy-logs
+          path: |
+            ${{ runner.temp }}/ci-logs/
+
+          if-no-files-found: ignore
+  linux-fleet-compat:
+    name: linux-fleet-compat
+    runs-on: [nscloud-ubuntu-24.04-amd64-16x32]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore the Cargo target and registry
+        id: cargo-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
+          restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Isolate test home and XDG state
+        run: |
+          # Cargo's home lives under RUNNER_TEMP, not HOME: tests get an isolated HOME,
+          # and actions/cache expands a leading tilde against the HOME of the step that runs it.
+          printf 'CARGO_HOME=%s\n' "$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          home="$RUNNER_TEMP/test-home"
+          mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Summarize tested revision
+        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
+      - name: Run fleet compatibility against the pinned older st3
+        shell: bash
+        run: nix develop -c bash scripts/ci-linux fleet-compat
+      - name: Retain stage logs and timings
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-fleet-compat-logs
+          path: |
+            ${{ runner.temp }}/ci-logs/
+
+          if-no-files-found: ignore
+  linux-gate:
+    name: linux-gate
+    needs: [linux-tests, linux-clippy, linux-fleet-compat]
+    if: always()
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    timeout-minutes: 5
+    steps:
+      - name: Require every Linux stage to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "stage results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done
+  isolation-vm:
+    name: isolation-vm
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe KVM
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing: this runner profile offers no nested virtualization"
             exit 1
           fi
-          echo "ST3_COMPAT_BIN=$PWD/baseline/bin/st3" >> "$GITHUB_ENV"
-      - name: Replicate between the baseline and new members
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then sudo chmod 0666 /dev/kvm; fi
+          python3 - <<'EOF'
+          import fcntl, os
+          fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+          version = fcntl.ioctl(fd, 0xAE00)  # KVM_GET_API_VERSION
+          vm = fcntl.ioctl(fd, 0xAE01, 0)  # KVM_CREATE_VM
+          assert version == 12, f"unexpected KVM API version {version}"
+          os.close(vm)
+          print(f"KVM API {version}: created a VM")
+          EOF
+          printf 'KVM: \x60%s\x60, CPU virtualization flag %s, VM creation succeeded\n\n| Phase | Elapsed |\n| --- | --- |\n' "$(ls -l /dev/kvm)" "$(grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo none)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Archive the st2 integration test binary
         run: |
-          test -n "$ST3_COMPAT_BIN"
-          nix develop --command cargo test -p st3 --test integration -- --ignored --exact \
-            fleet::an_old_build_config_peer_replicates_with_new_members 2>&1 | tee compat.log
-          grep -q "test result: ok. 1 passed" compat.log
+          start=$SECONDS
+          nix develop -c cargo nextest archive --locked -p st2 --test integration --archive-file "$RUNNER_TEMP/isolation.tar.zst"
+          printf '| test archive build | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the NixOS VM test driver
+        run: |
+          start=$SECONDS
+          nix build --print-build-logs --out-link "$RUNNER_TEMP/vm-driver" .#legacyPackages.x86_64-linux.transport-isolation-vm.driver
+          printf '| VM driver build | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run the exec and pty cascade tests in the VM
+        env:
+          ST_ISOLATION_ARCHIVE: "${{ runner.temp }}/isolation.tar.zst"
+          ST_ISOLATION_WORKSPACE: ${{ github.workspace }}
+          ST_ISOLATION_TIMINGS: "${{ runner.temp }}/vm-timings.json"
+        run: |
+          start=$SECONDS
+          mkdir -p "$RUNNER_TEMP/vm-out"
+          "$RUNNER_TEMP/vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/vm-out"
+          jq -r '"| VM boot | \(.boot_seconds)s |\n| cascade tests in VM (extract and run) | \(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
+          printf '| VM test driver total | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"

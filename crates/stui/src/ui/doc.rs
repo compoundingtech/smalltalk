@@ -143,6 +143,12 @@ impl DocExt for Doc {
                 ..target
             });
         }
+        self.messages.extend(
+            inner
+                .messages
+                .into_iter()
+                .map(|(id, range)| (id, range.start + base..range.end + base)),
+        );
         for line in inner.lines {
             let used = line.width();
             let mut spans = vec![Span::styled(format!("{v} "), border)];
