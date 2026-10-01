@@ -707,11 +707,9 @@ impl Ui {
                     ("alt+←→↑↓", "splits"),
                     ("ctrl+w", "close"),
                 ],
-                Some(_) if !self.on_home() => vec![
-                    ("ctrl+k", "open"),
-                    ("[ ]", "tabs"),
-                    ("ctrl+w", "close"),
-                ],
+                Some(_) if !self.on_home() => {
+                    vec![("ctrl+k", "open"), ("[ ]", "tabs"), ("ctrl+w", "close")]
+                }
                 Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
                 None => vec![("1-4", "tabs"), ("↑↓", "select")],
             };
@@ -2302,6 +2300,7 @@ impl Ui {
                     to: chat.to_name.clone(),
                     subject: title.clone(),
                     body: text,
+                    delivered: false,
                 },
             });
             entries.push(Entry {
@@ -2312,6 +2311,7 @@ impl Ui {
                     to: "you".into(),
                     subject: title,
                     body: "Good question. Here is what I know, and what I would need from you to go on. (demo reply)".into(),
+                    delivered: false,
                 },
             });
         }
@@ -2402,6 +2402,7 @@ impl Ui {
                             to: name,
                             subject: String::new(),
                             body: draft,
+                            delivered: false,
                         },
                     });
                 }
@@ -2637,6 +2638,7 @@ impl Ui {
     fn click(&mut self, hit: Hit) {
         match hit {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
+            Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
             Hit::GlassAdd(group) => {
                 self.focus_group(group);

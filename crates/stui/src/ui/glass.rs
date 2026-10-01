@@ -748,13 +748,25 @@ impl Ui {
             .filter(|item| !self.snoozed.contains(&item.id))
             .count();
         spans.push(Span::styled(" · ", bar(theme::dim())));
-        spans.push(if need > 0 {
-            Span::styled(
-                format!("◆ {need} need you"),
-                bar(theme::strong(theme::PERSON)),
-            )
+        // Each count opens the palette at what it counts.
+        let mut x = area.x + Line::from(spans.clone()).width() as u16;
+        let need_text = if need > 0 {
+            format!("◆ {need} need you")
         } else {
-            Span::styled("nothing needs you", bar(theme::dim()))
+            "nothing needs you".to_owned()
+        };
+        self.hit(
+            Rect {
+                x,
+                width: text::width(&need_text) as u16,
+                ..area
+            },
+            Hit::PaletteSection(0),
+        );
+        spans.push(if need > 0 {
+            Span::styled(need_text, bar(theme::strong(theme::PERSON)))
+        } else {
+            Span::styled(need_text, bar(theme::dim()))
         });
         let working = self
             .world
@@ -764,19 +776,29 @@ impl Ui {
             .filter(|agent| agent.state == AgentState::Working)
             .count();
         spans.push(Span::styled(" · ", bar(theme::dim())));
-        spans.push(Span::styled(
-            format!("{} {working} working", self.spinner()),
-            bar(theme::fg(theme::WORKING)),
-        ));
+        x = area.x + Line::from(spans.clone()).width() as u16;
+        let working_text = format!("{} {working} working", self.spinner());
+        self.hit(
+            Rect {
+                x,
+                width: text::width(&working_text) as u16,
+                ..area
+            },
+            Hit::PaletteSection(1),
+        );
+        spans.push(Span::styled(working_text, bar(theme::fg(theme::WORKING))));
         let machines = self.world.machines.items();
-        if !machines.is_empty() {
+        let machines_shown = !machines.is_empty();
+        if machines_shown {
             let count = |reach: &[Reach]| {
                 machines
                     .iter()
                     .filter(|machine| reach.contains(&machine.reach))
                     .count()
             };
-            spans.push(Span::styled(" · fleet ", bar(theme::dim())));
+            spans.push(Span::styled(" · ", bar(theme::dim())));
+            x = area.x + Line::from(spans.clone()).width() as u16;
+            spans.push(Span::styled("fleet ", bar(theme::dim())));
             for (glyph, color, n) in [
                 ("●", theme::GREEN, count(&[Reach::Here, Reach::Direct])),
                 ("◐", theme::SAPPHIRE, count(&[Reach::Indirect])),
@@ -786,6 +808,17 @@ impl Ui {
                     spans.push(Span::styled(format!("{glyph}{n} "), bar(theme::fg(color))));
                 }
             }
+        }
+        let end = area.x + Line::from(spans.clone()).width() as u16;
+        if machines_shown {
+            self.hit(
+                Rect {
+                    x,
+                    width: end.saturating_sub(x),
+                    ..area
+                },
+                Hit::PaletteSection(3),
+            );
         }
         buf.set_line(area.x, area.y, &Line::from(spans), area.width);
         // ▢═▢: two panes and a bridge, a pair of glasses.
@@ -1092,6 +1125,13 @@ impl Ui {
                 KeyCode::Char('t') if control => self.open_choice(None, Open::Tab),
                 KeyCode::Char('g') if control => self.open_choice(None, Open::Glass),
                 KeyCode::Char('k') if control || command => glasses.palette = None,
+                // Ctrl (or Alt, or ⌘) and a digit show only that section; the same again shows all.
+                KeyCode::Char(digit @ '1'..='5') if control || alt || command => {
+                    let section = digit as usize - '1' as usize;
+                    palette.section = (palette.section != Some(section)).then_some(section);
+                    palette.selected = 0;
+                    palette.top = None;
+                }
                 KeyCode::Char(letter) if !control && !command => {
                     palette.query.push(letter);
                     palette.selected = 0;
@@ -1144,6 +1184,10 @@ impl Ui {
             // Outside a draft, the sidebar's tab digits open the palette at that section.
             KeyCode::Char(digit @ '1'..='5') if quiet && key.modifiers.is_empty() => {
                 self.open_palette(Some(digit as usize - '1' as usize), Open::Here)
+            }
+            // A mission's k shows its whole declaration, as its card says; Up still scrolls.
+            KeyCode::Char('k') if quiet && subject && self.tab == 2 && key.modifiers.is_empty() => {
+                self.action_key('k')
             }
             // A subject's tab has no list to move through: these scroll its pane.
             KeyCode::Up | KeyCode::Char('k') if quiet && subject && !control => {
@@ -2178,6 +2222,51 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn a_missions_k_shows_its_declaration_and_ctrl_digits_pick_a_palette_section() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Tab,
+        );
+        typed(&mut ui, "k");
+        assert!(ui.kdl, "k shows the whole declaration");
+        typed(&mut ui, "k");
+        assert!(!ui.kdl);
+        ctrl(&mut ui, 'k');
+        press(&mut ui, KeyCode::Char('3'), KeyModifiers::CONTROL);
+        let section = |ui: &Ui| {
+            ui.glasses
+                .as_ref()
+                .unwrap()
+                .palette
+                .as_ref()
+                .unwrap()
+                .section
+        };
+        assert_eq!(section(&ui), Some(2));
+        press(&mut ui, KeyCode::Char('3'), KeyModifiers::CONTROL);
+        assert_eq!(section(&ui), None, "the same again shows every section");
+        // The status line's counts open the palette at what they count.
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        screen(&ui);
+        let need = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .find(|(_, hit)| matches!(hit, Hit::PaletteSection(0)))
+            .map(|(rect, _)| *rect)
+            .unwrap();
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: need.x + 1,
+            row: need.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(section(&ui), Some(0));
     }
 
     #[test]

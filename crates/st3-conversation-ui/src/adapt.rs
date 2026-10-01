@@ -49,6 +49,8 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
     let mut stamped: Vec<(String, Entry)> = Vec::new();
     let mut tools: BTreeMap<String, usize> = BTreeMap::new();
     let mut delivery: BTreeMap<String, bool> = BTreeMap::new();
+    // Graph messages the agent's harness received, from its own transcript.
+    let mut delivered: BTreeSet<String> = BTreeSet::new();
     // A Small Talk message is two entries: who wrote to whom, then what they wrote. A
     // harness transcript heads its own turns with message entries too; only a graph message,
     // `message/…`, is Small Talk.
@@ -98,6 +100,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     } else {
                         body
                     },
+                    delivered: false,
                 }
             };
             stamped.push((
@@ -113,10 +116,11 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
         let body = match (&entry.role, &entry.body) {
             (TimelineRole::User | TimelineRole::System, TimelineBody::Content(content)) => {
                 // Harness markup becomes what it means; context blocks disappear.
-                let bodies = from_harness(
+                let bodies = harness_bodies(
                     entry.role == TimelineRole::User,
                     content.text.as_deref().unwrap_or(""),
                     &shown,
+                    &mut delivered,
                 );
                 for (index, mut body) in bodies.into_iter().enumerate() {
                     if let Body::Mail { from, to, .. } = &mut body {
@@ -226,6 +230,14 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
         ));
     }
     stamped.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, entry) in &mut stamped {
+        if let Body::Mail {
+            delivered: mark, ..
+        } = &mut entry.body
+        {
+            *mark = delivered.contains(&entry.id);
+        }
+    }
     fold_events(stamped.into_iter().map(|(_, entry)| entry), &delivery)
 }
 
@@ -374,6 +386,26 @@ fn heads(text: &str, tag: &str) -> Vec<String> {
 /// `shown` holds the graph messages the stream already draws as mail: a delivery of one of
 /// those is a line, and a delivery of any other is the mail itself.
 pub fn from_harness(is_user: bool, raw: &str, shown: &BTreeSet<String>) -> Vec<Body> {
+    harness_bodies(is_user, raw, shown, &mut BTreeSet::new())
+}
+
+/// The graph message a `[PING from st3] message/ID from …` line announces.
+fn ping_id(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("[PING from st3] ")?
+        .split_whitespace()
+        .next()
+        .filter(|id| id.starts_with("message/"))
+}
+
+/// `from_harness`, also noting in `delivered` each shown message the harness received: that
+/// message is marked delivered instead of announced again.
+fn harness_bodies(
+    is_user: bool,
+    raw: &str,
+    shown: &BTreeSet<String>,
+    delivered: &mut BTreeSet<String>,
+) -> Vec<Body> {
     let mut text = raw.replace("\r\n", "\n");
     let mut bodies = Vec::new();
     // st's own envelope, as codex and the pi family receive it.
@@ -385,46 +417,17 @@ pub fn from_harness(is_user: bool, raw: &str, shown: &BTreeSet<String>) -> Vec<B
         let from = attribute(&head, "from").unwrap_or_default();
         let subject = attribute(&head, "subject").unwrap_or_default();
         let graph = attribute(&head, "graph").unwrap_or_default();
-        bodies.push(if shown.contains(&graph) {
-            Body::Event(format!(
-                "delivered to the agent: {} · from {}",
-                shorten(&subject, 80),
-                short(&from)
-            ))
-        } else {
-            Body::Mail {
-                from,
-                to: attribute(&head, "to").unwrap_or_default(),
-                subject,
-                body: clean_message_text(&unescape(&block)),
-            }
-        });
-    }
-    // `[PING from st3] message/ID from SENDER: TITLE` announces mail on its own line.
-    let mut kept = Vec::new();
-    for line in text.lines() {
-        let ping = line
-            .trim()
-            .strip_prefix("[PING from st3] ")
-            .and_then(|rest| rest.split_once(" from "))
-            .and_then(|(_, rest)| rest.split_once(": "));
-        match ping {
-            Some((sender, title)) => bodies.push(Body::Event(format!(
-                "delivered to the agent: {} · from {}",
-                shorten(title, 80),
-                short(sender)
-            ))),
-            None => kept.push(line),
+        if shown.contains(&graph) {
+            delivered.insert(graph);
+            continue;
         }
-    }
-    text = kept.join("\n");
-    for block in take_blocks(&mut text, "task-notification") {
-        let status = field(&block, "status").unwrap_or_else(|| "update".into());
-        let summary = field(&block, "summary").unwrap_or_default();
-        bodies.push(Body::Event(format!(
-            "background task {status}: {}",
-            shorten(&summary, 90)
-        )));
+        bodies.push(Body::Mail {
+            from,
+            to: attribute(&head, "to").unwrap_or_default(),
+            subject,
+            body: clean_message_text(&unescape(&block)),
+            delivered: false,
+        });
     }
     // A `<channel>` delivery announces mail that is already in the stream, so it becomes one line.
     let mut deliveries = Vec::new();
@@ -449,6 +452,14 @@ pub fn from_harness(is_user: bool, raw: &str, shown: &BTreeSet<String>) -> Vec<B
         .into_iter()
         .zip(deliveries)
     {
+        // A delivery of mail the stream shows marks that mail delivered; its PING line inside
+        // is the same delivery, not another.
+        if let Some(id) = block.lines().find_map(ping_id)
+            && shown.contains(id)
+        {
+            delivered.insert(id.to_owned());
+            continue;
+        }
         let subject = block
             .lines()
             .find_map(|line| line.trim().strip_prefix("Subject:").map(str::trim))
@@ -457,6 +468,38 @@ pub fn from_harness(is_user: bool, raw: &str, shown: &BTreeSet<String>) -> Vec<B
         bodies.push(Body::Event(format!(
             "delivered to the agent: {} · from {sender}",
             shorten(&subject, 80)
+        )));
+    }
+    // `[PING from st3] message/ID from SENDER: TITLE` announces mail on its own line.
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        let ping = line
+            .trim()
+            .strip_prefix("[PING from st3] ")
+            .and_then(|rest| rest.split_once(" from "))
+            .and_then(|(_, rest)| rest.split_once(": "));
+        if let Some(id) = ping_id(line)
+            && shown.contains(id)
+        {
+            delivered.insert(id.to_owned());
+            continue;
+        }
+        match ping {
+            Some((sender, title)) => bodies.push(Body::Event(format!(
+                "delivered to the agent: {} · from {}",
+                shorten(title, 80),
+                short(sender)
+            ))),
+            None => kept.push(line),
+        }
+    }
+    text = kept.join("\n");
+    for block in take_blocks(&mut text, "task-notification") {
+        let status = field(&block, "status").unwrap_or_else(|| "update".into());
+        let summary = field(&block, "summary").unwrap_or_default();
+        bodies.push(Body::Event(format!(
+            "background task {status}: {}",
+            shorten(&summary, 90)
         )));
     }
     for command in take_blocks(&mut text, "command-name") {

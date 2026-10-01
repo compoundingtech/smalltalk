@@ -129,13 +129,23 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             state,
             output,
         } => {
-            let (bg, glyph, color) = match state {
-                ToolState::Running => (theme.tool_bg, spinner, theme.working),
-                ToolState::Ok => (theme.tool_ok_bg, "✓", theme.green),
-                ToolState::Failed => (theme.tool_err_bg, "✕", theme.red),
+            // Quiet until opened: an edge in the outcome's colour, dim text, no fill. Opened,
+            // it reads at full brightness.
+            let (glyph, color) = match state {
+                ToolState::Running => (spinner, theme.working),
+                ToolState::Ok => ("✓", theme.green),
+                ToolState::Failed => ("✕", theme.red),
+            };
+            let edge = || run("▎ ", theme::fg(color));
+            let (title_style, row_style) = if open {
+                (theme.bold(), Style::default().fg(theme.subtext0))
+            } else {
+                (
+                    Style::default().fg(theme.overlay1),
+                    Style::default().fg(theme.overlay0),
+                )
             };
             let title = text::truncate(&text::sanitize(title), width.saturating_sub(6));
-            let used = 3 + text::width(&title) + 2;
             doc.targets.push(Target {
                 line: 0,
                 column: 0,
@@ -143,24 +153,9 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 hit: PaneIntent::Expand(entry.id.clone()),
             });
             doc.line(Line::from(vec![
-                Span::styled(
-                    format!(" {glyph} "),
-                    Style::default()
-                        .fg(color)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    title,
-                    Style::default()
-                        .fg(theme.text)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " ".repeat(width.saturating_sub(used) + 2),
-                    Style::default().bg(bg),
-                ),
+                Span::styled(edge().text, edge().style),
+                Span::styled(format!("{glyph} "), theme::fg(color)),
+                Span::styled(title, title_style),
             ]));
             // Every row the output takes once wrapped; collapsed, a call shows its last few.
             let mut rows = Vec::new();
@@ -171,14 +166,19 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 } else if line.starts_with('-') || line.contains("error") {
                     Style::default().fg(theme.red)
                 } else {
-                    Style::default().fg(theme.subtext0)
+                    row_style
+                };
+                let style = if open {
+                    style
+                } else {
+                    style.add_modifier(Modifier::DIM)
                 };
                 rows.extend(text::wrap(
                     &[run(line, style)],
                     width,
-                    &[run("   ", style)],
-                    &[run("   ", style)],
-                    Some(bg),
+                    &[edge(), run("  ", style)],
+                    &[edge(), run("  ", style)],
+                    None,
                 ));
             }
             let total = rows.len();
@@ -187,55 +187,31 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             } else {
                 total.saturating_sub(COLLAPSED_TOOL_LINES)
             };
-            if hidden > 0 {
+            let control = |doc: &mut Doc, label: String| {
                 doc.targets.push(Target {
                     line: doc.lines.len(),
                     column: 0,
                     width: width as u16,
                     hit: PaneIntent::Expand(entry.id.clone()),
                 });
-                doc.line(pad(
-                    Line::from(Span::styled(
-                        format!("   … {hidden} more lines · o or click to show"),
-                        Style::default().fg(theme.overlay0).bg(bg),
-                    )),
-                    width,
-                    bg,
-                ));
+                doc.line(Line::from(vec![
+                    Span::styled(edge().text, edge().style),
+                    Span::styled(format!("  {label}"), Style::default().fg(theme.overlay0)),
+                ]));
+            };
+            if hidden > 0 {
+                control(
+                    &mut doc,
+                    format!("… {hidden} more lines · o or click to show"),
+                );
             }
             // An open long call folds from the same place it opened, as well as from its end.
             if open && total > COLLAPSED_TOOL_LINES {
-                doc.targets.push(Target {
-                    line: doc.lines.len(),
-                    column: 0,
-                    width: width as u16,
-                    hit: PaneIntent::Expand(entry.id.clone()),
-                });
-                doc.line(pad(
-                    Line::from(Span::styled(
-                        "   ▴ collapse",
-                        Style::default().fg(theme.overlay0).bg(bg),
-                    )),
-                    width,
-                    bg,
-                ));
+                control(&mut doc, "▴ collapse".into());
             }
             doc.lines(rows.into_iter().skip(hidden));
             if open && total > COLLAPSED_TOOL_LINES {
-                doc.targets.push(Target {
-                    line: doc.lines.len(),
-                    column: 0,
-                    width: width as u16,
-                    hit: PaneIntent::Expand(entry.id.clone()),
-                });
-                doc.line(pad(
-                    Line::from(Span::styled(
-                        "   ▴ collapse",
-                        Style::default().fg(theme.overlay0).bg(bg),
-                    )),
-                    width,
-                    bg,
-                ));
+                control(&mut doc, "▴ collapse".into());
             }
         }
         Body::Mail {
@@ -243,8 +219,25 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             to,
             subject,
             body,
+            delivered,
         } => {
             let bar = run("▎ ", theme::fg(theme.sapphire));
+            // The person's own mail says how far it got: ✓ st has it, ✓✓ the agent's harness
+            // has it.
+            let progress = match (from == "you", delivered) {
+                (false, _) => run(String::new(), theme.dim()),
+                (true, false) => run("  ✓ sent", theme.dim()),
+                (true, true) => run("  ✓✓ delivered", theme::fg(theme.green)),
+            };
+            // Mail to the person stands out: full brightness on a tinted block, like their own
+            // messages. Mail between others stays quieter.
+            let to_you = to == "you";
+            let tint = to_you.then_some(theme.tool_bg);
+            let on = |style: Style| match tint {
+                Some(bg) => style.bg(bg),
+                None => style,
+            };
+            let bar = run(bar.text, on(bar.style));
             doc.lines(text::wrap(
                 &[
                     run(
@@ -253,27 +246,29 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                         } else {
                             format!("{from} → {to}")
                         },
-                        theme::strong(theme.sapphire),
+                        on(theme::strong(theme.sapphire)),
                     ),
-                    run(format!("  {}", text::sanitize(subject)), theme.bold()),
-                    run(format!("  {}", entry.at), theme.dim()),
+                    run(format!("  {}", text::sanitize(subject)), on(theme.bold())),
+                    run(format!("  {}", entry.at), on(theme.dim())),
+                    run(progress.text, on(progress.style)),
                 ],
                 inner,
                 std::slice::from_ref(&bar),
                 std::slice::from_ref(&bar),
-                None,
+                tint,
             ));
-            // Mail to the person reads as plainly as anything they read; mail between others
-            // stays quieter.
-            let style = if to == "you" {
-                theme.text()
-            } else {
-                theme.soft()
-            };
-            for line in text::markdown(body, inner.saturating_sub(2), style, theme) {
+            let style = if to_you { theme.text() } else { theme.soft() };
+            for line in text::markdown(body, inner.saturating_sub(2), on(style), theme) {
                 let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
-                spans.extend(line.spans);
-                doc.line(Line::from(spans));
+                spans.extend(line.spans.into_iter().map(|span| {
+                    let style = on(span.style);
+                    span.style(style)
+                }));
+                let line = Line::from(spans);
+                doc.line(match tint {
+                    Some(bg) => pad(line, inner, bg),
+                    None => line,
+                });
             }
         }
         Body::Pending {
