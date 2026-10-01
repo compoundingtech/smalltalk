@@ -1581,6 +1581,13 @@ pub struct MissionRunStateMoment {
 /// whether it includes history, and the status.
 type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
 
+pub(crate) struct MissionGateRunner {
+    pub subject: String,
+    pub host: String,
+    pub owner_run: String,
+    pub retired: bool,
+}
+
 pub struct Store {
     connection: WriterConnection,
     readers: ReadPool,
@@ -1631,6 +1638,7 @@ const TERMINAL_OWNED_RUNTIME_SUBJECTS: &str = "SELECT desired.subject
      LEFT JOIN run_generations generation
        ON substr(desired.owner_generation, 1, 15)='run-generation/'
       AND generation.id=substr(desired.owner_generation, 16)
+     LEFT JOIN step_runs step ON step.subject=desired.owner_step
      WHERE desired.member IS NOT NULL
        AND (
          owner.status IN ('completed','failed','cancelled')
@@ -1638,6 +1646,7 @@ const TERMINAL_OWNED_RUNTIME_SUBJECTS: &str = "SELECT desired.subject
          OR root.status IN ('completed','failed','cancelled')
          OR root.phase='terminal'
          OR generation.status IN ('completed','failed','cancelled')
+         OR step.status='cancelled'
        )
      ORDER BY desired.subject";
 const RETIRED_OWNED_INTAKE_SUBJECTS: &str = "SELECT desired.subject
@@ -10399,6 +10408,62 @@ impl Store {
         statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Gate runners are launched directly rather than through desired declarations. Their
+    /// owner is durable in the request; older mechanical/LLM requests encode it in the subject.
+    pub(crate) fn mission_gate_runners(&self) -> Result<Vec<MissionGateRunner>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "WITH runners AS (
+               SELECT DISTINCT subject, origin AS host,
+                      json_extract(body, '$.fields.owner') AS owner
+               FROM claims request WHERE kind='gate.requested'
+                 AND (json_extract(body, '$.fields.runner') IN ('exec','loop-metric')
+                      OR json_extract(body, '$.fields.model') IS NOT NULL)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM claims stopped
+                   WHERE stopped.subject=request.subject AND stopped.kind='runtime.observed'
+                     AND json_extract(stopped.body, '$.fields.status')='stopped'
+                 )
+             )
+             SELECT DISTINCT runners.subject, runners.host, 'mission-run/' || run.id,
+                    step.status IN ('completed','failed','cancelled')
+                    OR generation.status IN ('completed','failed','cancelled','superseded')
+                    OR run.phase='terminal' OR run.phase LIKE 'cleanup-%'
+                    OR root.phase='terminal' OR root.phase LIKE 'cleanup-%'
+             FROM runners
+             JOIN step_runs step ON runners.owner=step.subject
+               OR (runners.owner IS NULL AND
+                   substr(runners.subject, 1, length(step.subject)+16)=
+                     'gate-operation/' || replace(step.subject, '/', '.') || '/')
+             JOIN mission_runs run ON run.id=step.run_id
+             JOIN mission_runs root ON root.id=run.root_run_id
+             JOIN run_generations generation ON generation.id=step.generation_id
+             UNION
+             SELECT DISTINCT runners.subject, runners.host, 'mission-run/' || run.id,
+                    run.phase IN ('final-cancelled','terminal') OR run.phase LIKE 'cleanup-%'
+                    OR run.status IN ('completed','failed','cancelled')
+                    OR root.phase='terminal' OR root.phase LIKE 'cleanup-%'
+             FROM runners
+             JOIN mission_runs run ON runners.owner='mission-run/' || run.id
+               OR (runners.owner IS NULL AND
+                   substr(runners.subject, 1, length(run.id)+28)=
+                     'gate-operation/mission-run.' || run.id || '/')
+             JOIN mission_runs root ON root.id=run.root_run_id
+             ORDER BY 1",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(MissionGateRunner {
+                    subject: row.get(0)?,
+                    host: row.get(1)?,
+                    owner_run: row.get(2)?,
+                    retired: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
