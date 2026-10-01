@@ -15340,6 +15340,8 @@ fn append_claim_tx(
     predecessors: &[String],
     forced_batch: Option<&str>,
 ) -> Result<ClaimRecord> {
+    st3_schema::owned_terminals::validate_declaration_owner(subject, kind, actor)
+        .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
     let fields = schema_fields_for_body(kind, body)?;
     let claim_spec = st3_schema::registry()
@@ -19264,6 +19266,12 @@ fn classify_replicated_claim_with_registry(
             ),
         ));
     }
+    st3_schema::owned_terminals::validate_declaration_owner(
+        &claim.subject,
+        &claim.kind,
+        claim.actor.as_deref(),
+    )
+    .map_err(|e| St3Error::new(e.code, e.message))?;
     st3_schema::glasses::validate_owner(&claim.subject, claim.actor.as_deref())
         .map_err(|e| St3Error::new(e.code, e.message))?;
     if claim.subject.starts_with("glass/")
@@ -41149,6 +41157,12 @@ pub fn validate_claim_input(input: &ClaimInput) -> Result<(), St3Error> {
         validate_actor(actor)?;
     }
     validate_claim_fields(input)?;
+    st3_schema::owned_terminals::validate_declaration_owner(
+        &input.subject,
+        &input.kind,
+        input.actor.as_deref(),
+    )
+    .map_err(|e| St3Error::new(e.code, e.message))?;
     st3_schema::glasses::validate_owner(&input.subject, input.actor.as_deref())
         .map_err(|e| St3Error::new(e.code, e.message))?;
     claim_operation(input)?;

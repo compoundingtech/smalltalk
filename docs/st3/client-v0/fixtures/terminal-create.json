@@ -1,0 +1,15 @@
+{
+  "api_version": "st3.client.v0",
+  "id": "action/terminal-create",
+  "type": "terminal.create",
+  "idempotency_key": "fixture-terminal-create-0001",
+  "fence": {
+    "snapshot_id": "snapshot/example/1/creation",
+    "subject_revisions": {}
+  },
+  "parameters": {
+    "name": "A shell",
+    "host": "builder",
+    "cwd": "/tmp/work"
+  }
+}

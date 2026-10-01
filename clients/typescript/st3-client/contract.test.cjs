@@ -236,3 +236,17 @@ test('glass methods preserve structure, null creation base, and idempotency head
     assert.equal(calls.at(-1).options.method, 'DELETE');
     assert.equal(calls.at(-1).options.headers['Idempotency-Key'], 'delete');
 });
+
+test('creation methods submit the shared typed fixtures', async () => {
+    const calls = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        if (url.endsWith('/capabilities')) return response(envelope(capabilities));
+        return response(envelope({ kind: 'action-result', action_id: 'action/create', operation_id: 'operation/create', status: 'completed', affected_ids: ['agent/example/worker'], snapshot_id: snapshot.id }));
+    } });
+    for (const [fixture, method] of [['agent-create', 'agentCreate'], ['terminal-create', 'terminalCreate'], ['terminal-end', 'terminalEnd']]) {
+        const request = require(`../../../docs/st3/client-v0/fixtures/${fixture}.json`);
+        await client[method](request);
+        assert.deepEqual(JSON.parse(calls.at(-1).init.body), request);
+    }
+});
