@@ -11873,16 +11873,14 @@ impl Store {
     /// non-runtime claims, without reducing the subject's entire history.
     pub fn selected_actual_origin(&self, subject: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
+        // Walk the accepted-time index newest first: sorting every runtime observation of the
+        // subject cost each settled stop, checked on every pass, a tenth of a millisecond.
         let runtime_origin = connection
-            .query_row(
-                &canonical_sql(
-                    "SELECT origin FROM claims
-                 WHERE subject=?1 AND kind='runtime.observed'
-                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
-                [subject],
-                |row| row.get(0),
-            )
+            .prepare_cached(&format!(
+                "{} LIMIT 1",
+                newest_claims_of_kind_query("claims.origin", "runtime.observed")
+            ))?
+            .query_row(params![subject, i64::MAX as u64], |row| row.get(0))
             .optional()?;
         if runtime_origin.is_some() {
             return Ok(runtime_origin);
