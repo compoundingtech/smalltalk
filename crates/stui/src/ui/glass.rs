@@ -57,13 +57,22 @@ pub(crate) struct Glasses {
 
 /// A tab pressed with the mouse: it becomes a drag once the pointer moves with the button held;
 /// until the button is let go nothing is changed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct TabDrag {
-    /// The group and tab pressed.
-    from: (usize, usize),
+    /// What was pressed: a tab, or a row of the sidebar.
+    from: DragFrom,
     start: (u16, u16),
     at: (u16, u16),
     moving: bool,
+}
+
+/// What is being dragged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DragFrom {
+    /// A tab: its group and place in the strip.
+    Tab(usize, usize),
+    /// A subject from the sidebar, which opens where it is let go.
+    Subject(String),
 }
 
 /// Where a dragged tab would land.
@@ -949,24 +958,42 @@ impl Ui {
         let point = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let tab = self
+                let hit = self
                     .frame
                     .borrow()
                     .hits
                     .iter()
                     .rev()
                     .find(|(rect, _)| super::contains(*rect, point.0, point.1))
-                    .and_then(|(_, hit)| match hit {
-                        Hit::GlassTab(group, tab) => Some((*group, *tab)),
-                        _ => None,
-                    });
-                glasses.drag = tab.map(|from| TabDrag {
+                    .map(|(_, hit)| hit.clone());
+                let start = |from| TabDrag {
                     from,
                     start: point,
                     at: point,
                     moving: false,
-                });
-                false
+                };
+                match hit {
+                    // A tab shows at once, as a click; it may also be dragged.
+                    Some(Hit::GlassTab(group, tab)) => {
+                        glasses.drag = Some(start(DragFrom::Tab(group, tab)));
+                        false
+                    }
+                    // A sidebar row is selected now and opens when let go, unless it was
+                    // dragged somewhere first.
+                    Some(Hit::SidebarRow(index)) => {
+                        let section = glasses.sidebar.section;
+                        glasses.sidebar.selected[section] = index;
+                        let id = self.listing_for(section, 40).ids.get(index).cloned();
+                        if let Some(glasses) = self.glasses.as_mut() {
+                            glasses.drag = id.map(|id| start(DragFrom::Subject(id)));
+                        }
+                        true
+                    }
+                    _ => {
+                        glasses.drag = None;
+                        false
+                    }
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let Some(drag) = glasses.drag.as_mut() else {
@@ -981,10 +1008,19 @@ impl Ui {
                     return false;
                 };
                 if !drag.moving {
+                    // A click: a tab already showed; a sidebar row opens now.
+                    if matches!(drag.from, DragFrom::Subject(_)) {
+                        self.open_from_sidebar();
+                        return true;
+                    }
                     return false;
                 }
-                if let Some(target) = self.drop_at(point) {
-                    self.drop_tab(drag.from, target);
+                match (self.drop_at(point), drag.from) {
+                    (Some(target), DragFrom::Tab(group, tab)) => {
+                        self.drop_tab((group, tab), target)
+                    }
+                    (Some(target), DragFrom::Subject(id)) => self.drop_subject(&id, target),
+                    (None, _) => {}
                 }
                 true
             }
@@ -1137,9 +1173,66 @@ impl Ui {
         self.show_focused();
     }
 
+    /// Open `id` where a drag from the sidebar let go: as a tab in a strip, or in a new split.
+    fn drop_subject(&mut self, id: &str, target: Drop) {
+        let pane = pane_for(id).or_else(|| {
+            let section = self.glasses.as_ref()?.sidebar.section;
+            (section == 3).then(|| Pane::Machine(Some(format!("machine/{id}"))))
+        });
+        let Some(pane) = pane else { return };
+        if let Some(glasses) = self.glasses.as_mut() {
+            glasses.sidebar.focused = false;
+        }
+        // Already open somewhere: move that tab there instead of opening it twice.
+        let open = self
+            .glasses
+            .as_ref()
+            .and_then(|glasses| glasses.glass().layout.find(&pane.key()));
+        if let Some(from) = open {
+            self.drop_tab(from, target);
+            return;
+        }
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        glasses.home = false;
+        let glass = glasses.glass_mut();
+        let tab = Tab::pane(pane.key());
+        let (group, index) = match target {
+            Drop::Strip { group, index } => {
+                let Some(at) = glass.layout.group_mut(group) else {
+                    return;
+                };
+                let index = index.min(at.tabs.len());
+                at.tabs.insert(index, tab);
+                (group, index)
+            }
+            Drop::Edge { group, side, first } => {
+                let new = if first {
+                    glass.layout.split_first(group, side, Group::of(tab))
+                } else {
+                    glass.layout.split(group, side, Group::of(tab))
+                };
+                (new, 0)
+            }
+        };
+        glass.focus = group;
+        if let Some(at) = glass.layout.group_mut(group) {
+            at.current = index + offset(group);
+        }
+        glasses.zoomed = false;
+        let id = glasses.glass().id.clone();
+        self.glass_changed(&id);
+        self.show_focused();
+    }
+
     /// While a tab is dragged: where it would land, and its name by the pointer.
     fn draw_drag(&self, buf: &mut Buffer) {
-        let Some(drag) = self.glasses.as_ref().and_then(|glasses| glasses.drag) else {
+        let Some(drag) = self
+            .glasses
+            .as_ref()
+            .and_then(|glasses| glasses.drag.clone())
+        else {
             return;
         };
         if !drag.moving {
@@ -1185,30 +1278,31 @@ impl Ui {
             }
             None => {}
         }
-        let name = self
-            .glasses
-            .as_ref()
-            .and_then(|glasses| {
-                glasses
-                    .glass()
-                    .layout
-                    .groups()
-                    .get(drag.from.0)
-                    .and_then(|group| {
-                        group
-                            .tabs
-                            .get(drag.from.1.saturating_sub(offset(drag.from.0)))
-                    })
-                    .cloned()
-            })
-            .map(|tab| {
-                tab.title.unwrap_or_else(|| {
-                    Pane::parse(&tab.pane)
-                        .map(|pane| self.pane_title(&pane))
-                        .unwrap_or(tab.pane)
+        let name = match &drag.from {
+            DragFrom::Tab(group, tab) => self
+                .glasses
+                .as_ref()
+                .and_then(|glasses| {
+                    glasses
+                        .glass()
+                        .layout
+                        .groups()
+                        .get(*group)
+                        .and_then(|at| at.tabs.get(tab.saturating_sub(offset(*group))))
+                        .cloned()
                 })
-            })
-            .unwrap_or_default();
+                .map(|tab| {
+                    tab.title.unwrap_or_else(|| {
+                        Pane::parse(&tab.pane)
+                            .map(|pane| self.pane_title(&pane))
+                            .unwrap_or(tab.pane)
+                    })
+                })
+                .unwrap_or_default(),
+            DragFrom::Subject(id) => pane_for(id)
+                .map(|pane| self.pane_title(&pane))
+                .unwrap_or_else(|| id.clone()),
+        };
         let label = format!(" ⇄ {name} ");
         let x = drag.at.0.saturating_add(1);
         let y = drag.at.1.saturating_add(1);
@@ -3498,6 +3592,77 @@ mod tests {
             tabs(&ui).2,
             vec![vec![mission.to_owned(), ATLAS.to_owned()]]
         );
+    }
+
+    #[test]
+    fn sidebar_rows_open_on_click_and_drag_out_into_a_strip_or_a_new_split() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mouse = |ui: &mut Ui, kind, (column, row): (u16, u16)| {
+            ui.mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let row_at = |ui: &Ui, index: usize| -> (u16, u16) {
+            screen(ui);
+            let info = ui.frame.borrow();
+            let rect = info
+                .hits
+                .iter()
+                .find(|(_, hit)| *hit == Hit::SidebarRow(index))
+                .map(|(rect, _)| *rect)
+                .expect("the row is drawn");
+            (rect.x + 3, rect.y)
+        };
+        let drag = |ui: &mut Ui, from: (u16, u16), to: (u16, u16)| {
+            mouse(ui, MouseEventKind::Down(MouseButton::Left), from);
+            mouse(ui, MouseEventKind::Drag(MouseButton::Left), to);
+            screen(ui);
+            mouse(ui, MouseEventKind::Up(MouseButton::Left), to);
+        };
+        let mut ui = glass();
+        ctrl(&mut ui, 's');
+        let agents = ui.listing_for(1, 40).ids;
+        let agent = |index: usize| format!("agent:{}", agents[index]);
+        // A click opens the row as a tab, as Enter does.
+        let from = row_at(&ui, 0);
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), from);
+        mouse(&mut ui, MouseEventKind::Up(MouseButton::Left), from);
+        assert_eq!(tabs(&ui).2, vec![vec![agent(0)]]);
+        // Dragged onto the strip, before the open tab.
+        screen(&ui);
+        let strip = ui.frame.borrow().glass_leaves[0];
+        let from = row_at(&ui, 1);
+        drag(&mut ui, from, (strip.x, strip.y - 1));
+        assert_eq!(tabs(&ui).2, vec![vec![agent(1), agent(0)]]);
+        // Dragged to the bottom edge: a new split below holding it.
+        screen(&ui);
+        let content = ui.frame.borrow().glass_leaves[0];
+        let from = row_at(&ui, 2);
+        drag(
+            &mut ui,
+            from,
+            (
+                content.x + content.width / 2,
+                content.y + content.height - 1,
+            ),
+        );
+        assert_eq!(tabs(&ui).2, vec![vec![agent(1), agent(0)], vec![agent(2)]]);
+        // Something already open moves there rather than opening twice.
+        screen(&ui);
+        let content = ui.frame.borrow().glass_leaves[1];
+        let from = row_at(&ui, 0);
+        drag(
+            &mut ui,
+            from,
+            (
+                content.x + content.width / 2,
+                content.y + content.height / 2,
+            ),
+        );
+        assert_eq!(tabs(&ui).2, vec![vec![agent(1)], vec![agent(2), agent(0)]]);
     }
 
     #[test]
