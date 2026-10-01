@@ -2719,7 +2719,9 @@ impl Ui {
         self.new_agent = None;
         self.agent_form = false;
         if self.glasses.is_some() {
-            self.open_in_glass(Pane::Agent(Some(id.clone())), glass::Open::Here);
+            // The agent's conversation takes the form's tab.
+            self.close_form_tab();
+            self.open_in_glass(Pane::Agent(Some(id.clone())), glass::Open::Tab);
         } else {
             self.tab = 1;
         }
