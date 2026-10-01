@@ -391,7 +391,7 @@ pub fn from_harness(is_user: bool, raw: &str, shown: &BTreeSet<String>) -> Vec<B
             shorten(&summary, 90)
         )));
     }
-    // st and st2 deliveries: the message itself is in the stream as mail.
+    // A `<channel>` delivery announces mail that is already in the stream, so it becomes one line.
     let mut deliveries = Vec::new();
     let mut from = 0;
     while let Some(offset) = text[from..].find("<channel") {
