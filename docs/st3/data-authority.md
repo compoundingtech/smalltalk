@@ -1,8 +1,9 @@
 # st data authority
 
-This document classifies each SQLite table in schema version 13.
+This document classifies each SQLite table in schema version 15.
 
-Schema version 13 upgrades schema versions 10, 11, and 12 in place.
+Schema version 15 upgrades schema versions 10 through 14 in place. Document bindings gain a
+shared canonical `binding_key` and an index; existing keys are backfilled once from claims.
 
 The claim log and immutable blobs are the durable graph authority.
 

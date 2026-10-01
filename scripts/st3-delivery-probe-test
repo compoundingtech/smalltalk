@@ -58,7 +58,7 @@ class FakeApi:
             raise TimeoutError("send committed; client lost its response")
         if self.advanced and path.endswith("/claims") and body["lifecycle"] != "closed":
             raise RuntimeError("invalid-message-transition: message already advanced")
-        return {"subject": "attention/probe"}
+        return {"subject": "step-run/probe/ask"}
 
 
 class ProbeTests(unittest.IsolatedAsyncioTestCase):
@@ -86,10 +86,21 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sends[0], sends[1])
         self.assertEqual(key, sends[1]["idempotency_key"])
         route = self.monitor.state["routes"][self.target]
-        self.assertEqual(route["attention"], "attention/probe")
+        self.assertEqual(route["attention"], "step-run/probe/ask")
         self.assertEqual(route["status"], "sending")
         await self.monitor.route(self.target)
-        self.assertEqual(sum(path == "/v1/attention" for path, _ in self.monitor.api.posts), 1)
+        self.assertEqual(sum(path == "/v1/work/ask" for path, _ in self.monitor.api.posts), 1)
+
+    async def test_recovery_after_person_completion_does_not_reopen_the_ask(self):
+        await self.monitor.route(self.target)
+        route = self.monitor.state["routes"][self.target]
+        route["attention"] = "step-run/probe/ask"
+        route["latency_ms"] = 5000
+        async def completed(path, body):
+            raise probe.ApiError("stale-fence", "the person step completed")
+        self.monitor.api.post = completed
+        await self.monitor.withdraw(route)
+        self.assertNotIn("attention", route)
 
     async def test_refused_direct_route_probes_indirect_delivery_through_an_active_hub(self):
         self.monitor.api.refused = True
@@ -111,12 +122,12 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.monitor.measuring[self.target] -= 14_400_000_000_000
         self.monitor.api.online = False
         await self.monitor.route(self.target)
-        self.assertFalse(any(path == "/v1/attention" for path, _ in self.monitor.api.posts))
+        self.assertFalse(any(path == "/v1/work/ask" for path, _ in self.monitor.api.posts))
         self.monitor.api.online = True
         await self.monitor.route(self.target)
         self.assertEqual(self.monitor.state["routes"][self.target]["message"], original)
         self.assertEqual(self.monitor.state["routes"][self.target]["status"], "pending")
-        self.assertFalse(any(path == "/v1/attention" for path, _ in self.monitor.api.posts))
+        self.assertFalse(any(path == "/v1/work/ask" for path, _ in self.monitor.api.posts))
 
     async def test_absence_withdraws_existing_route_attention(self):
         await self.monitor.route(self.target)
@@ -126,7 +137,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.monitor.api.online = False
         await self.monitor.route(self.target)
         self.assertNotIn("attention", self.monitor.state["routes"][self.target])
-        self.assertTrue(any(path.startswith("/v1/attention/withdraw/") for path, _ in self.monitor.api.posts))
+        self.assertTrue(any(path == "/v1/work/cancel-ask" for path, _ in self.monitor.api.posts))
         self.monitor.api.online = True
         await self.monitor.route(self.target)
         self.assertEqual(self.monitor.state["routes"][self.target]["status"], "pending")
@@ -148,7 +159,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(route["latency_ms"], 60_000)
         self.assertTrue(route["late"])
         self.assertNotIn("attention", route)
-        self.assertTrue(any(path.startswith("/v1/attention/withdraw/") for path, _ in self.monitor.api.posts))
+        self.assertTrue(any(path == "/v1/work/cancel-ask" for path, _ in self.monitor.api.posts))
 
     async def test_pending_receipt_and_send_survive_process_replacement(self):
         await self.monitor.route(self.target)
