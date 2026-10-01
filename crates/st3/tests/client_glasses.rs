@@ -217,7 +217,7 @@ async fn glasses_routes_enforce_owner_and_mutation_contract_and_hide_raw_history
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c["id"] == "glasses" && c["state"] == "granted")
+            .any(|c| c["id"] == "glasses" && c["version"] == 1 && c["state"] == "granted")
     );
     let empty_body = json!({"name":"Home only","layout":{"tabs":[]}});
     let (empty_status, empty) = request(

@@ -659,8 +659,9 @@ ID. Names are free text and need not be unique. The client handles name lookup.
 its person; these routes accept no owner selector. Anonymous sessions and agents have no glass
 access. Paired devices need `read.glasses` for reads and `control.glasses` for writes. New
 limited pairings include both grants. Existing devices with explicit grants need a new pairing
-if they lack them. Discover the granted `glasses` capability (version 0) before migrating local
-storage; it is granted when the session has both read and write access.
+if they lack them. Discover the granted `glasses` capability (version 1 or later) before migrating local
+storage; it is granted when the session has both read and write access. Version 1 stores
+splits with tab groups; version 0 used tabs containing splits and is not compatible with this body.
 
 `PUT /v1/client/glasses/{uuid}` accepts `{body, base_revision}`. A new ID requires a null
 base revision. Existing IDs accept stale or null bases: writes replace the whole body, using
