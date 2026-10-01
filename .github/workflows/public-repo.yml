@@ -1,13 +1,16 @@
+# Generated file - DO NOT EDIT
+# Source: public-repo.yml.genie.ts
+
 name: Public repository check
 
 on:
-  pull_request:
+  pull_request: null
   push:
     branches: [main]
 
 jobs:
   public-repo:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-x86-64
     steps:
       - uses: actions/checkout@v4
       - name: Test repository guard

@@ -715,7 +715,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                     let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
                         _ = self.notify.notified() => {}
-                        _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                        _ = tokio::time::sleep(Duration::from_millis(delay)) => {
+                            crate::performance::record_wake("deadline", None);
+                        }
                     }
                 }
                 None => self.notify.notified().await,
@@ -1406,12 +1408,16 @@ impl<R: RuntimeControl> Reconciler<R> {
             } else {
                 "pass/member live"
             });
+            // A stop's actual origin is read once a pass here and reused by `reconcile_stop`:
+            // every settled stop a host ever declared is checked on every pass.
+            let mut actual_origin = None;
             let owner = if let Some(member) = &subject.member {
                 Ok(Some(member.host.clone()))
             } else if subject.kind == "stop" {
                 self.store
                     .selected_actual_origin(&subject.subject)
                     .and_then(|origin| {
+                        actual_origin = Some(origin.clone());
                         Ok(origin.or(self.store.selected_desired_origin(&subject.subject)?))
                     })
             } else {
@@ -1433,7 +1439,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 // is still observed, checked, and given its work.
                 let mut blocked = member_errors.remove(&subject.subject);
                 if subject.kind == "stop" {
-                    self.reconcile_stop(subject, ptys.as_ref())?;
+                    self.reconcile_stop_with_origin(subject, ptys.as_ref(), actual_origin)?;
                     self.remove_checkout_after_run(subject, &live_workspaces)?;
                     return Ok(());
                 }
@@ -2712,10 +2718,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             }))
     }
 
+    #[cfg(test)]
     fn reconcile_stop(
         &self,
         subject: &DesiredSubject,
         ptys: Option<&HashMap<String, RuntimeObservation>>,
+    ) -> Result<()> {
+        self.reconcile_stop_with_origin(subject, ptys, None)
+    }
+
+    /// Reconcile a stop. `actual_origin` is the subject's selected actual origin when the caller
+    /// already read it in this pass.
+    fn reconcile_stop_with_origin(
+        &self,
+        subject: &DesiredSubject,
+        ptys: Option<&HashMap<String, RuntimeObservation>>,
+        actual_origin: Option<Option<String>>,
     ) -> Result<()> {
         let Some(actual) = self.store.latest_actual_value(&subject.subject)? else {
             // A stop-only declaration with no observed runtime is already satisfied.
@@ -2741,7 +2759,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         };
         let fields = actual.get("fields").unwrap_or(&actual);
-        let selected_origin = self.store.selected_actual_origin(&subject.subject)?;
+        let selected_origin = match actual_origin {
+            Some(origin) => origin,
+            None => self.store.selected_actual_origin(&subject.subject)?,
+        };
         let owner_host = subject
             .member
             .as_ref()
@@ -3874,6 +3895,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&subject);
+            crate::performance::record_wake("timer restart", None);
             notify.notify_one();
         });
     }
@@ -7924,6 +7946,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let remaining = timeout_remaining.min(lease_remaining).max(1) as u64;
             handle.spawn(async move {
                 tokio::time::sleep(Duration::from_millis(remaining)).await;
+                crate::performance::record_wake("timer step-timeout", None);
                 notify.notify_one();
             });
         }
@@ -9219,6 +9242,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         let remaining = (*duration_ms as u128).saturating_sub(elapsed) as u64;
                         handle.spawn(async move {
                             tokio::time::sleep(Duration::from_millis(remaining)).await;
+                            crate::performance::record_wake("timer gate", None);
                             notify.notify_one();
                         });
                     }
@@ -9491,6 +9515,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             handle.spawn(async move {
                 tokio::time::sleep(GATE_POLL_INTERVAL).await;
                 armed.store(false, Ordering::Release);
+                crate::performance::record_wake("timer gate-poll", None);
                 notify.notify_one();
             });
         }
@@ -9561,6 +9586,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         let notify = self.notify.clone();
                         handle.spawn(async move {
                             tokio::time::sleep(Duration::from_millis(100)).await;
+                            crate::performance::record_wake("timer llm-gate", None);
                             notify.notify_one();
                         });
                     }
@@ -9645,6 +9671,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let remaining = (time_limit_ms as u128).saturating_sub(elapsed) as u64;
                 handle.spawn(async move {
                     tokio::time::sleep(Duration::from_millis(remaining)).await;
+                    crate::performance::record_wake("timer llm-gate", None);
                     notify.notify_one();
                 });
             }
@@ -9947,6 +9974,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&watched_subject);
+                    crate::performance::record_wake("file watch", None);
                     notify.notify_one();
                 }
             })?;
@@ -10443,6 +10471,7 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn signal_changed(reconcile_notify: &Notify, event_notify: &watch::Sender<u64>) {
+    crate::performance::record_wake("reconciler", None);
     reconcile_notify.notify_one();
     event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
 }

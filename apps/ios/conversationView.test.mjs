@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { unreadableTranscript, cleanMessageText, conversationEntries, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle } from './conversationView.ts';
+import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle } from './conversationView.ts';
 
 let sequence = 0;
 const at = minute => `2026-09-30T12:${String(minute).padStart(2, '0')}:00Z`;
@@ -93,4 +93,14 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 0);
     { id: 'h', sequence: 3, revision: 1, timestamp: '2026-10-01T10:00:02Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text: '<channel source="plugin:st3-channel:st3" from="person/avery">[st3-delivery:1.md]\n[PING from st3] message/one from person/avery: (no subject)\n</channel>' } },
   ], new Map([['person/avery', 'you']]));
   assert.deepEqual(delivered.map(entry => [entry.body.kind, entry.body.delivered]), [['mail', true]]);
+}
+
+// Finding: an entry matches by what a person reads in it, case aside.
+{
+  const mail = { id: 'm', at: '', timestamp: '', body: { kind: 'mail', from: 'Keeper', to: 'you', subject: 'Audit', text: 'The Harbor keys rotated.' } };
+  const tool = { id: 't', at: '', timestamp: '', body: { kind: 'tool', title: '$ ls', state: 'ok', output: ['README.md', 'Cargo.toml'] } };
+  assert.equal(entryMatches(mail, 'harbor'), true);
+  assert.equal(entryMatches(tool, 'cargo'), true);
+  assert.equal(entryMatches(tool, 'harbor'), false);
+  assert.equal(entryMatches(tool, '  '), true, 'an empty query keeps everything');
 }

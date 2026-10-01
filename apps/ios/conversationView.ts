@@ -318,6 +318,17 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
   return foldDeliveryFlaps(stamped.map((entry, order) => ({ entry, order })).sort((a, b) => a.entry.timestamp.localeCompare(b.entry.timestamp) || a.order - b.order).map(({ entry }) => entry));
 }
 
+/** Whether an entry says `query` anywhere a person reads, case aside: for finding in a conversation. */
+export function entryMatches(entry: ConversationEntry, query: string): boolean {
+  const wanted = query.trim().toLowerCase();
+  if (!wanted) return true;
+  const body = entry.body;
+  const said = body.kind === 'tool' ? [body.title, ...body.output]
+    : body.kind === 'mail' ? [body.from, body.to, body.subject, body.text]
+    : [body.text];
+  return said.some(text => text.toLowerCase().includes(wanted));
+}
+
 /**
  * A delivery that paused while st restarted and then recovered says nothing a person needs:
  * each such pair becomes one quiet line, and a run of them one line with a count.

@@ -257,6 +257,7 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 std::slice::from_ref(&bar),
                 tint,
             ));
+            let start = doc.lines.len();
             let style = if to_you { theme.text() } else { theme.soft() };
             for line in text::markdown(body, inner.saturating_sub(2), on(style), theme) {
                 let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
@@ -269,6 +270,10 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     Some(bg) => pad(line, inner, bg),
                     None => line,
                 });
+            }
+            if entry.id.starts_with("message/") && doc.lines.len() > start {
+                doc.messages
+                    .push((entry.id.clone(), start..doc.lines.len()));
             }
         }
         Body::Pending {
