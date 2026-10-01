@@ -172,6 +172,23 @@ Lists show current state. Add `--all` for history. Every command has `--help`, a
 `--json` flag prints the stable client format that the apps read. Run `stui` for the same views
 in a terminal app.
 
+### Embedding native conversations
+
+`crates/st3-conversation-ui` provides the same native conversation presentation used by
+`stui`, without terminal acquisition, application tabs or daemon connections. Feed
+`st3-client` conversation frames into `Timeline::apply(Frame { replace, has_more, items })`,
+adapt the timeline with caller-owned display names, and render it with `Cache::render`
+and caller-supplied `Theme` tokens. The returned document contains styled lines and typed
+`PaneIntent` targets. `State` retains scrolling, tool expansion, display-column selection
+and composer drafts; send, open and older-history intents are executed by the embedding app.
+Replacement frames remove the previous bounded window; incremental frames revise entries
+by ID. `has_more` remains available so a client can distinguish bounded from complete history.
+
+The shared crate and `stui` use workspace Ratatui 0.29. An embedding application using
+Ratatui 0.30 must align its rendering dependency before passing buffers or lines across this
+boundary. Native conversations are not a terminal emulator: harness menus and arbitrary
+permission prompts still require access to the harness terminal.
+
 ## Start an agent
 
 One command declares a seat on any fleet machine, waits until its harness is ready, and attaches
