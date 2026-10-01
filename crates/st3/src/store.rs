@@ -15090,21 +15090,27 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     let mut lineage = vec![row.claim_id.clone()];
     let mut current = row.claim_id;
     while let Some(claim) = claim_by_id_tx(connection, &current)? {
-        let [predecessor] = claim.predecessors.as_slice() else {
-            break;
-        };
-        let Some(previous) = claim_by_id_tx(connection, predecessor)? else {
-            break;
-        };
-        if previous.kind != "intent.desired"
-            || previous.subject != subject
-            || lineage.contains(&previous.id)
-            || !presentation_only_change(&previous.body, &claim.body)
-        {
-            break;
+        // A claim that merges concurrent revisions has one predecessor per fork; follow the
+        // first one that is still the same launch.
+        let mut next = None;
+        for predecessor in &claim.predecessors {
+            if lineage.contains(predecessor) {
+                continue;
+            }
+            if let Some(previous) = claim_by_id_tx(connection, predecessor)?
+                && previous.kind == "intent.desired"
+                && previous.subject == subject
+                && presentation_only_change(&previous.body, &claim.body)
+            {
+                next = Some(previous.id);
+                break;
+            }
         }
-        current.clone_from(&previous.id);
-        lineage.push(previous.id);
+        let Some(next) = next else {
+            break;
+        };
+        current.clone_from(&next);
+        lineage.push(next);
     }
     Ok(lineage)
 }
@@ -24885,6 +24891,32 @@ agent "test/worker" { workspace "."; command "true"; name "Initial" }
         let cleared = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap().0;
         assert_eq!(crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)), "test/worker");
         assert_eq!(cleared.member.unwrap().display_name, None);
+    }
+
+    #[test]
+    fn a_rename_that_merges_concurrent_renames_keeps_the_launch_revision() {
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        let intent = parse_intent(r#"version 2
+agent "test/worker" { command "true"; name "A" }
+"#, "left").unwrap();
+        let preview = left.mission(&intent, IntentInput {
+            kdl: String::new(), source_name: None,
+        }).unwrap();
+        left.apply(&intent, &preview.subject_tokens, "a").unwrap();
+        let launch = left.selected_desired_token("agent/test/worker").unwrap().unwrap();
+        receive_and_project(&right, "left", &exchange_from(&left, &ReplicationInventory::default()));
+        // Two hosts relabel the same seat concurrently, then one relabels the merged fork.
+        left.rename_agent("agent/test/worker", Some("R1"), "r1").unwrap();
+        right.rename_agent("agent/test/worker", Some("R2"), "r2").unwrap();
+        receive_and_project(&right, "left", &exchange_from(&left, &right.replication_inventory().unwrap()));
+        receive_and_project(&left, "right", &exchange_from(&right, &left.replication_inventory().unwrap()));
+        left.rename_agent("agent/test/worker", Some("R3"), "r3").unwrap();
+        let merged = left.selected_desired_token("agent/test/worker").unwrap().unwrap();
+        assert_eq!(left.claim_by_id(&merged).unwrap().unwrap().predecessors.len(), 2);
+        let lineage = left.launch_lineage("agent/test/worker").unwrap();
+        assert_eq!(lineage.first(), Some(&merged));
+        assert_eq!(lineage.last(), Some(&launch), "{lineage:?}");
     }
 
     #[test]

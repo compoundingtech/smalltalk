@@ -2710,14 +2710,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(self.store.launch_lineage(subject)?.pop().unwrap_or_default())
     }
 
+    /// Whether the latest launch was for the selected declaration, or for a revision it only
+    /// relabels. Older launches do not count: after A → B → A the seat runs A again.
     fn member_was_launched_for_selected_desired(&self, subject: &str) -> Result<bool> {
         let lineage = self.store.launch_lineage(subject)?;
         Ok(self
             .store
             .observations_for(subject, "runtime.action.succeeded")?
             .iter()
-            .filter_map(|claim| claim.body.pointer("/fields/desired_token").and_then(Value::as_str))
-            .any(|token| lineage.iter().any(|candidate| candidate == token)))
+            .rev()
+            .find_map(|claim| claim.body.pointer("/fields/desired_token").and_then(Value::as_str))
+            .is_some_and(|token| lineage.iter().any(|candidate| candidate == token)))
     }
 
     #[cfg(test)]
@@ -15099,6 +15102,42 @@ agent "test/worker" {
         reconciler.reconcile_once().unwrap();
         assert_eq!(*runtime.starts.lock().unwrap(), vec![runtime_id]);
         assert!(runtime.stops.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_relabel_of_an_older_launch_runs_again_after_another_revision_launched() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, r#"version 2
+agent "test/worker" { workspace "/tmp"; command "true"; name "X"; restart "never" }
+"#, "x");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(store.clone(), runtime.clone(), "node".into(),
+            Arc::new(Notify::new()));
+        reconciler.reconcile_once().unwrap();
+        let runtime_id = runtime.starts.lock().unwrap()[0].clone();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: runtime_id.clone(), terminal: true, status: "exited".into(),
+            exit_code: Some(0), incarnation_id: Some("x".into()),
+        });
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 1);
+        // Revision Y launched later; replication then selects a relabel of X again. The seat runs
+        // X's configuration once more instead of matching X's older launch.
+        store.append_claim(&ClaimInput {
+            subject: "agent/test/worker".into(),
+            kind: "runtime.action.succeeded".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("desired_token".into(), Value::String("revision-y".into())),
+                ("runtime_id".into(), Value::String(runtime_id.clone())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("launch-y".into()),
+        }).unwrap();
+        store.rename_agent("agent/test/worker", Some("X again"), "relabel-x").unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 2);
     }
 
     #[test]
