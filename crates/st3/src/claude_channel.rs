@@ -61,6 +61,7 @@ pub async fn run(
     let report = || {
         json!({"transport":"claude-channel", "pid":std::process::id(),
         "image":st_drivers::reexec::running_identity().map(|i| i.token()),
+        "follows":st_drivers::reexec::installed_binary().map(|path| path.display().to_string()),
         "channel":{"pid":std::process::id(),"image":st_drivers::reexec::running_identity().map(|i| i.token()),"age_ms":0},
         "ready":state.initialized})
     };
@@ -112,6 +113,7 @@ pub async fn run(
             _ = interval.tick() => {
                 subscription.report(json!({"transport":"claude-channel", "pid":std::process::id(),
                     "image":st_drivers::reexec::running_identity().map(|i| i.token()),
+                    "follows":st_drivers::reexec::installed_binary().map(|path| path.display().to_string()),
                     "channel":{"pid":std::process::id(),"image":st_drivers::reexec::running_identity().map(|i| i.token()),"age_ms":0},
                     "ready":state.initialized}));
                 if state.initialized && replayed {

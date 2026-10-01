@@ -653,7 +653,7 @@
       "additionalProperties": false,
       "required": ["state"],
       "properties": {
-        "state": { "enum": ["current", "stale", "unknown"] },
+        "state": { "enum": ["current", "outdated", "legacy", "stale", "unknown"] },
         "reason": { "type": ["string", "null"] },
         "polled_seconds_ago": { "type": ["integer", "null"], "minimum": 0 },
         "transport": { "type": ["string", "null"] }

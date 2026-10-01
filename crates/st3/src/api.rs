@@ -4656,13 +4656,12 @@ fn claude_hooks_check(
         });
     }
     let mut faults = Vec::new();
-    match crate::reconcile::launch_executable() {
-        Ok(binary) if is_executable_file(&binary) => {}
-        Ok(binary) => faults.push(format!(
+    let binary = crate::reconcile::st_binary_link(&state.state_dir);
+    if !is_executable_file(&binary) {
+        faults.push(format!(
             "the hooks run ST3_BIN={}, which is not an executable file",
             binary.display()
-        )),
-        Err(error) => faults.push(format!("the hooks' st3 binary does not resolve: {error:#}")),
+        ));
     }
     let set = crate::hooks::set_dir(&crate::hooks::root(&state.state_dir));
     if let Err(error) = crate::hooks::verify(&set) {

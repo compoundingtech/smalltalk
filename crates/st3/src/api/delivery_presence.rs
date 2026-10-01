@@ -2,14 +2,16 @@
 //!
 //! A seat's delivery process (its native driver, or the pi-family channel) polls its mailbox every
 //! second and attaches a small report: the transport, its PID, the identity of the st image it
-//! executes, and for Claude the channel process that hands messages to the TUI. The daemon keeps
-//! the latest report per recipient in memory. Nothing here is graph state: a restarted daemon
-//! learns every live path again within a second, and a path that stopped polling is exactly the
-//! fact this module exists to notice.
+//! executes, the installed binary it follows, and for Claude the channel process that hands
+//! messages to the TUI. The daemon keeps the latest report per recipient in memory. Nothing here
+//! is graph state: a restarted daemon learns every live path again within a second, and a path
+//! that stopped polling is exactly the fact this module exists to notice.
 //!
 //! A harness that reports ready while its delivery path is stale would take messages that never
 //! arrive. The agent views therefore show such a seat as `waiting`, with the reason, instead of
-//! `running`.
+//! `running`. A ready path that still runs a replaced st binary does deliver, with its old code,
+//! so it is `outdated` rather than stale; its reason says whether it will follow the daemon's
+//! binary or needs a seat restart.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -31,6 +33,11 @@ struct Report {
     transport: Option<String>,
     pid: Option<u32>,
     image: Option<String>,
+    /// The installed binary the process re-executes into once that file changes.
+    follows: Option<String>,
+    /// The image `follows` names now, read by the daemon when it assesses the report.
+    #[serde(skip)]
+    follows_image: Option<String>,
     ready: Option<bool>,
     reason: Option<String>,
     #[serde(skip)]
@@ -142,7 +149,14 @@ pub(crate) fn assess(recipient: &str, driver: &str) -> Assessment {
     assess_beat(
         presence.started.elapsed(),
         presence.image.as_deref(),
-        beat.map(|(at, report)| (at.elapsed(), report)),
+        beat.map(|(at, mut report)| {
+            report.follows_image = report.follows.as_deref().and_then(|path| {
+                st_drivers::reexec::ImageIdentity::of(std::path::Path::new(path))
+                    .ok()
+                    .map(|identity| identity.token())
+            });
+            (at.elapsed(), report)
+        }),
         driver,
     )
 }
@@ -229,14 +243,30 @@ fn assess_beat(
         (_, None) => true,
         (None, Some(_)) => false,
     };
-    if !current_image(report.image.as_deref()) {
-        return stale(match report.image {
-            Some(_) => format!(
-                "the delivery process (pid {}) still runs a replaced st binary",
-                report.pid.unwrap_or_default()
+    // A ready path on a replaced binary still delivers, with its old code. It catches up on its
+    // own only when the file it follows is now the daemon's image.
+    let replaced = |process: &str, pid: Option<u32>| {
+        let pid = pid.unwrap_or_default();
+        match report.follows.as_deref() {
+            Some(_) if current_image(report.follows_image.as_deref()) => format!(
+                "the {process} (pid {pid}) still runs a replaced st binary and is switching to the daemon's"
             ),
-            None => "the delivery process runs an st binary that predates delivery reports; restart the seat".into(),
-        });
+            Some(follows) => format!(
+                "the {process} (pid {pid}) runs a replaced st binary and follows {follows}, which is not the daemon's; restart the seat to update it"
+            ),
+            None => format!(
+                "the {process} (pid {pid}) runs a replaced st binary that predates following the daemon's; restart the seat to update it"
+            ),
+        }
+    };
+    let mut outdated = None;
+    if !current_image(report.image.as_deref()) {
+        if report.image.is_none() {
+            return stale(
+                "the delivery process runs an st binary that predates delivery reports; restart the seat".into(),
+            );
+        }
+        outdated = Some(replaced("delivery process", report.pid));
     }
     if driver == "claude" {
         let Some(channel) = report.channel.as_ref() else {
@@ -252,16 +282,17 @@ fn assess_beat(
                 channel.age_ms.unwrap_or_default() / 1000
             ));
         }
-        if !current_image(channel.image.as_deref()) {
-            return stale(format!(
-                "the Claude channel (pid {}) still runs a replaced st binary",
-                channel.pid.unwrap_or_default()
-            ));
+        if outdated.is_none() && !current_image(channel.image.as_deref()) {
+            outdated = Some(replaced("Claude channel", channel.pid));
         }
     }
     Assessment {
-        state: "current",
-        reason: None,
+        state: if outdated.is_some() {
+            "outdated"
+        } else {
+            "current"
+        },
+        reason: outdated,
         polled_seconds_ago: Some(age.as_secs()),
         transport: report.transport,
     }
@@ -271,11 +302,15 @@ fn assess_beat(
 mod tests {
     use super::*;
 
+    const DAEMON: Option<&str> = Some("new");
+
     fn report(image: Option<&str>, channel: Option<(Option<&str>, u64)>) -> Report {
         Report {
             transport: Some("claude-channel".into()),
             pid: Some(7),
             image: image.map(str::to_owned),
+            follows: Some("/state/bin/st3".into()),
+            follows_image: Some("new".into()),
             ready: None,
             reason: None,
             legacy: false,
@@ -287,11 +322,15 @@ mod tests {
         }
     }
 
+    fn reason(assessment: &Assessment) -> &str {
+        assessment.reason.as_deref().unwrap_or_default()
+    }
+
     #[test]
     fn a_seat_without_a_poll_is_unknown_during_startup_and_stale_after() {
-        let early = assess_beat(Duration::from_secs(3), Some("new"), None, "codex");
+        let early = assess_beat(Duration::from_secs(3), DAEMON, None, "codex");
         assert_eq!(early.state, "unknown");
-        let late = assess_beat(Duration::from_secs(60), Some("new"), None, "codex");
+        let late = assess_beat(Duration::from_secs(60), DAEMON, None, "codex");
         assert!(late.stale(), "{late:?}");
     }
 
@@ -299,7 +338,7 @@ mod tests {
     fn a_live_poll_from_this_binary_is_current() {
         let assessment = assess_beat(
             Duration::from_secs(60),
-            Some("new"),
+            DAEMON,
             Some((
                 Duration::from_secs(1),
                 report(Some("new"), Some((Some("new"), 500))),
@@ -320,7 +359,7 @@ mod tests {
         };
         let live = assess_beat(
             Duration::from_secs(60),
-            Some("new"),
+            DAEMON,
             Some((Duration::from_secs(1), legacy.clone())),
             "omp",
         );
@@ -329,7 +368,7 @@ mod tests {
         assert!(live.reason.unwrap().contains("not reported"));
         let stopped = assess_beat(
             Duration::from_secs(60),
-            Some("new"),
+            DAEMON,
             Some((Duration::from_secs(46), legacy)),
             "omp",
         );
@@ -342,7 +381,7 @@ mod tests {
         report.ready = Some(false);
         let starting = assess_beat(
             Duration::from_secs(60),
-            Some("new"),
+            DAEMON,
             Some((Duration::from_secs(1), report.clone())),
             "omp",
         );
@@ -350,7 +389,7 @@ mod tests {
         report.ready = Some(true);
         let ready = assess_beat(
             Duration::from_secs(60),
-            Some("new"),
+            DAEMON,
             Some((Duration::from_secs(1), report)),
             "omp",
         );
@@ -358,13 +397,74 @@ mod tests {
     }
 
     #[test]
-    fn a_replaced_or_silent_delivery_path_is_stale() {
-        for (beat, driver, words) in [
+    fn a_ready_path_on_a_replaced_binary_is_outdated_and_says_whether_it_catches_up() {
+        let following = report(Some("old"), None);
+        let mut elsewhere = following.clone();
+        elsewhere.follows = Some("/nix/store/old-st3/bin/st3".into());
+        elsewhere.follows_image = Some("old".into());
+        let mut collected = elsewhere.clone();
+        collected.follows_image = None;
+        let mut unreported = following.clone();
+        unreported.follows = None;
+        let restart =
+            "follows /nix/store/old-st3/bin/st3, which is not the daemon's; restart the seat";
+        for (report, driver, words) in [
             (
-                (Duration::from_secs(1), report(Some("old"), None)),
-                "codex",
-                "replaced st binary",
+                following.clone(),
+                "omp",
+                "delivery process (pid 7) still runs a replaced st binary and is switching to the daemon's",
             ),
+            (elsewhere, "omp", restart),
+            (collected, "omp", restart),
+            (
+                unreported,
+                "codex",
+                "predates following the daemon's; restart the seat",
+            ),
+            (
+                report(Some("new"), Some((Some("old"), 100))),
+                "claude",
+                "Claude channel (pid 8) still runs a replaced st binary and is switching",
+            ),
+        ] {
+            let assessment = assess_beat(
+                Duration::from_secs(60),
+                DAEMON,
+                Some((Duration::from_secs(1), report)),
+                driver,
+            );
+            assert_eq!(assessment.state, "outdated", "{assessment:?}");
+            assert!(!assessment.stale());
+            assert!(
+                reason(&assessment).contains(words),
+                "{assessment:?} should say {words}"
+            );
+        }
+        // Readiness and liveness still decide first: an old path that cannot hand off is stale.
+        let mut refused = following;
+        refused.ready = Some(false);
+        let assessment = assess_beat(
+            Duration::from_secs(60),
+            DAEMON,
+            Some((Duration::from_secs(1), refused)),
+            "omp",
+        );
+        assert!(assessment.stale(), "{assessment:?}");
+        let silent_channel = assess_beat(
+            Duration::from_secs(60),
+            DAEMON,
+            Some((
+                Duration::from_secs(1),
+                report(Some("old"), Some((Some("old"), 60_000))),
+            )),
+            "claude",
+        );
+        assert!(silent_channel.stale(), "{silent_channel:?}");
+    }
+
+    #[test]
+    fn a_silent_or_unidentified_delivery_path_is_stale() {
+        for (beat, driver, words) in [
             (
                 (Duration::from_secs(1), report(None, None)),
                 "codex",
@@ -388,23 +488,11 @@ mod tests {
                 "claude",
                 "stopped reporting",
             ),
-            (
-                (
-                    Duration::from_secs(1),
-                    report(Some("new"), Some((Some("old"), 100))),
-                ),
-                "claude",
-                "channel (pid 8) still runs a replaced",
-            ),
         ] {
-            let assessment = assess_beat(Duration::from_secs(60), Some("new"), Some(beat), driver);
+            let assessment = assess_beat(Duration::from_secs(60), DAEMON, Some(beat), driver);
             assert!(assessment.stale(), "{assessment:?}");
             assert!(
-                assessment
-                    .reason
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains(words),
+                reason(&assessment).contains(words),
                 "{assessment:?} should say {words}"
             );
         }

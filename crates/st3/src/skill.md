@@ -8,7 +8,7 @@ description: How to use st from an st agent seat. Applies only when the ST_AGENT
 This applies only to a session st started: `printenv ST_AGENT` prints this seat's identity. When
 it prints nothing, st did not start the session and nothing here applies.
 
-`ST_AGENT` names this seat, and `ST3_BIN` is the st executable that started it.
+`ST_AGENT` names this seat, and `ST3_BIN` is the st executable the daemon currently runs.
 `"$ST3_BIN" --help` lists every command; each subcommand has its own `--help`.
 
 ## Messages
