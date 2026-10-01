@@ -11,7 +11,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use http_body_util::{BodyExt as _, Full};
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -19,15 +19,19 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio_tungstenite::{
     WebSocketStream, connect_async,
-    tungstenite::{Message as WsMessage, client::IntoClientRequest as _},
+    tungstenite::{
+        Message as WsMessage, client::IntoClientRequest as _, protocol::WebSocketConfig,
+    },
 };
 
 const HARD_MAX_RESPONSE_BYTES: usize = 8 * 1_048_576;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(35);
 const STREAM_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+const RAW_TERMINAL_SUBPROTOCOL: &str = "st3.client.pty.v0";
+const RAW_TERMINAL_CHUNK_BYTES: usize = 16_384;
 
 /// Resolve the local daemon socket in the same order as the `st3` CLI.
 ///
@@ -115,6 +119,51 @@ impl std::fmt::Debug for Client {
             .field("endpoint", &self.endpoint)
             .field("paired", &self.credential.is_some())
             .field("local_person", &self.local_person)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Which PTY connection the consumer will request after opening its raw byte stream.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RawTerminalMode {
+    Attach,
+    Peek,
+}
+
+impl RawTerminalMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Attach => "attach",
+            Self::Peek => "peek",
+        }
+    }
+}
+
+/// The incarnation fence and connection mode for acquiring a raw stream capability.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RawTerminalAttachmentRequest {
+    pub runtime_incarnation: String,
+    pub mode: RawTerminalMode,
+}
+
+/// A single-use raw PTY stream capability, extracted from the client-v0 response envelope.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RawTerminalAttachment {
+    pub terminal_id: String,
+    pub runtime_incarnation: String,
+    pub owner_host_id: String,
+    pub mode: RawTerminalMode,
+    pub stream_capability: String,
+}
+
+impl std::fmt::Debug for RawTerminalAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawTerminalAttachment")
+            .field("terminal_id", &self.terminal_id)
+            .field("runtime_incarnation", &self.runtime_incarnation)
+            .field("owner_host_id", &self.owner_host_id)
+            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
@@ -834,6 +883,119 @@ impl Client {
         .await
     }
 
+    /// Acquire a fresh, single-use capability for a fenced raw PTY connection.
+    /// Reconnecting consumers must call this again rather than replaying a capability.
+    pub async fn raw_terminal_attachment(
+        &self,
+        terminal_id: &str,
+        runtime_incarnation: &str,
+        mode: RawTerminalMode,
+    ) -> Result<RawTerminalAttachment, ClientError> {
+        self.post::<Envelope<RawTerminalAttachment>>(
+            &format!(
+                "/v1/client/terminals/{}/raw-attachments",
+                percent_encode_segment(terminal_id.trim_start_matches("terminal/"))
+            ),
+            &RawTerminalAttachmentRequest {
+                runtime_incarnation: runtime_incarnation.to_owned(),
+                mode,
+            },
+        )
+        .await
+        .map(|response| response.value)
+    }
+
+    /// Consume a capability and return a PTY-compatible Unix connector.
+    ///
+    /// The caller writes its own ATTACH or PEEK frame. This transport neither parses nor
+    /// synthesizes PTY protocol frames. Dropping the returned stream cancels the bounded
+    /// bridge, including while either direction is backpressured.
+    pub async fn raw_terminal_stream(
+        &self,
+        attachment: &RawTerminalAttachment,
+    ) -> Result<tokio::net::UnixStream, ClientError> {
+        let path = format!(
+            "/v1/client/terminals/{}/raw-stream?incarnation={}&mode={}",
+            percent_encode_segment(attachment.terminal_id.trim_start_matches("terminal/")),
+            percent_encode(&attachment.runtime_incarnation),
+            attachment.mode.as_str(),
+        );
+        let request_for = |base: &str| -> Result<Request<()>, ClientError> {
+            let mut request = websocket_request(
+                &format!("{base}{path}"),
+                self.credential.as_deref(),
+                self.local_person.as_deref(),
+                None,
+            )?;
+            request.headers_mut().insert(
+                hyper::header::SEC_WEBSOCKET_PROTOCOL,
+                hyper::header::HeaderValue::from_str(&format!(
+                    "{RAW_TERMINAL_SUBPROTOCOL}, st3.cap.{}",
+                    attachment.stream_capability
+                ))
+                .map_err(|error| ClientError::Protocol(error.to_string()))?,
+            );
+            Ok(request)
+        };
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(HARD_MAX_RESPONSE_BYTES))
+            .max_frame_size(Some(HARD_MAX_RESPONSE_BYTES));
+        match &self.endpoint {
+            Endpoint::Unix(socket) => {
+                let stream = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    tokio::net::UnixStream::connect(socket),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("raw terminal connect deadline exceeded".into())
+                })?
+                .map_err(|error| unreachable_error(&socket.display().to_string(), &error))?;
+                let (websocket, response) = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    tokio_tungstenite::client_async_with_config(
+                        request_for("ws://localhost")?,
+                        stream,
+                        Some(config),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("raw terminal handshake deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                validate_raw_terminal_subprotocol(&response)?;
+                raw_terminal_connector(websocket)
+            }
+            Endpoint::FabricLoopback(base) => {
+                let websocket_base = if let Some(base) = base.strip_prefix("https://") {
+                    format!("wss://{base}")
+                } else if let Some(base) = base.strip_prefix("http://") {
+                    format!("ws://{base}")
+                } else {
+                    return Err(ClientError::Protocol(
+                        "gateway endpoint must use http or https".into(),
+                    ));
+                };
+                let (websocket, response) = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    tokio_tungstenite::connect_async_with_config(
+                        request_for(&websocket_base)?,
+                        Some(config),
+                        false,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("raw terminal handshake deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                validate_raw_terminal_subprotocol(&response)?;
+                raw_terminal_connector(websocket)
+            }
+        }
+    }
+
     /// Open the terminal stream that one `terminal.attach` capability allows.
     pub async fn terminal_stream(
         &self,
@@ -1348,6 +1510,106 @@ fn websocket_request(
         );
     }
     Ok(request)
+}
+
+fn validate_raw_terminal_subprotocol(
+    response: &tokio_tungstenite::tungstenite::handshake::client::Response,
+) -> Result<(), ClientError> {
+    let selected = response
+        .headers()
+        .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok());
+    if selected != Some(RAW_TERMINAL_SUBPROTOCOL) {
+        return Err(ClientError::Protocol(format!(
+            "raw terminal WebSocket selected {selected:?}, expected {RAW_TERMINAL_SUBPROTOCOL}"
+        )));
+    }
+    Ok(())
+}
+
+fn raw_terminal_connector<S>(
+    websocket: WebSocketStream<S>,
+) -> Result<tokio::net::UnixStream, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (consumer, bridge) = tokio::net::UnixStream::pair()
+        .map_err(|error| ClientError::Transport(error.to_string()))?;
+    let bridge = bridge
+        .into_std()
+        .map_err(|error| ClientError::Transport(error.to_string()))?;
+    // A separately registered descriptor observes peer shutdown even when a stalled write
+    // prevents the data pumps from reading EOF. It never consumes any of the consumer's bytes.
+    let monitor = bridge
+        .try_clone()
+        .and_then(tokio::io::unix::AsyncFd::new)
+        .map_err(|error| ClientError::Transport(error.to_string()))?;
+    let bridge = tokio::net::UnixStream::from_std(bridge)
+        .map_err(|error| ClientError::Transport(error.to_string()))?;
+    tokio::spawn(async move {
+        let (mut outgoing, mut incoming) = websocket.split();
+        let (mut reader, mut writer) = bridge.into_split();
+        let flush = tokio::sync::Notify::new();
+        let to_gateway = async {
+            let mut bytes = [0_u8; RAW_TERMINAL_CHUNK_BYTES];
+            loop {
+                tokio::select! {
+                    read = reader.read(&mut bytes) => {
+                        let Ok(length) = read else { return };
+                        if length == 0 {
+                            return;
+                        }
+                        if outgoing.send(WsMessage::Binary(
+                            Bytes::copy_from_slice(&bytes[..length]),
+                        )).await.is_err() {
+                            return;
+                        }
+                    }
+                    () = flush.notified() => {
+                        if outgoing.flush().await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+        let from_gateway = async {
+            while let Some(Ok(message)) = incoming.next().await {
+                match message {
+                    WsMessage::Binary(bytes) => {
+                        if writer.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                    WsMessage::Ping(_) => flush.notify_one(),
+                    WsMessage::Pong(_) => {}
+                    // Text is not a raw PTY stream. Close without interpreting it as PTY data.
+                    _ => return,
+                }
+            }
+        };
+        let consumer_closed = async {
+            loop {
+                let Ok(mut ready) = monitor.readable().await else {
+                    return;
+                };
+                if ready.ready().is_read_closed() || ready.ready().is_error() {
+                    return;
+                }
+                // Ignore ordinary data readiness on this independent, edge-triggered
+                // observer. Clearing the guard's snapshot cannot erase a newer close event.
+                ready.clear_ready();
+            }
+        };
+        tokio::select! {
+            () = to_gateway => {}
+            () = from_gateway => {}
+            () = consumer_closed => {}
+        }
+        // All pumps live in this task. Canceling either direction drops both socket halves
+        // and the monitor, so no separately spawned task can retain the remote attachment.
+    });
+    Ok(consumer)
 }
 
 fn validate_terminal_subprotocol(

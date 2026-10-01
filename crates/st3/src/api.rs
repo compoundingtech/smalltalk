@@ -62,6 +62,8 @@ mod delivery_presence;
 mod delivery_probes;
 mod terminal_view;
 
+pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
@@ -378,6 +380,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/client/terminals/{id}/stream",
             get(client_v0::terminal_stream),
+        )
+        .route(
+            "/v1/client/terminals/{id}/raw-attachments",
+            post(client_v0::raw_terminal::attachment),
+        )
+        .route(
+            "/v1/client/terminals/{id}/raw-stream",
+            get(client_v0::raw_terminal::stream),
         )
         .route("/v1/schema", get(schema))
         .route("/v1/intent/mission", post(mission))
@@ -4311,8 +4321,8 @@ async fn guard_bound_request(
 pub async fn serve_tcp(address: &str, app: Router) -> anyhow::Result<()> {
     let address = address.parse::<std::net::SocketAddr>()?;
     anyhow::ensure!(
-        address.ip().is_loopback(),
-        "the peer listener must bind to a loopback address"
+        crate::fleet::transport::is_permitted_route_address(&address.ip()),
+        "the peer listener must bind to a loopback or Tailscale address"
     );
     let listener = TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
