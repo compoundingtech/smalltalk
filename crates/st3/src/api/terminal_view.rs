@@ -919,7 +919,7 @@ mod tests {
         first.feed(b"\x1b]2;deploy\x07");
         let resynced = Emulator::new(2, 10, title);
         assert_eq!(
-            resynced.screen("fallback").value("t", "i", 0)["title"],
+            resynced.screen("fallback").value("t", "i")["title"],
             "deploy"
         );
     }
@@ -970,7 +970,7 @@ mod tests {
                 .await
                 .expect("the watcher stays up")
                 .expect("a screen before the deadline");
-            let value = screen.value("terminal/rt", "inc-1", 0);
+            let value = screen.value("terminal/rt", "inc-1");
             if value["lines"][0]["text"] == "hi there ok" {
                 assert_eq!(value["title"], "agent");
                 assert_eq!(value["lines"][0]["runs"][1], json!({ "text": "ok", "cells": 2, "strikethrough": true }));
