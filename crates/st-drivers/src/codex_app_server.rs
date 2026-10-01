@@ -339,9 +339,9 @@ fn codex_error_class(
     error_info: Option<&Value>,
 ) -> Option<(driver_diagnostic::Reason, &'static str, String)> {
     use driver_diagnostic::Reason;
-    let word = match error_info? {
-        Value::String(word) => word.as_str(),
-        Value::Object(map) if map.len() == 1 => map.keys().next()?.as_str(),
+    let word = match error_info {
+        Some(Value::String(word)) => word.as_str(),
+        Some(Value::Object(map)) if map.len() == 1 => map.keys().next()?.as_str(),
         _ => {
             return Some((
                 Reason::TurnUnclassified,
@@ -1073,8 +1073,8 @@ impl CodexInboxDelivery {
         let before = self.turn_error.clone();
         match method {
             "error" => {
-                // Every field this reads is required on `ErrorNotification`. A frame missing one
-                // is not this notification, so it proves nothing and must not clear anything.
+                // ErrorNotification requires the identity, retry flag, and error object.
+                // Missing one proves nothing and must not clear a standing failure.
                 let (Some(turn_id), Some(will_retry)) = (
                     message.pointer("/params/turnId").and_then(Value::as_str),
                     message
@@ -1083,8 +1083,16 @@ impl CodexInboxDelivery {
                 ) else {
                     return false;
                 };
+                let Some(error) = message
+                    .pointer("/params/error")
+                    .filter(|error| error.is_object())
+                else {
+                    return false;
+                };
+                // TurnError.codexErrorInfo is optional and nullable. The notification proves a
+                // failure even when the producer cannot name its cause.
                 let Some((reason, word, codex_word)) =
-                    codex_error_class(message.pointer("/params/error/codexErrorInfo"))
+                    codex_error_class(error.get("codexErrorInfo"))
                 else {
                     // The credential arm. `observe_provider_auth` owns it from `turn/completed`,
                     // where the same rejection arrives with the turn's own typed result.

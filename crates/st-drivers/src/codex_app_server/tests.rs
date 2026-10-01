@@ -6590,9 +6590,9 @@ fn a_malformed_error_frame_neither_publishes_nor_clears() {
         // No `turnId`.
         json!({"method": "error", "params": {"threadId": "thread-main", "willRetry": true,
                                              "error": {"codexErrorInfo": "serverOverloaded"}}}),
-        // No error info at all.
+        // No error object.
         json!({"method": "error", "params": {"threadId": "thread-main", "turnId": "turn-a",
-                                             "willRetry": true, "error": {}}}),
+                                             "willRetry": true}}),
         // Another thread's failure.
         json!({"method": "error", "params": {"threadId": "thread-other", "turnId": "turn-a",
                                              "willRetry": true,
@@ -6753,4 +6753,37 @@ fn the_control_pump_reports_the_recorded_usage_limit_failure_over_its_socket() {
     };
     assert_eq!(failure.stage, driver_diagnostic::Stage::Turn);
     assert_eq!(failure.reason, driver_diagnostic::Reason::TurnUsageLimit);
+}
+
+#[test]
+fn an_error_with_no_optional_codex_error_info_reports_an_unclassified_failure() {
+    // The generated ErrorNotification schema requires error/threadId/turnId/willRetry;
+    // TurnError requires message but allows codexErrorInfo to be absent or null.
+    for error in [
+        json!({"message": "provider failed"}),
+        json!({"message": "provider failed", "codexErrorInfo": null}),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::Active {
+            turn_id: "turn-a".into(),
+        });
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &json!({"method": "error", "params": {
+                "threadId": "thread-main", "turnId": "turn-a", "willRetry": true, "error": error
+            }}),
+        );
+        assert_eq!(
+            observed_record(&agent_dir).reason.as_deref(),
+            Some("unclassified")
+        );
+        let driver_diagnostic::Observed::Failure(failure) = turn_diagnostic(&agent_dir) else {
+            panic!("an error without a named cause is still failure evidence");
+        };
+        assert_eq!(failure.reason, driver_diagnostic::Reason::TurnUnclassified);
+    }
 }

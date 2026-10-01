@@ -521,7 +521,7 @@ A human ask and a credential rejection keep their own observed reason.
 | `account` | — | `account_on_hold`, `billing_error` |
 | `rejected` | `badRequest`, `activeTurnNotSteerable` | `invalid_request`, `model_not_found` |
 | `internal` | `internalServerError`, `threadRollbackFailed`, `sandboxError` | `server_error` |
-| `unclassified` | `other`, unknown or unreadable cause | `unknown`, missing or unknown cause |
+| `unclassified` | `other`, missing, unknown or unreadable cause | `unknown`, missing or unknown cause |
 
 Codex object variants carry the error word as their single key. A notification
 missing its required identity or retry fields proves nothing. A standing turn
