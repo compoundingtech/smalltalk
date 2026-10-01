@@ -6184,14 +6184,23 @@ mod retry_tests {
             PathBuf::from("unused.sock"),
             notify.subscribe(),
         ));
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !fleet.activity.read().unwrap().contains_key("beacon") {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        // The first exchange moves both nodes' fleet bindings, so the dialer starts a follow-up
+        // exchange at once; on a loaded machine that can come long after the first answer.
+        // Measure from the healthy wait: a completed exchange, then no request for longer than
+        // the coalescing window.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut seen = requests.load(Ordering::Relaxed);
+            loop {
+                tokio::time::sleep(3 * REPLICATION_WAKE_COALESCE).await;
+                let now = requests.load(Ordering::Relaxed);
+                if now == seen && fleet.activity.read().unwrap().contains_key("beacon") {
+                    break;
+                }
+                seen = now;
             }
         })
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let before = requests.load(Ordering::Relaxed);
         // A successful client read/probe proves peer life, but it does not change the graph.
         fleet.note_activity("beacon");

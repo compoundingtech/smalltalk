@@ -5,7 +5,7 @@
 //! The focused pane points stui's own tab and selection at its subject, so every key and action
 //! the sidebar layout has works the same inside a glass.
 
-use super::glass_store::{self, Stored, StoredGlass};
+use super::glass_store::{self, Stored, StoredGlass, StoredView};
 use super::layout::{Group, Layout, Side, Tab};
 use super::*;
 use ratatui::style::Color;
@@ -30,6 +30,9 @@ pub(crate) struct Glasses {
     graph: bool,
     /// Changes st has not confirmed, newest per glass id, each with the key a retry reuses.
     pending: BTreeMap<String, GlassWrite>,
+    /// The focused split fills the glass for now (Ctrl+O), as tmux zooms a pane; this window
+    /// only, never stored.
+    zoomed: bool,
     /// The glass made at start only because this device had none by the name asked for. If it
     /// is still empty when st first sends the person's glasses, st's glass of that name is
     /// shown instead of keeping both.
@@ -131,6 +134,33 @@ impl Glass {
         }
     }
 
+    /// Where this window is in the glass, for this device to remember.
+    fn view(&self) -> StoredView {
+        StoredView {
+            focus: self.focus,
+            current: self
+                .layout
+                .groups()
+                .iter()
+                .map(|group| group.current)
+                .collect(),
+        }
+    }
+
+    /// The glass as this device last left it, where its structure still allows.
+    fn viewed(mut self, view: Option<StoredView>) -> Self {
+        let Some(view) = view else { return self };
+        let count = self.layout.groups().len();
+        for (index, current) in view.current.into_iter().enumerate().take(count) {
+            let shown = self.count(index);
+            if let Some(group) = self.layout.group_mut(index) {
+                group.current = current.min(shown.saturating_sub(1));
+            }
+        }
+        self.focus = view.focus.min(count.saturating_sub(1));
+        self
+    }
+
     /// How many tabs group `index`'s strip shows, Home included.
     fn count(&self, index: usize) -> usize {
         self.layout
@@ -172,6 +202,9 @@ impl Glass {
 }
 
 impl Glasses {
+    pub(crate) fn palette_open(&self) -> bool {
+        self.palette.is_some()
+    }
     /// The agents whose conversations show in the shown glass: each group's shown tab, the
     /// focused group first.
     pub(crate) fn shown_agents(&self) -> Vec<String> {
@@ -193,16 +226,19 @@ impl Glasses {
         let mut all = stored
             .glasses
             .into_iter()
-            .map(|glass| Glass {
-                id: if glass.id.is_empty() {
-                    new_id()
-                } else {
-                    glass.id
-                },
-                revision: glass.revision,
-                name: glass.name,
-                layout: glass.layout,
-                focus: 0,
+            .map(|glass| {
+                Glass {
+                    id: if glass.id.is_empty() {
+                        new_id()
+                    } else {
+                        glass.id
+                    },
+                    revision: glass.revision,
+                    name: glass.name,
+                    layout: glass.layout,
+                    focus: 0,
+                }
+                .viewed(glass.view)
             })
             .collect::<Vec<_>>();
         let name = wanted.or(stored.last).unwrap_or_else(|| "main".to_owned());
@@ -222,6 +258,7 @@ impl Glasses {
             palette: None,
             store,
             graph: false,
+            zoomed: false,
             pending: BTreeMap::new(),
             placeholder,
         }
@@ -266,6 +303,7 @@ impl Glasses {
                     revision: glass.revision.clone(),
                     name: glass.name.clone(),
                     layout: glass.layout.clone(),
+                    view: Some(glass.view()),
                 })
                 .collect(),
         };
@@ -308,6 +346,9 @@ struct Palette {
     section: Option<usize>,
     /// What Enter does: Ctrl+T opens the palette to make a tab.
     enter: Open,
+    /// The first row shown once the wheel moved the list, as content scrolls; `None` keeps the
+    /// selection in view, as keys do.
+    top: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -466,7 +507,7 @@ impl Ui {
             choices.push(glass(
                 "+",
                 format!("New glass “{name}”"),
-                "ctrl+o switches",
+                "ctrl+g switches",
                 String::new(),
                 Action::NewGlass(name.to_owned()),
             ));
@@ -533,7 +574,15 @@ impl Ui {
             height: area.height.saturating_sub(2),
             ..area
         };
-        let (rects, dividers) = glass.layout.rects(body);
+        // Zoomed, the focused split takes the whole glass and the others wait unseen.
+        let (rects, dividers) = if glasses.zoomed {
+            let groups = glass.layout.groups().len();
+            let mut rects = vec![Rect::default(); groups];
+            rects[glass.focus] = body;
+            (rects, Vec::new())
+        } else {
+            glass.layout.rects(body)
+        };
         for (rect, side) in dividers {
             let symbol = match side {
                 Side::Right => "│",
@@ -565,6 +614,9 @@ impl Ui {
             let (Some(rect), Some(content)) = (rects.get(index), contents.get(index)) else {
                 continue;
             };
+            if rect.is_empty() {
+                continue;
+            }
             self.tab_strip(buf, Rect { height: 1, ..*rect }, glass, index);
             self.draw_group(buf, *content, glass, index);
         }
@@ -714,13 +766,25 @@ impl Ui {
             .filter(|item| !self.snoozed.contains(&item.id))
             .count();
         spans.push(Span::styled(" · ", bar(theme::dim())));
-        spans.push(if need > 0 {
-            Span::styled(
-                format!("◆ {need} need you"),
-                bar(theme::strong(theme::PERSON)),
-            )
+        // Each count opens the palette at what it counts.
+        let mut x = area.x + Line::from(spans.clone()).width() as u16;
+        let need_text = if need > 0 {
+            format!("◆ {need} need you")
         } else {
-            Span::styled("nothing needs you", bar(theme::dim()))
+            "nothing needs you".to_owned()
+        };
+        self.hit(
+            Rect {
+                x,
+                width: text::width(&need_text) as u16,
+                ..area
+            },
+            Hit::PaletteSection(0),
+        );
+        spans.push(if need > 0 {
+            Span::styled(need_text, bar(theme::strong(theme::PERSON)))
+        } else {
+            Span::styled(need_text, bar(theme::dim()))
         });
         let working = self
             .world
@@ -730,19 +794,29 @@ impl Ui {
             .filter(|agent| agent.state == AgentState::Working)
             .count();
         spans.push(Span::styled(" · ", bar(theme::dim())));
-        spans.push(Span::styled(
-            format!("{} {working} working", self.spinner()),
-            bar(theme::fg(theme::WORKING)),
-        ));
+        x = area.x + Line::from(spans.clone()).width() as u16;
+        let working_text = format!("{} {working} working", self.spinner());
+        self.hit(
+            Rect {
+                x,
+                width: text::width(&working_text) as u16,
+                ..area
+            },
+            Hit::PaletteSection(1),
+        );
+        spans.push(Span::styled(working_text, bar(theme::fg(theme::WORKING))));
         let machines = self.world.machines.items();
-        if !machines.is_empty() {
+        let machines_shown = !machines.is_empty();
+        if machines_shown {
             let count = |reach: &[Reach]| {
                 machines
                     .iter()
                     .filter(|machine| reach.contains(&machine.reach))
                     .count()
             };
-            spans.push(Span::styled(" · fleet ", bar(theme::dim())));
+            spans.push(Span::styled(" · ", bar(theme::dim())));
+            x = area.x + Line::from(spans.clone()).width() as u16;
+            spans.push(Span::styled("fleet ", bar(theme::dim())));
             for (glyph, color, n) in [
                 ("●", theme::GREEN, count(&[Reach::Here, Reach::Direct])),
                 ("◐", theme::SAPPHIRE, count(&[Reach::Indirect])),
@@ -752,6 +826,17 @@ impl Ui {
                     spans.push(Span::styled(format!("{glyph}{n} "), bar(theme::fg(color))));
                 }
             }
+        }
+        let end = area.x + Line::from(spans.clone()).width() as u16;
+        if machines_shown {
+            self.hit(
+                Rect {
+                    x,
+                    width: end.saturating_sub(x),
+                    ..area
+                },
+                Hit::PaletteSection(3),
+            );
         }
         buf.set_line(area.x, area.y, &Line::from(spans), area.width);
         // ▢═▢: two panes and a bridge, a pair of glasses.
@@ -827,6 +912,20 @@ impl Ui {
                 },
                 Hit::GlassAdd(index),
             );
+        }
+        let zoomed = self.glasses.as_ref().is_some_and(|glasses| glasses.zoomed);
+        if zoomed && focused {
+            let label = " ⤢ zoomed · ctrl+o ";
+            let width = text::width(label) as u16;
+            if x + width < area.x + area.width {
+                buf.set_stringn(
+                    area.x + area.width - width,
+                    area.y,
+                    label,
+                    width as usize,
+                    theme::fg(theme::YELLOW).bg(strip),
+                );
+            }
         }
     }
 
@@ -1001,7 +1100,11 @@ impl Ui {
             .iter()
             .position(|(index, _)| *index == Some(palette.selected))
             .unwrap_or(0);
-        let top = selected_row.saturating_sub(list_height.saturating_sub(1));
+        let top = palette
+            .top
+            .unwrap_or_else(|| selected_row.saturating_sub(list_height.saturating_sub(1)))
+            .min(rows.len().saturating_sub(list_height));
+        self.frame.borrow_mut().palette_top = top;
         for (offset, (index, line)) in rows.iter().skip(top).take(list_height).enumerate() {
             let y = rect.y + 2 + offset as u16;
             buf.set_line(rect.x + 1, y, line, rect.width - 2);
@@ -1035,6 +1138,7 @@ impl Ui {
         let command = key.modifiers.contains(KeyModifiers::SUPER);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         if let Some(palette) = glasses.palette.as_mut() {
+            palette.top = None;
             match key.code {
                 KeyCode::Esc => glasses.palette = None,
                 KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
@@ -1053,6 +1157,13 @@ impl Ui {
                 KeyCode::Char('t') if control => self.open_choice(None, Open::Tab),
                 KeyCode::Char('g') if control => self.open_choice(None, Open::Glass),
                 KeyCode::Char('k') if control || command => glasses.palette = None,
+                // Ctrl (or Alt, or ⌘) and a digit show only that section; the same again shows all.
+                KeyCode::Char(digit @ '1'..='5') if control || alt || command => {
+                    let section = digit as usize - '1' as usize;
+                    palette.section = (palette.section != Some(section)).then_some(section);
+                    palette.selected = 0;
+                    palette.top = None;
+                }
                 KeyCode::Char(letter) if !control && !command => {
                     palette.query.push(letter);
                     palette.selected = 0;
@@ -1065,6 +1176,7 @@ impl Ui {
         // While the person types, every editing key is the input's (Ctrl+W deletes a word);
         // Esc leaves the input and glasses keys work again.
         if self.editing
+            || self.find.is_some()
             || self.new_mission.is_some()
             || self.chat.as_ref().is_some_and(|chat| chat.editing)
         {
@@ -1085,16 +1197,33 @@ impl Ui {
             KeyCode::Char('v') if control => self.split_group(Side::Right),
             KeyCode::Char('x') if control => self.split_group(Side::Below),
             KeyCode::Char('w') if control => self.close_tab(),
-            KeyCode::Char('o') if control => self.next_glass(),
+            KeyCode::Char('o') if control => {
+                glasses.zoomed = !glasses.zoomed && glasses.glass().layout.groups().len() > 1;
+            }
+            KeyCode::Char('g') if control => self.next_glass(),
             KeyCode::Char(digit @ '1'..='9') if alt => self.show_tab(digit as usize - '1' as usize),
-            KeyCode::PageDown if control => self.show_tab((current + 1) % tabs),
-            KeyCode::PageUp if control => self.show_tab((current + tabs - 1) % tabs),
+            // Next and previous tab in the focused split: Ctrl+PgDn/PgUp, Ctrl+Tab where the
+            // terminal reports it, and ] and [ whenever nothing is being typed.
+            KeyCode::PageDown | KeyCode::Tab if control => self.show_tab((current + 1) % tabs),
+            KeyCode::PageUp | KeyCode::BackTab if control => {
+                self.show_tab((current + tabs - 1) % tabs)
+            }
+            KeyCode::Char(']') if quiet && key.modifiers.is_empty() => {
+                self.show_tab((current + 1) % tabs)
+            }
+            KeyCode::Char('[') if quiet && key.modifiers.is_empty() => {
+                self.show_tab((current + tabs - 1) % tabs)
+            }
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if alt => {
                 self.move_focus(key.code)
             }
             // Outside a draft, the sidebar's tab digits open the palette at that section.
             KeyCode::Char(digit @ '1'..='5') if quiet && key.modifiers.is_empty() => {
                 self.open_palette(Some(digit as usize - '1' as usize), Open::Here)
+            }
+            // A mission's k shows its whole declaration, as its card says; Up still scrolls.
+            KeyCode::Char('k') if quiet && subject && self.tab == 2 && key.modifiers.is_empty() => {
+                self.action_key('k')
             }
             // A subject's tab has no list to move through: these scroll its pane.
             KeyCode::Up | KeyCode::Char('k') if quiet && subject && !control => {
@@ -1114,20 +1243,18 @@ impl Ui {
             .is_some_and(|glasses| glasses.palette.is_some())
     }
 
-    /// One wheel step moves the palette's selection a row, and the list follows it.
+    /// The wheel scrolls the palette's list as content, three rows a step; the selection
+    /// stays where it is until a key moves it.
     pub(crate) fn scroll_palette(&mut self, up: bool) {
+        let shown = self.frame.borrow().palette_top;
         if let Some(palette) = self
             .glasses
             .as_mut()
             .and_then(|glasses| glasses.palette.as_mut())
         {
-            palette.selected = if up {
-                palette.selected.saturating_sub(1)
-            } else {
-                palette.selected + 1
-            };
+            let top = palette.top.unwrap_or(shown);
+            palette.top = Some(if up { top.saturating_sub(3) } else { top + 3 });
         }
-        self.clamp_palette();
     }
 
     pub(crate) fn open_palette(&mut self, section: Option<usize>, enter: Open) {
@@ -1300,6 +1427,7 @@ impl Ui {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
         };
+        glasses.zoomed = false;
         let glass = glasses.glass_mut();
         let group = glass.layout.split(glass.focus, side, Group::default());
         let id = glass.id.clone();
@@ -1489,6 +1617,8 @@ impl Ui {
             shown.current = tab;
         }
         glass.focus = group;
+        // Where the person is, remembered on this device for the next start.
+        glasses.save();
         self.show_focused();
     }
 
@@ -1496,8 +1626,27 @@ impl Ui {
         self.show_in(group, usize::MAX);
     }
 
+    /// Bring stui's own tab and selection back to the focused pane's subject when they drifted:
+    /// at start, before the lists arrive, the subject cannot be selected yet.
+    pub(crate) fn resync_focus(&mut self) {
+        let Some(pane) = self
+            .glasses
+            .as_ref()
+            .and_then(|glasses| glasses.glass().focused())
+            .and_then(Pane::parse)
+        else {
+            return;
+        };
+        let Some((tab, subject)) = pane_subject(&pane) else {
+            return;
+        };
+        if self.tab != tab || subject.is_some_and(|subject| self.selected_id() != Some(subject)) {
+            self.focus_pane(&pane);
+        }
+    }
+
     /// Point stui's own tab and selection at what the focused group shows.
-    fn show_focused(&mut self) {
+    pub(crate) fn show_focused(&mut self) {
         let Some(glasses) = self.glasses.as_ref() else {
             return;
         };
@@ -1513,8 +1662,15 @@ impl Ui {
         }
     }
 
-    /// Focus the group nearest in the arrow's direction, on screen.
+    /// Focus the group nearest in the arrow's direction, on screen; a zoomed split comes back
+    /// to its place first.
     fn move_focus(&mut self, direction: KeyCode) {
+        if let Some(glasses) = self.glasses.as_mut()
+            && glasses.zoomed
+        {
+            glasses.zoomed = false;
+            return;
+        }
         let Some(focus) = self.glasses.as_ref().map(|glasses| glasses.glass().focus) else {
             return;
         };
@@ -1648,16 +1804,8 @@ impl Ui {
 
     /// Point stui's own tab and selection at a pane's subject, so its keys act on it.
     fn focus_pane(&mut self, pane: &Pane) {
-        let (tab, subject) = match pane {
-            Pane::Home(id) => (0, id.clone()),
-            Pane::Agent(id) => (1, id.clone()),
-            Pane::Mission(id) | Pane::Declaration(id) => (2, id.clone()),
-            Pane::Machine(id) => (
-                3,
-                id.as_deref()
-                    .map(|id| id.trim_start_matches("machine/").to_owned()),
-            ),
-            _ => return,
+        let Some((tab, subject)) = pane_subject(pane) else {
+            return;
         };
         self.tab = tab;
         self.terminal = self.terminal.take().filter(|_| tab == 1);
@@ -1681,6 +1829,21 @@ impl Ui {
             self.selected[tab] = position;
         }
     }
+}
+
+/// The sidebar tab and the selected id a pane's subject is, where it has one.
+fn pane_subject(pane: &Pane) -> Option<(usize, Option<String>)> {
+    Some(match pane {
+        Pane::Home(id) => (0, id.clone()),
+        Pane::Agent(id) => (1, id.clone()),
+        Pane::Mission(id) | Pane::Declaration(id) => (2, id.clone()),
+        Pane::Machine(id) => (
+            3,
+            id.as_deref()
+                .map(|id| id.trim_start_matches("machine/").to_owned()),
+        ),
+        _ => return None,
+    })
 }
 
 /// A layout as st's client types spell it. stui splits two at a time; a longer split nests.
@@ -1907,6 +2070,10 @@ mod tests {
         assert_eq!((tabs(&ui).1, ui.tab), (0, 0));
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2[0].len(), 2, "Home cannot be closed");
+        typed(&mut ui, "]");
+        assert_eq!(tabs(&ui).1, 1);
+        typed(&mut ui, "[");
+        assert_eq!(tabs(&ui).1, 0);
         press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
@@ -2102,6 +2269,124 @@ mod tests {
     }
 
     #[test]
+    fn a_missions_k_shows_its_declaration_and_ctrl_digits_pick_a_palette_section() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Tab,
+        );
+        typed(&mut ui, "k");
+        assert!(ui.kdl, "k shows the whole declaration");
+        typed(&mut ui, "k");
+        assert!(!ui.kdl);
+        ctrl(&mut ui, 'k');
+        press(&mut ui, KeyCode::Char('3'), KeyModifiers::CONTROL);
+        let section = |ui: &Ui| {
+            ui.glasses
+                .as_ref()
+                .unwrap()
+                .palette
+                .as_ref()
+                .unwrap()
+                .section
+        };
+        assert_eq!(section(&ui), Some(2));
+        press(&mut ui, KeyCode::Char('3'), KeyModifiers::CONTROL);
+        assert_eq!(section(&ui), None, "the same again shows every section");
+        // The status line's counts open the palette at what they count.
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        screen(&ui);
+        let need = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .find(|(_, hit)| matches!(hit, Hit::PaletteSection(0)))
+            .map(|(rect, _)| *rect)
+            .unwrap();
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: need.x + 1,
+            row: need.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(section(&ui), Some(0));
+    }
+
+    #[test]
+    fn slash_finds_text_in_a_conversation_newest_first() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        let said = |ui: &Ui| {
+            let Some(Load::Ready(entries)) =
+                ui.world.conversations.get("agent/example/atlas/builder")
+            else {
+                panic!("the demo agent has a conversation")
+            };
+            entries.clone()
+        };
+        // A word the demo conversation says more than once.
+        let word = "the";
+        assert!(said(&ui).len() > 1);
+        typed(&mut ui, "/");
+        typed(&mut ui, word);
+        let shown = screen(&ui);
+        let find = ui.find.as_ref().unwrap();
+        let count = find.count.get();
+        assert!(count > 1, "{shown}");
+        assert!(shown.contains(&format!("1 of {count}")), "{shown}");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        screen(&ui);
+        assert!(screen(&ui).contains(&format!("2 of {count}")));
+        press(&mut ui, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert!(screen(&ui).contains(&format!("1 of {count}")));
+        // Typing goes to the find bar, not to glasses.
+        ctrl(&mut ui, 'w');
+        assert_eq!(ui.find.as_ref().unwrap().query, "");
+        assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(ui.find.is_none());
+        assert!(screen(&ui).contains("Message Atlas Builder"));
+    }
+
+    #[test]
+    fn ctrl_o_zooms_the_focused_split_and_back() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Right,
+        );
+        assert!(screen(&ui).contains("Atlas Builder"));
+        ctrl(&mut ui, 'o');
+        let zoomed = screen(&ui);
+        assert!(zoomed.contains("zoomed · ctrl+o"), "{zoomed}");
+        assert!(
+            !zoomed.lines().nth(1).unwrap().contains("Atlas Builder"),
+            "only the focused split shows"
+        );
+        ctrl(&mut ui, 'o');
+        assert!(
+            screen(&ui)
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("Atlas Builder")
+        );
+        // A move between splits brings a zoomed one back first.
+        ctrl(&mut ui, 'o');
+        press(&mut ui, KeyCode::Left, KeyModifiers::ALT);
+        assert!(!ui.glasses.as_ref().unwrap().zoomed);
+        assert_eq!(tabs(&ui).0, 1);
+    }
+
+    #[test]
     fn the_wheel_moves_the_palette_and_nothing_behind_it() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
@@ -2113,15 +2398,24 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             })
         };
-        screen(&ui);
+        let before = screen(&ui);
         wheel(&mut ui, MouseEventKind::ScrollDown);
         wheel(&mut ui, MouseEventKind::ScrollDown);
         let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
-        assert_eq!(palette.selected, 2);
+        assert_eq!(
+            (palette.selected, palette.top),
+            (0, Some(6)),
+            "content scrolls"
+        );
+        assert_ne!(screen(&ui), before);
         wheel(&mut ui, MouseEventKind::ScrollUp);
         let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
-        assert_eq!(palette.selected, 1);
+        assert_eq!(palette.top, Some(3));
         assert_eq!(ui.list_top.borrow()[0], 0, "the list behind did not scroll");
+        // A key brings the selection back into view.
+        press(&mut ui, KeyCode::Down, KeyModifiers::NONE);
+        let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
+        assert_eq!((palette.selected, palette.top), (1, None));
     }
 
     #[test]
@@ -2147,7 +2441,7 @@ mod tests {
     }
 
     #[test]
-    fn glasses_are_named_kept_on_the_device_and_switched_with_ctrl_o() {
+    fn glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("glasses.json");
         let mut ui = Ui::new(demo::world());
@@ -2174,14 +2468,16 @@ mod tests {
         );
         assert!(screen(&ui).lines().next().unwrap().contains("review ▾"));
 
-        ctrl(&mut ui, 'o');
+        ctrl(&mut ui, 'g');
         assert_eq!(ui.glasses.as_ref().unwrap().glass().name, "main");
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
 
-        // Another window on this device opens the last glass used, with its tabs.
+        // Another window on this device opens the last glass used, with its tabs, on the tab
+        // it was showing.
         let again = Glasses::open(None, Some(store.clone()));
         assert_eq!(again.glass().name, "main");
         assert_eq!(again.all.len(), 2);
+        assert_eq!(again.glass().focused(), Some(ATLAS));
         assert_eq!(again.glass().layout.groups()[0].tabs, [Tab::pane(ATLAS)]);
         assert_eq!(
             Glasses::open(Some("review".into()), Some(store))

@@ -716,15 +716,39 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             card.blank();
             card.lines(text::markdown(question, inner, theme::text()));
             card.blank();
+            // The answer goes back to the agent that asked, and its waiting step continues.
             if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
                 text_box(&mut card, &format!("answer {from}"), drafts, "", inner);
                 card.buttons(&[
-                    ("enter", "Complete step", Hit::Enter, theme::ACCENT),
+                    ("enter", "Send the answer", Hit::Enter, theme::ACCENT),
                     ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
                 ]);
-            } else if !confirm_row(&mut card, drafts, "Mark this request answered") {
-                card.buttons(&[("c", "Complete step", Hit::Key('c'), theme::ACCENT)]);
+            } else {
+                let label = match drafts.confirm {
+                    Some('y') => format!("Answer {from} “Yes”"),
+                    Some('n') => format!("Answer {from} “No”"),
+                    _ => "Mark this request answered".to_owned(),
+                };
+                if !confirm_row(&mut card, drafts, &label) {
+                    // A yes-or-no question can be answered in one key.
+                    if item.title.trim_end().ends_with('?') {
+                        card.buttons(&[
+                            ("y", "Yes", Hit::Key('y'), theme::GREEN),
+                            ("n", "No", Hit::Key('n'), theme::RED),
+                            ("c", "Answer in words", Hit::Key('c'), theme::ACCENT),
+                        ]);
+                    } else {
+                        card.buttons(&[("c", "Answer", Hit::Key('c'), theme::ACCENT)]);
+                    }
+                }
             }
+            card.wrap(
+                &text::inline(
+                    &format!("Your answer goes back to {from} and the step it waits on continues."),
+                    theme::dim(),
+                ),
+                inner,
+            );
         }
         AttentionKind::Message { from, body } => {
             card.line(Line::from(vec![

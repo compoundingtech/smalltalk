@@ -20,7 +20,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use st3_client::{
-    Client, ClientError, Fence, LaunchReviseParameters, MessageSendParameters, Resource,
+    Client, ClientError, Fence, LaunchReviseParameters, MessageSendParameters, Resource, TargetParameters,
     TimelineBody,
 };
 use std::{
@@ -54,6 +54,44 @@ struct Sent {
     snapshot_id: String,
 }
 
+/// Read evidence belongs to a presented frame, so navigation cannot cancel retries.
+#[derive(Default)]
+struct ReadReceipts {
+    confirmed: HashSet<String>,
+    pending: BTreeMap<String, Option<Instant>>,
+}
+
+impl ReadReceipts {
+    fn displayed(&mut self, id: String, now: Instant) {
+        if !self.confirmed.contains(&id) {
+            self.pending.entry(id).or_insert(Some(now));
+        }
+    }
+    fn next(&mut self, now: Instant) -> Option<String> {
+        // Each read changes the snapshot fence. Publish serially to avoid racing receipts.
+        if self.pending.values().any(Option::is_none) {
+            return None;
+        }
+        let id = self
+            .pending
+            .iter()
+            .find_map(|(id, retry)| retry.filter(|at| *at <= now).map(|_| id.clone()))?;
+        self.pending.insert(id.clone(), None);
+        Some(id)
+    }
+    fn completed(&mut self, id: String, succeeded: bool, now: Instant) {
+        if succeeded {
+            self.pending.remove(&id);
+            if self.confirmed.len() >= 2048 {
+                self.confirmed.clear();
+            }
+            self.confirmed.insert(id);
+        } else {
+            self.pending.insert(id, Some(now + Duration::from_secs(2)));
+        }
+    }
+}
+
 pub struct Context {
     pub client: Client,
     pub runtime: tokio::runtime::Runtime,
@@ -75,6 +113,7 @@ struct Following {
 }
 
 enum Fetched {
+    Read(String, Result<(), String>),
     Preview(String, Load<MissionPreview>),
     /// The message behind an unread-message item: sender, title and text.
     Body(String, String, Option<String>, String),
@@ -164,6 +203,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut conversing: Vec<String> = Vec::new();
     let mut preview_requested: HashSet<String> = HashSet::new();
     let mut body_requested: HashSet<String> = HashSet::new();
+    let mut read_receipts = ReadReceipts::default();
     // Messages sent from here, shown at once until st reports them back.
     let mut pending: Vec<Pending> = Vec::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
@@ -172,6 +212,8 @@ pub fn run(context: Context) -> Result<()> {
     ui.glasses = glass.map(|name| {
         super::glass::Glasses::open(name, super::glass_store::path(&person))
     });
+    // A glass opens where this device left it.
+    ui.show_focused();
 
     let _guard = Guard::enter(ui.glasses.is_some())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -283,6 +325,7 @@ pub fn run(context: Context) -> Result<()> {
                     changed = true;
                 }
                 feed::Update::ConversationFailed { target, message } => {
+                    ui.conversation_failed(&target, &message);
                     failed.insert(target, message);
                     changed = true;
                 }
@@ -347,6 +390,9 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(result) = fetched.try_recv() {
             match result {
+                Fetched::Read(id, result) => {
+                    read_receipts.completed(id, result.is_ok(), Instant::now());
+                }
                 Fetched::Sent(token, outcome) => {
                     if let Some(entry) = pending.iter_mut().find(|entry| entry.token == token) {
                         match outcome {
@@ -693,6 +739,38 @@ pub fn run(context: Context) -> Result<()> {
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
         execute!(io::stdout(), EndSynchronizedUpdate)?;
+        let visible = ui.visible_messages();
+        let incoming: HashSet<_> = timelines
+            .values()
+            .flat_map(|timeline| &timeline.items)
+            .filter_map(|entry| match &entry.body {
+                TimelineBody::Message(message)
+                    if message.to.as_deref() == Some(person.as_str()) =>
+                {
+                    Some(message.message_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        for id in visible
+            .into_iter()
+            .filter(|id| incoming.contains(id.as_str()))
+        {
+            read_receipts.displayed(id, Instant::now());
+        }
+        if extras.live
+            && let Some(id) = read_receipts.next(Instant::now())
+        {
+            let client = client.clone();
+            let person = person.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let result = acknowledge_visible_message(&client, &person, &id)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(Fetched::Read(id, result));
+            });
+        }
         if event::poll(Duration::from_millis(80))? {
             // crossterm's read never returns on a closed terminal, so check for one before each.
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
@@ -793,20 +871,9 @@ fn conversations(
             {
                 Load::Failed(reason)
             }
-            (Some(timeline), error) => {
-                let mut entries = adapt::conversation(&timeline.items, &names);
-                // Never hide a failure behind what loaded before it.
-                if let Some(error) = error {
-                    entries.push(super::view::Entry {
-                        id: format!("failed:{target}"),
-                        at: String::new(),
-                        body: super::view::Body::Event(format!(
-                            "Could not load newer entries: {error}"
-                        )),
-                    });
-                }
-                Load::Ready(entries)
-            }
+            // A failure after the conversation loaded is said on the rule above its message
+            // box, where it clears once st catches up; the feed retries on its own.
+            (Some(timeline), _) => Load::Ready(adapt::conversation(&timeline.items, &names)),
             (None, Some(error)) => {
                 Load::Failed(format!("Could not load this conversation: {error}"))
             }
@@ -815,6 +882,42 @@ fn conversations(
         out.insert(target.to_owned(), load);
     }
     out
+}
+
+/// The draw loop supplies body-visible IDs. Metadata fetches, caches and hidden pages never
+/// call this. Failed publication remains queued after navigation until confirmed.
+async fn acknowledge_visible_message(client: &Client, person: &str, id: &str) -> Result<()> {
+    let found = client.messages_get(id).await?;
+    let Resource::Message(message) = found.value else {
+        anyhow::bail!("message disappeared");
+    };
+    if message.to != person || matches!(message.state.as_str(), "read" | "closed") {
+        return Ok(());
+    }
+    let mut fence = Fence {
+        snapshot_id: found.snapshot.id,
+        ..Fence::default()
+    };
+    fence
+        .subject_revisions
+        .insert(message.header.id.clone(), message.header.revision);
+    let (action, idem) = crate::action_pair();
+    let result = client
+        .message_read(
+            action,
+            idem,
+            fence,
+            TargetParameters {
+                target_id: message.header.id,
+                ..Default::default()
+            },
+        )
+        .await?;
+    anyhow::ensure!(
+        matches!(result.value.status, st3_client::ActionStatus::Completed),
+        "read receipt was not completed"
+    );
+    Ok(())
 }
 
 async fn perform(
@@ -1079,6 +1182,228 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_receipt_retries_survive_navigation_and_serialize_snapshot_changes() {
+        let now = Instant::now();
+        let mut receipts = ReadReceipts::default();
+        receipts.displayed("message/one".into(), now);
+        assert_eq!(receipts.next(now).as_deref(), Some("message/one"));
+        receipts.displayed("message/two".into(), now);
+        assert!(
+            receipts.next(now).is_none(),
+            "do not race the in-flight snapshot"
+        );
+        receipts.completed("message/one".into(), false, now);
+        assert_eq!(receipts.next(now).as_deref(), Some("message/two"));
+        receipts.completed("message/two".into(), true, now);
+        assert!(receipts.next(now).is_none(), "retry backs off");
+        assert_eq!(
+            receipts.next(now + Duration::from_secs(2)).as_deref(),
+            Some("message/one"),
+            "retry without another displayed frame"
+        );
+        receipts.completed("message/one".into(), true, now);
+        receipts.displayed("message/one".into(), now);
+        assert!(
+            receipts.next(now + Duration::from_secs(3)).is_none(),
+            "redrawing does not resend a confirmed receipt"
+        );
+    }
+
+    #[test]
+    fn a_visible_message_header_without_its_body_is_not_a_read() {
+        use super::super::view::{Body, Entry};
+        let entries = vec![Entry {
+            id: "message/reply".into(),
+            at: "12:00".into(),
+            body: Body::Mail {
+                from: "keeper".into(),
+                to: "you".into(),
+                subject: "Reply".into(),
+                body: "Here is the reply.".into(),
+                delivered: false,
+            },
+        }];
+        let cache = super::super::conversation::Cache::default();
+        let doc = cache.render(&entries, 90, &HashSet::new(), "*");
+        let body_start = doc.messages[0].1.start as u16;
+        let ui = Ui::new(super::super::demo::world());
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(90, body_start)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                ui.pane(frame.buffer_mut(), "header", area, doc.clone(), false);
+            })
+            .unwrap();
+        assert!(
+            ui.visible_messages().is_empty(),
+            "a header is not body consumption"
+        );
+    }
+
+    #[tokio::test]
+    async fn displayed_person_reply_changes_sender_status_without_reading_hidden_mail() {
+        use super::super::view::{Body, Entry};
+        use st3::model::ClaimInput;
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(st3::store::Store::open_memory("person-read").unwrap());
+        for id in ["message/reply", "message/hidden"] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: id.into(),
+                    kind: "message.sent".into(),
+                    actor: Some("agent/example/keeper".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), serde_json::json!("sent")),
+                        ("from".into(), serde_json::json!("agent/example/keeper")),
+                        ("to".into(), serde_json::json!("person/avery")),
+                        ("content".into(), serde_json::json!("Here is the reply.")),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(id.into()),
+                })
+                .unwrap();
+        }
+        let state = st3::api::AppState {
+            store: store.clone(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: tokio::sync::watch::channel(0_u64).0,
+            node: "person-read".into(),
+            state_dir: root.path().into(),
+            pty_root: root.path().join("pty"),
+            pty_binary: root.path().join("unused-pty"),
+            fleet_id: None,
+            configured_peers: vec![],
+            client_relay: None,
+            native_session_home: None,
+            planner_default: st3::model::PlannerSpec::default(),
+        };
+        let socket = root.path().join("daemon.sock");
+        let server_path = socket.clone();
+        let server = tokio::spawn(async move {
+            st3::api::serve_unix(&server_path, st3::api::router(state))
+                .await
+                .unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = Client::unix_as(&socket, "person/avery");
+        client.messages_get("message/reply").await.unwrap();
+        assert_eq!(
+            store.message("message/reply").unwrap().unwrap().status,
+            "sent",
+            "fetching does not acknowledge"
+        );
+        let mail = |id: &str| Entry {
+            id: id.into(),
+            at: "12:00".into(),
+            body: Body::Mail {
+                from: "keeper".into(),
+                to: "you".into(),
+                subject: "Reply".into(),
+                body: "Here is the reply.".into(),
+                delivered: false,
+            },
+        };
+        let mut world = super::super::demo::world();
+        let agent = world.agents.items()[0].clone();
+        let agent_id = agent.id.clone();
+        world.agents = Load::Ready(vec![agent]);
+        world.conversations.insert(
+            agent_id,
+            Load::Ready(vec![
+                mail("message/hidden"),
+                Entry {
+                    id: "filler".into(),
+                    at: "12:00".into(),
+                    body: Body::Assistant("A line of context.\n".repeat(60)),
+                },
+                mail("message/reply"),
+            ]),
+        );
+        let mut ui = Ui::new(world);
+        ui.switch_tab(1);
+        assert!(
+            ui.visible_messages().is_empty(),
+            "cached conversations are not evidence"
+        );
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| ui.render(frame)).unwrap();
+        let shown = ui.visible_messages();
+        assert!(shown.contains("message/reply"));
+        assert!(
+            !shown.contains("message/hidden"),
+            "offscreen mail remains queued"
+        );
+        for id in shown {
+            acknowledge_visible_message(&client, "person/avery", &id)
+                .await
+                .unwrap();
+        }
+        acknowledge_visible_message(&client, "person/avery", "message/reply")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.message("message/reply").unwrap().unwrap().status,
+            "read"
+        );
+        assert_eq!(
+            store.message("message/hidden").unwrap().unwrap().status,
+            "sent"
+        );
+        assert_eq!(
+            store
+                .claims_for("message/reply", Some("message.read"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let status: serde_json::Value = st3::client::Client::unix(&socket)
+            .get("/v1/messages/delivery/message/reply")
+            .await
+            .unwrap();
+        assert_eq!(
+            status["delivery"]["state"], "read",
+            "the sender sees the read receipt"
+        );
+        let attention = client
+            .attention_list(None, Some(50), false)
+            .await
+            .unwrap()
+            .value
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                Resource::Attention(item) if item.source_id == "message/hidden" => {
+                    Some(item.header.id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        crate::attention_action(&client, "person/avery", &attention, "message.read", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.message("message/hidden").unwrap().unwrap().status,
+            "read",
+            "explicit Home mark-read works too"
+        );
+        ui.help = true;
+        terminal.draw(|frame| ui.render(frame)).unwrap();
+        assert!(
+            ui.visible_messages().is_empty(),
+            "covered bodies do not count"
+        );
+        server.abort();
+    }
 
     #[test]
     fn a_conversation_without_its_transcript_is_one_failure_not_half_a_conversation() {
