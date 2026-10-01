@@ -1116,6 +1116,7 @@ impl Ui {
         let mut x = area.x + 1;
         for (glyph, label, key, hit) in [
             ("＋", "New agent", "ctrl+n", Hit::NewAgent),
+            ("⌨", "New terminal", "", Hit::NewTerminal),
             ("⇥", "Split right", "ctrl+v", Hit::Split(true)),
             ("⤓", "Split below", "ctrl+x", Hit::Split(false)),
         ] {

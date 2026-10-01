@@ -3722,6 +3722,7 @@ impl Ui {
             Hit::PaletteChoice(index) => self.open_choice(Some(index), glass::Open::Here),
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
+            Hit::NewTerminal => self.open_new_terminal(),
             Hit::SidebarRow(index) => {
                 if let Some(glasses) = self.glasses.as_mut() {
                     let sidebar = &mut glasses.sidebar;
