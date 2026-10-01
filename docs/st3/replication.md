@@ -55,14 +55,6 @@ same order for existing claim queries. In-memory comparisons use `claim_key` or
 `key_from_record`, and claim-to-claim predicates use `after_sql`. Legacy batch position is its
 relative position within the batch. A global arrival index never chooses a shared winner.
 
-Document version rows retain the earliest canonical binding for repeated name/hash pairs;
-mission revision rows do the same for repeated identical revisions. Document latest flags,
-history order and cursor boundaries use binding claim keys. Complete mailbox readers and
-selected unread reminders use canonical sent-claim keys; bounded mailbox cursors remain local.
-The shuffle fixture compares paged document answers and the existing person attention view,
-including unread messages, reminder selection and episode onset. Proposal lifecycle tests
-compare all shared rows and digests through creation, review, draining, cancellation and apply.
-
 ## Projection digest coverage and cost
 
 `store/projection_digest.rs::TABLES` lists the shared tables: operations, blobs, documents,
@@ -105,7 +97,7 @@ the test inventory and production registry to agree, and the fixture exercises e
 
 `st replication status` prints `table-digest` entries and names differing tables under each
 peer. `st replication diff PEER` and `st doctor` also name them. Table differences are meaningful
-only when inventories agree, projection is current and local committed batches are sealed. Old peers omit `projection_digests`;
+only when inventories agree and projection is current. Old peers omit `projection_digests`;
 exchanges and heals then compare their unchanged six-table compatibility hash. Old peers cannot
 verify full projection coverage. Modern peers compare complete maps. SQLite schema 14 adds the
 transactional digest machinery and rebuilds shared projections once, correcting older stored
