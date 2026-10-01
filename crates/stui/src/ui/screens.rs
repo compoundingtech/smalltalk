@@ -2551,7 +2551,12 @@ pub fn random_name() -> String {
 }
 
 /// `cursors` are where typing goes in the prompt and the name.
-pub fn new_agent_form(form: &AgentForm, hosts: &[String], cursors: [usize; 2], width: usize) -> Doc {
+pub fn new_agent_form(
+    form: &AgentForm,
+    hosts: &[String],
+    cursors: [usize; 2],
+    width: usize,
+) -> Doc {
     let mut inner = Doc::new();
     let w = width.saturating_sub(4);
     inner.blank();
@@ -2599,7 +2604,8 @@ pub fn new_agent_form(form: &AgentForm, hosts: &[String], cursors: [usize; 2], w
         if value.is_empty() && !focused {
             body.line(Line::from(span(hint, theme::dim())));
         } else {
-            for runs in super::edit::lines(value, focused.then_some(cursors[index]), theme::text()) {
+            for runs in super::edit::lines(value, focused.then_some(cursors[index]), theme::text())
+            {
                 body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
             }
         }
