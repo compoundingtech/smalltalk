@@ -3153,6 +3153,7 @@ mod tests {
                 "checkpoint.verified",
                 "daemon.diagnostic",
                 "daemon.started",
+                "delivery.hold",
                 "doc.bound",
                 "eval.verdict",
                 "file.observed",
