@@ -204,7 +204,7 @@ subscription "new-ready-pull-requests" {
     mission "review/pull-request"
     resource "pull-request"
     workspace "/work/pull-request-reviews"
-    requester "agent/fleet/repository/standing/owner"
+    requester "agent/example/repository/standing/owner"
   }
 }
 ```
@@ -226,24 +226,33 @@ request with a reason naming the authoring run.
 The first listing that records a repository ID is a baseline for its collections. Earlier facts
 came from a first-page read, so the older items it adds were missed, not opened.
 
-One observation requests at most five mission runs for one subscription. It records the rest as
-held requests and asks `person/operator` once to decide them. A person lists, releases, or cancels
-requests:
+Every new item gets a durable mission request. Requests wait in observation order and start as
+capacity becomes available under the mission's `concurrent-runs` limit. The run's gates govern
+execution after it starts. A capacity retry keeps its place ahead of newer requests; the daemon
+retries automatically with bounded backoff. No burst size asks a person to release requests.
+
+The queue is visible with:
 
 ```sh
 st missions requests subscription/NAME
-st missions release REQUEST --as person/operator --reason "the review is needed"
-st missions cancel-request REQUEST --as person/operator --reason "an old issue resurfaced"
 ```
 
-A released request starts like any pending request. A cancelled request never starts.
+It shows open requests as `pending`, oldest first. A person can cancel a request with
+`st missions cancel-request REQUEST --as person/operator --reason "the work is no longer needed"`.
+A cancelled request never starts.
+
+On upgrade, the reconciler automatically moves existing held requests into this queue. It cancels
+requests for superseded heads, closed or merged pull requests, or pull requests back in draft,
+with a reason. Current requests start as capacity allows. Stored attention items from the old
+five-request cap close automatically, including while the queue is waiting for capacity.
+`st missions release` remains available for legacy held requests; automatic intake does not need it.
 
 An optional `requester` assigns run revision authority to one exact agent or person. The requester still needs matching mission authority, from its `mission-authority` rules or the default of a person-declared `fleet/PROJECT/...` seat.
 
 A draft pull request does not create a resource. Its first ready observation creates one resource and one mission request.
 
-A pull request review request that has not started, including one waiting for capacity or held for
-a person, starts only while its head is the open pull request's current head. When the pull request
+A pull request review request that has not started, including a legacy hold or one waiting for
+capacity, starts only while its head is the open pull request's current head. When the pull request
 resource shows it closed, back in draft, or at a newer head, the reconciler records
 `subscription.mission-request-cancelled` with the reason instead of starting it. The newer head has
 its own request.
@@ -282,7 +291,7 @@ subscription "green" {
       field "conclusion" "is" "success"
     }
   }
-  to "agent/fleet/cos/standing/cos"
+  to "agent/example/cos/standing/cos"
   delivery "message"
 }
 ```
@@ -338,7 +347,10 @@ mission cancellation to stop it.
 - Each new repository collection item creates one resource and one mission request; a new ready PR
   head creates one more, and an unchanged head or issue does not replay across intake restarts.
 - A renamed locator and a first complete listing create no mission request.
-- One observation holds each request beyond its first five for a person.
+- A burst of twenty new items queues every request and starts all twenty in order as mission capacity allows.
+- New requests cannot pass an older request waiting on a capacity retry.
+- Legacy held requests migrate automatically; current requests start and stale requests cancel with a reason.
+- Stored held-request attention closes even while the queue waits for capacity.
 - A draft-to-ready transition creates one pull request resource and one mission request.
 - Pull requests from the GitHub issues endpoint do not create issue resources.
 - An unselected field change creates an observation claim and no message for that subscription.

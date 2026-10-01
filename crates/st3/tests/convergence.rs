@@ -13,7 +13,8 @@
 //! checkpoint work until nothing moves. Then every node must hold:
 //!
 //! 1. the same authority digest, among nodes that take part in checkpoints;
-//! 2. the oracle's graph digest;
+//! 2. the oracle's complete projection digests on modern nodes; old builds compare their legacy
+//!    hash and shared business tables, since they cannot retain dropped source/operation facts;
 //! 3. the oracle's reader answers, for every subject;
 //! 4. every claim of a kind no rule drops, and every person's claim, with the oracle's body;
 //! 5. the same trimmed checkpoint and the same tombstones, field by field, and tombstones
@@ -310,9 +311,12 @@ impl World {
     fn tap(&mut self, index: usize) {
         for _ in 0..50 {
             let node = &self.nodes[index].store;
-            let exchange = node
+            let mut exchange = node
                 .export_replication_exchange(FLEET, &self.oracle.replication_inventory().unwrap())
                 .unwrap();
+            if self.nodes[index].old_build {
+                exchange.projection_digests.clear();
+            }
             if exchange.envelopes.is_empty() {
                 return;
             }
@@ -343,6 +347,9 @@ impl World {
             .store
             .export_replication_exchange(FLEET, &inventory)
             .unwrap();
+        if self.nodes[from].old_build {
+            exchange.projection_digests.clear();
+        }
         if !whole && !exchange.envelopes.is_empty() {
             self.rng.shuffle(&mut exchange.envelopes);
             let keep = 1 + self.rng.below(exchange.envelopes.len());
@@ -1175,8 +1182,37 @@ impl World {
                     own.invalid_records, own.pending_records
                 ));
             }
-            if own.graph_digest != oracle.graph_digest {
-                failures.push(format!("{name}: graph digest differs from the oracle's"));
+            if node.old_build {
+                let legacy = store
+                    .export_replication_summary(FLEET)
+                    .unwrap()
+                    .graph_digest;
+                let oracle_legacy = self
+                    .oracle
+                    .export_replication_summary(FLEET)
+                    .unwrap()
+                    .graph_digest;
+                if legacy != oracle_legacy {
+                    failures.push(format!(
+                        "{name}: legacy graph digest differs from the oracle's"
+                    ));
+                }
+            } else if own.graph_digest != oracle.graph_digest {
+                failures.push(format!(
+                    "{name}: complete graph digest differs from the oracle's"
+                ));
+            }
+            for (table, digest) in &oracle.projection_digests {
+                // An old build may lack facts dropped while it was excused, and cannot adopt
+                // their tombstones. Modern nodes compare every table, including those facts.
+                if node.old_build && matches!(table.as_str(), "claim_sources" | "operations") {
+                    continue;
+                }
+                if own.projection_digests.get(table) != Some(digest) {
+                    failures.push(format!(
+                        "{name}: shared table {table} differs from the oracle's"
+                    ));
+                }
             }
             let answers = store.checkpoint_reader_answers(&subjects, now).unwrap();
             for (subject, answer) in &oracle_answers {

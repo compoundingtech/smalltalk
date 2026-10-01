@@ -413,15 +413,22 @@ fn subject_references(
             let Some(schedule) = crate::graph::schedule_spec(&desired.desired, host) else {
                 return Ok(());
             };
-            if let Some(work) = schedule.work.filter(|_| !schedule.stopped)
-                && scope
-                    .revision(graph, &work.mission, &work.revision)?
-                    .is_none()
-            {
-                refusals.push(format!(
-                    "{owner}schedule `{subject}` runs a mission that is not stored: {}",
-                    graph.missing_revision(&work.mission, &work.revision)?
-                ));
+            if let Some(work) = schedule.work.filter(|_| !schedule.stopped) {
+                match work.revision.as_deref() {
+                    Some(revision) if scope.revision(graph, &work.mission, revision)?.is_none() => {
+                        refusals.push(format!(
+                            "{owner}schedule `{subject}` runs a mission that is not stored: {}",
+                            graph.missing_revision(&work.mission, revision)?
+                        ));
+                    }
+                    None if !scope.mission(graph, &work.mission)? => {
+                        refusals.push(format!(
+                            "{owner}schedule `{subject}` references unpublished mission `mission/{}`",
+                            work.mission
+                        ));
+                    }
+                    _ => {}
+                }
             }
         }
         _ => {}
@@ -485,19 +492,43 @@ mission "watch" state="ready" {{
     }
 
     #[test]
+    fn unpinned_schedule_refuses_unknown_mission_at_publish() {
+        let store = Store::open_memory("node").unwrap();
+        let source = watch(
+            r#"schedule "cycle" {
+  every "6h"
+  anchor "2026-01-01T00:00:00Z"
+  work { mission "unknown"; workspace "/tmp/cycles" }
+}"#,
+        );
+        assert_eq!(
+            refusals(&store, &source),
+            [
+                "mission `mission/watch` declares schedule `schedule/${ST_MISSION_RUN}/cycle` references unpublished mission `mission/unknown`"
+            ]
+        );
+        for state in ["draft", "ready", "retired"] {
+            let declared = format!(
+                "{source}\nmission \"unknown\" state=\"{state}\" {{ goal \"Cycle.\"; step \"work\" {{ agentless }} }}"
+            );
+            assert!(refusals(&store, &declared).is_empty());
+        }
+    }
+
+    #[test]
     fn a_step_selecting_an_agent_nothing_declares_is_refused() {
         let store = Store::open_memory("node").unwrap();
         let missing = r#"version 2
 mission "work" state="ready" {
   goal "Complete the work."
-  step "do-work" { assigned-to "agent/fleet/nobody" }
+  step "do-work" { assigned-to "agent/example/nobody" }
 }"#;
         assert_eq!(
             refusals(&store, missing),
-            ["mission `mission/work` references missing eligible agent `agent/fleet/nobody`"]
+            ["mission `mission/work` references missing eligible agent `agent/example/nobody`"]
         );
         let declared =
-            format!("{missing}\nagent \"fleet/nobody\" {{ workspace \"/tmp\"; command \"true\" }}");
+            format!("{missing}\nagent \"example/nobody\" {{ workspace \"/tmp\"; command \"true\" }}");
         assert_eq!(refusals(&store, &declared), Vec::<String>::new());
     }
 
@@ -581,11 +612,11 @@ mission "parent" state="ready" {{
     const SUBSCRIPTION: &str = r#"subscription "changed" {
   observer "observer/status"
   on "status"
-  to "agent/fleet/watcher"
+  to "agent/example/watcher"
   delivery "message"
 }"#;
 
-    const WATCHER: &str = r#"agent "fleet/watcher" { workspace "/tmp"; command "true" }"#;
+    const WATCHER: &str = r#"agent "example/watcher" { workspace "/tmp"; command "true" }"#;
 
     #[test]
     fn a_subscription_to_a_missing_observer_or_mission_is_refused() {
@@ -599,7 +630,7 @@ mission "parent" state="ready" {{
         assert_eq!(
             refusals(&store, &watch(&format!("{SUBSCRIPTION}\n{OBSERVER}"))),
             [
-                "mission `mission/watch` declares subscription `subscription/${ST_MISSION_RUN}/changed` has missing delivery target `agent/fleet/watcher`"
+                "mission `mission/watch` declares subscription `subscription/${ST_MISSION_RUN}/changed` has missing delivery target `agent/example/watcher`"
             ]
         );
         assert_eq!(
@@ -654,7 +685,7 @@ mission "parent" state="ready" {{
         assert_eq!(
             store.unresolved_graph_references().unwrap(),
             [
-                "mission `mission/watch` declares subscription `subscription/${ST_MISSION_RUN}/changed` has missing delivery target `agent/fleet/watcher`".to_owned(),
+                "mission `mission/watch` declares subscription `subscription/${ST_MISSION_RUN}/changed` has missing delivery target `agent/example/watcher`".to_owned(),
                 format!(
                     "step `cycle` of mission `mission/parent` uses a mission that is not stored: mission `mission/cycle@{UNSTORED}` is not stored on this host"
                 ),

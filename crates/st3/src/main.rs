@@ -858,8 +858,9 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                     "PEER  {}  {}{}",
                     peer.peer,
                     peer.status,
-                    peer.last_error
+                    peer.refusal_reason
                         .as_deref()
+                        .or(peer.last_error.as_deref())
                         .map(|error| format!("  {error}"))
                         .unwrap_or_default()
                 );
@@ -1547,14 +1548,14 @@ enum MissionViewCommand {
         /// Exact seat subject or its identity without the `agent/` prefix.
         agent: String,
     },
-    /// List the open mission requests that one subscription recorded.
+    /// Show one subscription's automatic mission request queue.
     Requests {
         subscription: String,
         /// Include started, cancelled, and failed requests.
         #[arg(long)]
         all: bool,
     },
-    /// Start one mission request that an observation held for a person.
+    /// Release a legacy held request; new requests are queued automatically.
     Release(SubscriptionRequestArgs),
     /// Close one pending or held mission request without starting it.
     CancelRequest(SubscriptionRequestArgs),
@@ -3222,7 +3223,7 @@ async fn run(cli: Cli) -> Result<()> {
         .or_else(|| std::env::var("ST3_ENDPOINT").ok())
         .as_deref()
         .map(Endpoint::parse)
-        .unwrap_or_else(|| Endpoint::Unix(config.socket.clone()));
+        .unwrap_or_else(|| Endpoint::Unix(config.client_socket()));
     let _ = DAEMON_WAIT.set(Duration::from_secs(cli.daemon_wait));
     let client = cli_client(&endpoint);
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
@@ -3510,7 +3511,63 @@ fn raise_open_file_limit() {
     }
 }
 
+fn select_private_gateway(config: &mut Config, private_state: bool, private_socket: bool) {
+    if !(private_state || private_socket) {
+        return;
+    }
+    let defaults = Config::default();
+    if config.state_dir == defaults.state_dir && config.socket == defaults.socket {
+        return;
+    }
+    let parent = if private_socket {
+        config
+            .socket
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+    } else {
+        Some(config.state_dir.as_path())
+    };
+    config.client_gateway_socket = parent
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("st3-client.sock");
+}
+
+#[cfg(test)]
+mod private_gateway_tests {
+    use super::*;
+
+    #[test]
+    fn private_state_and_socket_derive_a_private_gateway() {
+        let mut config = Config::default();
+        let default_gateway = config.client_gateway_socket.clone();
+        config.state_dir = "/tmp/private-state".into();
+        select_private_gateway(&mut config, true, false);
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-state/st3-client.sock")
+        );
+        config.socket = "/tmp/private-socket/api.sock".into();
+        select_private_gateway(&mut config, true, true);
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-socket/st3-client.sock")
+        );
+        assert_ne!(config.client_gateway_socket, default_gateway);
+    }
+
+    #[test]
+    fn default_daemon_keeps_its_default_gateway() {
+        let mut config = Config::default();
+        let gateway = config.client_gateway_socket.clone();
+        select_private_gateway(&mut config, false, false);
+        assert_eq!(config.client_gateway_socket, gateway);
+    }
+}
+
 async fn run_up(args: UpArgs) -> Result<()> {
+    let private_state = args.state_dir.is_some();
+    let private_socket = args.socket.is_some();
+    let explicit_gateway = args.client_gateway_socket.is_some();
     let mut config = Config::load_unvalidated(args.config.as_deref())?;
     if let Some(node) = args.node {
         config.node = node;
@@ -3526,6 +3583,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     if let Some(socket) = args.client_gateway_socket {
         config.client_gateway_socket = socket;
+    }
+    if !explicit_gateway {
+        select_private_gateway(&mut config, private_state, private_socket);
     }
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);
@@ -3711,13 +3771,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.client_gateway_socket.display()
     );
     let local_socket = config.socket.clone();
+    let state_socket = config.state_dir.join("run/st3.sock");
     let client_gateway_socket = config.client_gateway_socket.clone();
     // The first diagnostic report reads the whole claim log; no read waits for it.
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
     tokio::try_join!(
-        st3::api::serve_unix_bound(&local_socket, router(state.clone())),
+        st3::api::serve_unix_bound(&local_socket, &state_socket, router(state.clone())),
         serve_unix(&client_gateway_socket, fabric_router(state)),
     )?;
     Ok(())
@@ -6979,8 +7040,18 @@ fn render_replication_peers(
             "peer\t{}\t{}\t{}",
             peer.peer,
             peer.status,
-            peer.last_error.as_deref().unwrap_or("")
+            peer.refusal_reason
+                .as_deref()
+                .or(peer.last_error.as_deref())
+                .unwrap_or("")
         );
+        if !peer.differing_tables.is_empty() {
+            let _ = writeln!(
+                output,
+                "  shared tables differ: {}",
+                peer.differing_tables.join(", ")
+            );
+        }
         if let Some(at) = peer.last_success_at_unix_ms {
             let _ = writeln!(output, "  last seen {}", relative_time(at, now));
         } else {
@@ -6997,12 +7068,19 @@ fn render_replication_peers(
             .graph_compared_at_unix_ms
             .map(|at| relative_time(at, now))
             .unwrap_or_else(|| "never".into());
-        let digests = format!(
-            "this node {}, {} {}",
-            short_digest(local_graph_digest),
-            peer.peer,
-            short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
-        );
+        let digests = if peer.projection_digests.is_empty() {
+            format!(
+                "legacy peer digest {}; full projection coverage unavailable",
+                short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
+            )
+        } else {
+            format!(
+                "this node {}, {} {}",
+                short_digest(local_graph_digest),
+                peer.peer,
+                short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
+            )
+        };
         if let Some(since) = sync.graph_differs_since_unix_ms {
             let _ = writeln!(
                 output,
@@ -7096,6 +7174,9 @@ async fn run_replication(
             );
             println!("authority-digest\t{}", status.authority_digest);
             println!("graph-digest\t{}", status.graph_digest);
+            for (table, digest) in &status.projection_digests {
+                println!("table-digest\t{table}\t{digest}");
+            }
             println!("envelopes\t{}", status.received_envelopes);
             println!(
                 "records\tvalid={} pending={} unknown={} invalid={} repaired={} checkpointed={}",
@@ -7214,16 +7295,21 @@ async fn run_replication(
                     "remote": remote.authority_digest,
                     "equal": remote.authority_digest.as_deref() == Some(status.authority_digest.as_str()),
                 },
+                "differing_tables": remote.differing_tables,
                 "graph": {
                     "local": status.graph_digest,
                     "remote": remote.graph_digest,
-                    "equal": remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()),
+                    "equal": if remote.projection_digests.is_empty() { None } else { Some(remote.graph_digest.as_deref() == Some(status.graph_digest.as_str())) },
+                    "coverage": if remote.projection_digests.is_empty() { "legacy-only" } else { "all-shared-projections" },
                 },
             });
             if json_output {
                 return print_value(&value, true);
             }
             println!("peer\t{}\t{}", peer, remote.status);
+            if !remote.differing_tables.is_empty() {
+                println!("different-tables\t{}", remote.differing_tables.join(", "));
+            }
             println!(
                 "authority\t{}\t{}\t{}",
                 if remote.authority_digest.as_deref() == Some(status.authority_digest.as_str()) {
@@ -7236,7 +7322,9 @@ async fn run_replication(
             );
             println!(
                 "graph\t{}\t{}\t{}",
-                if remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()) {
+                if remote.projection_digests.is_empty() {
+                    "unverified (legacy peer)"
+                } else if remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()) {
                     "equal"
                 } else {
                     "different"
@@ -14298,10 +14386,13 @@ mod tests {
 
     fn peer_status(peer: &str, digest: Option<&str>) -> st3::model::ReplicationPeerStatus {
         st3::model::ReplicationPeerStatus {
+            projection_digests: Default::default(),
+            differing_tables: Vec::new(),
             peer: peer.into(),
             status: "up".into(),
             last_success_at_unix_ms: None,
             last_error: None,
+            refusal_reason: None,
             schema_digest: None,
             authority_digest: digest.map(str::to_owned),
             graph_digest: None,
@@ -14665,7 +14756,7 @@ mod tests {
     fn agent_card_shows_mission_authority_and_its_source() {
         let card = |authority: serde_json::Value| {
             let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
-                "kind": "agent", "id": "agent/fleet/website/standing/website", "revision": "one",
+                "kind": "agent", "id": "agent/example/website/standing/website", "revision": "one",
                 "updated_at": "2026-09-29T12:00:00Z", "name": "Website",
                 "state": "running", "reachability": "local", "runtime_ids": [],
                 "mission_authority": authority
@@ -14784,7 +14875,7 @@ mod tests {
     #[test]
     fn agent_queue_view_lists_the_claim_then_runs_in_order_and_moves() {
         let queue: st3_client::AgentQueue = serde_json::from_value(serde_json::json!({
-            "kind": "agent-queue", "agent_id": "agent/fleet/worker",
+            "kind": "agent-queue", "agent_id": "agent/example/worker",
             "current_work_ids": ["step-run/held/build"],
             "next_work_id": "step-run/second/review",
             "runs": [
@@ -14819,7 +14910,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             render_agent_queue(&queue),
-            "AGENT QUEUE  agent/fleet/worker\n\
+            "AGENT QUEUE  agent/example/worker\n\
              CURRENT      step-run/held/build\n\
              NEXT WORK    step-run/second/review\n\
              RUNS         3\n  \
@@ -15352,16 +15443,40 @@ mod tests {
     }
 
     #[test]
+    fn replication_status_names_shared_table_differences() {
+        let mut peer = peer_status("alder", None);
+        peer.projection_digests
+            .insert("planning_sessions".into(), "different".into());
+        peer.differing_tables = vec!["documents".into(), "planning_sessions".into()];
+        let rendered = render_replication_peers(&[peer], "local", 0);
+        assert!(rendered.contains("shared tables differ: documents, planning_sessions"));
+    }
+
+    #[test]
+    fn replication_status_renders_the_fabric_grant_reason() {
+        let mut peer = peer_status("cobalt", None);
+        peer.status = "refused".into();
+        peer.refusal_reason =
+            Some("refused by that member's Fabric grants (service st3-peer-v1)".into());
+        let output = render_replication_peers(&[peer], "local", 2000);
+        assert!(output.contains("peer\tcobalt\trefused\trefused by that member's Fabric grants"));
+        assert!(!output.contains("down"));
+    }
+
+    #[test]
     fn replication_status_says_which_side_holds_what_and_how_long_catching_up_takes() {
         let now = 1_000_000;
         let local = "1111111111111111aaaa";
         let peer =
             |name: &str, graph: Option<&str>, sync: Option<st3::model::ReplicationPeerSync>| {
                 ReplicationPeerStatus {
+                    projection_digests: BTreeMap::from([("claim_sources".into(), "sample".into())]),
+                    differing_tables: Vec::new(),
                     peer: name.into(),
                     status: "up".into(),
                     last_success_at_unix_ms: Some(now - 2_000),
                     last_error: None,
+                    refusal_reason: None,
                     schema_digest: None,
                     authority_digest: None,
                     graph_digest: graph.map(str::to_owned),
@@ -15380,7 +15495,7 @@ mod tests {
         let output = render_replication_peers(
             &[
                 peer(
-                    "Silber",
+                    "ExampleMac",
                     Some("3333333333333333"),
                     Some(st3::model::ReplicationPeerSync {
                         peer_only_envelopes: 124_384,
@@ -15418,12 +15533,12 @@ mod tests {
             output,
             "sync\tdiverged: Laptop holds the same envelopes but projects a different graph, \
              since 3m ago\n\
-             sync\tcatching up: Silber has 124,384 envelopes this node lacks, \
+             sync\tcatching up: ExampleMac has 124,384 envelopes this node lacks, \
              caught up in about 15m\n\
-             peer\tSilber\tup\t\n\
+             peer\tExampleMac\tup\t\n\
              \x20 last seen 2s ago\n\
-             \x20 Silber has 124,384 envelopes this node lacks\n\
-             \x20 this node has 3 envelopes Silber lacks\n\
+             \x20 ExampleMac has 124,384 envelopes this node lacks\n\
+             \x20 this node has 3 envelopes ExampleMac lacks\n\
              \x20 receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)\n\
              peer\tQuiet\tup\t\n\
              \x20 last seen 2s ago\n\
@@ -15454,7 +15569,7 @@ mod tests {
         page.sync = Some(st3_client::SyncNotice {
             state: "catching-up".into(),
             peers: vec![st3_client::SyncPeer {
-                host_id: "host/Silber".into(),
+                host_id: "host/ExampleMac".into(),
                 peer_only_envelopes: 1,
                 local_only_envelopes: 0,
                 last_exchange_at: Some("1970-01-01T00:16:38Z".into()),
@@ -15462,10 +15577,10 @@ mod tests {
                 diverged_since: None,
             }],
         });
-        let output = render_now_page(&page, "st3 now --as person/nathan");
+        let output = render_now_page(&page, "st3 now --as person/alex");
         assert!(
             output.starts_with(
-                "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+                "SYNCING  ExampleMac has 1 envelope this host lacks · estimating time to catch up · \
                  last exchange "
             ),
             "{output}"
@@ -15476,7 +15591,7 @@ mod tests {
         );
         assert_eq!(
             render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
-            "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+            "SYNCING  ExampleMac has 1 envelope this host lacks · estimating time to catch up · \
              last exchange 2s ago\n  Until then, items below can be out of date. \
              Progress: st3 replication status\n\n"
         );
@@ -15492,7 +15607,7 @@ mod tests {
         sync.peers[0].diverged_since = Some("1970-01-01T00:13:40Z".into());
         assert_eq!(
             render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
-            "DIVERGED  Silber projects a different graph from the same envelopes · since 3m ago\n\
+            "DIVERGED  ExampleMac projects a different graph from the same envelopes · since 3m ago\n\
              \x20 Exchanges cannot fix this, so items below can be wrong. \
              Details: st3 replication status\n\n"
         );
@@ -15577,7 +15692,7 @@ mod tests {
         });
         let rendered = render_product_page("NOW", &page, "st now");
         assert!(
-            rendered.contains("  requester retired: only person/nathan can close it\n"),
+            rendered.contains("  requester retired: only person/alex can close it\n"),
             "{rendered}"
         );
     }
@@ -15605,7 +15720,7 @@ mod tests {
             concat!(
                 "NOW  3\n",
                 "attention/release-review  attention  high  open  Review release\n",
-                "  action: st attention show launch/release --as person/nathan\n",
+                "  action: st attention show launch/release --as person/alex\n",
                 "work/release/1/build  work  claimed  build  attempt 1\n",
                 "  assigned: agent/release\n",
                 "  action: st work show work/release/1/build\n",
@@ -15619,7 +15734,7 @@ mod tests {
     fn now_page_without_work_does_not_claim_zero_working() {
         let attention_only = render_now_page(
             &fixture_product_page(&["attention"], false),
-            "st now --as person/nathan",
+            "st now --as person/alex",
         );
         assert!(
             attention_only.starts_with("NEEDS YOU  1\n"),
@@ -15634,7 +15749,7 @@ mod tests {
 
         let with_work = render_now_page(
             &fixture_product_page(&["attention", "work"], false),
-            "st now --as person/nathan --owner-run mission-run/release/1",
+            "st now --as person/alex --owner-run mission-run/release/1",
         );
         assert!(with_work.contains("\nWORKING  1\n"), "{with_work}");
         assert!(!with_work.contains("UNHEALTHY"), "{with_work}");
@@ -15696,20 +15811,20 @@ mod tests {
     #[test]
     fn an_empty_mailbox_prints_a_heading_and_no_current_items() {
         assert_eq!(
-            render_mailbox("person/nathan", None, false, &[]),
-            "MESSAGES  0\nFILTERS  mailbox=person/nathan\nNo current items.\n"
+            render_mailbox("person/alex", None, false, &[]),
+            "MESSAGES  0\nFILTERS  mailbox=person/alex\nNo current items.\n"
         );
         assert_eq!(
             render_mailbox(
                 "agent/worker",
-                Some("person/nathan"),
+                Some("person/alex"),
                 true,
-                &["message/one\tread\tperson/nathan\tHello".into()]
+                &["message/one\tread\tperson/alex\tHello".into()]
             ),
             concat!(
                 "MESSAGES  1\n",
-                "FILTERS  mailbox=agent/worker · from=person/nathan · archived=included\n",
-                "message/one\tread\tperson/nathan\tHello\n",
+                "FILTERS  mailbox=agent/worker · from=person/alex · archived=included\n",
+                "message/one\tread\tperson/alex\tHello\n",
             )
         );
     }
@@ -15824,11 +15939,11 @@ mod tests {
         );
         assert_eq!(
             contract["purposes"]["attention"]["human_example"],
-            "st attention ls --as person/nathan"
+            "st attention ls --as person/alex"
         );
         assert_eq!(
             contract["purposes"]["attention"]["json_example"],
-            "st attention ls --as person/nathan --json"
+            "st attention ls --as person/alex --json"
         );
     }
 
@@ -15855,12 +15970,12 @@ mod tests {
             render_product_page(
                 "DEVICES",
                 &fixture_product_page(&["device"], false),
-                "st devices --as person/nathan"
+                "st devices --as person/alex"
             ),
             concat!(
                 "DEVICES  1\n",
-                "device/ios-release  active  person/nathan/session/ios-release  scopes 4\n",
-                "  action: st devices --as person/nathan revoke device/ios-release\n",
+                "device/ios-release  active  person/alex/session/ios-release  scopes 4\n",
+                "  action: st devices --as person/alex revoke device/ios-release\n",
             )
         );
     }
@@ -15901,7 +16016,7 @@ mod tests {
             "st3",
             "terminals",
             "attach",
-            "agent/fleet/app-web/standing/app-web",
+            "agent/example/app-web/standing/app-web",
         ])
         .unwrap();
         let Command::Terminals {
@@ -15910,7 +16025,7 @@ mod tests {
         else {
             panic!("the PTY attach command did not parse");
         };
-        assert_eq!(args.subject, "agent/fleet/app-web/standing/app-web");
+        assert_eq!(args.subject, "agent/example/app-web/standing/app-web");
         assert!(!args.force);
     }
 
@@ -15933,9 +16048,9 @@ mod tests {
             "--json",
             "terminals",
             "screen",
-            "terminal/agent/fleet/app-web/standing/app-web",
+            "terminal/agent/example/app-web/standing/app-web",
             "--as",
-            "person/nathan",
+            "person/alex",
         ])
         .unwrap();
         assert!(cli.json);
@@ -15947,9 +16062,9 @@ mod tests {
         };
         assert_eq!(
             args.subject,
-            "terminal/agent/fleet/app-web/standing/app-web"
+            "terminal/agent/example/app-web/standing/app-web"
         );
-        assert_eq!(args.person.as_deref(), Some("person/nathan"));
+        assert_eq!(args.person.as_deref(), Some("person/alex"));
     }
 
     #[test]
@@ -15970,7 +16085,7 @@ mod tests {
             "st3",
             "terminals",
             "attach-info",
-            "terminal/agent/fleet/app-web/standing/app-web",
+            "terminal/agent/example/app-web/standing/app-web",
         ])
         .unwrap();
         assert!(matches!(
@@ -15984,7 +16099,7 @@ mod tests {
             "st3",
             "terminals",
             "stream",
-            "terminal/agent/fleet/app-web/standing/app-web",
+            "terminal/agent/example/app-web/standing/app-web",
             "--capability",
             "test-capability",
             "--incarnation",
@@ -16006,7 +16121,7 @@ mod tests {
             "st3",
             "terminals",
             "input-client",
-            "terminal/agent/fleet/app-web/standing/app-web",
+            "terminal/agent/example/app-web/standing/app-web",
             "hello",
             "--key",
         ])
@@ -16078,7 +16193,7 @@ mod tests {
             "st3",
             "terminals",
             "attach",
-            "agent/fleet/app-web/standing/app-web",
+            "agent/example/app-web/standing/app-web",
             "--force",
         ])
         .unwrap();
@@ -16236,7 +16351,7 @@ mod tests {
             "publish",
             "missions/typecase.kdl",
             "--as",
-            "agent/fleet/cos/standing/cos",
+            "agent/example/cos/standing/cos",
         ])
         .unwrap();
         let Command::Missions {
@@ -16246,7 +16361,7 @@ mod tests {
             panic!("the mission publish command did not parse");
         };
         assert_eq!(args.file, PathBuf::from("missions/typecase.kdl"));
-        assert_eq!(args.actor, "agent/fleet/cos/standing/cos");
+        assert_eq!(args.actor, "agent/example/cos/standing/cos");
         assert!(
             Cli::try_parse_from([
                 "st3",
@@ -16270,7 +16385,7 @@ mod tests {
             "--reason",
             "the run was superseded",
             "--as",
-            "person/nathan",
+            "person/alex",
         ])
         .unwrap();
         let Command::Missions {
@@ -16281,7 +16396,7 @@ mod tests {
         };
         assert_eq!(args.mission_run, "mission-run/release/demo");
         assert_eq!(args.reason, "the run was superseded");
-        assert_eq!(args.actor, "person/nathan");
+        assert_eq!(args.actor, "person/alex");
     }
 
     #[test]
@@ -16775,13 +16890,13 @@ mod tests {
             "st3",
             "agents",
             "start",
-            "fleet/cos/standing/cos",
+            "example/cos/standing/cos",
             "--harness",
             "claude",
             "--model",
             "opus",
             "--as",
-            "person/nathan",
+            "person/alex",
             "--print-kdl",
         ])
         .unwrap();
@@ -16793,9 +16908,9 @@ mod tests {
         };
         let kdl = agent_start_document(&args).unwrap();
         let intent = st3::parse_intent(&kdl, "node").unwrap();
-        assert!(intent.subjects.contains_key("agent/fleet/cos/standing/cos"));
+        assert!(intent.subjects.contains_key("agent/example/cos/standing/cos"));
         assert!(
-            intent.subjects["agent/fleet/cos/standing/cos"]
+            intent.subjects["agent/example/cos/standing/cos"]
                 .owner_run
                 .is_none()
         );
@@ -16804,9 +16919,9 @@ mod tests {
             "st3",
             "agents",
             "stop",
-            "fleet/cos/standing/cos",
+            "example/cos/standing/cos",
             "--as",
-            "person/nathan",
+            "person/alex",
             "--print-kdl",
         ])
         .unwrap();
@@ -16849,14 +16964,14 @@ mod tests {
             "--attach",
         ]);
         assert!(args.attach && args.actor.is_none() && args.workspace.is_none());
-        let kdl = agent_new_document(&args, "/home/avery/st/agents/site", true);
-        assert!(kdl.contains(r#"workspace "/home/avery/st/agents/site" create=#true"#));
+        let kdl = agent_new_document(&args, "/home/example/st/agents/site", true);
+        assert!(kdl.contains(r#"workspace "/home/example/st/agents/site" create=#true"#));
         let intent = st3::parse_intent(&kdl, "laptop").unwrap();
         let seat = &intent.subjects["agent/builder.site"];
         assert!(seat.owner_run.is_none());
         let member = seat.member.as_ref().unwrap();
         assert_eq!(member.host, "builder");
-        assert_eq!(member.workspace, "/home/avery/st/agents/site");
+        assert_eq!(member.workspace, "/home/example/st/agents/site");
         assert!(member.workspace_create);
         assert_eq!(member.driver.as_deref(), Some("claude"));
         assert_eq!(member.restart, st3::model::RestartType::Always);
@@ -16893,7 +17008,7 @@ mod tests {
     #[test]
     fn a_new_codex_agent_is_the_fleet_codex_seat() {
         let args = agent_new_args(&[
-            "fleet/example/codex",
+            "example/codex",
             "--harness",
             "codex",
             "--model",
@@ -16911,7 +17026,7 @@ mod tests {
         assert!(!kdl.contains("create="));
         assert!(!kdl.contains("host "));
         let intent = st3::parse_intent(&kdl, "laptop").unwrap();
-        let member = intent.subjects["agent/fleet/example/codex"]
+        let member = intent.subjects["agent/example/codex"]
             .member
             .as_ref()
             .unwrap();
@@ -17013,9 +17128,9 @@ mod tests {
         }
 
         for argv in [
-            vec!["st3", "attention", "ls", "--as", "nathan"],
-            vec!["st3", "devices", "--as", "nathan"],
-            vec!["st3", "import", "run", "session/demo", "--as", "nathan"],
+            vec!["st3", "attention", "ls", "--as", "alex"],
+            vec!["st3", "devices", "--as", "alex"],
+            vec!["st3", "import", "run", "session/demo", "--as", "alex"],
         ] {
             assert!(
                 Cli::try_parse_from(&argv).is_err(),
@@ -17027,7 +17142,7 @@ mod tests {
     #[test]
     fn full_control_device_pairing_is_an_explicit_cli_choice() {
         let limited =
-            Cli::try_parse_from(["st3", "devices", "--as", "person/nathan", "pair", "iPhone"])
+            Cli::try_parse_from(["st3", "devices", "--as", "person/alex", "pair", "iPhone"])
                 .unwrap();
         let Command::Devices(DevicesArgs {
             command: Some(DevicesCommand::Pair { full_control, .. }),
@@ -17042,7 +17157,7 @@ mod tests {
             "st3",
             "devices",
             "--as",
-            "person/nathan",
+            "person/alex",
             "pair",
             "--full-control",
             "iPhone",
@@ -17205,14 +17320,14 @@ mission "review" state="ready" {
     #[test]
     fn review_commands_parse_a_filter_and_an_owner_target() {
         let list =
-            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/nathan"]).unwrap();
+            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/alex"]).unwrap();
         let Command::Attention {
             command: AttentionCommand::Ls { actor, .. },
         } = list.command
         else {
             panic!("the review list command did not parse");
         };
-        assert_eq!(actor.as_deref(), Some("person/nathan"));
+        assert_eq!(actor.as_deref(), Some("person/alex"));
 
         let approve = Cli::try_parse_from([
             "st3",
@@ -17220,7 +17335,7 @@ mission "review" state="ready" {
             "approve",
             "mission-run/release/one",
             "--as",
-            "person/nathan",
+            "person/alex",
         ])
         .unwrap();
         let Command::Attention {
@@ -17235,21 +17350,21 @@ mission "review" state="ready" {
     #[test]
     fn attention_commands_parse_list_request_and_resolution() {
         let list =
-            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/nathan"]).unwrap();
+            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/alex"]).unwrap();
         let Command::Attention {
             command: AttentionCommand::Ls { actor, .. },
         } = list.command
         else {
             panic!("the attention list command did not parse");
         };
-        assert_eq!(actor.as_deref(), Some("person/nathan"));
+        assert_eq!(actor.as_deref(), Some("person/alex"));
 
         let request = Cli::try_parse_from([
             "st3",
             "attention",
             "request",
             "--for",
-            "person/nathan",
+            "person/alex",
             "--title",
             "Fabric needs review",
             "--reason",
@@ -17277,7 +17392,7 @@ mission "review" state="ready" {
             "attention",
             "request",
             "--for",
-            "person/nathan",
+            "person/alex",
             "--title",
             "Publish this revision",
             "--reason",
@@ -17306,7 +17421,7 @@ mission "review" state="ready" {
             "--outcome",
             "dismissed",
             "--as",
-            "person/nathan",
+            "person/alex",
         ])
         .unwrap();
         let Command::Attention {
@@ -17335,7 +17450,7 @@ mission "review" state="ready" {
         assert_eq!(identity, "node.worker");
         assert_eq!(runtime_id, "node.worker");
         let (long_catalog, _, _, _) =
-            prepare_native_driver_in("agent/fleet/app-web/standing/app-web", root.path()).unwrap();
+            prepare_native_driver_in("agent/example/app-web/standing/app-web", root.path()).unwrap();
         let report = st2::validate::validate_for_host(&long_catalog, &st2::run::detect_host());
         assert!(report.issues.is_empty(), "{report:?}");
     }

@@ -1,5 +1,5 @@
 agent "fabric" {
-  host "Silber"
+  host "ExampleMac"
   workspace "/work"
   claude {
     model "opus"

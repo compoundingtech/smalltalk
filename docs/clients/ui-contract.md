@@ -18,7 +18,7 @@ iOS app must test against the same files.
 
 ## Definition of good
 
-Agreed with Nathan on 2026-09-28. Every screen is judged by these.
+Every screen is judged by these.
 
 1. **Never claim what you don't know.** Loading, empty and failed are three different states. A
    list that has not loaded says "Loading…", never "No items". A preview that cannot be read says
@@ -93,7 +93,10 @@ resources: until then it could only show invented data.
   what it holds now (mission › step, the step's goal, since when), what is queued next, and how
   it runs (harness and state, runtime, host, worktree, parent, fault).
 - An agent on another host may show only its Small Talk mail, not its transcript; say so.
-- An agent not started by st: explain in plain words why there is no conversation.
+- An agent not started by st: show its saved transcript when st can identify it; otherwise
+  explain in plain words why there is no conversation. A found process whose native session
+  is unidentified opens into this explanatory state, not a missing-session error. OMP internal
+  `__omp_worker_*` helpers are not agents and must not appear in the found-running group.
 
 ### Missions
 

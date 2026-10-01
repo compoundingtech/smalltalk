@@ -215,6 +215,84 @@ async fn serve_terminal_state(
 }
 
 #[tokio::test]
+async fn nested_launch_ids_reach_detail_and_child_routes() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = state(root.path(), "launch-routing");
+    let request = state
+        .store
+        .put_document(
+            "doc/planning/request",
+            b"Plan a release",
+            &None,
+            "launch-request",
+        )
+        .unwrap();
+    for id in [
+        "planning/fleet/harbor/release/one",
+        "launch/fleet/harbor/release/two",
+    ] {
+        state
+            .store
+            .create_planning_session(
+                id,
+                "release",
+                &format!("{}@{}", request.name, request.hash),
+                "/work/release",
+                "person/avery",
+                "agent/launch-routing.planner",
+                &Default::default(),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let app = st3::api::router(state);
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+    wait_for_socket(&socket).await;
+    let client = Client::unix(&socket);
+    for id in [
+        "launch/planning/fleet/harbor/release/one",
+        "launch/launch/fleet/harbor/release/two",
+    ] {
+        assert_eq!(client.launches_get(id).await.unwrap().value.header().id, id);
+        assert!(
+            client
+                .launch_variants_list(id, None, None)
+                .await
+                .unwrap()
+                .value
+                .items
+                .is_empty()
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_empty_launch_404_explains_that_the_launch_no_longer_exists() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new()).await.unwrap();
+    });
+    let client = Client::fabric_pairing(format!("http://{address}"));
+    let error = client
+        .launches_get("launch/planning/missing/one")
+        .await
+        .unwrap_err();
+    match error {
+        ClientError::Api(ErrorCode::NotFound, message, envelope) => {
+            assert_eq!(message, "this launch no longer exists");
+            assert!(!envelope.retryable);
+        }
+        other => panic!("missing launch must be understandable: {other}"),
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
     let (_root, state, pty, client, server) =
         serve_terminal_state("client-stream-changes", 24, 80).await;
@@ -644,15 +722,15 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     state
         .store
         .request_attention(
-            "attention/nathan-client-proof",
+            "attention/ada-client-proof",
             &AttentionRequest {
-                reviewer: "person/nathan".into(),
+                reviewer: "person/ada".into(),
                 title: "Client proof".into(),
                 reason: "Resolve through the generated client".into(),
                 severity: "error".into(),
                 targets: vec!["agent/terminal-demo".into()],
                 actor: "daemon/runtime".into(),
-                idempotency_key: "attention-nathan-client-proof".into(),
+                idempotency_key: "attention-ada-client-proof".into(),
             },
         )
         .unwrap();
@@ -663,7 +741,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
             &AttentionRequest {
                 reviewer: "person/alex".into(),
                 title: "Other person's attention".into(),
-                reason: "Must not resolve as Nathan".into(),
+                reason: "Must not resolve as Ada".into(),
                 severity: "warning".into(),
                 targets: Vec::new(),
                 actor: "daemon/runtime".into(),
@@ -675,7 +753,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
     wait_for_socket(&socket).await;
 
-    let client = Client::unix_as(&socket, "person/nathan");
+    let client = Client::unix_as(&socket, "person/ada");
     let read_only = Client::unix(&socket);
     assert_eq!(
         read_only.capabilities().await.unwrap().value.session_actor,
@@ -686,7 +764,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
             .pairing_begin(&PairingBegin {
                 api_version: st3_client::API_VERSION.into(),
                 device_name: "Unattributed device".into(),
-                person_id: "person/nathan".into(),
+                person_id: "person/ada".into(),
                 full_control: None,
             })
             .await
@@ -698,7 +776,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
         capabilities.value.transport,
         st3_client::TransportKind::Unix
     );
-    assert_eq!(capabilities.value.session_actor, "person/nathan");
+    assert_eq!(capabilities.value.session_actor, "person/ada");
     let work = client.work_list(None, Some(7), false).await.unwrap();
     assert_eq!(work.value.collection, "work");
     assert_eq!(work.value.page.limit, 7);
@@ -712,13 +790,13 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
         .iter()
         .find_map(|resource| match resource {
             Resource::Attention(attention)
-                if attention.header.id == "attention/nathan-client-proof" =>
+                if attention.header.id == "attention/ada-client-proof" =>
             {
                 Some(attention)
             }
             _ => None,
         })
-        .expect("person/nathan attention in generated client page");
+        .expect("person/ada attention in generated client page");
     let resolve_fence = Fence {
         snapshot_id: attention_page.snapshot.id.clone(),
         subject_revisions: BTreeMap::from([(
@@ -802,7 +880,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     assert!(
         state
             .store
-            .attention_items(Some("person/nathan"))
+            .attention_items(Some("person/ada"))
             .unwrap()
             .is_empty()
     );
@@ -842,13 +920,13 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
             },
         )
         .await
-        .expect("person/nathan closes person/alex attention");
+        .expect("person/ada closes person/alex attention");
     let closed = state
         .store
         .latest_claim("attention/alex-client-proof", Some("attention.resolved"))
         .unwrap()
         .expect("the item was closed");
-    assert_eq!(closed.actor.as_deref(), Some("person/nathan"));
+    assert_eq!(closed.actor.as_deref(), Some("person/ada"));
     assert_eq!(
         closed
             .body
@@ -963,7 +1041,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     assert!(
         control_claims
             .iter()
-            .all(|claim| claim.actor.as_deref() == Some("person/nathan")),
+            .all(|claim| claim.actor.as_deref() == Some("person/ada")),
         "terminal control attribution must come from the authenticated session: {control_claims:?}"
     );
 
@@ -1061,12 +1139,12 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     let unix_server =
         tokio::spawn(async move { st3::api::serve_unix(&server_socket, unix_app).await });
     wait_for_socket(&socket).await;
-    let local = Client::unix_as(&socket, "person/nathan");
+    let local = Client::unix_as(&socket, "person/ada");
     let challenge = local
         .pairing_begin(&PairingBegin {
             api_version: st3_client::API_VERSION.into(),
             device_name: "Conformance phone".into(),
-            person_id: "person/nathan".into(),
+            person_id: "person/ada".into(),
             full_control: None,
         })
         .await
@@ -1145,7 +1223,7 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
         st3_client::TransportKind::FabricLoopback
     );
     assert_eq!(capabilities.value.session_actor, paired.value.session_actor);
-    assert_eq!(paired.value.person_id, "person/nathan");
+    assert_eq!(paired.value.person_id, "person/ada");
     assert_eq!(
         client
             .operations_list(None, None, false)
@@ -1311,7 +1389,7 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     wait_for_socket(&gateway_socket).await;
     assert_private_socket(&socket);
     assert_private_socket(&gateway_socket);
-    Client::unix_as(&socket, "person/nathan")
+    Client::unix_as(&socket, "person/ada")
         .capabilities()
         .await
         .expect("the privileged local socket restarts independently");
