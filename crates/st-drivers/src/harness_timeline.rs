@@ -20,7 +20,7 @@ use sha2::{Digest as _, Sha256};
 use crate::flock::{FileLock, Mode, Open, open};
 use crate::fsatomic::{self, Durability, Staging};
 
-const SCHEMA: &str = "st2.harness-timeline.v1";
+const SCHEMA: &str = "st.harness-timeline.v1";
 const RECORD_NAME: &str = "harness-timeline";
 const LOCK_NAME: &str = ".harness-timeline.lock";
 const MAX_OPERATIONS: usize = 4_096;
@@ -172,7 +172,11 @@ impl Writer {
                 record.driver == self.driver && record.incarnation_id == self.incarnation_id
             })
             .unwrap_or_else(|| Record {
-                schema: SCHEMA.into(),
+                schema: crate::contracts::schema_for_session(
+                    self.path.parent().unwrap(),
+                    &self.incarnation_id,
+                    SCHEMA,
+                ),
                 driver: self.driver.clone(),
                 incarnation_id: self.incarnation_id.clone(),
                 next_sequence: 1,
@@ -835,7 +839,7 @@ fn now_ms() -> u64 {
 }
 
 fn validate_record(record: &Record) -> bool {
-    let fields_valid = record.schema == SCHEMA
+    let fields_valid = crate::contracts::schema_matches(&record.schema, SCHEMA)
         && matches!(record.driver.as_str(), "codex" | "claude" | "pi" | "omp")
         && !record.incarnation_id.is_empty()
         && record.operations.len() <= MAX_OPERATIONS

@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 /// Wire schema of one park marker.
-pub const PARK_SCHEMA: &str = "st2.park.v1";
+pub const PARK_SCHEMA: &str = "st.park.v1";
 
 fn hash_scope_component(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_be_bytes());
@@ -246,7 +246,7 @@ fn read_marker(
     };
     let record: ParkRecord =
         serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    if record.schema != PARK_SCHEMA {
+    if !crate::contracts::schema_matches(&record.schema, PARK_SCHEMA) {
         anyhow::bail!(
             "unknown schema {:?} in {} (expected {PARK_SCHEMA})",
             record.schema,

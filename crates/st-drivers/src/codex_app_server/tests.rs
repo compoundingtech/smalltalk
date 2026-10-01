@@ -1154,13 +1154,13 @@ fn delivery_request_uses_typed_start_and_exact_turn_steer() {
     let start = codex_delivery_request(
         2,
         "thread-main",
-        "st2:client",
+        "st:client",
         "notice",
         &CodexDeliveryMethod::Start,
     );
     assert_eq!(start["method"], "turn/start");
     assert_eq!(start["params"]["threadId"], "thread-main");
-    assert_eq!(start["params"]["clientUserMessageId"], "st2:client");
+    assert_eq!(start["params"]["clientUserMessageId"], "st:client");
     assert_eq!(start["params"]["input"][0]["type"], "text");
     assert_eq!(start["params"]["input"][0]["text"], "notice");
     assert!(start["params"].get("expectedTurnId").is_none());
@@ -1168,7 +1168,7 @@ fn delivery_request_uses_typed_start_and_exact_turn_steer() {
     let steer = codex_delivery_request(
         3,
         "thread-main",
-        "st2:client",
+        "st:client",
         "notice",
         &CodexDeliveryMethod::Steer {
             turn_id: "turn-current".into(),
@@ -2650,7 +2650,7 @@ fn control_initializes_before_recording_the_first_thread_only() {
         let mut websocket = tungstenite::accept(stream).unwrap();
         let initialize = read_json_message(&mut websocket).unwrap().unwrap();
         assert_eq!(initialize["method"], "initialize");
-        assert_eq!(initialize["params"]["clientInfo"]["name"], "st2");
+        assert_eq!(initialize["params"]["clientInfo"]["name"], "st");
         write_json_message(
             &mut websocket,
             &json!({ "id": 0, "result": { "userAgent": "fake" } }),

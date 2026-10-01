@@ -1,22 +1,22 @@
-//! The rows `st2 message ls --json` and `st2 message read --json` emit.
+//! The rows `message ls --json` and `message read --json` emit.
 
 use serde::{Deserialize, Serialize};
 
-/// One message as st2's CLI reports it.
+/// One message as the CLI's CLI reports it.
 ///
-/// The same type serializes in st2 and deserializes in every reader, which is the point: a reader
+/// The same type serializes in the CLI and deserializes in every reader, which is the point: a reader
 /// cannot disagree with the producer about which fields exist or which of them may be absent.
 ///
 /// # What is optional, and why it is not the same as empty
 ///
 /// `from`, `subject`, `in_reply_to` and `priority` are `Option` because the message file's
 /// frontmatter genuinely may not carry them — a message sent without `--subject` has no subject,
-/// and st2 emits `null`. That is distinct from a message whose subject is the empty string, which
+/// and the CLI emits `null`. That is distinct from a message whose subject is the empty string, which
 /// is a subject that happens to say nothing. The distinction is preserved here rather than
 /// flattened, so a reader can choose how to present each; collapsing them into `""` would discard
 /// the difference before the reader ever saw it.
 ///
-/// `filename` and `ts` are not optional. Both are derived by st2 from the message's filename —
+/// `filename` and `ts` are not optional. Both are derived by the CLI from the message's filename —
 /// `ts` from its unix-ms prefix, falling back to `0` — so neither can be absent from a row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageRow {
@@ -59,7 +59,7 @@ pub struct MessageRow {
     pub body: Option<String>,
 }
 
-/// How much sender history st2 can prove is represented by [`SentMessages`].
+/// How much sender history the CLI can prove is represented by [`SentMessages`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "kebab-case")]
 pub enum SentCoverage {
@@ -94,7 +94,7 @@ pub struct SentMessageRow {
     pub body: Option<String>,
 }
 
-/// The stable `st2 message sent --json` envelope.
+/// The stable `message sent --json` envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SentMessages {
     pub coverage: SentCoverage,
@@ -122,7 +122,7 @@ mod tests {
         }
     }
 
-    /// The bug this crate exists to prevent: a reader that cannot accept what st2 emits. A message
+    /// The bug this crate exists to prevent: a reader that cannot accept what the CLI emits. A message
     /// sent without `--subject` is ordinary, and `null` must round-trip to `None` rather than fail.
     #[test]
     fn a_null_subject_or_sender_round_trips_as_absent() {
@@ -206,7 +206,7 @@ mod tests {
     ///
     /// This is the distinction the defect turned on: `#[serde(default)]` covers only the absent
     /// case, so a hand-written reader that used it accepted a missing `subject` and rejected the
-    /// `null` st2 actually emits. `Option` covers both, and this test is what stops anyone
+    /// `null` the producer actually emits. `Option` covers both, and this test is what stops anyone
     /// "simplifying" these fields back to a defaulted `String`.
     #[test]
     fn an_absent_optional_key_parses_the_same_as_an_explicit_null() {
@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(absent.from, None);
     }
 
-    /// A reader pinned to this crate may be older than the `st2` binary it invokes, so a field it
+    /// A reader pinned to this crate may be older than the `the CLI` binary it invokes, so a field it
     /// has never heard of must be ignored rather than fatal.
     #[test]
     fn a_field_this_reader_does_not_know_is_ignored_not_rejected() {

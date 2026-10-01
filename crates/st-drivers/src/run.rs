@@ -1311,7 +1311,7 @@ impl ParkChannel {
             Ok(scope) => scope,
             Err(error) => {
                 tracing::warn!(
-                    "st2: cannot open the supervisor park channel ({error}); parks remain terminal but cannot be observed or explicitly released."
+                    "st: cannot open the supervisor park channel ({error}); parks remain terminal but cannot be observed or explicitly released."
                 );
                 return Self {
                     projection: None,
@@ -1323,7 +1323,7 @@ impl ParkChannel {
             Ok(projection) => Some(projection),
             Err(error) => {
                 tracing::warn!(
-                    "st2: cannot publish parked tasks ({error}); `st2 tasks` will not show park faults for this supervisor."
+                    "st: cannot publish parked tasks ({error}); `st2 tasks` will not show park faults for this supervisor."
                 );
                 None
             }
@@ -1795,9 +1795,9 @@ fn reconcile_pass_with_residency(
         let entered = span.as_ref().map(tracing::Span::enter);
         let found = crate::discover(root);
         if let Some(span) = &span {
-            span.record("st2.catalog.spec_count", span_count(found.specs.len()));
-            span.record("st2.report.warning_count", span_count(found.warnings.len()));
-            span.record("st2.report.error_count", span_count(found.errors.len()));
+            span.record("st.catalog.spec_count", span_count(found.specs.len()));
+            span.record("st.report.warning_count", span_count(found.warnings.len()));
+            span.record("st.report.error_count", span_count(found.errors.len()));
             finish_child_span(Some(span), !found.errors.is_empty());
         }
         drop(entered);
@@ -1891,15 +1891,15 @@ fn reconcile_pass_with_residency(
         );
         if let Some(span) = &span {
             span.record(
-                "st2.materialize.failure_count",
+                "st.materialize.failure_count",
                 span_count(materialized.failed_agents.len()),
             );
             span.record(
-                "st2.report.warning_count",
+                "st.report.warning_count",
                 span_count(materialized.warnings.len()),
             );
             span.record(
-                "st2.report.error_count",
+                "st.report.error_count",
                 span_count(materialized.errors.len()),
             );
             finish_child_span(Some(span), !materialized.errors.is_empty());
@@ -1933,7 +1933,7 @@ fn reconcile_pass_with_residency(
         let entered = span.as_ref().map(tracing::Span::enter);
         let sessions = runner.list_sessions();
         if let (Some(span), Ok(sessions)) = (span.as_ref(), sessions.as_ref()) {
-            span.record("st2.runtime.session_count", span_count(sessions.len()));
+            span.record("st.runtime.session_count", span_count(sessions.len()));
         }
         finish_child_span(span.as_ref(), sessions.is_err());
         drop(entered);
@@ -2163,7 +2163,7 @@ fn archive_expired_retirements(
         Ok(Some(pass)) => {
             for entry in pass.archive.archived {
                 tracing::info!(
-                    target: "st2",
+                    target: "st",
                     id = %entry.id,
                     to = %entry.to,
                     "archived an agent out of the live catalog"
@@ -2261,29 +2261,29 @@ fn gate_harness_launches_on_hooks<'a, V>(
     }
 }
 
-/// Root span for one reconcile pass. The compatibility name remains `st2.reconcile_pass`;
-/// `span.label` and `st2.reconcile.path` distinguish the bounded path enum.
+/// Root span for one reconcile pass, shared by the current supervisor and legacy catalog runner.
+/// `span.label` and `st.reconcile.path` distinguish the bounded path enum.
 fn reconcile_span(this_host: &str, path: &'static str) -> tracing::Span {
     tracing::info_span!(
-        "st2.reconcile_pass",
+        "st.reconcile_pass",
         "span.label" = path,
-        "st2.host" = this_host,
-        "st2.reconcile.path" = path,
-        "st2.crash_loops" = tracing::field::Empty,
-        "st2.unparked" = tracing::field::Empty,
-        "st2.report.errors" = tracing::field::Empty,
-        "st2.report.warnings" = tracing::field::Empty,
-        "st2.reconcile.skipped" = tracing::field::Empty,
-        "st2.result" = tracing::field::Empty,
+        "st.host" = this_host,
+        "st.reconcile.path" = path,
+        "st.crash_loops" = tracing::field::Empty,
+        "st.unparked" = tracing::field::Empty,
+        "st.report.errors" = tracing::field::Empty,
+        "st.report.warnings" = tracing::field::Empty,
+        "st.reconcile.skipped" = tracing::field::Empty,
+        "st.result" = tracing::field::Empty,
     )
 }
 
 fn catalog_lock_span() -> Option<tracing::Span> {
     crate::telemetry::tracer_export_enabled().then(|| {
         tracing::info_span!(
-            "st2.catalog.lock",
+            "st.catalog.lock",
             "span.label" = "shared",
-            "st2.result" = tracing::field::Empty,
+            "st.result" = tracing::field::Empty,
         )
     })
 }
@@ -2291,12 +2291,12 @@ fn catalog_lock_span() -> Option<tracing::Span> {
 fn catalog_discover_span() -> Option<tracing::Span> {
     crate::telemetry::tracer_export_enabled().then(|| {
         tracing::info_span!(
-            "st2.catalog.discover",
+            "st.catalog.discover",
             "span.label" = "catalog",
-            "st2.catalog.spec_count" = tracing::field::Empty,
-            "st2.report.warning_count" = tracing::field::Empty,
-            "st2.report.error_count" = tracing::field::Empty,
-            "st2.result" = tracing::field::Empty,
+            "st.catalog.spec_count" = tracing::field::Empty,
+            "st.report.warning_count" = tracing::field::Empty,
+            "st.report.error_count" = tracing::field::Empty,
+            "st.result" = tracing::field::Empty,
         )
     })
 }
@@ -2304,10 +2304,10 @@ fn catalog_discover_span() -> Option<tracing::Span> {
 fn lifecycle_hooks_span(consumer: &'static str) -> Option<tracing::Span> {
     crate::telemetry::tracer_export_enabled().then(|| {
         tracing::info_span!(
-            "st2.hooks.verify",
+            "st.hooks.verify",
             "span.label" = "lifecycle hooks",
-            "st2.hooks.consumer" = consumer,
-            "st2.result" = tracing::field::Empty,
+            "st.hooks.consumer" = consumer,
+            "st.result" = tracing::field::Empty,
         )
     })
 }
@@ -2315,12 +2315,12 @@ fn lifecycle_hooks_span(consumer: &'static str) -> Option<tracing::Span> {
 fn catalog_materialize_span(label: &'static str) -> Option<tracing::Span> {
     crate::telemetry::tracer_export_enabled().then(|| {
         tracing::info_span!(
-            "st2.catalog.materialize",
+            "st.catalog.materialize",
             "span.label" = label,
-            "st2.materialize.failure_count" = tracing::field::Empty,
-            "st2.report.warning_count" = tracing::field::Empty,
-            "st2.report.error_count" = tracing::field::Empty,
-            "st2.result" = tracing::field::Empty,
+            "st.materialize.failure_count" = tracing::field::Empty,
+            "st.report.warning_count" = tracing::field::Empty,
+            "st.report.error_count" = tracing::field::Empty,
+            "st.result" = tracing::field::Empty,
         )
     })
 }
@@ -2328,10 +2328,10 @@ fn catalog_materialize_span(label: &'static str) -> Option<tracing::Span> {
 fn runtime_observe_span() -> Option<tracing::Span> {
     crate::telemetry::tracer_export_enabled().then(|| {
         tracing::info_span!(
-            "st2.runtime.observe",
+            "st.runtime.observe",
             "span.label" = "all sessions",
-            "st2.runtime.session_count" = tracing::field::Empty,
-            "st2.result" = tracing::field::Empty,
+            "st.runtime.session_count" = tracing::field::Empty,
+            "st.result" = tracing::field::Empty,
         )
     })
 }
@@ -2339,14 +2339,14 @@ fn runtime_observe_span() -> Option<tracing::Span> {
 fn reconcile_execute_span() -> Option<tracing::Span> {
     crate::telemetry::tracer_export_enabled().then(|| {
         tracing::info_span!(
-            "st2.reconcile.execute",
+            "st.reconcile.execute",
             "span.label" = "apply plan",
-            "st2.plan.launch_count" = tracing::field::Empty,
-            "st2.plan.gc_count" = tracing::field::Empty,
-            "st2.plan.teardown_count" = tracing::field::Empty,
-            "st2.report.warning_count" = tracing::field::Empty,
-            "st2.report.error_count" = tracing::field::Empty,
-            "st2.result" = tracing::field::Empty,
+            "st.plan.launch_count" = tracing::field::Empty,
+            "st.plan.gc_count" = tracing::field::Empty,
+            "st.plan.teardown_count" = tracing::field::Empty,
+            "st.report.warning_count" = tracing::field::Empty,
+            "st.report.error_count" = tracing::field::Empty,
+            "st.result" = tracing::field::Empty,
         )
     })
 }
@@ -2359,7 +2359,7 @@ fn finish_child_span(span: Option<&tracing::Span>, failed: bool) {
     let Some(span) = span else {
         return;
     };
-    span.record("st2.result", if failed { "fail" } else { "pass" });
+    span.record("st.result", if failed { "fail" } else { "pass" });
     if failed {
         span.set_status(Status::error(""));
     }
@@ -2387,15 +2387,15 @@ fn execute_reconcile(
         on_canonical_live,
     );
     if let (Some(span), Some((warnings_before, errors_before))) = (span.as_ref(), before) {
-        span.record("st2.plan.launch_count", span_count(plan.launch.len()));
-        span.record("st2.plan.gc_count", span_count(plan.gc.len()));
-        span.record("st2.plan.teardown_count", span_count(plan.teardown.len()));
+        span.record("st.plan.launch_count", span_count(plan.launch.len()));
+        span.record("st.plan.gc_count", span_count(plan.gc.len()));
+        span.record("st.plan.teardown_count", span_count(plan.teardown.len()));
         span.record(
-            "st2.report.warning_count",
+            "st.report.warning_count",
             span_count(report.warnings.len().saturating_sub(warnings_before)),
         );
         let added_errors = report.errors.len().saturating_sub(errors_before);
-        span.record("st2.report.error_count", span_count(added_errors));
+        span.record("st.report.error_count", span_count(added_errors));
         finish_child_span(Some(span), added_errors > 0);
     }
 }
@@ -2403,29 +2403,29 @@ fn execute_reconcile(
 /// Stamp bounded pass outcomes onto the root and emit the deterministic per-pass completion log.
 /// Call while the span is entered.
 fn finish_reconcile_pass(span: &tracing::Span, report: &UpReport) {
-    span.record("st2.crash_loops", span_count(report.crash_loops.len()));
-    span.record("st2.unparked", span_count(report.unparked.len()));
-    span.record("st2.report.errors", span_count(report.errors.len()));
-    span.record("st2.report.warnings", span_count(report.warnings.len()));
-    span.record("st2.reconcile.skipped", report.skipped);
+    span.record("st.crash_loops", span_count(report.crash_loops.len()));
+    span.record("st.unparked", span_count(report.unparked.len()));
+    span.record("st.report.errors", span_count(report.errors.len()));
+    span.record("st.report.warnings", span_count(report.warnings.len()));
+    span.record("st.reconcile.skipped", report.skipped);
     let failed = !report.errors.is_empty();
     let result = if failed { "fail" } else { "pass" };
-    span.record("st2.result", result);
+    span.record("st.result", result);
     if failed {
         span.set_status(Status::error(""));
     }
-    tracing::info!(target: "st2", result, "reconcile pass complete");
+    tracing::info!(target: "st", result, "reconcile pass complete");
 }
 
 fn finish_failed_reconcile_pass(span: &tracing::Span) {
-    span.record("st2.crash_loops", 0_i64);
-    span.record("st2.unparked", 0_i64);
-    span.record("st2.report.errors", 1_i64);
-    span.record("st2.report.warnings", 0_i64);
-    span.record("st2.reconcile.skipped", true);
-    span.record("st2.result", "fail");
+    span.record("st.crash_loops", 0_i64);
+    span.record("st.unparked", 0_i64);
+    span.record("st.report.errors", 1_i64);
+    span.record("st.report.warnings", 0_i64);
+    span.record("st.reconcile.skipped", true);
+    span.record("st.result", "fail");
     span.set_status(Status::error(""));
-    tracing::info!(target: "st2", result = "fail", "reconcile pass complete");
+    tracing::info!(target: "st", result = "fail", "reconcile pass complete");
 }
 
 /// One reconcile pass with a throwaway flapping-cap (`st2 up --once`). Returns an owned report;
@@ -2521,7 +2521,7 @@ pub fn reconcile_pass_specs_with_cursor(
             let observe_entered = observe_span.as_ref().map(tracing::Span::enter);
             let sessions = runner.list_sessions();
             if let (Some(span), Ok(sessions)) = (observe_span.as_ref(), sessions.as_ref()) {
-                span.record("st2.runtime.session_count", span_count(sessions.len()));
+                span.record("st.runtime.session_count", span_count(sessions.len()));
             }
             finish_child_span(observe_span.as_ref(), sessions.is_err());
             drop(observe_entered);
@@ -2554,7 +2554,7 @@ pub fn reconcile_pass_specs_with_cursor(
 /// this so crash classification and reconciliation see the same terminal state: otherwise a clean
 /// process can exit between two `pty list` calls, be reaped by the second call, then look like a
 /// vanished crash on the next tick. The external snapshot deliberately omits
-/// `st2.runtime.observe`; its provenance is outside this pass.
+/// `st.runtime.observe`; its provenance is outside this pass.
 #[doc(hidden)]
 pub fn reconcile_pass_specs_with_sessions(
     specs: &[agent_spec::spec::AgentSpec],
@@ -2687,9 +2687,9 @@ pub fn up_once_selected(
                 let discover_entered = discover_span.as_ref().map(tracing::Span::enter);
                 let found = crate::discovery::discover(catalog_root);
                 if let Some(span) = &discover_span {
-                    span.record("st2.catalog.spec_count", span_count(found.specs.len()));
-                    span.record("st2.report.warning_count", span_count(found.warnings.len()));
-                    span.record("st2.report.error_count", span_count(found.errors.len()));
+                    span.record("st.catalog.spec_count", span_count(found.specs.len()));
+                    span.record("st.report.warning_count", span_count(found.warnings.len()));
+                    span.record("st.report.error_count", span_count(found.errors.len()));
                     finish_child_span(Some(span), !found.errors.is_empty());
                 }
                 drop(discover_entered);
@@ -2734,15 +2734,15 @@ pub fn up_once_selected(
                 );
                 if let Some(span) = &materialize_span {
                     span.record(
-                        "st2.materialize.failure_count",
+                        "st.materialize.failure_count",
                         span_count(materialized.failed_agents.len()),
                     );
                     span.record(
-                        "st2.report.warning_count",
+                        "st.report.warning_count",
                         span_count(materialized.warnings.len()),
                     );
                     span.record(
-                        "st2.report.error_count",
+                        "st.report.error_count",
                         span_count(materialized.errors.len()),
                     );
                     finish_child_span(Some(span), !materialized.errors.is_empty());
@@ -2796,7 +2796,7 @@ where
         let observe_entered = observe_span.as_ref().map(tracing::Span::enter);
         let sessions = runner.list_sessions();
         if let (Some(span), Ok(sessions)) = (observe_span.as_ref(), sessions.as_ref()) {
-            span.record("st2.runtime.session_count", span_count(sessions.len()));
+            span.record("st.runtime.session_count", span_count(sessions.len()));
         }
         finish_child_span(observe_span.as_ref(), sessions.is_err());
         drop(observe_entered);
@@ -2859,7 +2859,7 @@ pub fn up_loop_specs(
                 // parked, so per-pass counting would inflate crash_loops_total unboundedly.
                 crate::metrics::record_crash_loop();
                 tracing::error!(
-                    "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
+                    "st: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
                 );
                 surface_crash_loop(root, this_host, cl);
@@ -2882,9 +2882,7 @@ pub fn up_loop_specs(
             break;
         }
     }
-    eprintln!(
-        "st2: stopping; leaving sessions running (agents are decoupled from the supervisor)."
-    );
+    eprintln!("st: stopping; leaving sessions running (agents are decoupled from the supervisor).");
     crate::event::clear_owner_binding(root, this_host);
     Ok(())
 }
@@ -3227,7 +3225,7 @@ fn up_loop_until_with_residency(
                 // parked, so per-pass counting would inflate crash_loops_total unboundedly.
                 crate::metrics::record_crash_loop();
                 tracing::error!(
-                    "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
+                    "st: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
                 );
                 surface_crash_loop(root, this_host, cl);
@@ -3245,9 +3243,7 @@ fn up_loop_until_with_residency(
         }
     }
 
-    eprintln!(
-        "st2: stopping; leaving sessions running (agents are decoupled from the supervisor)."
-    );
+    eprintln!("st: stopping; leaving sessions running (agents are decoupled from the supervisor).");
     Ok(())
 }
 
@@ -3265,7 +3261,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
     let agent = cl.agent_bus_id(this_host);
     let Some(supervisor) = cl.supervisor.as_deref() else {
         tracing::warn!(
-            "st2: crash-loop '{}' ({agent}) has no supervisor to notify.",
+            "st: crash-loop '{}' ({agent}) has no supervisor to notify.",
             cl.pty_id
         );
         return;
@@ -3273,7 +3269,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
     let Ok(Some(agent_dir)) = message::resolve_declared_dir(catalog_root, supervisor, this_host)
     else {
         tracing::warn!(
-            "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
+            "st: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
             cl.pty_id
         );
         return;
@@ -3285,7 +3281,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
     let unbindable_socket = session_socket_overage(&effective_pty_root(catalog_root), &cl.pty_id);
     let body = match &unbindable_socket {
         Some((socket, over)) => format!(
-            "st2 gave up restarting task '{id}' (agent {agent}) — it crash-looped past its \
+            "st gave up restarting task '{id}' (agent {agent}) — it crash-looped past its \
              restart{{}} policy (mode=fail) and is parked. The cause is structural and `st2 \
              unpark` cannot recover it: the task's session socket path {socket} is {bytes} bytes, \
              exceeding the {limit}-byte portable limit by {over}, so every launch fails the same \
@@ -3297,7 +3293,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
             limit = PORTABLE_SOCKET_PATH_LIMIT,
         ),
         None => format!(
-            "st2 gave up restarting task '{id}' (agent {agent}) — it crash-looped past its \
+            "st gave up restarting task '{id}' (agent {agent}) — it crash-looped past its \
              restart{{}} policy (mode=fail) and is parked. Its last dead session is left as \
              evidence, and `st2 tasks` reports the park. Investigate the cause, then `st2 unpark \
              {id}` to recover just this task — restarting st2 is not required and would cold-boot \
@@ -3305,7 +3301,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
             id = cl.pty_id
         ),
     };
-    let from = format!("st2.{this_host}"); // the runner is the sender
+    let from = format!("st.{this_host}"); // the runner is the sender
     let tags = ["crash-loop".to_string()];
     if let Err(e) = message::send_to_inbox(
         &message::inbox_dir(&agent_dir),
@@ -3316,7 +3312,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         &body,
     ) {
         tracing::warn!(
-            "st2: failed to notify supervisor '{supervisor}' of crash-loop '{}': {e}",
+            "st: failed to notify supervisor '{supervisor}' of crash-loop '{}': {e}",
             cl.pty_id
         );
     }

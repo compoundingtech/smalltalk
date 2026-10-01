@@ -29,7 +29,16 @@
 
 set -u
 
-identity="${ST2_CLAUDE_IDENTITY:-${ST_AGENT:-}}"
+# Older running providers retain their original environment across binary replacement.
+for name in ST_CLAUDE_IDENTITY ST_CLAUDE_RUNTIME_ID ST_CLAUDE_SESSION ST_CLAUDE_SESSION_SEQ ST_CLAUDE_EXPECTED_NATIVE_SESSION ST_CLAUDE_RESUME_GENERATION; do
+  legacy="ST2_${name#ST_}"
+  if [[ ${!name+x} != x && ${!legacy+x} == x ]]; then
+    printf -v "$name" '%s' "${!legacy}"
+    export "$name"
+  fi
+done
+
+identity="${ST_CLAUDE_IDENTITY:-${ST_AGENT:-}}"
 # CATALOG-first, matching claude-observe.sh: `--catalog` resolves the agent DECLARATION, and with
 # a custom bus root (ST_ROOT != CATALOG) resolution under ST_ROOT would find nothing.
 root="${CATALOG:-${ST_ROOT:-}}"

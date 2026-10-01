@@ -121,7 +121,7 @@ pub(crate) fn run_for_with_environment(
         verify_version(&provider_argv[0])?;
     }
     let executable = std::env::current_exe()
-        .with_context(|| format!("resolving st2 executable for the {label} channel"))?;
+        .with_context(|| format!("resolving st executable for the {label} channel"))?;
     let session = required_incarnation.unwrap_or_else(harness_state::session_token);
     // The claim is written: it supersedes whatever the predecessor left — including a
     // still-fresh live record — before the channel or terminal writer act under it.
@@ -339,7 +339,7 @@ fn record_session_end(
     .with_ownership(session, seq);
     if let Err(error) = writer.ended(label) {
         tracing::warn!(
-            "st2 {} driver: recording session end failed: {error}",
+            "st {} driver: recording session end failed: {error}",
             kind.label
         );
     }
@@ -407,7 +407,7 @@ fn channel_env(
 ) -> Result<Vec<(String, String)>> {
     let executable = executable
         .to_str()
-        .context("st2 executable path is not UTF-8")?;
+        .context("st executable path is not UTF-8")?;
     let catalog_root = catalog_root.to_str().context("catalog root is not UTF-8")?;
     Ok(vec![
         (kind.bin_env.to_string(), executable.to_string()),
@@ -644,11 +644,11 @@ mod tests {
         let pi = names(&PI_KIND);
         let omp = names(&OMP_KIND);
         assert!(
-            pi.iter().all(|name| name.starts_with("ST2_PI_CHANNEL_")),
+            pi.iter().all(|name| name.starts_with("ST_PI_CHANNEL_")),
             "{pi:?}"
         );
         assert!(
-            omp.iter().all(|name| name.starts_with("ST2_OMP_CHANNEL_")),
+            omp.iter().all(|name| name.starts_with("ST_OMP_CHANNEL_")),
             "{omp:?}"
         );
         assert!(

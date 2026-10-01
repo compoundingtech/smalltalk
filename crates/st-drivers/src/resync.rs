@@ -1403,16 +1403,16 @@ fn emit_resync(
             match crate::event::refusal_kind(&error) {
                 Some(crate::event::RefusalKind::RecipientNotRunning) => {
                     eprintln!(
-                        "st2: resync for '{path}' is parked until '{bus_id}' is running again: {error:#}"
+                        "st: resync for '{path}' is parked until '{bus_id}' is running again: {error:#}"
                     );
                     PublicationOutcome::Parked
                 }
                 Some(crate::event::RefusalKind::Permanent) => {
-                    eprintln!("st2: resync for '{path}' dropped; no retry can admit it: {error:#}");
+                    eprintln!("st: resync for '{path}' dropped; no retry can admit it: {error:#}");
                     PublicationOutcome::Refused
                 }
                 None => {
-                    eprintln!("st2: resync emit for '{path}' failed: {error:#}");
+                    eprintln!("st: resync emit for '{path}' failed: {error:#}");
                     PublicationOutcome::Retry
                 }
             }

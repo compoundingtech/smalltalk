@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use st2_wire::message::{SentCoverage, SentMessageRow, SentMessages};
+use st_wire::message::{SentCoverage, SentMessageRow, SentMessages};
 
 use crate::flock::{self, FileLock};
 use crate::identity::{AgentSelector, ResolveError};

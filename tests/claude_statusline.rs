@@ -117,6 +117,7 @@ impl Seat {
             .env("ST_AGENT", identity)
             // The wrapper's token is deliberately absent: these seats are wrapperless, so the tee
             // falls back to Claude's own session id exactly as the hooks do.
+            .env_remove("ST_CLAUDE_SESSION")
             .env_remove("ST2_CLAUDE_SESSION")
             .env_remove("ST_CLAUDE_STATUSLINE_RENDERER")
             .stdin(Stdio::piped())
@@ -192,7 +193,7 @@ fn the_tee_records_the_reading_and_hands_the_same_payload_to_the_env_renderer() 
     );
 
     let record = seat.record().expect("the reading is recorded");
-    assert_eq!(record["schema"], "st2.harness-context.v1");
+    assert_eq!(record["schema"], "st.harness-context.v1");
     assert_eq!(record["harness"], "claude");
     assert_eq!(record["usedTokens"], 194_763);
     assert_eq!(record["windowTokens"], 1_000_000);
