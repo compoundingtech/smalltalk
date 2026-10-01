@@ -783,7 +783,7 @@ mod tests {
     fn example_claude_declaration_registers_the_canonical_hook_settings() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/examples/native/agent-claude.kdl"
+            "/../../examples/native/agent-claude.kdl"
         );
         let raw = std::fs::read_to_string(path).unwrap();
         let document: kdl::KdlDocument = raw.parse().unwrap();

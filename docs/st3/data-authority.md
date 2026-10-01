@@ -74,6 +74,7 @@ order from the same admitted claims.
 | `batches` | Claim-log authority | Accepted local and replicated batch headers |
 | `claims` | Claim-log authority | Accepted local and replicated claims |
 | `blobs` | Content authority | Posted bytes, verified by SHA-256 |
+| `local_blobs` | Local upload staging | Bytes awaiting a durable claim reference; promotion into `blobs` commits with that claim |
 | `operations` | Projection | Claim `_operation` metadata |
 | `documents` | Projection | `doc.bound` claims and blobs |
 | `desired` | Projection | Selected `intent.desired` heads |
@@ -98,6 +99,7 @@ order from the same admitted claims.
 | `replica_envelopes` | Replicated authority | Authenticated outer envelopes and their exact payloads |
 | `replica_records` | Admission state | Envelope records, validation results, and repair references |
 | `projection_health` | Local diagnostic projection | Projection attempts against admitted authority |
+| `projection_digest_repaired_claims` | Local repair exclusion cache | Known original claim identities from replicated repairs; survives receipt cleanup so retained invalid originals cannot rejoin shared source or operation projections |
 | `replica_envelope_signatures` | Replicated authority | Writers' member-key signatures over envelopes, verified at receipt |
 | `replica_envelope_holds` | Admission state | Envelopes held as `unsigned` or `fenced` by fleet membership; retried on each wake |
 | `replication_peers` | Local transport state | Last signed exchange or transport failure for each configured peer |

@@ -29,8 +29,12 @@ let
   binDir = "${cfg.stateDir}/bin";
   executable = "${binDir}/st3";
   environment = cfg.environment // {
-    PATH = binDir + ":" + lib.makeBinPath (lib.optional (cfg.ptyPackage != null) cfg.ptyPackage ++ [ effectivePackage ])
-      + ":/usr/local/bin:/usr/bin:/bin";
+    # The Linux daemon asks the user manager to move PTY servers into their own scopes via busctl.
+    PATH = binDir + ":" + lib.makeBinPath (
+      lib.optional (cfg.ptyPackage != null) cfg.ptyPackage
+      ++ [ effectivePackage ]
+      ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.systemd
+    ) + ":/usr/local/bin:/usr/bin:/bin";
     XDG_CONFIG_HOME = config.xdg.configHome;
     XDG_STATE_HOME = config.xdg.stateHome;
   };
