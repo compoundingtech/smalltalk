@@ -105,16 +105,19 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s scripts/st3-messaging-faults-eval -p 'test_*.py'
 ```
 
-The normal Linux Cargo integration suite runs the complete matrix in
-`messaging_faults::messages_recover_across_transport_and_process_faults`, so `st/ci`
-gates every case on the candidate binary. It builds the actual historical source
+The Linux Cargo integration suite exposes every case as its own `messaging_faults::*` test,
+so the Namespace Linux gate runs the complete matrix in parallel and retries individual cases.
+Each test calls the same eval with `--cases CASE`; all recovery and observation gates remain
+unchanged. The fixture inherits a systemd user runtime only when its bus exists; on runners
+without a user manager, the existing detached task path is exercised. The separate isolation VM
+proves the systemd scope contracts. It builds the actual historical source
 pinned by `.github/messaging-compat-baseline.json` through Nix. That build omits
 checks, other binaries and the retired package's PTY wrapper; its channel source
 and locked Rust dependencies are unchanged. Nix caches the immutable package.
 Set `ST3_MESSAGING_COMPAT_BIN` to use an already built historical executable.
-`ST3_MESSAGING_FAULTS_EVIDENCE` can select a new evidence directory for a local run;
+`ST3_MESSAGING_FAULTS_EVIDENCE` can select a parent directory for per-case local evidence;
 on failure the default temporary evidence directory is retained. CI also retains
-successful normalized evidence under its checkout's `target/messaging-faults/run-*/evidence/`.
+successful normalized evidence under its checkout's `target/messaging-faults/<case>-*/evidence/`.
 
 The daemon push implementation's ten-case evidence is in
 [evidence/2026-10-01-push/result.json](evidence/2026-10-01-push/result.json).

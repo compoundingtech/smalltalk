@@ -55,6 +55,12 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
 /** Provider fixtures, rendered hooks, and the standalone workspace test build. */
 export const testBuildSteps = [
   {
+    name: 'Prepare the historical messaging channel',
+    if: "runner.os == 'Linux'",
+    run: `binary=$(timeout 10m bash scripts/messaging-compat-binary)
+printf 'ST3_MESSAGING_COMPAT_BIN=%s\\n' "$binary" >> "$GITHUB_ENV"`,
+  },
+  {
     name: 'Prepare provider component fixtures',
     run: `system=$(nix eval --impure --raw --expr builtins.currentSystem)
 components=$(nix build ".#checks.$system.provider-components" --no-link --print-out-paths --print-build-logs)
