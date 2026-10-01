@@ -626,15 +626,14 @@ async fn response_envelope(
         .get::<axum::extract::MatchedPath>()
         .map(|route| route.as_str().to_owned())
         .unwrap_or_else(|| "/unmatched".to_owned());
+    let caller = request
+        .extensions()
+        .get::<crate::profile::Caller>()
+        .map(|caller| caller.0.clone())
+        .unwrap_or_else(|| "(tcp)".into());
     let profile = crate::profile::Op::start(
         format!("{} {request_route}", request.method()),
-        Some(
-            request
-                .extensions()
-                .get::<crate::profile::Caller>()
-                .map(|caller| caller.0.clone())
-                .unwrap_or_else(|| "(tcp)".into()),
-        ),
+        Some(caller.clone()),
     );
     let client_request = request.uri().path().starts_with("/v1/client/");
     let fabric_boundary_error = (matches!(transport, ClientTransportBoundary::FabricLoopback)
@@ -701,12 +700,13 @@ async fn response_envelope(
             let runtime = tokio::runtime::Handle::current();
             let handler_profile = profile.clone();
             let cpu_kind = request_route.clone();
+            let cpu_client = caller.clone();
             match tokio::task::spawn_blocking(move || {
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
-                crate::performance::with_cpu(Some(&cpu_kind), || {
+                crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
                     runtime.block_on(next.run(request))
                 })
             })
@@ -724,7 +724,7 @@ async fn response_envelope(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"))
     {
-        record_request_latency(&request_route, &request_path, started);
+        record_request_latency(&request_route, &request_path, &caller, started);
         if let Some(profile) = profile {
             profile.finish();
         }
@@ -806,7 +806,7 @@ async fn response_envelope(
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    record_request_latency(&request_route, &request_path, started);
+    record_request_latency(&request_route, &request_path, &caller, started);
     if let Some(profile) = profile {
         profile.enveloped(enveloping.elapsed(), body.len());
         profile.finish();
@@ -854,9 +854,9 @@ fn request_latency_snapshot() -> Vec<Value> {
         .collect()
 }
 
-fn record_request_latency(route: &str, path: &str, started: Instant) {
+fn record_request_latency(route: &str, path: &str, caller: &str, started: Instant) {
     let elapsed = started.elapsed();
-    crate::performance::record_request(route, elapsed);
+    crate::performance::record_request(route, Some(caller), elapsed);
     {
         let mut routes = request_latency().lock().unwrap();
         if routes.len() < 256 || routes.contains_key(route) {
@@ -3849,7 +3849,7 @@ where
     let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
+        crate::performance::with_charged(cpu_kind, operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -3865,7 +3865,7 @@ where
     let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
+        crate::performance::with_charged(cpu_kind, operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -3883,7 +3883,7 @@ where
     let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
+        crate::performance::with_charged(cpu_kind, operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -3961,11 +3961,8 @@ async fn serve_unix_with_ancestor(
                 continue;
             }
         };
-        let peer_pid = if bind_harness || crate::profile::enabled() {
-            local_peer_pid(&stream)
-        } else {
-            None
-        };
+        // Every local connection names its caller, so request counts by client are always on.
+        let peer_pid = local_peer_pid(&stream);
         let app = app.clone();
         tokio::spawn(async move {
             // /proc ancestry may fault in pages on a loaded host. Keep that work
@@ -3973,8 +3970,10 @@ async fn serve_unix_with_ancestor(
             let (bound_agent, caller, delivery_peer) = match peer_pid {
                 Some(pid) => tokio::task::spawn_blocking(move || {
                     let bound_agent = bind_harness.then(|| ancestor(pid)).flatten();
-                    let caller = crate::profile::enabled()
-                        .then(|| crate::profile::Caller::of_peer(pid, bound_agent.as_deref()));
+                    let caller = Some(crate::profile::Caller::of_command(
+                        local_process_arguments(pid).map(|(arguments, _)| arguments),
+                        bound_agent.as_deref(),
+                    ));
                     let delivery_peer = bind_harness.then(|| native_delivery_peer(pid)).flatten();
                     (bound_agent, caller, delivery_peer)
                 })
@@ -11628,6 +11627,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         record_request_latency(
             "/v1/client/agents",
             "/v1/client/agents",
+            "stui",
             Instant::now() - Duration::from_secs(2),
         );
         // The old implementation spawned a blocking write, so give that write
