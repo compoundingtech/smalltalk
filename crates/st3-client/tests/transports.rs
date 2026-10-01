@@ -890,7 +890,10 @@ async fn attach_terminal(client: &Client, suffix: &str) -> TerminalAttachment {
         });
     let terminal_id = runtime.terminal_id.as_deref().unwrap();
     let incarnation = runtime.incarnation_id.as_deref().unwrap();
-    let terminal_sequence = runtime.terminal_sequence.unwrap();
+    assert!(
+        runtime.terminal_sequence.is_none(),
+        "screen fences are not graph indices"
+    );
     assert_eq!(runtime.terminal_access.as_ref().unwrap().read, "granted");
     client
         .terminal_attach(
@@ -899,7 +902,6 @@ async fn attach_terminal(client: &Client, suffix: &str) -> TerminalAttachment {
             Fence {
                 snapshot_id: runtimes.snapshot.id,
                 runtime_incarnation: Some(incarnation.into()),
-                terminal_sequence: Some(terminal_sequence),
                 ..Fence::default()
             },
             TargetParameters {
@@ -923,7 +925,6 @@ async fn detach_terminal(client: &Client, attachment: &TerminalAttachment, suffi
             Fence {
                 snapshot_id: capabilities.snapshot.id,
                 runtime_incarnation: Some(attachment.runtime_incarnation.clone()),
-                terminal_sequence: Some(capabilities.snapshot.store_index),
                 ..Fence::default()
             },
             TargetParameters {
@@ -1262,7 +1263,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
                 Fence {
                     snapshot_id: read_only_fence.snapshot.id.clone(),
                     runtime_incarnation: Some(read_only_attachment.runtime_incarnation.clone()),
-                    terminal_sequence: Some(read_only_fence.snapshot.store_index),
+                    terminal_sequence: Some(read_only_screen.value.next_sequence),
                     ..Fence::default()
                 },
                 TerminalInputParameters {
@@ -1279,7 +1280,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
                 Fence {
                     snapshot_id: read_only_fence.snapshot.id.clone(),
                     runtime_incarnation: Some(read_only_attachment.runtime_incarnation.clone()),
-                    terminal_sequence: Some(read_only_fence.snapshot.store_index),
+                    terminal_sequence: Some(read_only_screen.value.next_sequence),
                     ..Fence::default()
                 },
                 TerminalResizeParameters {
@@ -1317,7 +1318,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
             Fence {
                 snapshot_id: control_fence.snapshot.id.clone(),
                 runtime_incarnation: Some(first_attachment.runtime_incarnation.clone()),
-                terminal_sequence: Some(control_fence.snapshot.store_index),
+                terminal_sequence: Some(first.value.next_sequence),
                 ..Fence::default()
             },
             TerminalInputParameters {

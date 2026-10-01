@@ -6,12 +6,14 @@ name: macOS CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: "macos-${{ github.event.pull_request.number || github.ref }}"
+  group: "macos-${{ github.event.pull_request.number || github.run_id }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -50,8 +52,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix3-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
-          restore-keys: "nix3-${{ github.job }}-${{ runner.os }}-"
+          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -75,6 +77,11 @@ jobs:
       - name: Use the cached Nix outputs
         if: runner.os == 'Linux'
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
+      - name: Prepare the historical messaging channel
+        if: runner.os == 'Linux'
+        run: |
+          binary=$(timeout 10m bash scripts/messaging-compat-binary)
+          printf 'ST3_MESSAGING_COMPAT_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Prepare provider component fixtures
         run: |
           system=$(nix eval --impure --raw --expr builtins.currentSystem)

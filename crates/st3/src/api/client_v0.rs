@@ -893,6 +893,9 @@ const ACTIONS: &[&str] = &[
     "work.release",
     "work.retry",
     "work.publish-mission",
+    "agent.create",
+    "terminal.create",
+    "terminal.end",
     "agent.queue-move",
     "lane.join",
     "lane.leave",
@@ -937,6 +940,9 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "work.fail",
     "work.release",
     "work.retry",
+    "agent.create",
+    "terminal.create",
+    "terminal.end",
     "agent.queue-move",
     "lane.join",
     "lane.leave",
@@ -1044,7 +1050,10 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
-        } else if session.allows(scope) {
+        } else if session.allows(scope)
+            && (!matches!(*action, "agent.create" | "terminal.create" | "terminal.end")
+                || require_creation_actor(session).is_ok())
+        {
             "granted"
         } else {
             "ungranted"
@@ -1784,7 +1793,8 @@ fn runtime_resources(
             "desired_revision": desired_revision,
             "owner_run_id": selected.owner_run,
             "terminal_id": terminal_id,
-            "terminal_sequence": terminal.then_some(snapshot.store_index),
+            // Screen fences come from terminal.screen, never from a graph projection.
+            "terminal_sequence": null,
             "terminal_access": terminal.then(|| json!({
                 "read": if local && session.allows("terminal.read") { "granted" } else { "unavailable" },
                 "input": if local && session.allows("terminal.control") { "granted" } else { "unavailable" },
@@ -5302,11 +5312,7 @@ async fn terminal_screen_value(
             screen = changed;
         }
     }
-    Ok(screen.value(
-        &client_detail_id("terminal", id),
-        &live.incarnation_id,
-        state.store.index().map_err(ApiError::internal)?,
-    ))
+    Ok(screen.value(&client_detail_id("terminal", id), &live.incarnation_id))
 }
 
 #[derive(Default, Deserialize)]
@@ -6270,12 +6276,7 @@ async fn terminal_stream_socket(
         if sent.as_deref() == Some(screen.revision()) {
             continue;
         }
-        let Ok(next_sequence) = state.store.index() else {
-            sink.fail(&ApiError::internal("the store index is unavailable"))
-                .await;
-            return;
-        };
-        let value = screen.value(&terminal_id, &live.incarnation_id, next_sequence);
+        let value = screen.value(&terminal_id, &live.incarnation_id);
         if !sink.send(&terminal_stream_envelope(&state, value)).await {
             sink.close(1009, "terminal screen exceeds the client limit")
                 .await;
@@ -6314,6 +6315,9 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
+    if action == "agent.create" {
+        return Some("control.runtimes");
+    }
     if action == "work.done" {
         return Some("control.attention");
     }
@@ -6631,6 +6635,7 @@ fn validate_fence(
     state: &AppState,
     _snapshot: &ClientSnapshot,
     fence: &Fence,
+    terminal_view_action: bool,
 ) -> Result<(), ApiError> {
     let parsed = fence
         .snapshot_id
@@ -6640,7 +6645,14 @@ fn validate_fence(
     let current_index = state.store.index().map_err(ApiError::internal)?;
     let expected_host = state.node.replace(char::is_whitespace, "-");
     if !parsed.is_some_and(|(host, index)| {
-        host == expected_host && index.parse::<u64>().ok() == Some(current_index)
+        host == expected_host
+            && index.parse::<u64>().ok().is_some_and(|index| {
+                if terminal_view_action {
+                    index <= current_index
+                } else {
+                    index == current_index
+                }
+            })
     }) {
         return Err(stale(
             "the client snapshot changed before the action was submitted",
@@ -6681,6 +6693,260 @@ fn validate_fence(
     Ok(())
 }
 
+// Creation uses a session-scoped key in both the declaration and apply receipt. A retried
+// dispatch after a lost action receipt recovers the existing member, rather than publishing twice.
+fn creation_key(session: &ClientSession, request: &ActionRequest) -> String {
+    hex::encode(Sha256::digest(format!(
+        "{}:{}",
+        session.actor, request.idempotency_key
+    )))
+}
+fn require_creation_actor(session: &ClientSession) -> Result<&str, ApiError> {
+    if !acting_party(session) {
+        return Err(forbidden(
+            "creation requires the session's concrete person or local agent",
+        ));
+    }
+    Ok(&session.authority_actor)
+}
+
+fn creation_string(value: &str, field: &str, max: usize) -> Result<(), ApiError> {
+    if value.trim().is_empty() || value.len() > max || value.contains('\0') {
+        return Err(validation(format!(
+            "{field} must be nonempty, without NUL, and at most {max} bytes"
+        )));
+    }
+    Ok(())
+}
+fn existing_creation(
+    state: &AppState,
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<Option<String>, ApiError> {
+    let key = creation_key(session, request);
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&request.parameters).map_err(ApiError::internal)?,
+    ));
+    for desired in state.store.desired_subjects().map_err(ApiError::internal)? {
+        if let Some(member) = &desired.member
+            && member.tags.get("st3.client.create-key") == Some(&key)
+        {
+            if member.tags.get("st3.client.create-parameters") != Some(&digest) {
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    code: "idempotency-conflict".into(),
+                    message: "creation key already used for different parameters".into(),
+                    details: Box::default(),
+                });
+            }
+            return Ok(Some(if request.action_type == "terminal.create" {
+                format!("terminal/{}", desired.subject)
+            } else {
+                desired.subject
+            }));
+        }
+    }
+    Ok(None)
+}
+async fn publish_creation(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    request: &ActionRequest,
+    kdl: String,
+    kind: &str,
+) -> Result<String, ApiError> {
+    let mut document: kdl::KdlDocument = kdl
+        .parse()
+        .map_err(|error: kdl::KdlError| validation(error.to_string()))?;
+    let node = document
+        .nodes_mut()
+        .iter_mut()
+        .find(|node| node.name().value() == kind)
+        .unwrap();
+    let tags = node
+        .children_mut()
+        .as_mut()
+        .unwrap()
+        .nodes_mut()
+        .iter_mut()
+        .find(|node| node.name().value() == "tags")
+        .unwrap();
+    tags.entries_mut().push(kdl::KdlEntry::new_prop(
+        "st3.client.create-parameters",
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&request.parameters).map_err(ApiError::internal)?,
+        )),
+    ));
+    document.autoformat();
+    let kdl = document.to_string();
+    let intent = crate::graph::parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
+    let subject = intent
+        .subjects
+        .values()
+        .find(|subject| subject.kind == kind)
+        .ok_or_else(|| validation("creation declares no member"))?
+        .subject
+        .clone();
+    let key = creation_key(session, request);
+    if let Some(existing) = state
+        .store
+        .desired_subjects()
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|member| member.subject == subject)
+    {
+        if existing
+            .member
+            .as_ref()
+            .and_then(|member| member.tags.get("st3.client.create-key"))
+            == Some(&key)
+            && existing.desired
+                == intent
+                    .subjects
+                    .values()
+                    .find(|member| member.subject == subject)
+                    .unwrap()
+                    .desired
+        {
+            return Ok(subject);
+        }
+        if kind != "agent" || existing.kind != "stop" {
+            return Err(validation(format!(
+                "{subject} already exists; use a different name or idempotency key"
+            )));
+        }
+    }
+    let mut scoped = request.clone();
+    scoped.idempotency_key = format!("client-create:{key}");
+    apply_runtime_control_intent(state, snapshot, &scoped, &session.authority_actor, kdl).await?;
+    Ok(subject)
+}
+async fn create_agent(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<Vec<String>, ApiError> {
+    require_creation_actor(session)?;
+    let mut parameters: st3_client::AgentCreateParameters =
+        serde_json::from_value(request.parameters.clone())
+            .map_err(|error| validation(error.to_string()))?;
+    creation_string(&parameters.name, "name", 160)?;
+    if !crate::skill::HARNESSES.contains(&parameters.harness.as_str()) {
+        return Err(validation("unknown harness"));
+    }
+    for (field, value) in [
+        ("model", &parameters.model),
+        ("effort", &parameters.effort),
+        ("host", &parameters.host),
+        ("description", &parameters.description),
+    ] {
+        if let Some(value) = value {
+            creation_string(value, field, 4096)?;
+        }
+    }
+    if let Some(message) = &parameters.message {
+        creation_string(message, "message", 65536)?;
+    }
+    if let Some(id) = existing_creation(state, session, request)? {
+        return Ok(vec![id]);
+    }
+    let host = parameters
+        .host
+        .as_deref()
+        .unwrap_or(&state.node)
+        .trim_start_matches("host/")
+        .to_owned();
+    let host = if host == "local" {
+        state.node.clone()
+    } else {
+        host
+    };
+    creation_string(&host, "host", 160)?;
+    parameters.host = Some(host.clone());
+    let workspace = if let Some(workspace) = &parameters.workspace {
+        workspace.clone()
+    } else if host == state.node {
+        crate::config::default_agent_workspace(&parameters.name)
+            .map_err(|error| validation(error.to_string()))?
+            .display()
+            .to_string()
+    } else {
+        let relay = state
+            .client_relay
+            .as_ref()
+            .filter(|relay| relay.reaches(&client_host_id(&host)))
+            .ok_or_else(|| remote_unavailable(&client_host_id(&host)))?;
+        let value = relay
+            .read(
+                &client_host_id(&host),
+                &crate::peer::ClientReadRequest {
+                    authority_actor: session.authority_actor.clone(),
+                    relay: None,
+                    request: crate::peer::ClientReadOperation::AgentWorkspace {
+                        identity: parameters.name.clone(),
+                    },
+                },
+            )
+            .await
+            .map_err(|error| remote_read_error(&client_host_id(&host), error))?;
+        value["workspace"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("host returned no workspace"))?
+            .to_owned()
+    };
+    creation_string(&workspace, "workspace", 4096)?;
+    if !std::path::Path::new(&workspace).is_absolute() {
+        return Err(validation(
+            "workspace must be absolute on the selected host",
+        ));
+    }
+    let kdl = crate::creation::agent_document(
+        &parameters,
+        &workspace,
+        true,
+        Some(&creation_key(session, request)),
+    );
+    Ok(vec![
+        publish_creation(state, snapshot, session, request, kdl, "agent").await?,
+    ])
+}
+async fn create_terminal(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<Vec<String>, ApiError> {
+    let person = require_creation_actor(session)?;
+    let parameters: st3_client::TerminalCreateParameters =
+        serde_json::from_value(request.parameters.clone())
+            .map_err(|error| validation(error.to_string()))?;
+    creation_string(&parameters.name, "name", 160)?;
+    if let Some(id) = existing_creation(state, session, request)? {
+        return Ok(vec![id]);
+    }
+    let host = parameters
+        .host
+        .as_deref()
+        .unwrap_or(&state.node)
+        .trim_start_matches("host/");
+    creation_string(host, "host", 160)?;
+    let cwd = parameters.cwd.as_deref().unwrap_or(".");
+    creation_string(cwd, "cwd", 4096)?;
+    if cwd != "." && !std::path::Path::new(cwd).is_absolute() {
+        return Err(validation("cwd must be absolute on the selected host"));
+    }
+    let key = creation_key(session, request);
+    let mut bytes: [u8; 16] = hex::decode(&key[..32]).unwrap().try_into().unwrap();
+    bytes[6] = (bytes[6] & 15) | 0x80; // UUIDv8: stable, session-scoped creation identity.
+    bytes[8] = (bytes[8] & 63) | 0x80;
+    let id = uuid::Uuid::from_bytes(bytes).to_string();
+    let kdl = crate::creation::terminal_document(person, &id, &parameters, host, cwd, &key);
+    let subject = publish_creation(state, snapshot, session, request, kdl, "pty").await?;
+    Ok(vec![format!("terminal/{subject}")])
+}
+
 async fn dispatch_action(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -6690,6 +6956,35 @@ async fn dispatch_action(
     let p = &request.parameters;
     let authority_actor = &session.authority_actor;
     match request.action_type.as_str() {
+        "agent.create" => create_agent(state, snapshot, session, request).await,
+        "terminal.create" => create_terminal(state, snapshot, session, request).await,
+        "terminal.end" => {
+            let person = require_creation_actor(session)?;
+            let subject = terminal_subject(&parameter_string(p, "target_id")?);
+            if st3_schema::owned_terminals::owner(&subject)
+                .map_err(|error| validation(error.message))?
+                != Some(person)
+            {
+                return Err(forbidden("only the terminal's creator may end it"));
+            }
+            if state
+                .store
+                .selected_desired_token(&subject)
+                .map_err(ApiError::internal)?
+                .is_none()
+            {
+                return Err(ApiError::not_found("terminal does not exist"));
+            }
+            let kdl = format!(
+                "version 2\nstop {}\n",
+                serde_json::to_string(&subject).map_err(ApiError::internal)?
+            );
+            let mut scoped = request.clone();
+            scoped.idempotency_key =
+                format!("client-terminal-end:{}", creation_key(session, request));
+            apply_runtime_control_intent(state, snapshot, &scoped, person, kdl).await?;
+            Ok(vec![format!("terminal/{subject}")])
+        }
         decision @ ("review.approve" | "review.reject" | "review.request-changes") => {
             let target = parameter_string(p, "target_id")?;
             let result = post_review(
@@ -7441,6 +7736,12 @@ pub(super) async fn action(
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
     require_scope(&session, scope)?;
+    // Terminal views/control are fenced by their own screen and incarnation, not unrelated
+    // graph writes. Keep declaration mutations on the strict whole-snapshot fence.
+    let terminal_view_action = matches!(
+        request.action_type.as_str(),
+        "terminal.attach" | "terminal.detach" | "terminal.input" | "terminal.resize"
+    );
     let read_only_terminal_lifecycle = matches!(
         request.action_type.as_str(),
         "terminal.attach" | "terminal.detach"
@@ -7504,7 +7805,7 @@ pub(super) async fn action(
         let live =
             remote_terminal_live_session(&state, &terminal_subject(&terminal_id), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) {
-            validate_fence(&state, &snapshot, &request.fence)?;
+            validate_fence(&state, &snapshot, &request.fence, terminal_view_action)?;
             let expected_sequence = request
                 .fence
                 .terminal_sequence
@@ -7536,24 +7837,45 @@ pub(super) async fn action(
             return Ok(Json(value));
         }
     }
-    let mut reconciled_attachment = None;
-    let fence_result = (|| {
-        validate_fence(&state, &snapshot, &request.fence)?;
-        if request.action_type.starts_with("terminal.")
-            && request.action_type != "terminal.detach"
-            && request.fence.terminal_sequence
-                != Some(state.store.index().map_err(ApiError::internal)?)
-        {
+    if matches!(
+        request.action_type.as_str(),
+        "terminal.input" | "terminal.resize"
+    ) {
+        let terminal_id = parameter_string(&request.parameters, "terminal_id")?;
+        let incarnation = request
+            .fence
+            .runtime_incarnation
+            .as_deref()
+            .ok_or_else(|| validation("terminal control requires an incarnation fence"))?;
+        let expected = request
+            .fence
+            .terminal_sequence
+            .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
+        let screen = terminal_screen_value(
+            &state,
+            &terminal_id,
+            Some(incarnation),
+            None,
+            Duration::ZERO,
+        )
+        .await?;
+        if screen["next_sequence"].as_u64() != Some(expected) {
             return Err(stale("the terminal sequence fence is stale"));
         }
-        Ok(())
-    })();
+    }
+    let mut reconciled_attachment = None;
+    let fence_result = validate_fence(&state, &snapshot, &request.fence, terminal_view_action);
     if let Err(error) = fence_result {
         if request.action_type == "terminal.attach" {
             reconciled_attachment =
                 existing_terminal_attachment(&state, &session, &request, &request_digest)?;
         }
-        if reconciled_attachment.is_none() {
+        let recovered_creation = matches!(
+            request.action_type.as_str(),
+            "agent.create" | "terminal.create"
+        ) && require_creation_actor(&session).is_ok()
+            && existing_creation(&state, &session, &request)?.is_some();
+        if reconciled_attachment.is_none() && !recovered_creation {
             return Err(error);
         }
     }
@@ -8057,6 +8379,69 @@ subscription "watch/source" {
         assert_eq!(gate("watch"), "watch");
         assert_eq!(gate("flag"), "predicate");
         assert_eq!(gate("command"), "command");
+    }
+
+    #[tokio::test]
+    async fn creation_recovers_committed_declarations_before_the_action_receipt() {
+        for kind in ["agent.create", "terminal.create"] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state_named(root.path(), "create-recovery");
+            let session = ClientSession::local(Some("person/ada")).unwrap();
+            let snapshot = new_client_snapshot(&state);
+            let parameters = if kind == "agent.create" {
+                json!({"name":"worker", "harness":"codex", "workspace":"/tmp", "message":"First"})
+            } else {
+                json!({"name":"Shell", "cwd":"/tmp"})
+            };
+            let request = ActionRequest {
+                api_version: CLIENT_API_VERSION.into(),
+                id: "action/recovery".into(),
+                action_type: kind.into(),
+                idempotency_key: "creation-recovery-001".into(),
+                fence: Fence {
+                    snapshot_id: snapshot.id.clone(),
+                    ..Default::default()
+                },
+                parameters,
+            };
+            let ids = dispatch_action(&state, &snapshot, &session, &request)
+                .await
+                .unwrap();
+            assert_eq!(
+                existing_creation(&state, &session, &request).unwrap(),
+                Some(ids[0].clone())
+            );
+            let result = action(
+                State(state.clone()),
+                Extension(snapshot.clone()),
+                Extension(session.clone()),
+                Json(request.clone()),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(result["affected_ids"], json!(ids));
+            assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
+            let mut changed = request.clone();
+            changed.parameters["name"] = json!("different");
+            assert_eq!(
+                existing_creation(&state, &session, &changed)
+                    .unwrap_err()
+                    .code,
+                "idempotency-conflict"
+            );
+            // Retry after the receipt exists recovers it despite the original stale snapshot.
+            let retry = action(
+                State(state.clone()),
+                Extension(new_client_snapshot(&state)),
+                Extension(session),
+                Json(request),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(retry["affected_ids"], result["affected_ids"]);
+        }
     }
 
     #[tokio::test]
@@ -11557,6 +11942,196 @@ mission "example/zero-run" state="ready" {
                 claim.kind
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_actions_survive_unrelated_writes_but_reject_changed_screens() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let Some(pty) = std::env::split_paths(&path)
+            .map(|dir| dir.join("pty"))
+            .find(|p| p.is_file())
+        else {
+            assert!(std::env::var_os("CI").is_none(), "CI must provide pty");
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state(root.path());
+        state.pty_binary = pty.clone();
+        let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
+            .with_binary(pty.to_string_lossy());
+        struct Cleanup(st_runtime::PtyRuntime);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.stop("fence-test");
+                let _ = self.0.remove("fence-test");
+            }
+        }
+        let _cleanup = Cleanup(runtime.clone());
+        let pty_root = state.pty_root.clone();
+        let output = tokio::task::spawn_blocking(move || std::process::Command::new(pty)
+            .env("PTY_ROOT", pty_root)
+            .args(["run", "-d", "--force", "--id", "fence-test", "--tag", "keep=true", "--", "/bin/sh", "-c", "stty -echo; printf ready; while IFS= read -r line; do printf '\\r\\naccepted:%s' \"$line\"; done"])
+            .output().unwrap()).await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let live = runtime
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|live| live.name == "fence-test")
+            .unwrap();
+        let incarnation = format!("{}:{}", live.pid.unwrap(), live.created_at.unwrap());
+        let observe = |incarnation: &str| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/fence-test".into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("runtime_id".into(), json!("fence-test")),
+                        ("incarnation_id".into(), json!(incarnation)),
+                        ("status".into(), json!("running")),
+                        ("terminal".into(), json!(true)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        observe(&incarnation);
+        let screen = terminal_screen_value(
+            &state,
+            "agent/fence-test",
+            Some(&incarnation),
+            None,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let fence = Fence {
+            snapshot_id: snapshot.id.clone(),
+            runtime_incarnation: Some(incarnation.clone()),
+            terminal_sequence: Some(screen["next_sequence"].as_u64().unwrap()),
+            ..Default::default()
+        };
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let request =
+            |action_type: &str, key: &str, fence: Fence, parameters: Value| ActionRequest {
+                api_version: CLIENT_API_VERSION.into(),
+                id: format!("action/{key}"),
+                action_type: action_type.into(),
+                idempotency_key: format!("terminal-fence-test-{key}"),
+                fence,
+                parameters,
+            };
+        // A graph update after the client read must not invalidate this terminal's view.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/unrelated".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), json!("vanished"))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(
+            validate_fence(&state, &snapshot, &fence, false).is_err(),
+            "declaration mutations remain strict"
+        );
+        let mut attach_fence = fence.clone();
+        attach_fence.terminal_sequence = None;
+        let _ = action(
+            State(state.clone()),
+            Extension(snapshot.clone()),
+            Extension(session.clone()),
+            Json(request(
+                "terminal.attach",
+                "fence-attach",
+                attach_fence,
+                json!({"target_id":"terminal/agent/fence-test"}),
+            )),
+        )
+        .await
+        .unwrap();
+        let _ = action(
+            State(state.clone()),
+            Extension(snapshot.clone()),
+            Extension(session.clone()),
+            Json(request(
+                "terminal.input",
+                "fence-input",
+                fence.clone(),
+                json!({"terminal_id":"terminal/agent/fence-test","mode":"line","value":"hello"}),
+            )),
+        )
+        .await
+        .unwrap();
+        let changed = terminal_screen_value(
+            &state,
+            "agent/fence-test",
+            Some(&incarnation),
+            screen["revision"].as_str(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_ne!(screen["next_sequence"], changed["next_sequence"]);
+        assert!(changed.to_string().contains("accepted:hello"));
+        for action_type in ["terminal.input", "terminal.resize"] {
+            let parameters = if action_type == "terminal.input" {
+                json!({"terminal_id":"terminal/agent/fence-test","mode":"line","value":"must-not-land"})
+            } else {
+                json!({"terminal_id":"terminal/agent/fence-test","rows":20,"columns":80})
+            };
+            let error = action(
+                State(state.clone()),
+                Extension(snapshot.clone()),
+                Extension(session.clone()),
+                Json(request(action_type, action_type, fence.clone(), parameters)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "stale-fence");
+        }
+        let mut foreign = fence.clone();
+        foreign.snapshot_id = foreign.snapshot_id.replacen(&state.node, "another-host", 1);
+        assert!(validate_fence(&state, &snapshot, &foreign, true).is_err());
+        let mut future = fence.clone();
+        future.snapshot_id = format!(
+            "snapshot/{}/{}/digest",
+            state.node,
+            state.store.index().unwrap() + 1
+        );
+        assert!(validate_fence(&state, &snapshot, &future, true).is_err());
+        let mut revision = fence.clone();
+        revision
+            .subject_revisions
+            .insert("agent/unrelated".into(), "old-revision".into());
+        assert!(validate_fence(&state, &snapshot, &revision, true).is_err());
+        observe("replacement-incarnation");
+        let error = action(
+            State(state.clone()),
+            Extension(snapshot),
+            Extension(session),
+            Json(request(
+                "terminal.attach",
+                "fence-replaced",
+                fence,
+                json!({"target_id":"terminal/agent/fence-test"}),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "stale-fence");
     }
 
     #[test]

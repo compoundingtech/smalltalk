@@ -9,6 +9,7 @@ import { Banners, Empty, StatusLine, useDebugScroll, useListsOnFocus, useRefresh
 import { MISSION_LEGEND, missionRows, missionSections, missionTitle, missionWord, stepStyle, wordName, wordStyle, type MissionRow } from '../missionsView';
 import type { RootParams, RootScreen } from '../navigation';
 import { missionSteps } from '../presentation';
+import { homeRows } from '../homeView';
 import { useStore, type Planner } from '../store';
 import { theme } from '../theme';
 import { Button, Field, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
@@ -77,7 +78,7 @@ export function MissionsScreen() {
 
 // One mission: what finished, what is happening, what is next, and who holds each step.
 export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
-  const { data, status, actions } = useStore();
+  const { data, status, actions, caps } = useStore();
   const listed = data.missions.find(mission => mission.id === route.params.id);
   const [detail, setDetail] = useState<Mission | null>(null);
   useEffect(() => { let live = true; void actions.mission(route.params.id).then(found => { if (live && found) setDetail(found); }); return () => { live = false; }; }, [route.params.id, listed?.revision, status]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -88,6 +89,8 @@ export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
   const steps = [...missionSteps(mission)].sort((a, b) => stepStyle(a.state).rank - stepStyle(b.state).rank || a.path.localeCompare(b.path));
   const runs = mission.run_details ?? [];
   const outcome = runs.at(-1)?.outcome;
+  // What this mission waits on the person for, first and answerable: each opens its card.
+  const waiting = homeRows(data.attention.filter(item => item.mission_id === mission.id), caps?.session_actor);
   return <Screen>
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingBottom: 32 }}>
@@ -96,6 +99,17 @@ export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
         <T dim selectable>{mission.id}</T>
         {outcome ? <T soft>set {outcome.status}{outcome.previous_status ? ` (was ${outcome.previous_status})` : ''} by {outcome.actor}: {outcome.reason}</T> : null}
       </View>
+      {waiting.length ? <>
+        <SectionHeader title="needs you" count={waiting.length} color={theme.person} />
+        {waiting.map(row => <ListRow
+          key={row.item.id}
+          glyph={row.glyph}
+          glyphColor={row.color}
+          title={<T numberOfLines={2}><T color={row.color}>{row.kind} </T><T bold>{row.title}</T></T>}
+          second="tap to answer"
+          onPress={() => navigation.navigate('Attention', { id: row.item.id })}
+        />)}
+      </> : null}
       <SectionHeader title="steps" count={steps.length} />
       {steps.map(step => {
         const style = stepStyle(step.state);

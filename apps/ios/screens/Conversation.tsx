@@ -6,13 +6,20 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
 import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName } from '../agentsView';
 import { Banners } from '../chrome';
-import { conversationEntries, entryMatches, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
+import rules from '../../../fixtures/clients/conversation-style.json';
+import { tokenColor, type ConversationRules } from '../conversationStyle';
+import { COLLAPSED_TOOL_LINES, conversationEntries, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
 import { rememberBounded } from '../boundedCache';
+import { sessionPerson } from '../homeView';
 import type { RootScreen } from '../navigation';
 import { applyConversation, isUnresolved, type Conversation } from '../sessionView';
 import { useStore } from '../store';
 import { fonts, theme } from '../theme';
-import { Button, Field, Markdown, T } from '../ui';
+import { Button, Field, LINE, Markdown, T } from '../ui';
+
+// Drawn by stui's rules (fixtures/clients/conversation-style.json), so both apps look alike.
+const RULES: ConversationRules = rules;
+const c = tokenColor;
 
 const empty: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1 };
 type Pending = { id: string; text: string; at: string; failed?: string };
@@ -35,10 +42,13 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const unresolved = session ? isUnresolved(session) : false;
   const title = route.params.title ?? (agent ? agentName(agent) : session?.driver ?? target.split('/').pop() ?? target);
   const [timeline, setTimeline] = useState<Conversation<TimelineEntry>>(() => conversationCache.current.get(target) ?? empty);
+  // Whether st has answered at all: until it has, the screen says it is loading, never "nothing".
+  const [loaded, setLoaded] = useState(() => conversationCache.current.has(target));
   const [issue, setIssue] = useState('');
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
   const [pending, setPending] = useState<Pending[]>([]);
   const [find, setFind] = useState('');
+  const [findOpen, setFinding] = useState(false);
   const [draft, setDraft] = useState(() => draftCache.current.get(target) ?? '');
   const [away, setAway] = useState(false);
   const list = useRef<FlatList<Row>>(null);
@@ -57,19 +67,16 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     const runtime = agent && agent.runtime_ids.length && !['stopped', 'failed'].includes(agent.state) ? agent.runtime_ids[0] : undefined;
     navigation.setOptions({
       title,
-      // Finding in the conversation: only the entries that say it stay, newest first.
-      headerSearchBarOptions: {
-        placeholder: 'Find in this conversation',
-        hideWhenScrolling: true,
-        autoCapitalize: 'none',
-        onChangeText: event => setFind(event.nativeEvent.text),
-        onCancelButtonPress: () => setFind(''),
-      },
       // A native bar button: the agent's live terminal, while it has one.
-      unstable_headerRightItems: () => runtime ? [{
-        type: 'button', label: 'Terminal', icon: { type: 'sfSymbol', name: 'terminal' }, disabled: status !== 'online',
-        onPress: () => void actions.runtimeTerminal(runtime).then(terminalId => { if (terminalId) navigation.navigate('Terminal', { terminalId, title }); }),
-      }] : [],
+      // Find opens a field above the conversation. A native header search bar blurred an
+      // inverted conversation and took its taps.
+      unstable_headerRightItems: () => [
+        { type: 'button' as const, label: 'Find', icon: { type: 'sfSymbol' as const, name: 'magnifyingglass' as const }, onPress: () => setFinding(open => !open) },
+        ...(runtime ? [{
+          type: 'button' as const, label: 'Terminal', icon: { type: 'sfSymbol' as const, name: 'terminal' as const }, disabled: status !== 'online',
+          onPress: () => void actions.runtimeTerminal(runtime).then(terminalId => { if (terminalId) navigation.navigate('Terminal', { terminalId, title }); }),
+        }] : []),
+      ],
     });
   }, [navigation, title, agent, status, actions]);
 
@@ -79,6 +86,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     setIssue('');
     const follow = feed.followConversation(target, {
       onEntries: frame => setTimeline(previous => {
+        setLoaded(true);
         const next = applyConversation(previous, frame);
         rememberBounded(conversationCache.current, target, next, 24);
         return next;
@@ -90,7 +98,10 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
 
   const names = useMemo(() => {
     const map = new Map(data.agents.map(candidate => [candidate.id, agentName(candidate)]));
+    // The phone's session acts for a person (`person/NAME/session/…`); mail names the person.
+    const person = sessionPerson(caps?.session_actor);
     if (caps?.session_actor) map.set(caps.session_actor, 'you');
+    if (person) map.set(person, 'you');
     return map;
   }, [data.agents, caps?.session_actor]);
   // Half a conversation is worse than none: when st could not read the transcript, say why.
@@ -100,7 +111,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   useEffect(() => {
     setPending(previous => previous.filter(item => item.failed || !entries.some(entry => entry.body.kind === 'mail' && entry.body.from === 'you' && entry.body.text.trim() === item.text.trim())));
   }, [entries]);
-  const finding = find.trim() !== '';
+  const finding = findOpen && find.trim() !== '';
   const found = useMemo(() => finding ? entries.filter(entry => entryMatches(entry, find)) : entries, [entries, find, finding]);
   const rows: Row[] = useMemo(() => [
     ...(finding ? [] : [...pending].reverse().map(item => ({ kind: 'pending' as const, pending: item }))),
@@ -126,6 +137,10 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     <Banners />
     {agent ? <AgentStrip agent={agent} onMission={(id, missionTitle) => navigation.navigate('Mission', { id, title: missionTitle })} /> : session ? <View style={styles.strip}><T dim numberOfLines={1}>{session.driver ?? 'harness'} · {session.state} · {session.id}</T></View> : null}
     {issue ? <View style={styles.strip}><T color={theme.waiting}>{issue}</T></View> : null}
+    {findOpen ? <View style={[styles.strip, { flexDirection: 'row', alignItems: 'center', gap: 8 }]}>
+      <Field value={find} onChangeText={setFind} placeholder="Find in this conversation" autoFocus autoCapitalize="none" returnKeyType="search" style={{ flex: 1 }} />
+      <Pressable accessibilityRole="button" onPress={() => { setFinding(false); setFind(''); }}><T color={theme.accent}>Done</T></Pressable>
+    </View> : null}
     {finding ? <View style={styles.strip}><T color={theme.yellow}>{found.length === 0 ? `Nothing here says “${find.trim()}”` : `${found.length} ${found.length === 1 ? 'entry says' : 'entries say'} “${find.trim()}”`}</T></View> : null}
     <FlatList
       ref={list}
@@ -134,8 +149,10 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       keyExtractor={row => row.kind === 'entry' ? row.entry.id : row.kind === 'pending' ? row.pending.id : 'older'}
       renderItem={({ item: row }) => row.kind === 'older'
         ? <View style={styles.entry}><T dim>older history is not shown here · `st conversations timeline` has all of it</T></View>
-        : row.kind === 'pending' ? <PendingView pending={row.pending} /> : <EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} />}
-      ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : status === 'online' ? 'No conversation in the recent timeline.' : 'Offline; this conversation has not been loaded.'}</T>}</View>}
+        : row.kind === 'pending' ? <PendingView pending={row.pending} />
+        // A long press opens the entry's text to select any part of it; iOS text selects only whole.
+        : <Pressable onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} /></Pressable>}
+      ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 60 }}
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
@@ -177,10 +194,10 @@ function AgentStrip({ agent, onMission }: { agent: NonNullable<ReturnType<typeof
 }
 
 const PendingView = memo(function PendingView({ pending }: { pending: Pending }) {
-  const color = pending.failed ? theme.red : theme.surface2;
-  return <View style={[styles.entry, styles.barred, { borderLeftColor: color }]}>
-    <T color={pending.failed ? theme.red : theme.overlay0}>{pending.failed ? `you · not sent: ${pending.failed}` : 'you · sending…'}<T dim>  {pending.at}</T></T>
-    <Markdown text={pending.text} color={theme.overlay0} />
+  const rule = RULES.pending;
+  return <View style={[styles.entry, styles.barred, { borderLeftColor: c(pending.failed ? rule.failed : rule.sending_edge) }]}>
+    <T color={c(pending.failed ? rule.failed : rule.sending.color)}>{pending.failed ? `you · not sent: ${pending.failed}` : rule.sending.text}<T dim>  {pending.at}</T></T>
+    <Markdown selectable={false} text={pending.text} color={c(rule.text)} />
   </View>;
 });
 
@@ -188,38 +205,62 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
   const body = entry.body;
   switch (body.kind) {
     case 'user':
-      return <View style={styles.user}>
-        <T dim style={{ alignSelf: 'flex-end' }}>{entry.at}</T>
-        <T selectable>{body.text}</T>
+      return <View style={[styles.user, { backgroundColor: c(RULES.user.fill) }]}>
+        <T color={c(RULES.user.time)} style={{ alignSelf: 'flex-end' }}>{entry.at}</T>
+        <T color={c(RULES.user.text)}>{body.text}</T>
       </View>;
     case 'assistant':
-      return <View style={styles.entry}><Markdown text={body.text} /></View>;
-    case 'mail': {
-      // Mail to the person stands out; their own says how far it got: ✓ st has it, ✓✓ the agent has it.
-      const toYou = body.to === 'you';
-      return <View style={[styles.entry, styles.barred, { borderLeftColor: theme.sapphire }, toYou ? { backgroundColor: theme.toolBg } : null]}>
-        <T><T bold color={theme.sapphire}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.from === 'you' ? (body.delivered ? <T color={theme.green}>  ✓✓ delivered</T> : <T dim>  ✓ sent</T>) : null}</T>
-        <Markdown text={body.text} color={toYou ? theme.text : theme.subtext0} />
-      </View>;
-    }
+      return <View style={styles.entry}><Markdown selectable={false} text={body.text} color={c(RULES.assistant)} /></View>;
+    case 'mail': return <MailView entry={entry} body={body} open={open} onToggle={onToggle} />;
     case 'event': {
-      const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : theme.overlay0;
+      const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : c(RULES.event.label);
       return <View style={[styles.entry, { flexDirection: 'row' }]}>
-        <T color={theme.surface1}>── </T><T color={color} style={{ flex: 1 }}>{body.text} · {entry.at}</T>
+        <T color={c(RULES.event.rule)}>── </T><T color={color} style={{ flex: 1 }}>{body.text} · {entry.at}</T>
       </View>;
     }
     case 'tool': {
-      const [bg, glyph, color] = body.state === 'running' ? [theme.toolBg, '⠿', theme.working] : body.state === 'ok' ? [theme.toolOkBg, '✓', theme.green] : [theme.toolErrBg, '✕', theme.red];
+      // Quiet until opened, as in stui: an edge in the outcome's colour, dim text, no fill, and
+      // at most six one-line rows; opened, it reads at full brightness.
+      const rule = RULES.tool;
+      const [glyph, color] = body.state === 'running' ? ['⠿', c(rule.running)] : body.state === 'ok' ? [rule.ok.text, c(rule.ok.color)] : [rule.failed.text, c(rule.failed.color)];
       const shown = shownToolLines(body, open);
-      const expandable = body.output.length > 5 && body.state !== 'failed';
-      return <Pressable accessibilityRole={expandable ? 'button' : undefined} accessibilityState={expandable ? { expanded: open } : undefined} disabled={!expandable} onPress={() => onToggle(entry.id)} style={[styles.tool, { backgroundColor: bg }]}>
-        <T numberOfLines={1}><T bold color={color}>{glyph} </T><T bold>{body.title}</T></T>
-        {shown.hidden ? <T dim>  … {shown.hidden} earlier lines · tap to expand</T> : null}
-        {shown.lines.map((line, index) => <T key={index} selectable style={styles.toolLine} color={line.startsWith('+') ? theme.green : line.startsWith('-') || line.includes('error') ? theme.red : theme.subtext0}>{line || ' '}</T>)}
-        {open && expandable ? <T dim>  collapse</T> : null}
+      const expandable = body.output.length > COLLAPSED_TOOL_LINES;
+      const quiet = !open;
+      const look = quiet ? rule.quiet : rule.open;
+      return <Pressable accessibilityRole={expandable ? 'button' : undefined} accessibilityState={expandable ? { expanded: open } : undefined} disabled={!expandable} onPress={() => onToggle(entry.id)} style={[styles.tool, { borderLeftColor: color }]}>
+        <T numberOfLines={1}><T bold color={color}>{glyph} </T><T bold={look.title_bold} color={c(look.title)}>{body.title}</T></T>
+        {shown.hidden ? <T color={c(rule.collapse.color)}>  … {shown.hidden} more lines · tap to show</T> : null}
+        {open && expandable ? <T color={c(rule.collapse.color)}>  {rule.collapse.text}</T> : null}
+        {shown.lines.map((line, index) => <T key={index} numberOfLines={quiet ? 1 : undefined} style={[styles.toolLine, quiet && { opacity: 0.7 }]} color={c(line.startsWith('+') ? rule.added : line.startsWith('-') || line.includes('error') ? rule.removed : look.rows)}>{line || ' '}</T>)}
+        {open && expandable ? <T color={c(rule.collapse.color)}>  {rule.collapse.text}</T> : null}
       </Pressable>;
     }
   }
+});
+
+type Mail = Extract<ConversationEntry['body'], { kind: 'mail' }>;
+
+// Mail the person is part of leads; mail between others stays back and folds to a few rows,
+// like a tool call, until tapped. Mail to the person is filled like their own messages, and
+// their own says how far it got: ✓ st has it, ✓✓ the agent has it.
+const MailView = memo(function MailView({ entry, body, open, onToggle }: { entry: ConversationEntry; body: Mail; open: boolean; onToggle: (id: string) => void }) {
+  const rule = RULES.mail;
+  const toYou = body.to === 'you';
+  const look = folds(body) ? rule.between_others : rule.involving_you;
+  const [height, setHeight] = useState(0);
+  const limit = RULES.tool.collapsed_rows * LINE;
+  const long = folds(body) && height > limit;
+  const mark = body.from !== 'you' ? null : body.delivered ? rule.delivered : rule.sent;
+  return <Pressable disabled={!long} accessibilityRole={long ? 'button' : undefined} accessibilityState={long ? { expanded: open } : undefined} onPress={() => onToggle(entry.id)}
+    style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }, toYou ? { backgroundColor: c(rule.to_you_fill) } : null]}>
+    <T><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
+    <View style={long && !open ? { maxHeight: limit, overflow: 'hidden' } : null}>
+      {/* Measured at its full height and never shrunk by the fold: a measurement the fold could
+          change would fold and unfold the mail in a loop. */}
+      <View style={{ flexShrink: 0 }} onLayout={event => { const next = event.nativeEvent.layout.height; setHeight(previous => Math.max(previous, next)); }}><Markdown selectable={false} text={body.text} color={c(look.text)} /></View>
+    </View>
+    {long ? <T color={c(RULES.tool.collapse.color)}>{open ? `  ${RULES.tool.collapse.text}` : '  … more · tap to show'}</T> : null}
+  </Pressable>;
 });
 
 const styles = StyleSheet.create({
@@ -228,7 +269,7 @@ const styles = StyleSheet.create({
   entry: { paddingHorizontal: 12, paddingVertical: 6 },
   user: { backgroundColor: theme.userBg, paddingHorizontal: 12, paddingVertical: 8, marginVertical: 6 },
   barred: { borderLeftWidth: 2, marginLeft: 10, paddingLeft: 8 },
-  tool: { marginHorizontal: 8, marginVertical: 4, paddingHorizontal: 8, paddingVertical: 6 },
+  tool: { marginHorizontal: 8, marginVertical: 4, paddingHorizontal: 8, paddingVertical: 4, borderLeftWidth: 2 },
   toolLine: { fontSize: 12, lineHeight: 17, paddingLeft: 18 },
   composer: { flexDirection: 'row', alignItems: 'flex-end', gap: 6, paddingHorizontal: 10, paddingTop: 6, borderTopColor: theme.surface0, borderTopWidth: StyleSheet.hairlineWidth * 2, backgroundColor: theme.mantle },
   prompt: { paddingBottom: 9, fontFamily: fonts.bold },

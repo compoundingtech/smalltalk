@@ -6,11 +6,13 @@
 //! same `World`.
 
 pub mod adapt;
+mod attach;
 #[cfg(test)]
 mod contract;
 pub mod conversation;
 pub mod demo;
 pub mod doc;
+mod edit;
 mod glass;
 mod glass_store;
 pub mod layout;
@@ -76,6 +78,8 @@ struct FrameInfo {
     sidebar_height: usize,
     /// Glasses: where each group's content was drawn, in group order.
     glass_leaves: Vec<Rect>,
+    /// Glasses: where Home was drawn over the glass, while it is open.
+    home: Option<Rect>,
     read_messages: HashSet<String>,
     /// The focused agent's pane was too narrow for details beside its conversation.
     agent_narrow: bool,
@@ -141,6 +145,19 @@ pub enum Effect {
     },
     /// Keep a glass in st, or delete it there.
     SaveGlass(glass::GlassWrite),
+    /// Interrupt an agent's turn, as Esc does in its harness's own TUI.
+    StopAgent {
+        agent: String,
+    },
+    /// Start a new agent; its first message is what the person asked of it.
+    CreateAgent {
+        name: String,
+        harness: String,
+        model: Option<String>,
+        effort: Option<String>,
+        host: Option<String>,
+        message: Option<String>,
+    },
     /// Send a failed or unconfirmed message again, as the same request.
     Resend {
         entry: String,
@@ -240,6 +257,20 @@ pub struct Ui {
     details_here: bool,
     /// Finding text in a conversation.
     find: Option<Find>,
+    /// The new agent form, kept while the person looks elsewhere.
+    new_agent: Option<screens::AgentForm>,
+    /// The Agents tab shows the new agent form rather than the selected agent.
+    agent_form: bool,
+    /// An agent just started from here, to select once st lists it.
+    started: Option<String>,
+    /// Images attached to each draft, by its key, until it is sent.
+    attachments: HashMap<String, Vec<attach::Attachment>>,
+    /// Where typing goes in the input that has the keyboard.
+    cursor: edit::Cursor,
+    /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
+    pub(crate) picker: Option<ratatui_image::picker::Picker>,
+    /// Each attachment's thumbnail, encoded once so a redraw never sends the image again.
+    thumbnails: RefCell<HashMap<std::path::PathBuf, Option<ratatui_image::protocol::Protocol>>>,
     /// When st last sent each conversation something, shown above its message box.
     updated: HashMap<String, Instant>,
     /// Why a conversation could not be brought up to date, until st sends it again.
@@ -296,6 +327,13 @@ impl Ui {
             build: false,
             details_here: false,
             find: None,
+            new_agent: None,
+            agent_form: false,
+            started: None,
+            attachments: HashMap::new(),
+            cursor: edit::Cursor::default(),
+            picker: None,
+            thumbnails: RefCell::new(HashMap::new()),
             updated: HashMap::new(),
             stalled: HashMap::new(),
         }
@@ -319,6 +357,7 @@ impl Ui {
             }
         }
         self.tab = tab;
+        self.select_started();
         if self.glasses.is_some() {
             self.resync_focus();
         }
@@ -368,6 +407,107 @@ impl Ui {
         self.tab == 1 && self.selected_id().as_deref() == Some(agent)
     }
 
+    /// Make the links drawn in `area` clickable: addresses written out, and markdown links by
+    /// the text they were drawn with.
+    fn links(&self, buf: &Buffer, area: Rect) {
+        for y in area.y..area.y + area.height {
+            let cells = (area.x..area.x + area.width)
+                .map(|x| (x, &buf[(x, y)]))
+                .collect::<Vec<_>>();
+            let row = cells
+                .iter()
+                .map(|(_, cell)| cell.symbol().chars().next().unwrap_or(' '))
+                .collect::<Vec<_>>();
+            let text = row.iter().collect::<String>();
+            // Written-out addresses.
+            let mut from = 0;
+            while let Some(offset) = text[from..].find("http") {
+                let start = from + offset;
+                let tail = &text[start..];
+                if !(tail.starts_with("https://") || tail.starts_with("http://")) {
+                    from = start + 4;
+                    continue;
+                }
+                let url = tail
+                    .split(char::is_whitespace)
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>']);
+                let column = text[..start].chars().count();
+                let width = url.chars().count();
+                if let Some((x, _)) = cells.get(column) {
+                    self.hit(
+                        Rect {
+                            x: *x,
+                            y,
+                            width: width as u16,
+                            height: 1,
+                        },
+                        Hit::Link(url.to_owned()),
+                    );
+                }
+                from = start + url.len().max(1);
+            }
+            // Markdown links: underlined runs whose text names a link.
+            let mut index = 0;
+            while index < cells.len() {
+                if !cells[index].1.modifier.contains(Modifier::UNDERLINED) {
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                while index < cells.len() && cells[index].1.modifier.contains(Modifier::UNDERLINED)
+                {
+                    index += 1;
+                }
+                let words = row[start..index].iter().collect::<String>();
+                if let Some(url) = st3_conversation_ui::text::link_for(&words) {
+                    self.hit(
+                        Rect {
+                            x: cells[start].0,
+                            y,
+                            width: (index - start) as u16,
+                            height: 1,
+                        },
+                        Hit::Link(url),
+                    );
+                }
+            }
+        }
+    }
+
+    /// One attachment's thumbnail, encoded on first sight and kept.
+    fn draw_thumbnail(&self, buf: &mut Buffer, area: Rect, attachment: &attach::Attachment) {
+        let Some(picker) = &self.picker else { return };
+        let mut thumbnails = self.thumbnails.borrow_mut();
+        let thumbnail = thumbnails
+            .entry(attachment.path.clone())
+            .or_insert_with(|| {
+                let image = image::ImageReader::open(&attachment.path)
+                    .ok()?
+                    .with_guessed_format()
+                    .ok()?
+                    .decode()
+                    .ok()?;
+                picker
+                    .new_protocol(
+                        image,
+                        ratatui::layout::Size::new(area.width, area.height),
+                        ratatui_image::Resize::Fit(None),
+                    )
+                    .ok()
+            });
+        match thumbnail {
+            Some(protocol) => {
+                use ratatui::widgets::Widget as _;
+                ratatui_image::Image::new(protocol).render(area, buf);
+            }
+            None => {
+                buf.set_stringn(area.x, area.y, "▣", 1, theme::fg(theme::LAVENDER));
+            }
+        }
+    }
+
     /// ` ● live · updated 12s ago `, or paused when st is not following it.
     fn freshness(&self, agent: &str) -> Span<'static> {
         let age = self.updated.get(agent).map(|at| {
@@ -398,6 +538,82 @@ impl Ui {
             (false, None) => (" ○ paused · focus to follow ".to_owned(), theme::YELLOW),
         };
         Span::styled(text, theme::fg(color))
+    }
+
+    /// Text the terminal pasted (bracketed paste): it goes where typing goes, whole, newlines
+    /// included, so a paste never sends anything by itself. A pasted path to an image, such as a
+    /// file dropped on the terminal, attaches that image to a message to an agent.
+    pub fn paste(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let first = text.lines().next().unwrap_or("").to_owned();
+        if let Some(find) = self.find.as_mut() {
+            edit::insert(&mut find.query, &self.cursor, "find", &first);
+            find.current = 0;
+            find.jump.set(true);
+            return;
+        }
+        if self.paste_into_palette(&first) {
+            return;
+        }
+        if let Some((fields, focus)) = self.new_mission.as_mut() {
+            edit::insert(
+                &mut fields[*focus],
+                &self.cursor,
+                &format!("mission:{focus}"),
+                &text,
+            );
+            return;
+        }
+        if let Some(chat) = self.chat.clone().filter(|chat| chat.editing) {
+            let input = format!("chat:{}", chat.item);
+            let draft = self
+                .conversation_state
+                .drafts
+                .entry(input.clone())
+                .or_default();
+            edit::insert(draft, &self.cursor, &input, &text);
+            return;
+        }
+        // A paste over an agent's conversation starts a message to it.
+        if !self.editing && self.tab == 1 && self.selected_id().is_some() {
+            self.editing = true;
+        }
+        if !self.editing {
+            return;
+        }
+        let Some(key) = self.draft_key() else { return };
+        if self.tab == 1
+            && let Some(attachment) = attach::from_path(&text)
+        {
+            self.flash(format!("Attached {}", attachment.label()));
+            self.attachments.entry(key).or_default().push(attachment);
+            return;
+        }
+        let draft = self
+            .conversation_state
+            .drafts
+            .entry(key.clone())
+            .or_default();
+        edit::insert(draft, &self.cursor, &key, &text);
+    }
+
+    /// Attach the image on this machine's clipboard to the message being written.
+    fn attach_clipboard(&mut self) {
+        let Some(key) = self.draft_key() else { return };
+        // kitty hands over the person's own clipboard through the terminal, wherever stui
+        // runs; elsewhere this machine's clipboard is the person's.
+        let attached = if attach::terminal_clipboard() {
+            attach::from_terminal().or_else(|error| attach::from_clipboard().map_err(|_| error))
+        } else {
+            attach::from_clipboard()
+        };
+        match attached {
+            Ok(attachment) => {
+                self.flash(format!("Attached {}", attachment.label()));
+                self.attachments.entry(key).or_default().push(attachment);
+            }
+            Err(error) => self.flash(format!("Nothing attached: {error}")),
+        }
     }
 
     /// The selected agent's newest message that failed or went unconfirmed, by entry id.
@@ -707,7 +923,7 @@ impl Ui {
             );
             return;
         }
-        let hints: Vec<(&str, &str)> = if self.terminal.is_some() && self.tab == 1 {
+        let hints: Vec<(&str, &str)> = if self.terminal_focused() {
             vec![
                 ("ctrl+\\", "return"),
                 ("keys", "go to the agent"),
@@ -1087,15 +1303,19 @@ impl Ui {
                 }
                 _ => Vec::new(),
             };
+            let text = self.conversation_state.drafts.get(&chat_key).map(String::as_str).unwrap_or("");
             screens::Chat {
                 to: chat.to_name.clone(),
-                text: self.conversation_state.drafts.get(&chat_key).map(String::as_str).unwrap_or(""),
+                text,
+                cursor: self.cursor.at(&chat_key, text),
                 editing: chat.editing,
                 thread,
             }
         });
+        let text = self.conversation_state.drafts.get(key).map(String::as_str);
         Drafts {
-            text: self.conversation_state.drafts.get(key).map(String::as_str),
+            text,
+            cursor: self.cursor.at(key, text.unwrap_or("")),
             editing: self.editing,
             confirm: self.confirm,
             chat,
@@ -1107,6 +1327,7 @@ impl Ui {
         let id = self.selected_id();
         match self.tab {
             0 => Pane::Home(id),
+            1 if self.agent_form => Pane::NewAgent,
             1 => match &self.terminal {
                 Some(view) => Pane::Terminal(view.agent.clone()),
                 None => Pane::Agent(id),
@@ -1138,7 +1359,25 @@ impl Ui {
             Pane::NewMission => {
                 let empty = Default::default();
                 let (fields, focus) = self.new_mission.as_ref().unwrap_or(&empty);
-                screens::new_mission_form(fields, *focus, width)
+                screens::new_mission_form(
+                    fields,
+                    *focus,
+                    self.cursor.at(&format!("mission:{focus}"), &fields[*focus]),
+                    width,
+                )
+            }
+            Pane::NewAgent => {
+                let empty = Default::default();
+                let form = self.new_agent.as_ref().unwrap_or(&empty);
+                screens::new_agent_form(
+                    form,
+                    &self.other_hosts(),
+                    [
+                        self.cursor.at("agent:task", &form.task),
+                        self.cursor.at("agent:name", &form.name),
+                    ],
+                    width,
+                )
             }
             Pane::Declaration(id) => screens::mission_kdl(&self.world, id.as_deref(), width),
             Pane::Mission(id) => {
@@ -1371,10 +1610,20 @@ impl Ui {
         } else {
             self.composer_lines(agent, width)
         };
+        // Attached images show as small thumbnails above the box, where the terminal draws them.
+        let thumbnails = match (&self.picker, find, self.attachments.get(&agent.id)) {
+            (Some(_), None, Some(list)) if !list.is_empty() => list.clone(),
+            _ => Vec::new(),
+        };
+        let strip = if thumbnails.is_empty() {
+            0
+        } else {
+            THUMBNAIL.height
+        };
         let composer_height = if composer.is_empty() {
             0
         } else {
-            composer.len() as u16 + 2
+            composer.len() as u16 + 2 + strip
         };
         let body = Rect {
             y: area.y + header_height,
@@ -1439,6 +1688,22 @@ impl Ui {
                     theme::SURFACE0
                 }),
             );
+            // A working agent can be stopped from here, as with Ctrl+C.
+            if self.live
+                && agent.state == AgentState::Working
+                && !agent.unmanaged
+                && self.composing(&agent.id)
+            {
+                let label = " working · ctrl+c twice stops it ";
+                buf.set_stringn(
+                    area.x + 2,
+                    y,
+                    label,
+                    area.width.saturating_sub(4) as usize,
+                    theme::dim(),
+                );
+                // Not clickable: it sits where a click focuses the box (Nathan, 2026-10-01).
+            }
             // How fresh the conversation is, on the rule above the box: st pushes changes to
             // the conversations on screen, and one that is not followed says so.
             if self.live {
@@ -1453,8 +1718,24 @@ impl Ui {
                     );
                 }
             }
+            for (index, attachment) in thumbnails.iter().enumerate() {
+                let x = area.x + 2 + index as u16 * (THUMBNAIL.width + 1);
+                if x + THUMBNAIL.width > area.x + area.width {
+                    break;
+                }
+                self.draw_thumbnail(
+                    buf,
+                    Rect {
+                        x,
+                        y: y + 1,
+                        width: THUMBNAIL.width,
+                        height: THUMBNAIL.height,
+                    },
+                    attachment,
+                );
+            }
             for (offset, line) in composer.iter().enumerate() {
-                buf.set_line(area.x, y + 1 + offset as u16, line, area.width);
+                buf.set_line(area.x, y + 1 + strip + offset as u16, line, area.width);
             }
             self.hit(
                 Rect {
@@ -1500,6 +1781,14 @@ impl Ui {
                 area.width.saturating_sub(1),
             );
         }
+        self.links(
+            buf,
+            Rect {
+                height: (total.saturating_sub(top)).min(height) as u16,
+                width: area.width.saturating_sub(1),
+                ..area
+            },
+        );
         for target in &doc.targets {
             if target.line >= top && target.line < top + height {
                 let rect = Rect {
@@ -1625,7 +1914,7 @@ impl Ui {
             buf.set_stringn(
                 area.x,
                 area.y + 1,
-                " Not attached. Open the agent and press Enter to attach its terminal.",
+                " Not attached. Ctrl+] attaches the terminal; Ctrl+\\ leaves it.",
                 area.width as usize,
                 theme::dim(),
             );
@@ -1680,16 +1969,24 @@ impl Ui {
             0 => "  no matches".to_owned(),
             count => format!("  {} of {count}", find.current.min(count - 1) + 1),
         };
-        Line::from(vec![
-            Span::styled("/ ", theme::strong(theme::ACCENT)),
-            Span::styled(find.query.clone(), theme::text()),
-            Span::styled("█", theme::fg(theme::ACCENT)),
-            Span::styled(place, theme::fg(theme::YELLOW)),
-            Span::styled(
-                "  · enter older · shift+enter newer · esc close",
-                theme::dim(),
-            ),
-        ])
+        let at = self.cursor.at("find", &find.query);
+        let query = edit::lines(&find.query, Some(at), theme::text())
+            .into_iter()
+            .flatten()
+            .map(|run| Span::styled(run.text, run.style));
+        Line::from(
+            [Span::styled("/ ", theme::strong(theme::ACCENT))]
+                .into_iter()
+                .chain(query)
+                .chain([
+                    Span::styled(place, theme::fg(theme::YELLOW)),
+                    Span::styled(
+                        "  · enter older · shift+enter newer · esc close",
+                        theme::dim(),
+                    ),
+                ])
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// The message box under a conversation, wrapped, newest lines last.
@@ -1703,6 +2000,48 @@ impl Ui {
         // Only the focused pane's box takes keys; the others show their draft, and how to reach
         // them by click.
         let editing = self.editing && self.composing(&agent.id);
+        // Attached images ride above the text as chips; Backspace in an empty box takes the
+        // last one back.
+        let chips = self
+            .attachments
+            .get(&agent.id)
+            .map(|list| {
+                list.iter()
+                    .enumerate()
+                    .map(|(index, attachment)| {
+                        Line::from(vec![
+                            Span::styled("  ▣ ", theme::fg(theme::LAVENDER)),
+                            Span::styled(
+                                format!("{} {}", index + 1, attachment.label()),
+                                theme::fg(theme::LAVENDER),
+                            ),
+                            Span::styled(
+                                if index + 1 == list.len() {
+                                    "  · ⌫ in an empty box removes it"
+                                } else {
+                                    ""
+                                },
+                                theme::dim(),
+                            ),
+                        ])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut lines = self.composer_text(agent, width, editing, &draft);
+        if !chips.is_empty() {
+            lines.splice(0..0, chips);
+        }
+        lines
+    }
+
+    fn composer_text(
+        &self,
+        agent: &Agent,
+        width: usize,
+        editing: bool,
+        draft: &str,
+    ) -> Vec<Line<'static>> {
         if draft.is_empty() && !editing {
             let hint = if self.composing(&agent.id) {
                 format!("Message {} · c or click", agent.name)
@@ -1720,12 +2059,8 @@ impl Ui {
             theme::soft()
         };
         let mut lines = Vec::new();
-        let paragraphs = draft.split('\n').collect::<Vec<_>>();
-        for (index, paragraph) in paragraphs.iter().enumerate() {
-            let mut runs = vec![text::run(paragraph.to_string(), style)];
-            if editing && index == paragraphs.len() - 1 {
-                runs.push(text::run("█", theme::fg(theme::ACCENT)));
-            }
+        let at = editing.then(|| self.cursor.at(&agent.id, draft));
+        for (index, runs) in edit::lines(draft, at, style).into_iter().enumerate() {
             let first = if index == 0 {
                 text::run(
                     "› ",
@@ -1914,12 +2249,17 @@ impl Ui {
         if self.glass_key(key) {
             return;
         }
-        // An attached terminal gets every key first, Ctrl-C included.
-        if self.terminal.is_some() && self.tab == 1 {
+        // A focused, attached terminal gets every key first, Ctrl-C included.
+        if self.terminal_focused() {
             let control = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 // Terminals send Ctrl+\\ as 0x1c, which crossterm reports as Ctrl+4.
                 KeyCode::Char('\\' | '4') if control => {
+                    // In glasses the tab turns back into the agent's conversation.
+                    if let Some(Pane::Terminal(agent)) = self.focused_pane() {
+                        self.swap_focused_pane(Pane::Agent(Some(agent)));
+                        self.terminal = None;
+                    }
                     self.effects.push(Effect::CloseTerminal);
                 }
                 KeyCode::Char(letter @ ('c' | 'd')) if control => {
@@ -1944,6 +2284,15 @@ impl Ui {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             if self.editing {
                 self.editing = false;
+            } else if self.confirm == Some('s') {
+                // The second Ctrl+C stops the agent, as a harness's own TUI would.
+                self.confirm = None;
+                self.act('s');
+            } else if let Some(name) = self.working_agent() {
+                self.confirm = Some('s');
+                self.flash(format!(
+                    "Stop {name}? Ctrl+C again or y stops it · Esc keeps it working"
+                ));
             } else {
                 self.quit = true;
             }
@@ -1972,12 +2321,16 @@ impl Ui {
                     find.jump.set(true);
                 }
                 _ => {
-                    if edit_text(&mut find.query, key) {
+                    if edit::edit(&mut find.query, &self.cursor, "find", key) {
                         find.current = 0;
                         find.jump.set(true);
                     }
                 }
             }
+            return;
+        }
+        if self.agent_form && self.tab == 1 && self.new_agent.is_some() {
+            self.agent_form_key(key);
             return;
         }
         if let Some((fields, focus)) = self.new_mission.as_mut() {
@@ -1991,12 +2344,22 @@ impl Ui {
                         .modifiers
                         .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
                 {
-                    fields[focus_now].push('\n')
+                    edit::insert(
+                        &mut fields[focus_now],
+                        &self.cursor,
+                        &format!("mission:{focus_now}"),
+                        "\n",
+                    )
                 }
                 KeyCode::Enter if focus_now < 3 => *focus = focus_now + 1,
                 KeyCode::Enter => self.create_launch(),
                 _ => {
-                    edit_text(&mut fields[focus_now], key);
+                    edit::edit(
+                        &mut fields[focus_now],
+                        &self.cursor,
+                        &format!("mission:{focus_now}"),
+                        key,
+                    );
                 }
             }
             return;
@@ -2011,10 +2374,12 @@ impl Ui {
                 }
                 KeyCode::Enter => self.submit_chat(),
                 _ => {
-                    edit_text(
-                        self.conversation_state.drafts.entry(key_id).or_default(),
-                        key,
-                    );
+                    let draft = self
+                        .conversation_state
+                        .drafts
+                        .entry(key_id.clone())
+                        .or_default();
+                    edit::edit(draft, &self.cursor, &key_id, key);
                 }
             }
             return;
@@ -2040,28 +2405,56 @@ impl Ui {
                 || (key.code == KeyCode::Char('j')
                     && key.modifiers.contains(KeyModifiers::CONTROL));
             if newline {
-                self.conversation_state
+                let draft = self
+                    .conversation_state
                     .drafts
-                    .entry(key_id)
-                    .or_default()
-                    .push('\n');
+                    .entry(key_id.clone())
+                    .or_default();
+                edit::insert(draft, &self.cursor, &key_id, "\n");
                 return;
             }
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            let empty = self
+                .conversation_state
+                .drafts
+                .get(&key_id)
+                .is_none_or(String::is_empty);
             match key.code {
                 KeyCode::Esc => self.editing = false,
                 KeyCode::Enter => self.submit(),
+                // Ctrl+V while writing to an agent attaches the clipboard's image.
+                KeyCode::Char('v') if control && self.tab == 1 => self.attach_clipboard(),
+                // Backspace in an empty box takes back the last image.
+                KeyCode::Backspace
+                    if empty
+                        && self
+                            .attachments
+                            .get(&key_id)
+                            .is_some_and(|list| !list.is_empty()) =>
+                {
+                    if let Some(list) = self.attachments.get_mut(&key_id) {
+                        list.pop();
+                    }
+                }
                 _ => {
-                    edit_text(
-                        self.conversation_state.drafts.entry(key_id).or_default(),
-                        key,
-                    );
+                    let draft = self
+                        .conversation_state
+                        .drafts
+                        .entry(key_id.clone())
+                        .or_default();
+                    edit::edit(draft, &self.cursor, &key_id, key);
                 }
             }
             return;
         }
         if let Some(action) = self.confirm {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
+                // Enter is how a message is sent; it never confirms stopping an agent.
+                KeyCode::Char('y') => {
+                    self.confirm = None;
+                    self.act(action);
+                }
+                KeyCode::Enter if action != 's' => {
                     self.confirm = None;
                     self.act(action);
                 }
@@ -2127,7 +2520,14 @@ impl Ui {
                     "Grouped view · t for the tree"
                 });
             }
-            KeyCode::Enter if self.tab == 1 => self.open_terminal(),
+            // Ctrl+] attaches the agent's terminal, beside Ctrl+\ that leaves it; terminals send
+            // it as 0x1d, which crossterm reports as Ctrl+5. Enter was too easy to hit by mistake.
+            KeyCode::Char(']' | '5')
+                if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.open_terminal()
+            }
+            KeyCode::Char('n') if self.tab == 1 => self.open_new_agent(None),
             KeyCode::Char('n') if self.tab == 2 => {
                 self.new_mission = Some((Default::default(), 0));
             }
@@ -2193,7 +2593,7 @@ impl Ui {
         };
         let tools = entries
             .iter()
-            .filter(|entry| matches!(entry.body, Body::Tool { .. }))
+            .filter(|entry| st3_conversation_ui::conversation::folds(&entry.body))
             .map(|entry| entry.id.clone())
             .collect::<Vec<_>>();
         if tools
@@ -2258,6 +2658,14 @@ impl Ui {
                 }
             }
             1 if key == 'i' => self.toggle_details(),
+            1 if key == 'S' => {
+                if let Some(name) = self.working_agent() {
+                    self.confirm = Some('s');
+                    self.flash(format!(
+                        "Stop {name}? Ctrl+C again or y stops it · Esc keeps it working"
+                    ));
+                }
+            }
             1 if key == 'c'
                 && self.world.agents.items().iter().any(|agent| {
                     Some(&agent.id) == self.selected_id().as_ref() && !agent.unmanaged
@@ -2310,6 +2718,33 @@ impl Ui {
             self.flash(format!("{} has no terminal to open", agent.name));
             return;
         }
+        // In glasses the agent's tab turns into its terminal, and Ctrl+\ turns it back.
+        if self.glasses.is_some() {
+            match self.focused_pane() {
+                Some(Pane::Terminal(id)) if id == agent.id => {}
+                Some(Pane::Agent(Some(id))) if id == agent.id => {
+                    self.swap_focused_pane(Pane::Terminal(agent.id.clone()))
+                }
+                _ => self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab),
+            }
+            self.attach_terminal(&agent.id);
+            return;
+        }
+        self.attach_terminal(&agent.id);
+    }
+
+    /// Attach `agent`'s terminal: followed live, or the demo's in demo mode.
+    pub(crate) fn attach_terminal(&mut self, agent: &str) {
+        let Some(agent) = self
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|candidate| candidate.id == agent)
+            .cloned()
+        else {
+            return;
+        };
         if self.live {
             self.effects.push(Effect::OpenTerminal { agent: agent.id });
             self.flash("Opening the terminal…");
@@ -2324,6 +2759,149 @@ impl Ui {
                 ended: None,
             });
         }
+    }
+
+    /// The fleet's machines other than this one, in list order: the new agent form's hosts.
+    fn other_hosts(&self) -> Vec<String> {
+        self.world
+            .machines
+            .items()
+            .iter()
+            .filter(|machine| machine.reach != Reach::Here)
+            .map(|machine| machine.name.clone())
+            .collect()
+    }
+
+    /// Open the new agent form: in a new tab of the focused split in a glass, on the Agents
+    /// tab otherwise. `task` fills in what it should do.
+    pub(crate) fn open_new_agent(&mut self, task: Option<String>) {
+        match self.new_agent.as_mut() {
+            Some(form) => {
+                if let Some(task) = task {
+                    form.task = task;
+                }
+            }
+            None => self.new_agent = Some(screens::AgentForm::new(task.unwrap_or_default())),
+        }
+        if self.glasses.is_some() {
+            self.open_in_glass(Pane::NewAgent, glass::Open::Tab);
+        } else {
+            self.tab = 1;
+            self.agent_form = true;
+            self.terminal = None;
+        }
+    }
+
+    fn cancel_agent_form(&mut self) {
+        self.new_agent = None;
+        self.agent_form = false;
+        if self.glasses.is_some() {
+            self.close_form_tab();
+        }
+    }
+
+    fn agent_form_key(&mut self, key: KeyEvent) {
+        let hosts = self.other_hosts().len();
+        let Some(form) = self.new_agent.as_mut() else {
+            return;
+        };
+        let shifted = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Esc => self.cancel_agent_form(),
+            KeyCode::Tab | KeyCode::Down if form.focus >= 2 || key.code == KeyCode::Tab => {
+                form.focus = (form.focus + 1) % screens::AgentForm::FIELDS;
+            }
+            KeyCode::BackTab | KeyCode::Up if form.focus >= 2 || key.code == KeyCode::BackTab => {
+                form.focus =
+                    (form.focus + screens::AgentForm::FIELDS - 1) % screens::AgentForm::FIELDS;
+            }
+            KeyCode::Left | KeyCode::Right if form.focus >= 2 => {
+                form.cycle(key.code == KeyCode::Right, hosts);
+            }
+            KeyCode::Enter if shifted && form.focus == 0 => {
+                edit::insert(&mut form.task, &self.cursor, "agent:task", "\n")
+            }
+            KeyCode::Enter => self.start_agent(),
+            _ => match form.focus {
+                0 => {
+                    edit::edit(&mut form.task, &self.cursor, "agent:task", key);
+                }
+                1 => {
+                    // A name is one word of letters, digits, dots and dashes.
+                    if let KeyCode::Char(character) = key.code
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !(character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
+                    {
+                        return;
+                    }
+                    edit::edit(&mut form.name, &self.cursor, "agent:name", key);
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn start_agent(&mut self) {
+        let hosts = self.other_hosts();
+        let Some(form) = self.new_agent.clone() else {
+            return;
+        };
+        if form.name.trim().is_empty() {
+            if let Some(form) = self.new_agent.as_mut() {
+                form.focus = 1;
+            }
+            self.flash("Give it a name");
+            return;
+        }
+        let message = Some(form.task.trim().to_owned()).filter(|task| !task.is_empty());
+        let host = form
+            .host
+            .checked_sub(1)
+            .and_then(|index| hosts.get(index).cloned());
+        if self.live {
+            self.effects.push(Effect::CreateAgent {
+                name: form.name.trim().to_owned(),
+                harness: form.harness().to_owned(),
+                model: form.model().map(str::to_owned),
+                effort: form.effort().map(str::to_owned),
+                host,
+                message,
+            });
+            self.flash(format!("Starting {}…", form.name.trim()));
+        } else {
+            self.flash("Agent started · demo: nothing was sent");
+        }
+    }
+
+    /// st started the agent asked for here: its conversation replaces the form.
+    pub(crate) fn agent_started(&mut self, id: String) {
+        self.new_agent = None;
+        self.agent_form = false;
+        if self.glasses.is_some() {
+            // The agent's conversation takes the form's tab.
+            self.close_form_tab();
+            self.open_in_glass(Pane::Agent(Some(id.clone())), glass::Open::Tab);
+        } else {
+            self.tab = 1;
+        }
+        self.started = Some(id);
+        self.select_started();
+    }
+
+    /// Select the agent just started once st lists it.
+    fn select_started(&mut self) {
+        let Some(id) = self.started.clone() else {
+            return;
+        };
+        let tab = self.tab;
+        self.tab = 1;
+        if let Some(position) = self.ids().iter().position(|candidate| *candidate == id) {
+            self.selected[1] = position;
+            self.started = None;
+        }
+        self.tab = tab;
     }
 
     fn create_launch(&mut self) {
@@ -2481,10 +3059,29 @@ impl Ui {
 
     fn submit(&mut self) {
         let Some(id) = self.draft_key() else { return };
-        let Some(PaneIntent::Send(draft)) = self.conversation_state.send(&id) else {
+        let images = if self.tab == 1 {
+            self.attachments.get(&id).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let draft = match self.conversation_state.send(&id) {
+            Some(PaneIntent::Send(draft)) => Some(draft),
+            _ if !images.is_empty() => Some(String::new()),
+            _ => None,
+        };
+        let Some(mut draft) = draft else {
             self.flash("Write something first");
             return;
         };
+        // Until st carries images, the message names each file; an agent on this machine
+        // reads it there.
+        if !images.is_empty() {
+            if !draft.is_empty() {
+                draft.push_str("\n\n");
+            }
+            draft.push_str(&attach::mention(&images));
+            self.attachments.remove(&id);
+        }
         // The input stays focused after a send; Esc leaves it.
         if self.live {
             let effect = match self.tab {
@@ -2578,7 +3175,34 @@ impl Ui {
         }
     }
 
+    /// The agent whose conversation is shown, by name, while it is working.
+    fn working_agent(&self) -> Option<String> {
+        if self.tab != 1 || self.agent_form || self.terminal_focused() {
+            return None;
+        }
+        let id = self.selected_id()?;
+        self.world
+            .agents
+            .items()
+            .iter()
+            .find(|agent| agent.id == id && agent.state == AgentState::Working && !agent.unmanaged)
+            .map(|agent| agent.name.clone())
+    }
+
     fn act(&mut self, action: char) {
+        if action == 's' {
+            // Stop the agent's turn: its harness gets Esc, as in its own TUI.
+            let Some(agent) = self.selected_id().filter(|_| self.tab == 1) else {
+                return;
+            };
+            if self.live {
+                self.effects.push(Effect::StopAgent { agent });
+                self.flash("Stopping…");
+            } else {
+                self.flash("Stopped · demo: nothing was sent");
+            }
+            return;
+        }
         if action == 'v' {
             if let Some(id) = self.revoke.take() {
                 if self.live {
@@ -2642,10 +3266,15 @@ impl Ui {
                 .find(|item| item.id == id)
                 .is_some_and(|item| item.actions.iter().any(|action| action == name));
             if offered {
+                // Notes written on a review go with an approval too.
+                let reason = (name == "review.approve")
+                    .then(|| self.conversation_state.drafts.remove(&id))
+                    .flatten()
+                    .filter(|notes| !notes.trim().is_empty());
                 self.effects.push(Effect::Attention {
                     id,
                     action: name.into(),
-                    reason: None,
+                    reason,
                 });
                 self.flash("Sending…");
             } else {
@@ -2814,6 +3443,19 @@ impl Ui {
         match hit {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
+            Hit::NewAgent => self.open_new_agent(None),
+            Hit::Home if self.home_open() => self.close_home(),
+            Hit::Home => self.open_home(),
+            // The terminal may be on another machine than stui (over SSH or fabric): the
+            // clipboard is the person's, so the link lands where their browser is.
+            Hit::Link(url) => {
+                copy(&url);
+                self.flash(format!(
+                    "Copied {} · paste it in a browser",
+                    text::truncate(&url, 60)
+                ));
+            }
+            Hit::Split(right) => self.split(right),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
             Hit::GlassAdd(group) => {
                 self.focus_group(group);
@@ -2833,6 +3475,11 @@ impl Ui {
                     _ => {}
                 }
             }
+            Hit::Key('\t') if self.agent_form => {
+                if let Some(form) = self.new_agent.as_mut() {
+                    form.focus = (form.focus + 1) % screens::AgentForm::FIELDS;
+                }
+            }
             Hit::Key('\t') => {
                 if let Some((_, focus)) = self.new_mission.as_mut() {
                     *focus = (*focus + 1) % 4;
@@ -2849,6 +3496,8 @@ impl Ui {
                 }
             }
             Hit::Enter if self.new_mission.is_some() => self.create_launch(),
+            Hit::Enter if self.agent_form && self.tab == 1 => self.start_agent(),
+            Hit::Escape if self.agent_form && self.tab == 1 => self.cancel_agent_form(),
             Hit::Enter => {
                 if self.chat.is_some() {
                     self.submit_chat()
@@ -2893,6 +3542,11 @@ impl Ui {
             }
             Hit::Help => self.help = !self.help,
             Hit::Open(id) => self.open(&id),
+            Hit::Field(index) if self.agent_form => {
+                if let Some(form) = self.new_agent.as_mut() {
+                    form.focus = index;
+                }
+            }
             Hit::Field(index) => {
                 if let Some((_, focus)) = self.new_mission.as_mut() {
                     *focus = index;
@@ -3058,29 +3712,9 @@ impl Ui {
     }
 }
 
-/// Terminal text editing on a draft, which is edited at its end: typing, Backspace, and the
-/// readline keys people expect (Ctrl+W and Alt+Backspace delete a word, Ctrl+U the line).
-/// Returns whether the key belonged to the text; a typing key never reaches anything else.
+/// Editing at the text's end, for an input without a cursor of its own (the palette's query).
 fn edit_text(text: &mut String, key: KeyEvent) -> bool {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    match key.code {
-        KeyCode::Backspace if control || alt => delete_word(text),
-        KeyCode::Backspace | KeyCode::Char('h') if key.code == KeyCode::Backspace || control => {
-            text.pop();
-        }
-        KeyCode::Char('w') if control && !alt => delete_word(text),
-        KeyCode::Char('u') if control && !alt => {
-            let start = text.rfind('\n').map_or(0, |index| index + 1);
-            text.truncate(start);
-        }
-        // Cursor keys have nowhere to go at the end of the draft; they still belong to it.
-        KeyCode::Char('a' | 'e' | 'k' | 'b' | 'f' | 'd') if control && !alt => {}
-        // AltGr arrives as Ctrl+Alt on some terminals: that is typing too.
-        KeyCode::Char(character) if control == alt => text.push(character),
-        _ => return false,
-    }
-    true
+    edit::edit(text, &edit::Cursor::default(), "", key)
 }
 
 /// Where `query` shows in a drawn document, case aside: (line, display column, display width).
@@ -3114,19 +3748,12 @@ fn find_matches(doc: &Doc, query: &str) -> Vec<(usize, usize, usize)> {
     found
 }
 
-/// Readline's word delete: the blanks before the end, then the word before them.
-fn delete_word(text: &mut String) {
-    let before = text.len();
-    while text.ends_with([' ', '\t']) {
-        text.pop();
-    }
-    while text.ends_with(|character: char| !character.is_whitespace()) {
-        text.pop();
-    }
-    if text.len() == before && text.ends_with('\n') {
-        text.pop();
-    }
-}
+/// The size of an attachment's thumbnail, in cells.
+const THUMBNAIL: ratatui::layout::Size = ratatui::layout::Size {
+    width: 10,
+    height: 4,
+};
+
 
 fn contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
@@ -3230,7 +3857,13 @@ impl Guard {
     fn enter(keys: bool) -> Result<Self> {
         crate::watch_terminal_hangup();
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        // A paste arrives whole, so its newlines never press Enter.
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste
+        )?;
         let enhanced = keys && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
         if enhanced {
             execute!(
@@ -3249,7 +3882,12 @@ impl Drop for Guard {
         if self.enhanced {
             let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
         }
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            crossterm::event::DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -3322,6 +3960,7 @@ pub fn run_demo(args: &[String]) -> Result<()> {
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
                 match event::read()? {
                     Event::Key(key) => ui.key(key),
+                    Event::Paste(text) => ui.paste(text),
                     Event::Mouse(mouse) => ui.mouse(mouse),
                     _ => {}
                 }
@@ -3682,7 +4321,7 @@ mod tests {
     fn every_attention_kind_draws_its_own_card() {
         let mut ui = Ui::new(demo::world());
         let expectations = [
-            ("attention/1", "Request changes"),
+            ("attention/1", "c or click to write"),
             ("attention/2", "YOUR FEEDBACK"),
             ("attention/3", "Approve launch"),
             ("attention/4", "SUGGESTED FIX"),
@@ -3934,10 +4573,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_an_agents_terminal_and_ctrl_backslash_returns() {
+    fn ctrl_bracket_opens_an_agents_terminal_and_ctrl_backslash_returns() {
         let mut ui = Ui::new(demo::world());
         ui.tab = 1;
         press(&mut ui, KeyCode::Enter);
+        assert!(ui.terminal.is_none(), "Enter alone never attaches");
+        ui.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
         assert!(ui.terminal.is_some());
         let screen = frame(&ui, 120, 30).join("\n");
         assert!(screen.contains("Return"), "{screen}");

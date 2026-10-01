@@ -8,7 +8,7 @@ description: How to use st from an st agent seat. Applies only when the ST_AGENT
 This applies only to a session st started: `printenv ST_AGENT` prints this seat's identity. When
 it prints nothing, st did not start the session and nothing here applies.
 
-`ST_AGENT` names this seat, and `ST3_BIN` is the st executable that started it.
+`ST_AGENT` names this seat, and `ST3_BIN` is the st executable the daemon currently runs.
 `"$ST3_BIN" --help` lists every command; each subcommand has its own `--help`.
 
 ## Messages
@@ -35,13 +35,13 @@ it.
 
 ## Person work
 
-`"$ST3_BIN" work ask --for PERSON --title TEXT --reason TEXT --step STEP --idempotency-key KEY --as "$ST_AGENT"`
-creates a person-assigned step in the same generation. The asking step waits without a worker
-lease; the person's response resumes it. `--new-run NAME` creates a minimal ask run when the
-seat has no claimed work. The ask ends with its requester, originating attempt or owner.
-`work done PERSON_STEP --as PERSON --summary TEXT` records the response.
-`work cancel-ask PERSON_STEP --as "$ST_AGENT" --reason TEXT` cancels the requester's ask.
-`st now` and `attention ls/show` display current source work; attention has no separate close action.
+`"$ST3_BIN" work ask --for PERSON --title TEXT --reason TEXT --step STEP --idempotency-key KEY --as "$ST_AGENT"` creates a person-assigned step in the same generation. The asking step waits without a worker lease; the person's response resumes it. `--new-run NAME` creates a minimal ask run when the seat has no claimed work. The ask ends with its requester, originating attempt or owner.
+`work done PERSON_STEP --as PERSON --summary TEXT` records the response; `work cancel-ask PERSON_STEP --as "$ST_AGENT" --reason TEXT` cancels the requester's ask.
+`st now` and `attention ls/show` show a person's requests and reviews; attention has no separate close action.
+Messages stay in conversations and do not enter a person's attention.
+A fault arrives as a message to the agent that owns it, which retries, revises or cancels, and asks a person with `work ask` only for what only a person can give.
+
+`"$ST3_BIN" agents restart AGENT --as "$ST_AGENT"` keeps a top-level or mission seat's declaration and waits for a new running incarnation, or explains why it cannot. `--timeout 2m` changes the default ten-minute wait. Its authority is the same as stop and start.
 
 ## Other agents' terminals
 

@@ -14,6 +14,8 @@ export type StackParams = {
   GlassesRoot: undefined;
   Conversation: { target: string; sessionId?: string; title?: string };
   Terminal: { terminalId: string; title?: string };
+  /** One conversation entry's text, to select and copy any part of it. */
+  SelectText: { text: string; title?: string };
   Mission: { id: string; title?: string };
   Attention: { id: string };
   Launch: { id: string };

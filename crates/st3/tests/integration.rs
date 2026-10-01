@@ -3,9 +3,12 @@
 //! Cargo builds only the targets the manifest names (`autotests = false`), so add a
 //! `mod NAME;` line here or an explicit test target for every new file.
 
+mod agents_restart;
+mod client_creation;
 mod client_glasses;
 mod client_v0_cli;
 mod client_v0_contract;
+mod codex_bootstrap;
 mod command_recorder;
 mod convergence;
 mod daemon_bench;
@@ -17,11 +20,13 @@ mod fault_isolation;
 mod first_sync;
 mod fleet;
 mod hook_telemetry;
+mod idle_budget;
 mod log_diet;
 mod messaging_faults;
 mod mission_cancellation;
 mod no_st2_seat;
 mod operational_state_contract;
+mod reconcile_pass_perf;
 mod recorder_report;
 mod seat_queue_perf;
 mod terminal_attach;

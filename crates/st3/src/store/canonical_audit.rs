@@ -402,6 +402,14 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
             }
         }
     }
+    // Each node names the same owner for each fault, so exactly one host tells that agent.
+    for as_of in [2_000_000_000_000_u128, 2_000_000_600_000_u128] {
+        let faults =
+            |store: &Store| serde_json::to_value(store.fault_snapshot(as_of).unwrap()).unwrap();
+        if faults(expected) != faults(actual) {
+            mismatches.push(format!("{phase}: fault snapshot at {as_of}"));
+        }
+    }
     let message_state = |store: &Store| {
         store
             .message("message/audit")

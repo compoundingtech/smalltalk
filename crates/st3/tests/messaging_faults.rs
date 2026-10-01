@@ -1,8 +1,8 @@
-//! The sender-to-reader fault matrix runs in the normal Linux suite, including st/ci.
+//! Each sender-to-reader fault case is a separate Linux test so nextest can run them in parallel.
 //! The provider API stand-in consumes native handoffs without making model calls.
-#[cfg(target_os = "linux")]
-#[test]
-fn messages_recover_across_transport_and_process_faults() {
+#![cfg(target_os = "linux")]
+
+fn run_case(case: &str) {
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -12,27 +12,9 @@ fn messages_recover_across_transport_and_process_faults() {
         None => {
             // Pin the real channel before reexec/reporting, rather than making a current
             // process pretend it is old. Nix caches this immutable package across CI runs.
-            let baseline: serde_json::Value = serde_json::from_str(include_str!(
-                "../../../.github/messaging-compat-baseline.json"
-            ))
-            .unwrap();
-            let commit = baseline["commit"].as_str().unwrap();
-            assert_eq!(commit.len(), 40);
-            assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            let expression = format!(
-                "((builtins.getFlake \"github:compoundingtech/smalltalk/{commit}\").packages.${{builtins.currentSystem}}.st3).overrideAttrs (_: {{ doCheck = false; nativeCheckInputs = []; postInstall = \"\"; cargoBuildFlags = [\"-p\" \"st3\"]; }})"
-            );
             let output = Command::new("timeout")
-                .args([
-                    "10m",
-                    "nix",
-                    "build",
-                    "--impure",
-                    "--no-link",
-                    "--print-out-paths",
-                    "--expr",
-                    &expression,
-                ])
+                .args(["10m", "bash"])
+                .arg(repo.join("scripts/messaging-compat-binary"))
                 .output()
                 .expect(
                     "Nix builds the pinned historical channel (or set ST3_MESSAGING_COMPAT_BIN)",
@@ -42,7 +24,7 @@ fn messages_recover_across_transport_and_process_faults() {
                 "historical channel build: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            PathBuf::from(String::from_utf8(output.stdout).unwrap().trim()).join("bin/st3")
+            PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
         }
     };
     assert!(
@@ -51,19 +33,24 @@ fn messages_recover_across_transport_and_process_faults() {
         old.display()
     );
     let in_ci = std::env::var_os("CI_RUN_ID").is_some();
-    let mut output_root = Some(if in_ci {
+    let evidence_parent = std::env::var_os("ST3_MESSAGING_FAULTS_EVIDENCE").map(PathBuf::from);
+    let mut output_root = Some(if let Some(parent) = &evidence_parent {
+        std::fs::create_dir_all(parent).unwrap();
+        tempfile::Builder::new()
+            .prefix(&format!("{case}-"))
+            .tempdir_in(parent)
+            .unwrap()
+    } else if in_ci {
         let artifacts = repo.join("target/messaging-faults");
         std::fs::create_dir_all(&artifacts).unwrap();
         tempfile::Builder::new()
-            .prefix("run-")
+            .prefix(&format!("{case}-"))
             .tempdir_in(artifacts)
             .unwrap()
     } else {
         tempfile::tempdir().unwrap()
     });
-    let evidence = std::env::var_os("ST3_MESSAGING_FAULTS_EVIDENCE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| output_root.as_ref().unwrap().path().join("evidence"));
+    let evidence = output_root.as_ref().unwrap().path().join("evidence");
     // Double-fork out of the CI seat's ancestry. A sender is person/eval; an st harness
     // must never impersonate that sender. Captured pipes stay open until the eval exits.
     let output = Command::new("setsid")
@@ -73,6 +60,7 @@ fn messages_recover_across_transport_and_process_faults() {
         .arg(&evidence)
         .arg("--old-binary")
         .arg(old)
+        .args(["--cases", case])
         .output()
         .expect("run the isolated messaging fault eval");
     let result = std::fs::read_to_string(evidence.join("result.json"));
@@ -81,7 +69,7 @@ fn messages_recover_across_transport_and_process_faults() {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
         .is_some_and(|result| result["verdict"] == "pass" && result.get("ended").is_some());
-    if !passed || in_ci {
+    if !passed || in_ci || evidence_parent.is_some() {
         eprintln!("messaging fault evidence: {}", evidence.display());
         let _ = output_root.take().unwrap().keep();
     }
@@ -97,7 +85,9 @@ fn messages_recover_across_transport_and_process_faults() {
         result.get("ended").is_some(),
         "eval stopped early: {result}"
     );
-    assert_eq!(result["cases"].as_array().unwrap().len(), 10, "{result}");
+    let cases = result["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 1, "{result}");
+    assert_eq!(cases[0]["case"], case, "{result}");
     assert_eq!(
         result["verdict"],
         "pass",
@@ -105,4 +95,59 @@ fn messages_recover_across_transport_and_process_faults() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn baseline() {
+    run_case("baseline");
+}
+
+#[test]
+fn daemon_restart() {
+    run_case("daemon-restart");
+}
+
+#[test]
+fn binary_swap() {
+    run_case("binary-swap");
+}
+
+#[test]
+fn path_deploy() {
+    run_case("path-deploy");
+}
+
+#[test]
+fn link_seconds() {
+    run_case("link-seconds");
+}
+
+#[test]
+fn link_minutes() {
+    run_case("link-minutes");
+}
+
+#[test]
+fn receiver_down() {
+    run_case("receiver-down");
+}
+
+#[test]
+fn harness_restart() {
+    run_case("harness-restart");
+}
+
+#[test]
+fn channel_killed() {
+    run_case("channel-killed");
+}
+
+#[test]
+fn old_channel() {
+    run_case("old-channel");
+}
+
+#[test]
+fn handoff_failed() {
+    run_case("handoff-failed");
 }

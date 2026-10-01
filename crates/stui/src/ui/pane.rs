@@ -23,6 +23,8 @@ pub enum Pane {
     Worktree(Option<String>),
     /// The new mission form.
     NewMission,
+    /// The new agent form.
+    NewAgent,
 }
 
 impl Pane {
@@ -40,6 +42,7 @@ impl Pane {
             Pane::Machine(subject) => with("machine", subject),
             Pane::Worktree(subject) => with("worktree", subject),
             Pane::NewMission => "new-mission:".into(),
+            Pane::NewAgent => "new-agent:".into(),
         }
     }
 
@@ -61,6 +64,7 @@ impl Pane {
             "machine" => Pane::Machine(subject),
             "worktree" => Pane::Worktree(subject),
             "new-mission" => Pane::NewMission,
+            "new-agent" => Pane::NewAgent,
             _ => return None,
         })
     }
@@ -85,6 +89,7 @@ mod tests {
             Pane::Machine(some("machine/harbor")),
             Pane::Worktree(None),
             Pane::NewMission,
+            Pane::NewAgent,
         ] {
             assert_eq!(
                 Pane::parse(&pane.key()),

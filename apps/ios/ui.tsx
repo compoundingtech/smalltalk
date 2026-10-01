@@ -24,8 +24,8 @@ export function SectionHeader({ title, count, color = theme.overlay1 }: { title:
 }
 
 /** One list row: glyph, name, right-hand detail, and an optional dim second line. */
-export function ListRow({ glyph, glyphColor, title, right, second, onPress, indent = 0, selected, accessibilityLabel }: { glyph?: string; glyphColor?: string; title: ReactNode; right?: ReactNode; second?: ReactNode; onPress?: () => void; indent?: number; selected?: boolean; accessibilityLabel?: string }) {
-  return <Pressable accessibilityRole={onPress ? 'button' : undefined} accessibilityLabel={accessibilityLabel} disabled={!onPress} onPress={onPress} style={({ pressed }) => [styles.row, (pressed || selected) && { backgroundColor: theme.rowSelected }, { paddingLeft: 12 + indent * 16 }]}>
+export function ListRow({ glyph, glyphColor, title, right, second, onPress, onLongPress, indent = 0, selected, accessibilityLabel }: { glyph?: string; glyphColor?: string; title: ReactNode; right?: ReactNode; second?: ReactNode; onPress?: () => void; onLongPress?: () => void; indent?: number; selected?: boolean; accessibilityLabel?: string }) {
+  return <Pressable accessibilityRole={onPress ? 'button' : undefined} accessibilityLabel={accessibilityLabel} disabled={!onPress && !onLongPress} onPress={onPress} onLongPress={onLongPress} style={({ pressed }) => [styles.row, (pressed || selected) && { backgroundColor: theme.rowSelected }, { paddingLeft: 12 + indent * 16 }]}>
     <View style={styles.rowFirst}>
       {glyph ? <T bold color={glyphColor} style={styles.glyph}>{glyph}</T> : null}
       <View style={styles.rowTitle}>{typeof title === 'string' ? <T bold numberOfLines={1}>{title}</T> : title}</View>
@@ -77,7 +77,7 @@ function Runs({ runs, base }: { runs: Run[]; base: TextStyle }) {
 }
 
 /** Markdown as stui renders a reply: peach headings, lavender bullets, code in a gutter. */
-export function Markdown({ text, color = theme.text }: { text: string; color?: string }) {
+export function Markdown({ text, color = theme.text, selectable = true }: { text: string; color?: string; selectable?: boolean }) {
   const base: TextStyle = { ...styles.text, color };
   return <View>{markdown(text).map((block, index) => {
     switch (block.kind) {
@@ -87,9 +87,9 @@ export function Markdown({ text, color = theme.text }: { text: string; color?: s
       case 'quote': return <View key={index} style={styles.quote}><Text style={[base, { color: theme.subtext0, fontFamily: fonts.italic }]}><Runs runs={block.runs} base={{ ...base, color: theme.subtext0, fontFamily: fonts.italic }} /></Text></View>;
       case 'item': return <View key={index} style={[styles.item, { paddingLeft: block.indent * 7 }]}><Text style={[base, { color: theme.lavender }]}>{block.marker}</Text><Text style={[base, styles.itemText]}><Runs runs={block.runs} base={base} /></Text></View>;
       case 'fence': return <Text key={index} style={[base, { color: theme.overlay0 }]}>{block.text}</Text>;
-      case 'code': return <Text key={index} selectable style={[base, { color: theme.subtext1, paddingLeft: 14 }]}>{block.text || ' '}</Text>;
+      case 'code': return <Text key={index} selectable={selectable} style={[base, { color: theme.subtext1, paddingLeft: 14 }]}>{block.text || ' '}</Text>;
       case 'table': return <Text key={index} style={[base, { color: theme.subtext0 }]}>{block.text}</Text>;
-      case 'text': return <Text key={index} selectable style={base}><Runs runs={block.runs} base={base} /></Text>;
+      case 'text': return <Text key={index} selectable={selectable} style={base}><Runs runs={block.runs} base={base} /></Text>;
     }
   })}</View>;
 }

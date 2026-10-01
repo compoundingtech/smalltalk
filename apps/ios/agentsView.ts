@@ -198,10 +198,11 @@ export function agentTreeLines(rows: AgentRowView[]): TreeLine[] {
     }
     return a.path.length - b.path.length;
   });
+  const compact = compactFolders(leaves.map(leaf => leaf.path));
   const lines: TreeLine[] = [];
   let open: string[] = [];
-  for (const { path, row } of leaves) {
-    const folders = path.slice(0, -1);
+  for (const [index, { row }] of leaves.entries()) {
+    const folders = compact[index];
     let shared = 0;
     while (shared < open.length && shared < folders.length && open[shared] === folders[shared]) shared++;
     open = open.slice(0, shared);
@@ -212,6 +213,36 @@ export function agentTreeLines(rows: AgentRowView[]): TreeLine[] {
     lines.push({ kind: 'row', key: row.id, depth: folders.length, row });
   }
   return lines;
+}
+
+/**
+ * Each path's folders, with a folder that holds only one folder joined to it on one line
+ * (Nathan, 2026-10-01): `fleet/smalltalk/operations` rather than three nested folders.
+ */
+export function compactFolders(paths: string[][]): string[][] {
+  const holds = new Map<string, Set<string>>();
+  for (const path of paths) {
+    const folders = path.slice(0, -1);
+    folders.forEach((_, depth) => {
+      const key = folders.slice(0, depth + 1).join('/');
+      const children = holds.get(key) ?? new Set<string>();
+      children.add(folders[depth + 1] ?? '');
+      holds.set(key, children);
+    });
+  }
+  return paths.map(path => {
+    const folders = path.slice(0, -1);
+    const compact: string[] = [];
+    for (let depth = 0; depth < folders.length; depth++) {
+      let name = folders[depth];
+      while (depth + 1 < folders.length && holds.get(folders.slice(0, depth + 1).join('/'))?.size === 1) {
+        depth++;
+        name = `${name}/${folders[depth]}`;
+      }
+      compact.push(name);
+    }
+    return compact;
+  });
 }
 
 export { harnessColor };

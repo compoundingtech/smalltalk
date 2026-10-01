@@ -38,6 +38,7 @@ Fixture errors record the phase that timed out. The cases are:
 | baseline | No fault | Sender accepts the message |
 | daemon-restart | Queue remotely before stopping the receiving daemon and replication worker, using a temporary link gate to prevent a successful handoff race | Restarted API answers and worker is started |
 | binary-swap | Queue during a partition, atomically replace the receiver's executable at its watched path, restart its daemon/worker | API answers and peer link opens |
+| path-deploy | Queue during a partition, restart the receiver's daemon/worker from the replacement at a new path, as a new Nix store path does, leaving the old executable in place | API answers and peer link opens |
 | link-seconds | Drop both peer routes for three seconds with a message queued | Both routes open |
 | link-minutes | Drop both peer routes for two minutes with a message queued | Both routes open |
 | receiver-down | Receiving daemon and worker are down when the sender accepts the message | Restarted API answers and worker is started |
@@ -76,7 +77,8 @@ Duplicates after that bounded observation window are not covered.
 
 Delivery and reporting are separate results: a working old channel that st reports
 as stale fails the reporting gate even if the message arrives. `result.json` records
-both receipt timing and the delivery assessment. Modern paths must be `current`; the historical
+both receipt timing and the delivery assessment. Modern paths must be `current`, and every
+`st3 driver` process of the seat must run the daemon's executable; the historical
 path must be `legacy`, which exposes recent polling without inventing image/readiness evidence.
 The failed-handoff case also requires a visible blockage in the agent, doctor and sender views. Per-case evidence keeps graph
 traces, native receipts, process snapshots, agent cards, replication status and
@@ -103,16 +105,19 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s scripts/st3-messaging-faults-eval -p 'test_*.py'
 ```
 
-The normal Linux Cargo integration suite runs the complete matrix in
-`messaging_faults::messages_recover_across_transport_and_process_faults`, so `st/ci`
-gates every case on the candidate binary. It builds the actual historical source
+The Linux Cargo integration suite exposes every case as its own `messaging_faults::*` test,
+so the Namespace Linux gate runs the complete matrix in parallel and retries individual cases.
+Each test calls the same eval with `--cases CASE`; all recovery and observation gates remain
+unchanged. The fixture inherits a systemd user runtime only when its bus exists; on runners
+without a user manager, the existing detached task path is exercised. The separate isolation VM
+proves the systemd scope contracts. It builds the actual historical source
 pinned by `.github/messaging-compat-baseline.json` through Nix. That build omits
 checks, other binaries and the retired package's PTY wrapper; its channel source
 and locked Rust dependencies are unchanged. Nix caches the immutable package.
 Set `ST3_MESSAGING_COMPAT_BIN` to use an already built historical executable.
-`ST3_MESSAGING_FAULTS_EVIDENCE` can select a new evidence directory for a local run;
+`ST3_MESSAGING_FAULTS_EVIDENCE` can select a parent directory for per-case local evidence;
 on failure the default temporary evidence directory is retained. CI also retains
-successful normalized evidence under its checkout's `target/messaging-faults/run-*/evidence/`.
+successful normalized evidence under its checkout's `target/messaging-faults/<case>-*/evidence/`.
 
 The daemon push implementation's ten-case evidence is in
 [evidence/2026-10-01-push/result.json](evidence/2026-10-01-push/result.json).

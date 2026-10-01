@@ -228,7 +228,11 @@ a ready revision brings it back.
 
 A mission run owns the execution state declared inside that run. A top-level `agent` is instead a
 first-class durable seat with no mission owner. Seats can receive messages and claim work from many
-finite missions over their lifetime.
+finite missions over their lifetime. A person's standalone shell is a top-level PTY named
+`pty/person/NAME/UUID`, with no mission owner and no agent harness. Free-mode local agents
+can likewise create a plain shell at `pty/agent/PATH/UUID`. Only its exact creator may publish its
+`intent.desired` claims, including a stop; local admission and replication enforce this.
+Other top-level execution members still require a mission run.
 
 The origin of the `mission-run.created` claim advances the mission run. It also materializes the run declarations.
 
@@ -942,7 +946,7 @@ st supplies these exact context names:
 | `ST_GATE` | Gate name in a running gate context. |
 | `ST3_SUBJECT` | Full subject of the current runtime member. |
 | `ST_AGENT` | Full owning agent subject. It is absent for agentless runtimes. |
-| `ST3_BIN` | Absolute path to the exact st executable that started the runtime. |
+| `ST3_BIN` | Absolute path of `STATE_DIR/current/st3`, a link the daemon points at the st executable it runs; see [seat deploys](seat-deploys.md). |
 | `ST_LOOP_ROUND` | Current loop round. It is present in loop child missions. |
 | `ST_LOOP_FEEDBACK` | Exact prior feedback document, or an empty value. |
 
@@ -993,7 +997,22 @@ An unknown variable or a variable that is not available in the current phase is 
 
 ## Agent start
 
-A native harness starts with no prompt. A started or restarted seat takes no turn until a person types or a graph message is posted.
+A native harness starts idle by default. Its creator can supply an explicit first message:
+
+```kdl
+harness "codex" {
+  message "Inspect the failing tests." id="unique-launch-id"
+}
+```
+
+The text is limited to 64 KiB and the nonempty launch ID to 256 bytes. The driver uses the harness's
+native startup argument (OpenCode uses `--prompt`; the others use a positional argument). A durable
+`custom.agent.initial-message` receipt under `custom/agent/initial-message-HASH` records the launch
+attempt before provider invocation. Restart and driver adoption do not repeat it. A crash after the
+receipt commits but before the provider starts can consume the message without delivering it;
+changing the launch ID explicitly requests a fresh attempt. No automatic boot instruction is added.
+Pi treats an `@`-prefixed argument as a file even after `--`; such text gets a leading newline to
+keep it a literal message.
 
 A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`. Put the instruction in a step goal or send the seat a message.
 
@@ -1254,6 +1273,7 @@ agent "example/cos/standing/cos" {
 
 The subject is exactly `agent/example/cos/standing/cos`; placement does not change its identity.
 The seat's bare `fresh-context` node starts a new harness session before each step it claims, even when the step has no `fresh-context` node. Omit it when the seat should retain context across ordinary steps.
+A seat's bare `handles-faults` node makes it the fleet's fault agent: it receives each fault that no step assignee or agent requester owns, such as a failed loop on a run a person requested. When several live seats carry it, the first by subject takes them. Faults never go to a person's attention.
 Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st
 channel. Use `exec {}` for non-interactive provider commands.
 

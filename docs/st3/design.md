@@ -30,6 +30,15 @@ defined precedence. An unresolved or invalid head makes only its affected subjec
 See [data authority](data-authority.md) for the authority classes. See [schema](schema.md) for the
 public subject and claim vocabulary.
 
+The graph is its own crate, `crates/smallclaims`: the claim log and its batches, envelopes and
+their admission, the canonical order, projection digests, replication and heals between members,
+fleet membership, checkpoints, documents and blobs. It depends on nothing of smalltalk's, so agents,
+missions, seats, delivery, drivers, the CLI and stui stay out of it. smalltalk's store wraps the
+graph's and plugs in through `smallclaims::store::Runtime`: its tables and their migration, claim
+kind validation, local writes, projection and replay, cache invalidation, the digested tables, and
+the checkpoint rules and proof answers. A runtime may call the graph freely; the graph reaches a
+runtime only through that trait.
+
 ## KDL publication
 
 Every document starts with `version 2`. Declarations follow that node directly. There is no wrapper
@@ -161,7 +170,7 @@ members and the rest of the pass still run.
 A member whose start keeps failing does not spawn again on every pass:
 
 - it waits 15 seconds between attempts;
-- after three failures within five minutes it parks; the current parked source appears in attention until replaced or retired.
+- after three failures within five minutes it parks; the current parked source is a fault for its owning agent until replaced or retired.
 
 Cleanup of a cancelled, failed, or finished run reads only the declarations that the run owns. It
 never waits for the run's mission revision or its steps, so a run whose revision is unavailable
@@ -207,9 +216,23 @@ split lets a ready step survive a daemon outage, a driver outage, and a failed d
 An agent notification only indicates that ready work or a message may exist. It does not authorize
 new work. The work queue and message record remain authoritative.
 
-`st attention ls --as person/NAME` combines that person's current human gates, launch approvals,
-revision approvals, unread messages, and explicit fault requests. Human identity is required rather
-than inferred. The stable client-v0 attention resource is the machine source for user interfaces.
+`st attention ls --as person/NAME` lists only what waits on that person and no agent can resolve:
+requests (person steps and agents' `st work ask`) and reviews (human gates, launch approvals and
+revision approvals). Human identity is required rather than inferred. The stable client-v0
+attention resource is the machine source for user interfaces, and stui's home and the phone show
+exactly this set.
+
+Messages never enter attention; they stay in conversations. An agent that waits on a person's
+answer asks with `st work ask`.
+
+Faults never enter attention either. A failed loop, step, deploy, observer or runtime goes to an
+owning agent: the agent assigned to the failed step, else the run's requester (or the requester of
+a run above it) when that is an agent, else the fleet's fault agent, the first live agent whose
+declaration carries the bare `handles-faults` node. Only a live agent declaration owns a fault. The
+host that runs the owner sends it one message per fault episode, from `daemon/runtime` with the
+title `Fault: TITLE`. The agent retries, revises or cancels, and asks a person with `st work ask`
+only for what only a person can give. A fault that no agent owns stays visible in `st doctor`'s
+`attention-age` check once it is a day old.
 
 ## Resources and observers
 

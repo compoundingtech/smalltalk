@@ -5,16 +5,43 @@ name: Workspace CI
 
 on:
   pull_request: {}
+  merge_group: {}
+  push:
+    branches: [main]
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: "workspace-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}"
+  group: "workspace-${{ github.event.pull_request.number || github.run_id }}-${{ github.event_name }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  namespace-capacity:
+    name: namespace-capacity
+    if: github.event_name == 'workflow_dispatch'
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Record Namespace platform capacity
+        run: |
+          nsc workspace concurrency --output json | jq '{concurrency: [.concurrency[] | {platforms, limits, activeConcurrency}]}' > "$RUNNER_TEMP/namespace-capacity.json"
+          cat "$RUNNER_TEMP/namespace-capacity.json"
+          printf 'Measured at %s\n\n' "$(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
+          printf '\x60\x60\x60json\n' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/namespace-capacity.json" >> "$GITHUB_STEP_SUMMARY"
+          printf '\n\x60\x60\x60\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain Namespace capacity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: namespace-capacity
+          path: "${{ runner.temp }}/namespace-capacity.json"
+          if-no-files-found: error
   genie-freshness:
     name: genie-freshness
     timeout-minutes: 20
@@ -78,8 +105,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix3-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
-          restore-keys: "nix3-${{ github.job }}-${{ runner.os }}-"
+          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -103,6 +130,11 @@ jobs:
       - name: Use the cached Nix outputs
         if: runner.os == 'Linux'
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
+      - name: Prepare the historical messaging channel
+        if: runner.os == 'Linux'
+        run: |
+          binary=$(timeout 10m bash scripts/messaging-compat-binary)
+          printf 'ST3_MESSAGING_COMPAT_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Prepare provider component fixtures
         run: |
           system=$(nix eval --impure --raw --expr builtins.currentSystem)
@@ -167,8 +199,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix3-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
-          restore-keys: "nix3-${{ github.job }}-${{ runner.os }}-"
+          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -242,8 +274,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix3-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
-          restore-keys: "nix3-${{ github.job }}-${{ runner.os }}-"
+          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -355,7 +387,7 @@ jobs:
           start=$SECONDS
           nix build --print-build-logs --out-link "$RUNNER_TEMP/vm-driver" .#legacyPackages.x86_64-linux.transport-isolation-vm.driver
           printf '| VM driver build | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
-      - name: Run the exec and pty cascade tests in the VM
+      - name: Run all three systemd-scope tests in the VM
         env:
           ST_ISOLATION_ARCHIVE: "${{ runner.temp }}/isolation.tar.zst"
           ST_ISOLATION_WORKSPACE: ${{ github.workspace }}
@@ -364,5 +396,5 @@ jobs:
           start=$SECONDS
           mkdir -p "$RUNNER_TEMP/vm-out"
           "$RUNNER_TEMP/vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/vm-out"
-          jq -r '"| VM boot | \(.boot_seconds)s |\n| cascade tests in VM (extract and run) | \(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '"| VM boot | \(.boot_seconds)s |\n| systemd-scope tests in VM (extract and run) | \(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
           printf '| VM test driver total | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"

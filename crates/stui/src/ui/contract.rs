@@ -1,7 +1,8 @@
 //! The shared client contract in `fixtures/clients`: what every Small Talk client shows.
 //!
 //! stui writes these files and the iOS app tests against them, so both apps clean the same
-//! transcripts the same way, use the same words and colours, and share one demo world.
+//! transcripts the same way, use the same words and colours, draw a conversation's entries
+//! by the same rules, and share one demo world.
 //! Run `STUI_UPDATE_CONTRACT=1 cargo test -p stui contract` after an intended change.
 
 use super::adapt;
@@ -138,6 +139,10 @@ fn files() -> Vec<(&'static str, Value)> {
         ),
         ("theme.json", theme_tokens()),
         ("words.json", words()),
+        (
+            "conversation-style.json",
+            serde_json::to_value(st3_conversation_ui::style::RULES).unwrap(),
+        ),
         (
             "transcripts/claude.expected.json",
             conversation_of(include_str!(

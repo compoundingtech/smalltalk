@@ -47,8 +47,8 @@ export const commonSetupSteps = [
     uses: 'actions/cache@v4',
     with: {
       path: '${{ runner.temp }}/st-ci-cache',
-      key: "nix3-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}",
-      'restore-keys': 'nix3-${{ github.job }}-${{ runner.os }}-',
+      key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
+      'restore-keys': 'nix4-${{ github.job }}-${{ runner.os }}-',
     },
   },
   ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
@@ -70,6 +70,12 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
 
 /** Provider fixtures, rendered hooks, and the standalone workspace test build. */
 export const testBuildSteps = [
+  {
+    name: 'Prepare the historical messaging channel',
+    if: "runner.os == 'Linux'",
+    run: `binary=$(timeout 10m bash scripts/messaging-compat-binary)
+printf 'ST3_MESSAGING_COMPAT_BIN=%s\\n' "$binary" >> "$GITHUB_ENV"`,
+  },
   {
     name: 'Prepare provider component fixtures',
     run: `system=$(nix eval --impure --raw --expr builtins.currentSystem)

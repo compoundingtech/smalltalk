@@ -20,6 +20,7 @@ class OracleTests(unittest.TestCase):
             "provider_pids_before": [123], "provider_pids_after": [123],
             "incarnation_before": "123:one", "incarnation_after": "123:one",
             "delivery_after": {"state": "current"}, "sender_message_status": "closed",
+            "seat_images_after": ["/next/st3"], "daemon_image": "/next/st3",
         }
 
     def test_independent_evidence_agrees(self):
@@ -41,6 +42,7 @@ class OracleTests(unittest.TestCase):
             ({"incarnation_after": "123:two"}, "incarnation changed"),
             ({"incarnation_before": None, "incarnation_after": None}, "incarnation changed"),
             ({"delivery_after": {"state": "stale"}}, "report is stale"),
+            ({"seat_images_after": ["/next/st3", "/old/st3"]}, "still run a replaced binary: /old/st3"),
             ({"sender_message_status": "sent"}, "not converged"),
         ]:
             with self.subTest(change=change):
@@ -49,7 +51,8 @@ class OracleTests(unittest.TestCase):
                 self.assertIn(reason, "; ".join(runner.judge(proof)))
 
     def test_legacy_liveness_does_not_claim_a_current_binary(self):
-        self.proof.update(case="old-channel", delivery_after={"state": "legacy"})
+        self.proof.update(case="old-channel", delivery_after={"state": "legacy"},
+                          seat_images_after=["/legacy/st3", "/next/st3"])
         self.assertEqual([], runner.judge(self.proof))
         self.proof["delivery_after"] = {"state": "current"}
         self.assertIn("report is current", "; ".join(runner.judge(self.proof)))

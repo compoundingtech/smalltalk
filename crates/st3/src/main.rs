@@ -111,6 +111,9 @@ enum Command {
         command: LaunchCommand,
     },
     /// Show and manage work that needs a person.
+    #[command(
+        after_help = "Messages never appear here; read them with `st conversations`.\nFaults never appear here; st sends each one to the agent that owns it, which asks a person with `st work ask` only if it needs to."
+    )]
     Attention {
         #[command(subcommand)]
         command: AttentionCommand,
@@ -1807,6 +1810,10 @@ struct PlanningCancelArgs {
 
 #[derive(Subcommand)]
 enum PtyCommand {
+    /// Open a plain shell for the configured person, without an agent harness.
+    New(PtyNewArgs),
+    /// End a personal shell permanently, including its durable declaration.
+    End(PtyScreenArgs),
     /// List current terminal sessions; use --all for stopped history.
     Ls {
         #[arg(long)]
@@ -1850,6 +1857,20 @@ enum PtyCommand {
     Send(PtySendArgs),
     /// Deliver one supported Unix signal to a terminal member.
     Signal(PtySignalArgs),
+}
+
+#[derive(Args)]
+struct PtyNewArgs {
+    /// Display name; defaults to a generated name.
+    name: Option<String>,
+    #[arg(long)]
+    host: Option<String>,
+    /// Absolute directory on the selected host. Locally defaults to the caller's directory;
+    /// remotely defaults to the daemon's directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long = "as", value_parser = parse_actor_subject)]
+    person: Option<String>,
 }
 
 #[derive(Args)]
@@ -2346,6 +2367,10 @@ enum AgentsCommand {
     Start(AgentStartArgs),
     /// Stop one exact durable seat.
     Stop(AgentStopArgs),
+    /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
+    Restart(AgentRestartArgs),
+    /// Change only a seat's human label, without restarting its harness.
+    Rename(AgentRenameArgs),
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
     /// The show form is also available as `st missions queued AGENT`.
     Queue(AgentQueueArgs),
@@ -2366,6 +2391,23 @@ struct AgentHoldArgs {
     #[arg(long = "as")]
     actor: Option<String>,
 }
+
+#[derive(Args)]
+struct AgentRenameArgs {
+    subject: String,
+    #[arg(
+        required_unless_present = "clear",
+        conflicts_with = "clear",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    label: Option<String>,
+    /// Restore the subject-derived presentation label.
+    #[arg(long)]
+    clear: bool,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
 #[derive(Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct AgentQueueArgs {
@@ -2547,6 +2589,9 @@ struct AgentStartArgs {
 
 #[derive(Args)]
 struct AgentNewArgs {
+    /// Start the harness with this first message using its native prompt argument.
+    #[arg(long, allow_hyphen_values = true)]
+    message: Option<String>,
     /// Stable seat identity. A slash-qualified identity is kept exactly after `agent/`; a simple
     /// name is prefixed with its host, as in `agent/HOST.NAME`.
     name: String,
@@ -2591,6 +2636,18 @@ struct AgentStopArgs {
     /// Print the exact stop KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+}
+
+#[derive(Args)]
+struct AgentRestartArgs {
+    /// Exact seat subject or its identity without the `agent/` prefix.
+    #[arg(value_parser = parse_agent_start_identity)]
+    subject: String,
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+    /// How long to wait for a new running incarnation.
+    #[arg(long, default_value = "10m")]
+    timeout: String,
 }
 
 #[derive(Args)]
@@ -2981,6 +3038,9 @@ struct MessageSendArgs {
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+    /// Reuse this key with the same message when retrying an unconfirmed send.
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -3022,6 +3082,9 @@ struct MessageReplyArgs {
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+    /// Reuse this key with the same message when retrying an unconfirmed send.
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -3065,6 +3128,10 @@ struct DriverArgs {
     subject: Option<String>,
     #[arg(long)]
     identity: Option<String>,
+    #[arg(long, requires = "initial_message_id", allow_hyphen_values = true)]
+    initial_message: Option<String>,
+    #[arg(long, requires = "initial_message")]
+    initial_message_id: Option<String>,
     #[arg(last = true)]
     argv: Vec<String>,
 }
@@ -3443,8 +3510,12 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Apply(args) => Some(args.actor.as_str()),
             AgentsCommand::Start(args) => Some(args.actor.as_str()),
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
+            AgentsCommand::Restart(args) => Some(args.actor.as_str()),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness delivery hold needs explicit --as {own}")
+            })?),
+            AgentsCommand::Rename(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness rename needs explicit --as {own}")
             })?),
             AgentsCommand::Queue(args) => match &args.command {
                 Some(AgentQueueCommand::Move(args)) => Some(args.actor.as_deref().ok_or_else(|| {
@@ -5029,6 +5100,92 @@ async fn run_pty(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        PtyCommand::New(args) => {
+            let person =
+                configured_actor(args.person.as_deref(), configured_person, "terminals new")?;
+            let generated = generated_client(endpoint, Some(&person))?;
+            let capabilities = generated.capabilities().await?;
+            let local = client.get::<Value>("/v1/health").await?["node"]
+                .as_str()
+                .context("daemon has no node")?
+                .to_owned();
+            let cwd = if let Some(cwd) = args.cwd {
+                if args
+                    .host
+                    .as_deref()
+                    .is_none_or(|host| host.trim_start_matches("host/") == local)
+                {
+                    Some(std::path::absolute(cwd)?.display().to_string())
+                } else {
+                    anyhow::ensure!(
+                        cwd.is_absolute(),
+                        "remote cwd must be an absolute path on its host"
+                    );
+                    Some(cwd.display().to_string())
+                }
+            } else if args
+                .host
+                .as_deref()
+                .is_none_or(|host| host.trim_start_matches("host/") == local)
+            {
+                Some(std::env::current_dir()?.display().to_string())
+            } else {
+                None
+            };
+            let nonce = uuid::Uuid::now_v7().simple().to_string();
+            let result = generated
+                .terminal_create(
+                    format!("action/{nonce}"),
+                    format!("terminal-new:{nonce}"),
+                    ClientFence {
+                        snapshot_id: capabilities.snapshot.id,
+                        ..ClientFence::default()
+                    },
+                    st3_client::TerminalCreateParameters {
+                        name: args
+                            .name
+                            .unwrap_or_else(|| format!("shell-{}", &nonce[24..])),
+                        host: args.host,
+                        cwd,
+                    },
+                )
+                .await?;
+            if json_output {
+                print_client_value(&result, true)
+            } else {
+                println!(
+                    "{}",
+                    result
+                        .value
+                        .affected_ids
+                        .first()
+                        .context("creation returned no terminal")?
+                );
+                Ok(())
+            }
+        }
+        PtyCommand::End(args) => {
+            let person =
+                configured_actor(args.person.as_deref(), configured_person, "terminals end")?;
+            let generated = generated_client(endpoint, Some(&person))?;
+            let capabilities = generated.capabilities().await?;
+            let nonce = uuid::Uuid::now_v7().simple().to_string();
+            let result = generated
+                .terminal_end(
+                    format!("action/{nonce}"),
+                    format!("terminal-end:{nonce}"),
+                    ClientFence {
+                        snapshot_id: capabilities.snapshot.id,
+                        ..ClientFence::default()
+                    },
+                    ClientTargetParameters {
+                        target_id: args.subject,
+                        ..ClientTargetParameters::default()
+                    },
+                )
+                .await?;
+            print_client_value(&result, json_output)
+        }
         PtyCommand::Ls { all, cursor, limit } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -7204,6 +7361,20 @@ fn render_performance(view: &Value) -> String {
             out.push('\n');
         }
     }
+    if let Some(wakes) = view["reconciler_wakes"].as_array() {
+        let _ = writeln!(
+            out,
+            "RECONCILER WAKES  count · cause (a pass can serve several wakes)"
+        );
+        for row in wakes {
+            let _ = writeln!(
+                out,
+                "  {}  {}",
+                row["count"],
+                row["cause"].as_str().unwrap_or("?")
+            );
+        }
+    }
     if let Some(note) = view["query_time_note"].as_str() {
         let _ = writeln!(out, "{note}");
     }
@@ -8080,6 +8251,13 @@ async fn session_incarnation(client: &Client, subject: &str) -> Result<String> {
 }
 
 fn normalize_member_subject(subject: &str, namespace: &str) -> String {
+    // Product terminal IDs include the resource prefix; the private PTY routes and registry
+    // tags name their underlying member. `terminals new` returns the public form.
+    let subject = if namespace == "pty" {
+        subject.strip_prefix("terminal/").unwrap_or(subject)
+    } else {
+        subject
+    };
     if subject.contains('/') {
         subject.into()
     } else {
@@ -8483,6 +8661,21 @@ async fn run_agents(
             );
             Ok(())
         }
+        AgentsCommand::Rename(args) => {
+            let actor = args.actor.as_deref().or(configured_person).context(
+                "st3 agents rename needs --as ACTOR or a configured person",
+            )?;
+            let response: Value = cli_client(endpoint).post(
+                "/v1/agents/rename",
+                &json!({
+                    "subject": normalize_agent_subject(&args.subject),
+                    "name": args.label,
+                    "actor": actor,
+                    "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                }),
+            ).await?;
+            print_value(&response, json_output)
+        }
         AgentsCommand::Queue(args) => {
             run_agent_queue(endpoint, configured_person, args, json_output).await
         }
@@ -8541,6 +8734,113 @@ async fn run_agents(
                 }
             }
             Ok(())
+        }
+        AgentsCommand::Restart(args) => {
+            let timeout = st3::graph::parse_duration(&args.timeout, false)?;
+            let subject = format!("agent/{}", args.subject);
+            let client = cli_client(endpoint);
+            let request: ClaimRecord = client
+                .post(
+                    "/v1/agents/restart",
+                    &json!({
+                        "subject": subject,
+                        "actor": args.actor,
+                        "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                    }),
+                )
+                .await?;
+            let previous = request.body["fields"]["incarnation_id"]
+                .as_str()
+                .unwrap_or("");
+            let gateway = generated_client(endpoint, None)?;
+            let wait = async {
+                let mut cursor = request.store_index;
+                loop {
+                    let status = status_for(&client, &subject).await?;
+                    let current = status
+                        .subjects
+                        .iter()
+                        .find(|item| item.subject == subject)
+                        .context("the seat disappeared during restart")?;
+                    anyhow::ensure!(
+                        current.conflicts.is_empty()
+                            && current.desired_token.as_deref()
+                                == request.body.pointer("/evidence/0").and_then(Value::as_str),
+                        "`{subject}` declaration changed during restart; inspect it with `st agents show {subject}`"
+                    );
+                    let response = gateway.agents_get(&subject).await?;
+                    if let ClientResource::Agent(agent) = response.value {
+                        if agent.state == "running"
+                            && agent
+                                .incarnation_id
+                                .as_deref()
+                                .is_some_and(|incarnation| incarnation != previous)
+                        {
+                            return Ok::<_, anyhow::Error>(agent);
+                        }
+                        if matches!(agent.state.as_str(), "failed" | "stopped")
+                            && agent
+                                .incarnation_id
+                                .as_deref()
+                                .is_some_and(|incarnation| incarnation != previous)
+                        {
+                            anyhow::bail!(
+                                "`{subject}` replacement is {}: {}; inspect it with `st agents show {subject}`",
+                                agent.state,
+                                agent
+                                    .fault
+                                    .as_deref()
+                                    .or(agent.harness_state.as_deref())
+                                    .unwrap_or("the replacement exited before becoming ready")
+                            );
+                        }
+                        if let Some(fault) = agent.fault.as_deref() {
+                            anyhow::bail!("`{subject}` could not restart: {fault}");
+                        }
+                        if agent.state == "waiting"
+                            && agent
+                                .incarnation_id
+                                .as_deref()
+                                .is_some_and(|incarnation| incarnation != previous)
+                        {
+                            anyhow::bail!(
+                                "`{subject}` restarted and is waiting for your input; attach with `st terminals attach {subject}`"
+                            );
+                        }
+                    }
+                    let events: Vec<EventRecord> = client
+                        .get(&format!(
+                            "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=1000",
+                            urlencoding::encode(&subject),
+                        ))
+                        .await?;
+                    for event in events {
+                        let fields = event.body.get("fields").unwrap_or(&event.body);
+                        if event.kind == "runtime.reconcile-decision"
+                            && matches!(fields["decision"].as_str(), Some("member-fault" | "raise"))
+                        {
+                            anyhow::bail!(
+                                "`{subject}` could not restart: {}; inspect it with `st agents show {subject}`",
+                                fields["reason"]
+                                    .as_str()
+                                    .unwrap_or("the runtime could not restart")
+                            );
+                        }
+                        cursor = cursor.max(event.store_index);
+                    }
+                }
+            };
+            let agent = tokio::time::timeout(Duration::from_millis(timeout), wait).await
+                .with_context(|| format!("`{subject}` did not reach a new running incarnation within {}; inspect it with `st agents show {subject}`", args.timeout))??;
+            if json_output {
+                print_value(&agent, true)
+            } else {
+                println!(
+                    "Restarted {subject}: running on incarnation {}",
+                    agent.incarnation_id.as_deref().unwrap_or("")
+                );
+                Ok(())
+            }
         }
         AgentsCommand::Stop(args) => {
             let subject = normalize_member_subject(&args.subject, "agent");
@@ -8764,89 +9064,25 @@ fn agent_start_document(
     Ok(publication_document(agent))
 }
 
-/// The Claude settings the fleet's Claude seats run with: st's own channel plugin on, and the
-/// plugins st2's marketplace shipped off.
-const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":false,"st-channel@st":true}}"#;
+#[cfg(test)]
+use st3::creation::CLAUDE_SEAT_SETTINGS;
 
-/// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
-/// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
 fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bool) -> String {
-    let mut body = KdlDocument::new();
-    if let Some(description) = &args.description {
-        body.nodes_mut()
-            .push(kdl_node("description", [description.as_str()]));
-    }
-    if let Some(host) = &args.host {
-        body.nodes_mut().push(kdl_node("host", [host.as_str()]));
-    }
-    let mut workspace = kdl_node("workspace", [workspace]);
-    if create_workspace {
-        workspace
-            .entries_mut()
-            .push(KdlEntry::new_prop("create", true));
-    }
-    body.nodes_mut().push(workspace);
-    let arguments: &[&str] = match args.harness.as_str() {
-        "claude" => {
-            let mut environment = KdlNode::new("env");
-            let mut variables = KdlDocument::new();
-            variables
-                .nodes_mut()
-                .push(kdl_node("CLAUDE_CODE_CHILD_SESSION", ["0"]));
-            environment.set_children(variables);
-            body.nodes_mut().push(environment);
-            body.nodes_mut().push(render_node(&[
-                kdl_node("git-exclude", [".claude/"]),
-                kdl_node(
-                    "json-upsert",
-                    [".claude/settings.local.json", CLAUDE_SEAT_SETTINGS],
-                ),
-            ]));
-            &[
-                "--dangerously-skip-permissions",
-                "--settings",
-                CLAUDE_SEAT_SETTINGS,
-            ]
-        }
-        "codex" => &[
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--dangerously-bypass-hook-trust",
-        ],
-        _ => &[],
+    let parameters = st3_client::AgentCreateParameters {
+        name: args.name.clone(),
+        harness: args.harness.clone(),
+        host: args.host.clone(),
+        model: args.model.clone(),
+        effort: args.effort.clone(),
+        description: args.description.clone(),
+        workspace: None,
+        message: args.message.clone(),
     };
-    let mut harness = kdl_node("harness", [args.harness.as_str()]);
-    let mut harness_body = KdlDocument::new();
-    if let Some(model) = &args.model {
-        harness_body
-            .nodes_mut()
-            .push(kdl_node("model", [model.as_str()]));
-    }
-    if let Some(effort) = &args.effort {
-        harness_body
-            .nodes_mut()
-            .push(kdl_node("effort", [effort.as_str()]));
-    }
-    if !arguments.is_empty() {
-        harness_body
-            .nodes_mut()
-            .push(kdl_node("args", arguments.iter().copied()));
-    }
-    if !harness_body.nodes().is_empty() {
-        harness.set_children(harness_body);
-    }
-    body.nodes_mut().push(harness);
-    body.nodes_mut().push(kdl_node("restart", ["always"]));
-    let mut agent = kdl_node("agent", [args.name.as_str()]);
-    agent.set_children(body);
-    publication_document(agent)
-}
-
-fn render_node(operations: &[KdlNode]) -> KdlNode {
-    let mut render = KdlNode::new("render");
-    let mut body = KdlDocument::new();
-    body.nodes_mut().extend(operations.iter().cloned());
-    render.set_children(body);
-    render
+    let key = args
+        .message
+        .as_ref()
+        .map(|_| uuid::Uuid::now_v7().to_string());
+    st3::creation::agent_document(&parameters, workspace, create_workspace, key.as_deref())
 }
 
 async fn run_agent_new(
@@ -8911,7 +9147,33 @@ async fn run_agent_new(
         Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => {}
         Err(error) => return Err(error.into()),
     }
-    publish_text(&client, kdl, source_name, actor.clone()).await?;
+    if actor.starts_with("person/") {
+        let generated = generated_client(endpoint, Some(&actor))?;
+        let capabilities = generated.capabilities().await?;
+        let nonce = uuid::Uuid::now_v7().simple().to_string();
+        generated
+            .agent_create(
+                format!("action/{nonce}"),
+                format!("agent-new:{nonce}"),
+                ClientFence {
+                    snapshot_id: capabilities.snapshot.id,
+                    ..ClientFence::default()
+                },
+                st3_client::AgentCreateParameters {
+                    name: args.name.clone(),
+                    harness: args.harness.clone(),
+                    host: args.host.clone(),
+                    model: args.model.clone(),
+                    effort: args.effort.clone(),
+                    workspace: Some(workspace.clone()),
+                    description: args.description.clone(),
+                    message: args.message.clone(),
+                },
+            )
+            .await?;
+    } else {
+        publish_text(&client, kdl, source_name, actor.clone()).await?;
+    }
     if !json_output {
         eprintln!("Created {subject} in {workspace}; waiting for the agent to start.");
     }
@@ -9162,6 +9424,8 @@ async fn run_agent_inspection(
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
+        | AgentsCommand::Restart(_)
+        | AgentsCommand::Rename(_)
         | AgentsCommand::Queue(_)
         | AgentsCommand::Hold(_) => {
             unreachable!("agent mutation and queue commands return before inspection")
@@ -11341,6 +11605,7 @@ async fn run_message(
                     tags: Vec::new(),
                     from: args.from,
                     print_kdl: args.print_kdl,
+                    idempotency_key: args.idempotency_key,
                 },
             )
             .await?;
@@ -11491,18 +11756,17 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<M
         return Ok(None);
     }
     client
-        .post(
-            "/v1/messages",
-            &MessageSendRequest {
-                idempotency_key: format!("st3-message-send:{id}"),
-                from,
-                to,
-                content: args.body,
-                title: args.subject,
-                in_reply_to: args.in_reply_to,
-                tags: args.tags,
-            },
-        )
+        .send_message(&MessageSendRequest {
+            idempotency_key: args
+                .idempotency_key
+                .unwrap_or_else(|| format!("st3-message-send:{id}")),
+            from,
+            to,
+            content: args.body,
+            title: args.subject,
+            in_reply_to: args.in_reply_to,
+            tags: args.tags,
+        })
         .await
         .map(Some)
 }
@@ -11994,6 +12258,18 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         if let Some(state) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV) {
             return resume_native_driver(client, subject, &args.driver, argv, &state).await;
         }
+        if let (Some(message), Some(id)) = (&args.initial_message, &args.initial_message_id) {
+            // The durable launch receipt precedes invocation. A fresh incarnation never repeats
+            // the first message; adoption resumes above without invoking a new provider.
+            let incarnation = wait_for_agent_incarnation(client, subject).await?;
+            if retry_while_daemon_unreachable(subject, || {
+                st3::creation::claim_initial_message(client, subject, id, &incarnation)
+            })
+            .await?
+            {
+                st3::creation::append_native_message(&args.driver, &mut argv, message)?;
+            }
+        }
         if args.driver == "codex" {
             return run_codex_native(client, subject, argv).await;
         }
@@ -12383,6 +12659,7 @@ fn native_delivery_report(transport: &str, agent_dir: Option<&Path>) -> String {
         "transport": transport,
         "pid": std::process::id(),
         "image": st_drivers::reexec::running_identity().map(|identity| identity.token()),
+        "follows": st_drivers::reexec::installed_binary().map(|path| path.display().to_string()),
     });
     if let Some(agent_dir) = agent_dir {
         let channel = st_drivers::claude_mcp::read_presence(agent_dir);
@@ -13980,6 +14257,20 @@ fn legacy_delivery_hold(
 async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the Codex driver argv is empty");
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
+    // The local PTY can publish before reconciliation records runtime.running. Like the
+    // other native drivers, publish startup evidence before binding the mailbox: that bind
+    // must wait for the exact running incarnation instead of treating this fresh seat as stale.
+    retry_while_daemon_unreachable(subject, || {
+        publish_harness_state(
+            client,
+            subject,
+            "codex",
+            "starting",
+            Some(&incarnation),
+            None,
+        )
+    })
+    .await?;
     drive_codex_native(
         client,
         subject,
@@ -14844,8 +15135,19 @@ impl NativeMailbox {
                     mailbox_receipt(client, &self.fence, &view.subject, "read").await?;
                     return Ok(());
                 }
+                // Delivery is durable handoff evidence, including mail handed to the legacy
+                // provider turn before the push ledger used graph subjects as its keys.
+                if view.status == "delivered" {
+                    self.queued.remove(&view.subject);
+                    return Ok(());
+                }
                 if view.status == "sent" {
-                    mailbox_receipt(client, &self.fence, &view.subject, "staged").await?;
+                    let staged =
+                        mailbox_receipt_claim(client, &self.fence, &view.subject, "staged").await?;
+                    if staged.kind != "message.staged" {
+                        self.queued.remove(&view.subject);
+                        return Ok(());
+                    }
                 }
                 if !self.queued.contains_key(&view.subject) {
                     let body = message_content(client, view).await?;
@@ -14925,7 +15227,10 @@ async fn mailbox_receipt_claim(
 }
 
 fn seat_label(seat: &st3::model::DesiredSubject) -> String {
-    st3::mailbox::seat_label(seat)
+    st3::mailbox::seat_label(
+        seat,
+        std::env::var("AGENT_PERSONA_SHORT").ok().as_deref(),
+    )
 }
 fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> Result<()> {
     let label = seat_label(seat);
@@ -15895,6 +16200,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_mailbox_upgrade_does_not_queue_legacy_delivered_mail_or_acknowledge_it_as_read()
+    {
+        // The two providers share this pump but load their own native receipt ledgers.
+        for driver in ["codex", "opencode"] {
+            let root = tempfile::tempdir().unwrap();
+            let agent_dir = root.path().join("agent");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            st_drivers::push_mailbox::register(&agent_dir);
+            let client = Client::new(Endpoint::Unix(root.path().join("absent-daemon.sock")));
+            let mut view = MessageView {
+                subject: "message/legacy".into(),
+                from: "person/eval".into(),
+                to: "agent/eval.worker".into(),
+                content: "doc/unavailable@hash".into(),
+                status: "delivered".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                created_index: 1,
+            };
+            let mut mailbox = NativeMailbox {
+                subscription: None,
+                fence: st3::mailbox::Fence::new(&view.to, "new-incarnation", "delivery"),
+                messages: vec![view.clone()],
+                queued: BTreeMap::new(),
+                replayed: true,
+            };
+            // Even a previously cached body must leave the fresh-handoff queue when delivery lands.
+            mailbox.queued.insert(
+                view.subject.clone(),
+                native_queued_message(&view, "Cached signal".into()),
+            );
+            view.subject = "message/pending".into();
+            view.status = "staged".into();
+            view.content = "Fresh signal".into();
+            mailbox.messages.push(view.clone());
+            for _ in 0..3 {
+                let receipts = if driver == "codex" {
+                    NativeDeliveryReceipts::Codex {
+                        state_dir: root.path(),
+                        identity: "eval.worker",
+                        runtime_id: "worker",
+                    }
+                } else {
+                    NativeDeliveryReceipts::OpenCode {
+                        catalog_root: root.path(),
+                        identity: "eval.worker",
+                        runtime_id: "worker",
+                    }
+                };
+                // An absent daemon makes any accidental body fetch, staging or fabricated read fail.
+                mailbox.pump(&client, &agent_dir, receipts).await.unwrap();
+                let queued = st_drivers::push_mailbox::messages(
+                    &agent_dir,
+                    &agent_dir.join("resources/inbox"),
+                )
+                .unwrap();
+                assert_eq!(queued.len(), 1, "{driver}");
+                assert_eq!(queued[0].filename, "message/pending");
+                assert!(st_drivers::push_mailbox::is_unread(
+                    &agent_dir,
+                    "message/legacy",
+                    &queued
+                ));
+            }
+            assert!(!agent_dir.join("resources").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn pi_family_pending_read_survives_daemon_outage_and_reexec_under_its_fence() {
         use axum::{Json, Router, routing::post};
         let root = tempfile::tempdir().unwrap();
@@ -16079,6 +16454,7 @@ mod tests {
         let back: DriverResume =
             serde_json::from_slice(&serde_json::to_vec(&resume).unwrap()).unwrap();
         assert_eq!(back.session, resume.session);
+        assert_eq!(back.incarnation, resume.incarnation);
         assert!(back.loop_state.ready);
         assert_eq!(back.loop_state.delivery_episode, 2);
         assert_eq!(
@@ -18049,6 +18425,50 @@ mod tests {
     }
 
     #[test]
+    fn message_send_and_reply_accept_a_key_for_unconfirmed_retries() {
+        let send = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "send",
+            "agent/example/worker",
+            "--from",
+            "person/ada",
+            "--body",
+            "Hello",
+            "--idempotency-key",
+            "retry-a-send",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Send(send),
+        } = send.command
+        else {
+            panic!("send did not parse");
+        };
+        assert_eq!(send.idempotency_key.as_deref(), Some("retry-a-send"));
+        let reply = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "reply",
+            "message/example",
+            "--from",
+            "person/ada",
+            "--body",
+            "Hello",
+            "--idempotency-key",
+            "retry-a-reply",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Reply(reply),
+        } = reply.command
+        else {
+            panic!("reply did not parse");
+        };
+        assert_eq!(reply.idempotency_key.as_deref(), Some("retry-a-reply"));
+    }
+
+    #[test]
     fn message_replies_route_to_the_other_participant() {
         let original = MessageView {
             subject: "message/original".into(),
@@ -18280,6 +18700,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn agent_rename_needs_a_nonempty_label_or_clear() {
+        let rename = |label: &[&str]| {
+            Cli::try_parse_from(
+                ["st3", "agents", "rename", "agent/worker"]
+                    .into_iter()
+                    .chain(label.iter().copied())
+                    .chain(["--as", "person/alex"]),
+            )
+        };
+        assert!(rename(&["Garden"]).is_ok());
+        assert!(rename(&["--clear"]).is_ok());
+        assert!(rename(&[""]).is_err());
+        assert!(rename(&[]).is_err());
+    }
+
     fn agent_new_args(arguments: &[&str]) -> AgentNewArgs {
         let cli = Cli::try_parse_from(
             ["st3", "agents", "new"]
@@ -18294,6 +18730,68 @@ mod tests {
             panic!("agents new did not parse");
         };
         args
+    }
+
+    #[test]
+    fn creation_cli_accepts_a_literal_first_message_and_plain_shell_options() {
+        let args = agent_new_args(&[
+            "worker",
+            "--harness",
+            "codex",
+            "--message",
+            "--literal first message",
+        ]);
+        assert_eq!(args.message.as_deref(), Some("--literal first message"));
+        assert_eq!(
+            normalize_member_subject(
+                "terminal/pty/person/ada/019a0000-0000-7000-8000-000000000001",
+                "pty"
+            ),
+            "pty/person/ada/019a0000-0000-7000-8000-000000000001"
+        );
+        assert_eq!(
+            normalize_member_subject("terminal/agent/test.worker", "pty"),
+            "agent/test.worker"
+        );
+        let source = agent_new_document(&args, "/tmp", false);
+        let intent = st3::graph::parse_intent(&source, "test").unwrap();
+        assert!(intent.subjects.values().next().unwrap().member.is_some());
+        let cli = Cli::try_parse_from([
+            "st3",
+            "terminals",
+            "new",
+            "Shell",
+            "--host",
+            "builder",
+            "--cwd",
+            "/tmp",
+            "--as",
+            "person/ada",
+        ])
+        .unwrap();
+        let Command::Terminals {
+            command: PtyCommand::New(args),
+        } = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(args.name.as_deref(), Some("Shell"));
+        assert_eq!(args.host.as_deref(), Some("builder"));
+        let cli = Cli::try_parse_from([
+            "st3",
+            "terminals",
+            "end",
+            "terminal/pty/person/ada/019a0000-0000-7000-8000-000000000001",
+            "--as",
+            "person/ada",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Terminals {
+                command: PtyCommand::End(_)
+            }
+        ));
     }
 
     #[test]

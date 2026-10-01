@@ -61,6 +61,7 @@ pub async fn run(
     let report = || {
         json!({"transport":"claude-channel", "pid":std::process::id(),
         "image":st_drivers::reexec::running_identity().map(|i| i.token()),
+        "follows":st_drivers::reexec::installed_binary().map(|path| path.display().to_string()),
         "channel":{"pid":std::process::id(),"image":st_drivers::reexec::running_identity().map(|i| i.token()),"age_ms":0},
         "ready":state.initialized})
     };
@@ -112,11 +113,14 @@ pub async fn run(
             _ = interval.tick() => {
                 subscription.report(json!({"transport":"claude-channel", "pid":std::process::id(),
                     "image":st_drivers::reexec::running_identity().map(|i| i.token()),
+                    "follows":st_drivers::reexec::installed_binary().map(|path| path.display().to_string()),
                     "channel":{"pid":std::process::id(),"image":st_drivers::reexec::running_identity().map(|i| i.token()),"age_ms":0},
                     "ready":state.initialized}));
                 if state.initialized && replayed {
                     for message in &messages {
                         if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") { continue; }
+                        if !state.attempted.contains(&message.subject)
+                            && !prepare_handoff(client, &state.fence, message).await.unwrap_or(false) { continue; }
                         let envelope = if let Some(envelope) = content.get(&message.subject) { envelope.clone() } else {
                             let Ok(body) = body(client, message).await else { continue; };
                             let envelope = st_drivers::ding::st3_notification_text(&message.subject, &message.from, &message.to,
@@ -128,7 +132,6 @@ pub async fn run(
                             envelope
                         };
                         if state.attempted.contains(&message.subject) { continue; }
-                        if receipt(client, &state.fence, &message.subject, "staged").await.is_err() { continue; }
                         // Before the handoff, persist its stable identity. A broken stdout or channel
                         // restart cannot authorize repeating an uncertain native notification.
                         state.attempted.insert(message.subject.clone());
@@ -283,8 +286,26 @@ async fn body(client: &Client, message: &MessageView) -> Result<String> {
         Ok(message.content.clone())
     }
 }
-async fn receipt(client: &Client, fence: &Fence, message: &str, lifecycle: &str) -> Result<()> {
-    let _: ClaimRecord = client
+// Delivered graph mail has already crossed a native handoff, even if this incarnation has
+// no local ledger. Keep attempted mail available for transcript proof, but never restage it.
+async fn prepare_handoff(client: &Client, fence: &Fence, message: &MessageView) -> Result<bool> {
+    match message.status.as_str() {
+        "sent" => Ok(receipt(client, fence, &message.subject, "staged")
+            .await?
+            .kind
+            == "message.staged"),
+        "staged" => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+async fn receipt(
+    client: &Client,
+    fence: &Fence,
+    message: &str,
+    lifecycle: &str,
+) -> Result<ClaimRecord> {
+    client
         .post(
             "/v1/mailbox/receipts",
             &Receipt {
@@ -293,8 +314,7 @@ async fn receipt(client: &Client, fence: &Fence, message: &str, lifecycle: &str)
                 lifecycle: lifecycle.into(),
             },
         )
-        .await?;
-    Ok(())
+        .await
 }
 async fn write(stdout: &mut tokio::io::Stdout, frame: &Value) -> Result<()> {
     stdout
@@ -328,6 +348,134 @@ fn request(line: &str, initialized: &mut bool) -> Result<Option<Value>> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[tokio::test]
+    async fn claude_delivered_replay_makes_no_staging_requests_and_settled_mail_is_not_handed_off()
+    {
+        use axum::{Json, Router, routing::post};
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let root = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::store::Store::open(&root.path().join("graph.db"), "node").unwrap(),
+        );
+        let message = |subject: &str, status: &str| MessageView {
+            subject: subject.into(),
+            from: "person/eval".into(),
+            to: "agent/eval.worker".into(),
+            content: "Signal".into(),
+            status: status.into(),
+            title: None,
+            in_reply_to: None,
+            tags: Vec::new(),
+            created_index: 1,
+        };
+        let claim = |message: &MessageView, lifecycle: &str| ClaimInput {
+            subject: message.subject.clone(),
+            kind: format!("message.{lifecycle}"),
+            actor: Some(
+                if lifecycle == "sent" {
+                    &message.from
+                } else {
+                    &message.to
+                }
+                .clone(),
+            ),
+            fields: if lifecycle == "sent" {
+                BTreeMap::from([
+                    ("status".into(), json!(lifecycle)),
+                    ("from".into(), json!(message.from)),
+                    ("to".into(), json!(message.to)),
+                    ("content".into(), json!(message.content)),
+                ])
+            } else {
+                BTreeMap::from([("status".into(), json!(lifecycle))])
+            },
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        let sent = message("message/fresh", "sent");
+        let raced = message("message/raced", "sent");
+        store.append_claim(&claim(&sent, "sent")).unwrap();
+        store.append_claim(&claim(&raced, "sent")).unwrap();
+        let settled = store.append_claim(&claim(&raced, "delivered")).unwrap();
+        let graph = store.clone();
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/v1/mailbox/receipts",
+            post(move |Json(receipt): Json<Receipt>| {
+                let graph = graph.clone();
+                let captured = captured.clone();
+                let settled = settled.clone();
+                async move {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((receipt.message.clone(), receipt.lifecycle.clone()));
+                    // The fenced endpoint settles a stale staging view to existing later evidence.
+                    let record = if receipt.message == settled.subject {
+                        settled
+                    } else {
+                        graph
+                            .append_claim(&ClaimInput {
+                                subject: receipt.message,
+                                kind: format!("message.{}", receipt.lifecycle),
+                                actor: Some(receipt.fence.subject),
+                                fields: BTreeMap::from([(
+                                    "status".into(),
+                                    json!(receipt.lifecycle),
+                                )]),
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: None,
+                            })
+                            .unwrap()
+                    };
+                    Json(json!({"api_version":"st3.v1", "value":record}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(crate::client::Endpoint::Http(format!("http://{address}")));
+        let fence = Fence::new("agent/eval.worker", "new-incarnation", "delivery");
+        // Sixty replay ticks of one hundred legacy-delivered messages used to make 6,000 POSTs.
+        for _ in 0..60 {
+            for index in 0..100 {
+                assert!(
+                    !prepare_handoff(
+                        &client,
+                        &fence,
+                        &message(&format!("message/legacy-{index}"), "delivered")
+                    )
+                    .await
+                    .unwrap()
+                );
+            }
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(
+            prepare_handoff(&client, &fence, &message("message/pending", "staged"))
+                .await
+                .unwrap()
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(prepare_handoff(&client, &fence, &sent).await.unwrap());
+        assert!(!prepare_handoff(&client, &fence, &raced).await.unwrap());
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                (sent.subject.clone(), "staged".into()),
+                (raced.subject.clone(), "staged".into())
+            ]
+        );
+        assert_eq!(
+            store.message(&raced.subject).unwrap().unwrap().status,
+            "delivered"
+        );
+        server.abort();
+    }
 
     #[test]
     fn claude_native_proof_requires_the_exact_envelope_in_a_user_record() {

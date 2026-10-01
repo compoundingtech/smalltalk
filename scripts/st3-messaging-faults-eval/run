@@ -18,7 +18,7 @@ import tomllib
 import uuid
 
 HERE = Path(__file__).resolve().parent
-CASES = ("baseline", "daemon-restart", "binary-swap", "link-seconds", "link-minutes",
+CASES = ("baseline", "daemon-restart", "binary-swap", "path-deploy", "link-seconds", "link-minutes",
          "receiver-down", "harness-restart", "channel-killed", "old-channel", "handoff-failed")
 
 
@@ -148,9 +148,13 @@ class Node:
         self.env = {**env, "HOME": str(self.root / "home"),
                     "XDG_STATE_HOME": str(self.root / "home/state"),
                     "XDG_CONFIG_HOME": str(self.root / "home/config"),
-                    "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", str(self.root / "run")),
                     "ST3_ENDPOINT": str(self.endpoint), "ST3_DAEMON_WAIT": "0",
                     "PATH": f"{self.root / 'bin'}:{env['PATH']}"}
+        # Only inherit an actual user manager. A synthetic runtime directory makes
+        # systemd-run attempt scopes on runners that have no user bus.
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime_dir and (Path(runtime_dir) / "bus").is_socket():
+            self.env["XDG_RUNTIME_DIR"] = runtime_dir
         # Historical daemons rebuild PATH from a login shell. Pin that shell's
         # fixture executables too, so it cannot launch an installed real provider.
         profile = "export PATH=" + shlex.quote(self.env["PATH"]) + "\n"
@@ -332,6 +336,12 @@ def judge(proof):
     expected_delivery = "legacy" if proof["case"] == "old-channel" else "current"
     if delivery.get("state") != expected_delivery:
         failures.append(f"delivery report is {delivery.get('state', 'unreported')}: {delivery.get('reason')}")
+    # The historical channel runs its own build on purpose; every other st process of the seat
+    # must run the executable the daemon runs once the fault clears.
+    if proof["case"] != "old-channel":
+        replaced = [image for image in proof["seat_images_after"] if image != proof["daemon_image"]]
+        if replaced:
+            failures.append(f"seat st processes still run a replaced binary: {', '.join(replaced)}")
     if proof["graph_read_claims"] != 1:
         failures.append(f"graph contains {proof['graph_read_claims']} read claims (expected 1)")
     elif not proof["read_receipt_matches_graph"]:
@@ -445,6 +455,18 @@ agent "fault-probe" {{
                 await asyncio.sleep(args.short_seconds)
             await target.start()
             link.enabled = True
+        elif case == "path-deploy":
+            link.drop()
+            subject = await send(source, case)
+            # A deploy that starts the daemon from a new path, as a new Nix store path does. The
+            # path the seat started from keeps its old executable, unchanged.
+            deployed = target.root / "next-store/bin/st3"
+            deployed.parent.mkdir(parents=True)
+            shutil.copy2(replacement, deployed)
+            await target.down()
+            target.binary = deployed
+            await target.start()
+            link.enabled = True
         elif case in ("link-seconds", "link-minutes"):
             link.drop()
             subject = await send(source, case)
@@ -527,7 +549,9 @@ agent "fault-probe" {{
             provider_pids_before=initial, provider_pids_after=provider_pids(after),
             incarnation_before=before_card.get("incarnation_id"), incarnation_after=after_card.get("incarnation_id"),
             delivery_after=after_card.get("delivery", {}), sender_message_status=(source_view or {}).get("status"),
-            delivered_during_outage=case in ("daemon-restart", "receiver-down", "binary-swap", "old-channel", "link-seconds", "link-minutes")
+            seat_images_after=sorted({row["image"] for row in after if " driver " in row["argv"]}),
+            daemon_image=str(target.binary),
+            delivered_during_outage=case in ("daemon-restart", "receiver-down", "binary-swap", "path-deploy", "old-channel", "link-seconds", "link-minutes")
                 and any(row["at_unix_ms"] < cleared for row in received),
             read_receipt_matches_graph=len(graph_reads) == 1 and graph_reads[0]["accepted_at_unix_ms"] == read_at)
         result["failures"] = judge(result)

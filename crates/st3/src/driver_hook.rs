@@ -150,6 +150,7 @@ fn live_claude_label(env: &dyn HookEnv, identity: &str) -> Result<String> {
         .var("ST3_SUBJECT")
         .or_else(|| env.var("ST_AGENT"))
         .unwrap_or_else(|| format!("agent/{identity}"));
+    let persona_short = env.var("AGENT_PERSONA_SHORT");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -168,16 +169,29 @@ fn live_claude_label(env: &dyn HookEnv, identity: &str) -> Result<String> {
             .find(|seat| seat.subject == subject)
             .and_then(|seat| seat.desired)
             .context("seat has no desired record")?;
-        let member = serde_json::from_value::<crate::model::MemberSpec>(desired.clone()).ok();
-        Ok(crate::mailbox::seat_label(&crate::model::DesiredSubject {
-            subject,
-            kind: "agent".into(),
-            desired,
-            member,
-            owner_run: None,
-            owner_generation: None,
-            owner_step: None,
-        }))
+        // Status exposes the canonical KDL node, not the supervisor's MemberSpec. Read its
+        // `name` child on every render so renames and clearing a name take effect immediately.
+        let display_name = desired
+            .get("children")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|child| child.get("name").and_then(Value::as_str) == Some("name"))
+            .and_then(|child| child.pointer("/arguments/0"))
+            .and_then(Value::as_str);
+        let desired = serde_json::json!({"display_name": display_name});
+        Ok(crate::mailbox::seat_label(
+            &crate::model::DesiredSubject {
+                subject,
+                kind: "agent".into(),
+                desired,
+                member: None,
+                owner_run: None,
+                owner_generation: None,
+                owner_step: None,
+            },
+            persona_short.as_deref(),
+        ))
     })
 }
 
@@ -377,6 +391,56 @@ mod tests {
             reported.push(diagnostic)
         });
         (code, reported)
+    }
+
+    #[test]
+    fn claude_live_label_reads_canonical_status_names_and_reflects_rename_and_clear() {
+        use axum::{Json, Router, routing::get};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let desired = std::sync::Arc::new(std::sync::Mutex::new(serde_json::json!({
+            "name":"agent", "arguments":["eval.worker"],
+            "children":[{"name":"name", "arguments":["Quartz"], "children":[]}],
+        })));
+        let captured = desired.clone();
+        let app = Router::new().route(
+            "/v1/status",
+            get(move || {
+                let captured = captured.clone();
+                async move {
+                    Json(serde_json::json!({"api_version":"st3.v1", "value": {
+                        "store_index":1, "pending_actions":[], "subjects":[{
+                            "subject":"agent/eval.worker", "kind":"agent", "desired_token":null,
+                            "desired_revision":null, "desired":captured.lock().unwrap().clone(),
+                            "actual":null, "conflicts":[], "claims":[], "owner_run":null,
+                            "gap":null, "reachability":"unknown", "reason":null,
+                        }],
+                    }}))
+                }
+            }),
+        );
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = runtime.spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut env = BTreeMap::from([
+            ("ST3_ENDPOINT".into(), format!("http://{address}")),
+            ("ST3_SUBJECT".into(), "agent/eval.worker".into()),
+        ]);
+        assert_eq!(live_claude_label(&env, "eval.worker").unwrap(), "Quartz");
+        env.insert("AGENT_PERSONA_SHORT".into(), "gen".into());
+        assert_eq!(live_claude_label(&env, "eval.worker").unwrap(), "Quartz[gen]");
+        desired.lock().unwrap()["children"][0]["arguments"][0] = serde_json::json!("Indigo\u{7}");
+        assert_eq!(live_claude_label(&env, "eval.worker").unwrap(), "Indigo[gen]");
+        desired.lock().unwrap()["children"] = serde_json::json!([]);
+        assert_eq!(
+            live_claude_label(&env, "eval.worker").unwrap(),
+            "eval.worker[gen]"
+        );
+        server.abort();
     }
 
     #[test]

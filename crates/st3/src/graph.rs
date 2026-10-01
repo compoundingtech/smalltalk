@@ -393,7 +393,13 @@ fn parse_desired_node(
             format!("unknown desired-state node `{kind}`"),
         ));
     }
+    let owned_terminal = kind == "pty"
+        && context.owner_run.is_none()
+        && st3_schema::owned_terminals::owner(&format!("pty/{}", one_string_with_children(node)?))
+            .map_err(|e| St3Error::new(e.code, e.message))?
+            .is_some();
     if !context.allow_execution_root
+        && !owned_terminal
         && matches!(
             kind,
             "exec" | "pty" | "lane" | "observer" | "subscription" | "schedule"
@@ -1311,6 +1317,7 @@ fn parse_agent(
     }
 
     if let Some(member) = primary.as_mut() {
+        member.tags.extend(parse_tags(children)?);
         member.tags.insert("st3.subject".into(), subject.clone());
         if fresh_context {
             member
@@ -1448,6 +1455,7 @@ fn parse_standalone_member(
         shutdown_timeout_ms,
         true,
     )?;
+    member.display_name = child_string(children, "name")?;
     member.tags.insert("st3.subject".into(), subject.clone());
     insert_subject(
         context,
@@ -2133,8 +2141,8 @@ fn driver_member(
             _ => provider.extend(["--effort".into(), effort]),
         }
     }
-    // No startup prompt: a started or restarted seat takes no turn until a person types or a
-    // graph message is posted. Work reaches an idle seat as a posted message naming the step.
+    // The native argv stays idle by default. An explicit message is passed separately to the
+    // wrapper below, which claims one durable launch attempt before adding its native argument.
     provider.extend(extra);
     let mut wrapper = vec![
         "st3".into(),
@@ -2142,8 +2150,16 @@ fn driver_member(
         name.clone(),
         "--subject".into(),
         subject.into(),
-        "--".into(),
     ];
+    if let Some(message) = unique_child(children, "message")? {
+        wrapper.extend([
+            "--initial-message".into(),
+            positional_strings_without_children(message)?[0].clone(),
+            "--initial-message-id".into(),
+            property_string(message, "id")?.expect("validated message ID"),
+        ]);
+    }
+    wrapper.push("--".into());
     wrapper.extend(provider);
     Ok(MemberSpec {
         kind: MemberKind::Agent,
@@ -2363,9 +2379,11 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "command",
         "argv",
         "env",
+        "tags",
         "render",
         "harness",
         "fresh-context",
+        "handles-faults",
         "mission-authority",
         "queue-authority",
         "seat-authority",
@@ -2399,15 +2417,23 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "command",
         "argv",
         "env",
+        "tags",
         "render",
         "harness",
         "fresh-context",
+        "handles-faults",
         "mission-authority",
         "queue-authority",
         "seat-authority",
         "agent-authority",
     ] {
         unique_child(document, child)?;
+    }
+    if let Some(flag) = unique_child(document, "handles-faults")? {
+        ensure_bare(flag)?;
+    }
+    if let Some(tags) = unique_child(document, "tags")? {
+        validate_tags(tags)?;
     }
     if let Some(authority) = unique_child(document, "mission-authority")?
         && !declares_no_mission_authority(authority)?
@@ -2701,14 +2727,21 @@ fn validate_task_body(
 ) -> Result<(), St3Error> {
     let mut allowed = vec!["id", "command", "argv", "cwd", "tags", "env", "unset"];
     if standalone {
-        allowed.extend(["host", "workspace", "restart", "shutdown-timeout", "render"]);
+        allowed.extend([
+            "host",
+            "workspace",
+            "restart",
+            "shutdown-timeout",
+            "render",
+            "name",
+        ]);
     }
     reject_unknown_children(document, &allowed, "member", owner)?;
     for child in ["id", "command", "argv", "cwd", "tags", "env", "unset"] {
         unique_child(document, child)?;
     }
     if standalone {
-        for child in ["host", "workspace", "shutdown-timeout", "render"] {
+        for child in ["host", "workspace", "shutdown-timeout", "render", "name"] {
             unique_child(document, child)?;
         }
         validate_restart_forms(document)?;
@@ -2789,9 +2822,9 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
         )
     })?;
     let allowed: &[&str] = match provider.as_str() {
-        "claude" => &["model", "effort", "dev-channels", "args"],
-        "codex" | "pi" | "omp" => &["model", "effort", "args"],
-        "opencode" => &["model", "args"],
+        "claude" => &["model", "effort", "dev-channels", "args", "message"],
+        "codex" | "pi" | "omp" => &["model", "effort", "args", "message"],
+        "opencode" => &["model", "args", "message"],
         _ => return Err(St3Error::new("unknown-driver", "unknown typed driver")),
     };
     if body
@@ -2805,6 +2838,24 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
                 "harness `{provider}` cannot take a prompt: a seat starts idle and takes no turn until a person types or a message is posted; put the instruction in a step goal or send the seat a message"
             ),
         ));
+    }
+    if let Some(message) = unique_child(body, "message")? {
+        ensure_only_properties(message, &["id"])?;
+        ensure_no_children(message)?;
+        let values = positional_strings_without_children(message)?;
+        let id = property_string(message, "id")?.unwrap_or_default();
+        if values.len() != 1
+            || values[0].trim().is_empty()
+            || values[0].len() > 65536
+            || values[0].contains('\0')
+            || id.is_empty()
+            || id.len() > 256
+        {
+            return Err(St3Error::new(
+                "invalid-initial-message",
+                "message needs nonempty text up to 64 KiB and a stable id",
+            ));
+        }
     }
     reject_unknown_children(body, allowed, "harness", &provider)?;
     for child in allowed {

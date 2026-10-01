@@ -41,3 +41,22 @@ const legacyBody: GlassBody = { name: 'Old', tabs: [] };
 // @ts-expect-error panes belong to tabs, not layout leaves
 const legacyLayout: GlassLayout = { pane: 'opaque:key' };
 void legacyBody; void legacyLayout;
+
+const createAgent: ActionOf<'agent.create'> = {
+    api_version: 'st3.client.v0', id: 'action/create', type: 'agent.create',
+    idempotency_key: 'creation-test-key', fence: { snapshot_id: 'snapshot/test', subject_revisions: {} },
+    parameters: { name: 'worker', harness: 'codex', message: '--literal text', workspace: '/tmp' },
+};
+const createTerminal: ActionOf<'terminal.create'> = {
+    ...createAgent, type: 'terminal.create', parameters: { name: 'Shell', cwd: '/tmp' },
+};
+void createAgent.parameters.message;
+void createTerminal.parameters.cwd;
+
+const attachTerminal: ActionOf<'terminal.attach'> = {
+    api_version: 'st3.client.v0', id: 'action/attach', type: 'terminal.attach',
+    idempotency_key: 'terminal-attach-key',
+    fence: { snapshot_id: 'snapshot/test', subject_revisions: {}, runtime_incarnation: 'runtime:one' },
+    parameters: { target_id: 'terminal/agent/example' },
+};
+void attachTerminal;

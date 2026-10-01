@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Smalltalk terminal UI starter shell"
 license = "MIT"
+# The workspace's build identity stamp, shared with st2 and st-drivers (see src/version.rs).
+build = "../../build.rs"
 
 [dependencies]
 anyhow = "1"
@@ -19,8 +21,12 @@ serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 toml = "0.9"
 libc = "0.2"
+base64 = "0.22"
 unicode-width = "0.2.0"
 reqwest = { version = "0.12", default-features = false }
+# Thumbnails of attached images: kitty placeholders, sixel or iTerm2, else half blocks.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [[bin]]
 name = "stui"
