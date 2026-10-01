@@ -1939,6 +1939,8 @@ pub struct DoctorCheck {
 pub struct DoctorReport {
     pub status: String,
     pub checks: Vec<DoctorCheck>,
+    #[serde(default)]
+    pub performance: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

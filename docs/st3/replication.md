@@ -90,6 +90,9 @@ SQLite triggers update per-table row counts and 512-bit modular sums of domain-s
 SHA-512 row hashes in the row's own transaction. Insert, update, delete, replacement, savepoint
 rollback and commit therefore change rows and cached digest state together. SHA-256 commits the
 table name, column schema, count and sum; a sorted map of those table digests commits the graph.
+Shared columns are encoded in sorted name order, including the logical operation row. A fresh
+schema and an additive migration can place the same column at different physical positions;
+that layout does not change the digest. Registry version 6 rebuilds older physical-order caches.
 These are diagnostic digests; authenticated envelopes and signatures remain the replication
 integrity boundary. Work scales with changed row bytes, plus the fixed-size accumulator.
 Reading all table digests reads one small cache, independent of retained history size. Operations

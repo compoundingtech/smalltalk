@@ -25,6 +25,8 @@ Use these documents for implementation details:
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits
   for the writer and read connections, SQLite statements, CPU, and callers.
+- [Operational queries](operational-queries.md) explains bounded mission lists, outcome history,
+  mission run summaries, and the five-minute performance report in `st doctor`.
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
 - [Eval audit](eval-audit.md) records the test intent and prompt boundary for each st eval.
 - [Running st with omp](omp.md) covers omp seat setup, behavior, and known limits.

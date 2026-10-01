@@ -47,8 +47,9 @@ pub struct Context {
     pub person: String,
     pub cache_path: Option<std::path::PathBuf>,
     pub cached: Option<Model>,
-    /// `stui --glasses` / `--glass NAME`: the glass to open instead of the sidebar layout.
-    pub glass: Option<String>,
+    /// `stui --glasses` / `--glass NAME`: open glasses instead of the sidebar layout, at the
+    /// named glass or the last one used on this device.
+    pub glass: Option<Option<String>>,
 }
 
 /// The terminal the feed follows for the open terminal view.
@@ -99,9 +100,11 @@ pub fn run(context: Context) -> Result<()> {
     let mut pending: Vec<Pending> = Vec::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
     ui.live = true;
-    ui.glass = glass.map(super::glass::Glass::new);
+    ui.glasses = glass.map(|name| {
+        super::glass::Glasses::open(name, super::glass_store::path(&person))
+    });
 
-    let _guard = Guard::enter(ui.glass.is_some())?;
+    let _guard = Guard::enter(ui.glasses.is_some())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let started = Instant::now();

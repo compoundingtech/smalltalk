@@ -2692,7 +2692,7 @@ fn main() -> Result<()> {
             person: person.unwrap_or_default(),
             cache_path,
             cached,
-            glass: ui::glass_name(&args),
+            glass: ui::glass_request(&args),
         });
     }
     let (updates, incoming) = mpsc::channel::<Update>();

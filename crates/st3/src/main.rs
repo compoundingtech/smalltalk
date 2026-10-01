@@ -1523,7 +1523,7 @@ enum MissionViewCommand {
     /// List current missions; use --all for historical terminal missions.
     Ls {
         /// Follow current collection changes.
-        #[arg(long, conflicts_with_all = ["all", "cursor"])]
+        #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
         #[arg(long)]
         all: bool,
@@ -1531,6 +1531,15 @@ enum MissionViewCommand {
         cursor: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Terminal transitions since a duration such as 6h, or an RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// End of the time window (RFC3339 timestamp or duration ago).
+        #[arg(long)]
+        until: Option<String>,
+        /// Terminal state: failed, cancelled, timed-out, or completed. Includes reasons.
+        #[arg(long, value_parser = ["failed", "cancelled", "timed-out", "completed"])]
+        status: Option<String>,
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
@@ -2088,6 +2097,9 @@ enum TraceCommand {
 struct DoctorArgs {
     #[arg(long)]
     strict: bool,
+    /// Show only the slowest requests and queries over the last five minutes.
+    #[arg(long)]
+    performance: bool,
 }
 
 #[derive(Subcommand)]
@@ -2708,7 +2720,7 @@ enum WorkCommand {
     /// List current actionable work; use --as to filter one agent or --all for history.
     Ls {
         /// Follow current collection changes.
-        #[arg(long, conflicts_with_all = ["all", "cursor"])]
+        #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
         #[arg(long = "as")]
         actor: Option<String>,
@@ -2719,6 +2731,15 @@ enum WorkCommand {
         cursor: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Terminal transitions since a duration such as 6h, or an RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// End of the time window (RFC3339 timestamp or duration ago).
+        #[arg(long)]
+        until: Option<String>,
+        /// Terminal state: failed, cancelled, timed-out, or completed. Includes reasons.
+        #[arg(long, value_parser = ["failed", "cancelled", "timed-out", "completed"])]
+        status: Option<String>,
     },
     /// Explain one work item, its owner, readiness, lease, and evidence.
     Show { subject: String },
@@ -4253,11 +4274,34 @@ async fn run_mission_view(
             all,
             cursor,
             limit,
+            since,
+            until,
+            status,
         } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the mission limit must be 1 through 200"
             );
+            if since.is_some()
+                || until.is_some()
+                || status.is_some()
+                || cursor
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("outcomes:"))
+            {
+                return list_outcomes(
+                    client,
+                    "missions",
+                    since,
+                    until,
+                    status,
+                    None,
+                    cursor,
+                    limit,
+                    json_output,
+                )
+                .await;
+            }
             if watch {
                 return run_collection_watch(
                     endpoint,
@@ -4283,28 +4327,36 @@ async fn run_mission_view(
             )
         }
         MissionViewCommand::Show(args) => {
-            let selected = args.mission_or_run;
-            let run = if selected.starts_with("mission-run/") {
-                client
-                    .get::<MissionRunView>(&format!(
-                        "/v1/mission-runs/{}",
-                        urlencoding::encode(&selected)
-                    ))
-                    .await?
-            } else {
-                let runs: Vec<MissionRunView> = client
+            let mut selected = args.mission_or_run;
+            if !selected.starts_with("mission-run/") {
+                let overview: Value = client
                     .get(&format!(
-                        "/v1/mission-runs?mission={}",
+                        "/v1/mission-overview?mission={}",
                         urlencoding::encode(&selected)
                     ))
                     .await?;
-                anyhow::ensure!(
-                    runs.len() == 1,
-                    "mission `{selected}` has {} active runs; use an exact mission run subject",
-                    runs.len()
-                );
-                runs.into_iter().next().expect("one active run was checked")
-            };
+                if overview["total_runs"].as_u64() != Some(1) {
+                    anyhow::ensure!(
+                        !args.follow,
+                        "--follow needs an exact mission run subject; choose a run from the summary"
+                    );
+                    if json_output {
+                        return print_value(&overview, true);
+                    }
+                    print!("{}", render_mission_overview(&overview));
+                    return Ok(());
+                }
+                selected = overview["newest"][0]["id"]
+                    .as_str()
+                    .context("missing run in mission summary")?
+                    .to_owned();
+            }
+            let run = client
+                .get::<MissionRunView>(&format!(
+                    "/v1/mission-runs/{}",
+                    urlencoding::encode(&selected)
+                ))
+                .await?;
             if args.follow {
                 return follow_mission_run(client, run, 0, json_output).await;
             }
@@ -6023,7 +6075,12 @@ fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms:
 /// Active and finished runs apart, so a mission with one live run and five old ones does not
 /// read as six runs. A daemon that does not report active runs gets the plain total.
 fn render_mission_runs(mission: &st3_client::Mission) -> String {
-    let total = mission.runs.len();
+    let total = mission
+        .extra
+        .get("total_runs")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(mission.runs.len());
     let plural = |count: usize| if count == 1 { "" } else { "s" };
     let Some(active) = mission.active_runs.map(|active| active.min(total)) else {
         return format!("{total} run{}", plural(total));
@@ -6105,7 +6162,9 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                 if let Some(usage) = &item.usage {
                     let _ = writeln!(output, "  usage {}", render_usage(usage));
                 }
-                if let Some(run) = item.runs.last() {
+                if item.extra.get("runs_truncated").and_then(Value::as_bool) == Some(true) {
+                    let _ = writeln!(output, "  inspect: st missions show {}", item.header.id);
+                } else if let Some(run) = item.runs.last() {
                     let _ = writeln!(output, "  inspect: st missions show {run}");
                 }
             }
@@ -6834,7 +6893,201 @@ fn parse_timeout(value: &str) -> Result<Duration> {
     anyhow::bail!("a timeout must use ms, s, m, h, or zero")
 }
 
+fn outcome_time(value: &str, now: u128) -> Result<u128> {
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(value) {
+        return u128::try_from(at.timestamp_millis())
+            .context("the time must be after the Unix epoch");
+    }
+    let ago = parse_timeout(value).context("use a duration such as 6h or an RFC3339 timestamp")?;
+    Ok(now.saturating_sub(ago.as_millis()))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OutcomeCursor {
+    collection: String,
+    since: u128,
+    until: u128,
+    status: Option<String>,
+    actor: Option<String>,
+    before: u64,
+    limit: usize,
+}
+
+async fn list_outcomes(
+    client: &Client,
+    collection: &str,
+    since: Option<String>,
+    until: Option<String>,
+    status: Option<String>,
+    actor: Option<String>,
+    cursor: Option<String>,
+    limit: usize,
+    json_output: bool,
+) -> Result<()> {
+    let now = current_unix_ms()?;
+    let mut filter = if let Some(cursor) = cursor {
+        let encoded = cursor
+            .strip_prefix("outcomes:")
+            .context("use the outcome cursor printed by this command")?;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?;
+        let saved: OutcomeCursor = serde_json::from_slice(&decoded)?;
+        anyhow::ensure!(
+            saved.collection == collection
+                && saved.limit == limit
+                && saved.actor == actor
+                && status
+                    .as_deref()
+                    .is_none_or(|s| saved.status.as_deref() == Some(s)),
+            "the outcome cursor does not match the collection or filters"
+        );
+        anyhow::ensure!(
+            since.is_none() && until.is_none(),
+            "the cursor already fixes the time window; omit --since and --until"
+        );
+        saved
+    } else {
+        OutcomeCursor {
+            collection: collection.into(),
+            since: since
+                .as_deref()
+                .map(|v| outcome_time(v, now))
+                .transpose()?
+                .unwrap_or(0),
+            until: until
+                .as_deref()
+                .map(|v| outcome_time(v, now))
+                .transpose()?
+                .unwrap_or(now),
+            status,
+            actor,
+            before: i64::MAX as u64,
+            limit,
+        }
+    };
+    anyhow::ensure!(
+        filter.since <= filter.until,
+        "--since must be before --until"
+    );
+    let mut path = format!(
+        "/v1/outcome-history?collection={collection}&since={}&until={}&before={}&limit={limit}",
+        filter.since, filter.until, filter.before
+    );
+    if let Some(status) = &filter.status {
+        path.push_str(&format!("&status={}", urlencoding::encode(status)));
+    }
+    if let Some(actor) = &filter.actor {
+        path.push_str(&format!("&actor={}", urlencoding::encode(actor)));
+    }
+    let mut page: Value = client.get(&path).await?;
+    if let Some(before) = page["next_before"].as_u64() {
+        filter.before = before;
+        let next = format!(
+            "outcomes:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&filter)?)
+        );
+        page["next_cursor"] = json!(next);
+    }
+    if json_output {
+        return print_value(&page, true);
+    }
+    let items = page["items"].as_array().context("invalid outcome page")?;
+    println!("{} OUTCOMES  {}", collection.to_uppercase(), items.len());
+    for item in items {
+        println!(
+            "{}  {}  {}",
+            item["subject"].as_str().unwrap_or("?"),
+            item["status"].as_str().unwrap_or("?"),
+            relative_time(item["at_unix_ms"].as_u64().unwrap_or(0) as u128, now)
+        );
+        if let Some(reason) = item["reason"].as_str() {
+            println!("  reason: {reason}");
+        }
+        if let Some(mission) = item["mission"].as_str() {
+            println!("  mission: {mission}");
+        }
+    }
+    if let Some(cursor) = page["next_cursor"].as_str() {
+        let actor = filter
+            .actor
+            .as_deref()
+            .map(|a| format!(" --as {a}"))
+            .unwrap_or_default();
+        println!("Next: st {collection} ls{actor} --limit {limit} --cursor '{cursor}'");
+    }
+    Ok(())
+}
+
+fn render_mission_overview(view: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "MISSION  {}\nRUNS     {} total\n",
+        view["mission"].as_str().unwrap_or("?"),
+        view["total_runs"]
+    );
+    if let Some(counts) = view["counts"].as_object() {
+        for (state, count) in counts {
+            let _ = writeln!(out, "  {state}: {count}");
+        }
+    }
+    for (key, title) in [("newest", "NEWEST"), ("failed", "FAILED")] {
+        let _ = writeln!(out, "{title} (up to {} runs)", view["preview_limit"]);
+        if let Some(runs) = view[key].as_array() {
+            for run in runs {
+                let _ = writeln!(
+                    out,
+                    "  {}  {}",
+                    run["id"].as_str().unwrap_or("?"),
+                    run["status"].as_str().unwrap_or("?")
+                );
+                if let Some(reason) = run["reason"].as_str() {
+                    let _ = writeln!(out, "    reason: {reason}");
+                }
+            }
+        }
+    }
+    out
+}
+
+fn render_performance(view: &Value) -> String {
+    use std::fmt::Write as _;
+    if view.is_null() {
+        return String::new();
+    }
+    let mut out = format!(
+        "PERFORMANCE  last {} seconds · sorted by total wall time\n",
+        view["window_seconds"]
+    );
+    for (key, title) in [("requests", "REQUESTS AND TASKS"), ("queries", "QUERIES")] {
+        let _ = writeln!(out, "{title}  count · total ms · max ms · CPU ms · kind");
+        if let Some(rows) = view[key].as_array() {
+            for row in rows {
+                let _ = writeln!(
+                    out,
+                    "  {}  {:.1}  {:.1}  {:.1}  {}",
+                    row["count"],
+                    row["total_ms"].as_f64().unwrap_or(0.0),
+                    row["max_ms"].as_f64().unwrap_or(0.0),
+                    row["cpu_ms"].as_f64().unwrap_or(0.0),
+                    row["kind"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+    if let Some(note) = view["query_time_note"].as_str() {
+        let _ = writeln!(out, "{note}");
+    }
+    out
+}
+
 async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Result<()> {
+    if args.performance {
+        let report: Value = client.get("/v1/performance").await?;
+        if json_output {
+            return print_value(&report, true);
+        }
+        print!("{}", render_performance(&report));
+        return Ok(());
+    }
     let report: DoctorReport = client.get("/v1/doctor").await?;
     if json_output {
         print_value(&report, true)?;
@@ -6842,6 +7095,7 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
         for check in &report.checks {
             println!("{}\t{}\t{}", check.status, check.name, check.message);
         }
+        print!("{}", render_performance(&report.performance));
     }
     anyhow::ensure!(report.status != "fail", "st doctor found a failed check");
     anyhow::ensure!(
@@ -9981,6 +10235,9 @@ async fn run_work(
             all,
             cursor,
             limit,
+            since,
+            until,
+            status,
         } => {
             if let Some(actor) = actor.as_deref() {
                 reject_foreign_agent_actor(actor)?;
@@ -9989,6 +10246,26 @@ async fn run_work(
                 limit > 0 && limit <= 200,
                 "the work limit must be 1 through 200"
             );
+            if since.is_some()
+                || until.is_some()
+                || status.is_some()
+                || cursor
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("outcomes:"))
+            {
+                return list_outcomes(
+                    client,
+                    "work",
+                    since,
+                    until,
+                    status,
+                    actor,
+                    cursor,
+                    limit,
+                    json_output,
+                )
+                .await;
+            }
             if watch {
                 return run_collection_watch(
                     endpoint,

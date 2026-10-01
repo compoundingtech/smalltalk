@@ -106,6 +106,8 @@ fn shared_folds_never_order_by_local_arrival() {
         "claims_for_subject_kind_at",
         "timeline_claim_rows_for_incarnation_at",
         "claims_for_kind_at",
+        // Node-local terminal history pagination; reason selection remains canonical.
+        "outcome_history",
         "agent_last_activity_at",
         "try_project_simple_replication_tx",
         "export_replication_for_heads",
@@ -197,7 +199,7 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
-            let columns = columns
+            let mut columns = columns
                 .iter()
                 .filter(|name| !local_columns.contains(&name.as_str()))
                 .map(|name| {
@@ -208,6 +210,7 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                     }
                 })
                 .collect::<Vec<_>>();
+            columns.sort();
             let query = if *table == "operations" {
                 format!(
                     "SELECT * FROM ({}) ORDER BY 1",
@@ -750,6 +753,72 @@ fn equal_time_writers_choose_the_same_shared_source() {
     assert_eq!(
         serde_json::to_value(ordered.latest_actual_value("observer/audit").unwrap()).unwrap(),
         serde_json::to_value(reversed.latest_actual_value("observer/audit").unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn fresh_and_additively_migrated_column_orders_have_identical_full_digests() {
+    let temp = tempfile::tempdir().unwrap();
+    let fresh = Store::open_memory("alder").unwrap();
+    write_audit_history(&fresh);
+    let before = projection_digest::tables(&fresh.readers.get()).unwrap();
+    let path = temp.path().join("upgraded.sqlite3");
+    let original_columns: Vec<String> = fresh
+        .readers
+        .get()
+        .prepare("PRAGMA table_info(planning_sessions)")
+        .unwrap()
+        .query_map([], |r| r.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    fresh
+        .connection
+        .lock()
+        .unwrap()
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER projection_digest_planning_sessions_insert;
+        DROP TRIGGER projection_digest_planning_sessions_update;
+        DROP TRIGGER projection_digest_planning_sessions_delete;
+        CREATE TABLE saved_planner_specs AS SELECT id,planner_spec_json FROM planning_sessions;
+        ALTER TABLE planning_sessions DROP COLUMN planner_spec_json;
+        PRAGMA user_version=12;",
+        )
+        .unwrap();
+    drop(connection);
+    let upgraded = Store::open(&path, "alder").unwrap();
+    {
+        let connection = upgraded.connection.lock().unwrap();
+        connection.execute_batch("UPDATE planning_sessions SET planner_spec_json=(
+            SELECT planner_spec_json FROM saved_planner_specs WHERE saved_planner_specs.id=planning_sessions.id);
+            DROP TABLE saved_planner_specs;").unwrap();
+    }
+    let connection = upgraded.readers.get();
+    let upgraded_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(planning_sessions)")
+        .unwrap()
+        .query_map([], |r| r.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_ne!(
+        original_columns, upgraded_columns,
+        "exercise an actual physical column reorder"
+    );
+    assert_eq!(before, projection_digest::tables(&connection).unwrap());
+    assert_eq!(before, projection_digest::oracle(&connection).unwrap());
+    drop(connection);
+    assert_eq!(shared_rows(&fresh), shared_rows(&upgraded));
+    drop(upgraded);
+    let reopened = Store::open(&path, "alder").unwrap();
+    assert_eq!(shared_rows(&fresh), shared_rows(&reopened));
+    assert_eq!(
+        before,
+        projection_digest::tables(&reopened.readers.get()).unwrap()
     );
 }
 
