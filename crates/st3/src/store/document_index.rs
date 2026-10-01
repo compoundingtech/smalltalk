@@ -70,6 +70,118 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
+    fn schema_fifteen_rollback_retains_and_resolves_current_person_work() {
+        use crate::model::{PersonAskRequest, PersonStepResponse};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let store = Store::open(&path, "alder").unwrap();
+        let intent = crate::graph::parse_internal_intent(
+            "version 2\nagent \"alder.asker\" { workspace \"/tmp\"; command \"true\"; restart always; }",
+            "alder",
+        )
+        .unwrap();
+        store.apply_internal(&intent, "rollback-owner").unwrap();
+        let mut input = PersonAskRequest {
+            legacy_request: None,
+            person: "person/avery".into(),
+            title: "Review the release".into(),
+            reason: "Choose a release date.".into(),
+            actor: "agent/alder.asker".into(),
+            step: None,
+            new_run: Some("release-review".into()),
+            incarnation: None,
+            idempotency_key: "before-rollback".into(),
+        };
+        let existing = store.ask_person(&input).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO meta VALUES('canonical_shared_projection_rules','2')",
+                [],
+            )
+            .unwrap();
+        let before = projection_digest::tables(&store.readers.get()).unwrap();
+        drop(store);
+
+        let fallback = Store::open(&path, "alder").unwrap();
+        assert_eq!(
+            before,
+            projection_digest::tables(&fallback.readers.get()).unwrap()
+        );
+        assert_eq!(
+            fallback
+                .step_run(&existing.subject)
+                .unwrap()
+                .unwrap()
+                .status,
+            "ready"
+        );
+        let response = PersonStepResponse {
+            subject: existing.subject.clone(),
+            actor: "person/avery".into(),
+            summary: "Friday".into(),
+            evidence: Vec::new(),
+            episode: None,
+            idempotency_key: "complete-after-rollback".into(),
+        };
+        assert_eq!(
+            fallback
+                .finish_person_step(&response, false)
+                .unwrap()
+                .status,
+            "completed"
+        );
+        input.idempotency_key = "after-rollback".into();
+        let subsequent = fallback.ask_person(&input).unwrap();
+        let response = PersonStepResponse {
+            subject: subsequent.subject.clone(),
+            actor: input.actor,
+            summary: "Superseded by the chosen date".into(),
+            evidence: Vec::new(),
+            episode: None,
+            idempotency_key: "cancel-after-rollback".into(),
+        };
+        assert_eq!(
+            fallback.finish_person_step(&response, true).unwrap().status,
+            "cancelled"
+        );
+        fallback
+            .put_document("doc/rollback-work", b"Friday", &None, "write-after-work")
+            .unwrap();
+        let stable = projection_digest::tables(&fallback.readers.get()).unwrap();
+        assert_eq!(
+            stable,
+            projection_digest::oracle(&fallback.readers.get()).unwrap()
+        );
+        drop(fallback);
+
+        let reopened = Store::open(&path, "alder").unwrap();
+        assert_eq!(
+            stable,
+            projection_digest::tables(&reopened.readers.get()).unwrap()
+        );
+        assert_eq!(
+            reopened
+                .step_run(&existing.subject)
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+        assert_eq!(
+            reopened
+                .step_run(&subsequent.subject)
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+    }
+
+    #[test]
     fn schema_fifteen_rollback_preserves_upgraded_writes_and_admits_more() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("claims.sqlite3");
