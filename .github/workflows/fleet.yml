@@ -80,8 +80,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix2-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
-          restore-keys: "nix2-${{ github.job }}-${{ runner.os }}-"
+          key: "nix3-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
+          restore-keys: "nix3-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -169,8 +169,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix2-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
-          restore-keys: "nix2-${{ github.job }}-${{ runner.os }}-"
+          key: "nix3-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
+          restore-keys: "nix3-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -244,8 +244,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix2-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
-          restore-keys: "nix2-${{ github.job }}-${{ runner.os }}-"
+          key: "nix3-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
+          restore-keys: "nix3-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:

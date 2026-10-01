@@ -32,17 +32,30 @@ case "$cmd" in
     ;;
   save)
     start=$SECONDS
-    # Keep only what is expensive to obtain again: paths this run built or fetched itself (compiled
-    # outputs, fixed-output downloads such as crate tarballs), which carry no upstream signature.
-    # Anything cache.nixos.org or Cachix serves is quicker to fetch than a 4 GB cache is to restore.
+    # Keep only what is cheap to store and slow to get again. A file store only accepts a path whose
+    # references are already in it, and a full closure (devShell, toolchain, glibc...) is gigabytes
+    # that cache.nixos.org and Cachix serve faster than a cache restores them. So save:
+    #  1. paths this run obtained itself (no upstream signature) that reference nothing: the fixed-output
+    #     crate and source downloads, hundreds of tiny fetches that otherwise run on every job;
+    #  2. the closures of the outputs that are expensive to build: the pinned fleet-compat baseline and
+    #     the provider components.
     # Paths already in the cache are skipped.
-    nix path-info --all --json |
+    nix path-info --all --json --json-format 1 2> /dev/null |
       jq -r 'if type == "object"
-             then to_entries | map(select((.value.signatures // []) | length == 0)) | map(.key)
-             else map(select((.signatures // []) | length == 0)) | map(.path) end | .[]' > "$cache.paths"
-    printf 'Nix cache: %s locally obtained store paths to save\n' "$(wc -l < "$cache.paths")"
-    xargs -a "$cache.paths" -r nix copy --to "file://$cache?secret-key=$key.sec&compression=zstd" \
-      --no-check-sigs --no-recursive
+             then to_entries | map(select((.value.signatures // []) == [] and (.value.references // []) == []))
+                             | map(.key)
+             else map(select((.signatures // []) == [] and (.references // []) == [])) | map(.path) end
+             | .[] | select(endswith(".drv") | not)' > "$cache.paths"
+    printf 'Nix cache: %s reference-free downloads and sources to save\n' "$(wc -l < "$cache.paths")"
+    to="file://$cache?secret-key=$key.sec&compression=zstd"
+    xargs -a "$cache.paths" -r nix copy --to "$to" --no-check-sigs --no-recursive
+    roots=()
+    [ -e "$RUNNER_TEMP/baseline" ] && roots+=("$RUNNER_TEMP/baseline")
+    [ -n "${ST2_VISTA_COMPONENT:-}" ] && roots+=("${ST2_VISTA_COMPONENT%%/share/*}")
+    if [ "${#roots[@]}" -gt 0 ]; then
+      printf 'Nix cache: closures of %s\n' "${roots[*]}"
+      nix copy --to "$to" --no-check-sigs "${roots[@]}"
+    fi
     printf 'Nix cache %s: %s store paths after saving (%ss)\n' "$cache" \
       "$(find "$cache" -maxdepth 1 -name '*.narinfo' | wc -l)" "$((SECONDS - start))"
     ;;
