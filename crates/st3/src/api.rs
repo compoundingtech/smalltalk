@@ -204,11 +204,14 @@ impl ApiError {
             | "stale-document-token"
             | "stale-incarnation"
             | "stale-launch-preview"
-            | "fleet-leaving" => StatusCode::CONFLICT,
-            "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
-                StatusCode::FORBIDDEN
-            }
-            "lane-not-found" => StatusCode::NOT_FOUND,
+            | "fleet-leaving"
+            | "glass-deleted"
+            | "glass-limit" => StatusCode::CONFLICT,
+            "launch-review-not-authorized"
+            | "wrong-message-recipient"
+            | "lane-approval-denied"
+            | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
+            "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -264,6 +267,13 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route("/v1/client/glasses", get(client_v0::glasses_list))
+        .route(
+            "/v1/client/glasses/{id}",
+            get(client_v0::glass_get)
+                .put(client_v0::glass_put)
+                .delete(client_v0::glass_delete),
+        )
         .route(
             "/v1/client/request-latency",
             get(client_v0::request_latency),
@@ -957,7 +967,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
-        "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
+        "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" | "glass-owner-forbidden" => {
             "forbidden".into()
         }
         "lane-not-found" => "not-found".into(),
@@ -982,7 +992,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unexpected-lane-anchor"
         | "invalid-lane-anchor"
         | "invalid-lane-state"
-        | "invalid-lane-change" => "validation-failed".into(),
+        | "invalid-lane-change" | "glass-limit" | "glass-deleted" | "invalid-glass-base" => "validation-failed".into(),
         // A retry of a request whose claim a checkpoint dropped cannot be answered again.
         "claim-checkpointed" => "idempotency-conflict".into(),
         _ => "internal".into(),
@@ -1325,7 +1335,11 @@ async fn client_capabilities(
             "max_page_items": CLIENT_MAX_PAGE_ITEMS,
             "max_event_items": 500,
             "max_response_bytes": CLIENT_MAX_RESPONSE_BYTES,
-            "max_wait_ms": 30_000
+            "max_wait_ms": 30_000,
+            "max_glass_body_bytes": st3_schema::glasses::MAX_BODY_BYTES,
+            "max_glasses": st3_schema::glasses::MAX_GLASSES,
+            "max_glass_depth": st3_schema::glasses::MAX_DEPTH,
+            "max_glass_nodes": st3_schema::glasses::MAX_NODES
         },
         "event_cursor": cursor,
         "oldest_event_cursor": format!("event-cursor/{}/{oldest}", state.node),
@@ -8073,6 +8087,7 @@ async fn get_claim(
     let id_for_read = id.clone();
     blocking_store(move || store.claim_by_id(&id_for_read))
         .await?
+        .filter(|claim| !claim.subject.starts_with("glass/"))
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("claim `{id}` does not exist")))
 }

@@ -1,5 +1,7 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
+pub mod glasses;
+
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -340,6 +342,18 @@ impl Registry {
                 self.validate_reference(kind, name, value, field)?;
             }
         }
+        if subject_spec.family == "glass" {
+            glasses::owner(subject)?;
+            if !matches!(kind, "glass.upserted" | "glass.deleted") {
+                return Err(error(
+                    "claim-write-forbidden",
+                    "a glass requires a dedicated glass claim",
+                ));
+            }
+            if kind == "glass.upserted" {
+                glasses::validate_body(fields.get("body").unwrap_or(&Value::Null))?;
+            }
+        }
         Ok(spec)
     }
 
@@ -616,6 +630,12 @@ fn build_registry() -> Registry {
             false,
         ),
         ("person", "person/IDENTITY", "A human actor.", false),
+        (
+            "glass",
+            "glass/person/NAME/UUID",
+            "A private person workspace.",
+            false,
+        ),
         (
             "mission",
             "mission/ID",
@@ -957,6 +977,24 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
                 "stop",
                 "subscription",
             ],
+        ),
+        (
+            "glass.upserted",
+            &["glass"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            Some("glasses"),
+            false,
+            &[],
+        ),
+        (
+            "glass.deleted",
+            &["glass"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            Some("glasses"),
+            false,
+            &[],
         ),
         (
             "doc.bound",
@@ -2018,6 +2056,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("revision", string()),
             ("desired", object()),
         ],
+        "glass.upserted" => &[
+            ("body", object()),
+            ("base_revision", string()),
+            ("replaced_revision", string()),
+        ],
+        "glass.deleted" => &[("base_revision", string()), ("replaced_revision", string())],
         "doc.bound" => &[
             ("name", string()),
             ("hash", string()),
@@ -3009,6 +3053,7 @@ mod tests {
                 "file",
                 "fleet-invite",
                 "gate-operation",
+                "glass",
                 "host",
                 "lane",
                 "loop-run",
@@ -3090,6 +3135,8 @@ mod tests {
                 "fleet.member-removed",
                 "gate.requested",
                 "gate.result",
+                "glass.deleted",
+                "glass.upserted",
                 "harness.context-clear.requested",
                 "harness.context-clear.result",
                 "harness.diagnostic",

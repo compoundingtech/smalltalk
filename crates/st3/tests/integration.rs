@@ -3,6 +3,7 @@
 //! Cargo builds only the targets the manifest names (`autotests = false`), so add a
 //! `mod NAME;` line here or an explicit test target for every new file.
 
+mod client_glasses;
 mod client_v0_cli;
 mod client_v0_contract;
 mod command_recorder;

@@ -1,3 +1,5 @@
+mod glasses;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -2683,7 +2685,7 @@ fn claims_page_query(subject: bool, descending: bool) -> String {
     let order = if descending { "DESC" } else { "ASC" };
     format!(
         "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-         FROM claims WHERE {subject_filter}store_index>?1 AND (?2 IS NULL OR store_index<?2)
+         FROM claims WHERE subject NOT LIKE 'glass/%' AND {subject_filter}store_index>?1 AND (?2 IS NULL OR store_index<?2)
          ORDER BY store_index {order} LIMIT ?4"
     )
 }
@@ -9080,6 +9082,9 @@ impl Store {
                     }
                 }
                 let mut stored_fields = normalize_resource_observation(transaction, input)?;
+                if let Some(fields) = glasses::prepare(transaction, input)? {
+                    stored_fields = Some(fields);
+                }
                 // A leave names its own batch as the last sequence of its window. The sequence is only
                 // known here, under the writer lock, so a zero high water stands for "this batch".
                 if input.kind == "fleet.member-left"
@@ -9156,6 +9161,8 @@ impl Store {
             validate_actor(actor)?;
         }
         validate_claim_fields(input)?;
+        st3_schema::glasses::validate_owner(&input.subject, input.actor.as_deref())
+            .map_err(|e| St3Error::new(e.code, e.message))?;
         claim_operation(input)?;
         Ok(())
     }
@@ -10112,6 +10119,9 @@ impl Store {
         let mut subjects = Vec::new();
         let mut pending_actions = Vec::new();
         for subject in subject_names {
+            if subject.starts_with("glass/") {
+                continue;
+            }
             let reduced = match newest {
                 Some(newest) => {
                     Some(self.cached_subject_status(&connection, &subject, store_index, newest)?)
@@ -19126,6 +19136,7 @@ fn append_claim_tx(
     predecessors: &[String],
     forced_batch: Option<&str>,
 ) -> Result<ClaimRecord> {
+    st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
     let fields = schema_fields_for_body(kind, body)?;
     let claim_spec = st3_schema::registry()
         .validate_claim(subject, kind, &fields)
@@ -19363,6 +19374,9 @@ fn insert_event(
     subject: &str,
     body: &Value,
 ) -> Result<()> {
+    if subject.starts_with("glass/") {
+        return Ok(());
+    }
     transaction.execute(
         "INSERT OR IGNORE INTO events(store_index, kind, subject, body) VALUES (?1, ?2, ?3, ?4)",
         params![store_index, kind, subject, canonical_json_text(body)?],
@@ -26175,6 +26189,16 @@ fn validate_replicated_claim(
                 "replicated claim `{}` violates {}: {}",
                 claim.id, error.code, error.message
             ),
+        ));
+    }
+    st3_schema::glasses::validate_owner(&claim.subject, claim.actor.as_deref())
+        .map_err(|e| St3Error::new(e.code, e.message))?;
+    if claim.subject.starts_with("glass/")
+        && (!fields.contains_key("base_revision") || !fields.contains_key("replaced_revision"))
+    {
+        return Err(St3Error::new(
+            "invalid-replicated-claim",
+            "glass claims must record base_revision and replaced_revision",
         ));
     }
     ensure_claim_blobs(transaction, claim)?;
@@ -33136,7 +33160,7 @@ mod tests {
         }
     }
 
-    fn receive_and_project(
+    pub(super) fn receive_and_project(
         target: &Store,
         relay: &str,
         exchange: &ReplicationExchange,
@@ -33159,7 +33183,10 @@ mod tests {
         admission
     }
 
-    fn exchange_from(source: &Store, remote: &ReplicationInventory) -> ReplicationExchange {
+    pub(super) fn exchange_from(
+        source: &Store,
+        remote: &ReplicationInventory,
+    ) -> ReplicationExchange {
         source.bind_fleet(TEST_FLEET).expect("source fleet");
         source
             .export_replication_exchange(TEST_FLEET, remote)
@@ -37666,7 +37693,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     }
 
     /// One exchange carrying exactly `envelopes`, as a peer that holds only those would send it.
-    fn exchange_of(peer: &str, envelopes: Vec<ReplicaEnvelope>) -> ReplicationExchange {
+    pub(super) fn exchange_of(peer: &str, envelopes: Vec<ReplicaEnvelope>) -> ReplicationExchange {
         ReplicationExchange {
             projection_digests: Default::default(),
             peer: peer.into(),

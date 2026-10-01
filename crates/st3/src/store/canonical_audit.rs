@@ -150,6 +150,13 @@ fn shared_folds_never_order_by_local_arrival() {
                 .split(';')
                 .next()
                 .unwrap();
+            // A marker explicitly orders the fold canonically. With window functions the
+            // rest of the same SQL literal may contain a snapshot bound after this clause.
+            if order.trim_start().starts_with("CANONICAL_ASC(")
+                || order.trim_start().starts_with("CANONICAL_DESC(")
+            {
+                continue;
+            }
             if !order.contains("store_index") && !order.contains("created_index") {
                 continue;
             }
@@ -250,6 +257,11 @@ fn table_digest(rows: &[String]) -> String {
 }
 
 fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mut Vec<String>) {
+    if expected.glasses("person/ada", i64::MAX as u64).unwrap()
+        != actual.glasses("person/ada", i64::MAX as u64).unwrap()
+    {
+        mismatches.push(format!("{phase}: glass bodies/revision sources"));
+    }
     let expected_rows = shared_rows(expected);
     for (table, rows) in shared_rows(actual) {
         let wanted = &expected_rows[&table];
@@ -428,6 +440,10 @@ fn write_audit_history(source: &Store) {
         ),
         "audit-desired",
     );
+    source.append_claim(&ClaimInput {
+        subject:"glass/person/ada/019a0000-0000-7000-8000-000000000001".into(), kind:"glass.upserted".into(), actor:Some("person/ada".into()),
+        fields: serde_json::from_value(json!({"body":{"name":"Audit workspace","tabs":[{"layout":{"pane":"home:"}}]}, "base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None,
+    }).unwrap();
     let declared_message = r#"version 2
 message "audit-declared" {
   from "agent/alder.worker"

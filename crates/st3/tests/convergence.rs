@@ -553,6 +553,14 @@ impl World {
         let manifest = store
             .checkpoint_manifest(&trimmed.id, trimmed.cut_unix_ms)
             .unwrap();
+        // Check at the adoption/trim boundary: a later valid checkpoint can repair a
+        // partial adoption before the final convergence check sees the corruption.
+        if let Err(error) = verify_checkpoint_manifest(&manifest, &trimmed.drop_digest) {
+            self.fail(format!(
+                "{}: its tombstones do not match {}: {}",
+                self.nodes[index].name, trimmed.id, error.message
+            ));
+        }
         self.tombstoned
             .extend(manifest.claims.into_iter().map(|claim| claim.id));
     }
