@@ -444,12 +444,22 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                     card.buttons(&[
                         ("a", "Approve, with your notes", Hit::Key('a'), theme::GREEN),
                         ("c", "Keep writing", Hit::Key('c'), theme::OVERLAY1),
-                        ("enter", "Send back with these notes", Hit::Enter, theme::YELLOW),
+                        (
+                            "enter",
+                            "Send back with these notes",
+                            Hit::Enter,
+                            theme::YELLOW,
+                        ),
                     ]);
                 } else {
                     card.buttons(&[
                         ("a", "Approve", Hit::Key('a'), theme::GREEN),
-                        ("c", "Write notes or request changes", Hit::Key('c'), theme::YELLOW),
+                        (
+                            "c",
+                            "Write notes or request changes",
+                            Hit::Key('c'),
+                            theme::YELLOW,
+                        ),
                     ]);
                 }
             }
@@ -2156,11 +2166,12 @@ fn tree_listing(
     legend: Vec<Line<'static>>,
 ) -> Listing {
     leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    let compact = compact_folders(&leaves.iter().map(|leaf| leaf.0.clone()).collect::<Vec<_>>());
     let mut items = Vec::new();
     let mut ids = Vec::new();
     let mut open: Vec<String> = Vec::new();
-    for (path, id, first, right) in leaves {
-        let folders = &path[..path.len().saturating_sub(1)];
+    for ((_, id, first, right), folders) in leaves.into_iter().zip(compact) {
+        let folders = &folders[..];
         let shared = open.iter().zip(folders).take_while(|(a, b)| a == b).count();
         open.truncate(shared);
         for (depth, folder) in folders.iter().enumerate().skip(shared) {
@@ -2189,6 +2200,46 @@ fn tree_listing(
         state,
         legend,
     }
+}
+
+/// Each path's folders, with a folder that holds only one folder joined to it on one line
+/// (Nathan, 2026-10-01): `fleet/smalltalk/operations/` rather than three nested folders.
+fn compact_folders(paths: &[Vec<String>]) -> Vec<Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // What each folder holds: its subfolders by name, and a leaf as the empty name.
+    let mut holds = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
+    for path in paths {
+        let folders = &path[..path.len().saturating_sub(1)];
+        for depth in 0..folders.len() {
+            let child = folders.get(depth + 1).cloned().unwrap_or_default();
+            holds
+                .entry(folders[..=depth].to_vec())
+                .or_default()
+                .insert(child);
+        }
+    }
+    paths
+        .iter()
+        .map(|path| {
+            let folders = &path[..path.len().saturating_sub(1)];
+            let mut compact = Vec::new();
+            let mut depth = 0;
+            while depth < folders.len() {
+                let mut name = folders[depth].clone();
+                while depth + 1 < folders.len()
+                    && holds
+                        .get(&folders[..=depth])
+                        .is_some_and(|children| children.len() == 1)
+                {
+                    depth += 1;
+                    name = format!("{name}/{}", folders[depth]);
+                }
+                compact.push(name);
+                depth += 1;
+            }
+            compact
+        })
+        .collect()
 }
 
 pub fn agents_tree(world: &World, spinner: &'static str) -> Listing {
@@ -2266,6 +2317,30 @@ pub fn missions_tree(world: &World, spinner: &'static str, system: bool) -> List
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+
+    #[test]
+    fn a_folder_holding_only_a_folder_joins_it_on_one_line() {
+        let path = |text: &str| text.split('/').map(str::to_owned).collect::<Vec<_>>();
+        let compact = compact_folders(&[
+            path("fleet/smalltalk/operations/2026-10-01/operator"),
+            path("fleet/smalltalk/ci/watcher"),
+            path("fleet/cos/standing/cos"),
+            path("solo"),
+        ]);
+        assert_eq!(
+            compact,
+            [
+                vec![
+                    "fleet".to_owned(),
+                    "smalltalk".into(),
+                    "operations/2026-10-01".into()
+                ],
+                vec!["fleet".to_owned(), "smalltalk".into(), "ci".into()],
+                vec!["fleet".to_owned(), "cos/standing".into()],
+                Vec::<String>::new(),
+            ]
+        );
+    }
 
     #[test]
     fn a_tree_has_one_line_per_folder_and_leaf_in_path_order() {
