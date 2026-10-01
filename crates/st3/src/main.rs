@@ -14957,8 +14957,19 @@ impl NativeMailbox {
                     mailbox_receipt(client, &self.fence, &view.subject, "read").await?;
                     return Ok(());
                 }
+                // Delivery is durable handoff evidence, including mail handed to the legacy
+                // provider turn before the push ledger used graph subjects as its keys.
+                if view.status == "delivered" {
+                    self.queued.remove(&view.subject);
+                    return Ok(());
+                }
                 if view.status == "sent" {
-                    mailbox_receipt(client, &self.fence, &view.subject, "staged").await?;
+                    let staged =
+                        mailbox_receipt_claim(client, &self.fence, &view.subject, "staged").await?;
+                    if staged.kind != "message.staged" {
+                        self.queued.remove(&view.subject);
+                        return Ok(());
+                    }
                 }
                 if !self.queued.contains_key(&view.subject) {
                     let body = message_content(client, view).await?;
@@ -16008,6 +16019,76 @@ mod tests {
         // A handoff failure below the retry limit makes the message deliverable again.
         assert!(!resumed.accept_frame(r#"{"type":"failed","meta":{"messageId":"message/one"}}"#));
         assert!(!resumed.delivered.contains("message/one"));
+    }
+
+    #[tokio::test]
+    async fn native_mailbox_upgrade_does_not_queue_legacy_delivered_mail_or_acknowledge_it_as_read()
+    {
+        // The two providers share this pump but load their own native receipt ledgers.
+        for driver in ["codex", "opencode"] {
+            let root = tempfile::tempdir().unwrap();
+            let agent_dir = root.path().join("agent");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            st_drivers::push_mailbox::register(&agent_dir);
+            let client = Client::new(Endpoint::Unix(root.path().join("absent-daemon.sock")));
+            let mut view = MessageView {
+                subject: "message/legacy".into(),
+                from: "person/eval".into(),
+                to: "agent/eval.worker".into(),
+                content: "doc/unavailable@hash".into(),
+                status: "delivered".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                created_index: 1,
+            };
+            let mut mailbox = NativeMailbox {
+                subscription: None,
+                fence: st3::mailbox::Fence::new(&view.to, "new-incarnation", "delivery"),
+                messages: vec![view.clone()],
+                queued: BTreeMap::new(),
+                replayed: true,
+            };
+            // Even a previously cached body must leave the fresh-handoff queue when delivery lands.
+            mailbox.queued.insert(
+                view.subject.clone(),
+                native_queued_message(&view, "Cached signal".into()),
+            );
+            view.subject = "message/pending".into();
+            view.status = "staged".into();
+            view.content = "Fresh signal".into();
+            mailbox.messages.push(view.clone());
+            for _ in 0..3 {
+                let receipts = if driver == "codex" {
+                    NativeDeliveryReceipts::Codex {
+                        state_dir: root.path(),
+                        identity: "eval.worker",
+                        runtime_id: "worker",
+                    }
+                } else {
+                    NativeDeliveryReceipts::OpenCode {
+                        catalog_root: root.path(),
+                        identity: "eval.worker",
+                        runtime_id: "worker",
+                    }
+                };
+                // An absent daemon makes any accidental body fetch, staging or fabricated read fail.
+                mailbox.pump(&client, &agent_dir, receipts).await.unwrap();
+                let queued = st_drivers::push_mailbox::messages(
+                    &agent_dir,
+                    &agent_dir.join("resources/inbox"),
+                )
+                .unwrap();
+                assert_eq!(queued.len(), 1, "{driver}");
+                assert_eq!(queued[0].filename, "message/pending");
+                assert!(st_drivers::push_mailbox::is_unread(
+                    &agent_dir,
+                    "message/legacy",
+                    &queued
+                ));
+            }
+            assert!(!agent_dir.join("resources").exists());
+        }
     }
 
     #[tokio::test]
