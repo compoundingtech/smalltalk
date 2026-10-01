@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use chrono::{Datelike as _, NaiveDate, TimeZone as _, Utc};
 use notify::Watcher as _;
 use serde_json::Value;
 use sha2::Digest as _;
@@ -21,7 +22,7 @@ use crate::model::{
     GateSpec, LaunchSpec, LoopCandidateSelector, LoopExhaustionSpec, LoopSpec, MemberKind,
     MemberLifecycle, MemberSpec, MessageView, MetricSource, MissionInputKind, MissionRunRequest,
     MissionRunView, MissionSpec, MissionState, RestartIntensity, RestartType, StepRunView,
-    StepSpec, SubscriptionSpec, UsedMissionSpec, WorkSelector,
+    StepSpec, SubscriptionSpec, UsedMissionSpec, WorkSelector, CalendarSchedule,
 };
 use crate::resource::{
     ObservationRequest, ProviderForbidden, ProviderRateLimit, ProviderUnauthenticated,
@@ -62,6 +63,103 @@ const DECLARED_CHECKOUT_LIMIT: usize = 4096;
 thread_local! {
     static DECLARATION_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+/// Resolve the local date, not an elapsed 24-hour interval. A gap fires at the
+/// first real minute after the requested wall time; a fold takes its first instant.
+fn calendar_instant(zone: chrono_tz::Tz, at_minute: u16, date: NaiveDate) -> Result<i64> {
+    let midnight = date.and_hms_opt(0, 0, 0).context("invalid calendar date")?;
+    let requested = midnight + chrono::Duration::minutes(i64::from(at_minute));
+    for minute in 0..=2880 {
+        let local = requested + chrono::Duration::minutes(minute);
+        match zone.from_local_datetime(&local) {
+            chrono::LocalResult::Single(instant) => return Ok(instant.timestamp_millis()),
+            chrono::LocalResult::Ambiguous(earlier, later) => {
+                return Ok(earlier.timestamp_millis().min(later.timestamp_millis()));
+            }
+            chrono::LocalResult::None => {}
+        }
+    }
+    anyhow::bail!("no valid local instant within two days of {requested} in {zone}")
+}
+
+fn calendar_date_on_or_after(date: NaiveDate, weekday: Option<u8>) -> Result<NaiveDate> {
+    let Some(weekday) = weekday else {
+        return Ok(date);
+    };
+    let ahead = (u32::from(weekday) - 1 + 7 - date.weekday().num_days_from_monday()) % 7;
+    date.checked_add_days(chrono::Days::new(u64::from(ahead)))
+        .context("calendar date overflow")
+}
+
+fn calendar_occurrence(
+    calendar: &CalendarSchedule,
+    last: Option<u64>,
+    now: i64,
+    catch_up: &str,
+    max_catch_up: Option<u32>,
+) -> Result<(u64, i64)> {
+    let zone: chrono_tz::Tz = calendar.timezone.parse()?;
+    let today = Utc
+        .timestamp_millis_opt(now)
+        .single()
+        .context("invalid schedule clock")?
+        .with_timezone(&zone)
+        .date_naive();
+    let stride = if calendar.weekday.is_some() { 7 } else { 1 };
+    let next_after_last = match last {
+        Some(key) => NaiveDate::from_ymd_opt(
+            (key / 10000).try_into()?,
+            ((key / 100) % 100).try_into()?,
+            (key % 100).try_into()?,
+        )
+        .context("invalid calendar occurrence date")?
+        .succ_opt()
+        .context("calendar date overflow")?,
+        None => today,
+    };
+    let mut next = calendar_date_on_or_after(next_after_last, calendar.weekday)?;
+    let current_day = if let Some(weekday) = calendar.weekday {
+        let behind = (today.weekday().number_from_monday() + 7 - u32::from(weekday)) % 7;
+        today.checked_sub_days(chrono::Days::new(u64::from(behind)))
+            .context("calendar date overflow")?
+    } else {
+        today
+    };
+    let current_at = calendar_instant(zone, calendar.at_minute, current_day)?;
+    let current = if now >= current_at {
+        current_day
+    } else {
+        current_day
+            .checked_sub_days(chrono::Days::new(stride))
+            .context("calendar date overflow")?
+    };
+    if next <= current {
+        match catch_up {
+            "latest" => next = current,
+            "skip" => {
+                next = current
+                    .checked_add_days(chrono::Days::new(stride))
+                    .context("calendar date overflow")?;
+            }
+            "all" => {
+                let missed = current.signed_duration_since(next).num_days() / stride as i64 + 1;
+                let max = max_catch_up.unwrap_or(0);
+                if missed > i64::from(max) {
+                    anyhow::bail!(
+                        "the missed occurrences exceed max-catch-up {max}; raise max-catch-up \
+                         or choose catch-up \"latest\" or \"skip\""
+                    );
+                }
+            }
+            _ => anyhow::bail!("invalid schedule catch-up policy"),
+        }
+    }
+    let key = u64::try_from(next.year())? * 10000
+        + u64::from(next.month()) * 100
+        + u64::from(next.day());
+    Ok((key, calendar_instant(zone, calendar.at_minute, next)?))
+}
+
 
 /// The screen line on which Claude asks for /login. Claude prints the prompt as its own line,
 /// at most after a status glyph, so a line that only quotes the phrase, such as source code or
@@ -8086,6 +8184,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 return Ok(());
             }
             (0_u64, at)
+        } else if let Some(calendar) = &spec.calendar {
+            calendar_occurrence(calendar, last, now, &spec.catch_up, spec.max_catch_up)?
         } else {
             let Some(interval) = spec.every_ms else {
                 return Ok(());
@@ -8138,6 +8238,25 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .context("schedule timestamp overflow")?;
             (next, scheduled)
         };
+        let scheduled_at = if spec.calendar.is_some() {
+            self.store
+                .claims_for(&schedule.subject, Some("schedule.occurrence-scheduled"))?
+                .into_iter()
+                .find(|claim| {
+                    claim.body["fields"]["revision"].as_str() == Some(revision.as_str())
+                        && claim.body["fields"]["occurrence"].as_u64() == Some(occurrence)
+                })
+                .map(|claim| -> Result<i64> {
+                    Ok(claim.body["fields"]["scheduled_at_unix_ms"]
+                        .as_str()
+                        .context("scheduled occurrence has no instant")?
+                        .parse()?)
+                })
+                .transpose()?
+                .unwrap_or(scheduled_at)
+        } else {
+            scheduled_at
+        };
         let operation = format!("{}:{revision}:{occurrence}", schedule.subject);
         if !self
             .armed_schedules
@@ -8163,6 +8282,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             expected_subject: None,
             idempotency_key: Some(format!("clock-wake:{operation}")),
         })?;
+        // The claim's instant remains authoritative when tzdata changes after arming.
+        let scheduled_at = request
+            .body
+            .pointer("/fields/scheduled_at_unix_ms")
+            .and_then(Value::as_str)
+            .context("scheduled occurrence has no instant")?
+            .parse::<i64>()?;
         self.event_notify
             .send_modify(|generation| *generation = generation.saturating_add(1));
         let work = spec.work.clone();
@@ -8222,6 +8348,52 @@ impl<R: RuntimeControl> Reconciler<R> {
                     idempotency_key: Some(format!("clock-reached:{operation}")),
                 });
                 if let (Ok(reached), Some(work)) = (reached, work) {
+                    let (selected_revision, failure_code, failure_reason) =
+                        match scheduled_work_revision(&store, &work) {
+                            Ok(Some(revision)) => (Some(revision), "", String::new()),
+                            Ok(None) => (
+                                None,
+                                "no-ready-mission-revision",
+                                format!(
+                                    "mission/{} has no ready published head on schedule host",
+                                    work.mission
+                                ),
+                            ),
+                            Err(error) => (
+                                None,
+                                "mission-head-unavailable",
+                                format!("cannot read mission/{} head: {error}", work.mission),
+                            ),
+                        };
+                    let Some(selected_revision) = selected_revision else {
+                        let _ = store.append_claim(&ClaimInput {
+                            subject: schedule_subject.clone(),
+                            kind: "schedule.work-failed".into(),
+                            actor: None,
+                            fields: BTreeMap::from([
+                                ("request".into(), Value::String(reached.id.clone())),
+                                ("code".into(), Value::String(failure_code.into())),
+                                ("reason".into(), Value::String(failure_reason.clone())),
+                            ]),
+                            evidence: vec![reached.id.clone()],
+                            expected_subject: None,
+                            idempotency_key: Some(format!("schedule-work-failed:{operation}")),
+                        });
+                        if failure_code == "no-ready-mission-revision" {
+                            let _ = request_schedule_head_attention(
+                                &store,
+                                &schedule_subject,
+                                &reached.id,
+                                &failure_reason,
+                            );
+                        }
+                        armed
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .remove(&operation);
+                        signal_changed(&notify, &event_notify);
+                        return;
+                    };
                     let _ = store.append_claim(&ClaimInput {
                         subject: schedule_subject.clone(),
                         kind: "schedule.work-requested".into(),
@@ -8233,7 +8405,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 "mission".into(),
                                 Value::String(format!("mission/{}", work.mission)),
                             ),
-                            ("mission_revision".into(), Value::String(work.revision)),
+                            ("mission_revision".into(), Value::String(selected_revision)),
                             ("workspace".into(), Value::String(work.workspace)),
                             (
                                 "inputs".into(),
@@ -8406,6 +8578,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("schedule-work-started:{}", run.id)),
             })?;
+            let attention = schedule_head_attention_subject(&schedule.subject);
+            if self
+                .store
+                .attention_request(&attention)?
+                .is_some_and(|item| item.status == "pending")
+            {
+                self.store.withdraw_attention(
+                    &attention,
+                    &crate::model::AttentionWithdrawRequest {
+                        actor: RECONCILER_ACTOR.into(),
+                        reason: "A subsequent schedule occurrence started successfully.".into(),
+                        idempotency_key: format!("schedule-head-ready:{}", run.id),
+                    },
+                )?;
+            }
         }
         anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
         Ok(())
@@ -10467,6 +10654,55 @@ fn expand_gate(
         GateSpec::Deadline { .. } => {}
     }
     Ok(())
+}
+
+fn schedule_head_attention_subject(schedule: &str) -> String {
+    let digest = hex::encode(sha2::Sha256::digest(schedule.as_bytes()));
+    format!("attention/schedule-head-{}", &digest[..32])
+}
+
+fn request_schedule_head_attention(
+    store: &Store,
+    schedule: &str,
+    occurrence: &str,
+    reason: &str,
+) -> Result<()> {
+    let attention = schedule_head_attention_subject(schedule);
+    if store
+        .attention_request(&attention)?
+        .is_some_and(|item| item.status == "pending")
+    {
+        return Ok(());
+    }
+    store.request_attention(
+        &attention,
+        &AttentionRequest {
+            reviewer: "person/operator".into(),
+            title: "A scheduled mission has no ready head".into(),
+            reason: format!("{schedule}: {reason}. Publish a ready head to resume scheduled work."),
+            severity: "warning".into(),
+            targets: vec![schedule.into()],
+            actor: RECONCILER_ACTOR.into(),
+            idempotency_key: format!("schedule-head-unready:{occurrence}"),
+        },
+    )?;
+    Ok(())
+}
+
+/// Select the authoritative head at the occurrence request boundary, never when a queued
+/// request eventually starts. `None` means the current head is not ready, not that an older
+/// ready revision may be used.
+fn scheduled_work_revision(
+    store: &Store,
+    work: &crate::model::ScheduledWork,
+) -> Result<Option<String>> {
+    if let Some(revision) = &work.revision {
+        return Ok(Some(revision.clone()));
+    }
+    Ok(store
+        .mission_spec(&work.mission, None)?
+        .filter(|head| head.state == MissionState::Ready)
+        .map(|head| head.revision))
 }
 
 /// Report whether a lane, observer, subscription, or schedule declaration is a stop.
@@ -16001,6 +16237,439 @@ mission "scheduled-cycle" state="ready" {
             .unwrap()
             .unwrap()
             .revision
+    }
+    #[test]
+    fn daily_calendar_gap_fold_and_catch_up_keep_local_date_keys() {
+        let berlin = CalendarSchedule { at_minute: 150, weekday: None, timezone: "Europe/Berlin".into() };
+        let date = |value| NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap();
+        let utc = |value| chrono::DateTime::parse_from_rfc3339(value).unwrap().timestamp_millis();
+        assert_eq!(
+            calendar_instant(chrono_tz::Europe::Berlin, berlin.at_minute, date("2027-03-28")).unwrap(),
+            utc("2027-03-28T01:00:00Z"),
+            "02:30 is nonexistent: fire at the first valid instant 03:00 local"
+        );
+        assert_eq!(
+            calendar_instant(chrono_tz::Europe::Berlin, berlin.at_minute, date("2026-10-25")).unwrap(),
+            utc("2026-10-25T00:30:00Z"),
+            "02:30 occurs twice: choose the earlier offset"
+        );
+        let morning = CalendarSchedule { at_minute: 480, weekday: None, timezone: "Europe/Berlin".into() };
+        let now = utc("2027-03-30T05:00:00Z"); // Before today's 08:00 local.
+        assert_eq!(
+            calendar_occurrence(&morning, Some(20270327), now, "latest", None).unwrap(),
+            (20270329, utc("2027-03-29T06:00:00Z"))
+        );
+        assert_eq!(
+            calendar_occurrence(&morning, Some(20270327), now, "skip", None).unwrap().0,
+            20270330
+        );
+        assert!(calendar_occurrence(&morning, Some(20270327), now, "all", Some(1))
+            .unwrap_err().to_string().contains("max-catch-up 1"));
+        assert_eq!(
+            calendar_occurrence(&morning, Some(20270327), now, "all", Some(2)).unwrap().0,
+            20270328
+        );
+        // The second instant of the fold is after the first local 02:30,
+        // but the already-reached date is never selected again.
+        assert_eq!(
+            calendar_occurrence(&berlin, Some(20261025), utc("2026-10-25T01:30:00Z"), "latest", None).unwrap().0,
+            20261026
+        );
+    }
+    #[test]
+    fn weekly_calendar_tracks_berlin_mondays_across_dst_and_catch_up() {
+        let weekly = CalendarSchedule {
+            at_minute: 540, weekday: Some(1), timezone: "Europe/Berlin".into(),
+        };
+        let utc = |value| chrono::DateTime::parse_from_rfc3339(value).unwrap().timestamp_millis();
+        assert_eq!(
+            calendar_occurrence(&weekly, Some(20260323), utc("2026-03-29T12:00:00Z"), "latest", None).unwrap(),
+            (20260330, utc("2026-03-30T07:00:00Z")),
+            "the spring transition moves Monday 09:00 one UTC hour earlier"
+        );
+        let before_monday = utc("2026-10-26T07:00:00Z");
+        assert_eq!(
+            calendar_occurrence(&weekly, Some(20261005), before_monday, "latest", None).unwrap(),
+            (20261019, utc("2026-10-19T07:00:00Z"))
+        );
+        assert_eq!(
+            calendar_occurrence(&weekly, Some(20261005), before_monday, "skip", None).unwrap(),
+            (20261026, utc("2026-10-26T08:00:00Z")),
+            "the autumn transition moves Monday 09:00 one UTC hour later"
+        );
+        assert!(calendar_occurrence(&weekly, Some(20261005), before_monday, "all", Some(1))
+            .unwrap_err().to_string().contains("max-catch-up 1"));
+        assert_eq!(
+            calendar_occurrence(&weekly, Some(20261005), before_monday, "all", Some(2)).unwrap().0,
+            20261012
+        );
+        assert_eq!(
+            calendar_occurrence(&weekly, None, utc("2026-10-27T12:00:00Z"), "all", Some(1)).unwrap().0,
+            20261102,
+            "first publication starts at the next matching weekday, not an unbounded history"
+        );
+        let sunday = CalendarSchedule {
+            at_minute: 150, weekday: Some(7), timezone: "Europe/Berlin".into(),
+        };
+        assert_eq!(
+            calendar_occurrence(&sunday, Some(20270321), utc("2027-03-28T01:30:00Z"), "latest", None).unwrap(),
+            (20270328, utc("2027-03-28T01:00:00Z")),
+            "a weekly spring gap fires at the first valid local instant"
+        );
+        assert_eq!(
+            calendar_occurrence(&sunday, Some(20261018), utc("2026-10-25T01:30:00Z"), "latest", None).unwrap(),
+            (20261025, utc("2026-10-25T00:30:00Z")),
+            "a weekly autumn fold fires at its earlier instant"
+        );
+        assert_eq!(
+            calendar_occurrence(&sunday, Some(20261025), utc("2026-10-25T01:30:00Z"), "latest", None).unwrap().0,
+            20261101,
+            "the repeated local clock cannot fire the same Sunday twice"
+        );
+    }
+
+
+    #[tokio::test]
+    async fn daily_calendar_reaches_once_and_preserves_durable_claim_key() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let revision = scheduled_mission_revision(&store);
+        apply_source(&store, &format!(r#"version 2
+schedule "daily" {{
+  calendar {{ at "00:00"; timezone "Etc/UTC" }}
+  catch-up "latest"
+  work {{ mission "scheduled-cycle@{revision}"; workspace "/tmp/st3-calendar-test" }}
+}}"#), "calendar-schedule");
+        let reconciler = Reconciler::new(
+            store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let reached = store.claims_for("schedule/daily", Some("schedule.occurrence-reached")).unwrap();
+        assert_eq!(reached.len(), 1);
+        let key = reached[0].body["fields"]["occurrence"].as_u64().unwrap();
+        assert_eq!(key, Utc::now().format("%Y%m%d").to_string().parse::<u64>().unwrap());
+        reconciler.reconcile_once().unwrap();
+        let restarted = Reconciler::new(
+            store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+        );
+        restarted.reconcile_once().unwrap();
+        assert_eq!(store.claims_for("schedule/daily", Some("schedule.occurrence-reached")).unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn daily_calendar_reuses_recorded_instant_after_rule_change() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let mission_revision = scheduled_mission_revision(&store);
+        apply_source(&store, &format!(r#"version 2
+schedule "daily" {{
+  calendar {{ at "23:59"; timezone "Etc/UTC" }}
+  work {{ mission "scheduled-cycle@{mission_revision}"; workspace "/tmp/st3-calendar-test" }}
+}}"#), "calendar-schedule");
+        let revision = store.selected_desired_revision("schedule/daily").unwrap().unwrap();
+        let key: u64 = Utc::now().format("%Y%m%d").to_string().parse().unwrap();
+        let recorded = (now_ms() as i64 - 100).to_string();
+        store.append_claim(&ClaimInput {
+            subject: "schedule/daily".into(),
+            kind: "schedule.occurrence-scheduled".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("revision".into(), Value::String(revision.clone())),
+                ("occurrence".into(), Value::from(key)),
+                ("scheduled_at_unix_ms".into(), Value::String(recorded.clone())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("clock-wake:schedule/daily:{revision}:{key}")),
+        }).unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let reached = store.claims_for("schedule/daily", Some("schedule.occurrence-reached")).unwrap();
+        assert_eq!(reached.len(), 1);
+        assert_eq!(reached[0].body["fields"]["occurrence"], key);
+        assert_eq!(reached[0].body["fields"]["scheduled_at_unix_ms"], recorded);
+    }
+
+
+
+    #[test]
+    fn ready_head_selection_across_dst_transition_date_anchors() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let first = scheduled_mission_revision(&store);
+        for anchor in ["2026-10-25T01:00:00Z", "2027-03-28T01:00:00Z"] {
+            if anchor == "2027-03-28T01:00:00Z" {
+                apply_source(
+                    &store,
+                    r#"version 2
+mission "scheduled-cycle" state="ready" {
+  goal "Run the improved cycle after publication."
+  step "improved" { agentless }
+}"#,
+                    "improved-cycle-across-dst",
+                );
+            }
+            let expected = store
+                .mission_spec("scheduled-cycle", None)
+                .unwrap()
+                .unwrap()
+                .revision;
+            assert_eq!(expected == first, anchor == "2026-10-25T01:00:00Z");
+            let source = format!(
+                r#"version 2
+schedule "cycle" {{
+  every "1h"
+  anchor "{anchor}"
+  work {{ mission "scheduled-cycle"; workspace "/tmp/cycles" }}
+}}"#
+            );
+            let intent = parse_intent(&source, "node").unwrap();
+            let schedule = intent
+                .subjects
+                .values()
+                .find(|item| item.kind == "schedule")
+                .unwrap();
+            let work = crate::graph::schedule_spec(&schedule.desired, "node")
+                .unwrap()
+                .work
+                .unwrap();
+            assert_eq!(
+                scheduled_work_revision(&store, &work).unwrap(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unpinned_schedule_selects_ready_head_at_each_request_and_keeps_started_revision() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let first = scheduled_mission_revision(&store);
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().display();
+        let at = (Utc::now() + chrono::Duration::milliseconds(40))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+schedule "first" {{
+  at "{at}"
+  work {{ mission "scheduled-cycle"; workspace "{workspace}" }}
+}}"#
+            ),
+            "first-unpinned",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let first_request = store
+            .claims_for("schedule/first", Some("schedule.work-requested"))
+            .unwrap();
+        assert_eq!(first_request.len(), 1);
+        assert_eq!(first_request[0].body["fields"]["mission_revision"], first);
+
+        apply_source(
+            &store,
+            r#"version 2
+mission "scheduled-cycle" state="ready" {
+  goal "Complete an improved scheduled cycle."
+  step "improved" { agentless }
+}"#,
+            "improved-cycle",
+        );
+        let second = store
+            .mission_spec("scheduled-cycle", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert_ne!(first, second);
+        reconciler.reconcile_once().unwrap();
+        let started = store
+            .claims_for("schedule/first", Some("schedule.work-started"))
+            .unwrap();
+        assert_eq!(started.len(), 1);
+        let run = started[0].body["fields"]["mission_run"].as_str().unwrap();
+        assert_eq!(store.mission_run(run).unwrap().unwrap().revision, first);
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let at = (Utc::now() + chrono::Duration::milliseconds(40))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+schedule "second" {{
+  at "{at}"
+  work {{ mission "scheduled-cycle"; workspace "{workspace}" }}
+}}"#
+            ),
+            "second-unpinned",
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        reconciler.reconcile_once().unwrap();
+        let request = store
+            .claims_for("schedule/second", Some("schedule.work-requested"))
+            .unwrap();
+        assert_eq!(request.len(), 1);
+        assert_eq!(request[0].body["fields"]["mission_revision"], second);
+        let started = store
+            .claims_for("schedule/second", Some("schedule.work-started"))
+            .unwrap();
+        assert_eq!(started.len(), 1);
+        let run = started[0].body["fields"]["mission_run"].as_str().unwrap();
+        assert_eq!(store.mission_run(run).unwrap().unwrap().revision, second);
+    }
+
+    #[tokio::test]
+    async fn unpinned_schedule_fails_when_current_head_is_not_ready() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let previous = scheduled_mission_revision(&store);
+        apply_source(
+            &store,
+            r#"version 2
+mission "scheduled-cycle" state="draft" {
+  goal "Unreviewed cycle is not runnable."
+}"#,
+            "draft-cycle",
+        );
+        let head = store
+            .mission_spec("scheduled-cycle", None)
+            .unwrap()
+            .unwrap();
+        assert_ne!(head.revision, previous);
+        assert_eq!(head.state, MissionState::Draft);
+        let root = tempfile::tempdir().unwrap();
+        let at = (Utc::now() + chrono::Duration::milliseconds(40))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+schedule "unready" {{
+  at "{at}"
+  work {{ mission "scheduled-cycle"; workspace "{}" }}
+}}"#,
+                root.path().display()
+            ),
+            "unready-schedule",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        reconciler.reconcile_once().unwrap();
+        let failed = store
+            .claims_for("schedule/unready", Some("schedule.work-failed"))
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].body["fields"]["code"],
+            "no-ready-mission-revision"
+        );
+        assert!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-requested"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-started"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unpinned_schedule_keeps_one_attention_until_an_occurrence_succeeds() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "scheduled-cycle" state="draft" { goal "Not ready." }"#,
+            "draft-cycle",
+        );
+        let root = tempfile::tempdir().unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let attention = schedule_head_attention_subject("schedule/unready");
+        for occurrence in 0..4 {
+            if occurrence == 3 {
+                scheduled_mission_revision(&store);
+            }
+            let at = (Utc::now() + chrono::Duration::milliseconds(40))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            apply_source(
+                &store,
+                &format!(
+                    r#"version 2
+schedule "unready" {{
+  at "{at}"
+  work {{ mission "scheduled-cycle"; workspace "{}" }}
+}}"#,
+                    root.path().display()
+                ),
+                &format!("occurrence-{occurrence}"),
+            );
+            reconciler.reconcile_once().unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            reconciler.reconcile_once().unwrap();
+            assert_eq!(
+                store
+                    .claims_for(&attention, Some("attention.requested"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            if occurrence < 3 {
+                assert_eq!(
+                    store.attention_request(&attention).unwrap().unwrap().status,
+                    "pending"
+                );
+            }
+        }
+        assert_eq!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-failed"))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-started"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let closed = store
+            .claims_for(&attention, Some("attention.resolved"))
+            .unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].body["fields"]["outcome"], "withdrawn");
+        assert!(
+            store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != attention)
+        );
     }
 
     #[tokio::test]

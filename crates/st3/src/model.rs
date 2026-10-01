@@ -610,15 +610,25 @@ pub struct ScheduleSpec {
     pub at_unix_ms: Option<i64>,
     pub every_ms: Option<u64>,
     pub anchor_unix_ms: Option<i64>,
+    pub calendar: Option<CalendarSchedule>,
     pub catch_up: String,
     pub max_catch_up: Option<u32>,
     pub work: Option<ScheduledWork>,
 }
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CalendarSchedule {
+    /// Minutes since local midnight.
+    pub at_minute: u16,
+    /// ISO weekday (Monday = 1), or none for daily.
+    pub weekday: Option<u8>,
+    pub timezone: String,
+}
+
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScheduledWork {
     pub mission: String,
-    pub revision: String,
+    pub revision: Option<String>,
     pub workspace: String,
     #[serde(default)]
     pub inputs: BTreeMap<String, String>,
