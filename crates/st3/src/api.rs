@@ -4103,8 +4103,8 @@ fn native_delivery_identity(
             return None;
         }
         match pair[1].as_str() {
-            "omp-channel" => Some(("omp-channel", false)),
-            "pi-channel" => Some(("pi-channel", false)),
+            "omp-channel" | "omp" => Some(("omp-channel", false)),
+            "pi-channel" | "pi" => Some(("pi-channel", false)),
             "claude-mcp" => Some(("claude-channel", false)),
             "claude" => Some(("claude-channel", true)),
             "codex" => Some(("app-server", true)),
@@ -11862,6 +11862,19 @@ mod tests {
         assert!(delivery_presence::known(recipient).is_none());
         record_legacy_poll(Some(&peer), Some(recipient), false);
         assert_eq!(delivery_presence::known(recipient).unwrap().state, "legacy");
+    }
+
+    #[test]
+    fn native_title_subscriptions_recognize_the_outer_pi_and_omp_drivers() {
+        for driver in ["pi", "omp"] {
+            let args = vec!["st".into(), "driver".into(), driver.into()];
+            let env = vec!["ST_AGENT=agent/eval.worker".into()];
+            let peer = native_delivery_identity(37, &args, &env).expect("native title owner");
+            assert_eq!(peer.agent, "agent/eval.worker");
+            assert_eq!(peer.transport, format!("{driver}-channel"));
+            assert!(!peer.archives_inbox);
+            assert!(native_delivery_identity(37, &args, &[]).is_none(), "argv alone cannot authorize a seat");
+        }
     }
 
     #[test]
