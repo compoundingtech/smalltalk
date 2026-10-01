@@ -108,7 +108,7 @@ fn run_with_required_resume(
         (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
         (SESSION_ENV.to_string(), observer.session().to_string()),
         (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
-        ("ST2_CLAUDE_IDENTITY".to_string(), identity.clone()),
+        ("ST_CLAUDE_IDENTITY".to_string(), identity.clone()),
         (
             "CATALOG".to_string(),
             catalog_root.to_string_lossy().into_owned(),
@@ -160,7 +160,7 @@ pub fn run_controlled_paths(
         (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
         (SESSION_ENV.to_string(), observer.session().to_string()),
         (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
-        ("ST2_CLAUDE_IDENTITY".to_string(), identity.clone()),
+        ("ST_CLAUDE_IDENTITY".to_string(), identity.clone()),
         (
             "CATALOG".to_string(),
             catalog_root.to_string_lossy().into_owned(),
@@ -502,18 +502,18 @@ fn development_channel_argv(
 /// Invoked per event by the fail-open `claude-observe.sh` hook, so each invocation is its own
 /// short-lived writer; the transition counter continues from disk.
 /// The env var carrying the wrapper's runtime/task ID into Claude's hook subprocesses.
-pub const RUNTIME_ID_ENV: &str = "ST2_CLAUDE_RUNTIME_ID";
+pub const RUNTIME_ID_ENV: &str = "ST_CLAUDE_RUNTIME_ID";
 /// The env var carrying the wrapper's session incarnation token into Claude's hook subprocesses.
-pub const SESSION_ENV: &str = "ST2_CLAUDE_SESSION";
+pub const SESSION_ENV: &str = "ST_CLAUDE_SESSION";
 /// The env var carrying the wrapper's claimed ownership sequence beside the token.
-pub const SESSION_SEQ_ENV: &str = "ST2_CLAUDE_SESSION_SEQ";
+pub const SESSION_SEQ_ENV: &str = "ST_CLAUDE_SESSION_SEQ";
 /// The exact native session that a cold residency launch must resume.
-pub const EXPECTED_NATIVE_SESSION_ENV: &str = "ST2_CLAUDE_EXPECTED_NATIVE_SESSION";
+pub const EXPECTED_NATIVE_SESSION_ENV: &str = "ST_CLAUDE_EXPECTED_NATIVE_SESSION";
 /// The cold residency generation whose SessionStart must prove the exact native session.
-pub const RESUME_GENERATION_ENV: &str = "ST2_CLAUDE_RESUME_GENERATION";
+pub const RESUME_GENERATION_ENV: &str = "ST_CLAUDE_RESUME_GENERATION";
 
-const BINDING_SCHEMA: &str = "st2.claude-session-binding.v1";
-const CHECKPOINT_SCHEMA: &str = "st2.claude-residency-checkpoint.v1";
+const BINDING_SCHEMA: &str = "st.claude-session-binding.v1";
+const CHECKPOINT_SCHEMA: &str = "st.claude-residency-checkpoint.v1";
 const BINDING_FILE: &str = "binding.json";
 const PENDING_BINDING_FILE: &str = "binding.pending.json";
 const CHECKPOINT_FILE: &str = "residency-checkpoint.json";
@@ -822,7 +822,7 @@ fn load_binding_file(
     };
     let binding: ClaudeSessionBinding = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        binding.schema == BINDING_SCHEMA,
+        crate::contracts::schema_matches(&binding.schema, BINDING_SCHEMA),
         "unsupported Claude native session binding schema"
     );
     anyhow::ensure!(
@@ -919,8 +919,11 @@ fn record_session_start_binding(
             );
         }
     }
+    let schema = load_binding(&state_dir, identity, runtime_id)?
+        .filter(|binding| binding.runtime_incarnation == runtime_incarnation)
+        .map_or_else(|| BINDING_SCHEMA.to_owned(), |binding| binding.schema);
     let binding = ClaudeSessionBinding {
-        schema: BINDING_SCHEMA.to_string(),
+        schema,
         agent: identity.to_string(),
         runtime_id: runtime_id.to_string(),
         runtime_incarnation: runtime_incarnation.to_string(),
@@ -961,7 +964,7 @@ pub fn checkpoint_residency(
         &binding.canonical_workspace,
     )?;
     let checkpoint = ClaudeResidencyCheckpoint {
-        schema: CHECKPOINT_SCHEMA.to_string(),
+        schema: crate::contracts::schema_for_owner(&binding.schema, CHECKPOINT_SCHEMA),
         source_generation,
         resume_generation,
         binding,
@@ -982,7 +985,7 @@ fn load_checkpoint(
         .with_context(|| format!("reading Claude residency checkpoint {}", path.display()))?;
     let checkpoint: ClaudeResidencyCheckpoint = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        checkpoint.schema == CHECKPOINT_SCHEMA,
+        crate::contracts::schema_matches(&checkpoint.schema, CHECKPOINT_SCHEMA),
         "unsupported Claude residency checkpoint schema"
     );
     anyhow::ensure!(
@@ -991,7 +994,7 @@ fn load_checkpoint(
         "Claude residency checkpoint belongs to a different generation"
     );
     anyhow::ensure!(
-        checkpoint.binding.schema == BINDING_SCHEMA
+        crate::contracts::schema_matches(&checkpoint.binding.schema, BINDING_SCHEMA)
             && checkpoint.binding.agent == agent
             && checkpoint.binding.runtime_id == runtime_id,
         "Claude residency checkpoint belongs to a different agent runtime"
@@ -1137,6 +1140,8 @@ pub fn run_observe_payload(
     raw: &str,
     var: &dyn Fn(&str) -> Option<String>,
 ) -> Result<()> {
+    let raw_var = var;
+    let var = &|name: &str| crate::contracts::env_with(name, raw_var);
     let agent_dir =
         message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
             .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
@@ -1199,7 +1204,7 @@ fn observe_payload(
             if mandatory_resume {
                 return Err(error);
             }
-            tracing::warn!("st2 claude-observe: native session binding write failed: {error:#}");
+            tracing::warn!("st claude-observe: native session binding write failed: {error:#}");
         }
         // st3 reads this record to bind a managed chat to the wrapper's current native session.
         if let (Some(incarnation), Some(native_id)) = (
@@ -1212,7 +1217,7 @@ fn observe_payload(
                 if let Err(error) = write_native_session_binding(agent_dir, incarnation, native_id)
                 {
                     tracing::warn!(
-                        "st2 claude-observe: native session binding write failed: {error:#}"
+                        "st claude-observe: native session binding write failed: {error:#}"
                     );
                 }
             }
@@ -1227,7 +1232,7 @@ fn observe_payload(
     if let Err(error) = crate::harness_timeline::observe_claude(&mut timeline, event, &payload) {
         // Timeline observability is fail-open just like state/context publication: a record fault
         // must not hold up the hook process Claude is waiting on.
-        tracing::warn!("st2 claude-observe: harness-timeline write failed: {error:#}");
+        tracing::warn!("st claude-observe: harness-timeline write failed: {error:#}");
     }
     if event == "Stop" {
         if let Some(home) = var("HOME") {
@@ -1236,7 +1241,7 @@ fn observe_payload(
                 &payload,
                 Path::new(&home),
             ) {
-                tracing::warn!("st2 claude-observe: native answer publication failed: {error:#}");
+                tracing::warn!("st claude-observe: native answer publication failed: {error:#}");
             }
         }
     }
@@ -1245,7 +1250,7 @@ fn observe_payload(
     // otherwise return below. Fail-open: a context record that cannot be written must never stop
     // a hook the harness is waiting on, and the numbers authorize nothing (HC-A02).
     if let Err(error) = observe_compaction(agent_dir, identity, event, &payload) {
-        tracing::warn!("st2 claude-observe: harness-context compaction write failed: {error:#}");
+        tracing::warn!("st claude-observe: harness-context compaction write failed: {error:#}");
     }
     // The credential axis is independent of both the numbers and the categorical state, and is
     // applied before the observation guard below for the same reason the compaction write is:
@@ -1339,7 +1344,7 @@ fn observe_writer(
                 Ok(None) => writer.with_session(token),
                 Err(error) => {
                     tracing::warn!(
-                        "st2 claude-observe: observed-state claim failed; degrading to token-only: {error:#}"
+                        "st claude-observe: observed-state claim failed; degrading to token-only: {error:#}"
                     );
                     writer.with_session(token)
                 }
@@ -1377,7 +1382,7 @@ fn context_writer(
     payload: &serde_json::Value,
 ) -> Result<harness_context::Writer> {
     let writer = harness_context::Writer::new(agent_dir, identity, Harness::Claude)?;
-    let exported = std::env::var(SESSION_ENV).ok().filter(|t| !t.is_empty());
+    let exported = crate::contracts::env(SESSION_ENV);
     Ok(match exported.or_else(|| wrapperless_token(payload)) {
         Some(token) => writer.with_session(token),
         None => writer,
@@ -1554,7 +1559,7 @@ pub fn run_statusline(catalog_root: &Path, identity: &str) -> Result<()> {
     let mut raw = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut raw);
     if let Err(error) = record_statusline(catalog_root, identity, &raw) {
-        tracing::warn!("st2 claude-statusline: recording failed; chaining anyway: {error:#}");
+        tracing::warn!("st claude-statusline: recording failed; chaining anyway: {error:#}");
     }
     chain_statusline(&raw)
 }
@@ -1598,7 +1603,7 @@ fn chain_statusline(raw: &[u8]) -> Result<()> {
         // Both resolution paths named, because "no renderer resolved" is the whole diagnosis and
         // the operator's next move is to set one of exactly these two.
         tracing::warn!(
-            "st2 claude-statusline: no downstream renderer resolved from \
+            "st claude-statusline: no downstream renderer resolved from \
              ${STATUSLINE_RENDERER_ENV} or ~/{STATUSLINE_RENDERER_FILE}; \
              rendering an empty status line"
         );
@@ -1615,7 +1620,7 @@ fn chain_statusline(raw: &[u8]) -> Result<()> {
         Ok(child) => child,
         Err(error) => {
             tracing::warn!(
-                "st2 claude-statusline: downstream renderer `{command}` could not start: {error}"
+                "st claude-statusline: downstream renderer `{command}` could not start: {error}"
             );
             return Ok(());
         }
@@ -2335,7 +2340,7 @@ mod tests {
         assert_eq!(
             failure.support,
             driver_diagnostic::Support::Unknown,
-            "st2 gates no Claude version, so support is not knowable from a hook"
+            "st gates no Claude version, so support is not knowable from a hook"
         );
 
         // A later quota failure carries no credential edge, so the rejection stands.

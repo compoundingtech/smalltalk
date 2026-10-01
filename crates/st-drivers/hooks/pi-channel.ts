@@ -1,12 +1,12 @@
-// st2 native message delivery for the pi harness.
+// st native message delivery for the pi harness.
 //
 // pi has no MCP and no app-server. Its integration point is an extension loaded into the live
 // interactive process, which is strictly better than either: `pi.sendUserMessage()` is a typed
-// injection point and `ctx.isIdle()` is a positive idle proof, so st2 never inspects a screen to
+// injection point and `ctx.isIdle()` is a positive idle proof, so st never inspects a screen to
 // decide whether delivery is safe.
 //
-// This asset is published as part of st2's immutable content-addressed hook set and referenced from
-// a launch as `<verified set>/pi-channel.ts`. It deliberately holds no policy: st2 decides which
+// This asset is published as part of st's immutable content-addressed hook set and referenced from
+// a launch as `<verified set>/pi-channel.ts`. It deliberately holds no policy: st decides which
 // message is delivered, how (`deliverAs` travels on the frame), and what a starting session is told
 // about its own durable state (`sessionContext` travels on the hello). This file only moves frames.
 //
@@ -22,14 +22,21 @@ import type {
 
 const PROTOCOL = 1;
 
-const BIN = "ST2_PI_CHANNEL_BIN";
-const CATALOG = "ST2_PI_CHANNEL_CATALOG";
-const IDENTITY = "ST2_PI_CHANNEL_IDENTITY";
-const RUNTIME_ID = "ST2_PI_CHANNEL_RUNTIME_ID";
-const SESSION = "ST2_PI_CHANNEL_SESSION";
-const SEQ = "ST2_PI_CHANNEL_SEQ";
+const legacyName = (name: string) => `ST2_${name.slice(3)}`;
+const readEnv = (name: string) => process.env[name] ?? process.env[legacyName(name)];
+const removeEnv = (name: string) => {
+  delete process.env[name];
+  delete process.env[legacyName(name)];
+};
 
-// pi starts the session even if st2 is slow to answer. Restored context is worth a short wait and
+const BIN = "ST_PI_CHANNEL_BIN";
+const CATALOG = "ST_PI_CHANNEL_CATALOG";
+const IDENTITY = "ST_PI_CHANNEL_IDENTITY";
+const RUNTIME_ID = "ST_PI_CHANNEL_RUNTIME_ID";
+const SESSION = "ST_PI_CHANNEL_SESSION";
+const SEQ = "ST_PI_CHANNEL_SEQ";
+
+// pi starts the session even if st is slow to answer. Restored context is worth a short wait and
 // never worth a hung agent.
 const HELLO_TIMEOUT_MS = 5000;
 
@@ -65,7 +72,7 @@ type Stash = {
    * The last assistant message's `usage.cost.total`.
    *
    * Cost rides only the message-bearing events, but a context frame may be emitted from an event
-   * that carries none (`agent_end`, `session_start`). st2's record replaces a reading's fields
+   * that carries none (`agent_end`, `session_start`). st's record replaces a reading's fields
    * WHOLESALE — deliberately, so a withheld number is never fabricated from a previous one — so a
    * frame omitting the cost would erase the published one on the very next turn boundary. Holding
    * the last one here and restating it is what keeps `costUsd` meaning "the last assistant
@@ -80,7 +87,7 @@ type Stash = {
  * pi reports `tokens: null` and `percent: null` for real — immediately after a compaction, and
  * across a process restart until the next assistant usage arrives — while `contextWindow` stays
  * populated. That is pi positively saying it does not know, and substituting zero, the previous
- * reading, or a division st2 could have done itself is exactly the fabrication HC-R03 forbids.
+ * reading, or a division st could have done itself is exactly the fabrication HC-R03 forbids.
  * A non-finite value is treated the same way: `NaN` and `Infinity` are not readings.
  */
 const finiteOrNull = (value: unknown): number | null =>
@@ -128,27 +135,29 @@ void pinnedTelemetrySurface;
  * outlives re-instantiation; the environment does not.
  */
 const stash = (): Stash => {
-  const globals = globalThis as { __st2PiChannel?: Stash };
-  if (!globals.__st2PiChannel) {
-    // EVERY ST2_PI_CHANNEL_* value is stashed and unexported — the ownership pair included: a
+  const globals = globalThis as { __stPiChannel?: Stash; __st2PiChannel?: Stash };
+  // Reuse an older loaded extension's ownership before considering the process environment.
+  globals.__stPiChannel ??= globals.__st2PiChannel;
+  if (!globals.__stPiChannel) {
+    // EVERY ST_PI_CHANNEL_* value is stashed and unexported — the ownership pair included: a
     // leaked runtime id or session token would hand a nested pi (or any tool child) this seat's
     // registry key and record ownership. The channel subprocess receives them explicitly below.
-    globals.__st2PiChannel = {
-      bin: process.env[BIN],
-      catalog: process.env[CATALOG],
-      identity: process.env[IDENTITY],
-      runtimeId: process.env[RUNTIME_ID],
-      session: process.env[SESSION],
-      seq: process.env[SEQ],
+    globals.__stPiChannel = {
+      bin: readEnv(BIN),
+      catalog: readEnv(CATALOG),
+      identity: readEnv(IDENTITY),
+      runtimeId: readEnv(RUNTIME_ID),
+      session: readEnv(SESSION),
+      seq: readEnv(SEQ),
     };
-    delete process.env[BIN];
-    delete process.env[CATALOG];
-    delete process.env[IDENTITY];
-    delete process.env[RUNTIME_ID];
-    delete process.env[SESSION];
-    delete process.env[SEQ];
   }
-  return globals.__st2PiChannel;
+  removeEnv(BIN);
+  removeEnv(CATALOG);
+  removeEnv(IDENTITY);
+  removeEnv(RUNTIME_ID);
+  removeEnv(SESSION);
+  removeEnv(SEQ);
+  return globals.__stPiChannel;
 };
 
 export default function (pi: ExtensionAPI) {
@@ -187,7 +196,7 @@ export default function (pi: ExtensionAPI) {
       // channel means presence decays, so the agent reads as unreachable instead of quietly
       // mis-delivering.
       ctx.ui?.notify?.(
-        "st2: this pi build exposes no ctx.isIdle(); refusing to open the st2 channel",
+        "st: this pi build exposes no ctx.isIdle(); refusing to open the st channel",
         "error",
       );
       return Promise.resolve("");
@@ -260,7 +269,7 @@ export default function (pi: ExtensionAPI) {
           if (frame.protocol !== PROTOCOL) {
             closeChild(child);
             ctx.ui?.notify?.(
-              `st2: pi channel protocol ${frame.protocol} is not understood by this extension (expected ${PROTOCOL}); reinstall st2's hook set`,
+              `st: pi channel protocol ${frame.protocol} is not understood by this extension (expected ${PROTOCOL}); reinstall st's hook set`,
             );
             settle("");
             return;
@@ -276,7 +285,7 @@ export default function (pi: ExtensionAPI) {
           // `deliverAs` is required only while a turn is streaming, and an idle send that carries
           // one is rejected, so the idle proof selects the call shape. It never selects the policy.
           // Not optional-chained: `ctx.isIdle?.() ?? true` would read a missing idle proof as
-          // "idle" and silently turn every mid-turn delivery into a plain send. st2 pins the
+          // "idle" and silently turn every mid-turn delivery into a plain send. st pins the
           // surfaces whose skew is silent, and this is the one such surface in this file.
           if (ctx.isIdle()) {
             await pi.sendUserMessage(frame.content);
@@ -321,7 +330,7 @@ export default function (pi: ExtensionAPI) {
   // and the idle edge is `agent_settled`, not `agent_end`: measured against the repo's own pi
   // captures, `ctx.isIdle()` is still false through `agent_end`, and a queued follow-up turn
   // starts exactly at that boundary — an `agent_end` emit would blip a spurious idle before it.
-  // `agent_settled` is the first point pi is provably idle. The frame is observational — st2
+  // `agent_settled` is the first point pi is provably idle. The frame is observational — st
   // decides what becomes of it — and a closed channel drops it silently, matching the fail-open
   // rule this file already follows. pi 0.84.2 exposes no typed waiting-on-a-human event, so no
   // frame here ever claims one.
@@ -382,7 +391,7 @@ export default function (pi: ExtensionAPI) {
   //
   // `ctx.getContextUsage()` answers the whole fill triple in one call and rides the ctx of every
   // lifecycle event, so this producer keeps no accumulator and reads no second source. It also
-  // holds no cadence policy: st2's harness-context write guard quantizes to 1% of the window, so
+  // holds no cadence policy: st's harness-context write guard quantizes to 1% of the window, so
   // emitting on every boundary costs at most one write per bucket entered however chatty pi is,
   // and the record's own heartbeat rule decides the rest. Emitting liberally is therefore correct
   // — and the finest boundary is the one that matters. Turn-boundary-only observation was
@@ -435,7 +444,7 @@ export default function (pi: ExtensionAPI) {
    * The harness-durable compaction count (HC-R12): pi's own session store answers it, and the
    * answer survives a process restart — measured 2 → 3 across a compaction and read back
    * correctly on the next process's `session_start`. `null` when the store cannot be read, which
-   * makes st2 fall back to counting the edge itself; that is a weaker, incarnation-scoped answer
+   * makes st fall back to counting the edge itself; that is a weaker, incarnation-scoped answer
    * and never a wrong one.
    */
   const durableCompactions = (ctx: ExtensionContext): number | null => {
@@ -562,7 +571,7 @@ export default function (pi: ExtensionAPI) {
       // A custom message participates in LLM context without triggering a turn of its own — the
       // closest pi equivalent to the other harnesses' `additionalContext` hook output.
       pi.sendMessage(
-        { customType: "st2-session-start", content: restored, display: true },
+        { customType: "st-session-start", content: restored, display: true },
         { deliverAs: "nextTurn" },
       );
     }

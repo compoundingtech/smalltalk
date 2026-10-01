@@ -1154,13 +1154,13 @@ fn delivery_request_uses_typed_start_and_exact_turn_steer() {
     let start = codex_delivery_request(
         2,
         "thread-main",
-        "st2:client",
+        "st:client",
         "notice",
         &CodexDeliveryMethod::Start,
     );
     assert_eq!(start["method"], "turn/start");
     assert_eq!(start["params"]["threadId"], "thread-main");
-    assert_eq!(start["params"]["clientUserMessageId"], "st2:client");
+    assert_eq!(start["params"]["clientUserMessageId"], "st:client");
     assert_eq!(start["params"]["input"][0]["type"], "text");
     assert_eq!(start["params"]["input"][0]["text"], "notice");
     assert!(start["params"].get("expectedTurnId").is_none());
@@ -1168,7 +1168,7 @@ fn delivery_request_uses_typed_start_and_exact_turn_steer() {
     let steer = codex_delivery_request(
         3,
         "thread-main",
-        "st2:client",
+        "st:client",
         "notice",
         &CodexDeliveryMethod::Steer {
             turn_id: "turn-current".into(),
@@ -1379,7 +1379,10 @@ fn delivery_client_id_is_stable_and_binds_every_identity_component() {
         id,
         stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md")
     );
-    assert!(id.starts_with("st2:"));
+    assert_eq!(
+        id, "st2:a536a0d515eda67a5ffb2d617cd69c945683c384ed0c1f0906de158b690b0971",
+        "native identity survives the label migration"
+    );
     assert_ne!(
         id,
         stable_client_user_message_id("h.other", "thread-main", "1786380000000-abc123.md")
@@ -2650,7 +2653,7 @@ fn control_initializes_before_recording_the_first_thread_only() {
         let mut websocket = tungstenite::accept(stream).unwrap();
         let initialize = read_json_message(&mut websocket).unwrap().unwrap();
         assert_eq!(initialize["method"], "initialize");
-        assert_eq!(initialize["params"]["clientInfo"]["name"], "st2");
+        assert_eq!(initialize["params"]["clientInfo"]["name"], "st");
         write_json_message(
             &mut websocket,
             &json!({ "id": 0, "result": { "userAgent": "fake" } }),
@@ -6786,4 +6789,35 @@ fn an_error_with_no_optional_codex_error_info_reports_an_unclassified_failure() 
         };
         assert_eq!(failure.reason, driver_diagnostic::Reason::TurnUnclassified);
     }
+}
+
+#[test]
+fn adopted_codex_records_keep_their_schema_family() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CodexRuntime::with_incarnation("h.worker".into(), "runtime".into(), "old".into()).unwrap();
+    runtime.schema = "st2.codex-runtime.v1".into();
+    let path = tmp.path().join("runtime.json");
+    atomic_json(&path, &runtime).unwrap();
+    let adopted = load_runtime(&path, "h.worker", "runtime").unwrap();
+    let binding = CodexThreadBinding::new(&adopted, "thread-main".into());
+    let state = CodexControlState::new(&adopted, "thread-main".into());
+    assert_eq!(binding.schema, "st2.codex-thread-binding.v1");
+    assert_eq!(state.schema, "st2.codex-control-state.v1");
+    let binding_path = tmp.path().join("binding.json");
+    atomic_json(&binding_path, &binding).unwrap();
+    assert_eq!(
+        load_current_binding(&binding_path, &adopted).unwrap(),
+        Some(binding)
+    );
+    let fresh =
+        CodexRuntime::with_incarnation("h.worker".into(), "runtime".into(), "new".into()).unwrap();
+    assert_eq!(fresh.schema, "st.codex-runtime.v1");
+    assert_eq!(
+        CodexThreadBinding::new(&fresh, "thread-main".into()).schema,
+        "st.codex-thread-binding.v1"
+    );
+    runtime.schema = "st2.codex-runtime.v2".into();
+    atomic_json(&path, &runtime).unwrap();
+    assert!(load_runtime(&path, "h.worker", "runtime").is_err());
 }

@@ -30,7 +30,7 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("st2"));
+static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("st"));
 
 static RECONCILE_PASSES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER

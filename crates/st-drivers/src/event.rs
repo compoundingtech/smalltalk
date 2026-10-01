@@ -179,7 +179,7 @@ pub(crate) fn publish_owner_binding_under_lock(
 ) -> anyhow::Result<()> {
     let metadata = lock.control().metadata()?;
     let binding = StreamOwnerBinding {
-        schema: "st2.stream-owner.v1".to_owned(),
+        schema: "st.stream-owner.v1".to_owned(),
         logical_host: host.to_owned(),
         catalog_lock_device: metadata.dev(),
         catalog_lock_inode: metadata.ino(),
@@ -233,7 +233,7 @@ fn read_valid_owner_binding(
     )?;
     let metadata = lock.control().metadata()?;
     anyhow::ensure!(
-        binding.schema == "st2.stream-owner.v1"
+        crate::contracts::schema_matches(&binding.schema, "st.stream-owner.v1")
             && binding.logical_host == host
             && binding.catalog_lock_device == metadata.dev()
             && binding.catalog_lock_inode == metadata.ino(),

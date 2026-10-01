@@ -825,7 +825,7 @@
               hash = "sha256-ATysqeRVcLEeqPuz+LnjJ0NpNrNiiAZAtZ+f4qz93sk=";
             };
           in
-          pkgs.runCommand "st2-pi-extension-types-${version}" {
+          pkgs.runCommand "st-pi-extension-types-${version}" {
             nativeBuildInputs = [
               pkgs.gnutar
               pkgs.nodejs
@@ -870,6 +870,7 @@
               --format=esm --platform=node --target=es2022 \
               --outfile=hooks/typecheck/smoke-out/omp-channel.mjs
             ${pkgs.nodejs}/bin/node hooks/typecheck/omp-smoke.mjs
+            ${pkgs.nodejs}/bin/node hooks/typecheck/environment-smoke.mjs
             touch $out
           '';
 

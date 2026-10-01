@@ -134,7 +134,7 @@ pub(super) fn spawn_process_group(
     watchdog_command
         .arg("-c")
         .arg("IFS= read -r ignored; kill -KILL 0")
-        .arg("st2-codex-watchdog")
+        .arg("st-codex-watchdog")
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(watchdog_read)))
         .stdout(Stdio::null())
         .stderr(Stdio::null());

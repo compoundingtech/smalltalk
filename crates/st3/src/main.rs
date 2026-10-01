@@ -12923,8 +12923,12 @@ async fn run_pi_channel(
             stdout.flush().await?;
             PiChannelResume {
                 incarnation,
-                session: std::env::var("ST2_PI_CHANNEL_SESSION")
-                    .unwrap_or_else(|_| "unknown".into()),
+                session: st_drivers::contracts::env(if driver == "omp" {
+                    st_drivers::omp_session::CHANNEL_SESSION
+                } else {
+                    st_drivers::pi_session::CHANNEL_SESSION
+                })
+                .unwrap_or_else(|| "unknown".into()),
                 ..PiChannelResume::default()
             }
         }

@@ -114,4 +114,4 @@ redefine terminal delivery.
 The crash and retry state model, alternative analysis, and benchmark method are recorded in
 [`2026-08-12-sender-history-crash-model.md`](./.experiments/2026-08-12-sender-history-crash-model.md).
 Executable controls live in `tests/message_cli.rs` and the shared schema controls live in
-`crates/st2-wire/src/message.rs`.
+`crates/st-wire/src/message.rs`.

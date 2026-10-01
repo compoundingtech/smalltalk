@@ -389,7 +389,7 @@ fn candidate_overlay_reports_conflict_on_stdout_and_never_publishes() {
     );
     assert_eq!(output.status.code(), Some(1));
     let receipt = json(&output);
-    assert_eq!(receipt["schema"], "st2.validate.v2");
+    assert_eq!(receipt["schema"], "st.validate.v2");
     assert!(
         receipt["issues"]
             .as_array()

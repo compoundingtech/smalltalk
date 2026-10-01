@@ -86,7 +86,8 @@ public enum JSONValue: Codable, Sendable, Equatable {
 public struct Capability: Codable, Sendable { public let id: String; public let version: UInt; public let state: String }
 public struct Limits: Codable, Sendable {
     public let maxPageItems: Int; public let maxEventItems: Int; public let maxResponseBytes: Int; public let maxWaitMS: UInt64
-    enum CodingKeys: String, CodingKey { case maxPageItems = "max_page_items", maxEventItems = "max_event_items", maxResponseBytes = "max_response_bytes", maxWaitMS = "max_wait_ms" }
+    public let maxGlassBodyBytes, maxGlasses, maxGlassDepth, maxGlassNodes: Int?
+    enum CodingKeys: String, CodingKey { case maxGlassBodyBytes = "max_glass_body_bytes", maxGlasses = "max_glasses", maxGlassDepth = "max_glass_depth", maxGlassNodes = "max_glass_nodes", maxPageItems = "max_page_items", maxEventItems = "max_event_items", maxResponseBytes = "max_response_bytes", maxWaitMS = "max_wait_ms" }
 }
 public struct Capabilities: Codable, Sendable {
     public let kind: String; public let sessionActor: String; public let transport: String; public let capabilities: [Capability]; public let limits: Limits; public let eventCursor: String; public let oldestEventCursor: String; public let schemas: [String]
@@ -171,7 +172,7 @@ public struct OperationResource: Codable, Sendable { public let id, kind, revisi
 public struct HistoryResource: Codable, Sendable { public let id, kind, revision, updatedAt, eventType, occurredAt, summary: String; public let storeIndex: UInt64; public let targets: [String]; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", eventType = "event_type", occurredAt = "occurred_at", storeIndex = "store_index", summary, targets, operational } }
 public struct SessionResource: Codable, Sendable { public let id, kind, revision, updatedAt, ownerID, state, startedAt, timelineCursor: String; public let endedAt: String?; public let usage: UsageSummary?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", ownerID = "owner_id", state, startedAt = "started_at", endedAt = "ended_at", timelineCursor = "timeline_cursor", usage, operational } }
 public enum Resource: Codable, Sendable, Identifiable {
-    case attention(AttentionResource), message(MessageResource), launch(LaunchResource), launchVariant(LaunchVariantResource), launchDecision(LaunchDecisionResource), launchApproval(LaunchApprovalResource), mission(MissionResource), work(WorkResource), agent(AgentResource), runtime(RuntimeResource), observer(ObserverResource), subscription(SubscriptionResource), lane(LaneResource), machine(MachineResource), device(DeviceResource), operation(OperationResource), history(HistoryResource), session(SessionResource)
+    case attention(AttentionResource), message(MessageResource), launch(LaunchResource), launchVariant(LaunchVariantResource), launchDecision(LaunchDecisionResource), launchApproval(LaunchApprovalResource), mission(MissionResource), work(WorkResource), agent(AgentResource), runtime(RuntimeResource), observer(ObserverResource), subscription(SubscriptionResource), lane(LaneResource), machine(MachineResource), device(DeviceResource), operation(OperationResource), history(HistoryResource), session(SessionResource), glass(GlassResource)
     private struct Discriminator: Decodable { let kind: String }
     public init(from decoder: Decoder) throws {
         switch try Discriminator(from: decoder).kind {
@@ -193,11 +194,12 @@ public enum Resource: Codable, Sendable, Identifiable {
         case "operation": self = .operation(try OperationResource(from: decoder))
         case "history": self = .history(try HistoryResource(from: decoder))
         case "session": self = .session(try SessionResource(from: decoder))
+        case "glass": self = .glass(try GlassResource(from: decoder))
         default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown Resource kind"))
         }
     }
-    public func encode(to encoder: Encoder) throws { switch self { case .attention(let v): try v.encode(to: encoder); case .message(let v): try v.encode(to: encoder); case .launch(let v): try v.encode(to: encoder); case .launchVariant(let v): try v.encode(to: encoder); case .launchDecision(let v): try v.encode(to: encoder); case .launchApproval(let v): try v.encode(to: encoder); case .mission(let v): try v.encode(to: encoder); case .work(let v): try v.encode(to: encoder); case .agent(let v): try v.encode(to: encoder); case .runtime(let v): try v.encode(to: encoder); case .observer(let v): try v.encode(to: encoder); case .subscription(let v): try v.encode(to: encoder); case .lane(let v): try v.encode(to: encoder); case .machine(let v): try v.encode(to: encoder); case .device(let v): try v.encode(to: encoder); case .operation(let v): try v.encode(to: encoder); case .history(let v): try v.encode(to: encoder); case .session(let v): try v.encode(to: encoder) } }
-    public var id: String { switch self { case .attention(let v): v.id; case .message(let v): v.id; case .launch(let v): v.id; case .launchVariant(let v): v.id; case .launchDecision(let v): v.id; case .launchApproval(let v): v.id; case .mission(let v): v.id; case .work(let v): v.id; case .agent(let v): v.id; case .runtime(let v): v.id; case .observer(let v): v.id; case .subscription(let v): v.id; case .lane(let v): v.id; case .machine(let v): v.id; case .device(let v): v.id; case .operation(let v): v.id; case .history(let v): v.id; case .session(let v): v.id } }
+    public func encode(to encoder: Encoder) throws { switch self { case .attention(let v): try v.encode(to: encoder); case .message(let v): try v.encode(to: encoder); case .launch(let v): try v.encode(to: encoder); case .launchVariant(let v): try v.encode(to: encoder); case .launchDecision(let v): try v.encode(to: encoder); case .launchApproval(let v): try v.encode(to: encoder); case .mission(let v): try v.encode(to: encoder); case .work(let v): try v.encode(to: encoder); case .agent(let v): try v.encode(to: encoder); case .runtime(let v): try v.encode(to: encoder); case .observer(let v): try v.encode(to: encoder); case .subscription(let v): try v.encode(to: encoder); case .lane(let v): try v.encode(to: encoder); case .machine(let v): try v.encode(to: encoder); case .device(let v): try v.encode(to: encoder); case .operation(let v): try v.encode(to: encoder); case .history(let v): try v.encode(to: encoder); case .session(let v): try v.encode(to: encoder); case .glass(let v): try v.encode(to: encoder) } }
+    public var id: String { switch self { case .attention(let v): v.id; case .message(let v): v.id; case .launch(let v): v.id; case .launchVariant(let v): v.id; case .launchDecision(let v): v.id; case .launchApproval(let v): v.id; case .mission(let v): v.id; case .work(let v): v.id; case .agent(let v): v.id; case .runtime(let v): v.id; case .observer(let v): v.id; case .subscription(let v): v.id; case .lane(let v): v.id; case .machine(let v): v.id; case .device(let v): v.id; case .operation(let v): v.id; case .history(let v): v.id; case .session(let v): v.id; case .glass(let v): v.id } }
 }
 public struct ResourcePage: Codable, Sendable { public let kind: String; public let collection: String; public let filters: [String: String]; public let items: [Resource]; public let page: PageInfo; public let sync: SyncNotice? }
 public struct SyncNotice: Codable, Sendable { public let state: String; public let peers: [SyncPeer] }
@@ -349,3 +351,55 @@ public enum TerminalColor: Codable, Sendable, Equatable {
 public struct TerminalCursor: Codable, Sendable { public let row: Int; public let column: Int; public let visible: Bool; public let style: String; public let blinking: Bool }
 public struct TerminalModes: Codable, Sendable { public let alternateScreen: Bool; public let applicationCursor: Bool; public let applicationKeypad: Bool; public let bracketedPaste: Bool; public let focusEvents: Bool; public let mouseTracking: String; public let mouseEncoding: String; enum CodingKeys: String, CodingKey { case alternateScreen = "alternate_screen", applicationCursor = "application_cursor", applicationKeypad = "application_keypad", bracketedPaste = "bracketed_paste", focusEvents = "focus_events", mouseTracking = "mouse_tracking", mouseEncoding = "mouse_encoding" } }
 public struct TerminalScreen: Codable, Sendable { public let kind: String; public let terminalID: String; public let runtimeIncarnation: String; public let revision: String; public let rows: Int; public let columns: Int; public let cursor: TerminalCursor; public let title: String; public let modes: TerminalModes; public let lines: [TerminalLine]; public let nextSequence: UInt64; public let truncated: Bool; enum CodingKeys: String, CodingKey { case kind, terminalID = "terminal_id", runtimeIncarnation = "runtime_incarnation", revision, rows, columns, cursor, title, modes, lines, nextSequence = "next_sequence", truncated } }
+
+public enum GlassSplit: String, Codable, Sendable { case right, below }
+public indirect enum GlassLayout: Codable, Sendable {
+    case pane(String), split(GlassSplit, [GlassLayout])
+    enum CodingKeys: String, CodingKey { case pane, split, children }
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        if let pane = try box.decodeIfPresent(String.self, forKey: .pane) { self = .pane(pane) }
+        else { let children = try box.decode([GlassLayout].self, forKey: .children); guard children.count == 2 else { throw DecodingError.dataCorruptedError(forKey: .children, in: box, debugDescription: "A split needs two children") }; self = .split(try box.decode(GlassSplit.self, forKey: .split), children) }
+    }
+    public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); switch self { case .pane(let pane): try box.encode(pane, forKey: .pane); case .split(let split, let children): guard children.count == 2 else { throw EncodingError.invalidValue(children, .init(codingPath: encoder.codingPath, debugDescription: "A split needs two children")) }; try box.encode(split, forKey: .split); try box.encode(children, forKey: .children) } }
+}
+public struct GlassTab: Codable, Sendable { public var title: String?; public var layout: GlassLayout; public init(title: String? = nil, layout: GlassLayout) { self.title = title; self.layout = layout } }
+public struct GlassBody: Codable, Sendable { public var name: String; public var tabs: [GlassTab]; public init(name: String, tabs: [GlassTab]) { self.name = name; self.tabs = tabs } }
+public struct GlassResource: Codable, Sendable, Identifiable {
+    public let id: String
+    public let kind: String
+    public let revision: String
+    public let updatedAt: String
+    public let body: GlassBody?
+    public let deleted: Bool
+    public let baseRevision: String?
+    public let replacedRevision: String?
+    enum CodingKeys: String, CodingKey { case id, kind, revision, body, deleted, updatedAt = "updated_at", baseRevision = "base_revision", replacedRevision = "replaced_revision" }
+}
+public typealias Glass = GlassResource
+public struct GlassPut: Codable, Sendable {
+    public let body: GlassBody
+    public let baseRevision: String?
+    public init(body: GlassBody, baseRevision: String?) { self.body = body; self.baseRevision = baseRevision }
+    enum CodingKeys: String, CodingKey { case body, baseRevision = "base_revision" }
+    public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); try box.encode(body, forKey: .body); try box.encode(baseRevision, forKey: .baseRevision) }
+}
+public struct GlassDelete: Codable, Sendable {
+    public let baseRevision: String?
+    public init(baseRevision: String?) { self.baseRevision = baseRevision }
+    enum CodingKeys: String, CodingKey { case baseRevision = "base_revision" }
+    public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); try box.encode(baseRevision, forKey: .baseRevision) }
+}
+public struct GlassCollectionFrame: Codable, Sendable {
+    public let kind: String
+    public let id: String?
+    public let snapshot: Snapshot?
+    public let items: [Glass]?
+    public let upserts: [Glass]?
+    public let removes: [String]?
+    public let order: [String]?
+    public let hasMore: Bool?
+    public let code: String?
+    public let message: String?
+    enum CodingKeys: String, CodingKey { case kind, id, snapshot, items, upserts, removes, order, code, message, hasMore = "has_more" }
+}

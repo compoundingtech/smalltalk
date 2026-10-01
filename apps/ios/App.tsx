@@ -21,6 +21,7 @@ import { FleetScreen, PairScreen } from './screens/Fleet';
 import { AttentionScreen, HomeScreen } from './screens/Home';
 import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from './screens/Missions';
 import { TerminalScreen } from './screens/Terminal';
+import { GlassesScreen, GlassTabScreen } from './screens/Glasses';
 
 // The chrome is native: one UITabBarController (react-native-screens' tabs, through
 // @react-navigation/bottom-tabs' native navigator) holding a UINavigationController per tab
@@ -48,10 +49,12 @@ const stackOptions: NativeStackNavigationOptions = {
   headerBackButtonDisplayMode: 'default',
 };
 
-function TabStack({ tab }: { tab: Tab }) {
-  const root = ROOTS[tab] as keyof typeof ROOT_SCREENS;
+function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
   return <Stack.Navigator screenOptions={stackOptions}>
-    <Stack.Screen name={root} component={ROOT_SCREENS[root]} options={{ title: tab }} />
+    {tab === 'Glasses'
+      ? <Stack.Screen name="GlassesRoot" component={GlassesScreen} options={{ title: 'Glasses' }} />
+      : <Stack.Screen name={ROOTS[tab] as keyof typeof ROOT_SCREENS} component={ROOT_SCREENS[ROOTS[tab] as keyof typeof ROOT_SCREENS]} options={{ title: tab }} />}
+    <Stack.Screen name="GlassTab" component={GlassTabScreen} options={{ title: 'Tab' }} />
     <Stack.Screen name="Conversation" component={ConversationScreen} options={{ title: 'Conversation' }} />
     <Stack.Screen name="Terminal" component={TerminalScreen} options={{ title: 'Terminal', contentStyle: { backgroundColor: theme.crust } }} />
     <Stack.Screen name="Mission" component={MissionScreen} options={{ title: 'Mission' }} />
@@ -67,6 +70,7 @@ const TAB_COMPONENTS: Record<Tab, () => React.JSX.Element> = {
   Missions: () => <TabStack tab="Missions" />,
   Fleet: () => <TabStack tab="Fleet" />,
 };
+const GlassesTab = () => <TabStack tab="Glasses" />;
 
 function tabBarHidden(route: RouteProp<TabParams>): boolean {
   const focused = getFocusedRouteNameFromRoute(route) as keyof StackParams | undefined;
@@ -74,7 +78,7 @@ function tabBarHidden(route: RouteProp<TabParams>): boolean {
 }
 
 function Main() {
-  const { credential, url, order, data, caps, actions, setTreeView, requestScroll } = useStore();
+  const { credential, url, order, data, caps, actions, setTreeView, requestScroll, glassesOn } = useStore();
   const homeCount = homeRows(data.attention, caps?.session_actor).length;
   const paired = !!url && !!credential;
 
@@ -118,7 +122,7 @@ function Main() {
     screenOptions={({ route }) => ({
       headerShown: false,
       tabBarActiveTintColor: theme.accent,
-      tabBarIcon: { type: 'sfSymbol', name: ICONS[route.name as Tab] as never },
+      tabBarIcon: { type: 'sfSymbol', name: (route.name === 'Glasses' ? 'rectangle.split.2x1' : ICONS[route.name as Tab]) as never },
       tabBarStyle: { display: tabBarHidden(route) ? 'none' : 'flex' },
     })}
   >
@@ -128,6 +132,7 @@ function Main() {
       component={TAB_COMPONENTS[tab]}
       options={tab === 'Home' && homeCount ? { tabBarBadge: homeCount, tabBarBadgeStyle: { backgroundColor: theme.person, color: theme.crust } } : {}}
     />)}
+    {glassesOn ? <Tabs.Screen name="Glasses" component={GlassesTab} /> : null}
   </Tabs.Navigator>;
 }
 

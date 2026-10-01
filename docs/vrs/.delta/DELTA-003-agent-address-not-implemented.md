@@ -51,7 +51,7 @@ and canonical typed address instead of pretending that address is an agent ID.
 That is a new durable record version for `SentRecord`, which rejects unknown
 fields (`src/message.rs`). It is not one for harness-state or harness-context,
 whose readers ignore unknown fields by policy
-(`crates/st2-wire/src/lib.rs`) — the premise that strict version-1 readers reject
+(`crates/st-wire/src/lib.rs`) — the premise that strict version-1 readers reject
 additive fields was wrong for every record but the sender ledger, and each
 version-2 reader belongs in the pull request that adds the writer emitting it.
 

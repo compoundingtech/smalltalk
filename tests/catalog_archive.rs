@@ -108,7 +108,7 @@ fn archive_moves_a_retired_seat_out_of_discovery_with_its_resources_byte_identic
         String::from_utf8_lossy(&output.stderr)
     );
     let receipt = json(&output);
-    assert_eq!(receipt["schema"], "st2.catalog-archive.v1");
+    assert_eq!(receipt["schema"], "st.catalog-archive.v1");
     assert_eq!(receipt["dryRun"], false);
     assert_eq!(receipt["archiveRoot"], ".st2/archive");
     let archived = receipt["archived"].as_array().unwrap();
@@ -140,7 +140,7 @@ fn archive_moves_a_retired_seat_out_of_discovery_with_its_resources_byte_identic
     let tombstone: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join(".st2/archive/h/gone.tombstone.json")).unwrap())
             .unwrap();
-    assert_eq!(tombstone["schema"], "st2.catalog-archive-tombstone.v1");
+    assert_eq!(tombstone["schema"], "st.catalog-archive-tombstone.v1");
     assert_eq!(tombstone["id"], "h.gone");
     assert_eq!(tombstone["archiveRoot"], ".st2/archive/h/gone");
 
@@ -487,7 +487,7 @@ fn unarchive_restores_the_identity_byte_identically_and_clears_its_tombstone() {
         String::from_utf8_lossy(&restored.stderr)
     );
     let receipt = json(&restored);
-    assert_eq!(receipt["schema"], "st2.catalog-unarchive.v1");
+    assert_eq!(receipt["schema"], "st.catalog-unarchive.v1");
     assert_eq!(receipt["id"], "h.gone");
     assert_eq!(receipt["to"], "agents/h/gone");
 
