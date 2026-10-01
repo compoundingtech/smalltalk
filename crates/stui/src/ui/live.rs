@@ -1029,7 +1029,7 @@ mod tests {
              "body":{"media_type":"text/plain","text":"How is the audit going?"}},
             {"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
              "body":{"code":"transcript-not-bound","message":"transcript not bound: the transcript could not be read: line 12: expected value","retryable":true,
-                     "details":{"driver":"omp","transcript":"/home/avery/.omp/agent/sessions/harbor/0190.jsonl"}}},
+                     "details":{"driver":"omp","transcript":"/srv/example/omp/sessions/harbor/0190.jsonl"}}},
         ]))
         .unwrap();
         let target = "agent/example/harbor/keeper";

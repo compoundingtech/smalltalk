@@ -931,7 +931,9 @@ pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
         .unwrap_or(&error.message);
     Some(
         match error.details.get("transcript").and_then(Value::as_str) {
-            Some(path) => format!("This conversation could not be loaded: {reason} (transcript {path})"),
+            Some(path) => {
+                format!("This conversation could not be loaded: {reason} (transcript {path})")
+            }
             None => format!("This conversation could not be loaded: {reason}"),
         },
     )
@@ -1931,18 +1933,29 @@ mod tests {
             rows.extend(notice);
             serde_json::from_value(Value::Array(rows)).unwrap()
         };
-        assert_eq!(unreadable_transcript(&entries(None)), None, "a whole conversation shows");
+        assert_eq!(
+            unreadable_transcript(&entries(None)),
+            None,
+            "a whole conversation shows"
+        );
         let notice = |details: Value| {
             json!({"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
                 "body":{"code":"transcript-not-bound","message":"transcript not bound: the transcript could not be read: line 12: expected value","retryable":true,"details":details}})
         };
         assert_eq!(
-            unreadable_transcript(&entries(Some(notice(json!({"driver":"omp","transcript":"/home/avery/.omp/agent/sessions/harbor/0190.jsonl"}))))).as_deref(),
-            Some("This conversation could not be loaded: the transcript could not be read: line 12: expected value (transcript /home/avery/.omp/agent/sessions/harbor/0190.jsonl)")
+            unreadable_transcript(&entries(Some(notice(
+                json!({"driver":"omp","transcript":"/srv/example/omp/sessions/harbor/0190.jsonl"})
+            ))))
+            .as_deref(),
+            Some(
+                "This conversation could not be loaded: the transcript could not be read: line 12: expected value (transcript /srv/example/omp/sessions/harbor/0190.jsonl)"
+            )
         );
         assert_eq!(
             unreadable_transcript(&entries(Some(notice(json!({"driver":"omp"}))))).as_deref(),
-            Some("This conversation could not be loaded: the transcript could not be read: line 12: expected value")
+            Some(
+                "This conversation could not be loaded: the transcript could not be read: line 12: expected value"
+            )
         );
     }
 

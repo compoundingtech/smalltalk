@@ -72,7 +72,7 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 0);
   const notice = details => ({ id: 'n', role: 'system', timestamp: '2026-10-01T10:00:01Z', type: 'error', body: { code: 'transcript-not-bound', message: 'transcript not bound: the transcript could not be read: line 12: expected value', retryable: true, details } });
   const mail = { id: 'm', role: 'user', timestamp: '2026-10-01T10:00:00Z', type: 'content', body: { media_type: 'text/plain', text: 'How is the audit going?' } };
   assert.equal(unreadableTranscript([mail]), null);
-  assert.equal(unreadableTranscript([mail, notice({ driver: 'omp', transcript: '/home/avery/.omp/agent/sessions/harbor/0190.jsonl' })]), 'This conversation could not be loaded: the transcript could not be read: line 12: expected value (transcript /home/avery/.omp/agent/sessions/harbor/0190.jsonl)');
+  assert.equal(unreadableTranscript([mail, notice({ driver: 'omp', transcript: '/srv/example/omp/sessions/harbor/0190.jsonl' })]), 'This conversation could not be loaded: the transcript could not be read: line 12: expected value (transcript /srv/example/omp/sessions/harbor/0190.jsonl)');
   assert.equal(unreadableTranscript([mail, notice({ driver: 'omp' })]), 'This conversation could not be loaded: the transcript could not be read: line 12: expected value');
 }
 
