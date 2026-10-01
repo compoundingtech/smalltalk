@@ -420,6 +420,53 @@ fn cell_style(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> Style {
     style
 }
 
+/// What a terminal reports to a program that asked for the mouse, for `mouse` at a cell of its
+/// screen (zero-based). `None` when the program did not ask, or for what it did not ask for.
+pub(crate) fn mouse_bytes(
+    mouse: crossterm::event::MouseEvent,
+    column: u16,
+    row: u16,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    if !mode.intersects(TermMode::MOUSE_MODE) {
+        return None;
+    }
+    let button = |button: MouseButton| match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    let (code, release) = match mouse.kind {
+        MouseEventKind::Down(which) => (button(which), false),
+        MouseEventKind::Up(which) => (button(which), true),
+        MouseEventKind::Drag(which)
+            if mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) =>
+        {
+            (button(which) + 32, false)
+        }
+        _ => return None,
+    };
+    let modifiers = u8::from(mouse.modifiers.contains(KeyModifiers::SHIFT)) * 4
+        + u8::from(mouse.modifiers.contains(KeyModifiers::ALT)) * 8
+        + u8::from(mouse.modifiers.contains(KeyModifiers::CONTROL)) * 16;
+    let code = code + modifiers;
+    Some(if mode.contains(TermMode::SGR_MOUSE) {
+        format!(
+            "\x1b[<{code};{};{}{}",
+            column + 1,
+            row + 1,
+            if release { 'm' } else { 'M' }
+        )
+        .into_bytes()
+    } else {
+        // The old encoding: a release is button 3, and a cell past 223 cannot be said.
+        let code = if release { 3 + modifiers } else { code };
+        let cell = |value: u16| u8::try_from(value + 33).unwrap_or(255);
+        vec![0x1b, b'[', b'M', 32 + code, cell(column), cell(row)]
+    })
+}
+
 /// The bytes a terminal sends for `key`, following the program's cursor-key mode.
 pub(crate) fn key_bytes(key: KeyEvent, mode: TermMode) -> Option<Vec<u8>> {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -515,6 +562,33 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn clicks_reach_a_program_that_asked_for_the_mouse_and_no_other() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let event = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let down = event(MouseEventKind::Down(MouseButton::Left));
+        let up = event(MouseEventKind::Up(MouseButton::Left));
+        assert_eq!(mouse_bytes(down, 4, 2, TermMode::empty()), None);
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(mouse_bytes(down, 4, 2, sgr).unwrap(), b"\x1b[<0;5;3M");
+        assert_eq!(mouse_bytes(up, 4, 2, sgr).unwrap(), b"\x1b[<0;5;3m");
+        let drag = event(MouseEventKind::Drag(MouseButton::Left));
+        assert_eq!(mouse_bytes(drag, 4, 2, sgr), None, "clicks only");
+        assert_eq!(
+            mouse_bytes(drag, 4, 2, sgr | TermMode::MOUSE_DRAG).unwrap(),
+            b"\x1b[<32;5;3M"
+        );
+        assert_eq!(
+            mouse_bytes(down, 4, 2, TermMode::MOUSE_REPORT_CLICK).unwrap(),
+            [0x1b, b'[', b'M', 32, 37, 35]
+        );
     }
 
     #[test]

@@ -128,6 +128,8 @@ enum Fetched {
     Sent(String, Result<Option<String>, (String, bool)>),
     /// st started an agent asked for here.
     AgentStarted(String),
+    /// st started a shell asked for here.
+    TerminalStarted(String),
     /// A direct stream to an agent's PTY session, named by its runtime.
     Native {
         agent: String,
@@ -444,6 +446,7 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Devices(devices) => model.devices = devices,
                 Fetched::GlassSaved { id, key, outcome } => ui.glass_saved(&id, &key, outcome),
                 Fetched::AgentStarted(id) => ui.agent_started(id),
+                Fetched::TerminalStarted(id) => ui.terminal_started(id),
                 Fetched::Native {
                     agent,
                     name,
@@ -466,7 +469,13 @@ pub fn run(context: Context) -> Result<()> {
                     runtime_ids,
                     reason,
                 } => {
-                    if ui.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+                    if agent.starts_with("terminal/") {
+                        // A shell has no other view to fall back to.
+                        if let Some(view) = ui.terminal.as_mut().filter(|view| view.agent == agent)
+                        {
+                            view.ended = Some(format!("could not attach: {reason}"));
+                        }
+                    } else if ui.terminal.as_ref().is_some_and(|view| view.agent == agent) {
                         ui.flash(format!(
                             "No direct terminal ({reason}); showing st's view of it"
                         ));
@@ -648,9 +657,13 @@ pub fn run(context: Context) -> Result<()> {
                     let runtime_ids = found
                         .map(|candidate| candidate.runtime_ids.clone())
                         .unwrap_or_default();
-                    let name = found
-                        .map(crate::agent_label)
-                        .unwrap_or_else(|| agent.clone());
+                    let name = found.map(crate::agent_label).unwrap_or_else(|| {
+                        if agent.starts_with("terminal/") {
+                            "shell".into()
+                        } else {
+                            agent.clone()
+                        }
+                    });
                     attached = None;
                     terminal_runtimes = Some(runtime_ids.clone());
                     let _ = commands.send(Command::Unfollow);
@@ -659,7 +672,12 @@ pub fn run(context: Context) -> Result<()> {
                         let tx = fetched_tx.clone();
                         let agent = agent.clone();
                         runtime.spawn(async move {
-                            let _ = tx.send(match raw_attach(&client, &runtime_ids).await {
+                            let attached = if agent.starts_with("terminal/") {
+                                raw_attach_terminal(&client, &agent).await
+                            } else {
+                                raw_attach(&client, &runtime_ids).await
+                            };
+                            let _ = tx.send(match attached {
                                 Ok((name, stream)) => Fetched::Native {
                                     agent,
                                     name,
@@ -765,6 +783,7 @@ pub fn run(context: Context) -> Result<()> {
                 other => (other, None, None),
             };
             let started = matches!(effect, Effect::CreateAgent { .. });
+            let shell = matches!(effect, Effect::CreateTerminal { .. });
             let client = client.clone();
             let tx = fetched_tx.clone();
             let person = person.clone();
@@ -786,6 +805,9 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 if started && let Ok((_, Some(agent))) = &outcome {
                     let _ = tx.send(Fetched::AgentStarted(agent.clone()));
+                }
+                if shell && let Ok((_, Some(terminal))) = &outcome {
+                    let _ = tx.send(Fetched::TerminalStarted(terminal.clone()));
                 }
                 let _ = tx.send(Fetched::Notice(match outcome {
                     Ok((notice, _)) => notice,
@@ -1044,6 +1066,31 @@ async fn perform(
             )
             .await?;
             Ok(("Stopped its turn".into(), None))
+        }
+        Effect::CreateTerminal { name } => {
+            let snapshot = client.capabilities().await?.snapshot.id;
+            let (id, idem) = crate::action_pair();
+            let result = client
+                .terminal_create(
+                    id,
+                    idem,
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    st3_client::TerminalCreateParameters {
+                        name: name.clone(),
+                        host: None,
+                        cwd: None,
+                    },
+                )
+                .await?;
+            let terminal = result
+                .value
+                .affected_ids
+                .into_iter()
+                .find(|id| id.starts_with("terminal/"));
+            Ok((format!("Started shell {name}"), terminal))
         }
         Effect::CreateAgent {
             name,
@@ -1661,4 +1708,40 @@ async fn raw_attach(
         }
     }
     Err(reason)
+}
+
+/// A direct stream to a plain shell's PTY session, fenced to its current incarnation.
+async fn raw_attach_terminal(
+    client: &Client,
+    terminal: &str,
+) -> Result<(String, std::os::unix::net::UnixStream), String> {
+    // A shell just started may take a moment before its screen exists.
+    let mut tries = 0;
+    let screen = loop {
+        match client.terminal_screen(terminal).await {
+            Ok(screen) => break screen,
+            Err(_) if tries < 10 => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    let attachment = client
+        .raw_terminal_attachment(
+            terminal,
+            &screen.value.runtime_incarnation,
+            st3_client::RawTerminalMode::Attach,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let stream = client
+        .raw_terminal_stream(&attachment)
+        .await
+        .map_err(|error| error.to_string())?;
+    let name = terminal.trim_start_matches("terminal/").replace('/', ".");
+    stream
+        .into_std()
+        .map(|stream| (name, stream))
+        .map_err(|error| error.to_string())
 }

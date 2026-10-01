@@ -151,6 +151,10 @@ pub enum Effect {
         agent: String,
     },
     /// Start a new agent; its first message is what the person asked of it.
+    /// Start a plain shell for the person; it opens in a new tab.
+    CreateTerminal {
+        name: String,
+    },
     CreateAgent {
         name: String,
         harness: String,
@@ -282,6 +286,8 @@ pub struct Ui {
     anchors: RefCell<HashMap<String, Anchor>>,
     /// The rows and columns the terminal pane last had, to attach at.
     pub(crate) terminal_size: Cell<(u16, u16)>,
+    /// Where the attached terminal's screen was last drawn, for its mouse.
+    terminal_body: Cell<Option<Rect>>,
     /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
     pub(crate) picker: Option<ratatui_image::picker::Picker>,
     /// Each attachment's thumbnail, encoded once so a redraw never sends the image again.
@@ -348,6 +354,7 @@ impl Ui {
             attachments: HashMap::new(),
             cursor: edit::Cursor::default(),
             terminal_size: Cell::new((24, 80)),
+            terminal_body: Cell::new(None),
             anchors: RefCell::new(HashMap::new()),
             picker: None,
             thumbnails: RefCell::new(HashMap::new()),
@@ -949,7 +956,7 @@ impl Ui {
         let hints: Vec<(&str, &str)> = if self.terminal_focused() {
             vec![
                 ("ctrl+\\", "return"),
-                ("keys", "go to the agent"),
+                ("keys", "go to the terminal"),
                 ("ctrl-c twice", "interrupt"),
             ]
         } else if self.new_mission.is_some() && self.tab == 2 {
@@ -2001,6 +2008,7 @@ impl Ui {
             };
             self.terminal_size
                 .set((body.height.max(1), body.width.max(1)));
+            self.terminal_body.set(Some(body));
             native.fit(body.height, body.width);
             native.draw(buf, body);
             return;
@@ -2358,8 +2366,11 @@ impl Ui {
             match key.code {
                 // Terminals send Ctrl+\\ as 0x1c, which crossterm reports as Ctrl+4.
                 KeyCode::Char('\\' | '4') if control => {
-                    // In glasses the tab turns back into the agent's conversation.
-                    if let Some(Pane::Terminal(agent)) = self.focused_pane() {
+                    // In glasses an agent's tab turns back into its conversation; a shell's tab
+                    // stays a shell, detached.
+                    if let Some(Pane::Terminal(agent)) = self.focused_pane()
+                        && agent.starts_with("agent/")
+                    {
                         self.swap_focused_pane(Pane::Agent(Some(agent)));
                         self.terminal = None;
                     }
@@ -2813,7 +2824,24 @@ impl Ui {
     }
 
     fn open_terminal(&mut self) {
-        let Some(agent) = self.selected_id().and_then(|id| {
+        // A plain shell's tab attaches itself; it has no agent to look up.
+        if let Some(Pane::Terminal(id)) = self.focused_pane()
+            && id.starts_with("terminal/")
+        {
+            self.attach_terminal(&id);
+            return;
+        }
+        // In glasses it is the focused pane's own agent, never the list's selection, which can
+        // be another agent's.
+        let subject = if self.glasses.is_some() {
+            match self.focused_pane() {
+                Some(Pane::Agent(Some(id)) | Pane::Terminal(id)) => Some(id),
+                _ => None,
+            }
+        } else {
+            self.selected_id()
+        };
+        let Some(agent) = subject.and_then(|id| {
             self.world
                 .agents
                 .items()
@@ -2844,6 +2872,27 @@ impl Ui {
 
     /// Attach `agent`'s terminal: followed live, or the demo's in demo mode.
     pub(crate) fn attach_terminal(&mut self, agent: &str) {
+        // A plain shell is a terminal of its own, not an agent's.
+        if agent.starts_with("terminal/") {
+            if self.live {
+                self.effects.push(Effect::OpenTerminal {
+                    agent: agent.to_owned(),
+                });
+                self.flash("Opening the terminal…");
+            } else {
+                self.terminal = Some(TerminalView {
+                    agent: agent.to_owned(),
+                    title: "shell · demo terminal".into(),
+                    name: "shell".into(),
+                    lines: demo::terminal("shell"),
+                    cursor: None,
+                    stale: None,
+                    ended: None,
+                    native: None,
+                });
+            }
+            return;
+        }
         let Some(agent) = self
             .world
             .agents
@@ -2986,6 +3035,26 @@ impl Ui {
     }
 
     /// st started the agent asked for here: its conversation replaces the form.
+    /// Start a plain shell for the person, opened in a new tab once st has it.
+    pub(crate) fn open_new_terminal(&mut self) {
+        if self.live {
+            self.effects.push(Effect::CreateTerminal {
+                name: screens::random_name(),
+            });
+            self.flash("Starting a shell…");
+        } else {
+            self.terminal_started("terminal/pty/person/demo/shell".into());
+        }
+    }
+
+    /// st started a shell asked for here: it opens in a new tab, attached.
+    pub(crate) fn terminal_started(&mut self, id: String) {
+        if self.glasses.is_some() {
+            self.open_in_glass(Pane::Terminal(id.clone()), glass::Open::Tab);
+        }
+        self.attach_terminal(&id);
+    }
+
     pub(crate) fn agent_started(&mut self, id: String) {
         self.new_agent = None;
         self.agent_form = false;
@@ -3440,6 +3509,21 @@ impl Ui {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.help = false;
             }
+            return;
+        }
+        // A program in the focused terminal that asked for the mouse gets its clicks there.
+        if self.terminal_focused()
+            && let Some(native) = self.native_terminal()
+            && let Some(body) = self.terminal_body.get()
+            && contains(body, mouse.column, mouse.row)
+            && let Some(bytes) = pty::mouse_bytes(
+                mouse,
+                mouse.column - body.x,
+                mouse.row - body.y,
+                native.mode(),
+            )
+        {
+            native.write(bytes);
             return;
         }
         match mouse.kind {

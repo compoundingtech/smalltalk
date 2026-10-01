@@ -23,8 +23,10 @@ const SECTIONS: [&str; 6] = [
     "start",
 ];
 const GLASSES: usize = 4;
-/// Where each section ranks while a query is typed: agents, missions, then the rest in order.
-const RANK: [usize; 6] = [2, 0, 1, 3, 4, 5];
+/// Where each section ranks while a query is typed: agents, missions, what needs you, then
+/// starting things (so "new terminal" finds New terminal before a glass named after it), the
+/// fleet, and glasses.
+const RANK: [usize; 6] = [2, 0, 1, 4, 5, 3];
 const START: usize = 5;
 
 /// Every glass this window knows, and the one it shows.
@@ -388,6 +390,8 @@ enum Action {
     NewAgent(Option<String>),
     /// Home, over the glass.
     Home,
+    /// A plain shell in a new tab.
+    NewTerminal,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
 }
@@ -554,6 +558,12 @@ impl Ui {
             "new agent start".into(),
             Action::NewAgent(None),
         ));
+        choices.push(start(
+            "New terminal".into(),
+            "a shell in a new tab",
+            "new terminal shell".into(),
+            Action::NewTerminal,
+        ));
         if !name.is_empty() {
             choices.push(start(
                 format!("Start an agent: “{name}”"),
@@ -701,7 +711,12 @@ impl Ui {
             .collect::<Vec<_>>();
         // While something is typed, a matching agent ranks first, then missions, then the rest.
         if !palette.query.is_empty() {
-            scored.sort_by_key(|(choice, score)| (RANK[choice.section], -score));
+            // Starting an agent from whatever was typed matches anything, so it comes last:
+            // "close glass" closes the glass rather than starting an agent named that.
+            scored.sort_by_key(|(choice, score)| {
+                let catch_all = matches!(choice.action, Action::NewAgent(Some(_)));
+                (catch_all, RANK[choice.section], -score)
+            });
         }
         scored.into_iter().map(|(choice, _)| choice).collect()
     }
@@ -962,6 +977,7 @@ impl Ui {
     /// A pane whose subject st no longer lists. Unknown while its list is still loading.
     fn subject_gone(&self, pane: &Pane) -> bool {
         match pane {
+            Pane::Terminal(id) if id.starts_with("terminal/") => false,
             Pane::Agent(Some(id)) | Pane::Terminal(id) => self
                 .world
                 .agents
@@ -1222,6 +1238,7 @@ impl Ui {
     fn pane_title(&self, pane: &Pane) -> String {
         let find = |id: &Option<String>| id.clone().unwrap_or_default();
         match pane {
+            Pane::Terminal(id) if id.starts_with("terminal/") => "shell".into(),
             Pane::Agent(Some(id)) | Pane::Terminal(id) => self
                 .world
                 .agents
@@ -1695,6 +1712,7 @@ impl Ui {
             Action::Open(pane) => self.open_in_glass(pane, how),
             Action::ShowGlass(index) => self.show_glass(index),
             Action::NewAgent(task) => self.open_new_agent(task),
+            Action::NewTerminal => self.open_new_terminal(),
             Action::Home => self.open_home(),
             Action::Name(naming) => {
                 let query = match naming {
@@ -2711,6 +2729,35 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_opens_in_a_tab_detaches_in_place_and_attaches_itself_not_the_selected_agent() {
+        let mut ui = glass();
+        // The agents list has a selection of its own, which a shell's keys must never reach.
+        ui.tab = 1;
+        ui.selected[1] = 2;
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "new terminal");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        let shell = "terminal/pty/person/demo/shell";
+        assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+        assert_eq!(
+            ui.terminal.as_ref().map(|view| view.agent.as_str()),
+            Some(shell)
+        );
+        assert!(screen(&ui).contains("shell"));
+        // Ctrl+\ leaves it a shell tab, detached.
+        ctrl(&mut ui, '\\');
+        ui.terminal = None;
+        assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+        // Ctrl+] attaches this shell again, not whichever agent the list has selected.
+        ctrl(&mut ui, ']');
+        assert_eq!(
+            ui.terminal.as_ref().map(|view| view.agent.as_str()),
+            Some(shell)
+        );
+        assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
     fn a_draft_edits_at_its_cursor_with_the_shell_keys() {
         let mut ui = glass();
         ui.open_in_glass(
@@ -3575,6 +3622,24 @@ mod tests {
             matches!(&sent[..], [GlassWrite::Delete { id, base, .. }] if id == "0190-b" && base.as_deref() == Some("r2")),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that() {
+        let mut ui = glass();
+        let glasses = ui.glasses.as_mut().unwrap();
+        glasses.all.push(Glass::new("new terminal".into()));
+        let first = |ui: &mut Ui, query: &str| {
+            ui.open_palette(None, Open::Here);
+            typed(ui, query);
+            let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
+            let top = ui.matches(palette)[0].action.clone();
+            press(ui, KeyCode::Esc, KeyModifiers::NONE);
+            top
+        };
+        assert_eq!(first(&mut ui, "new terminal"), Action::NewTerminal);
+        assert_eq!(first(&mut ui, "close glass"), Action::CloseGlass);
+        assert_eq!(first(&mut ui, "shell"), Action::NewTerminal);
     }
 
     #[test]

@@ -342,7 +342,7 @@ fn report(text: &str, width: usize) -> Option<Vec<Line<'static>>> {
         .max()
         .unwrap_or(0)
         .min(14);
-    let mut row = |key: &str, value: &serde_json::Value, style: Style| {
+    let row = |key: &str, value: &serde_json::Value, style: Style| {
         let value = text::truncate(&shown(value), width.saturating_sub(key_width + 2));
         Line::from(vec![
             span(format!("{key:<key_width$}  "), theme::dim()),
