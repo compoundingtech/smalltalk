@@ -3244,7 +3244,7 @@ async fn run_cli(cli: Cli) -> ExitCode {
             if let Some(exit) = error.downcast_ref::<CommandExit>() {
                 return ExitCode::from(exit.0);
             }
-            eprintln!("st: {error:#}");
+            eprintln!("st: {}", plain_error(&error));
             let message = error.to_string();
             if daemon_is_unreachable(&error) {
                 ExitCode::from(5)
@@ -3259,6 +3259,26 @@ async fn run_cli(cli: Cli) -> ExitCode {
             }
         }
     }
+}
+
+/// The error chain as printed, with an st client-API error said in plain words and its code in
+/// parentheses for scripts, rather than a Rust enum name (`StaleFence`).
+fn plain_error(error: &anyhow::Error) -> String {
+    let full = format!("{error:#}");
+    let Some(api) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<st3_client::ClientError>())
+    else {
+        return full;
+    };
+    let st3_client::ClientError::Api(code, _, _) = api else {
+        return full;
+    };
+    let code = serde_json::to_value(code)
+        .ok()
+        .and_then(|code| code.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    full.replace(&api.to_string(), &format!("{} ({code})", api.plain()))
 }
 
 static DAEMON_WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -15666,6 +15686,30 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_api_errors_print_in_plain_words_with_their_code() {
+        let api = st3_client::ClientError::Api(
+            st3_client::ErrorCode::StaleFence,
+            "the client snapshot changed before the action was submitted".into(),
+            Box::new(st3_client::ErrorEnvelope {
+                api_version: "st3.client.v0".into(),
+                error_version: "st3.client.error.v0".into(),
+                request_id: "request/test".into(),
+                code: st3_client::ErrorCode::StaleFence,
+                message: "the client snapshot changed before the action was submitted".into(),
+                retryable: false,
+                retry_after_ms: None,
+                details: Default::default(),
+            }),
+        );
+        let error = anyhow::Error::new(api).context("start the terminal");
+        assert_eq!(
+            plain_error(&error),
+            "start the terminal: st changed while this was on its way, so it was not applied (stale-fence)"
+        );
+        assert_eq!(plain_error(&anyhow::anyhow!("plain")), "plain");
+    }
 
     #[test]
     fn a_claude_session_without_a_binding_is_reported_once_after_the_grace() {
