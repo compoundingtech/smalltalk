@@ -232,6 +232,9 @@ struct ReplicationWorkerArgs {
     socket: Option<PathBuf>,
     #[arg(long)]
     peer_listen: Option<String>,
+    /// Let --peer-listen bind a non-loopback, non-Tailscale address; traffic is plain HTTP.
+    #[arg(long)]
+    peer_listen_allow_plain_http: bool,
     #[arg(long)]
     fleet_id: Option<String>,
     #[arg(long)]
@@ -1466,6 +1469,9 @@ struct UpArgs {
     client_gateway_socket: Option<PathBuf>,
     #[arg(long)]
     peer_listen: Option<String>,
+    /// Let --peer-listen bind a non-loopback, non-Tailscale address; traffic is plain HTTP.
+    #[arg(long)]
+    peer_listen_allow_plain_http: bool,
     #[arg(long)]
     fleet_id: Option<String>,
     #[arg(long)]
@@ -3280,6 +3286,9 @@ async fn run(cli: Cli) -> Result<()> {
         if let Some(value) = args.peer_listen {
             config.peer_listen = Some(value);
         }
+        if args.peer_listen_allow_plain_http {
+            config.peer_listen_allow_plain_http = true;
+        }
         if let Some(value) = args.fleet_id {
             config.fleet_id = Some(value);
         }
@@ -3667,6 +3676,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);
+    }
+    if args.peer_listen_allow_plain_http {
+        config.peer_listen_allow_plain_http = true;
     }
     if let Some(fleet_id) = args.fleet_id {
         config.fleet_id = Some(fleet_id);
@@ -13573,6 +13585,20 @@ impl PiChannelResume {
                 };
                 self.frame_sequence = self.frame_sequence.saturating_add(1);
                 self.pending.state = Some((status.to_owned(), self.frame_sequence));
+                self.pending.blocked_on = frame
+                    .get("blockedOn")
+                    .and_then(Value::as_str)
+                    .filter(|word| *word == "human")
+                    .map(str::to_owned);
+                self.pending.ask = if self.pending.blocked_on.is_some() {
+                    frame.get("ask").and_then(Value::as_str).map(str::to_owned)
+                } else {
+                    None
+                };
+                self.pending.reason = frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(|reason| reason.chars().take(2_000).collect());
                 true
             }
             Some("delivered") => {
@@ -13643,6 +13669,14 @@ fn warn_pi_channel(
 struct PiFamilyReports {
     /// Only the latest state matters; a newer frame replaces an unsent older one.
     state: Option<(String, u64)>,
+    // Keep the state tuple's resume wire shape: an older image can leave a pending state.
+    // Missing axes in that image mean unblocked, never a sparse update to an older ask.
+    #[serde(default)]
+    blocked_on: Option<String>,
+    #[serde(default)]
+    ask: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
     acknowledgements: BTreeSet<String>,
     #[serde(default)]
     reads: BTreeSet<String>,
@@ -13675,6 +13709,26 @@ impl PiFamilyReports {
                                 Value::String(format!("{driver}-channel")),
                             ),
                             ("incarnation_id".into(), Value::String(incarnation.into())),
+                            (
+                                "blocked_on".into(),
+                                self.blocked_on
+                                    .clone()
+                                    .map(Value::String)
+                                    .unwrap_or(Value::Null),
+                            ),
+                            (
+                                "ask".into(),
+                                self.ask.clone().map(Value::String).unwrap_or(Value::Null),
+                            ),
+                            (
+                                "reason".into(),
+                                self.reason
+                                    .clone()
+                                    .map(Value::String)
+                                    .unwrap_or(Value::Null),
+                            ),
+                            ("input_buffer".into(), Value::Null),
+                            ("exit".into(), Value::Null),
                         ]),
                         evidence: Vec::new(),
                         expected_subject: None,
@@ -15877,6 +15931,31 @@ mod tests {
         assert!(!root.path().join("resources").exists());
         server.abort();
     }
+    #[test]
+    fn a_human_ask_survives_channel_replacement_until_an_answered_state_frame() {
+        let mut state = PiChannelResume::default();
+        assert!(state.accept_frame(
+            r#"{"type":"state","state":"active","blockedOn":"human","ask":"question","reason":"Which deployment target?"}"#,
+        ));
+        let mut resumed: PiChannelResume =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(resumed.pending.state, Some(("working".into(), 1)));
+        assert_eq!(resumed.pending.blocked_on.as_deref(), Some("human"));
+        assert_eq!(resumed.pending.ask.as_deref(), Some("question"));
+        assert_eq!(resumed.pending.reason.as_deref(), Some("Which deployment target?"));
+        // The extension only emits an unblocked state for the matching ask's result.
+        // An unrelated tool result is timeline data, not a new harness observation.
+        assert!(!resumed.accept_frame(
+            r#"{"type":"timeline","event":"tool_result","payload":{"toolCallId":"unrelated"}}"#,
+        ));
+        assert_eq!(resumed.pending.blocked_on.as_deref(), Some("human"));
+        assert!(resumed.accept_frame(r#"{"type":"state","state":"active"}"#));
+        assert_eq!(resumed.pending.state, Some(("working".into(), 2)));
+        assert!(resumed.pending.blocked_on.is_none());
+        assert!(resumed.pending.ask.is_none());
+        assert!(resumed.pending.reason.is_none());
+    }
+
     #[test]
     fn repeated_negative_handoffs_keep_retrying_and_resume_the_backoff() {
         let mut state = PiChannelResume::default();

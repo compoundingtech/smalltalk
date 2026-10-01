@@ -189,6 +189,26 @@ function diagnosticTone(body: Record<string, unknown>): 'quiet' | 'warning' | 'f
 }
 
 /**
+ * Why a conversation cannot be shown whole: st could not read the harness's transcript, and sent
+ * only the Small Talk around it. Half a conversation reads as the agent ignoring the person, so
+ * neither half shows; this says why, with the transcript's path so it can be reported (Nathan,
+ * 2026-10-01). As stui's `unreadable_transcript`.
+ */
+export function unreadableTranscript(timeline: Entry[]): string | null {
+  for (const entry of [...timeline].reverse()) {
+    if (entry.type !== 'error') continue;
+    const body = record(entry.body);
+    if (str(body.code) !== 'transcript-not-bound') continue;
+    // A seat that has said nothing since it started has no transcript yet; that is not a failure.
+    if (record(body.details).not_yet === true) return null;
+    const reason = (str(body.message) ?? '').replace(/^transcript not bound: /, '');
+    const path = str(record(body.details).transcript);
+    return path ? `This conversation could not be loaded: ${reason} (transcript ${path})` : `This conversation could not be loaded: ${reason}`;
+  }
+  return null;
+}
+
+/**
  * One conversation as st joined it: the harness's turns and the agent's Small Talk, in time
  * order. `names` maps graph ids to what a person calls them; the viewer is `you`.
  */
@@ -258,6 +278,10 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
         break;
       }
       case 'error': {
+        if (str(body.code) === 'transcript-not-bound' && record(body.details).not_yet === true) {
+          push(entry, entry.id, { kind: 'event', tone: 'quiet', text: 'nothing in the harness yet since this seat started' });
+          break;
+        }
         const tone = diagnosticTone(body);
         const message = str(body.message) ?? str(body.code) ?? 'st reported a problem';
         push(entry, entry.id, { kind: 'event', tone, text: tone === 'fault' ? `error: ${message}` : message });

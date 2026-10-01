@@ -21,7 +21,6 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use st3_client::{
     Client, Fence, LaunchReviseParameters, MessageSendParameters, Resource, TimelineBody,
-    TimelineEntry,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -143,7 +142,7 @@ pub fn run(context: Context) -> Result<()> {
     model.actor = person.clone();
     let mut extras = Extras::default();
     // Each conversation st has sent, kept after it closes so reopening it shows its last entries.
-    let mut timelines: BTreeMap<String, Vec<TimelineEntry>> = BTreeMap::new();
+    let mut timelines: BTreeMap<String, st3_conversation_ui::Timeline> = BTreeMap::new();
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
     // The agent or session whose conversation the feed holds.
     let mut conversing: Option<String> = None;
@@ -236,37 +235,29 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     extras.live = true;
                     extras.offline = None;
-                    model.last_connected = Some(
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    );
+                    model.last_connected =
+                        Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
                     changed = true;
                 }
                 feed::Update::Conversation {
                     target,
                     replace,
+                    has_more,
                     items,
                 } => {
                     failed.remove(&target);
-                    let entries = timelines.entry(target).or_default();
-                    if replace {
-                        *entries = items;
-                    } else {
-                        for item in items {
-                            match entries.iter_mut().find(|entry| entry.id == item.id) {
-                                Some(entry) => *entry = item,
-                                None => entries.push(item),
-                            }
-                        }
-                        entries.sort_by(|a, b| {
-                            a.timestamp
-                                .cmp(&b.timestamp)
-                                .then(a.sequence.cmp(&b.sequence))
+                    timelines
+                        .entry(target)
+                        .or_default()
+                        .apply(st3_conversation_ui::Frame {
+                            replace,
+                            has_more,
+                            items,
                         });
-                    }
                     // A message sent from here is done once st shows it in the conversation.
                     pending.retain(|pending| {
                         pending.message_id.as_ref().is_none_or(|id| {
-                            !timelines.values().flatten().any(|entry| {
+                            !timelines.values().flat_map(|timeline| &timeline.items).any(|entry| {
                                 matches!(&entry.body, TimelineBody::Message(message) if &message.message_id == id)
                             })
                         })
@@ -727,7 +718,7 @@ fn screen_lines(screen: &st3_client::TerminalScreen) -> Vec<ratatui::text::Line<
 fn conversations(
     model: &Model,
     person: &str,
-    timelines: &BTreeMap<String, Vec<TimelineEntry>>,
+    timelines: &BTreeMap<String, st3_conversation_ui::Timeline>,
     failed: &BTreeMap<String, String>,
     conversing: Option<&str>,
 ) -> BTreeMap<String, Load<Vec<super::view::Entry>>> {
@@ -741,8 +732,14 @@ fn conversations(
         .collect::<BTreeSet<_>>();
     for target in targets {
         let load = match (timelines.get(target), failed.get(target)) {
+            // Half a conversation is worse than none: say why instead.
+            (Some(timeline), _)
+                if let Some(reason) = adapt::unreadable_transcript(&timeline.items) =>
+            {
+                Load::Failed(reason)
+            }
             (Some(timeline), error) => {
-                let mut entries = adapt::conversation(timeline, &names);
+                let mut entries = adapt::conversation(&timeline.items, &names);
                 // Never hide a failure behind what loaded before it.
                 if let Some(error) = error {
                     entries.push(super::view::Entry {
@@ -1015,6 +1012,41 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversation_without_its_transcript_is_one_failure_not_half_a_conversation() {
+        let items: Vec<st3_client::TimelineEntry> = serde_json::from_value(serde_json::json!([
+            {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/one","from":"person/avery","to":"agent/example/harbor/keeper","title":"Status?"}},
+            {"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"How is the audit going?"}},
+            {"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
+             "body":{"code":"transcript-not-bound","message":"transcript not bound: the transcript could not be read: line 12: expected value","retryable":true,
+                     "details":{"driver":"omp","transcript":"/srv/example/omp/sessions/harbor/0190.jsonl"}}},
+        ]))
+        .unwrap();
+        let target = "agent/example/harbor/keeper";
+        let shown = conversations(
+            &Model::default(),
+            "person/avery",
+            &BTreeMap::from([(
+                target.to_owned(),
+                st3_conversation_ui::Timeline {
+                    items,
+                    ..Default::default()
+                },
+            )]),
+            &BTreeMap::new(),
+            Some(target),
+        );
+        match &shown[target] {
+            Load::Failed(reason) => assert!(
+                reason.contains("line 12: expected value") && reason.contains("0190.jsonl"),
+                "{reason}"
+            ),
+            other => panic!("expected one failure, not entries: {other:?}"),
+        }
+    }
 
     fn fixture_screen() -> st3_client::TerminalScreen {
         let text = include_str!("../../../../docs/st3/client-v0/fixtures/terminal-screen.json");

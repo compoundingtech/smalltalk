@@ -172,6 +172,23 @@ Lists show current state. Add `--all` for history. Every command has `--help`, a
 `--json` flag prints the stable client format that the apps read. Run `stui` for the same views
 in a terminal app.
 
+### Embedding native conversations
+
+`crates/st3-conversation-ui` provides the same native conversation presentation used by
+`stui`, without terminal acquisition, application tabs or daemon connections. Feed
+`st3-client` conversation frames into `Timeline::apply(Frame { replace, has_more, items })`,
+adapt the timeline with caller-owned display names, and render it with `Cache::render`
+and caller-supplied `Theme` tokens. The returned document contains styled lines and typed
+`PaneIntent` targets. `State` retains scrolling, tool expansion, display-column selection
+and composer drafts; send, open and older-history intents are executed by the embedding app.
+Replacement frames remove the previous bounded window; incremental frames revise entries
+by ID. `has_more` remains available so a client can distinguish bounded from complete history.
+
+The shared crate and `stui` use workspace Ratatui 0.29. An embedding application using
+Ratatui 0.30 must align its rendering dependency before passing buffers or lines across this
+boundary. Native conversations are not a terminal emulator: harness menus and arbitrary
+permission prompts still require access to the harness terminal.
+
 ## Start an agent
 
 One command declares a seat on any fleet machine, waits until its harness is ready, and attaches
@@ -343,10 +360,19 @@ st import show SESSION
 st conversations timeline SESSION
 ```
 
-`import show` gives the harness, the native session ID, the workspace, and the process, if one is
-running. A running harness whose command line does not name its session is listed as blocked; exit
-it, and import its saved session from `import ls --all`. Check the workspace before you import:
-do not import a session that a seat is already running.
+`import ls` reads exact transcript paths named by live harness commands without scanning saved
+history; `import ls --all` lists saved transcripts as well. The daemon reads saved transcripts in
+the background, starting when it starts; `import ls --all` and `import show` answer from the
+latest complete read within two seconds. Right after a daemon start on slow storage, they may ask
+you to retry. `import show` gives the harness, native session ID, workspace, and process, if one is
+running. A running harness whose command line does not name its exact transcript is listed as
+blocked; exit it, then import its saved session from `import ls --all`. Check the workspace before
+importing: do not import a session already run by a seat.
+
+For omp, the inventory reads only session transcripts, not JSONL tool logs within a session's
+attachment directory. If several transcript copies have the same native ID, st prefers a copy
+whose workspace matches the live process and then the newest copy; import refuses copies still
+indistinguishable by those rules before stopping any process.
 
 ```sh
 st import run SESSION --as person/ada

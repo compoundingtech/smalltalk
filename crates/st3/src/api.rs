@@ -63,6 +63,8 @@ mod delivery_probes;
 mod mailbox;
 mod terminal_view;
 
+pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
@@ -379,6 +381,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/client/terminals/{id}/stream",
             get(client_v0::terminal_stream),
+        )
+        .route(
+            "/v1/client/terminals/{id}/raw-attachments",
+            post(client_v0::raw_terminal::attachment),
+        )
+        .route(
+            "/v1/client/terminals/{id}/raw-stream",
+            get(client_v0::raw_terminal::stream),
         )
         .route("/v1/schema", get(schema))
         .route("/v1/intent/mission", post(mission))
@@ -1900,7 +1910,15 @@ fn client_agent_resources_uncached(
                     Some(_),
                     Some("ready" | "working" | "idle"),
                     _,
-                ) => "running",
+                ) => {
+                    if subject.harness.as_ref().is_some_and(|harness| {
+                        harness.blocked_on.as_deref() == Some("human")
+                    }) {
+                        "waiting"
+                    } else {
+                        "running"
+                    }
+                }
                 (
                     Some("running" | "ready" | "working" | "idle"),
                     Some(_),
@@ -1986,6 +2004,9 @@ fn client_agent_resources_uncached(
                 "owner_run_id": subject.owner_run,
                 "driver": driver,
                 "harness_state": harness_state,
+                "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
+                "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
+                "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),
                 "host_id": desired_hosts.get(&subject.subject),
                 "last_activity_at": last_activity_at.map(client_timestamp),
                 "silent_since": silent_since.map(client_timestamp),
@@ -3894,16 +3915,10 @@ pub fn start_operation_report(state: &AppState) {
 }
 
 /// Read the headers of this host's native session transcripts off the request path as the
-/// daemon starts. Discovery keeps each transcript's header until the file changes, so the first
-/// session list after a start reads what changed instead of every header, over a second on a
-/// host with a couple of thousand transcripts.
+/// daemon starts. Saved-history session lists and session reads use this background inventory
+/// instead of walking the transcript trees, so a cold tree cannot hold those requests.
 pub fn start_native_session_discovery(state: &AppState) {
-    let home = state.native_session_home.clone();
-    std::thread::spawn(move || {
-        if let Err(error) = crate::external_sessions::discover(home.as_deref(), true) {
-            eprintln!("st3: reading native session transcripts at start failed: {error:#}");
-        }
-    });
+    crate::external_sessions::start_history_inventory(state.native_session_home.as_deref());
 }
 
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
@@ -4315,8 +4330,8 @@ async fn guard_bound_request(
 pub async fn serve_tcp(address: &str, app: Router) -> anyhow::Result<()> {
     let address = address.parse::<std::net::SocketAddr>()?;
     anyhow::ensure!(
-        address.ip().is_loopback(),
-        "the peer listener must bind to a loopback address"
+        crate::fleet::transport::is_permitted_route_address(&address.ip()),
+        "the peer listener must bind to a loopback or Tailscale address"
     );
     let listener = TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
@@ -16576,6 +16591,141 @@ mission "agent-health" state="ready" {
         );
         assert_eq!(resources[0]["state"], "failed");
         assert_eq!(resources[0]["operational"]["layer"], "current");
+    }
+
+    #[test]
+    fn human_blocking_overrides_activity_but_not_runtime_or_harness_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        // A run-owned seat carries its declared harness driver, so a new incarnation without
+        // a harness observation is `starting` rather than a driverless wrapper's `running`.
+        let source = r#"
+version 2
+mission "agent-human" state="ready" {
+  goal "Exercise human blocking projection."
+  agent "worker" { workspace "/tmp"; harness "omp" {} }
+  step "queued" { assigned-to "agent/${ST_MISSION_RUN}/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "agent-human-source")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "agent-human".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "agent-human-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let subject = format!("agent/{}/worker", run.id);
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let observe_runtime = |status: &str| {
+            append(
+                "runtime.observed",
+                json!({
+                    "status": status, "runtime_id": "node.worker", "incarnation_id": "human-1",
+                }),
+            );
+        };
+        let observe_harness = |activity: &str| {
+            append(
+                "harness.observed",
+                json!({
+                    "state": activity, "driver": "omp", "incarnation_id": "human-1",
+                    "blocked_on": "human", "ask": "permission", "reason": "Deploy production?",
+                }),
+            );
+        };
+        // Exercise the canonical graph projection independently of process-local delivery health.
+        let agent = || {
+            client_agent_resources_uncached(&store, true, store.index().unwrap())
+                .unwrap()
+                .into_iter()
+                .find(|agent| agent["id"] == subject.as_str())
+                .unwrap()
+        };
+        observe_runtime("running");
+        for activity in ["working", "idle", "ready"] {
+            observe_harness(activity);
+            assert_eq!(agent()["state"], "waiting", "{activity}");
+        }
+        append("harness.observed", json!({
+            "state": "working", "driver": "omp", "incarnation_id": "human-1",
+            "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+        }));
+        let answered: st3_client::Agent = serde_json::from_value(agent()).unwrap();
+        assert_eq!(answered.state, "running");
+        assert_eq!(answered.harness_state.as_deref(), Some("working"));
+        assert!(answered.blocked_on.is_none());
+        assert!(answered.ask.is_none());
+        assert!(answered.reason.is_none());
+        // The harness schema's terminal activity keeps precedence over a stale ask.
+        observe_harness("ended");
+        assert_eq!(agent()["state"], "failed");
+        // Indeterminate activity keeps its existing waiting verdict; clients must not
+        // present it as an answerable human ask.
+        observe_harness("indeterminate");
+        assert_eq!(agent()["state"], "waiting");
+        assert_eq!(agent()["harness_state"], "indeterminate");
+        observe_harness("working");
+        observe_runtime("stopped");
+        assert_eq!(agent()["state"], "stopped");
+        observe_runtime("starting");
+        assert_eq!(agent()["state"], "starting");
+        observe_runtime("running");
+        append("runtime.reconcile-decision", json!({
+            "key": "member-reconcile", "decision": "member-fault", "reason": "Cannot reconcile seat",
+        }));
+        assert_eq!(agent()["state"], "failed");
+        append("runtime.reconcile-decision", json!({
+            "key": "member-reconcile", "decision": "member-started",
+        }));
+        append("runtime.observed", json!({
+            "status": "running", "runtime_id": "node.worker", "incarnation_id": "human-2",
+        }));
+        // Before a new incarnation's first observation, the previous ask is fenced out.
+        assert_eq!(agent()["state"], "starting", "{}", agent());
+        assert!(agent()["blocked_on"].is_null());
+        append("harness.observed", json!({
+            "state": "idle", "driver": "omp", "incarnation_id": "human-2",
+            "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+        }));
+        observe_harness("working");
+        let resumed: st3_client::Agent = serde_json::from_value(agent()).unwrap();
+        assert_eq!(resumed.state, "running");
+        assert_eq!(resumed.harness_state.as_deref(), Some("idle"));
+        assert_eq!(resumed.incarnation_id.as_deref(), Some("human-2"));
+        assert!(resumed.blocked_on.is_none());
+        assert!(resumed.ask.is_none());
+        assert!(resumed.reason.is_none());
     }
 
     #[test]
