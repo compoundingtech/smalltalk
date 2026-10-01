@@ -2361,6 +2361,223 @@ pub fn new_mission_form(fields: &[String; 4], focus: usize, width: usize) -> Doc
     doc
 }
 
+// ------------------------------------------------------------------ new agent
+
+/// The harnesses st runs, the models each is known to take (the first, "default", leaves it to
+/// the harness), and the efforts. Fixed lists until st can say what each harness offers.
+pub const HARNESSES: [&str; 5] = ["claude", "codex", "omp", "pi", "opencode"];
+pub const EFFORTS: [&str; 5] = ["default", "low", "medium", "high", "xhigh"];
+
+pub fn models(harness: &str) -> &'static [&'static str] {
+    match harness {
+        "claude" => &[
+            "default",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-4-5",
+            "claude-fable-5-1",
+        ],
+        "codex" => &["default", "gpt-6-sol"],
+        _ => &["default"],
+    }
+}
+
+/// The new agent form: what it should do (its first message), its name, and how it runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentForm {
+    pub task: String,
+    pub name: String,
+    pub harness: usize,
+    pub model: usize,
+    pub effort: usize,
+    /// 0 is this machine; then the fleet's other machines in their list order.
+    pub host: usize,
+    pub focus: usize,
+}
+
+impl AgentForm {
+    pub const FIELDS: usize = 6;
+
+    pub fn new(task: String) -> Self {
+        Self {
+            task,
+            name: random_name(),
+            ..Self::default()
+        }
+    }
+
+    pub fn harness(&self) -> &'static str {
+        HARNESSES[self.harness % HARNESSES.len()]
+    }
+
+    pub fn model(&self) -> Option<&'static str> {
+        let models = models(self.harness());
+        Some(models[self.model % models.len()]).filter(|model| *model != "default")
+    }
+
+    pub fn effort(&self) -> Option<&'static str> {
+        Some(EFFORTS[self.effort % EFFORTS.len()]).filter(|effort| *effort != "default")
+    }
+
+    /// Step a choice field (2 harness, 3 model, 4 effort, 5 host) by one, either way.
+    pub fn cycle(&mut self, forward: bool, hosts: usize) {
+        let step = |value: &mut usize, count: usize| {
+            *value = if forward {
+                (*value + 1) % count.max(1)
+            } else {
+                (*value + count.max(1) - 1) % count.max(1)
+            }
+        };
+        match self.focus {
+            2 => {
+                step(&mut self.harness, HARNESSES.len());
+                self.model = 0;
+            }
+            3 => {
+                let count = models(self.harness()).len();
+                step(&mut self.model, count)
+            }
+            4 => step(&mut self.effort, EFFORTS.len()),
+            5 => step(&mut self.host, hosts + 1),
+            _ => {}
+        }
+    }
+}
+
+/// A name nobody has to think of: `amber-otter`. The person can change it.
+pub fn random_name() -> String {
+    const FIRST: [&str; 16] = [
+        "amber", "brisk", "calm", "clever", "dusky", "eager", "gentle", "keen", "lucky", "merry",
+        "nimble", "quiet", "rapid", "steady", "sunny", "witty",
+    ];
+    const SECOND: [&str; 16] = [
+        "badger", "comet", "falcon", "fern", "harbor", "heron", "lantern", "maple", "otter",
+        "pebble", "quartz", "raven", "sparrow", "tide", "willow", "wren",
+    ];
+    let bits = uuid::Uuid::now_v7().as_u128();
+    // The low bits of a v7 id are random.
+    format!(
+        "{}-{}",
+        FIRST[(bits & 15) as usize],
+        SECOND[((bits >> 4) & 15) as usize]
+    )
+}
+
+pub fn new_agent_form(form: &AgentForm, hosts: &[String], width: usize) -> Doc {
+    let mut inner = Doc::new();
+    let w = width.saturating_sub(4);
+    inner.blank();
+    inner.wrap(
+        &[run(
+            "Say what it should do: that is its first message. st starts the agent and its conversation opens here.",
+            theme::soft(),
+        )],
+        w,
+    );
+    inner.blank();
+    let field = |inner: &mut Doc, index: usize, label: &str, body: Doc| {
+        let start = inner.lines.len();
+        inner.card(
+            label,
+            if form.focus == index {
+                theme::ACCENT
+            } else {
+                theme::OVERLAY1
+            },
+            false,
+            body,
+            w,
+        );
+        for line in start..inner.lines.len() {
+            inner.targets.push(super::doc::Target {
+                line,
+                column: 0,
+                width: w as u16,
+                hit: Hit::Field(index),
+            });
+        }
+    };
+    for (index, label, value, hint) in [
+        (
+            0,
+            "what it should do",
+            &form.task,
+            "Fix the flaky login test, then open a PR.",
+        ),
+        (1, "name", &form.name, "a name"),
+    ] {
+        let mut body = Doc::new();
+        let focused = form.focus == index;
+        if value.is_empty() && !focused {
+            body.line(Line::from(span(hint, theme::dim())));
+        } else {
+            let paragraphs = value.split('\n').collect::<Vec<_>>();
+            for (line_index, paragraph) in paragraphs.iter().enumerate() {
+                let mut runs = vec![run((*paragraph).to_owned(), theme::text())];
+                if focused && line_index == paragraphs.len() - 1 {
+                    runs.push(run("█", theme::fg(theme::ACCENT)));
+                }
+                body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
+            }
+        }
+        field(&mut inner, index, label, body);
+    }
+    let host = match form.host {
+        0 => "this machine".to_owned(),
+        index => hosts
+            .get(index - 1)
+            .cloned()
+            .unwrap_or_else(|| "this machine".into()),
+    };
+    for (index, label, value) in [
+        (2, "harness", form.harness().to_owned()),
+        (
+            3,
+            "model",
+            form.model().unwrap_or("the harness's default").to_owned(),
+        ),
+        (
+            4,
+            "effort",
+            form.effort().unwrap_or("the harness's default").to_owned(),
+        ),
+        (5, "host", host),
+    ] {
+        let focused = form.focus == index;
+        let mut body = Doc::new();
+        body.line(Line::from(vec![
+            span(if focused { "◂ " } else { "  " }, theme::fg(theme::ACCENT)),
+            span(
+                value,
+                if focused {
+                    theme::text()
+                } else {
+                    theme::soft()
+                },
+            ),
+            span(
+                if focused {
+                    " ▸   ← → to choose"
+                } else {
+                    ""
+                },
+                theme::dim(),
+            ),
+        ]));
+        field(&mut inner, index, label, body);
+    }
+    inner.blank();
+    inner.buttons(&[
+        ("tab", "Next field", Hit::Key('\t'), theme::OVERLAY1),
+        ("enter", "Start the agent", Hit::Enter, theme::GREEN),
+        ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+    ]);
+    inner.blank();
+    let mut doc = Doc::new();
+    doc.card("new agent", theme::ACCENT, false, inner, width);
+    doc
+}
+
 // ------------------------------------------------------------------ devices
 
 pub fn devices_card(world: &World, width: usize) -> Doc {

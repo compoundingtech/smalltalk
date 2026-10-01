@@ -142,6 +142,15 @@ pub enum Effect {
     },
     /// Keep a glass in st, or delete it there.
     SaveGlass(glass::GlassWrite),
+    /// Start a new agent; its first message is what the person asked of it.
+    CreateAgent {
+        name: String,
+        harness: String,
+        model: Option<String>,
+        effort: Option<String>,
+        host: Option<String>,
+        message: Option<String>,
+    },
     /// Send a failed or unconfirmed message again, as the same request.
     Resend {
         entry: String,
@@ -241,6 +250,12 @@ pub struct Ui {
     details_here: bool,
     /// Finding text in a conversation.
     find: Option<Find>,
+    /// The new agent form, kept while the person looks elsewhere.
+    new_agent: Option<screens::AgentForm>,
+    /// The Agents tab shows the new agent form rather than the selected agent.
+    agent_form: bool,
+    /// An agent just started from here, to select once st lists it.
+    started: Option<String>,
     /// Images attached to each draft, by its key, until it is sent.
     attachments: HashMap<String, Vec<attach::Attachment>>,
     /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
@@ -303,6 +318,9 @@ impl Ui {
             build: false,
             details_here: false,
             find: None,
+            new_agent: None,
+            agent_form: false,
+            started: None,
             attachments: HashMap::new(),
             picker: None,
             thumbnails: RefCell::new(HashMap::new()),
@@ -329,6 +347,7 @@ impl Ui {
             }
         }
         self.tab = tab;
+        self.select_started();
         if self.glasses.is_some() {
             self.resync_focus();
         }
@@ -1210,6 +1229,7 @@ impl Ui {
         let id = self.selected_id();
         match self.tab {
             0 => Pane::Home(id),
+            1 if self.agent_form => Pane::NewAgent,
             1 => match &self.terminal {
                 Some(view) => Pane::Terminal(view.agent.clone()),
                 None => Pane::Agent(id),
@@ -1242,6 +1262,11 @@ impl Ui {
                 let empty = Default::default();
                 let (fields, focus) = self.new_mission.as_ref().unwrap_or(&empty);
                 screens::new_mission_form(fields, *focus, width)
+            }
+            Pane::NewAgent => {
+                let empty = Default::default();
+                let form = self.new_agent.as_ref().unwrap_or(&empty);
+                screens::new_agent_form(form, &self.other_hosts(), width)
             }
             Pane::Declaration(id) => screens::mission_kdl(&self.world, id.as_deref(), width),
             Pane::Mission(id) => {
@@ -1479,7 +1504,11 @@ impl Ui {
             (Some(_), None, Some(list)) if !list.is_empty() => list.clone(),
             _ => Vec::new(),
         };
-        let strip = if thumbnails.is_empty() { 0 } else { THUMBNAIL.height };
+        let strip = if thumbnails.is_empty() {
+            0
+        } else {
+            THUMBNAIL.height
+        };
         let composer_height = if composer.is_empty() {
             0
         } else {
@@ -2147,6 +2176,10 @@ impl Ui {
             }
             return;
         }
+        if self.agent_form && self.tab == 1 && self.new_agent.is_some() {
+            self.agent_form_key(key);
+            return;
+        }
         if let Some((fields, focus)) = self.new_mission.as_mut() {
             let focus_now = *focus;
             match key.code {
@@ -2315,6 +2348,7 @@ impl Ui {
                 });
             }
             KeyCode::Enter if self.tab == 1 => self.open_terminal(),
+            KeyCode::Char('n') if self.tab == 1 => self.open_new_agent(None),
             KeyCode::Char('n') if self.tab == 2 => {
                 self.new_mission = Some((Default::default(), 0));
             }
@@ -2511,6 +2545,145 @@ impl Ui {
                 ended: None,
             });
         }
+    }
+
+    /// The fleet's machines other than this one, in list order: the new agent form's hosts.
+    fn other_hosts(&self) -> Vec<String> {
+        self.world
+            .machines
+            .items()
+            .iter()
+            .filter(|machine| machine.reach != Reach::Here)
+            .map(|machine| machine.name.clone())
+            .collect()
+    }
+
+    /// Open the new agent form: in a new tab of the focused split in a glass, on the Agents
+    /// tab otherwise. `task` fills in what it should do.
+    pub(crate) fn open_new_agent(&mut self, task: Option<String>) {
+        match self.new_agent.as_mut() {
+            Some(form) => {
+                if let Some(task) = task {
+                    form.task = task;
+                }
+            }
+            None => self.new_agent = Some(screens::AgentForm::new(task.unwrap_or_default())),
+        }
+        if self.glasses.is_some() {
+            self.open_in_glass(Pane::NewAgent, glass::Open::Tab);
+        } else {
+            self.tab = 1;
+            self.agent_form = true;
+            self.terminal = None;
+        }
+    }
+
+    fn cancel_agent_form(&mut self) {
+        self.new_agent = None;
+        self.agent_form = false;
+        if self.glasses.is_some() {
+            self.close_form_tab();
+        }
+    }
+
+    fn agent_form_key(&mut self, key: KeyEvent) {
+        let hosts = self.other_hosts().len();
+        let Some(form) = self.new_agent.as_mut() else {
+            return;
+        };
+        let shifted = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Esc => self.cancel_agent_form(),
+            KeyCode::Tab | KeyCode::Down if form.focus >= 2 || key.code == KeyCode::Tab => {
+                form.focus = (form.focus + 1) % screens::AgentForm::FIELDS;
+            }
+            KeyCode::BackTab | KeyCode::Up if form.focus >= 2 || key.code == KeyCode::BackTab => {
+                form.focus =
+                    (form.focus + screens::AgentForm::FIELDS - 1) % screens::AgentForm::FIELDS;
+            }
+            KeyCode::Left | KeyCode::Right if form.focus >= 2 => {
+                form.cycle(key.code == KeyCode::Right, hosts);
+            }
+            KeyCode::Enter if shifted && form.focus == 0 => form.task.push('\n'),
+            KeyCode::Enter => self.start_agent(),
+            _ => match form.focus {
+                0 => {
+                    edit_text(&mut form.task, key);
+                }
+                1 => {
+                    // A name is one word of letters, digits, dots and dashes.
+                    if let KeyCode::Char(character) = key.code
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !(character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
+                    {
+                        return;
+                    }
+                    edit_text(&mut form.name, key);
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn start_agent(&mut self) {
+        let hosts = self.other_hosts();
+        let Some(form) = self.new_agent.clone() else {
+            return;
+        };
+        if form.name.trim().is_empty() {
+            if let Some(form) = self.new_agent.as_mut() {
+                form.focus = 1;
+            }
+            self.flash("Give it a name");
+            return;
+        }
+        let message = Some(form.task.trim().to_owned()).filter(|task| !task.is_empty());
+        let host = form
+            .host
+            .checked_sub(1)
+            .and_then(|index| hosts.get(index).cloned());
+        if self.live {
+            self.effects.push(Effect::CreateAgent {
+                name: form.name.trim().to_owned(),
+                harness: form.harness().to_owned(),
+                model: form.model().map(str::to_owned),
+                effort: form.effort().map(str::to_owned),
+                host,
+                message,
+            });
+            self.flash(format!("Starting {}…", form.name.trim()));
+        } else {
+            self.flash("Agent started · demo: nothing was sent");
+        }
+    }
+
+    /// st started the agent asked for here: its conversation replaces the form.
+    pub(crate) fn agent_started(&mut self, id: String) {
+        self.new_agent = None;
+        self.agent_form = false;
+        if self.glasses.is_some() {
+            self.open_in_glass(Pane::Agent(Some(id.clone())), glass::Open::Here);
+        } else {
+            self.tab = 1;
+        }
+        self.started = Some(id);
+        self.select_started();
+    }
+
+    /// Select the agent just started once st lists it.
+    fn select_started(&mut self) {
+        let Some(id) = self.started.clone() else {
+            return;
+        };
+        let tab = self.tab;
+        self.tab = 1;
+        if let Some(position) = self.ids().iter().position(|candidate| *candidate == id) {
+            self.selected[1] = position;
+            self.started = None;
+        }
+        self.tab = tab;
     }
 
     fn create_launch(&mut self) {
@@ -3020,6 +3193,8 @@ impl Ui {
         match hit {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
+            Hit::NewAgent => self.open_new_agent(None),
+            Hit::Split(right) => self.split(right),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
             Hit::GlassAdd(group) => {
                 self.focus_group(group);
@@ -3039,6 +3214,11 @@ impl Ui {
                     _ => {}
                 }
             }
+            Hit::Key('\t') if self.agent_form => {
+                if let Some(form) = self.new_agent.as_mut() {
+                    form.focus = (form.focus + 1) % screens::AgentForm::FIELDS;
+                }
+            }
             Hit::Key('\t') => {
                 if let Some((_, focus)) = self.new_mission.as_mut() {
                     *focus = (*focus + 1) % 4;
@@ -3055,6 +3235,8 @@ impl Ui {
                 }
             }
             Hit::Enter if self.new_mission.is_some() => self.create_launch(),
+            Hit::Enter if self.agent_form && self.tab == 1 => self.start_agent(),
+            Hit::Escape if self.agent_form && self.tab == 1 => self.cancel_agent_form(),
             Hit::Enter => {
                 if self.chat.is_some() {
                     self.submit_chat()
@@ -3099,6 +3281,11 @@ impl Ui {
             }
             Hit::Help => self.help = !self.help,
             Hit::Open(id) => self.open(&id),
+            Hit::Field(index) if self.agent_form => {
+                if let Some(form) = self.new_agent.as_mut() {
+                    form.focus = index;
+                }
+            }
             Hit::Field(index) => {
                 if let Some((_, focus)) = self.new_mission.as_mut() {
                     *focus = index;
