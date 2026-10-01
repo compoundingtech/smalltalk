@@ -2608,6 +2608,49 @@ mod tests {
     }
 
     #[test]
+    fn links_in_a_conversation_can_be_clicked() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        if let Some(Load::Ready(entries)) = ui
+            .world
+            .conversations
+            .get_mut("agent/example/atlas/builder")
+        {
+            entries.push(Entry {
+                id: "linky".into(),
+                at: "17:40".into(),
+                body: Body::Assistant(
+                    "See [the pull request](https://github.com/example/widgets/pull/7) and https://example.com/notes."
+                        .into(),
+                ),
+            });
+        }
+        ui.follow_latest();
+        screen(&ui);
+        let links = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .filter_map(|(_, hit)| match hit {
+                Hit::Link(url) => Some(url.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            links.contains(&"https://github.com/example/widgets/pull/7".to_owned()),
+            "{links:?}"
+        );
+        assert!(
+            links.contains(&"https://example.com/notes".to_owned()),
+            "{links:?}"
+        );
+    }
+
+    #[test]
     fn the_wheel_moves_the_palette_and_nothing_behind_it() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
