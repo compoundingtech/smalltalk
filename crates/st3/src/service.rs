@@ -1038,6 +1038,9 @@ mod tests {
             observations: crate::config::ObservationsConfig::default(),
             checkpoint: crate::config::CheckpointConfig::default(),
             limits: crate::config::LimitsConfig::default(),
+            client_web: None,
+            usage: None,
+            client_subscription_limit: crate::api::ClientSubscriptionLimit::default().0,
             fleet: None,
         };
         let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;

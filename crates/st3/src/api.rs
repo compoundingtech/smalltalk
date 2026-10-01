@@ -61,6 +61,7 @@ use crate::store::Store;
 mod client_blobs;
 mod client_presence;
 mod client_v0;
+pub mod client_web;
 mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
@@ -70,6 +71,16 @@ mod owned_sets;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
+
+/// Maximum simultaneous subscriptions held by one collection WebSocket.
+#[derive(Clone, Copy)]
+pub struct ClientSubscriptionLimit(pub usize);
+
+impl Default for ClientSubscriptionLimit {
+    fn default() -> Self {
+        Self(64)
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -309,9 +320,14 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Build the loopback-only client gateway. Unlike the local Unix boundary, every ordinary
-/// client request on this router requires a paired bearer credential.
+/// client request on this router requires a paired bearer or cookie credential.
 pub fn fabric_router(state: AppState) -> Router {
     router_for_transport(state, ClientTransportBoundary::FabricLoopback)
+}
+
+/// Serve an optional browser bundle and relays at the paired gateway boundary.
+pub fn fabric_router_with_web(state: AppState, web: Arc<client_web::ClientWeb>) -> Router {
+    client_web::wrap(fabric_router(state), web)
 }
 
 fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> Router {
@@ -423,6 +439,12 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/client/collections/stream",
             get(client_v0::collection_stream),
+        )
+        .route("/v1/client/usage/quota", get(client_web::usage_quota))
+        .route("/v1/client/usage/history", get(client_web::usage_history))
+        .route(
+            "/v1/client/telemetry/traces",
+            post(client_web::telemetry_traces),
         )
         .route("/v1/client/actions", post(client_v0::action))
         .route(
@@ -815,6 +837,10 @@ async fn response_envelope(
         }
     };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
+        || response
+            .extensions()
+            .get::<client_web::RelayResponse>()
+            .is_some()
         || !response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)

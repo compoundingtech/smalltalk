@@ -135,7 +135,7 @@ pub(crate) async fn stream(
     if !live.terminal {
         return Err(validation("raw attachment requires a terminal runtime"));
     }
-    consume_terminal_attachment_mode(
+    let viewer = consume_terminal_attachment_mode(
         &state,
         &session,
         &client_detail_id("terminal", &id),
@@ -175,7 +175,10 @@ pub(crate) async fn stream(
         .protocols([SUBPROTOCOL])
         .max_message_size(CHUNK * 4)
         .max_frame_size(CHUNK * 4)
-        .on_upgrade(move |socket| splice(socket, transport, Some(query.mode))))
+        .on_upgrade(move |socket| async move {
+            let _viewer = viewer;
+            splice(socket, transport, Some(query.mode)).await;
+        }))
 }
 
 /// One bounded byte splice; closing either direction drops the persistent owner connection.

@@ -74,7 +74,7 @@ mutation queue, push notification service, cached graph authority, or multi-mast
 
 `st up` listens on two different Unix sockets. `st3.sock` is the privileged trusted-local API;
 `st3-client.sock` is the paired-only client gateway backed by `fabric_router`. The latter rejects
-ordinary requests without a paired bearer credential, except for pairing completion. The socket
+ordinary requests without a paired bearer or device cookie credential, except for pairing completion. The socket
 paths can be set with `socket` and `client_gateway_socket` in `config.toml`, or with `--socket` and
 `--client-gateway-socket` for a foreground daemon. They must never name the same path.
 
@@ -124,6 +124,56 @@ tailscale serve reset
 
 Warning: `tailscale serve reset` clears all Serve configuration on the host, not only the st
 gateway.
+
+### Browser bundle and relays
+
+The paired gateway optionally serves a browser bundle and same-origin relays. Configure these
+in `config.toml` and restart the daemon:
+
+```toml
+[client_web]
+static_dir = "/opt/client-bundle"
+mount = "/app"
+otlp_endpoint = "http://127.0.0.1:4318"
+
+[usage]
+endpoint = "http://127.0.0.1:4319"
+```
+
+The `client_web` fields are optional; the mount defaults to `/app`. When `[usage]` is present,
+its `endpoint` is required. The bundle directory must contain `index.html`. Existing files are
+served under the mount; missing extensionless paths
+fall back to the root index for client-side routing. Missing assets return `404`. Paths and
+symlinks cannot escape the configured directory. The static bundle is public within the trusted
+tailnet carrier, not an authenticated API, and must not contain credentials or private data.
+
+Browser pairing completion with `credential_delivery: "cookie"` sets `st3_device`, an HttpOnly,
+Secure, SameSite=Strict cookie scoped to `/v1/client`. Browsers therefore need the HTTPS carrier.
+The cookie mode omits the credential from the response body. Bearer credentials
+continue to work for native clients; both authentication forms use the same expiry, revocation,
+person and scopes, including WebSocket upgrades. An explicit bearer header takes precedence.
+This gateway relies on the tailnet trust boundary; it does not add an Origin policy or CSP.
+
+The two usage GET relays are `/v1/client/usage/quota` and `/v1/client/usage/history?account=ACCOUNT`.
+Only `/api/v1/quota` and `/api/v1/lens/usage_over_time` on the configured upstream are contacted;
+history pins `window=all`, `group_by=account`, `bucket=day` and the requested account as `group`.
+Responses are returned unchanged. Quota reads cache for five seconds and history for sixty;
+identical concurrent requests share one fetch. Failed reads are not cached.
+The telemetry route, `POST /v1/client/telemetry/traces`, accepts OTLP JSON and
+relays to the collector's `/v1/traces`; it does not rewrite resource attributes. Relays require
+the existing paired client boundary and return `404` when their endpoint is absent.
+
+The collection WebSocket accepts a W3C `traceparent` URL query parameter (and subscription
+commands may supply their own `traceparent`) to correlate gateway delivery with browser
+traces. Terminal viewers opened by a collection subscription end on unsubscribe or socket
+closure; closing one viewer does not end the shared terminal.
+
+Each collection socket holds up to 64 subscriptions by default. Set the top-level
+`client_subscription_limit` in `config.toml` to a positive integer to change the limit.
+An additional subscription receives an error with code `subscription-limit`; replacing an
+existing ID does not consume another slot, and unsubscribe frees its slot.
+
+### Fabric carrier
 
 The equivalent trusted-peer Fabric carrier lifecycle is:
 
