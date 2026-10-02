@@ -81,7 +81,8 @@ Forked from `pi-channel.ts`; same frame protocol discipline (LF-delimited JSON, 
 message / delivered / failed / state / context frames, PROTOCOL constant). Differences:
 
 - **Idle and terminal edges:** `agent_start` emits active. On a terminal `agent_end`, poll
-  `ctx.isIdle()` every ~100 ms with a bounded window and emit idle at the first true sample.
+  `ctx.isIdle()` every ~100 ms until positive proof or superseding ownership/activity, and emit
+  idle at the first true sample only when no human ask or approval is pending.
   Every poll captures a monotonically increasing generation; a newer settle attempt, new
   `agent_start`, structured ask, approval ask, session replacement, shutdown,
   `willContinue:true`, or terminal error advances the generation and retires older polls before
@@ -182,7 +183,9 @@ the fleet on changes the capture already covered — 18.0.10 shipped within hour
 admitted. The evidence a minor is admitted on is a measurement of *some* release in that minor,
 and the risk accepted is that a patch could move delivery-critical behavior within it. That has
 been observed once and absorbed: between 18.0.3 and 18.0.9 the idle edge moved from ~251 ms to
-~25 ms, which the bounded polling rule (OMP-R03) handles without change.
+~25 ms. The generation- and channel-fenced sampling rule (OMP-R03) also handles final unwind
+that takes longer: sampling continues until positive idle proof or a superseding event,
+and never publishes idle while a human ask or approval is pending.
 
 Captures, per measured release:
 

@@ -29,6 +29,10 @@ json.dump(pin, open(sys.argv[1], 'w'))
 PY
 pty_rev=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rev"])' "$work/pin.json")
 pty_url=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("https://github.com/"+p["owner"]+"/"+p["repo"]+".git")' "$work/pin.json")
+# .cargo/config.toml links local Linux builds with mold, which release runners do not have.
+# An empty CARGO_ENCODED_RUSTFLAGS takes precedence over config rustflags, so releases link
+# with the platform's default linker, for both builds below.
+export CARGO_ENCODED_RUSTFLAGS=
 cargo build --release --locked --target "$target" -p st3 -p st3-migrate -p stui
 build_dir=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 for binary in st3 st3-migrate stui; do

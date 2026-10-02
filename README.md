@@ -13,6 +13,17 @@ Small Talk (`st`) runs coding agents as durable seats and hands them work as mis
 records every seat, mission, step, message, and decision, so the state of your agents survives
 harness, daemon, and machine restarts. One daemon runs on each machine; machines can join a fleet.
 
+### Shared UI models
+
+`crates/st3-ui-model` provides renderer-independent UI semantics without a ratatui dependency.
+Its broad name is intentional; initially it contains only stui's mission model (`Word`,
+`StepState`, `Mission`, `Step`) and mission derivation. stui consumes that same model.
+`missions::adapt` borrows typed mission and agent projections plus unresolved, actor-filtered
+attention. Callers supply the current time and display policies explicitly; collection loading,
+clocks and application naming remain outside the crate. Mission precedence, queue/keep-open
+rules, outcomes and rich step details retain stui's existing behavior. Shared widgets and other
+UI models are separate follow-up work, not part of this mission extraction.
+
 ## Install
 
 Download prebuilt Linux x86_64 or macOS arm64 tools from [tagged releases](docs/st3/binary-releases.md),
@@ -37,7 +48,17 @@ This installs `st3`, the `st` symlink, the `stui` terminal app, `st3-migrate`, a
 this package. The previous generation is built and tested separately as `.#st2`;
 install it explicitly with `nix profile install .#st2`.
 
-Without Nix, build and install from a checkout with a Rust toolchain:
+Client terminal screens use `pty-terminal` and the same pinned `libghostty-vt` artifact as
+the PTY runtime. Styled runs carry terminal-cell widths (including wide characters), soft-wrap
+continuations, strikethrough and admitted OSC 8 links; keyboard modes include kitty flags.
+The Nix package and developer shell link the shared static library through pkg-config, so
+building Small Talk does not require Zig or a Ghostty source checkout.
+The runtime, screen projector and terminal UI pin their PTY protocol crates to the same
+producer revision, keeping one shared protocol source in the workspace.
+
+Without Nix, build and install from a checkout with a Rust toolchain and the matching
+`libghostty-vt` artifact. Set `PKG_CONFIG_PATH` to its `share/pkgconfig` directory;
+`pkg-config --static --libs libghostty-vt-static` must resolve before building:
 
 ```sh
 scripts/install                  # into ~/.local/bin
