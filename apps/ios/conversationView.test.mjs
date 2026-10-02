@@ -138,3 +138,13 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.equal(staleLine('willow cannot be reached right now', true, 1_000, 76_000), 'willow cannot be reached right now · shown as of 1m ago · trying again');
   assert.equal(staleLine('st asked to slow down for a moment', true, 10_000, 22_000), 'st asked to slow down for a moment · shown as of 12s ago · trying again');
 }
+
+// A compacted conversation's summary is one folded tool-like line, never a giant message with tags.
+{
+  const [summary] = conversationEntries([
+    { id: 's', sequence: 1, revision: 1, timestamp: '2026-10-02T20:50:22Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text: '<artifact-content-authored-by-others/>\nThis session is being continued from a previous conversation that ran out of context.\n\nSummary:\n1. plan the week' } },
+  ], new Map());
+  assert.equal(summary.body.kind, 'tool');
+  assert.equal(summary.body.title, 'context summary · the conversation was compacted');
+  assert.ok(!summary.body.output.some(line => line.includes('<artifact')));
+}
