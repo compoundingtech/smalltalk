@@ -95,7 +95,7 @@ HTTPS route after every rollout, then make an authenticated paired-client read.
 
 This provides tailnet-only HTTPS and WebSocket transport at the host's Tailscale name while the
 gateway continues to enforce the same paired credential, scopes, terminal subprotocol, and
-single-use attachment capability. Begin pairing over the trusted local socket with, for example,
+attachment capability. Begin pairing over the trusted local socket with, for example,
 `st devices --as person/alex pair "Alex iPhone"`; complete pairing from the remote device over
 the served gateway. To remove the carrier without changing graph credentials or daemon state:
 
@@ -597,10 +597,16 @@ reach the owner or the owner refuses, the CLI says why and falls back to this pr
 each screen into the local terminal and sends keystrokes and size changes as `terminal.input` (raw
 mode) and `terminal.resize` actions.
 
-`terminal.attach` returns a short-lived, single-use stream capability and URL bound to the
-authenticated session, terminal, and runtime incarnation; `terminal.detach` idempotently invalidates
-that viewer. A client opens the URL on the same Unix or Fabric-loopback gateway with WebSocket
-subprotocol `st3.client.terminal.v0`. Authentication, single-use capability consumption, and
+`terminal.attach` returns a stream capability and URL bound to the authenticated session, terminal,
+and runtime incarnation; `terminal.detach` idempotently invalidates that viewer. The capability is a
+lease: `reusable` is true, `ttl_s` (300) and `expires_at` say how long it lives, and every stream a
+client opens with it before then is accepted, so a reconnecting client reuses it instead of
+attaching again and, for a remote terminal, instead of making the gateway ask the owner again. The
+lease ends at `expires_at`, at `terminal.detach`, or when the runtime incarnation changes; the
+attachment then reports `state` `expired` or `detached` with no capability and `retry_hint`
+`reattach`: attach again with a new idempotency key. A stream already open is not cut off when its
+lease expires. A client opens the URL on the same Unix or Fabric-loopback gateway with WebSocket
+subprotocol `st3.client.terminal.v0`. Authentication, capability validation, and
 runtime-incarnation validation happen before upgrade.
 
 The WebSocket then stays open. The first message is the current screen. After that the server sends
@@ -648,6 +654,16 @@ answer or refusal back unchanged. Every hop checks that its sender is a fleet me
 applies its own grants to the person the read carries. A laptop peered only with a desktop
 therefore reads a conversation on a server that only the desktop dials. Each hop waits longer than
 the next one, so a long poll's answer is never cut short on its way back.
+
+`GET /v1/client/messages?actor=AGENT` lists an agent that another host owns from that host: the
+gateway relays the read for a concrete person or agent, the owner lists the messages it holds, and
+the page carries `replicated` with `source` `owner`, `complete` true and `state` `current`. Messages
+reach a gateway by replication, so its own copy can lag and read as empty. When the owner cannot be
+asked, the gateway returns its replica, never as if it were whole: `replicated` has `source`
+`replica`, `complete` false, `state` `lagging` (this host is still catching up with the owner's
+fleet, see `sync`) or `unverified`, and the `reason` the owner was not asked, such as `no-route` or
+`timed-out`. A client renders that as waiting, not as no messages. A list that names no remote
+agent has no `replicated`. Page cursors of a relayed list belong to the owner.
 
 A read that no peer can carry fails with `remote-unavailable`, and its `details` say why, so a
 client can tell a host nobody reaches from a slow or refusing one: `reason` is `no-route` (this node

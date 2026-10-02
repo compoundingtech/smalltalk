@@ -17912,6 +17912,7 @@ mod tests {
                 cursor_expires_at: None,
             },
             sync: None,
+            replicated: None,
         }
     }
 

@@ -107,6 +107,14 @@ pub enum ClientReadOperation {
     AgentWorkspace {
         identity: String,
     },
+    /// The messages to and from one agent, as the host that owns the agent lists them.
+    Messages {
+        actor: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        history: bool,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1055,6 +1063,22 @@ async fn receive_client_read(
                     _ => unreachable!(),
                 };
                 Ok(serde_json::to_value(result.value)?)
+            }
+            ClientReadOperation::Messages {
+                actor,
+                history,
+                limit,
+                cursor,
+            } => {
+                anyhow::ensure!(
+                    limit.is_none_or(|limit| (1..=200).contains(&limit)),
+                    "the messages limit is invalid"
+                );
+                let page = client
+                    .messages_list_for_peer(&actor, cursor.as_deref(), limit, history)
+                    .await?
+                    .value;
+                Ok(serde_json::to_value(page)?)
             }
             ClientReadOperation::AgentWorkspace { identity } => {
                 let workspace =
@@ -2168,9 +2192,161 @@ mod tests {
         assert_eq!(provenance.via, "host/chain-relay");
         assert!(!provenance.direct);
         assert_eq!(provenance.transport, "http");
-        assert_eq!(provenance.capability_ttl_s, 60);
+        assert_eq!(provenance.capability_ttl_s, 300);
         assert_eq!(provenance.fence_conflicts, 0);
         assert!(screen.facts.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_gateway_lists_a_remote_agents_messages_from_its_owner_and_says_when_it_cannot() {
+        let roots = [(); 2].map(|()| tempfile::tempdir().unwrap());
+        let make_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let mut gateway = make_state(roots[0].path(), "lag-gateway");
+        let owner = make_state(roots[1].path(), "lag-owner");
+        let agent = "agent/lag-worker";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String("lag-runtime".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("lag-runtime:i1".into()),
+                    ),
+                    ("status".into(), Value::String("running".into())),
+                    ("terminal".into(), Value::Bool(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("lag-worker-running".into()),
+            })
+            .unwrap();
+        gateway
+            .store
+            .import_replication("lag-owner", &owner.store.export_replication(0).unwrap())
+            .unwrap();
+        // The message reaches the owner, and has not replicated to the gateway yet.
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/lag-first".into(),
+                kind: "message.sent".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("from".into(), Value::String(agent.into())),
+                    ("to".into(), Value::String("person/avery".into())),
+                    (
+                        "content".into(),
+                        Value::String("done, ready for review".into()),
+                    ),
+                    ("status".into(), Value::String("sent".into())),
+                    ("title".into(), Value::String("done".into())),
+                    ("in_reply_to".into(), Value::Null),
+                    ("tags".into(), Value::Array(Vec::new())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("lag-first".into()),
+            })
+            .unwrap();
+
+        let secret = roots[0].path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let sockets = roots.each_ref().map(|root| root.path().join("st3.sock"));
+        let peer = PeerState::new(
+            MainBackend::new(sockets[1].clone()),
+            "lag-owner".into(),
+            FleetAuth::test("fleet-test", &[7; 32]),
+            FleetContext::legacy(BTreeSet::from(["lag-gateway".into()])),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = tokio::spawn(async move {
+            axum::serve(listener, peer_router(peer, smalltalk_routes())).await
+        });
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "lag-gateway".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "lag-owner".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        for (socket, state) in sockets.iter().zip([gateway, owner]) {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                crate::api::serve_unix(&socket, crate::api::router(state)).await
+            });
+        }
+        for socket in &sockets {
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let client = st3_client::Client::unix_as(&sockets[0], "person/avery");
+        let page = client
+            .messages_list_for_peer(agent, None, Some(20), false)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(page.items.len(), 1, "the owner's list reaches the gateway");
+        let replicated = page
+            .replicated
+            .expect("a remote agent's list says where it came from");
+        assert_eq!(replicated.owner_host_id, "host/lag-owner");
+        assert_eq!(replicated.source, "owner");
+        assert!(replicated.complete);
+        assert_eq!(replicated.state, "current");
+
+        // With the owner out of reach the gateway shows what it has and says the list may be
+        // missing items; it never passes an empty replica off as the whole list.
+        worker.abort();
+        let _ = worker.await;
+        let page = client
+            .messages_list_for_peer(agent, None, Some(20), false)
+            .await
+            .unwrap()
+            .value;
+        assert!(page.items.is_empty());
+        let replicated = page
+            .replicated
+            .expect("a replica says it is not the owner's list");
+        assert_eq!(replicated.source, "replica");
+        assert!(!replicated.complete);
+        assert_eq!(replicated.state, "unverified");
+        assert!(replicated.reason.is_some(), "{replicated:?}");
+
+        // An agent on this host, or any list that names no remote agent, carries no notice.
+        let page = client
+            .messages_list_for_recipient("person/avery", None, Some(20), false)
+            .await
+            .unwrap()
+            .value;
+        assert!(page.replicated.is_none());
     }
 
     #[tokio::test]

@@ -138,6 +138,22 @@ pub struct Page {
     /// as current, and while its graph has diverged from a peer's, so the page can be wrong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncNotice>,
+    /// Present on a list about another host's agent: whether the owner answered or this host's
+    /// replica stood in, and whether the replica can be missing recent items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated: Option<ReplicatedNotice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReplicatedNotice {
+    pub owner_host_id: String,
+    /// `owner` or `replica`.
+    pub source: String,
+    pub complete: bool,
+    /// `current`, `lagging` or `unverified`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2740,6 +2756,16 @@ pub struct TerminalAttachment {
     pub stream_capability: Option<String>,
     pub state: String,
     pub expires_at: String,
+    /// The capability opens any number of streams until it expires or is detached.
+    #[serde(default)]
+    pub reusable: bool,
+    /// How long the capability lives from attach, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_s: Option<u64>,
+    /// `reattach` when the capability can no longer open a stream: attach again with a new
+    /// idempotency key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

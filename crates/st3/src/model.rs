@@ -1319,6 +1319,27 @@ pub struct ClientResourcePage {
     pub page: ClientPageInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<ClientSyncNotice>,
+    /// Present on a list another host owns: whether the owner answered, or this host's replica
+    /// stood in for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated: Option<ClientReplicated>,
+}
+
+/// Where a page about another host's agent came from and whether it can be missing recent
+/// items.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClientReplicated {
+    pub owner_host_id: String,
+    /// `owner` when the owner answered, `replica` when this host's copy stood in.
+    pub source: String,
+    /// False when the page is a replica that may lack what the owner holds.
+    pub complete: bool,
+    /// `current` (the owner answered), `lagging` (this host is catching up with the owner's
+    /// fleet) or `unverified` (the owner could not be asked).
+    pub state: String,
+    /// Why the owner could not be asked, such as `no-route` or `timed-out`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Present on every page while this host is catching up with a peer, because its projections
