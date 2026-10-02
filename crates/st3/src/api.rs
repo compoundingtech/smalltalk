@@ -1832,7 +1832,36 @@ fn client_agent_resources(
         }
         overlay_delivery_presence(item, &local_host);
     }
+    overlay_subagents(store, &mut items)?;
     Ok(items)
+}
+
+/// Each seat's running subagents: open, with a lease that runs past this read. A lease runs out
+/// without a claim, so this is read per request rather than cached with the agents.
+fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
+    let mut running = BTreeMap::<String, Vec<Value>>::new();
+    for subagent in store.running_subagents(client_now_ms() as u64)? {
+        running
+            .entry(subagent.agent.clone())
+            .or_default()
+            .push(json!({
+                "id": subagent.subagent_id,
+                "subagent_type": subagent.subagent_type,
+                "description": subagent.description,
+                "driver": subagent.driver,
+                "session_id": subagent.session_id,
+                "work_id": subagent.step_run,
+                "started_at": (subagent.started_at_unix_ms > 0)
+                    .then(|| client_timestamp(u128::from(subagent.started_at_unix_ms))),
+                "lease_expires_at": client_timestamp(u128::from(subagent.lease_expires_at_unix_ms)),
+            }));
+    }
+    for item in items {
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        let subagents = running.remove(id).unwrap_or_default();
+        item["subagents"] = Value::Array(subagents);
+    }
+    Ok(())
 }
 
 /// Graph state says whether a harness took its ready turn; only this daemon can say whether the
@@ -13640,6 +13669,98 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             .unwrap();
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].kind, "custom.test.recorded");
+    }
+
+    #[test]
+    fn agents_list_the_subagents_their_harness_runs_now() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = format!(
+            "version 2\nagent \"busy\" {{ workspace {0:?}; command \"true\" }}\n\
+             agent \"quiet\" {{ workspace {0:?}; command \"true\" }}\n",
+            root.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "subagents")
+            .unwrap();
+        let now = client_now_ms() as u64;
+        let claim = |kind: &str, id: &str, fields: &[(&str, Value)]| {
+            let mut all = BTreeMap::from([("subagent_id".to_owned(), json!(id))]);
+            for (name, value) in fields {
+                all.insert((*name).to_owned(), value.clone());
+            }
+            state
+                .store
+                .append_client_claim(&ClaimInput {
+                    subject: "agent/node.busy".into(),
+                    kind: kind.into(),
+                    actor: Some("agent/node.busy".into()),
+                    fields: all,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let appear = |id: &str, lease: u64| {
+            claim(
+                "subagent.appeared",
+                id,
+                &[
+                    ("driver", json!("claude")),
+                    ("incarnation_id", json!("inc-1")),
+                    ("subagent_type", json!("Explore")),
+                    ("description", json!("map the code")),
+                    ("session_id", json!("session-1")),
+                    ("step_run", json!("step-run/run-1/build")),
+                    ("started_at_unix_ms", json!(1_790_931_600_000_u64)),
+                    ("lease_expires_at_unix_ms", json!(lease)),
+                ],
+            )
+        };
+        appear("running", now + 600_000);
+        appear("lapsed", now - 1);
+        appear("finished", now + 600_000);
+        claim(
+            "subagent.ended",
+            "finished",
+            &[("outcome", json!("completed"))],
+        );
+
+        let agents =
+            client_agent_resources(&state.store, false, "now", state.store.index().unwrap())
+                .unwrap();
+        let agent = |id: &str| agents.iter().find(|agent| agent["id"] == id).unwrap();
+        assert_eq!(
+            agent("agent/node.busy")["subagents"],
+            json!([{
+                "id": "running", "subagent_type": "Explore", "description": "map the code",
+                "driver": "claude", "session_id": "session-1",
+                "work_id": "step-run/run-1/build",
+                "started_at": "2026-10-02T09:00:00.000Z",
+                "lease_expires_at": client_timestamp(u128::from(now + 600_000)),
+            }])
+        );
+        assert_eq!(agent("agent/node.quiet")["subagents"], json!([]));
+        // Clients read it as the typed field.
+        let typed: st3_client::Resource =
+            serde_json::from_value(agent("agent/node.busy").clone()).unwrap();
+        let st3_client::Resource::Agent(typed) = typed else {
+            panic!("an agent resource");
+        };
+        assert_eq!(typed.subagents.len(), 1);
     }
 
     #[test]

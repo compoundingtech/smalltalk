@@ -10465,10 +10465,42 @@ fn render_client_agent(
             let _ = writeln!(output, "UPCOMING     {upcoming}");
         }
     }
+    for subagent in &agent.subagents {
+        let _ = writeln!(
+            output,
+            "SUBAGENT     {}",
+            subagent_line(subagent, Some(now_unix_ms))
+        );
+    }
     for runtime in &agent.runtime_ids {
         let _ = writeln!(output, "RUNTIME      {runtime}");
     }
     output
+}
+
+/// One line naming a running subagent: what it does, its type, and, given the time, when it
+/// started.
+fn subagent_line(subagent: &st3_client::AgentSubagent, now_unix_ms: Option<u128>) -> String {
+    let mut parts = vec![
+        subagent
+            .description
+            .clone()
+            .unwrap_or_else(|| subagent.id.clone()),
+    ];
+    if let Some(kind) = &subagent.subagent_type {
+        parts.push(kind.clone());
+    }
+    if let (Some(now), Some(started)) = (
+        now_unix_ms,
+        subagent
+            .started_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()),
+    ) {
+        let started = u128::try_from(started.timestamp_millis()).unwrap_or(0);
+        parts.push(format!("started {}", relative_time(started, now)));
+    }
+    parts.join(" · ")
 }
 
 fn render_client_agents(
@@ -10585,6 +10617,19 @@ fn render_client_agents(
                     agent.reachability
                 );
                 let _ = writeln!(output, "{member_prefix}   {}", agent.header.id);
+                // The subagents its harness runs now are its children.
+                for (index, subagent) in agent.subagents.iter().enumerate() {
+                    let branch = if index + 1 == agent.subagents.len() {
+                        "└─"
+                    } else {
+                        "├─"
+                    };
+                    let _ = writeln!(
+                        output,
+                        "{member_prefix}   {branch} {}",
+                        subagent_line(subagent, None)
+                    );
+                }
             }
         }
     }
@@ -17081,6 +17126,70 @@ mod tests {
         assert!(card.contains(
             "FAULT        render refuses to change tracked file .claude/settings.local.json"
         ));
+    }
+
+    fn subagent_worker() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "agent", "id": "agent/crew/worker", "revision": "one",
+            "updated_at": "2026-10-02T09:00:00Z", "name": "Worker",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "owner_run_id": "mission-run/crew", "harness_state": "working",
+            "subagents": [
+                {"id": "a1", "subagent_type": "Explore", "description": "map the code",
+                 "driver": "claude", "work_id": "step-run/crew/build",
+                 "started_at": "2026-10-02T09:00:00Z",
+                 "lease_expires_at": "2026-10-02T09:10:00Z"},
+                {"id": "019a-thread", "subagent_type": null, "description": null,
+                 "driver": "codex", "started_at": null,
+                 "lease_expires_at": "2026-10-02T09:10:00Z"}
+            ]
+        })
+    }
+
+    #[test]
+    fn agent_card_lists_the_subagents_its_harness_runs() {
+        let st3_client::Resource::Agent(agent) = serde_json::from_value(subagent_worker()).unwrap()
+        else {
+            panic!("agent resource")
+        };
+        let started = 1_790_931_600_000_u128;
+        let card = render_client_agent(&agent, &[], started + 180_000);
+        assert!(
+            card.contains(
+                "SUBAGENT     map the code · Explore · started 3m ago\nSUBAGENT     019a-thread\n"
+            ),
+            "{card}"
+        );
+        // An agent without subagents prints no subagent line.
+        let quiet = render_client_agent(
+            &st3_client::Agent {
+                subagents: Vec::new(),
+                ..agent
+            },
+            &[],
+            started,
+        );
+        assert!(!quiet.contains("SUBAGENT"), "{quiet}");
+    }
+
+    #[test]
+    fn agent_tree_nests_running_subagents_under_their_agent() {
+        let page: ClientPage = serde_json::from_value(serde_json::json!({
+            "kind": "page", "collection": "agents",
+            "items": [subagent_worker()],
+            "page": {"limit": 50, "has_more": false}
+        }))
+        .unwrap();
+        let tree = render_client_agents(&page, true, false, "st agents tree");
+        assert_eq!(
+            tree,
+            "AGENT TREE  1\n\
+             └─ crew\n\
+             \x20  └─ worker  working · local\n\
+             \x20     agent/crew/worker\n\
+             \x20     ├─ map the code · Explore\n\
+             \x20     └─ 019a-thread\n"
+        );
     }
 
     #[test]

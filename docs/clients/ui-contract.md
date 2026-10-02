@@ -89,9 +89,12 @@ resources: until then it could only show invented data.
   started by st). Each row: state glyph, name, harness, last activity; second line the graph
   path. A legend explains every glyph.
 - Tree view (toggle): the graph path as folders, one line per agent.
+- In both views, the subagents an agent's harness runs now hang beneath its row, one line each:
+  what it does, its type, and how long it has run. They are part of the agent's row: selecting
+  or clicking one selects the agent, and they have no actions of their own.
 - Selecting an agent shows its conversation (see below) and a composer. A details panel shows
-  what it holds now (mission › step, the step's goal, since when), what is queued next, and how
-  it runs (harness and state, runtime, host, worktree, parent, fault).
+  what it holds now (mission › step, the step's goal, since when), its subagents, what is queued
+  next, and how it runs (harness and state, runtime, host, worktree, parent, fault).
 - An agent on another host may show only its Small Talk mail, not its transcript; say so.
 - An agent not started by st: show its saved transcript when st can identify it; otherwise
   explain in plain words why there is no conversation. A found process whose native session

@@ -28,7 +28,8 @@ Rows are joined in st so a client never joins collections itself. A mission's
 `run_details` carry `steps` for each open run and for its latest run, and every
 run's steps in a mission detail read. An agent names its queue in
 `current_work`, `next_work`, and `upcoming_work`: each step's mission, run,
-path, title, first goal, and state. A work row names its `mission_id`.
+path, title, first goal, and state, and the `subagents` its harness runs now.
+A work row names its `mission_id`.
 
 Each window is read inside one SQLite snapshot, and its fence names that
 snapshot's store index, so rows always match their fence. Commits that land

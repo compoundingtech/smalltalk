@@ -188,6 +188,12 @@ WHERE kind='subagent.renewed';
 CREATE INDEX IF NOT EXISTS claims_subagent_ended_index
 ON claims(subject, json_extract(body, '$.fields.subagent_id'))
 WHERE kind='subagent.ended';
+CREATE INDEX IF NOT EXISTS claims_subagent_appeared_lease_index
+ON claims(CAST(json_extract(body, '$.fields.lease_expires_at_unix_ms') AS INTEGER))
+WHERE kind='subagent.appeared';
+CREATE INDEX IF NOT EXISTS claims_subagent_renewed_lease_index
+ON claims(CAST(json_extract(body, '$.fields.lease_expires_at_unix_ms') AS INTEGER))
+WHERE kind='subagent.renewed';
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
