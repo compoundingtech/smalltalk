@@ -81,7 +81,7 @@ const errorFrame = (code, message) => ({ kind: 'error', id: 'terminal', collecti
 
 {
   // A refused attachment is not retried.
-  const { client, sockets, calls } = fakeClient({ attachError: Object.assign(new Error('not allowed'), { response: { code: 'forbidden' } }) });
+  const { client, sockets, calls } = fakeClient({ attachError: Object.assign(new Error('this terminal belongs to another person'), { response: { code: 'forbidden' } }) });
   const feed = new Feed(client, noWindows, new ForegroundGate('active'), () => 'action/test', [5]);
   await settle();
   const issues = [];
@@ -89,7 +89,7 @@ const errorFrame = (code, message) => ({ kind: 'error', id: 'terminal', collecti
   await settle();
   await settle();
   assert.equal(calls.attaches.length, 1);
-  assert.equal(issues.at(-1), 'forbidden: not allowed');
+  assert.equal(issues.at(-1), 'not allowed: this terminal belongs to another person');
   assert.deepEqual(terminalSubscriptions(sockets[0]), []);
   feed.close();
 }
