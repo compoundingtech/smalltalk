@@ -160,8 +160,9 @@ the existing paired client boundary and return `404` when their endpoint is abse
 
 The collection WebSocket accepts a W3C `traceparent` URL query parameter (and subscription
 commands may supply their own `traceparent`) to correlate gateway delivery with browser
-traces. Terminal viewers opened by a collection subscription end on unsubscribe or socket
-closure; closing one viewer does not end the shared terminal.
+traces. A retryable first collection read retains its trace parent until delivery completes
+or the subscription ends. Terminal viewers opened by a collection subscription end on
+unsubscribe or socket closure; closing one viewer does not end the shared terminal.
 
 Each collection socket holds up to 64 subscriptions by default. Set the top-level
 `client_subscription_limit` in `config.toml` to a positive integer to change the limit.

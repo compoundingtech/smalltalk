@@ -776,12 +776,15 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 continue;
             };
             let outcome = deliver_collection(&mut socket, subscription, read).await;
-            if let Some((trace, started)) = traced.remove(&id) {
-                let result = match outcome {
-                    Refreshed::Current => "delivered",
-                    Refreshed::Dropped => "dropped",
-                    Refreshed::Closed => "closed",
-                };
+            let result = match outcome {
+                Refreshed::Current => Some("delivered"),
+                Refreshed::Retry => None,
+                Refreshed::Dropped => Some("dropped"),
+                Refreshed::Closed => Some("closed"),
+            };
+            if let Some(result) = result
+                && let Some((trace, started)) = traced.remove(&id)
+            {
                 super::client_web::record_span(
                     web.as_ref(),
                     &trace,
