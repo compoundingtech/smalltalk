@@ -422,7 +422,16 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
-                    CollectionEvent::Resync { id } => {
+                    // st keeps a conversation's subscription and retries it itself; it says why
+                    // so the last copy shown can say it is stale (the owner's host is away).
+                    CollectionEvent::Resync { id, code, message: Some(message) } if id.starts_with(CONVERSATION) => {
+                        let Some(current) = conversing.iter().find(|current| current.id == id) else { continue };
+                        let message = st3_client::plain_message(code.as_ref(), &message);
+                        if updates.send(Update::ConversationFailed { target: current.target.clone(), message, permanent: false }).is_err() {
+                            return Ended::Closed;
+                        }
+                    }
+                    CollectionEvent::Resync { id, .. } => {
                         if let Some(window) = Window::from_id(&id)
                             && let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None).await
                         {
