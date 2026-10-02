@@ -300,6 +300,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn replacement_mailbox_waits_when_the_graph_last_saw_an_exit_that_names_no_incarnation() {
+        // After a daemon restart the new daemon records the dead seat as exited without an
+        // incarnation, and the replacement's driver can bind before it publishes `starting`.
+        for status in ["exited", "vanished"] {
+            let store = Store::open_memory("node").unwrap();
+            ready(&store, "previous");
+            store
+                .append_claim(&claim(
+                    "agent/eval.worker",
+                    "runtime.observed",
+                    json!({"status":status,"runtime_id":"eval.worker"}),
+                    "previous-gone",
+                ))
+                .unwrap();
+            store
+                .append_claim(&claim(
+                    "agent/eval.worker",
+                    "harness.observed",
+                    json!({"state":"starting","driver":"opencode","incarnation_id":"replacement"}),
+                    "replacement-starting",
+                ))
+                .unwrap();
+            let replacement = Fence::new("agent/eval.worker", "replacement", "delivery");
+            assert_eq!(
+                store.bind_mailbox(&replacement).unwrap_err().code,
+                "mailbox-session-starting",
+                "{status}"
+            );
+            // Without the replacement's own starting evidence nothing is waited for.
+            assert_eq!(
+                store
+                    .bind_mailbox(&Fence::new("agent/eval.worker", "foreign", "delivery"))
+                    .unwrap_err()
+                    .code,
+                "stale-mailbox-session"
+            );
+        }
+    }
+
+    #[test]
     fn mailbox_can_bind_before_the_native_provider_reports_ready() {
         let store = Store::open_memory("node").unwrap();
         store

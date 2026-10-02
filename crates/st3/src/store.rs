@@ -16279,12 +16279,13 @@ fn check_mailbox_incarnation(
     let fields = runtime.get("fields").unwrap_or(&runtime);
     let live = fields.get("status").and_then(Value::as_str) == Some("running")
         && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
-    let predecessor = fields
-        .get("incarnation_id")
-        .and_then(Value::as_str)
-        .is_some_and(|incarnation| incarnation != fence.incarnation);
+    // A runtime observation that does not name this incarnation describes something older: a
+    // predecessor, or the daemon's own "exited" for a seat that died while no daemon watched,
+    // which names no incarnation at all. Only an observation of this very incarnation is final.
+    let describes_another = fields.get("incarnation_id").and_then(Value::as_str)
+        != Some(fence.incarnation.as_str());
     if !live
-        && (predecessor
+        && (describes_another
             || matches!(
                 fields.get("status").and_then(Value::as_str),
                 None | Some("starting")
