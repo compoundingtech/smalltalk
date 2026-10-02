@@ -2909,6 +2909,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fence_carries_every_schema_fence_field() {
+        // runtime.stop/restart/reset require runtime_desired_revision; a missing typed field makes them unsendable.
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+        ))
+        .unwrap();
+        let declared: std::collections::BTreeSet<&str> = schema["$defs"]["Fence"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let typed = serde_json::to_value(Fence::default()).unwrap();
+        let typed: std::collections::BTreeSet<&str> = typed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(typed, declared);
+    }
+
     const EMPTY_PAGE: &str = r#"{
         "api_version":"st3.client.v0",
         "request_id":"request/test",
