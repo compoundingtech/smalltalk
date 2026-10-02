@@ -438,7 +438,8 @@ submits the runtime resource ID as `target_id` and copies its `incarnation_id` a
 
 `agent.stop` takes `{ "agent": "agent/NAME", "reason": "optional explanation" }`;
 `agent.start` takes `{ "agent": "agent/NAME" }`. These require `control.runtimes` and the
-same concrete-person/local-agent authority policy as `agent.create` (including free mode).
+same authority as `agent.create`: the session's concrete person, or a local agent acting as
+itself (free mode).
 Stop publishes the same desired stop as `st agents stop`, even if no runtime is live, and
 preserves the immutable declaration. Start restores the unambiguous preceding agent
 declaration with its original identity and host, like `st agents start` without overrides.
