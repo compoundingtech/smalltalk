@@ -631,10 +631,13 @@ them, and every node deletes the same ones:
 1. **Seal.** Each participant publishes `checkpoint.sealed`, naming the envelopes it holds from
    before the cut. The participants are every writer the node has heard of, less those that left
    the fleet and those a person excused.
-2. **Verify.** Once every participant has sealed the same envelopes, each node plans the drops. It
-   proves on a copy of its store that deleting them changes neither the graph nor any reader's
-   answer, then publishes `checkpoint.verified` with the digest of the drops.
-3. **Trim.** When every participant verified the same drops, the checkpoint is stable. Each node
+2. **Verify.** Once every participant has sealed the same envelopes and rules, each node plans
+   the drops from the claims of those envelopes, less repaired originals: whether a node holds a
+   repaired original depends on whether it admitted it before the repair arrived. It proves on a
+   copy of its store that deleting them changes neither the graph nor any reader's answer, then
+   publishes `checkpoint.verified` with the digests of the drops, the kept claims, the graph and
+   the answers. A node verifies a checkpoint once.
+3. **Trim.** When every participant verified the same digests, the checkpoint is stable. Each node
    first records a tombstone for every envelope and claim it drops, then deletes them in chunks.
    After a crash, the next pass finishes the trim. The tombstones stand in for the dropped
    envelopes in the inventory. The authority digest does not change, and peers, including builds
@@ -658,6 +661,11 @@ st replication checkpoint excuse node-c --reason "away for a week" --as person/o
 
 An excusal fences nothing. What the excused writer wrote while away still replicates when it
 returns, and its next seal ends the excusal.
+
+When verifications differ, that checkpoint never becomes stable, and the next due checkpoint
+tries again. `status` names which digests differ for each participant. Seals that differ in
+`rules` mean the nodes run builds with different checkpoint rules; they wait until every
+participant runs the same rules.
 
 If a trim finds that a deletion would change the graph, it rolls that deletion back and stops. It
 records a `checkpoint-trim-graph-changed` diagnostic, and the node seals nothing more until a

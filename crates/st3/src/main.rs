@@ -8306,8 +8306,14 @@ fn render_checkpoint_status(status: &st3::store::CheckpointStatusView) -> String
             output.push_str(&format!("  differs     {writer}: {difference}\n"));
         }
         output.push_str(&format!("  verified    {}\n", names(&pending.verified)));
+        for (writer, difference) in &pending.verifications_differ {
+            output.push_str(&format!("  verifies    {writer}: different {difference}\n"));
+        }
         if !pending.verifications_agree {
-            output.push_str("  verifications disagree; see daemon diagnostics\n");
+            output.push_str(
+                "  verifications disagree, so this checkpoint is not stable; the next due \
+                 checkpoint tries again\n",
+            );
         }
     }
     output

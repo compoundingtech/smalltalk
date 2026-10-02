@@ -193,6 +193,7 @@ fn sync(nodes: &[&Store]) {
                     .unwrap();
                 target.validate_replication_backlog().unwrap();
                 target.project_replication_backlog().unwrap();
+                target.apply_replication_repairs().unwrap();
             }
         }
     }
@@ -656,6 +657,158 @@ fn stable_pair(alder: &Store, birch: &Store, context: &CheckpointContext) -> Str
         sync(&[alder, birch]);
     }
     checkpoint_name(newest_due_cut(context.now_unix_ms))
+}
+
+#[test]
+fn a_repaired_original_held_by_one_node_does_not_split_the_verifications() {
+    let scratch = tempfile::tempdir().unwrap();
+    let context = context(scratch.path(), 0);
+    let cut = newest_due_cut(context.now_unix_ms);
+    let [alder, birch, cedar] =
+        ["alder", "birch", "cedar"].map(|name| Store::open_memory(name).unwrap());
+    observe(&alder, 6);
+    observe(&birch, 3);
+    observe(&cedar, 2);
+    let replacement = alder
+        .append_claim(&ClaimInput {
+            subject: "daemon/alder".into(),
+            kind: "daemon.diagnostic".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("severity".into(), json!("warning")),
+                ("code".into(), json!("repair-test")),
+                ("reason".into(), json!("replacement")),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("replacement".into()),
+        })
+        .unwrap();
+    let original = alder
+        .claims_page(None, None, 0, None, false, 10_000)
+        .unwrap()
+        .claims
+        .into_iter()
+        .find(|claim| claim.kind == "daemon.diagnostic" && claim.id != replacement.id)
+        .unwrap()
+        .id;
+    sync(&[&alder, &birch, &cedar]);
+    // Birch's build rejected the original, so it never held its row, and a person repaired
+    // the record there. Alder and cedar admitted the original first and keep its row once the
+    // repair reaches them.
+    let record_ref = {
+        let connection = birch.connection.lock().unwrap();
+        let record_ref = connection
+            .query_row(
+                "SELECT record_ref FROM replica_records WHERE claim_id=?1",
+                [&original],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE replica_records SET state='invalid' WHERE record_ref=?1",
+                [&record_ref],
+            )
+            .unwrap();
+        record_ref
+    };
+    birch
+        .repair_replica_record(
+            &record_ref,
+            &replacement.id,
+            "the receiver rejects this record after an upgrade",
+            "person/operator",
+            "repair-version-skew",
+        )
+        .unwrap();
+    birch
+        .connection
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM claims WHERE id=?1", [&original])
+        .unwrap();
+    sync(&[&alder, &birch, &cedar]);
+    for node in [&alder, &cedar] {
+        assert!(claim_ids(node).contains(&original));
+        assert_eq!(
+            node.replica_record(&record_ref).unwrap().unwrap().state,
+            "repaired"
+        );
+    }
+    assert!(!claim_ids(&birch).contains(&original));
+
+    for round in ["sealed", "verified"] {
+        for node in [&alder, &birch, &cedar] {
+            assert_eq!(kinds(&step(node, &context)), [round]);
+        }
+        sync(&[&alder, &birch, &cedar]);
+    }
+    let claims = alder.checkpoint_claims().unwrap();
+    let checkpoint = checkpoint_name(cut);
+    let verified = first_verifications(&claims, &checkpoint);
+    assert_eq!(
+        verified
+            .values()
+            .map(|(_, terms)| terms)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "{verified:#?}"
+    );
+    for node in [&alder, &birch, &cedar] {
+        assert_eq!(stable_cuts(node), [cut]);
+        assert_eq!(kinds(&step(node, &context)), ["trimmed"]);
+    }
+    assert_eq!(claim_ids(&alder), claim_ids(&cedar));
+    assert_eq!(authority(&alder), authority(&birch));
+    assert_eq!(authority(&alder), authority(&cedar));
+}
+
+#[test]
+fn status_names_what_differs_between_verifications() {
+    let scratch = tempfile::tempdir().unwrap();
+    let context = context(scratch.path(), 0);
+    let cut = newest_due_cut(context.now_unix_ms);
+    let checkpoint = checkpoint_name(cut);
+    let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+    observe(&alder, 4);
+    observe(&birch, 3);
+    sync(&[&alder, &birch]);
+    for node in [&alder, &birch] {
+        assert_eq!(kinds(&step(node, &context)), ["sealed"]);
+    }
+    sync(&[&alder, &birch]);
+    assert_eq!(kinds(&step(&alder, &context)), ["verified"]);
+    // Birch verifies a different set of kept claims.
+    let terms = birch
+        .checkpoint_status(context.now_unix_ms, &[])
+        .unwrap()
+        .pending
+        .unwrap()
+        .terms;
+    let (_, mut plan, proof) = birch
+        .plan_checkpoint_through(cut, None, scratch.path())
+        .unwrap();
+    plan.retained_digest = "another".into();
+    birch
+        .publish_verification(&checkpoint, &terms, &plan, &proof)
+        .unwrap();
+    sync(&[&alder, &birch]);
+
+    let pending = alder
+        .checkpoint_status(context.now_unix_ms, &[])
+        .unwrap()
+        .pending
+        .unwrap();
+    assert!(!pending.verifications_agree);
+    assert_eq!(
+        pending.verifications_differ,
+        BTreeMap::from([("birch".to_owned(), "retained claims".to_owned())])
+    );
+    assert_eq!(pending.sealed, names(&["alder", "birch"]));
+    assert!(pending.disagreeing.is_empty());
+    assert!(stable_cuts(&alder).is_empty());
 }
 
 #[test]

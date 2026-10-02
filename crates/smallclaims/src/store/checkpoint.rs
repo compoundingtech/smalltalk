@@ -135,7 +135,8 @@ pub struct SealedEnvelope {
     pub records: usize,
 }
 
-/// The envelopes before a cut and their admitted claims, in canonical order.
+/// The envelopes before a cut and their admitted claims, less repaired originals, in canonical
+/// order.
 #[derive(Clone, Debug, Default)]
 pub struct SealedSet {
     pub cut_unix_ms: u128,
@@ -630,12 +631,17 @@ impl Store {
             .query_map([], |row| row.get::<_, Option<String>>(0))?
             .filter_map(|row| row.transpose())
             .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        // A repaired original is left out, as projections leave it out: a node holds its row
+        // only when it admitted the original before the repair arrived, so including it would
+        // make the set, and every digest of it, differ between nodes that hold the same
+        // envelopes.
         let claims = connection
             .prepare(&format!(
                 "SELECT {CLAIM_COLUMNS}, records.writer, records.sequence, records.envelope_hash,
                         records.state
                  FROM claims JOIN batches ON batches.id=claims.batch_id
                  JOIN replica_records records ON records.claim_id=claims.id
+                 WHERE records.state<>'repaired'
                  ORDER BY {CANONICAL_ORDER}"
             ))?
             .query_map([], |row| {
@@ -757,7 +763,7 @@ impl Store {
         let seal_rowid = through_rowid.map_or(seal_rowid, |through| through.min(seal_rowid));
         let cut = i64::try_from(cut_unix_ms)?;
         // As in `checkpoint_sealed_set_through`: an envelope is before the cut when it and every
-        // claim admitted from it are dated before the cut.
+        // claim admitted from it, less repaired originals, are dated before the cut.
         let identities = connection
             .prepare(
                 "SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash
@@ -770,6 +776,7 @@ impl Store {
                        WHERE records.writer=envelopes.writer
                          AND records.sequence=envelopes.sequence
                          AND records.envelope_hash=envelopes.envelope_hash
+                         AND records.state<>'repaired'
                          AND CAST(claims.accepted_at_unix_ms AS INTEGER) >= ?1)
                  UNION
                  SELECT writer, sequence, envelope_hash FROM checkpoint_envelopes
