@@ -246,49 +246,51 @@ fn seat_runtime(connection: &Connection, seat: &str) -> Result<Option<(String, O
     Ok(None)
 }
 
+/// What the sweep needs to know about a parent seat: its declaration's kind and its newest
+/// runtime status and incarnation.
+struct Seat {
+    declared: Option<String>,
+    runtime: Option<(String, Option<String>)>,
+}
+
+fn seat(connection: &Connection, agent: &str) -> Result<Seat> {
+    Ok(Seat {
+        declared: connection
+            .query_row(
+                "SELECT kind FROM desired WHERE subject=?1",
+                [agent],
+                |row| row.get(0),
+            )
+            .optional()?,
+        runtime: seat_runtime(connection, agent)?,
+    })
+}
+
 /// Why an open subagent must end now, as its outcome and reason, or `None` while it may run.
-fn ending(
-    connection: &Connection,
-    subagent: &SubagentView,
-    now: u64,
-) -> Result<Option<(&'static str, String)>> {
-    let declared: Option<String> = connection
-        .query_row(
-            "SELECT kind FROM desired WHERE subject=?1",
-            [&subagent.agent],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if declared.as_deref() != Some("agent") {
-        return Ok(Some((
-            "seat-stopped",
-            "its seat was stopped or removed".into(),
-        )));
+fn ending(seat: &Seat, subagent: &SubagentView, now: u64) -> Option<(&'static str, String)> {
+    if seat.declared.as_deref() != Some("agent") {
+        return Some(("seat-stopped", "its seat was stopped or removed".into()));
     }
-    match seat_runtime(connection, &subagent.agent)? {
+    match &seat.runtime {
         Some((status, _)) if status == "stopped" => {
-            return Ok(Some(("seat-stopped", "its seat was stopped".into())));
+            return Some(("seat-stopped", "its seat was stopped".into()));
         }
         Some((status, _))
             if matches!(status.as_str(), "exited" | "vanished" | "absent" | "failed") =>
         {
-            return Ok(Some(("harness-exited", format!("its harness {status}"))));
+            return Some(("harness-exited", format!("its harness {status}")));
         }
-        Some((_, Some(incarnation))) if incarnation != subagent.incarnation_id => {
-            return Ok(Some((
+        Some((_, Some(incarnation))) if *incarnation != subagent.incarnation_id => {
+            return Some((
                 "harness-exited",
                 format!("its harness restarted as incarnation {incarnation}"),
-            )));
+            ));
         }
         _ => {}
     }
-    if subagent.expired_at(now) {
-        return Ok(Some((
-            "expired",
-            "its lease ran out without a renewal".into(),
-        )));
-    }
-    Ok(None)
+    subagent
+        .expired_at(now)
+        .then(|| ("expired", "its lease ran out without a renewal".into()))
 }
 
 impl Store {
@@ -322,11 +324,16 @@ impl Store {
                 )
                 .map_err(internal)?
                 .max(low_water);
+            let mut seats = BTreeMap::<String, Seat>::new();
             for subagent in
                 open_subagents_at(&connection, Scope::RecordedOn(&self.origin, low_water))
                     .map_err(internal)?
             {
-                match ending(&connection, &subagent, now).map_err(internal)? {
+                if !seats.contains_key(&subagent.agent) {
+                    let state = seat(&connection, &subagent.agent).map_err(internal)?;
+                    seats.insert(subagent.agent.clone(), state);
+                }
+                match ending(&seats[&subagent.agent], &subagent, now) {
                     Some((outcome, reason)) => stale.push((subagent, outcome, reason)),
                     None => {
                         let next = sweep
