@@ -26435,7 +26435,7 @@ agent "test/empty" { command "true" }
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO replication_peers(peer, status, last_success_at_unix_ms, updated_at_unix_ms)
+                "INSERT OR REPLACE INTO replication_peers(peer, status, last_success_at_unix_ms, updated_at_unix_ms)
                  VALUES ('target', 'up', ?1, ?2)",
                 params![
                     now_ms().saturating_sub(91_000).to_string(),
@@ -26447,6 +26447,134 @@ agent "test/empty" { command "true" }
             store
                 .record_peer_failure("target", "down", "request timed out")
                 .unwrap()
+        );
+    }
+
+    /// A peer that stops answering (#1020) shows its failure at once, and stops counting as up
+    /// once it has missed an exchange; a failure within one quiet interval of an exchange in
+    /// the other direction keeps it up. The next exchange clears the failure.
+    #[test]
+    fn a_failed_attempt_after_a_missed_exchange_ends_up() {
+        let fleet = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let store = Store::open_memory("amber").unwrap();
+        store.bind_fleet(fleet).unwrap();
+        let last_exchange = |ago: u128| {
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT OR REPLACE INTO replication_peers(peer, status, last_success_at_unix_ms, updated_at_unix_ms)
+                     VALUES ('cobalt', 'up', ?1, ?1)",
+                    [now_ms().saturating_sub(ago).to_string()],
+                )
+                .unwrap();
+        };
+        let peer = || {
+            store
+                .replication_status(true, Some(fleet), &["cobalt".into()])
+                .unwrap()
+                .peers
+                .remove(0)
+        };
+
+        last_exchange(10_000);
+        store
+            .record_peer_failure("cobalt", "down", "request timed out")
+            .unwrap();
+        let status = peer();
+        assert_eq!(
+            status.status, "up",
+            "a one-way failure soon after an exchange"
+        );
+        assert_eq!(status.last_error.as_deref(), Some("request timed out"));
+        assert!(status.last_failure_at_unix_ms.is_some());
+
+        last_exchange(40_000);
+        assert!(
+            !store
+                .record_peer_failure("cobalt", "down", "request timed out")
+                .unwrap(),
+            "the published transport status keeps its grace"
+        );
+        let status = peer();
+        assert_eq!(status.status, "last-seen");
+        assert_eq!(status.last_error.as_deref(), Some("request timed out"));
+        assert!(!store.replication_peer_up("cobalt").unwrap().0);
+
+        let other = Store::open_memory("cobalt").unwrap();
+        other.bind_fleet(fleet).unwrap();
+        let exchange = other
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        store
+            .receive_replication_exchange("cobalt", fleet, &exchange)
+            .unwrap();
+        let status = peer();
+        assert_eq!(status.status, "up");
+        assert!(status.last_error.is_none());
+        assert!(status.last_failure_at_unix_ms.is_none());
+        assert!(store.replication_peer_up("cobalt").unwrap().0);
+    }
+
+    /// A measurement the peer has not refreshed for a quiet interval says what both held then
+    /// (#1020): status marks it stale and counts the envelopes this node gained since.
+    #[test]
+    fn an_old_sync_measurement_is_stale_and_counts_what_was_added_since() {
+        let fleet = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let store = Store::open_memory("amber").unwrap();
+        store.bind_fleet(fleet).unwrap();
+        let other = Store::open_memory("cobalt").unwrap();
+        other.bind_fleet(fleet).unwrap();
+        let exchange = other
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        store
+            .receive_replication_exchange("cobalt", fleet, &exchange)
+            .unwrap();
+        let sync = |store: &Store| {
+            store
+                .replication_status(true, Some(fleet), &["cobalt".into()])
+                .unwrap()
+                .peers
+                .remove(0)
+                .sync
+                .unwrap()
+        };
+        let fresh = sync(&store);
+        assert!(!fresh.stale);
+        assert_eq!(fresh.added_since_measured_envelopes, 0);
+
+        for index in 0..20 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/frozen-peer/{index}"),
+                    kind: "custom.frozen-peer.note".into(),
+                    actor: Some("person/tester".into()),
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        store
+            .replication_sync
+            .lock()
+            .unwrap()
+            .get_mut("cobalt")
+            .unwrap()
+            .measured
+            .as_mut()
+            .unwrap()
+            .measured_at_unix_ms -= 40_000;
+        let old = sync(&store);
+        assert!(old.stale);
+        assert_eq!(old.local_only_envelopes, fresh.local_only_envelopes);
+        assert!(
+            old.added_since_measured_envelopes >= 20,
+            "{}",
+            old.added_since_measured_envelopes
         );
     }
 

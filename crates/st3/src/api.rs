@@ -4923,9 +4923,7 @@ fn unread_current_seat_counts(
             .and_then(|owner| owner.member.as_ref())
             .map(|member| member.host.as_str())
             && host != store.origin()
-            && !store
-                .replication_peer_last_success(host)?
-                .is_some_and(|at| now.saturating_sub(at) < 90_000)
+            && !store.replication_peer_up(host)?.0
         {
             continue;
         }
@@ -5287,6 +5285,58 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 })
                 .map(|peer| format!("{}={}", peer.peer, peer.status))
                 .collect::<Vec<_>>();
+            // A member that listens is meant to answer, so its absence warns. A dial-out
+            // member, or a config peer outside membership, can be away for hours, as a sleeping
+            // laptop is; its absence is reported without a warning.
+            let now = client_now_ms();
+            let listening = state
+                .store
+                .fleet_view_sealed()
+                .map(|view| {
+                    view.members
+                        .into_iter()
+                        .filter(|member| member.state == "current" && member.mode == "listening")
+                        .map(|member| member.name)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let (absent, away): (Vec<_>, Vec<_>) = replication
+                .peers
+                .iter()
+                .filter(|peer| peer.status == "last-seen")
+                .partition(|peer| listening.contains(&peer.peer));
+            let describe = |peers: Vec<&crate::model::ReplicationPeerStatus>| {
+                peers
+                    .into_iter()
+                    .map(|peer| {
+                        format!(
+                            "{} {}{}{}",
+                            peer.peer,
+                            peer.last_success_at_unix_ms
+                                .map(|at| format!(
+                                    "has not exchanged for {}",
+                                    elapsed_words(now.saturating_sub(at))
+                                ))
+                                .unwrap_or_else(|| "has never exchanged with this node".into()),
+                            peer.sync
+                                .as_ref()
+                                .map(|sync| sync.local_only_envelopes
+                                    + sync.added_since_measured_envelopes)
+                                .filter(|unsent| *unsent != 0)
+                                .map(|unsent| format!(
+                                    "; this node has not sent it {unsent} envelopes"
+                                ))
+                                .unwrap_or_default(),
+                            peer.last_error
+                                .as_deref()
+                                .map(|error| format!(" (last attempt: {error})"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let absent = describe(absent);
+            let away = describe(away);
             let unresolved = replication.invalid_records;
             let diverged = replication
                 .peers
@@ -5322,7 +5372,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 || first_sync_failed.is_some()
             {
                 "fail"
-            } else if !unavailable.is_empty() || unresolved != 0 {
+            } else if !unavailable.is_empty() || !absent.is_empty() || unresolved != 0 {
                 "warn"
             } else {
                 "pass"
@@ -5331,7 +5381,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    "{}{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    absent
+                        .iter()
+                        .chain(&away)
+                        .map(|peer| format!("{peer}; "))
+                        .collect::<String>(),
                     first_sync_failed
                         .map(|first| format!(
                             "the first sync with {} ended with a different graph, and a heal \
@@ -5851,6 +5906,17 @@ async fn replication_heal_next(
         signal_changed(&state);
     }
     Ok(Json(step))
+}
+
+/// A span such as `45s`, `12m` or `3h` for a doctor message.
+fn elapsed_words(ms: u128) -> String {
+    let seconds = ms / 1_000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
 }
 
 fn replication_receive_has_new_data(received: usize) -> bool {

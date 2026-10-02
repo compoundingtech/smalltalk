@@ -2288,9 +2288,7 @@ fn machine_resources(
             operational_actionable,
             operational_reasons,
         ) = if host_id != local_host && configured_hosts.contains(&host_id) {
-            let last_success_at = state.store.replication_peer_last_success(&name)?;
-            let recent =
-                last_success_at.is_some_and(|at| client_now_ms().saturating_sub(at) < 90_000);
+            let (recent, last_success_at) = state.store.replication_peer_up(&name)?;
             (
                 if recent { "reachable" } else { "last-seen" },
                 vec![json!({
