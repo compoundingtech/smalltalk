@@ -4419,6 +4419,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook 0.3.18",
  "st3",
  "st3-client",
