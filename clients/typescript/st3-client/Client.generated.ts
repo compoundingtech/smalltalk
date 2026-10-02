@@ -2,6 +2,7 @@
 import { API_VERSION } from './Models.generated';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, Capabilities, DocumentContent, EnvelopeOf,
+    ResourcesFilter, ResourcesPage,
     SubjectDefinition, UsagePeriod,
     ConversationChanges, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelineEntry, TimelinePage,
@@ -321,6 +322,7 @@ export class St3Client {
     async missionsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/missions/${encodeURIComponent(routedId(id))}`); }
     async workList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/work' + query(options)); }
     async workGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/work/${encodeURIComponent(routedId(id))}`); }
+    async resourcesList(filters: ResourcesFilter = {}, options: PageOptions = {}): Promise<EnvelopeOf<ResourcesPage>> { return this.get('/v1/client/resources' + query({ ...filters, ...options })); }
     async agentsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/agents' + query(options)); }
     async agentsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/agents/${encodeURIComponent(routedId(id))}`); }
     async agentDeclarationGet(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<AgentDeclaration>> { return this.get(`/v1/client/agent-declarations/${encodeURIComponent(routedId(id))}` + query({ revision, show_env_values: showEnvValues })); }

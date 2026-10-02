@@ -164,6 +164,7 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Missions | `/missions`, `/missions/{id}` | updated time descending, ID |
 | Work | `/work`, `/work/{id}` | ready first, readiness epoch, path, ID |
 | Agents | `/agents`, `/agents/{id}` | presentation name, ID |
+| Resource observations | `/resources` (list only) | resource subject ID |
 | Runtimes | `/runtimes`, `/runtimes/{id}` | owning agent, runtime kind, ID |
 | Lanes | `/lanes`, `/lanes/{id}` | open lanes first, ID |
 | Operations | `/operations`, `/operations/{id}` | severity descending, component, ID |
@@ -193,6 +194,42 @@ until the page omits the notice.
 IDs are stable opaque strings with a type prefix. Renames change labels, not IDs. A detail response
 uses the same representation as its list item plus its documented detail fields. Deletion is
 represented by an event tombstone; an ID is never reused.
+
+### Resource observations
+
+`GET /v1/client/resources` lists the latest `resource.observed` claim for each resource subject,
+in canonical replicated claim order, not arrival order. It requires `read.projections`, including
+for paired devices. The rebuildable indexed projection serves bounded SQL pages rather than
+scanning the claim log.
+
+Filters are conjunctive and optional:
+
+- `opened_by=agent/...` matches `facts.opened_by`; `opened_by=mission-run/...` matches
+  `facts.opened_by_run`. Other subject types are rejected.
+- `kind=vcs.pull-request` matches the resource vocabulary kind, not the claim kind.
+- `subject_prefix=resource/github/...` matches a literal subject prefix.
+- `limit` and opaque `cursor` use the negotiated page limits. Repeat the same filters when
+  continuing a page.
+
+Each item contains `id` (resource subject), `kind` (resource vocabulary), `facts` (the latest
+observation's complete facts), `observed_at` (RFC 3339 UTC time at which the latest observation's
+claim was accepted), and nullable `opened_by` / `opened_by_run` copied from those facts. Older facts
+are not merged into a later observation, so clearing or changing attribution removes the old
+filter match.
+
+The response uses the normal `st3.client.v0` envelope and snapshot, with
+`value: {kind: "page", collection: "resources", filters, items, page, sync?}`.
+`page` contains `limit`, `has_more`, `next_cursor`, and `cursor_expires_at`. Pages retain the first
+snapshot while the resource projection is unchanged; unrelated claims do not invalidate them.
+A resource projection change or expiry returns `page-cursor-expired` (HTTP 410), and the client
+restarts pagination. The cursor is bound to its filters and page size.
+
+Rust exposes `Client::resources_list` with `ResourcesFilter` and a typed resource-observation page;
+Swift and TypeScript expose `resourcesList` with equivalent typed filters and items. Resource
+observations are distinct from operational resources: their `kind` is an open resource-vocabulary
+string, not the operational resource union's discriminator. This list route does not add a
+`resources` subscription to `st3.client.collections.v0`.
+
 
 ### Applied subject definitions
 

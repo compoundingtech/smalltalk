@@ -166,6 +166,15 @@ transactional digest machinery and rebuilds shared projections once, correcting 
 creation/change dates from claim facts. New writer connections must register the projection
 functions, including isolated checkpoint proof connections.
 
+The indexed `resource_observations` projection participates in the complete shared table digest
+and canonical replay audit. The projection version identifying its layout is included in the
+runtime schema compatibility identity alongside the claim vocabulary digest. Mixed builds with and
+without this projection continue exchanging admitted claim authority, but do not compare their
+incompatible projection maps as if they represented the same graph. After upgrade, the table is
+backfilled from retained admitted `resource.observed` claims and projection comparisons resume.
+This changes no claim or resource vocabulary and requires no new replication payload fields.
+
+
 ## Add any machine
 
 Install st on the new machine and configure the person who operates it, as described in the

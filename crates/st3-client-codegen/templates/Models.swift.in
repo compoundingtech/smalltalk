@@ -208,6 +208,26 @@ public enum Resource: Codable, Sendable, Identifiable {
     public func encode(to encoder: Encoder) throws { switch self { case .attention(let v): try v.encode(to: encoder); case .message(let v): try v.encode(to: encoder); case .launch(let v): try v.encode(to: encoder); case .launchVariant(let v): try v.encode(to: encoder); case .launchDecision(let v): try v.encode(to: encoder); case .launchApproval(let v): try v.encode(to: encoder); case .mission(let v): try v.encode(to: encoder); case .work(let v): try v.encode(to: encoder); case .agent(let v): try v.encode(to: encoder); case .runtime(let v): try v.encode(to: encoder); case .observer(let v): try v.encode(to: encoder); case .subscription(let v): try v.encode(to: encoder); case .lane(let v): try v.encode(to: encoder); case .machine(let v): try v.encode(to: encoder); case .device(let v): try v.encode(to: encoder); case .operation(let v): try v.encode(to: encoder); case .history(let v): try v.encode(to: encoder); case .session(let v): try v.encode(to: encoder); case .glass(let v): try v.encode(to: encoder) } }
     public var id: String { switch self { case .attention(let v): v.id; case .message(let v): v.id; case .launch(let v): v.id; case .launchVariant(let v): v.id; case .launchDecision(let v): v.id; case .launchApproval(let v): v.id; case .mission(let v): v.id; case .work(let v): v.id; case .agent(let v): v.id; case .runtime(let v): v.id; case .observer(let v): v.id; case .subscription(let v): v.id; case .lane(let v): v.id; case .machine(let v): v.id; case .device(let v): v.id; case .operation(let v): v.id; case .history(let v): v.id; case .session(let v): v.id; case .glass(let v): v.id } }
 }
+public struct ResourceObservation: Codable, Sendable, Identifiable {
+    public let id, kind, observedAt: String
+    public let facts: [String: JSONValue]
+    public let openedBy, openedByRun: String?
+    enum CodingKeys: String, CodingKey { case id, kind, facts, observedAt = "observed_at", openedBy = "opened_by", openedByRun = "opened_by_run" }
+}
+public struct ResourcesFilter: Codable, Sendable {
+    public var openedBy, kind, subjectPrefix: String?
+    public init(openedBy: String? = nil, kind: String? = nil, subjectPrefix: String? = nil) {
+        self.openedBy = openedBy; self.kind = kind; self.subjectPrefix = subjectPrefix
+    }
+    enum CodingKeys: String, CodingKey { case kind, openedBy = "opened_by", subjectPrefix = "subject_prefix" }
+}
+public struct ResourcesPage: Codable, Sendable {
+    public let kind, collection: String
+    public let filters: [String: String]
+    public let items: [ResourceObservation]
+    public let page: PageInfo
+    public let sync: SyncNotice?
+}
 public struct ResourcePage: Codable, Sendable { public let kind: String; public let collection: String; public let filters: [String: String]; public let items: [Resource]; public let page: PageInfo; public let sync: SyncNotice? }
 public struct SyncNotice: Codable, Sendable { public let state: String; public let peers: [SyncPeer] }
 public struct SyncPeer: Codable, Sendable { public let hostID: String; public let peerOnlyEnvelopes, localOnlyEnvelopes: UInt64; public let lastExchangeAt: String?; public let estimatedCatchUpSeconds: UInt64?; public let divergedSince: String?; enum CodingKeys: String, CodingKey { case hostID = "host_id", peerOnlyEnvelopes = "peer_only_envelopes", localOnlyEnvelopes = "local_only_envelopes", lastExchangeAt = "last_exchange_at", estimatedCatchUpSeconds = "estimated_catch_up_seconds", divergedSince = "diverged_since" } }

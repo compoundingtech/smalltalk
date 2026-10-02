@@ -118,6 +118,7 @@ public actor St3Client {
     public func missionsGet(id: String) async throws -> Envelope<Resource> { try await resource("missions", id: id) }
     public func workList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("work", cursor: cursor, limit: limit, history: history) }
     public func workGet(id: String) async throws -> Envelope<Resource> { try await resource("work", id: id) }
+    public func resourcesList(filters: ResourcesFilter = .init(), cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ResourcesPage> { var query: [URLQueryItem] = []; if let openedBy = filters.openedBy { query.append(.init(name: "opened_by", value: openedBy)) }; if let kind = filters.kind { query.append(.init(name: "kind", value: kind)) }; if let subjectPrefix = filters.subjectPrefix { query.append(.init(name: "subject_prefix", value: subjectPrefix)) }; if let cursor { query.append(.init(name: "cursor", value: cursor)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/resources", query: query) }
     public func agentsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("agents", cursor: cursor, limit: limit, history: history) }
     public func agentsGet(id: String) async throws -> Envelope<Resource> { try await resource("agents", id: id) }
     public func agentDeclarationGet(id: String, revision: String? = nil, showEnvValues: Bool = false) async throws -> Envelope<AgentDeclaration> { var query: [URLQueryItem] = [.init(name: "show_env_values", value: showEnvValues ? "true" : "false")]; if let revision { query.append(.init(name: "revision", value: revision)) }; return try await get("v1/client/agent-declarations/\(id)", query: query) }
@@ -228,6 +229,8 @@ public actor St3Client {
     private func post<T: Decodable & Sendable, Body: Encodable>(_ path: String, _ body: Body) async throws -> T { try await request(path, query: [], method: "POST", body: try JSONEncoder().encode(body)) }
     private func request<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem], method: String, body: Data?, idempotencyKey: String? = nil) async throws -> T {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!; let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")); components.percentEncodedPath = "/" + ([basePath, path].filter { !$0.isEmpty }.joined(separator: "/")); if !query.isEmpty { components.queryItems = query }
+        // Query parameters are decoded as form data by the server, where an unescaped "+" is a space.
+        components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         var request = URLRequest(url: components.url!); request.httpMethod = method; request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }; if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
