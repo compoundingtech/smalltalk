@@ -684,6 +684,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 settings: args.member.settings(),
                 legacy_secret_file: None,
                 fabric_protocol: None,
+                runtime: st3::store::runtime(),
+                version: env!("CARGO_PKG_VERSION").into(),
             })
             .await?;
             if let Some(path) = code_path {
@@ -1389,6 +1391,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             &secret_file,
             &settings,
             args.fabric_protocol.clone(),
+            st3::store::runtime(),
         )?;
         println!(
             "{} is the anchor of fleet {}. It admits itself and signs its history when st3 starts.",
@@ -1420,6 +1423,8 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             settings,
             legacy_secret_file: Some(secret_file),
             fabric_protocol: args.fabric_protocol.clone(),
+            runtime: st3::store::runtime(),
+            version: env!("CARGO_PKG_VERSION").into(),
         })
         .await?;
         anyhow::ensure!(

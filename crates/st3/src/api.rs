@@ -5983,15 +5983,10 @@ async fn fleet_invite_list(
         .map(Json)
 }
 
-fn internal_error(error: impl std::fmt::Display) -> St3Error {
-    St3Error::new("internal", error.to_string())
-}
-
 async fn fleet_invite_create(
     State(state): State<AppState>,
     Json(request): Json<FleetInviteRequest>,
 ) -> Result<Json<FleetInviteCreated>, ApiError> {
-    use crate::fleet::code::{CodeEndpoint, JoinCode, fingerprint};
     concrete_person(&request.person)?;
     let fleet_id = state.fleet_id.clone().ok_or_else(|| {
         ApiError::bad(St3Error::new(
@@ -6003,92 +5998,22 @@ async fn fleet_invite_create(
     let node = state.node.clone();
     let created = blocking_action(move || {
         let via = request.via.clone().unwrap_or_else(|| "auto".into());
-        if !matches!(via.as_str(), "auto" | "tailscale" | "fabric" | "loopback") {
-            return Err(St3Error::new(
-                "invalid-via",
-                "--via is auto, tailscale, fabric, or loopback",
-            ));
-        }
-        let membership = store.fleet_membership().map_err(internal_error)?;
-        let crate::fleet::MemberState::Current(own) = membership.state(&node) else {
-            return Err(St3Error::new(
-                "not-a-member",
-                "this node is not a current fleet member",
-            ));
-        };
-        let wanted = |transport: &str| via == "auto" || via == transport;
-        let text = |value: &Value, field: &str| value[field].as_str().map(str::to_owned);
-        let endpoints = own
-            .endpoints
-            .iter()
-            .filter_map(|endpoint| {
-                let transport = endpoint["transport"].as_str()?;
-                if !wanted(transport) {
-                    return None;
-                }
-                match transport {
-                    "tailscale" => Some(CodeEndpoint::Tailscale(text(endpoint, "address")?)),
-                    "fabric" => Some(CodeEndpoint::Fabric {
-                        node: text(endpoint, "node")?,
-                        protocol: text(endpoint, "protocol")?,
-                    }),
-                    "loopback" => Some(CodeEndpoint::Loopback(text(endpoint, "address")?)),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
-        if endpoints.is_empty() {
-            return Err(St3Error::new(
-                "no-endpoints",
-                format!(
-                    "this member advertises no {} endpoint yet; is its replication worker running?",
-                    if via == "auto" {
-                        "reachable"
-                    } else {
-                        via.as_str()
-                    }
-                ),
-            ));
-        }
-        let transports = endpoints
-            .iter()
-            .map(|endpoint| match endpoint {
-                CodeEndpoint::Tailscale(_) => "tailscale".to_owned(),
-                CodeEndpoint::Fabric { .. } => "fabric".to_owned(),
-                CodeEndpoint::Loopback(_) => "loopback".to_owned(),
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let member_key = store
-            .member_public_key()
-            .ok_or_else(|| St3Error::new("no-member-key", "this node has no member key"))?;
-        let invite = store.create_fleet_invite(
-            request.name.as_deref(),
-            std::time::Duration::from_secs(request.expires_seconds),
-            &transports,
-            &request.person,
-            request.migrate,
+        let invitation = crate::fleet::join::invite(
+            &store,
+            &fleet_id,
+            &node,
+            &crate::fleet::join::InviteOptions {
+                name: request.name.clone(),
+                lifetime: std::time::Duration::from_secs(request.expires_seconds),
+                via,
+                person: request.person.clone(),
+                migrate: request.migrate,
+            },
         )?;
-        let code = JoinCode {
-            fleet_id: uuid::Uuid::parse_str(&fleet_id).map_err(internal_error)?,
-            invite: hex::decode(&invite.invite)
-                .ok()
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(|| St3Error::new("internal", "the invite ID is damaged"))?,
-            token: invite.token,
-            fingerprint: fingerprint(&member_key),
-            expires_at: invite.expires_at_unix_ms / 1000,
-            name: request.name.clone(),
-            migrate: request.migrate,
-            endpoints,
-        }
-        .encode()
-        .map_err(internal_error)?;
         Ok(FleetInviteCreated {
-            invite: format!("fleet-invite/{}", invite.invite),
-            code,
-            expires_at_unix_ms: invite.expires_at_unix_ms,
+            invite: invitation.invite,
+            code: invitation.code,
+            expires_at_unix_ms: invitation.expires_at_unix_ms,
         })
     })
     .await?;

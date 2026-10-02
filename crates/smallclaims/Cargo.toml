@@ -7,14 +7,17 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 ciborium = "0.2"
 data-encoding = "2"
-getrandom = "0.3"
+flate2 = "1"
+getrandom = { version = "0.3", features = ["std"] }
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
 serde = { version = "1", features = ["derive"] }
@@ -23,7 +26,8 @@ serde = { version = "1", features = ["derive"] }
 # another dependency turns this on; the crate asks for it so it behaves the same built alone.
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+toml = "0.9"
 uuid = { version = "1", features = ["v7"] }
 
 [features]
@@ -32,5 +36,8 @@ uuid = { version = "1", features = ["v7"] }
 test-support = []
 
 [dev-dependencies]
+futures-util = "0.3"
 proptest = "1"
 tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }

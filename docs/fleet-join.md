@@ -1167,7 +1167,7 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
 - `fleet_claims_are_refused_on_the_public_claim_api`
 - `an_old_build_keeps_fleet_claims_as_unknown_records` (the unknown-kind admission path)
 
-`crates/st3/src/peer.rs`
+`crates/smallclaims/src/sync/worker.rs` (the peer worker; smalltalk's relay routes stay in `crates/st3/src/peer.rs`)
 
 - `a_member_request_needs_a_valid_member_signature`
 - `a_legacy_config_peer_is_accepted_with_hmac_alone`
