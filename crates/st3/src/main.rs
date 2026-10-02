@@ -1956,9 +1956,13 @@ struct PtyServeFabricArgs {
 #[derive(Args)]
 struct PtySendArgs {
     subject: String,
+    /// Text typed as one line and followed by Enter a moment later; with --raw the exact bytes,
+    /// with --key a key name.
     value: String,
+    /// Send exactly these bytes and no Enter: escape sequences, such as a mouse report.
     #[arg(long, conflicts_with = "key")]
     raw: bool,
+    /// Send one named key, such as enter, escape or ctrl+c.
     #[arg(long, conflicts_with = "raw")]
     key: bool,
 }
