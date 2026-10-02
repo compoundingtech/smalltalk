@@ -119,3 +119,11 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.equal(shown[0].at, '');
   assert.deepEqual(shown.slice(1).map(entry => entry.body.text), ['first', 'second']);
 }
+
+// A conversation st is refusing says why, how old what is shown is, and that the phone retries.
+{
+  const { staleLine } = await import('./conversationView.ts');
+  assert.equal(staleLine('the list changed while it was being read', false, null, 0), 'Not loaded yet: the list changed while it was being read. Trying again.');
+  assert.equal(staleLine('willow cannot be reached right now', true, 1_000, 76_000), 'willow cannot be reached right now · shown as of 1m ago · trying again');
+  assert.equal(staleLine('st asked to slow down for a moment', true, 10_000, 22_000), 'st asked to slow down for a moment · shown as of 12s ago · trying again');
+}
