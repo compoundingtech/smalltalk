@@ -22,11 +22,13 @@ futures-util = "0.3"
 getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"
+html-escape = "0.2"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 kdl = "6"
 libc = "0.2"
+lol_html = "2"
 notify = "8"
 pty-client = { git = "https://github.com/compoundingtech/pty-rust", rev = "06c303f708a49a8110a5eb640194deab0561fa3a" }
 pty-core = { git = "https://github.com/compoundingtech/pty-rust", rev = "06c303f708a49a8110a5eb640194deab0561fa3a" }
