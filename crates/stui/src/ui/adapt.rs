@@ -235,7 +235,12 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                             })
                             .unwrap_or_else(|| "An agent".into()),
                         from_id: item.requester_id.clone().unwrap_or_default(),
-                        question: clean_message_text(&item.detail),
+                        question: clean_message_text(
+                            item.request
+                                .as_ref()
+                                .map_or(&item.detail, |request| &request.question),
+                        ),
+                        structured: item.request.clone().map(Box::new),
                     },
                 ),
                 // Home holds only requests and reviews. Messages stay in conversations, and st
@@ -1033,6 +1038,34 @@ mod tests {
                 "error: the harness exited",
             ]
         );
+    }
+
+    #[test]
+    fn a_compacted_conversations_summary_is_one_folded_line() {
+        let notes = (1..=40)
+            .map(|n| format!("{n}. a note from before"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = format!(
+            "<artifact-content-authored-by-others/>\nThis session is being continued from a previous conversation that ran out of context.\n\nSummary:\n{notes}\n40. plan the week."
+        );
+        let rows = json!([
+            {"id": "s1", "sequence": 1, "revision": 1, "timestamp": "2026-10-02T20:50:22Z",
+             "role": "user", "final": true, "type": "content",
+             "body": {"media_type": "text/plain", "text": summary}},
+            {"id": "a1", "sequence": 2, "revision": 1, "timestamp": "2026-10-02T20:50:30Z",
+             "role": "assistant", "final": true, "type": "content",
+             "body": {"media_type": "text/plain", "text": "Picking up where I left off."}},
+        ]);
+        let text = rendered(&rows.to_string());
+        assert!(
+            text.contains("context summary · the conversation was compacted"),
+            "{text}"
+        );
+        assert!(!text.contains("<artifact-content"), "{text}");
+        assert!(text.contains("more lines"), "folded until opened:\n{text}");
+        assert!(!text.contains("Summary:"), "folded until opened:\n{text}");
+        assert!(text.contains("Picking up where I left off."));
     }
 
     fn rendered(fixture: &str) -> String {

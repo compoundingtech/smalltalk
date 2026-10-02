@@ -529,6 +529,7 @@ fn validate_surfaces(
         "VisualizationEdge",
         "VisualizationGroup",
         "StructuredRequest",
+        "PersonUpdate",
         "RequestSubject",
         "RequestAnswerOption",
         "PersonAnswerInput",

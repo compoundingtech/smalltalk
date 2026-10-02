@@ -1279,9 +1279,6 @@ struct DiscoveredItem {
     /// The data types the change belongs to: the item's collection, `comments`, `reactions` or
     /// `mentions`.
     data_types: BTreeSet<String>,
-    /// The item is new: neither a resource nor an older listing knew it, it was not known before
-    /// the observer's watermark, and this is not the baseline.
-    new_item: bool,
     deliver: bool,
 }
 
@@ -1360,6 +1357,9 @@ fn pull_request_needs_review(prior: Option<&Value>, item: &Value) -> bool {
 
 /// The most changed items one resource-change message lists.
 const MESSAGE_ITEMS: usize = 20;
+
+/// The most items and mentions one batched mission request carries.
+const ENTRIES_PER_REQUEST: usize = 50;
 
 /// The repository collections whose items become their own resources, with each item's subject
 /// segment and resource kind.
@@ -1562,7 +1562,6 @@ fn discovered_collection_items(
                 subject,
                 kind,
                 data_types: item_data_types(field, prior, &facts, &changed_fields),
-                new_item,
                 changed_fields,
                 facts,
                 deliver,
@@ -1766,6 +1765,209 @@ fn route_item_to_owner_tx(
     Ok(Some(subject))
 }
 
+/// The new items and mentions one observation adds to a batched delivery, each with its delivery
+/// key and the item claim it came from: every new pull request head, new issue, and new mention of
+/// a named login, on items no live agent owns. An owned item goes to its owner as one message
+/// instead, and an item an earlier observation already sent there is skipped.
+#[allow(clippy::too_many_arguments)]
+fn batch_entries_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    origin: &str,
+    batch_id: &str,
+    subscription_subject: &str,
+    subscription: &crate::model::SubscriptionSpec,
+    mission: &str,
+    repository_identity: &Value,
+    selected: &[String],
+    collection_discoveries: &BTreeMap<String, Vec<(String, String)>>,
+    item_claims: &[(BTreeSet<String>, String, String, Value)],
+    item_mentions: &[(String, String, Value, Vec<Value>)],
+    message_subjects: &mut Vec<String>,
+) -> Result<Vec<(String, String, Value)>, St3Error> {
+    let delivery_scope = subscription_subject
+        .rsplit('/')
+        .next()
+        .expect("a subscription subject has a local name");
+    let mut unowned = Vec::new();
+    for field in selected
+        .iter()
+        .filter(|field| matches!(field.as_str(), "pull_requests" | "issues"))
+    {
+        for (item_subject, claim) in collection_discoveries.get(field).into_iter().flatten() {
+            let Some((_, _, _, item_facts)) = item_claims
+                .iter()
+                .find(|(_, subject, ..)| subject == item_subject)
+            else {
+                continue;
+            };
+            let kind = if field == "pull_requests" {
+                "pull_request"
+            } else {
+                "issue"
+            };
+            let number = item_facts.get("number").and_then(Value::as_u64);
+            let head = item_facts.get("head_sha").and_then(Value::as_str);
+            let delivery_key = canonical_hash(&(
+                mission,
+                delivery_scope,
+                repository_identity,
+                kind,
+                number,
+                head,
+            ))
+            .map_err(internal)?;
+            if routed_to_owner_tx(transaction, &delivery_key)? {
+                continue;
+            }
+            if subscription.owner_message
+                && let Some((owner, why)) =
+                    item_owner_tx(transaction, item_facts).map_err(internal)?
+            {
+                let (title, detail) = item_route_text(item_facts);
+                message_subjects.extend(route_item_to_owner_tx(
+                    transaction,
+                    origin,
+                    batch_id,
+                    subscription_subject,
+                    item_subject,
+                    &owner,
+                    &why,
+                    &title,
+                    &detail,
+                    &delivery_key,
+                    std::slice::from_ref(claim),
+                )?);
+                continue;
+            }
+            let mut entry = json!({"kind": kind, "resource": item_subject, "claim": claim});
+            for name in [
+                "number",
+                "title",
+                "url",
+                "author",
+                "state",
+                "draft",
+                "head_sha",
+                "branch",
+                "opened_by",
+                "opened_by_run",
+            ] {
+                if let Some(value) = item_facts.get(name) {
+                    entry[name] = value.clone();
+                }
+            }
+            unowned.push((delivery_key, claim.clone(), entry));
+        }
+    }
+    for (item_subject, claim, item_facts, mentions) in item_mentions {
+        for mention in mentions {
+            let text = |name: &str| {
+                mention
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            };
+            let login = text("login");
+            // A login that mentions itself tells its person nothing.
+            if text("by").eq_ignore_ascii_case(login)
+                || !subscription
+                    .mentions
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(login))
+            {
+                continue;
+            }
+            let number = item_facts.get("number").and_then(Value::as_u64);
+            let item_title = item_facts
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let delivery_key = canonical_hash(&(
+                "mention",
+                delivery_scope,
+                repository_identity,
+                number,
+                login.to_ascii_lowercase(),
+                text("url"),
+                text("at"),
+            ))
+            .map_err(internal)?;
+            if routed_to_owner_tx(transaction, &delivery_key)? {
+                continue;
+            }
+            if subscription.owner_message
+                && let Some((owner, why)) =
+                    item_owner_tx(transaction, item_facts).map_err(internal)?
+            {
+                let by = Some(text("by"))
+                    .filter(|by| !by.is_empty())
+                    .unwrap_or("someone");
+                message_subjects.extend(route_item_to_owner_tx(
+                    transaction,
+                    origin,
+                    batch_id,
+                    subscription_subject,
+                    item_subject,
+                    &owner,
+                    &why,
+                    &format!(
+                        "{by} mentioned @{login} on #{}: {item_title}",
+                        number.unwrap_or_default()
+                    ),
+                    &format!(
+                        "{}\n\n{item_title}: {}",
+                        text("url"),
+                        item_facts
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                    ),
+                    &delivery_key,
+                    std::slice::from_ref(claim),
+                )?);
+                continue;
+            }
+            unowned.push((
+                delivery_key,
+                claim.clone(),
+                json!({
+                    "kind": "mention",
+                    "resource": item_subject,
+                    "claim": claim,
+                    "number": number,
+                    "title": item_title,
+                    "item_url": item_facts.get("url"),
+                    "login": login,
+                    "by": text("by"),
+                    "url": text("url"),
+                    "at": text("at"),
+                }),
+            ));
+        }
+    }
+    unowned.truncate(ENTRIES_PER_REQUEST);
+    for (key, _, entry) in &mut unowned {
+        let kind = entry["kind"].as_str().unwrap_or_default().to_owned();
+        entry["why"] = Value::String(match kind.as_str() {
+            "pull_request" => "a new pull request head that no live agent owns".into(),
+            "issue" => "a new issue that no live agent owns".into(),
+            _ => format!(
+                "{} mentioned @{}",
+                entry["by"].as_str().unwrap_or("someone"),
+                entry["login"].as_str().unwrap_or_default()
+            ),
+        });
+        if let Some(repository) = entry["resource"]
+            .as_str()
+            .and_then(|item| item.rsplitn(3, '/').nth(2))
+        {
+            entry["repository"] = Value::String(repository.to_owned());
+        }
+        entry["marker"] = Value::String(key.clone());
+    }
+    Ok(unowned)
+}
+
 /// Whether an earlier observation sent the item under this delivery key to its owner.
 fn routed_to_owner_tx(
     transaction: &rusqlite::Transaction<'_>,
@@ -1802,19 +2004,17 @@ fn item_route_text(facts: &Value) -> (String, String) {
     }
 }
 
-/// The mentions of an item that are new with this observation. A new item's mentions are all
-/// new. A recorded item's mention is new when the item did not know it and it was made no earlier
-/// than five minutes before the item's last observation, so turning mentions on, an edit to an
-/// old comment, or a body read again never reports an old mention.
-fn new_mentions(prior: Option<&(Value, u128)>, new_item: bool, facts: &Value) -> Vec<Value> {
+/// The mentions of an item that are new with this observation: those a recorded item did not
+/// know, made no earlier than five minutes before the item's last observation. Turning mentions
+/// on, an edit to an old comment, or a body read again never reports an old mention. A new item's
+/// own mentions are not new: the item itself reaches its review or triage, and an intake turned
+/// back on finds items opened while it was off, whose body mentions are old news.
+fn new_mentions(prior: Option<&(Value, u128)>, facts: &Value) -> Vec<Value> {
     let mentions = facts
         .get("mentions")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if new_item {
-        return mentions;
-    }
     let Some((prior, observed_at)) = prior else {
         return Vec::new();
     };
@@ -11225,7 +11425,6 @@ impl Store {
                         facts: mut item_facts,
                         changed_fields: item_changed_fields,
                         data_types,
-                        new_item,
                         deliver,
                     } = item;
                     // An agent's checkout names the opener first. An authoring run's own pull
@@ -11288,7 +11487,7 @@ impl Store {
                     if !data_types.is_empty() {
                         let prior = recorded_items.get(&subject).cloned().flatten();
                         let mentions = if data_types.contains("mentions") {
-                            new_mentions(prior.as_ref(), new_item, &item_facts)
+                            new_mentions(prior.as_ref(), &item_facts)
                         } else {
                             Vec::new()
                         };
@@ -11380,7 +11579,81 @@ impl Store {
                             ))
                         }
                         .map_err(internal)?;
-                        if subscription.delivery == "person" {
+                        // A batched message collects new items and mentions until the reconciler
+                        // sends them together, at most once per interval.
+                        if subscription.delivery == "message" && subscription.batch_every_ms.is_some() {
+                            let repository_identity = current_object
+                                .get("repository_id")
+                                .filter(|value| !value.is_null())
+                                .cloned()
+                                .unwrap_or_else(|| Value::String(resource.into()));
+                            let entries = batch_entries_tx(
+                                transaction,
+                                &self.origin,
+                                &batch_id,
+                                subscription_subject,
+                                subscription,
+                                &subscription.to,
+                                &repository_identity,
+                                &selected,
+                                &collection_discoveries,
+                                &item_claims,
+                                &item_mentions,
+                                &mut message_subjects,
+                            )?;
+                            if entries.is_empty() {
+                                continue;
+                            }
+                            let delivery_key = canonical_hash(&(
+                                "batched",
+                                &subscription.to,
+                                subscription_subject.rsplit('/').next(),
+                                entries.iter().map(|(key, ..)| key.as_str()).collect::<Vec<_>>(),
+                            ))
+                            .map_err(internal)?;
+                            let recorded = transaction
+                                .query_row(
+                                    "SELECT 1 FROM claims WHERE kind='subscription.batched'
+                                     AND json_extract(body, '$.fields.delivery_key')=?1 LIMIT 1",
+                                    [&delivery_key],
+                                    |_| Ok(()),
+                                )
+                                .optional()
+                                .map_err(internal)?
+                                .is_some();
+                            if !recorded {
+                                append_claim_tx(
+                                    transaction,
+                                    &self.origin,
+                                    subscription_subject,
+                                    "subscription.batched",
+                                    None,
+                                    &json!({"fields": {
+                                        "entries": entries.iter().map(|(_, _, entry)| entry).collect::<Vec<_>>(),
+                                        "delivery_key": delivery_key,
+                                    }, "evidence": entries.iter().map(|(_, claim, _)| claim).collect::<Vec<_>>()}),
+                                    &[],
+                                    Some(&batch_id),
+                                )
+                                .map_err(claim_append_error)?;
+                            }
+                            continue;
+                        }
+                        // A batched delivery reaches one agent per observation, never a person
+                        // directly: one request carries every new pull request head, new issue,
+                        // and new mention of the named logins on items no live agent owns, so the
+                        // mission's agent can group, summarize, and ask once. An owned item goes
+                        // to its owner.
+                        if subscription.delivery == "mission"
+                            && let Some(text_input) = subscription.text_input.as_deref()
+                        {
+                            let (Some(mission), Some(resource_input), Some(workspace)) = (
+                                subscription.mission.as_deref(),
+                                subscription.resource_input.as_deref(),
+                                subscription.workspace.as_deref(),
+                            ) else {
+                                continue;
+                            };
                             let repository_identity = current_object
                                 .get("repository_id")
                                 .filter(|value| !value.is_null())
@@ -11390,82 +11663,83 @@ impl Store {
                                 .rsplit('/')
                                 .next()
                                 .expect("a subscription subject has a local name");
-                            for (item_subject, claim, item_facts, mentions) in &item_mentions {
-                                for mention in mentions {
-                                    let text = |name: &str| {
-                                        mention.get(name).and_then(Value::as_str).unwrap_or_default()
-                                    };
-                                    let login = text("login");
-                                    // A login that mentions itself tells its person nothing.
-                                    if text("by").eq_ignore_ascii_case(login) {
-                                        continue;
-                                    }
-                                    let Some((_, person)) = subscription
-                                        .mentions
-                                        .iter()
-                                        .find(|(known, _)| known.eq_ignore_ascii_case(login))
-                                    else {
-                                        continue;
-                                    };
-                                    let number = item_facts.get("number").and_then(Value::as_u64);
-                                    let delivery_key = canonical_hash(&(
-                                        "mention",
-                                        delivery_scope,
-                                        &repository_identity,
-                                        number,
-                                        login.to_ascii_lowercase(),
-                                        text("url"),
-                                        text("at"),
-                                    ))
-                                    .map_err(internal)?;
-                                    if routed_to_owner_tx(transaction, &delivery_key)? {
-                                        continue;
-                                    }
-                                    let item_title = item_facts
-                                        .get("title")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default();
-                                    let by = Some(text("by")).filter(|by| !by.is_empty()).unwrap_or("someone");
-                                    let title = format!(
-                                        "{by} mentioned @{login} on #{}: {item_title}",
-                                        number.unwrap_or_default()
-                                    );
-                                    let detail = format!(
-                                        "{}\n\n{item_title}: {}",
-                                        text("url"),
-                                        item_facts.get("url").and_then(Value::as_str).unwrap_or_default()
-                                    );
-                                    if subscription.owner_message
-                                        && let Some((owner, why)) =
-                                            item_owner_tx(transaction, item_facts).map_err(internal)?
-                                    {
-                                        message_subjects.extend(route_item_to_owner_tx(
-                                            transaction,
-                                            &self.origin,
-                                            &batch_id,
-                                            subscription_subject,
-                                            item_subject,
-                                            &owner,
-                                            &why,
-                                            &title,
-                                            &detail,
-                                            &delivery_key,
-                                            std::slice::from_ref(claim),
-                                        )?);
-                                        continue;
-                                    }
-                                    person_work::ask_as_daemon_tx(
-                                        transaction,
-                                        &self.origin,
-                                        &format!("daemon/{}", self.origin),
-                                        person,
-                                        &title,
-                                        &detail,
-                                        "subscription-mention",
-                                        &delivery_key,
-                                    )?;
-                                }
+                            let unowned = batch_entries_tx(
+                                transaction,
+                                &self.origin,
+                                &batch_id,
+                                subscription_subject,
+                                subscription,
+                                mission,
+                                &repository_identity,
+                                &selected,
+                                &collection_discoveries,
+                                &item_claims,
+                                &item_mentions,
+                                &mut message_subjects,
+                            )?;
+                            if unowned.is_empty() {
+                                continue;
                             }
+                            let delivery_key = canonical_hash(&(
+                                "batch",
+                                mission,
+                                delivery_scope,
+                                unowned.iter().map(|(key, ..)| key.as_str()).collect::<Vec<_>>(),
+                            ))
+                            .map_err(internal)?;
+                            let requested = transaction
+                                .query_row(
+                                    "SELECT 1 FROM claims WHERE kind='subscription.mission-requested'
+                                     AND json_extract(body, '$.fields.delivery_key')=?1 LIMIT 1",
+                                    [&delivery_key],
+                                    |_| Ok(()),
+                                )
+                                .optional()
+                                .map_err(internal)?
+                                .is_some();
+                            // The run pins the repository's latest observation as its source.
+                            let Some(discovery) = observation_claim
+                                .as_ref()
+                                .map(|claim| claim.id.clone())
+                                .or(latest_claim_id_tx(transaction, resource).map_err(internal)?)
+                            else {
+                                continue;
+                            };
+                            if requested {
+                                continue;
+                            }
+                            let mut request_fields = json!({
+                                "mission": format!("mission/{mission}"),
+                                "resource": resource,
+                                "resource_input": resource_input,
+                                "workspace": workspace,
+                                "discovery": discovery,
+                                "delivery_key": delivery_key,
+                                "text_input": text_input,
+                                "text": serde_json::to_string(
+                                    &unowned.iter().map(|(_, _, mention)| mention).collect::<Vec<_>>()
+                                ).map_err(internal)?,
+                            });
+                            if let Some(revision) = subscription.revision.as_deref() {
+                                request_fields["mission_revision"] = Value::String(revision.into());
+                            }
+                            if let Some(requester) = subscription.requester.as_deref() {
+                                request_fields["requester"] = Value::String(requester.into());
+                            }
+                            append_claim_tx(
+                                transaction,
+                                &self.origin,
+                                subscription_subject,
+                                "subscription.mission-requested",
+                                None,
+                                &json!({"fields": request_fields, "evidence": unowned
+                                    .iter()
+                                    .map(|(_, claim, _)| claim.clone())
+                                    .collect::<Vec<_>>()}),
+                                &[],
+                                Some(&batch_id),
+                            )
+                            .map_err(claim_append_error)?;
                             continue;
                         }
                         if subscription.delivery == "mission" {
@@ -26493,7 +26767,7 @@ agent "test/empty" { command "true" }
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO replication_peers(peer, status, last_success_at_unix_ms, updated_at_unix_ms)
+                "INSERT OR REPLACE INTO replication_peers(peer, status, last_success_at_unix_ms, updated_at_unix_ms)
                  VALUES ('target', 'up', ?1, ?2)",
                 params![
                     now_ms().saturating_sub(91_000).to_string(),
@@ -26505,6 +26779,134 @@ agent "test/empty" { command "true" }
             store
                 .record_peer_failure("target", "down", "request timed out")
                 .unwrap()
+        );
+    }
+
+    /// A peer that stops answering (#1020) shows its failure at once, and stops counting as up
+    /// once it has missed an exchange; a failure within one quiet interval of an exchange in
+    /// the other direction keeps it up. The next exchange clears the failure.
+    #[test]
+    fn a_failed_attempt_after_a_missed_exchange_ends_up() {
+        let fleet = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let store = Store::open_memory("amber").unwrap();
+        store.bind_fleet(fleet).unwrap();
+        let last_exchange = |ago: u128| {
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT OR REPLACE INTO replication_peers(peer, status, last_success_at_unix_ms, updated_at_unix_ms)
+                     VALUES ('cobalt', 'up', ?1, ?1)",
+                    [now_ms().saturating_sub(ago).to_string()],
+                )
+                .unwrap();
+        };
+        let peer = || {
+            store
+                .replication_status(true, Some(fleet), &["cobalt".into()])
+                .unwrap()
+                .peers
+                .remove(0)
+        };
+
+        last_exchange(10_000);
+        store
+            .record_peer_failure("cobalt", "down", "request timed out")
+            .unwrap();
+        let status = peer();
+        assert_eq!(
+            status.status, "up",
+            "a one-way failure soon after an exchange"
+        );
+        assert_eq!(status.last_error.as_deref(), Some("request timed out"));
+        assert!(status.last_failure_at_unix_ms.is_some());
+
+        last_exchange(40_000);
+        assert!(
+            !store
+                .record_peer_failure("cobalt", "down", "request timed out")
+                .unwrap(),
+            "the published transport status keeps its grace"
+        );
+        let status = peer();
+        assert_eq!(status.status, "last-seen");
+        assert_eq!(status.last_error.as_deref(), Some("request timed out"));
+        assert!(!store.replication_peer_up("cobalt").unwrap().0);
+
+        let other = Store::open_memory("cobalt").unwrap();
+        other.bind_fleet(fleet).unwrap();
+        let exchange = other
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        store
+            .receive_replication_exchange("cobalt", fleet, &exchange)
+            .unwrap();
+        let status = peer();
+        assert_eq!(status.status, "up");
+        assert!(status.last_error.is_none());
+        assert!(status.last_failure_at_unix_ms.is_none());
+        assert!(store.replication_peer_up("cobalt").unwrap().0);
+    }
+
+    /// A measurement the peer has not refreshed for a quiet interval says what both held then
+    /// (#1020): status marks it stale and counts the envelopes this node gained since.
+    #[test]
+    fn an_old_sync_measurement_is_stale_and_counts_what_was_added_since() {
+        let fleet = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let store = Store::open_memory("amber").unwrap();
+        store.bind_fleet(fleet).unwrap();
+        let other = Store::open_memory("cobalt").unwrap();
+        other.bind_fleet(fleet).unwrap();
+        let exchange = other
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        store
+            .receive_replication_exchange("cobalt", fleet, &exchange)
+            .unwrap();
+        let sync = |store: &Store| {
+            store
+                .replication_status(true, Some(fleet), &["cobalt".into()])
+                .unwrap()
+                .peers
+                .remove(0)
+                .sync
+                .unwrap()
+        };
+        let fresh = sync(&store);
+        assert!(!fresh.stale);
+        assert_eq!(fresh.added_since_measured_envelopes, 0);
+
+        for index in 0..20 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/frozen-peer/{index}"),
+                    kind: "custom.frozen-peer.note".into(),
+                    actor: Some("person/tester".into()),
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        store
+            .replication_sync
+            .lock()
+            .unwrap()
+            .get_mut("cobalt")
+            .unwrap()
+            .measured
+            .as_mut()
+            .unwrap()
+            .measured_at_unix_ms -= 40_000;
+        let old = sync(&store);
+        assert!(old.stale);
+        assert_eq!(old.local_only_envelopes, fresh.local_only_envelopes);
+        assert!(
+            old.added_since_measured_envelopes >= 20,
+            "{}",
+            old.added_since_measured_envelopes
         );
     }
 

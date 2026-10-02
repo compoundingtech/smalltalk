@@ -1,9 +1,11 @@
 //! Structured person requests: a typed question with named answers, carried on a person ask.
 //!
-//! A request is one of three types. A `decision` proposes one action and names what accepting,
+//! A request is one of four types. A `decision` proposes one action and names what accepting,
 //! declining and (optionally) requesting changes each do. A `choice` names two to five options.
 //! `feedback` asks for text. Each named answer has a stable ID, so the asker dispatches on that
-//! ID instead of reading prose. An ask without a request stays a free-text ask.
+//! ID instead of reading prose. An `update` asks nothing: it brings the person information they
+//! asked for, names the work or message where they asked (`about`), and clears once read. An
+//! ask without a request stays a free-text ask.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -35,6 +37,7 @@ pub enum RequestType {
     Decision,
     Choice,
     Feedback,
+    Update,
 }
 
 impl RequestType {
@@ -43,6 +46,7 @@ impl RequestType {
             Self::Decision => "decision",
             Self::Choice => "choice",
             Self::Feedback => "feedback",
+            Self::Update => "update",
         }
     }
 }
@@ -62,10 +66,17 @@ pub struct StructuredRequest {
     pub version: u32,
     #[serde(rename = "type")]
     pub request_type: RequestType,
-    /// The one concrete question.
-    pub question: String,
+    /// The one concrete question. Required, except on an update, which asks nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
     /// Why only this person can answer: no runtime fact or standing instruction settles it.
-    pub why_person: String,
+    /// Required, except on an update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_person: Option<String>,
+    /// An update's proof that the person asked: their mission run or step run, or their
+    /// message to the agent posting the update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -174,8 +185,23 @@ impl StructuredRequest {
                 "this daemon reads request version {REQUEST_VERSION}"
             )));
         }
-        line("question", &self.question)?;
-        line("why_person", &self.why_person)?;
+        if self.request_type == RequestType::Update {
+            if self.question.is_some() || self.why_person.is_some() {
+                return Err(invalid(
+                    "an update asks nothing: it has no question or why_person",
+                ));
+            }
+            line(
+                "about (the run, step or message where the person asked)",
+                self.about.as_deref().unwrap_or_default(),
+            )?;
+        } else {
+            line("question", self.question.as_deref().unwrap_or_default())?;
+            line("why_person", self.why_person.as_deref().unwrap_or_default())?;
+            if self.about.is_some() {
+                return Err(invalid("only an update names what it is about"));
+            }
+        }
         if let Some(summary) = &self.summary {
             line("summary", summary)?;
         }
@@ -279,6 +305,17 @@ impl StructuredRequest {
                     ));
                 }
             }
+            RequestType::Update => {
+                if !self.answers.is_empty()
+                    || self.custom
+                    || self.recommendation.is_some()
+                    || !self.reasons.is_empty()
+                {
+                    return Err(invalid(
+                        "an update asks nothing: it has no answers, reasons or recommendation",
+                    ));
+                }
+            }
         }
         if let Some(recommendation) = &self.recommendation {
             if !ids.contains(recommendation.answer.as_str()) {
@@ -296,6 +333,17 @@ impl StructuredRequest {
     /// request also accepts a bare summary as its text, so a client that only sends text can
     /// still answer it.
     pub fn answer(&self, input: Option<&AnswerInput>, summary: &str) -> Result<Value, St3Error> {
+        if self.request_type == RequestType::Update {
+            // Opening an update or pressing read clears it; any summary is only history.
+            if input.is_some_and(|input| {
+                input.text.is_some() || input.id.as_deref().is_some_and(|id| id != "read")
+            }) {
+                return Err(invalid_answer(
+                    "an update takes no answer; it is only read. Reply in a conversation",
+                ));
+            }
+            return Ok(json!({"type": "update", "outcome": "read"}));
+        }
         let fallback;
         let input = match input {
             Some(input) => input,
@@ -329,6 +377,7 @@ impl StructuredRequest {
         }
         let mut answer = json!({"type": self.request_type.as_str()});
         match (self.request_type, input.id.as_deref()) {
+            (RequestType::Update, _) => unreachable!("an update returns above"),
             (RequestType::Feedback, Some(_)) => {
                 return Err(invalid_answer("feedback has no named answers; send text"));
             }
@@ -417,6 +466,7 @@ pub fn answer_summary(answer: &Value) -> String {
         (Some(label), Some(text)) => format!("{label}: {text}"),
         (Some(label), None) => label.to_owned(),
         (None, Some(text)) => text.to_owned(),
+        (None, None) if answer["outcome"] == "read" => "Read".into(),
         (None, None) => String::new(),
     }
 }
@@ -521,6 +571,67 @@ mod tests {
             feedback_with_answers,
             one_option.take(),
             newer,
+        ] {
+            assert_eq!(
+                StructuredRequest::parse(&request).unwrap_err().code,
+                "invalid-person-request",
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_update_names_where_it_was_asked_for_and_is_only_read() {
+        let update = json!({
+            "version": 1, "type": "update", "about": "mission-run/example/report/1",
+            "summary": "The nightly build is green again.",
+            "subjects": [{"kind": "document", "label": "Report", "ref": "doc/example/report"}]
+        });
+        let (request, canonical) = StructuredRequest::parse(&update).unwrap();
+        assert_eq!(canonical, update);
+        let read = json!({"type": "update", "outcome": "read"});
+        assert_eq!(request.answer(None, "").unwrap(), read);
+        assert_eq!(answer_summary(&read), "Read");
+        let pressed = AnswerInput {
+            id: Some("read".into()),
+            text: None,
+        };
+        assert_eq!(request.answer(Some(&pressed), "").unwrap(), read);
+        for input in [
+            AnswerInput {
+                id: Some("yes".into()),
+                text: None,
+            },
+            AnswerInput {
+                id: None,
+                text: Some("Thanks, now do the next one".into()),
+            },
+        ] {
+            assert_eq!(
+                request.answer(Some(&input), "").unwrap_err().code,
+                "invalid-person-answer"
+            );
+        }
+        let mut no_about = update.clone();
+        no_about.as_object_mut().unwrap().remove("about");
+        let mut asks = update.clone();
+        asks["question"] = json!("Is this fine?");
+        let mut answers = update.clone();
+        answers["answers"] =
+            json!([{"id": "ok", "label": "OK", "consequence": "Nothing changes."}]);
+        let mut about_on_decision = decision();
+        about_on_decision["about"] = json!("mission-run/example/report/1");
+        let mut decision_without_question = decision();
+        decision_without_question
+            .as_object_mut()
+            .unwrap()
+            .remove("question");
+        for request in [
+            no_about,
+            asks,
+            answers,
+            about_on_decision,
+            decision_without_question,
         ] {
             assert_eq!(
                 StructuredRequest::parse(&request).unwrap_err().code,

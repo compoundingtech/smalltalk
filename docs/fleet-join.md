@@ -452,7 +452,9 @@ continues from the last completed step:
    the heal fails `join` with both graph digests and the reason. The wait lasts up to 30 minutes;
    if it runs out, `join` says the machine is a member and still syncing, and exits 0.
    `--no-wait` returns once the services start. `st fleet wait [--timeout 30m]` waits for the
-   first sync later and fails if it failed.
+   first sync later and fails if it failed. It then also waits until this machine has caught up:
+   an exchange since the wait began, with every member that is up, at which it held everything
+   that member held. After a restart that is what the wait checks.
 
 Until its first exchange brings the membership claims, the new member knows only the sponsor. It
 checks the sponsor's responses against the key from the handshake, which `join.json` keeps. It
@@ -1048,7 +1050,8 @@ PEER  beacon  last-seen
 `current` is the member's admission state, not a claim that it is online. Use
 `st replication status` for each peer's last exchange time, envelope backlog and divergence;
 `st machines` and stui also show last contact. A member never seen has no successful exchange
-time yet. Normal absence does not produce a doctor fault or delivery-probe attention. Invalid
+time yet. An absent listening member, which is meant to answer, makes doctor warn; an absent
+dial-out member is only named, and neither produces delivery-probe attention. Invalid
 authentication, conflicting membership, rejected envelopes and projection faults remain
 visible. `st fleet status --json` includes the membership, endpoints and peer results for
 inspection.

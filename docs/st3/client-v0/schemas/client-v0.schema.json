@@ -162,6 +162,7 @@
             "episode": {"type": "string"},
             "action_parameters": {"type": "object"},
             "request": { "$ref": "#/$defs/StructuredRequest", "description": "A person-step ask's structured request; absent on a free-text ask." },
+            "update": { "$ref": "#/$defs/PersonUpdate", "description": "Information the person asked for. It asks nothing: reading it (work.done with answer id read) clears it." },
             "source_id": { "$ref": "#/$defs/Id" },
             "person_id": { "$ref": "#/$defs/Id" },
             "requester_id": { "$ref": "#/$defs/Id" },
@@ -1338,6 +1339,17 @@
         "custom": {"type": "boolean", "description": "A choice also takes an answer in the person's own words."}
       }
     },
+    "PersonUpdate": {
+      "type": "object", "additionalProperties": false, "required": ["version", "type", "about"],
+      "description": "Information an agent brings a person who asked for it. Nothing waits on it.",
+      "properties": {
+        "version": {"const": 1},
+        "type": {"const": "update"},
+        "about": {"$ref": "#/$defs/Id", "description": "Where the person asked: their mission run or step run, or their message to the agent."},
+        "summary": {"type": "string"},
+        "subjects": {"type": "array", "maxItems": 12, "items": {"$ref": "#/$defs/RequestSubject"}}
+      }
+    },
     "RequestSubject": {
       "type": "object", "additionalProperties": false, "required": ["kind", "label"],
       "properties": {
@@ -1366,8 +1378,8 @@
     "PersonAnswer": {
       "type": "object", "required": ["type", "outcome"],
       "properties": {
-        "type": {"enum": ["decision", "choice", "feedback"]},
-        "outcome": {"enum": ["accept", "decline", "request_changes", "selected", "custom", "feedback"]},
+        "type": {"enum": ["decision", "choice", "feedback", "update"]},
+        "outcome": {"enum": ["accept", "decline", "request_changes", "selected", "custom", "feedback", "read"]},
         "id": {"type": "string"},
         "label": {"type": "string"},
         "text": {"type": "string"}

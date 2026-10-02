@@ -11,6 +11,8 @@ use ratatui::text::{Line, Span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hit {
+    /// One of a structured request's named answers, by its place: chosen, then Enter sends it.
+    Answer(usize),
     /// Speak into the focused message box instead of typing (voice mode).
     Voice,
     /// Start a plain shell in a new tab.
