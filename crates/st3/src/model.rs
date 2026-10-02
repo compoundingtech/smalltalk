@@ -1654,7 +1654,7 @@ pub struct MessageAttachment {
     pub name: Option<String>,
     #[serde(default)]
     pub size: u64,
-    /// The member holding the bytes, such as `host/hetz`.
+    /// The member holding the bytes, such as `host/laptop`.
     pub origin: String,
 }
 

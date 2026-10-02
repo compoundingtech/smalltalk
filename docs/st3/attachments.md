@@ -11,7 +11,7 @@ An attachment's bytes are **not** claims and **not** replicated. They are files 
 The `message.sent` claim carries only a reference, in its `attachments` field:
 
 ```json
-{"sha256": "…64 hex…", "media_type": "image/png", "name": "Screenshot.png", "size": 184211, "origin": "host/bluey"}
+{"sha256": "…64 hex…", "media_type": "image/png", "name": "Screenshot.png", "size": 184211, "origin": "host/laptop"}
 ```
 
 Nothing in the claim log or in replication names the bytes except that reference, so a pasted
