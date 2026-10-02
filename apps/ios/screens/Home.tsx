@@ -14,7 +14,7 @@ import { randomName } from '../launcher';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
 import { cleanMessageText } from '../conversationView';
-import { ANSWERS, isRequest, report, yesNo } from '../requestView';
+import { ANSWERS, isRequest, report, spaced, yesNo } from '../requestView';
 import type { RootScreen } from '../navigation';
 
 // Home: what needs the person, as stui's Home lists it.
@@ -124,7 +124,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
 // A request's question: a JSON report as its telling fields, anything else as Markdown.
 function RequestQuestion({ text }: { text: string }) {
   const shown = report(text);
-  if (!shown) return <Markdown text={text} color={theme.text} />;
+  if (!shown) return <Markdown text={spaced(text)} color={theme.text} />;
   const tone = { fault: theme.red, text: theme.text, soft: theme.subtext0 } as const;
   return <View style={{ gap: 2 }}>
     {shown.before ? <Markdown text={shown.before} color={theme.text} /> : null}

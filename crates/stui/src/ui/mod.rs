@@ -4662,6 +4662,20 @@ mod tests {
     }
 
     #[test]
+    fn an_agents_question_gets_room_to_read() {
+        let question = "Recommend: yes, in three parts.\nWhy: the release run failed.\nMy proposal:\n1. Land #1049.\n2. Build on main.\n```\ncargo build\nnext\n```\nAnswer yes and I queue it.";
+        assert_eq!(
+            screens::spaced(question),
+            "**Recommend:** yes, in three parts.\n\n**Why:** the release run failed.\n\nMy proposal:\n1. Land #1049.\n2. Build on main.\n```\ncargo build\nnext\n```\nAnswer yes and I queue it."
+        );
+        // A long lead before a colon is a sentence, not a label.
+        assert_eq!(
+            screens::spaced("The release run on the Linux runner failed: mold is missing"),
+            "The release run on the Linux runner failed: mold is missing"
+        );
+    }
+
+    #[test]
     fn spoken_words_are_sent_tagged_dictated() {
         let mut ui = Ui::new(demo::world());
         ui.live = true;
