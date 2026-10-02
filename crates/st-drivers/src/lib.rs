@@ -28,6 +28,7 @@ pub mod ding;
 pub mod direct_actor;
 pub mod driver;
 pub mod driver_diagnostic;
+pub mod driver_paths;
 pub mod eval_spec;
 pub mod event;
 pub mod exec_backend;

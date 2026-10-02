@@ -317,8 +317,7 @@ def driver_processes(node):
     return rows
 
 
-def scenario(node, seats, name, scratch):
-    seats.prove("boot")
+def scenario(node, seats, name, scratch, replacement_binary=None):
     if name in ("fresh", "concurrent"):
         return
     if name == "restart":
@@ -334,12 +333,15 @@ def scenario(node, seats, name, scratch):
         seats.prove("daemon-restart")
     elif name == "reexec":
         before = driver_processes(node)
+        providers = {pid: argv for pid, argv in node.seat_processes() if "stub-" in argv}
+        if not providers:
+            fail("no provider process to preserve across reexec")
         if not before:
             fail("no seat driver process to re-exec")
         # A deploy installs the new binary, then restarts the daemon from it; the daemon re-points
         # the link every seat follows, and each driver and channel re-execs in place.
         replacement = scratch / "st3-replacement"
-        shutil.copy2(node.binary.resolve(), replacement)
+        shutil.copy2(replacement_binary or node.binary.resolve(), replacement)
         staging = node.root / "bin/st3.staged"
         staging.symlink_to(replacement)
         os.replace(staging, node.binary)
@@ -354,6 +356,8 @@ def scenario(node, seats, name, scratch):
         until(swapped, 60, "the seat's st processes did not re-exec into the replacement: "
                            + json.dumps({str(pid): argv[:80] for pid, (argv, _) in before.items()}))
         seats.prove("reexec", fresh_incarnation=False)
+        if not all(Path(f"/proc/{pid}").exists() for pid in providers):
+            fail("a provider process was replaced during driver reexec")
     else:
         fail(f"unknown scenario {name}")
 
@@ -370,9 +374,18 @@ def run(args, root, evidence):
         node.cli("missions", "publish", str(source), "--as", "person/eval")
         node.cli("missions", "start", MISSION, "--id", RUN_ID, "--workspace", str(root / "ws"),
                  "--as", "person/eval")
-        scenario(node, seats, args.scenario, args.scratch)
+        seats.prove("boot")
+        catalogs_before = {str(path): path.read_bytes() for pattern in ("catalog.kdl", "agent.kdl")
+                           for path in (root / "state/drivers").rglob(pattern)}
+        scenario(node, seats, args.scenario, args.scratch, args.replacement_binary)
+        catalogs_after = {str(path): path.read_bytes() for pattern in ("catalog.kdl", "agent.kdl")
+                          for path in (root / "state/drivers").rglob(pattern)}
+        if catalogs_after != catalogs_before:
+            fail("native startup/reexec fabricated or rewrote a catalog")
+        if not args.replacement_binary and catalogs_after:
+            fail("fresh native seats fabricated per-seat catalogs")
         return {"verdict": "pass", "harness": args.harness, "scenario": args.scenario,
-                "seconds_to_boot": seats.timings}
+                "seconds_to_boot": seats.timings, "catalog_files": len(catalogs_after)}
     except (Failure, subprocess.TimeoutExpired) as error:
         return {"verdict": "fail", "harness": args.harness, "scenario": args.scenario,
                 "failure": str(error), "seconds_to_boot": seats.timings}
@@ -397,6 +410,8 @@ def main():
     parser.add_argument("evidence", type=Path)
     parser.add_argument("harness", choices=HARNESSES)
     parser.add_argument("scenario", choices=SCENARIOS)
+    parser.add_argument("--replacement-binary", type=Path, default=None,
+                        help="upgrade a predecessor binary to this build in the reexec scenario")
     parser.add_argument("--bound", type=float, default=90, help="seconds each phase may take")
     parser.add_argument("--scratch", type=Path, default=None,
                         help="a directory on a real disk for the replacement binary (reexec)")
