@@ -93,9 +93,22 @@ final class Dictation {
     }
     try await analyzer.start(inputSequence: stream)
 
+    // Recording pauses other audio (music would be transcribed); releasing the session with
+    // notifyOthersOnDeactivation is what lets it play again afterwards (Nathan, 2026-10-02), so
+    // every way out releases it, a failed start included.
     let audio = AVAudioSession.sharedInstance()
-    try audio.setCategory(.record, mode: .measurement, options: .duckOthers)
+    try audio.setCategory(.record, mode: .measurement, options: [])
     try audio.setActive(true, options: .notifyOthersOnDeactivation)
+    do {
+      try listen(into: format)
+    } catch {
+      engine.stop()
+      Dictation.release()
+      throw error
+    }
+  }
+
+  private func listen(into format: AVAudioFormat) throws {
     let node = engine.inputNode
     let micFormat = node.outputFormat(forBus: 0)
     guard let converter = AVAudioConverter(from: micFormat, to: format) else {
@@ -126,10 +139,24 @@ final class Dictation {
     engine.stop()
     engine.inputNode.removeTap(onBus: 0)
     input?.finish()
+    // The microphone is done: let other audio resume now, not after the last words settle.
+    Dictation.release()
     try? await analyzer?.finalizeAndFinishThroughEndOfInput()
     await results?.value
-    try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     return latest
+  }
+
+  /// Give the audio session back, telling other apps (music) they may resume. It can fail while
+  /// the engine's I/O winds down, so it is tried again shortly after.
+  static func release() {
+    let audio = AVAudioSession.sharedInstance()
+    do {
+      try audio.setActive(false, options: .notifyOthersOnDeactivation)
+    } catch {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        try? audio.setActive(false, options: .notifyOthersOnDeactivation)
+      }
+    }
   }
 
   /// The buffer's loudness, 0 to 1, for the waveform.
