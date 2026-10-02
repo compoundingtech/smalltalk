@@ -10824,6 +10824,9 @@ impl Store {
                     .get("kind")
                     .cloned()
                     .expect("a normalized resource observation has a kind");
+                let facts = normalized_observation
+                    .get("facts")
+                    .expect("a normalized resource observation has facts");
                 let previous = latest_actual(transaction, resource)
                     .map_err(internal)?
                     .and_then(|actual| actual.get("facts").cloned());
@@ -11092,6 +11095,25 @@ impl Store {
                             .next()
                     {
                         item_facts["opened_by_run"] = Value::String(run);
+                    }
+                    if kind == "vcs.issue" {
+                        let normalized = normalize_resource_observation(
+                            transaction,
+                            &ClaimInput {
+                                subject: subject.clone(),
+                                kind: "resource.observed".into(),
+                                actor: None,
+                                fields: BTreeMap::from([
+                                    ("kind".into(), Value::String(kind.into())),
+                                    ("facts".into(), item_facts),
+                                ]),
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: None,
+                            },
+                        )?
+                        .expect("an issue observation is normalized");
+                        item_facts = normalized["facts"].clone();
                     }
                     let predecessors = latest_claim_id_tx(transaction, &subject)
                         .map_err(internal)?
@@ -15092,7 +15114,7 @@ fn normalize_resource_observation(
             ),
         ));
     }
-    let facts = resource_facts(&input.fields)?;
+    let mut facts = resource_facts(&input.fields)?;
     let spec = st3_schema::registry()
         .validate_resource_facts(&kind, &facts)
         .map_err(|error| St3Error::new(error.code, error.message))?;
@@ -15102,6 +15124,15 @@ fn normalize_resource_observation(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| previous.as_object().cloned().unwrap_or_default());
+        // Issue attribution belongs to its publisher, not to the latest observer or fixer.
+        // Keep each named field, including a mission-run-only opener, across observations.
+        if kind == "vcs.issue" {
+            for name in ["opened_by", "opened_by_run"] {
+                if let Some(value) = previous.get(name) {
+                    facts.insert(name.into(), value.clone());
+                }
+            }
+        }
         for (name, field) in &spec.fields {
             if field.immutable
                 && let Some(value) = facts.get(name)
@@ -15118,6 +15149,13 @@ fn normalize_resource_observation(
         }
     }
     let mut fields = input.fields.clone();
+    if kind == "vcs.issue" {
+        if fields.contains_key("facts") {
+            fields.insert("facts".into(), serde_json::to_value(facts).map_err(internal)?);
+        } else {
+            fields.extend(facts);
+        }
+    }
     fields.insert("kind".into(), Value::String(kind));
     Ok(Some(fields))
 }
@@ -41173,6 +41211,83 @@ subscription "green" {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn issue_openers_survive_publishers_and_direct_and_collection_observers() {
+        for attribution in [
+            json!({"opened_by_run": "mission-run/author"}),
+            json!({"opened_by": "agent/node.author", "opened_by_run": "mission-run/author"}),
+        ] {
+            let store = Store::open_memory("node").unwrap();
+            let source = r#"version 2
+resource "github/acme/demo" { kind "vcs.repository" }
+resource "github/acme/demo/issue/8" { kind "vcs.issue" }
+observer "repo" {
+  resource "resource/github/acme/demo"
+  provider "github.repository"
+  locator "acme/demo"
+  field "issues"
+}
+observer "issue" {
+  resource "resource/github/acme/demo/issue/8"
+  provider "github.issue"
+  locator "acme/demo#8"
+  field "state"
+}
+"#;
+            let intent = parse_intent(source, "node").unwrap();
+            let planned = store
+                .mission(&intent, IntentInput { kdl: source.into(), source_name: None })
+                .unwrap();
+            store.apply(&intent, &planned.subject_tokens, "publish-watch").unwrap();
+            let subject = "resource/github/acme/demo/issue/8";
+            let publish = |facts: Value| ClaimInput {
+                subject: subject.into(),
+                kind: "resource.observed".into(),
+                actor: Some("agent/node.author".into()),
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.issue".into())),
+                    ("facts".into(), facts),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            };
+            store.append_client_claim(&publish(attribution.clone())).unwrap();
+            store.append_client_claim(&publish(json!({
+                "opened_by_run": "mission-run/fixer", "state": "open"
+            }))).unwrap();
+            let observe = |observer: &str, resource: &str, facts: Value| {
+                let revision = store.selected_desired_revision(observer).unwrap().unwrap();
+                store.record_resource_observation(
+                    observer, &revision, None, resource, None, &facts, 50, &[],
+                ).unwrap();
+            };
+            observe("observer/issue", subject, json!({"state": "closed"}));
+            let actual = store.latest_actual_value(subject).unwrap().unwrap();
+            assert_eq!(actual["facts"]["state"], "closed");
+            assert_eq!(actual["facts"]["opened_by_run"], "mission-run/author");
+            if let Some(opener) = attribution.get("opened_by") {
+                assert_eq!(&actual["facts"]["opened_by"], opener);
+            }
+            observe("observer/repo", "resource/github/acme/demo", json!({"issues": []}));
+            observe("observer/repo", "resource/github/acme/demo", json!({
+                "issues": [{"number": 8, "state": "open", "title": "Updated issue"}]
+            }));
+            let actual = store.latest_actual_value(subject).unwrap().unwrap();
+            assert_eq!(actual["facts"]["state"], "open");
+            assert_eq!(actual["facts"]["title"], "Updated issue");
+            assert_eq!(actual["facts"]["opened_by_run"], "mission-run/author");
+            if let Some(opener) = attribution.get("opened_by") {
+                assert_eq!(&actual["facts"]["opened_by"], opener);
+                let changed = store.append_client_claim(&publish(json!({
+                    "opened_by": "agent/node.fixer", "opened_by_run": "mission-run/fixer"
+                }))).unwrap();
+                assert_eq!(&changed.body["fields"]["facts"]["opened_by"], opener);
+                assert_eq!(changed.body["fields"]["facts"]["opened_by_run"], "mission-run/author");
+            }
+        }
     }
 
     #[test]
