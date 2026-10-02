@@ -902,6 +902,25 @@ impl Client {
         ))
         .await
     }
+    pub async fn usage_period(
+        &self,
+        since_ms: Option<u64>,
+        until_ms: Option<u64>,
+    ) -> Result<Envelope<UsagePeriod>, ClientError> {
+        let mut query = Vec::new();
+        if let Some(since_ms) = since_ms {
+            query.push(format!("since_ms={since_ms}"));
+        }
+        if let Some(until_ms) = until_ms {
+            query.push(format!("until_ms={until_ms}"));
+        }
+        let query = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        self.get(&format!("/v1/client/usage{query}")).await
+    }
     pub async fn now_list(
         &self,
         cursor: Option<&str>,
