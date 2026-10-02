@@ -440,13 +440,13 @@ impl Model {
         .and_then(|(_, collection)| collection.sync.as_ref())
     }
 
-    pub fn attention(&self) -> impl Iterator<Item = &Attention> {
+    pub fn attention(&self) -> impl Iterator<Item = &Attention> + Clone {
         self.now.items.iter().filter_map(|item| match item {
             Resource::Attention(v) if v.state != "resolved" && v.person_id == self.actor => Some(v),
             _ => None,
         })
     }
-    pub fn agents(&self) -> impl Iterator<Item = &Agent> {
+    pub fn agents(&self) -> impl Iterator<Item = &Agent> + Clone {
         self.agents.items.iter().filter_map(|item| match item {
             Resource::Agent(v) => Some(v),
             _ => None,
@@ -479,7 +479,7 @@ impl Model {
             _ => None,
         })
     }
-    pub fn missions(&self) -> impl Iterator<Item = &Mission> {
+    pub fn missions(&self) -> impl Iterator<Item = &Mission> + Clone {
         self.missions.items.iter().filter_map(|item| match item {
             Resource::Mission(v) => Some(v),
             _ => None,

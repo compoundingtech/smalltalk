@@ -4352,6 +4352,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "st3-ui-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "st3-client",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4414,6 +4423,7 @@ dependencies = [
  "st3",
  "st3-client",
  "st3-conversation-ui",
+ "st3-ui-model",
  "tempfile",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
