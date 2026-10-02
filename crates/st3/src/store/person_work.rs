@@ -157,7 +157,37 @@ pub(super) fn run_live(
         }
         if let Some(parent) = header.parent_step_run.as_deref() {
             let Some(parent) = step(connection, parent)? else {
-                return Ok(false);
+                // Subscription and schedule deliveries use their declaration as the parent,
+                // normalized with a step-run prefix. They do not create a synthetic work step.
+                let subject = parent.strip_prefix("step-run/").unwrap_or(parent);
+                let Some(owner) = current_desired_row(connection, subject)? else {
+                    return Ok(false);
+                };
+                let body: Value = serde_json::from_str(&owner.body)?;
+                if !matches!(owner.kind.as_str(), "subscription" | "schedule")
+                    || body
+                        .get("children")
+                        .and_then(Value::as_array)
+                        .is_some_and(|children| {
+                            children.len() == 1 && children[0]["name"] == "stop"
+                        })
+                {
+                    return Ok(false);
+                }
+                let Some(owner_run) = owner.owner_run else {
+                    return Ok(false);
+                };
+                let owner_header =
+                    mission_run_header_tx(connection, owner_run.trim_start_matches("mission-run/"))
+                        .optional()?;
+                if owner_header
+                    .is_none_or(|owner| owner.root_mission_run != header.root_mission_run)
+                {
+                    return Ok(false);
+                }
+                run = owner_run.trim_start_matches("mission-run/").into();
+                expected_generation = owner.owner_generation;
+                continue;
             };
             if matches!(parent.status.as_str(), "completed" | "cancelled")
                 || (parent.status == "failed" && !failure)
@@ -802,6 +832,177 @@ mission "person-work" state="ready" {
             request: None,
         };
         (store, origin, input)
+    }
+
+    fn delivery_fixture(kind: &str) -> (Store, StepRunView, PersonAskRequest, MissionRunView) {
+        let (store, origin, mut input) = fixture();
+        let root = store.mission_run(&origin.run).unwrap().unwrap();
+        let source = r#"version 2
+mission "child-person-work" state="ready" {
+  goal "Gather one person decision."
+  step "prepare" { assigned-to "agent/alder.asker"; goal "Prepare the question." }
+}
+resource "issues" { kind "vcs.repository" }
+observer "issues" { resource "resource/issues"; provider "github.repository"; locator "example/repo"; field "issues" }
+subscription "intake" {
+  observer "observer/issues"; on "issues"
+  delivery "mission" { mission "child-person-work"; resource "source"; workspace "/tmp" }
+}
+schedule "intake" {
+  calendar { at "08:00"; timezone "UTC" }
+  work { mission "person-work@REVISION"; workspace "/tmp" }
+}"#.replace("REVISION", &root.revision);
+        let mut intent = crate::graph::parse_internal_intent(&source, "alder").unwrap();
+        let parent = format!("{kind}/intake");
+        let subscription = intent.subjects.get_mut(&parent).unwrap();
+        subscription.owner_run = Some(root.subject.clone());
+        subscription.owner_generation = Some(root.generation.clone());
+        store.apply_internal(&intent, "owned-subscription").unwrap();
+        let child = store
+            .create_child_mission_run(
+                &MissionRunRequest {
+                    mission: "child-person-work".into(),
+                    revision: None,
+                    workspace: "/tmp/child".into(),
+                    requester: Some(input.actor.clone()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: "subscription-child".into(),
+                },
+                &root,
+                &parent,
+                None,
+            )
+            .unwrap();
+        let origin = child
+            .steps
+            .iter()
+            .find(|step| step.step == "prepare")
+            .unwrap()
+            .clone();
+        store.connection.batched(|tx| -> Result<()> {
+            let claim = append_claim_tx(tx, "alder", &origin.subject, "work.claimed", Some(&input.actor),
+                &json!({"fields": {"attempt": 1, "status": "claimed", "claimant": input.actor,
+                    "claim_incarnation": "asker-one", "claim_expires_at_unix_ms": (now_ms()+600_000) as u64}}), &[], None)?;
+            project_mission_run_update(tx, &claim).unwrap();
+            Ok(())
+        }).unwrap().unwrap();
+        input.step = Some(origin.subject.clone());
+        (store, origin, input, root)
+    }
+
+    #[test]
+    fn delivery_child_person_ask_survives_reconciliation_and_replay() {
+        for kind in ["subscription", "schedule"] {
+            let (store, origin, input, _) = delivery_fixture(kind);
+            let ask = store.ask_person(&input).unwrap();
+            for replay in [false, true] {
+                if replay {
+                    store.replay_replication_graph().unwrap();
+                }
+                store.reconcile_person_asks().unwrap();
+                assert_eq!(
+                    store.step_run(&ask.subject).unwrap().unwrap().status,
+                    "ready"
+                );
+                assert!(
+                    store
+                        .attention_items(Some("person/avery"))
+                        .unwrap()
+                        .iter()
+                        .any(|item| item.subject == ask.subject)
+                );
+            }
+            let response = PersonStepResponse {
+                subject: ask.subject,
+                actor: "person/avery".into(),
+                summary: "Friday".into(),
+                evidence: vec![],
+                episode: None,
+                idempotency_key: "subscription-answer".into(),
+                answer: None,
+            };
+            store.finish_person_step(&response, false).unwrap();
+            assert_eq!(
+                store.step_run(&origin.subject).unwrap().unwrap().status,
+                "ready"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_child_person_asks_keep_owner_fences() {
+        for invalidation in [
+            "stop",
+            "root-ended",
+            "stale-generation",
+            "missing-parent",
+            "missing-step",
+        ] {
+            let (store, origin, input, root) = delivery_fixture("subscription");
+            let ask = store.ask_person(&input).unwrap();
+            match invalidation {
+                "stop" => {
+                    let mut intent = crate::graph::parse_internal_intent(
+                        "version 2\nsubscription \"intake\" { stop }",
+                        "alder",
+                    )
+                    .unwrap();
+                    let stopped = intent.subjects.get_mut("subscription/intake").unwrap();
+                    stopped.owner_run = Some(root.subject.clone());
+                    stopped.owner_generation = Some(root.generation.clone());
+                    store.apply_internal(&intent, "stop-subscription").unwrap();
+                }
+                "root-ended" => {
+                    store
+                        .set_mission_run_state(
+                            &root.subject,
+                            "cancelled",
+                            "terminal",
+                            Some("intake ended"),
+                        )
+                        .unwrap();
+                }
+                "stale-generation" => {
+                    store.connection.batched(|tx| -> Result<()> {
+                        tx.execute("UPDATE desired SET owner_generation='run-generation/old' WHERE subject='subscription/intake'", [])?;
+                        Ok(())
+                    }).unwrap().unwrap();
+                }
+                missing => {
+                    let parent = if missing == "missing-parent" {
+                        "step-run/subscription/missing"
+                    } else {
+                        "step-run/missing/prepare"
+                    };
+                    store
+                        .connection
+                        .batched(|tx| -> Result<()> {
+                            tx.execute(
+                                "UPDATE mission_runs SET parent_step_run=?1 WHERE id=?2",
+                                params![parent, origin.run.trim_start_matches("mission-run/")],
+                            )?;
+                            Ok(())
+                        })
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .iter()
+                    .all(|item| item.subject != ask.subject),
+                "{invalidation}"
+            );
+            store.reconcile_person_asks().unwrap();
+            assert_eq!(
+                store.step_run(&ask.subject).unwrap().unwrap().status,
+                "cancelled",
+                "{invalidation}"
+            );
+        }
     }
 
     #[test]

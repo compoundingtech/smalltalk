@@ -663,6 +663,14 @@ st replication checkpoint excuse node-c --reason "away for a week" --as person/o
 An excusal fences nothing. What the excused writer wrote while away still replicates when it
 returns, and its next seal ends the excusal.
 
+Excusing each side of a partition lets each side certify on its own. When they meet again, every
+node applies the same certificate: for one cut, the one with the most participants, and
+otherwise the newest. Adopting its manifest makes a node's tombstones exactly the manifest's. A
+claim that only the other side saw and dropped is then forgotten: no node holds it or its
+tombstone. Only a claim a rule may drop can be forgotten, one a kept claim replaces, so every
+answer stays the same, and the nodes still agree with each other. Person and mission claims are
+never dropped, so they are never forgotten. Issue #1052 tracks keeping those tombstones too.
+
 When verifications differ, that checkpoint never becomes stable, and the next due checkpoint
 tries again. `status` names which digests differ for each participant. Seals that differ in
 `rules` mean the nodes run builds with different checkpoint rules; they wait until every
