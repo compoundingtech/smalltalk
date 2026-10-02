@@ -51,6 +51,10 @@ does not take it over. When no agent is named, a mission run that published
 `resource/mission-run/RUN/pull-request` for the pull request becomes its `opened_by_run`. A review
 mission routes its findings to that agent or run.
 
+An issue resource accepts the same optional `opened_by` and `opened_by_run` facts from its
+publisher, such as the seat that opened it. st does not infer an issue opener. Each attribution
+fact, once named, stays across later publisher writes and issue or repository observations.
+
 The local file provider supports `status`, `path`, `content_hash`, `size`, `mode`, and `reason`. It never returns file content.
 
 ## Authored watch operation
