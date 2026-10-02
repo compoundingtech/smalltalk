@@ -1217,6 +1217,45 @@ async fn the_secret_never_leaves_its_file() {
     let _ = json!({});
 }
 
+/// `st fleet wait` gates a restart (#1022). A first sync is verified once; after a restart
+/// far behind, the wait must also see an exchange since it began at which this node held
+/// everything its peer held, instead of returning at once with the old verdict.
+#[tokio::test(flavor = "multi_thread")]
+async fn fleet_wait_after_a_restart_waits_until_the_member_has_caught_up() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let mut b = joined(root.path(), &a, "b", &[]).await;
+    let waited = b.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    assert!(waited.contains("first sync verified"), "{waited}");
+
+    b.stop();
+    for index in 0..500 {
+        a.note(&format!("while-b-stopped-{index}")).await;
+    }
+    let held = a.st_json(&["replication", "status"])["received_envelopes"]
+        .as_u64()
+        .unwrap();
+    b.start().await;
+    let waited = b.st_ok(&["fleet", "wait", "--timeout", "120s"]);
+    let received = b.st_json(&["replication", "status"])["received_envelopes"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        received >= held,
+        "fleet wait returned while b held {received} of a's {held} envelopes:\n{waited}"
+    );
+    assert!(waited.contains("this node then held the same"), "{waited}");
+    assert!(
+        waited.contains("caught up now: at its latest exchange with a"),
+        "{waited}"
+    );
+
+    // The JSON says the same.
+    let waited = b.st_json(&["fleet", "wait", "--timeout", "60s"]);
+    assert_eq!(waited["state"], "verified", "{waited}");
+    assert_eq!(waited["caught_up"]["peers"][0][0], "a", "{waited}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_member_is_refused() {
     let root = tempfile::tempdir().unwrap();
