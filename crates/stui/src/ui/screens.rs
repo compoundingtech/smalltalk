@@ -25,6 +25,9 @@ pub enum Item {
         first: Vec<Span<'static>>,
         right: Vec<Span<'static>>,
         second: Vec<Span<'static>>,
+        /// Lines beneath the row that belong to it, such as an agent's subagents. They select
+        /// and click as the row: nothing in them is selectable on its own.
+        children: Vec<Line<'static>>,
     },
     Note(Line<'static>),
     /// A folder line in a tree: no spacing around it.
@@ -202,6 +205,7 @@ pub fn home_list(world: &World, snoozed: &std::collections::HashSet<String>) -> 
             ],
             right: vec![],
             second,
+            children: Vec::new(),
         });
         ids.push(item.id.clone());
     }
@@ -1042,6 +1046,35 @@ fn agent_group(agent: &Agent) -> &'static str {
     }
 }
 
+/// An agent's subagents as lines beneath its row, one each under a branch: what each does, its
+/// type, and how long it has run. They are part of the agent's row, never rows of their own.
+fn subagent_lines(agent: &Agent, indent: &str, width: usize) -> Vec<Line<'static>> {
+    let count = agent.subagents.len();
+    agent
+        .subagents
+        .iter()
+        .enumerate()
+        .map(|(index, subagent)| {
+            let branch = if index + 1 == count { "└ " } else { "├ " };
+            let lead = format!("{indent}{branch}");
+            let age = if subagent.age.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", subagent.age)
+            };
+            let room = width.saturating_sub(text::width(&lead) + text::width(&age) + 1);
+            Line::from(vec![
+                span(lead, theme::fg(theme::SURFACE2)),
+                span(
+                    text::truncate(&subagent.label(), room),
+                    theme::fg(theme::OVERLAY1),
+                ),
+                span(age, theme::dim()),
+            ])
+        })
+        .collect()
+}
+
 pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
@@ -1084,6 +1117,7 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
                 format!("   {}", text::truncate(path, width.saturating_sub(4))),
                 theme::dim(),
             )],
+            children: subagent_lines(agent, "   ", width),
         });
         ids.push(agent.id.clone());
     }
@@ -1212,6 +1246,7 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
                 ),
                 theme::dim(),
             )],
+            children: Vec::new(),
         });
         ids.push(mission.id.clone());
     }
@@ -1679,6 +1714,7 @@ pub fn fleet_list(world: &World) -> Listing {
                 theme::dim(),
             )],
             second: vec![span(format!("   {}", machine_line(machine)), theme::dim())],
+            children: Vec::new(),
         });
         ids.push(machine.name.clone());
     }
@@ -1846,6 +1882,7 @@ pub fn worktrees_list(world: &World) -> Listing {
                 format!("  {} · {} agents", tree.path, tree.agents.len()),
                 theme::dim(),
             )],
+            children: Vec::new(),
         });
         ids.push(format!("{}:{}", tree.host, tree.path));
     }
@@ -2196,6 +2233,23 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
             None,
         ));
     }
+    if !agent.subagents.is_empty() {
+        doc.blank();
+        doc.section("subagents", Some(agent.subagents.len()), width);
+        for subagent in &agent.subagents {
+            let mut spans = vec![run(subagent.label(), theme::soft())];
+            if !subagent.age.is_empty() {
+                spans.push(run(format!(" · {}", subagent.age), theme::dim()));
+            }
+            doc.lines(text::wrap(
+                &spans,
+                width,
+                &[run("· ", theme::dim())],
+                &[run("  ", theme::dim())],
+                None,
+            ));
+        }
+    }
     doc.blank();
     doc.section("runs as", None, width);
     let (glyph, color) = agent_glyph(agent.state, spinner);
@@ -2264,6 +2318,7 @@ fn tree_listing(
             first: row,
             right,
             second: vec![],
+            children: Vec::new(),
         });
         ids.push(id);
     }
@@ -2315,7 +2370,7 @@ fn compact_folders(paths: &[Vec<String>]) -> Vec<Vec<String>> {
         .collect()
 }
 
-pub fn agents_tree(world: &World, spinner: &'static str) -> Listing {
+pub fn agents_tree(world: &World, spinner: &'static str, width: usize) -> Listing {
     let leaves = agent_order(world)
         .into_iter()
         .map(|agent| {
@@ -2348,6 +2403,21 @@ pub fn agents_tree(world: &World, spinner: &'static str) -> Listing {
         state_of(&world.agents, "Loading agents…", "No agents yet."),
         vec![],
     );
+    // Each agent's subagents hang beneath its leaf, indented past its glyph.
+    let agents = world.agents.items();
+    for item in &mut listing.items {
+        if let Item::Row {
+            index,
+            first,
+            children,
+            ..
+        } = item
+            && let Some(agent) = agents.iter().find(|agent| agent.id == listing.ids[*index])
+        {
+            let indent = format!("{}  ", first.first().map_or("", |span| &*span.content));
+            *children = subagent_lines(agent, &indent, width);
+        }
+    }
     listing.legend = agents_list(world, spinner, 40).legend;
     listing
 }
@@ -2441,8 +2511,46 @@ mod tree_tests {
     }
 
     #[test]
+    fn an_agents_subagents_hang_beneath_its_row_and_are_never_selectable() {
+        let world = super::super::demo::world();
+        for listing in [agents_list(&world, "⠋", 60), agents_tree(&world, "⠋", 60)] {
+            let builder = listing
+                .ids
+                .iter()
+                .position(|id| id == "agent/example/atlas/builder")
+                .unwrap();
+            let children = listing
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Row {
+                        index, children, ..
+                    } if *index == builder => Some(children),
+                    _ => None,
+                })
+                .unwrap();
+            let lines = children
+                .iter()
+                .map(super::super::text::plain)
+                .collect::<Vec<_>>();
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(
+                lines[0].contains("├ map the parser's error paths · Explore 4m"),
+                "{lines:?}"
+            );
+            assert!(
+                lines[1].contains("└ run the slow tests · general-purpose 1m"),
+                "{lines:?}"
+            );
+            // Only agents are selectable; their subagents add no rows of their own.
+            assert_eq!(listing.ids.len(), world.agents.items().len());
+            assert!(listing.ids.iter().all(|id| !id.contains("a3f9e1")));
+        }
+    }
+
+    #[test]
     fn a_tree_has_one_line_per_folder_and_leaf_in_path_order() {
-        let listing = agents_tree(&super::super::demo::world(), "⠋");
+        let listing = agents_tree(&super::super::demo::world(), "⠋", 40);
         let kinds = listing
             .items
             .iter()
