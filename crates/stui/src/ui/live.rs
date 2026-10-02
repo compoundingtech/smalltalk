@@ -177,7 +177,7 @@ fn save_glass(
                     )
                     .await
                     .map(|saved| Some(saved.value.header.revision))
-                    .map_err(|error| error.to_string()),
+                    .map_err(|error| error.plain()),
                 Err(error) => Err(error.to_string()),
             },
             GlassWrite::Delete { id, base, key } => client
@@ -190,7 +190,7 @@ fn save_glass(
                 )
                 .await
                 .map(|_| None)
-                .map_err(|error| error.to_string()),
+                .map_err(|error| error.plain()),
         };
         let _ = tx.send(Fetched::GlassSaved {
             id: write.id().to_owned(),
@@ -742,7 +742,10 @@ pub fn run(context: Context) -> Result<()> {
                                 crate::send_terminal_key(&client, &terminal, &incarnation, key)
                                     .await
                             {
-                                let _ = tx.send(Fetched::Notice(format!("Key not sent: {error}")));
+                                let _ = tx.send(Fetched::Notice(format!(
+                                    "Key not sent: {}",
+                                    plain(&error)
+                                )));
                             }
                         });
                     } else {
@@ -809,7 +812,8 @@ pub fn run(context: Context) -> Result<()> {
             let person = person.clone();
             let model = model.clone();
             runtime.spawn(async move {
-                let outcome = perform(&client, &person, &model, effect, sent.as_deref()).await;
+                let outcome =
+                    perform_steadily(&client, &person, &model, effect, sent.as_deref()).await;
                 if let Some(token) = token {
                     let _ = tx.send(Fetched::Sent(
                         token,
@@ -819,7 +823,7 @@ pub fn run(context: Context) -> Result<()> {
                             let unconfirmed = error
                                 .downcast_ref::<ClientError>()
                                 .is_some_and(|error| matches!(error, ClientError::Transport(_)));
-                            (error.to_string(), unconfirmed)
+                            (plain(error), unconfirmed)
                         }),
                     ));
                 }
@@ -831,7 +835,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 let _ = tx.send(Fetched::Notice(match outcome {
                     Ok((notice, _)) => notice,
-                    Err(error) => format!("Failed: {error}"),
+                    Err(error) => format!("Not done: {}", plain(&error)),
                 }));
             });
         }
@@ -1075,6 +1079,56 @@ async fn acknowledge_visible_message(client: &Client, person: &str, id: &str) ->
         "read receipt was not completed"
     );
     Ok(())
+}
+
+/// `perform`, tried again while st refused it only because it raced a busy store (or asked to
+/// slow down, or was not answering at all): each try reads a fresh fence, and nothing was
+/// applied, so a new request is safe. A timeout, which may have been applied, is not retried
+/// here; an unconfirmed send keeps its exact request for that.
+async fn perform_steadily(
+    client: &Client,
+    person: &str,
+    model: &Model,
+    effect: Effect,
+    sent: Option<&Mutex<Option<Sent>>>,
+) -> Result<(String, Option<String>)> {
+    let mut wait = Duration::from_millis(50);
+    for _ in 0..7 {
+        match perform(client, person, model, effect.clone(), sent).await {
+            Err(error) if not_applied(&error) => {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(2));
+            }
+            outcome => return outcome,
+        }
+    }
+    perform(client, person, model, effect, sent).await
+}
+
+/// Whether st refused a request in a way that guarantees it applied nothing and a fresh try
+/// may succeed.
+fn not_applied(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<ClientError>())
+        .any(|error| {
+            matches!(
+                error,
+                ClientError::Api(
+                    st3_client::ErrorCode::StaleFence | st3_client::ErrorCode::RateLimited,
+                    ..
+                ) | ClientError::Unreachable(_)
+            )
+        })
+}
+
+/// An error as a person reads it: st's errors in plain words, anything else as it is.
+pub(crate) fn plain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ClientError>())
+        .map(ClientError::plain)
+        .unwrap_or_else(|| error.to_string())
 }
 
 async fn perform(
@@ -1740,7 +1794,7 @@ async fn attach_direct(
                     tries += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(error.plain()),
             }
         };
         found.push((
@@ -1775,7 +1829,7 @@ async fn attach_direct(
         {
             Ok(attachment) => attachment,
             Err(error) => {
-                reason = error.to_string();
+                reason = error.plain();
                 continue;
             }
         };
@@ -1790,7 +1844,7 @@ async fn attach_direct(
                     })
                     .map_err(|error| error.to_string());
             }
-            Err(error) => reason = error.to_string(),
+            Err(error) => reason = error.plain(),
         }
     }
     Err(reason)

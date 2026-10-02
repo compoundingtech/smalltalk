@@ -419,6 +419,120 @@ pub enum ClientError {
     Protocol(String),
 }
 
+impl ClientError {
+    /// What went wrong in words a person reads: no codes and no Rust names. st's own message
+    /// follows where it says something the sentence does not.
+    pub fn plain(&self) -> String {
+        match self {
+            ClientError::Api(code, message, _) => plain_message(Some(code), message),
+            ClientError::Transport(message) if message.contains("deadline") => {
+                "st took too long to answer; it may or may not have done it".into()
+            }
+            ClientError::Transport(message) => format!("the connection to st broke ({message})"),
+            ClientError::Unreachable(unreachable) => {
+                format!(
+                    "st is not answering at {} (restarting?)",
+                    unreachable.endpoint
+                )
+            }
+            ClientError::Protocol(message) => {
+                format!("st sent something this client cannot read ({message})")
+            }
+        }
+    }
+
+    /// Whether the same request may succeed if tried again after a short wait: it raced a busy
+    /// store, st was restarting or slow, or another host was briefly out of reach. A refusal
+    /// about the thing itself (gone, not allowed, invalid) is not.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ClientError::Api(code, _, envelope) => {
+                envelope.retryable
+                    || matches!(
+                        code,
+                        ErrorCode::StaleFence
+                            | ErrorCode::PageCursorExpired
+                            | ErrorCode::CursorGap
+                            | ErrorCode::RemoteUnavailable
+                            | ErrorCode::RateLimited
+                            | ErrorCode::RuntimeAuthorityIndeterminate
+                            | ErrorCode::TerminalUnavailable
+                            | ErrorCode::Internal
+                    )
+            }
+            ClientError::Transport(_) | ClientError::Unreachable(_) => true,
+            ClientError::Protocol(_) => false,
+        }
+    }
+}
+
+/// An error st sent (a code, when it gave one, and its message) as a person reads it.
+pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
+    let Some(code) = code else {
+        return message.to_owned();
+    };
+    let host = message
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("host/"))
+        .map(|host| host.trim_end_matches(|c: char| !c.is_alphanumeric()));
+    match code {
+        ErrorCode::StaleFence => {
+            "st changed while this was on its way, so it was not applied".into()
+        }
+        ErrorCode::PageCursorExpired | ErrorCode::CursorGap => {
+            "the list changed while it was being read".into()
+        }
+        ErrorCode::RemoteUnavailable => match host {
+            Some(host) => format!("{host} cannot be reached right now"),
+            None => "the host this lives on cannot be reached right now".into(),
+        },
+        ErrorCode::RateLimited => "st asked to slow down for a moment".into(),
+        ErrorCode::RuntimeAuthorityIndeterminate => {
+            "st cannot tell yet which host runs this".into()
+        }
+        ErrorCode::IdempotencyConflict => {
+            "this was already sent once in another form, so it was not sent again".into()
+        }
+        ErrorCode::UnsupportedCapability => {
+            format!("this st does not do that yet ({message})")
+        }
+        ErrorCode::NotFound => format!("it is gone: {message}"),
+        ErrorCode::Forbidden => format!("not allowed: {message}"),
+        ErrorCode::Internal => format!("st hit a problem: {message}"),
+        ErrorCode::TerminalEnded => "the terminal ended: its process exited".into(),
+        ErrorCode::TerminalUnavailable => "the terminal cannot be reached right now".into(),
+        ErrorCode::ValidationFailed
+        | ErrorCode::AttentionMigrated
+        | ErrorCode::RuntimeNotLocal
+        | ErrorCode::Unknown => message.to_owned(),
+    }
+}
+
+/// Run `attempt` until it succeeds, its error is not transient, or `tries` run out, waiting a
+/// little longer each time (50 ms doubling, up to 2 s). Each try builds its request afresh, so a
+/// fence read inside it is current; an action that may have been applied (a transport error
+/// after sending) must reuse its idempotency key, which the caller keeps outside the closure.
+pub async fn retry_transient<T, F, Fut>(tries: u32, mut attempt: F) -> Result<T, ClientError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ClientError>>,
+{
+    let mut wait = Duration::from_millis(50);
+    let mut try_number = 0;
+    loop {
+        match attempt(try_number).await {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is_transient() && try_number + 1 < tries => {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(2));
+                try_number += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+
 /// The st daemon accepted no connection, typically because it is restarting. Nothing was sent,
 /// so the request is always safe to repeat.
 #[derive(Clone, Debug)]
@@ -1760,6 +1874,87 @@ fn percent_encode_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn api(code: ErrorCode, message: &str) -> ClientError {
+        ClientError::Api(
+            code.clone(),
+            message.into(),
+            Box::new(ErrorEnvelope {
+                api_version: "st3.client.v0".into(),
+                error_version: "st3.client.error.v0".into(),
+                request_id: "request/test".into(),
+                code,
+                message: message.into(),
+                retryable: false,
+                retry_after_ms: None,
+                details: Default::default(),
+            }),
+        )
+    }
+
+    #[test]
+    fn errors_read_as_sentences_and_say_whether_trying_again_may_help() {
+        let stale = api(
+            ErrorCode::StaleFence,
+            "the client snapshot changed before the action was submitted",
+        );
+        assert_eq!(
+            stale.plain(),
+            "st changed while this was on its way, so it was not applied"
+        );
+        assert!(stale.is_transient());
+        let remote = api(
+            ErrorCode::RemoteUnavailable,
+            "owner host/Juniper is temporarily unavailable; cached data remains usable",
+        );
+        assert_eq!(remote.plain(), "Juniper cannot be reached right now");
+        assert!(remote.is_transient());
+        let gone = api(ErrorCode::NotFound, "agent `agent/x` does not exist");
+        assert_eq!(gone.plain(), "it is gone: agent `agent/x` does not exist");
+        assert!(!gone.is_transient());
+        assert!(!api(ErrorCode::Forbidden, "no").is_transient());
+        // A terminal out of reach comes back; one whose process exited does not.
+        let away = api(ErrorCode::TerminalUnavailable, "the terminal owner is unavailable");
+        assert!(away.is_transient());
+        let ended = api(ErrorCode::TerminalEnded, "the terminal process exited");
+        assert_eq!(ended.plain(), "the terminal ended: its process exited");
+        assert!(!ended.is_transient());
+        let slow = ClientError::Transport("client-v0 request deadline exceeded".into());
+        assert!(slow.plain().contains("took too long"));
+        assert!(slow.is_transient());
+        for error in [&stale, &remote, &gone, &slow] {
+            let plain = error.plain();
+            assert!(
+                !plain.contains("StaleFence") && !plain.contains("Api("),
+                "{plain}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_errors_are_tried_again_and_others_are_not() {
+        let tries = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_transient(5, |_| {
+            let n = tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(api(ErrorCode::StaleFence, "raced"))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 2);
+        tries.store(0, std::sync::atomic::Ordering::SeqCst);
+        let result: Result<(), _> = retry_transient(5, |_| {
+            tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(api(ErrorCode::NotFound, "gone")) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     use super::*;
     use futures_util::SinkExt as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

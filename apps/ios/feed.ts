@@ -1,4 +1,4 @@
-import { applyWindow, type Agent, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { applyWindow, isTransientCode, plainMessage, type Agent, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { TERMINAL_RESTARTED, withFreshTerminalFence, type Foreground, type TerminalFollowHandlers } from './terminalControls';
 
 // The app holds three windows on one collections socket. It needs no work window: missions carry
@@ -38,7 +38,9 @@ export type ConversationHandlers = {
   onIssue: (issue: string) => void;
 };
 
-type Client = Pick<St3Client, 'collectionStream' | 'terminalScreen' | 'terminalAttach' | 'terminalDetach'>;
+type Client = Pick<St3Client, 'collectionStream' | 'terminalScreen' | 'terminalAttach' | 'terminalDetach'> & Partial<Pick<St3Client, 'capabilities'>>;
+/** How often a live socket is checked, and how long one check may take. */
+const PROBE_EVERY_MS = 10_000, PROBE_WAIT_MS = 5_000;
 type Follow = { close(): void };
 
 function errorCode(error: unknown): string | undefined {
@@ -51,7 +53,7 @@ function errorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return code ? `${code}: ${message}` : message;
 }
-const transient = (code: string | undefined) => code === 'internal' || code === 'remote-unavailable' || code === 'rate-limited';
+const transient = (code: string | undefined) => code === 'internal' || code === 'remote-unavailable' || code === 'rate-limited' || code === 'terminal-unavailable';
 
 // One collections socket per paired gateway and credential. It holds the app's windows, at most one
 // followed terminal, and at most one followed conversation. A dropped socket reconnects after
@@ -69,6 +71,9 @@ export class Feed {
   private terminal: TerminalFollow | undefined;
   private conversation: { target: string; handlers: ConversationHandlers; failures: number; timer?: ReturnType<typeof setTimeout> } | undefined;
   private glasses: { handlers: GlassesHandlers; window?: CollectionWindow } | undefined;
+  /** Windows (and the glasses) st stopped sending: how often they failed, and the timer to ask again. */
+  private retries: Partial<Record<FeedWindow | typeof GLASSES, { failures: number; timer?: ReturnType<typeof setTimeout> }>> = {};
+  private probe: ReturnType<typeof setInterval> | undefined;
   private readonly unsubscribe: () => void;
   private readonly client: Client;
   private readonly handlers: FeedHandlers;
@@ -138,8 +143,50 @@ export class Feed {
     this.stream = undefined;
     this.live = false;
     this.windows = {};
+    this.stopProbing();
+    for (const retry of Object.values(this.retries)) clearTimeout(retry?.timer);
+    this.retries = {};
     this.terminal?.socketLost();
     open?.close();
+  }
+
+  /**
+   * A socket can stay open and silent while st is wedged or the network blackholed it, and the
+   * app would say live with old data. While live, st is asked something small every 10 s; a slow
+   * answer is asked again at once, and only two misses in a row drop the socket.
+   */
+  private startProbing(): void {
+    const capabilities = this.client.capabilities?.bind(this.client);
+    if (this.probe || !capabilities) return;
+    const current = this.attempt;
+    const once = () => Promise.race([capabilities().then(() => true, () => false), new Promise<boolean>(resolve => setTimeout(() => resolve(false), PROBE_WAIT_MS))]);
+    this.probe = setInterval(() => {
+      void (async () => {
+        if (await once() || await once()) return;
+        if (current === this.attempt && !this.closed) this.dropped(new Error('st stopped answering'));
+      })();
+    }, PROBE_EVERY_MS);
+  }
+
+  private stopProbing(): void {
+    clearInterval(this.probe);
+    this.probe = undefined;
+  }
+
+  /** Ask again for a window st stopped sending, after a wait that grows; say so the first time only. */
+  private retryLater(name: FeedWindow | typeof GLASSES, again: () => void): boolean {
+    const retry = this.retries[name] ?? { failures: 0 };
+    clearTimeout(retry.timer);
+    const delay = this.retryDelaysMs[Math.min(retry.failures, this.retryDelaysMs.length - 1)];
+    retry.failures++;
+    retry.timer = setTimeout(() => { if (this.retries[name] === retry) { retry.timer = undefined; again(); } }, delay);
+    this.retries[name] = retry;
+    return retry.failures === 1;
+  }
+
+  private loaded(name: FeedWindow | typeof GLASSES): void {
+    clearTimeout(this.retries[name]?.timer);
+    delete this.retries[name];
   }
 
   private async connect(): Promise<void> {
@@ -170,6 +217,7 @@ export class Feed {
     this.stream = undefined;
     this.live = false;
     this.windows = {};
+    this.stopProbing();
     this.terminal?.socketLost();
     if (!this.foreground.active) return;
     const delay = this.retryDelaysMs[Math.min(this.failures, this.retryDelaysMs.length - 1)];
@@ -186,6 +234,7 @@ export class Feed {
       const next = applyWindow(follow.window, frame);
       if (!next) { follow.window = undefined; this.stream?.subscribeGlasses(GLASSES); return; }
       follow.window = next;
+      this.loaded(GLASSES);
       follow.handlers.onIssue('');
       follow.handlers.onGlasses(next.items.filter(item => item.kind === 'glass') as Glass[]);
     } else if (frame.kind === 'snapshot' || frame.kind === 'changes') {
@@ -194,9 +243,10 @@ export class Feed {
       const next = applyWindow(this.windows[name], frame);
       if (!next) { this.subscribeWindow(name); return; }
       this.windows[name] = next;
+      this.loaded(name);
       if (frame.kind === 'snapshot') {
         this.failures = 0;
-        if (!this.live) { this.live = true; this.handlers.onConnection('live'); }
+        if (!this.live) { this.live = true; this.handlers.onConnection('live'); this.startProbing(); }
       }
       const items = next.items.filter(item => item.kind === KINDS[name]) as FeedLists[typeof name];
       this.handlers.onWindow(name, items, next.hasMore, next.snapshot);
@@ -222,10 +272,21 @@ export class Feed {
         clearTimeout(follow.timer);
         follow.timer = setTimeout(() => { if (this.conversation === follow) this.stream?.subscribeConversation(CONVERSATION, follow.target); }, delay);
         // A page that expired under a busy store is routine; say so only if it keeps happening.
-        if (frame.code !== 'page-cursor-expired' || follow.failures > 2) follow.handlers.onIssue(`${frame.code ? `${frame.code}: ${frame.message}` : frame.message} · trying again`);
+        if (frame.code !== 'page-cursor-expired' || follow.failures > 2) follow.handlers.onIssue(`${plainMessage(frame.code, frame.message)} · trying again`);
       }
-      else if (id === GLASSES) this.glasses?.handlers.onIssue(frame.code ? `${frame.code}: ${frame.message}` : frame.message);
-      else if (id && id in FEED_WINDOWS) this.handlers.onWindowError?.(id as FeedWindow, frame.message);
+      else if (id === GLASSES && this.glasses) {
+        // st stopped sending the glasses; for what may clear, ask again later rather than leave them stale.
+        const plain = plainMessage(frame.code, frame.message);
+        if (!isTransientCode(frame.code)) this.glasses.handlers.onIssue(plain);
+        else if (this.retryLater(GLASSES, () => { if (this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); } })) this.glasses.handlers.onIssue(`${plain} · trying again`);
+      }
+      else if (id && id in FEED_WINDOWS) {
+        const name = id as FeedWindow;
+        // A list whose first read failed is asked for again when that may help, so it never stays stale under "live".
+        const plain = plainMessage(frame.code, frame.message);
+        if (!isTransientCode(frame.code)) this.handlers.onWindowError?.(name, plain);
+        else if (this.retryLater(name, () => this.subscribeWindow(name))) this.handlers.onWindowError?.(name, `${plain} · trying again`);
+      }
     }
   }
 }
@@ -302,9 +363,10 @@ class TerminalFollow {
 
   failed(code: string | undefined, message: string): void {
     if (this.closed) return;
-    if (code === 'stale-fence') this.stop(TERMINAL_RESTARTED);
-    else if (transient(code)) this.retry(`${code}: ${message}`);
-    else this.stop(code ? `${code}: ${message}` : message);
+    // st also says stale-fence for an owner briefly out of reach or a viewer that idled, not only
+    // a restart: attach again, and the attach itself refuses a terminal that really restarted.
+    if (code === 'stale-fence' || transient(code)) this.retry(plainMessage(code, message));
+    else this.stop(plainMessage(code, message));
   }
 
   /** The socket closed: whatever was in flight belongs to it. */

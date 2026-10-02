@@ -589,7 +589,9 @@ impl Ui {
         if self.paste_into_palette(&first) {
             return;
         }
-        if let Some((fields, focus)) = self.new_mission.as_mut() {
+        if self.mission_form_focused()
+            && let Some((fields, focus)) = self.new_mission.as_mut()
+        {
             edit::insert(
                 &mut fields[*focus],
                 &self.cursor,
@@ -2485,10 +2487,15 @@ impl Ui {
             self.agent_form_key(key);
             return;
         }
-        if let Some((fields, focus)) = self.new_mission.as_mut() {
+        if self.mission_form_focused()
+            && let Some((fields, focus)) = self.new_mission.as_mut()
+        {
             let focus_now = *focus;
             match key.code {
-                KeyCode::Esc => self.new_mission = None,
+                KeyCode::Esc => {
+                    self.new_mission = None;
+                    self.close_form_tab();
+                }
                 KeyCode::Tab => *focus = (focus_now + 1) % 4,
                 KeyCode::BackTab => *focus = (focus_now + 3) % 4,
                 KeyCode::Enter
@@ -3064,6 +3071,18 @@ impl Ui {
     }
 
     /// st started the agent asked for here: its conversation replaces the form.
+    /// The new mission form: in a new tab of the focused split in a glass, on Missions otherwise.
+    pub(crate) fn open_new_mission(&mut self) {
+        if self.new_mission.is_none() {
+            self.new_mission = Some((Default::default(), 0));
+        }
+        if self.glasses.is_some() {
+            self.open_in_glass(Pane::NewMission, glass::Open::Tab);
+        } else {
+            self.switch_tab(2);
+        }
+    }
+
     /// Start a plain shell for the person, opened in a new tab once st has it.
     pub(crate) fn open_new_terminal(&mut self) {
         if self.live {
@@ -3128,6 +3147,7 @@ impl Ui {
         }
         let [title, request, mission, workspace] = fields;
         self.new_mission = None;
+        self.close_form_tab();
         if self.live {
             self.effects.push(Effect::CreateLaunch {
                 title,
@@ -3702,6 +3722,7 @@ impl Ui {
             Hit::PaletteChoice(index) => self.open_choice(Some(index), glass::Open::Here),
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
+            Hit::NewTerminal => self.open_new_terminal(),
             Hit::SidebarRow(index) => {
                 if let Some(glasses) = self.glasses.as_mut() {
                     let sidebar = &mut glasses.sidebar;
@@ -3756,7 +3777,10 @@ impl Ui {
                     self.submit()
                 }
             }
-            Hit::Escape if self.new_mission.is_some() => self.new_mission = None,
+            Hit::Escape if self.new_mission.is_some() => {
+                self.new_mission = None;
+                self.close_form_tab();
+            }
             Hit::Escape => {
                 if self.popover.take().is_none() {
                     self.editing = false;

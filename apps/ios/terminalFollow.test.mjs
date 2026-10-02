@@ -56,14 +56,24 @@ const errorFrame = (code, message) => ({ kind: 'error', id: 'terminal', collecti
   assert.equal(sockets.length, 2);
   assert.equal(terminalSubscriptions(sockets[1]).at(-1).capability, 'capability-3');
 
-  // A stale fence shows the restart notice and never reattaches: input must not reach a
-  // replacement process.
-  sockets[1].frame(errorFrame('stale-fence', 'the terminal restarted'));
-  assert.equal(issues.at(-1), TERMINAL_RESTARTED);
+  // st also says stale-fence when the owner is briefly out of reach: the same incarnation is
+  // attached again.
+  sockets[1].frame(errorFrame('stale-fence', 'the terminal owner is not reachable'));
+  assert.match(issues.at(-1), /reconnecting/);
+  assert.doesNotMatch(issues.at(-1), /stale-fence/);
   await settle();
+  assert.equal(calls.attaches.length, 4);
+  assert.equal(terminalSubscriptions(sockets[1]).at(-1).capability, 'capability-4');
+
+  // A terminal that really restarted is refused by the attach's own incarnation check, and
+  // never reattached: input must not reach a replacement process.
+  calls.incarnation = 'incarnation/two';
+  sockets[1].frame(errorFrame('stale-fence', 'the terminal restarted'));
+  await settle();
+  assert.equal(issues.at(-1), TERMINAL_RESTARTED);
   sockets[1].drop(new Error('lost'));
   await settle();
-  assert.equal(calls.attaches.length, 3, 'a stale fence is not retried, even after a reconnect');
+  assert.equal(calls.attaches.length, 4, 'a restart is not reattached, even after a reconnect');
   assert.deepEqual(terminalSubscriptions(sockets[2]), []);
   follow.close();
   feed.close();

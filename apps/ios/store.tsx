@@ -3,7 +3,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, type Attention, type Capabilities, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client, notApplied, plainError, retryTransient, type Attention, type Capabilities, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { isSnapshotChurn, listSessionPages, type Conversation, type SessionView } from './sessionView';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
 import { listCollectionPages } from './collectionPages';
@@ -27,8 +27,9 @@ const URL_KEY = 'st3.gateway.url', ORDER_KEY = 'st3.tabs.order', CREDENTIAL_KEY 
 // Glasses are an experiment (mission fleet/stui/glass): off unless the person turns them on here.
 const GLASSES_KEY = 'st3.experiments.glasses';
 
+/** An error as a person reads it: st's errors in plain words (the SDK's plainError). */
 export function errorText(error: unknown): string {
-  return error instanceof ClientError ? `${error.response.code}: ${error.message}` : error instanceof Error ? error.message : String(error);
+  return plainError(error);
 }
 function currentAgent(agent: { operational?: { layer?: string } }) { return agent.operational?.layer !== 'history'; }
 function items<K extends Resource['kind']>(page: { items: Resource[] }, kind: K): Extract<Resource, { kind: K }>[] {
@@ -176,11 +177,17 @@ function useAppStore() {
     });
   }, [client]);
 
-  function fence(revisions: Record<string, string> = {}) { if (!snapshot) throw new Error('Refresh before acting.'); return { snapshot_id: snapshot.id, subject_revisions: revisions }; }
+  /** A fence on a snapshot read just now: one read seconds ago has nearly always moved on a busy host. */
+  async function fence(revisions: Record<string, string> = {}) {
+    if (!client) throw new Error('Still connecting; try again in a moment.');
+    const capability = await client.capabilities();
+    return { snapshot_id: capability.snapshot.id, subject_revisions: revisions };
+  }
+  /** Run an action, trying again (with a fresh fence each time) while st refused it only because it raced a busy store. */
   async function runAction(action: () => Promise<unknown>, reload: readonly OnDemand[] = []): Promise<boolean> {
-    if (status !== 'online') { setError('Reconnect before sending an action.'); return false; }
+    if (status !== 'online') { setError('Still connecting; try again in a moment.'); return false; }
     setBusy(true);
-    try { await action(); setError(''); await loadLists(reload); return true; } catch (e) { setError(errorText(e)); return false; } finally { setBusy(false); }
+    try { await retryTransient(8, action, notApplied); setError(''); await loadLists(reload); return true; } catch (e) { setError(errorText(e)); return false; } finally { setBusy(false); }
   }
 
   async function completePairing(gatewayClient: St3Client, id: string, code: string, gateway?: string) {
@@ -217,33 +224,28 @@ function useAppStore() {
     },
     async done(item: Attention, summary: string) {
       if (!client) return false;
-      return runAction(() => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary } }); });
+      return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary } }); });
     },
     /** Send Small Talk to an agent, as stui does: fenced to a fresh snapshot, once more if it moved. */
     async send(to: string, content: string, sessionId?: string): Promise<string | null> {
       if (!client) return 'not connected';
       if (status !== 'online') return 'offline';
-      let last: unknown;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const capability = await client.capabilities();
+      try {
+        // Each try is a new request on a fresh fence, made only after st said the last applied nothing.
+        await retryTransient(8, async () => {
           const id = actionId();
-          await client.messageSend({ id, idempotency_key: id, fence: { snapshot_id: capability.snapshot.id, subject_revisions: {} }, parameters: { to, content, ...(sessionId ? { session_id: sessionId } : {}) } });
-          return null;
-        } catch (e) {
-          last = e;
-          if (!(e instanceof ClientError) || !/stale/i.test(`${e.response.code} ${e.message}`)) break;
-        }
-      }
-      return errorText(last);
+          await client.messageSend({ id, idempotency_key: id, fence: await fence(), parameters: { to, content, ...(sessionId ? { session_id: sessionId } : {}) } });
+        }, notApplied);
+        return null;
+      } catch (e) { return errorText(e); }
     },
     async createLaunch(parameters: { title: string; request: string; workspace: string; provider: Planner; model?: string; effort?: string }) {
       if (!client) return false;
-      return runAction(async () => { const id = actionId(); await client.launchCreate({ id, idempotency_key: id, fence: fence(), parameters: { title: parameters.title, request: parameters.request, target: { type: 'new-mission', mission_id: `mission/ios-${Crypto.randomUUID()}`, workspace: parameters.workspace }, provider: parameters.provider, ...(parameters.model ? { model: parameters.model } : {}), ...(parameters.effort ? { effort: parameters.effort } : {}) } }); }, ['launches']);
+      return runAction(async () => { const id = actionId(); await client.launchCreate({ id, idempotency_key: id, fence: await fence(), parameters: { title: parameters.title, request: parameters.request, target: { type: 'new-mission', mission_id: `mission/ios-${Crypto.randomUUID()}`, workspace: parameters.workspace }, provider: parameters.provider, ...(parameters.model ? { model: parameters.model } : {}), ...(parameters.effort ? { effort: parameters.effort } : {}) } }); }, ['launches']);
     },
     async reviseLaunch(launch: Launch, feedback: string) {
       if (!client) return false;
-      return runAction(async () => { const id = actionId(); await client.launchRevise({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision }), parameters: { launch_id: launch.id, feedback } }); }, ['launches']);
+      return runAction(async () => { const id = actionId(); await client.launchRevise({ id, idempotency_key: id, fence: await fence({ [launch.id]: launch.revision }), parameters: { launch_id: launch.id, feedback } }); }, ['launches']);
     },
     async variants(launchId: string): Promise<LaunchVariant[]> {
       if (!client || status !== 'online') return [];
@@ -251,11 +253,11 @@ function useAppStore() {
     },
     async preview(launch: Launch, variant: LaunchVariant) {
       if (!client) return false;
-      return runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }, ['launches']);
+      return runAction(async () => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: await fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }, ['launches']);
     },
     async approve(launch: Launch, variant: LaunchVariant) {
       if (!client || !variant.preview_token) return false;
-      return runAction(() => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }, ['launches']);
+      return runAction(async () => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...(await fence({ [launch.id]: launch.revision, [variant.id]: variant.revision })), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }, ['launches']);
     },
     /** An agent names its runtimes; a runtime is read only when the person opens its terminal. */
     async runtimeTerminal(runtimeId: string): Promise<string | null> {
