@@ -11,6 +11,8 @@ use ratatui::text::{Line, Span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hit {
+    /// Speak into the focused message box instead of typing (voice mode).
+    Voice,
     /// Start a plain shell in a new tab.
     NewTerminal,
     /// A row of the Ctrl+S sidebar's list: select it and open it.
