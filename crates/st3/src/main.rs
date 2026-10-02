@@ -16408,8 +16408,11 @@ async fn forward_projected_messages_reporting(
                 }
                 // Receipt-backed transports advance graph delivery only after their durable ledger proves
                 // that the exact inbox file was consumed by a provider turn. Materialization alone is
-                // merely queued native delivery.
-                if !native_delivery_receipted(&consumed, &filename) {
+                // merely queued native delivery. Delivered-unread mail is reoffered every poll, but
+                // its delivery is already recorded: posting it again on each poll wakes every
+                // mailbox reader in the daemon for nothing (#1085).
+                if message.status == "delivered" || !native_delivery_receipted(&consumed, &filename)
+                {
                     return Ok(());
                 }
                 deliver_message(
@@ -20873,6 +20876,99 @@ mission "review" state="ready" {
         assert_eq!(store.message("message/delivered").unwrap().unwrap().status, "delivered");
         assert_eq!(store.message("message/read").unwrap().unwrap().status, "read");
         assert_eq!(store.message("message/closed").unwrap().unwrap().status, "closed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn consumed_delivered_unread_mail_posts_no_lifecycle_claim_on_any_poll() {
+        use axum::{
+            Json, Router,
+            extract::Path as AxumPath,
+            routing::{get, post},
+        };
+
+        // #1085: a seat holding many delivered-unread messages re-posted `delivered` for every
+        // one of them on every poll, and each repeat woke every mailbox reader in the daemon.
+        let posts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = posts.clone();
+        let app = Router::new()
+            .route(
+                "/v1/messages/page",
+                get(|| async {
+                    let message = |subject: &str, status: &str, index: u64| {
+                        json!({"subject": subject, "from": "agent/sender", "to": "agent/test",
+                            "content": "Signal", "status": status, "created_index": index})
+                    };
+                    Json(json!({"api_version": "st3.v1", "value": {
+                        "items": [message("message/delivered", "delivered", 1),
+                                  message("message/staged", "staged", 2)],
+                        "has_more": false, "next_cursor": null, "limit": 200
+                    }}))
+                }),
+            )
+            .route(
+                "/v1/messages/{message_id}/claims",
+                post(move |AxumPath(message_id): AxumPath<String>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        recorded.lock().unwrap().push(message_id.clone());
+                        Json(json!({"api_version": "st3.v1", "value": {
+                            "id": "claim/1", "store_index": 1, "batch_id": "batch/1",
+                            "subject": message_id, "kind": "message.delivered", "origin": "test",
+                            "actor": "agent/test", "body": {}, "predecessors": [],
+                            "accepted_at_unix_ms": 1
+                        }}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+        let mut writer = st_drivers::harness_timeline::Writer::new(root.path(), "claude", "one");
+        for subject in ["message/delivered", "message/staged"] {
+            let filename = st_drivers::message::send_to_inbox(
+                &inbox,
+                "agent/sender",
+                None,
+                None,
+                &[format!("st3-message:{subject}")],
+                "Signal",
+            )
+            .unwrap();
+            writer
+                .append(
+                    subject,
+                    st_drivers::harness_timeline::Role::User,
+                    st_drivers::harness_timeline::EntryType::Content,
+                    json!({"text": format!("[st3-delivery:{filename}]\nSignal")}),
+                    true,
+                )
+                .unwrap();
+        }
+        for _ in 0..5 {
+            forward_projected_messages(
+                &client,
+                "agent/test",
+                &inbox,
+                &archive,
+                "claude-channel",
+                NativeDeliveryReceipts::ClaudeChannel {
+                    agent_dir: root.path(),
+                    incarnation: "one",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let posts = posts.lock().unwrap().clone();
+        // A consumed message still in `staged` records its delivery (here the mock never
+        // settles it, so it is posted on each poll); an already-delivered one is never posted.
+        assert!(posts.iter().all(|id| id.contains("staged")), "{posts:?}");
+        assert_eq!(posts.len(), 5, "{posts:?}");
         server.abort();
     }
 

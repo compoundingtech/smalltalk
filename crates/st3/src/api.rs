@@ -9387,8 +9387,8 @@ async fn post_message_claim(
                 fields.insert("runtime_id".into(), Value::String(runtime_id));
             }
         }
-        let record = store
-            .append_claim(&ClaimInput {
+        let (record, appended) = store
+            .append_claim_outcome(&ClaimInput {
                 subject,
                 kind: kind.into(),
                 actor: Some(actor),
@@ -9398,11 +9398,15 @@ async fn post_message_claim(
                 idempotency_key: Some(request.idempotency_key),
             })
             .map_err(ApiError::bad)?;
-        Ok((record, is_work_wake(&message.tags)))
+        Ok((record, appended, is_work_wake(&message.tags)))
     })
     .await?;
-    let (record, work_wake) = record;
-    signal_message_changed(&state, kind, work_wake);
+    let (record, appended, work_wake) = record;
+    // An idempotent repeat or an already-settled transition changes nothing a reader can see.
+    // Signalling it anyway re-reads every subscribed seat's mailbox (#1085).
+    if appended {
+        signal_message_changed(&state, kind, work_wake);
+    }
     Ok(Json(record))
 }
 
@@ -13791,6 +13795,22 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "a conversation message's lifecycle woke the reconciler"
         );
         assert!(events.has_changed().unwrap());
+        events.borrow_and_update();
+        // A repeat, or a transition the message has already passed, changes nothing a reader
+        // can see and wakes no reader (#1085).
+        for (lifecycle, key) in [("delivered", "talk-delivered"), ("staged", "talk-staged")] {
+            let (status, claim) = json_request(
+                app.clone(),
+                &format!("/v1/messages/{id}/claims"),
+                json!({"lifecycle": lifecycle, "actor": "agent/receiver", "idempotency_key": key}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{claim}");
+            assert!(
+                !events.has_changed().unwrap(),
+                "a no-op {lifecycle} woke readers"
+            );
+        }
         // A work wake does.
         let (status, sent) = json_request(
             app.clone(),
