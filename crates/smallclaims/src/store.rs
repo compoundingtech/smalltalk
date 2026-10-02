@@ -6572,6 +6572,8 @@ pub fn append_claim_record_tx(
         predecessors,
         now,
     )?;
+    // A device signed this claim before the node wrote it: keep the signature with it.
+    principals::attach_expected_signature_tx(transaction, &id, subject, kind, actor)?;
     Ok(ClaimRecord {
         id,
         store_index,

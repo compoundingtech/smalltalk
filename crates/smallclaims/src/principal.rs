@@ -134,6 +134,81 @@ pub struct ClaimSignature {
     pub nonce: String,
     pub signed_at_unix_ms: u64,
     pub signature: String,
+    /// How the signed bytes are built. Absent: the claim's whole content, as a node signs it.
+    /// [`FIELDS_FORMAT`]: named fields as text, as a phone or a browser signs a request before
+    /// any node writes its claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// The fields a [`FIELDS_FORMAT`] signature covers; the node may add others.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signed_fields: Vec<String>,
+}
+
+/// A signature over named fields of a claim, laid out as text a device builds without CBOR:
+/// see [`fields_signing_bytes`].
+pub const FIELDS_FORMAT: &str = "fields-v1";
+const FIELDS_DOMAIN: &str = "smallclaims-claim-fields-v1";
+
+/// The bytes a [`FIELDS_FORMAT`] signature signs, one line each: the domain, the subject, the
+/// kind, the actor (empty when none), `NAME=VALUE` for each signed field in name order (VALUE is
+/// compact JSON with object keys sorted; a missing field is `null`), the signer, on whose behalf
+/// (empty when none), the key, the chain joined by `,`, the nonce, and the signing time.
+#[allow(clippy::too_many_arguments)]
+pub fn fields_signing_bytes(
+    subject: &str,
+    kind: &str,
+    actor: Option<&str>,
+    fields: &Value,
+    signed_fields: &[String],
+    signer: &str,
+    on_behalf: Option<&str>,
+    key: &str,
+    chain: &[String],
+    nonce: &str,
+    signed_at_unix_ms: u64,
+) -> Vec<u8> {
+    let mut names = signed_fields.to_vec();
+    names.sort();
+    names.dedup();
+    let mut text = format!(
+        "{FIELDS_DOMAIN}\n{subject}\n{kind}\n{}\n",
+        actor.unwrap_or_default()
+    );
+    for name in names {
+        let value = canonical_json_value(fields.get(&name).unwrap_or(&Value::Null));
+        text.push_str(&format!(
+            "{name}={}\n",
+            serde_json::to_string(&value).expect("a JSON value serializes")
+        ));
+    }
+    text.push_str(&format!(
+        "{signer}\n{}\n{key}\n{}\n{nonce}\n{signed_at_unix_ms}",
+        on_behalf.unwrap_or_default(),
+        chain.join(",")
+    ));
+    text.into_bytes()
+}
+
+/// Check a signature by `key`: an Ed25519 key is base64url; a P-256 key is `p256:` and the
+/// base64url of its uncompressed point, and signs ECDSA over SHA-256 with a fixed 64-byte
+/// signature, as the Secure Enclave and WebCrypto do.
+pub fn verify_key_signature(key: &str, message: &[u8], signature: &str) -> bool {
+    use base64::Engine as _;
+    let Some(point) = key.strip_prefix("p256:") else {
+        return verify_signature(key, message, signature);
+    };
+    let decode = |text: &str| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(text.as_bytes())
+            .ok()
+    };
+    let (Some(point), Some(signature)) = (decode(point), decode(signature)) else {
+        return false;
+    };
+    point.len() == 65
+        && ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, point)
+            .verify(message, &signature)
+            .is_ok()
 }
 
 /// The digest of what a signature covers in a claim: everything its writer chose, and nothing
@@ -200,15 +275,17 @@ impl ClaimSignature {
             nonce,
             signed_at_unix_ms,
             signature,
+            format: None,
+            signed_fields: Vec::new(),
         }
     }
 
-    /// Whether the signature is genuine for this content: the key signed exactly these fields.
-    pub fn verifies(&self, content: &str) -> bool {
-        verify_signature(
-            &self.key,
-            &signing_bytes(
-                content,
+    /// Whether the signature is genuine for this claim: the key signed exactly what its format
+    /// says it covers.
+    pub fn verifies(&self, claim: &Judged<'_>) -> bool {
+        let bytes = match self.format.as_deref() {
+            None => signing_bytes(
+                &claim.content,
                 &self.signer,
                 self.on_behalf.as_deref(),
                 &self.key,
@@ -216,8 +293,22 @@ impl ClaimSignature {
                 &self.nonce,
                 self.signed_at_unix_ms,
             ),
-            &self.signature,
-        )
+            Some(FIELDS_FORMAT) if !self.signed_fields.is_empty() => fields_signing_bytes(
+                claim.subject,
+                claim.kind,
+                claim.actor,
+                claim.fields,
+                &self.signed_fields,
+                &self.signer,
+                self.on_behalf.as_deref(),
+                &self.key,
+                &self.chain,
+                &self.nonce,
+                self.signed_at_unix_ms,
+            ),
+            _ => return false,
+        };
+        verify_key_signature(&self.key, &bytes, &self.signature)
     }
 }
 
@@ -259,6 +350,7 @@ pub struct Judged<'a> {
     pub id: &'a str,
     pub subject: &'a str,
     pub kind: &'a str,
+    pub actor: Option<&'a str>,
     pub content: String,
     pub fields: &'a Value,
 }
@@ -289,7 +381,7 @@ pub fn judge(claim: &Judged<'_>, signature: Option<&ClaimSignature>, facts: &dyn
     let Some(signature) = signature else {
         return Verdict::Unsigned;
     };
-    if !signature.verifies(&claim.content) {
+    if !signature.verifies(claim) {
         return Verdict::Invalid("the signature does not match the claim".into());
     }
     if facts.nonce_used_before(&signature.key, &signature.nonce) {
@@ -546,6 +638,7 @@ mod tests {
             id: "claim/1",
             subject: "note/plans",
             kind: "example.note",
+            actor: Some("person/ada"),
             content: content_digest("note/plans", "example.note", Some("person/ada"), fields),
             fields,
         }

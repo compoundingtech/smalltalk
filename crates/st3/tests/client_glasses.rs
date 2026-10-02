@@ -513,6 +513,7 @@ async fn glasses_rust_client_and_collection_stream_deliver_upserts_and_removes()
                 api_version: "st3.client.v0".into(),
                 code: challenge.code,
                 device_public_key: "a".repeat(64),
+                key_storage: None,
             },
         )
         .await
