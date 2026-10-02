@@ -505,6 +505,8 @@ pub struct Reconciler<R = NativeRuntime> {
     observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_cursors: Arc<Mutex<HashMap<String, Option<String>>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
+    /// When each batched subscription may next send what it collected.
+    batch_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     /// When a failed `checkout` may run Git again, and why it failed, by agent subject.
     checkout_retries: Arc<Mutex<HashMap<String, (u128, String)>>>,
     /// The last agent declaration's run-end checkout and workspace, by subject, with the store
@@ -614,6 +616,7 @@ impl Reconciler<NativeRuntime> {
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
+            batch_deadlines: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
@@ -662,6 +665,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
+            batch_deadlines: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
@@ -1202,6 +1206,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.store.next_subscription_mission_retry_deadline()
             }),
             self.delayed_restarts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .values()
+                .copied()
+                .min(),
+            self.batch_deadlines
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .values()
@@ -8806,6 +8816,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.cancel_unstarted_subscription_requests(&item.subject)?;
             return Ok(());
         }
+        if spec.delivery == "message"
+            && let Some(every_ms) = spec.batch_every_ms
+        {
+            return self.send_subscription_batch(item, &spec, every_ms);
+        }
         if spec.delivery != "mission" {
             return Ok(());
         }
@@ -8955,7 +8970,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 workspace,
                 requester: Some(requester),
                 mode: None,
-                inputs: BTreeMap::from([(input.into(), format!("{resource}@{discovery}"))]),
+                inputs: BTreeMap::from([(input.into(), format!("{resource}@{discovery}"))])
+                    .into_iter()
+                    .chain(
+                        field("text_input")
+                            .zip(field("text"))
+                            .map(|(name, text)| (name.to_owned(), text.to_owned())),
+                    )
+                    .collect(),
                 idempotency_key: format!("subscription-mission:{}", request.id),
             };
             let created = match &item.owner_run {
@@ -9022,6 +9044,141 @@ impl<R: RuntimeControl> Reconciler<R> {
             })?;
         }
         anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
+        Ok(())
+    }
+
+    /// Send what a batched subscription collected since its last batch as one message, at most
+    /// once per interval, and nothing when nothing arrived. The message and its `batch-sent`
+    /// record are keyed by the newest batch they cover, so a crash between them sends nothing twice.
+    fn send_subscription_batch(
+        &self,
+        item: &DesiredSubject,
+        spec: &SubscriptionSpec,
+        every_ms: u64,
+    ) -> Result<()> {
+        let batches = self
+            .store
+            .claims_for(&item.subject, Some("subscription.batched"))?;
+        let sent = self
+            .store
+            .claims_for(&item.subject, Some("subscription.batch-sent"))?;
+        let last = sent.last();
+        let after = last
+            .and_then(|claim| claim.body.pointer("/fields/through"))
+            .and_then(Value::as_str)
+            .and_then(|through| batches.iter().position(|claim| claim.id == through))
+            .map_or(0, |position| position + 1);
+        let pending = &batches[after.min(batches.len())..];
+        let mut deadlines = self
+            .batch_deadlines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(newest) = pending.last() else {
+            deadlines.remove(&item.subject);
+            return Ok(());
+        };
+        let due = last.map_or(0, |claim| {
+            claim
+                .accepted_at_unix_ms
+                .saturating_add(u128::from(every_ms))
+        });
+        if due > now_ms() {
+            deadlines.insert(item.subject.clone(), due);
+            return Ok(());
+        }
+        deadlines.remove(&item.subject);
+        drop(deadlines);
+        let entries = pending
+            .iter()
+            .flat_map(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/entries")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let text = |entry: &Value, name: &str| {
+            entry
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let lines = entries
+            .iter()
+            .map(|entry| {
+                let who = [text(entry, "by"), text(entry, "author")]
+                    .into_iter()
+                    .find(|who| !who.is_empty())
+                    .unwrap_or_else(|| "someone".into());
+                let link = [text(entry, "url"), text(entry, "item_url")]
+                    .into_iter()
+                    .find(|link| !link.is_empty())
+                    .unwrap_or_default();
+                format!(
+                    "- {} #{} {}: {}\n  {link}\n  by {who}; {}; marker {}",
+                    text(entry, "repository"),
+                    entry
+                        .get("number")
+                        .map(Value::to_string)
+                        .unwrap_or_default(),
+                    text(entry, "kind").replace('_', " "),
+                    text(entry, "title"),
+                    text(entry, "why"),
+                    text(entry, "marker"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let key = format!("subscription-batch-message:{}", newest.id);
+        let message_subject = format!(
+            "message/batch-{}",
+            &hex::encode(sha2::Sha256::digest(key.as_bytes()))[..20]
+        );
+        let count = entries.len();
+        self.store.append_claim(&ClaimInput {
+            subject: message_subject.clone(),
+            kind: "message.sent".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                (
+                    "from".into(),
+                    Value::String(format!("daemon/{}", self.host)),
+                ),
+                ("to".into(), Value::String(spec.to.clone())),
+                (
+                    "title".into(),
+                    Value::String(format!(
+                        "{count} GitHub item{} headed for a person",
+                        if count == 1 { "" } else { "s" }
+                    )),
+                ),
+                ("content".into(), Value::String(lines.join("\n"))),
+                ("status".into(), Value::String("sent".into())),
+                (
+                    "tags".into(),
+                    serde_json::json!(["resource-batch", item.subject]),
+                ),
+            ]),
+            evidence: pending.iter().map(|claim| claim.id.clone()).collect(),
+            expected_subject: None,
+            idempotency_key: Some(key),
+        })?;
+        self.store.append_claim(&ClaimInput {
+            subject: item.subject.clone(),
+            kind: "subscription.batch-sent".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("through".into(), Value::String(newest.id.clone())),
+                ("message".into(), Value::String(message_subject)),
+                ("entries".into(), Value::from(count)),
+            ]),
+            evidence: vec![newest.id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(format!("subscription-batch-sent:{}", newest.id)),
+        })?;
+        self.signal_changed();
         Ok(())
     }
 
@@ -23813,13 +23970,26 @@ subscription "mentions" { observer "observer/repo"; on "mentions"; to "agent/exa
     }
 
     /// The intake pipeline: a new pull request head that a live agent owns reaches that agent as
-    /// one message and requests no review; one nobody owns requests one review. A mention of a
-    /// person becomes one request on their home, or one message to the item's owner. Nothing is
-    /// delivered twice, at the baseline, or for an old mention.
+    /// one message and requests no review; one nobody owns requests one review. New mentions of a
+    /// named login reach an agent, never a person directly: those on items nobody owns go to one
+    /// mission run per observation as a text input, and one on an owned item goes to its owner.
+    /// Nothing is delivered twice, at the baseline, for a new item's own body, or for an old
+    /// mention.
     #[test]
-    fn the_intake_pipeline_routes_each_item_once_to_its_owner_or_a_person() {
+    fn the_intake_pipeline_routes_each_item_once_to_its_owner_or_an_agent() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-mission");
+        apply_source(
+            &store,
+            r#"version 2
+mission "mentions" state="ready" {
+  input "source" kind="resource"
+  input "mentions" kind="text"
+  goal "Group, summarize, and ask once about new mentions."
+  step "ask" { agentless }
+}"#,
+            "mentions-mission",
+        );
         let review = store
             .mission_spec("review", None)
             .unwrap()
@@ -23841,9 +24011,9 @@ subscription "reviews" {{
 }}
 subscription "mentions" {{
   observer "observer/repo"; on "mentions"
-  mention "orchid" "person/robin"
-  mention "fern" "person/lichen"
-  delivery "person" {{ owner "message" }}
+  mention "orchid"
+  mention "fern"
+  delivery "mission" {{ mission "mentions"; resource "source"; text "mentions"; workspace "/tmp/st3-mentions"; owner "message" }}
 }}"#
             ),
             "watch",
@@ -23877,13 +24047,13 @@ subscription "mentions" {{
                 )
                 .unwrap()
         };
-        let requests = || {
+        let requests = |subscription: &str| {
             store
-                .claims_for(
-                    "subscription/reviews",
-                    Some("subscription.mission-requested"),
-                )
+                .claims_for(subscription, Some("subscription.mission-requested"))
                 .unwrap()
+        };
+        let reviews = || {
+            requests("subscription/reviews")
                 .into_iter()
                 .map(|claim| {
                     claim.body["fields"]["resource"]
@@ -23893,17 +24063,23 @@ subscription "mentions" {{
                 })
                 .collect::<Vec<_>>()
         };
-        let asks = || {
-            store
-                .claims_for_kind_at("work.person-asked", None, false, 100)
-                .unwrap()
-                .claims
+        let mention_requests = || {
+            requests("subscription/mentions")
                 .into_iter()
                 .map(|claim| {
-                    (
-                        claim.body["fields"]["person"].as_str().unwrap().to_owned(),
-                        claim.body["fields"]["title"].as_str().unwrap().to_owned(),
-                    )
+                    let text = claim.body["fields"]["text"].as_str().unwrap();
+                    serde_json::from_str::<Vec<Value>>(text)
+                        .unwrap()
+                        .into_iter()
+                        .map(|mention| {
+                            format!(
+                                "{} #{} {}",
+                                mention["by"].as_str().unwrap(),
+                                mention["number"],
+                                mention["login"].as_str().unwrap()
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
         };
@@ -23934,25 +24110,28 @@ subscription "mentions" {{
             }
             pull
         };
-        let mention = |login: &str, at: &str| {
-            serde_json::json!({"login": login, "by": "fern", "at": at,
-                "url": "https://github.com/acme/garden/pull/2#issuecomment-1"})
+        let mention = |login: &str, by: &str, at: &str| {
+            serde_json::json!({"login": login, "by": by, "at": at,
+                "url": format!("https://github.com/acme/garden/pull/2#issuecomment-{login}-{by}")})
         };
+        let now = chrono::Utc::now().to_rfc3339();
         // The baseline delivers nothing, even a mention.
         let mut baseline = pull(1, 'a', None);
-        baseline["mentions"] = serde_json::json!([mention("orchid", "2026-01-01T00:00:00Z")]);
+        baseline["mentions"] = serde_json::json!([mention("orchid", "moss", &now)]);
         assert!(
             observe(serde_json::json!([baseline]))
                 .message_subjects
                 .is_empty()
         );
-        assert!(requests().is_empty() && asks().is_empty());
+        assert!(reviews().is_empty() && mention_requests().is_empty());
 
         // A new pull request the builder opened reaches the builder; one nobody owns, or whose
-        // opener is not a live agent, requests a review.
+        // opener is not a live agent, requests a review. A new item's own mentions go with it.
+        let mut unowned = pull(3, 'c', None);
+        unowned["mentions"] = serde_json::json!([mention("orchid", "moss", &now)]);
         let opened = observe(serde_json::json!([
             pull(2, 'b', Some("agent/node.builder")),
-            pull(3, 'c', None),
+            unowned,
             pull(4, 'd', Some("agent/departed")),
         ]));
         assert_eq!(
@@ -23963,11 +24142,15 @@ subscription "mentions" {{
             )]
         );
         assert_eq!(
-            requests(),
+            reviews(),
             [
                 "resource/repo/pull-request/3",
                 "resource/repo/pull-request/4"
             ]
+        );
+        assert!(
+            mention_requests().is_empty(),
+            "a new item's body goes to its review"
         );
 
         // A new head of the builder's pull request reaches it again, once.
@@ -23982,46 +24165,239 @@ subscription "mentions" {{
                 .message_subjects
                 .is_empty()
         );
-        assert_eq!(requests().len(), 2);
+        assert_eq!(reviews().len(), 2);
 
-        // A new comment that mentions orchid on a pull request nobody owns becomes one request on
-        // orchid's home; a mention of someone the subscription does not name reaches nobody.
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut mentioned = pull(3, 'c', None);
-        let mut own = mention("fern", &now);
-        own["by"] = Value::String("FERN".into());
-        mentioned["mentions"] =
-            serde_json::json!([mention("orchid", &now), mention("moss", &now), own]);
-        observe(serde_json::json!([mentioned.clone()]));
+        // New comments that mention orchid and fern on pull requests nobody owns reach one
+        // mission run together. A login's mention of itself, and a login no `mention` names,
+        // reach nobody.
+        let mut three = pull(3, 'c', None);
+        three["mentions"] = serde_json::json!([
+            mention("orchid", "moss", &now),
+            mention("orchid", "lark", &now),
+            mention("rook", "moss", &now),
+        ]);
+        let mut four = pull(4, 'd', None);
+        four["mentions"] =
+            serde_json::json!([mention("fern", "moss", &now), mention("lark", "lark", &now)]);
+        observe(serde_json::json!([three, four]));
         assert_eq!(
-            asks(),
-            [(
-                "person/robin".to_owned(),
-                "fern mentioned @orchid on #3: Pull 3".to_owned()
-            )]
+            mention_requests(),
+            [["lark #3 orchid", "moss #4 fern"]],
+            "each item keeps the newest mention of each login"
         );
-        // On the builder's pull request it reaches the builder instead.
+        // On the builder's pull request a mention reaches the builder instead.
         let mut owned = pull(2, 'e', None);
-        owned["mentions"] = serde_json::json!([mention("orchid", &now)]);
+        owned["mentions"] = serde_json::json!([mention("orchid", "moss", &now)]);
         let to_owner = observe(serde_json::json!([owned]));
         assert_eq!(
             routed(&to_owner),
             [(
                 "agent/node.builder".to_owned(),
-                "fern mentioned @orchid on #2: Pull 2".to_owned()
+                "moss mentioned @orchid on #2: Pull 2".to_owned()
             )]
         );
-        assert_eq!(asks().len(), 1);
+        assert_eq!(mention_requests().len(), 1);
 
         // An old mention that turns up later, such as one in a body read again, reaches nobody.
         let mut old = pull(4, 'd', None);
-        old["mentions"] = serde_json::json!([mention("orchid", "2026-01-02T00:00:00Z")]);
+        old["mentions"] = serde_json::json!([mention("orchid", "moss", "2026-01-02T00:00:00Z")]);
         assert!(
             observe(serde_json::json!([old]))
                 .message_subjects
                 .is_empty()
         );
-        assert_eq!(asks().len(), 1);
+        assert_eq!(mention_requests().len(), 1);
+
+        // The mention run gets the repository as its source and the mentions as its text input.
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .reconcile_subscription_missions(&store.desired_subjects().unwrap())
+            .unwrap();
+        let started = store
+            .claims_for(
+                "subscription/mentions",
+                Some("subscription.mission-started"),
+            )
+            .unwrap();
+        assert_eq!(started.len(), 1);
+        let run = store
+            .mission_run(started[0].body["fields"]["mission_run"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.inputs["source"].subject.as_deref(),
+            Some("resource/repo")
+        );
+        let text: Vec<Value> = serde_json::from_str(&run.inputs["mentions"].value).unwrap();
+        assert_eq!(
+            text[0]["url"],
+            "https://github.com/acme/garden/pull/2#issuecomment-orchid-lark"
+        );
+        assert_eq!(text[0]["resource"], "resource/repo/pull-request/3");
+        // No step of this pipeline asks a person directly.
+        assert!(
+            store
+                .claims_for_kind_at("work.person-asked", None, false, 10)
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+    }
+
+    /// A batched message collects new pull request heads, issues, and mentions from several
+    /// observations and sends them to its agent together: at most once per interval, never when
+    /// nothing arrived, and each item once.
+    #[test]
+    fn a_batched_delivery_sends_what_arrived_together_at_most_once_per_interval() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+agent "curator" { workspace "/tmp"; command "true" }
+agent "builder" { workspace "/tmp"; command "true" }
+observer "repo" {
+  resource "resource/repo"; provider "github.repository"; locator "acme/garden"
+  field "pull_requests"; field "issues"; field "mentions"
+}
+subscription "curate" {
+  observer "observer/repo"; on "pull_requests"; on "issues"; on "mentions"
+  mention "orchid"
+  to "agent/node.curator"
+  delivery "message" { every "1s"; owner "message" }
+}"#,
+            "watch",
+        );
+        let desired = store.desired_subjects().unwrap();
+        let item = desired
+            .iter()
+            .find(|item| item.subject == "subscription/curate")
+            .unwrap();
+        let subscriptions = vec![(
+            item.subject.clone(),
+            crate::graph::subscription_spec(&item.desired).unwrap(),
+        )];
+        let revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let observe = |facts: Value| {
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    &revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &facts,
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap()
+        };
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let flush = || {
+            reconciler
+                .reconcile_subscription_missions(&store.desired_subjects().unwrap())
+                .unwrap()
+        };
+        let batches = || {
+            store
+                .claims_for("subscription/curate", Some("subscription.batch-sent"))
+                .unwrap()
+                .into_iter()
+                .map(|sent| {
+                    let message = store
+                        .latest_claim(
+                            sent.body["fields"]["message"].as_str().unwrap(),
+                            Some("message.sent"),
+                        )
+                        .unwrap()
+                        .unwrap();
+                    (
+                        message.body["fields"]["to"].as_str().unwrap().to_owned(),
+                        message.body["fields"]["title"].as_str().unwrap().to_owned(),
+                        message.body["fields"]["content"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let pull = |number: u64, head: char| {
+            serde_json::json!({
+                "number": number, "title": format!("Pull {number}"), "head": head.to_string().repeat(40),
+                "state": "open", "draft": false, "author": "lark",
+                "url": format!("https://github.com/acme/garden/pull/{number}"),
+            })
+        };
+        observe(
+            serde_json::json!({"repository_id": 7, "pull_requests": [pull(1, 'a')], "issues": []}),
+        );
+        flush();
+        assert!(batches().is_empty(), "the baseline collects nothing");
+
+        // Two observations collect a new pull request, a new issue, and a mention; one owned by
+        // the builder goes to it alone.
+        let mut owned = pull(2, 'b');
+        owned["opened_by"] = Value::String("agent/node.builder".into());
+        observe(
+            serde_json::json!({"repository_id": 7, "pull_requests": [pull(3, 'c'), owned],
+            "issues": [{"number": 4, "title": "Bug", "url": "https://github.com/acme/garden/issues/4", "author": "moss", "state": "open"}]}),
+        );
+        let mut mentioned = pull(1, 'a');
+        mentioned["mentions"] = serde_json::json!([{"login": "orchid", "by": "moss", "at": now,
+            "url": "https://github.com/acme/garden/pull/1#issuecomment-9"}]);
+        observe(serde_json::json!({"repository_id": 7, "pull_requests": [mentioned]}));
+        flush();
+        let sent = batches();
+        assert_eq!(sent.len(), 1);
+        let (to, title, content) = &sent[0];
+        assert_eq!(to, "agent/node.curator");
+        assert_eq!(title, "3 GitHub items headed for a person");
+        assert!(
+            content.contains("resource/repo #3 pull request: Pull 3"),
+            "{content}"
+        );
+        assert!(content.contains("resource/repo #4 issue: Bug"), "{content}");
+        assert!(content.contains("moss mentioned @orchid"), "{content}");
+        assert!(
+            content.contains("https://github.com/acme/garden/pull/1#issuecomment-9"),
+            "{content}"
+        );
+        assert!(content.contains("marker "), "{content}");
+        assert!(
+            !content.contains("#2 "),
+            "the builder's pull request went to the builder"
+        );
+
+        // Quiet: nothing more is sent.
+        flush();
+        assert_eq!(batches().len(), 1);
+
+        // A new head arrives inside the interval: it waits, then goes out once.
+        observe(serde_json::json!({"repository_id": 7, "pull_requests": [pull(3, 'd')]}));
+        flush();
+        assert_eq!(batches().len(), 1, "the interval has not passed");
+        std::thread::sleep(Duration::from_millis(1_100));
+        flush();
+        flush();
+        let sent = batches();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].1, "1 GitHub item headed for a person");
+        assert!(sent[1].2.contains("#3 pull request"), "{}", sent[1].2);
     }
 
     #[test]

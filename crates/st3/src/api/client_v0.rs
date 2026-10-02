@@ -2288,9 +2288,7 @@ fn machine_resources(
             operational_actionable,
             operational_reasons,
         ) = if host_id != local_host && configured_hosts.contains(&host_id) {
-            let last_success_at = state.store.replication_peer_last_success(&name)?;
-            let recent =
-                last_success_at.is_some_and(|at| client_now_ms().saturating_sub(at) < 90_000);
+            let (recent, last_success_at) = state.store.replication_peer_up(&name)?;
             (
                 if recent { "reachable" } else { "last-seen" },
                 vec![json!({
@@ -3582,11 +3580,16 @@ fn managed_codex_transcript(
     // The wrapper owns this path; never resolve a path from client input. A reused
     // driver directory is only authoritative when its runtime and a durable
     // observation both name the same exact provider incarnation.
-    let directory = state
+    let root = state
         .state_dir
         .join("drivers")
-        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
-        .join("state");
+        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24]);
+    let native = root.join("sessions/codex");
+    let directory = if native.exists() {
+        native
+    } else {
+        root.join("state")
+    };
     let runtime = std::fs::read(directory.join("runtime.json"))
         .map_err(|_| "the Codex driver has not written its runtime record".to_owned())?;
     let binding = std::fs::read(directory.join("binding.json"))
@@ -3646,15 +3649,11 @@ fn managed_claude_transcript(
     let Some(evidence) = evidence else {
         return Err("the Claude driver has not reported which process owns the seat".into());
     };
-    let identity = owner.strip_prefix("agent/").unwrap_or(owner);
-    let directory = state
-        .state_dir
-        .join("drivers")
-        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
-        .join("catalog")
-        .join("agents")
-        .join(st_drivers::run::detect_host())
-        .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
+    let directory = crate::hooks::claude_agent_dir(
+        &state.state_dir.join("drivers"),
+        owner,
+        &st_drivers::run::detect_host(),
+    );
     // The current wrapper's SessionStart hook binds the Claude session it started. A previous
     // provider's binding can survive a restart, so it counts only when it names the same
     // provider incarnation as the seat's current observation; neither its presence nor the
@@ -3727,16 +3726,21 @@ fn managed_omp_transcript(
             };
         }
     }
-    let identity = owner.strip_prefix("agent/").unwrap_or(owner);
-    let directory = state
+    let root = state
         .state_dir
         .join("drivers")
-        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
-        .join("catalog")
-        .join("agents")
-        .join(st_drivers::run::detect_host())
-        .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
-        .join("provider-sessions");
+        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24]);
+    let native = root.join("sessions/omp/provider-sessions");
+    let directory = if root.join("sessions/omp").exists() {
+        native
+    } else {
+        crate::hooks::legacy_claude_agent_dir(
+            &state.state_dir.join("drivers"),
+            owner,
+            &st_drivers::run::detect_host(),
+        )
+        .join("provider-sessions")
+    };
     match crate::external_sessions::find_managed_omp_transcript(
         &directory,
         (started_at.timestamp_millis().max(0) as u128).saturating_sub(2_000),

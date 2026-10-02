@@ -1437,7 +1437,12 @@ mod retry_tests {
                     .replication_status(true, Some(fleet_id), &["traveller".into()])
                     .unwrap();
                 assert_eq!(status.peers[0].status, "last-seen");
-                assert!(status.peers[0].last_error.is_none());
+                // The servers' failed dials to the traveller's old address are evidence, kept
+                // with their time until the traveller exchanges again.
+                assert_eq!(
+                    status.peers[0].last_error.is_some(),
+                    status.peers[0].last_failure_at_unix_ms.is_some()
+                );
             }
             // A changed source address is irrelevant: only the returning side needs to
             // reach the stable servers. Both queues drain despite server hour-long backoff.

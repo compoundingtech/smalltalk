@@ -312,6 +312,8 @@ def judge(proof):
     failures = []
     if proof.get("projected_message_files", 0):
         failures.append("delivery created file-mailbox messages")
+    if proof.get("driver_catalog_files", 0):
+        failures.append("native drivers fabricated catalogs")
     delay = proof["read_after_clear_ms"]
     if delay is None:
         failures.append("message was not read")
@@ -544,6 +546,8 @@ agent "fault-probe" {{
         result.update(
             projected_message_files=sum(1 for path in (target.root / "state").rglob("*")
                 if path.is_file() and any(part in ("inbox", "archive") for part in path.parts)),
+            driver_catalog_files=sum(1 for pattern in ("catalog.kdl", "agent.kdl")
+                for path in (target.root / "state/drivers").rglob(pattern)),
             read_after_clear_ms=delay, received_copies=len(received), graph_read_claims=len(graph_reads),
             provider_starts=len(starts), expected_provider_starts=expected_starts,
             provider_pids_before=initial, provider_pids_after=provider_pids(after),

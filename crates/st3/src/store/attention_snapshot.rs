@@ -59,11 +59,14 @@ impl Store {
                 .and_then(|ask| ask.body["fields"].get("request"))
                 .filter(|request| request.is_object())
                 .cloned();
-            let response: &[&str] = match request.as_ref().and_then(|r| r["type"].as_str()) {
-                Some("decision" | "choice") => &["--answer", "ANSWER_ID"],
-                Some(_) => &["--text", "FEEDBACK"],
-                None => &["--summary", "RESPONSE"],
-            };
+            let (label, response): (&str, &[&str]) =
+                match request.as_ref().and_then(|r| r["type"].as_str()) {
+                    Some("decision" | "choice") => ("done", &["--answer", "ANSWER_ID"]),
+                    // An update clears when the person opens it or presses read.
+                    Some("update") => ("read", &["--answer", "read"]),
+                    Some(_) => ("done", &["--text", "FEEDBACK"]),
+                    None => ("done", &["--summary", "RESPONSE"]),
+                };
             items.push(AttentionItemView {
                 episode,
                 priority: "normal".into(),
@@ -85,7 +88,7 @@ impl Store {
                 targets: vec![subject.clone()],
                 requested_at_unix_ms: since,
                 actions: vec![attention_action(
-                    "done",
+                    label,
                     &[
                         "st",
                         "work",

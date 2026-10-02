@@ -863,9 +863,16 @@ pub struct SubscriptionSpec {
     /// "message"`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub owner_message: bool,
-    /// The GitHub logins whose mentions the subscription hears, each with the person it names.
+    /// The GitHub logins whose mentions the subscription hears.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mentions: Vec<(String, String)>,
+    pub mentions: Vec<String>,
+    /// The mission's text input that carries one observation's new items (`text "NAME"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_input: Option<String>,
+    /// A message delivery that collects new items and sends them together at most this often
+    /// (`every "30m"`), and only when something arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_every_ms: Option<u64>,
     pub stopped: bool,
 }
 
