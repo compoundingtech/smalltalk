@@ -15,6 +15,7 @@ export type ConversationRules = {
   mail: { involving_you: MailLook; between_others: MailLook; to_you_fill: string; sent: Label; delivered: Label };
   pending: { sending: Label; sending_edge: string; failed: string; unconfirmed: string; text: string };
   event: { rule: string; label: string };
+  bundle: { folded: string; opened: string; label: string; last: string };
 };
 
 /** A theme token's colour: `tool_bg` is `theme.toolBg`. */

@@ -19,7 +19,7 @@ function machineGlyph(state: string): { glyph: string; color: string } {
 
 // Fleet: machines, what runs where, this connection and the paired devices.
 export function FleetScreen() {
-  const { data, truncated, caps, url, gatewayMachineId, gatewayHost, order, actions, glassesOn } = useStore();
+  const { data, truncated, caps, url, gatewayMachineId, gatewayHost, order, actions, glassesOn, simpleOn } = useStore();
   useListsOnFocus(['machines', 'devices', 'sessions']);
   const refresh = useRefresh(['machines', 'devices', 'sessions']);
   const scroll = useRef<ScrollView>(null);
@@ -62,6 +62,13 @@ export function FleetScreen() {
         second="stui's spaces, their tabs and splits, one thing at a time"
         onPress={() => actions.setGlassesOn(!glassesOn)}
         accessibilityLabel={`Spaces, ${glassesOn ? 'on' : 'off'}. Double-tap to turn ${glassesOn ? 'off' : 'on'}.`}
+      />
+      <ListRow
+        glyph={simpleOn ? '●' : '○'}
+        glyphColor={simpleOn ? theme.green : theme.overlay1}
+        title={`Simplified conversations · ${simpleOn ? 'on' : 'off'}`}
+        second="a tool call to a line, a run of calls to one line; this phone only"
+        onPress={() => actions.setSimpleOn(!simpleOn)}
       />
       <SectionHeader title="this connection" />
       <View style={{ paddingHorizontal: 12, gap: 2 }}>

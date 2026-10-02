@@ -26,6 +26,8 @@ export type Planner = 'codex' | 'claude' | 'pi' | 'omp' | 'opencode';
 const URL_KEY = 'st3.gateway.url', ORDER_KEY = 'st3.tabs.order', CREDENTIAL_KEY = 'st3.device.credential';
 // Glasses are an experiment (mission fleet/stui/glass): off unless the person turns them on here.
 const GLASSES_KEY = 'st3.experiments.glasses';
+// Simplified conversations: this phone's own choice, on unless turned off, never synced.
+const SIMPLE_KEY = 'st3.conversation.simple';
 
 /** An error as a person reads it: st's errors in plain words (the SDK's plainError). */
 export function errorText(error: unknown): string {
@@ -59,6 +61,7 @@ function useAppStore() {
   const [treeView, setTreeView] = useState(false);
   // Spaces are how stui works, so the tab is on unless this phone turned it off.
   const [glassesOn, setGlassesOn] = useState(true);
+  const [simpleOn, setSimpleOn] = useState(true);
   const [glasses, setGlasses] = useState<Glass[]>([]), [glassesIssue, setGlassesIssue] = useState('');
   const [scrollRequest, setScrollRequest] = useState<{ y: number; at: number } | null>(null);
   const cachedActor = useRef(''), cacheSavedAt = useRef(0), cacheGeneration = useRef(0);
@@ -134,6 +137,7 @@ function useAppStore() {
 
   // Glasses: followed on the feed's socket while the experiment is on and the gateway grants them.
   useEffect(() => { void AsyncStorage.getItem(GLASSES_KEY).then(value => setGlassesOn(value !== '0')).catch(() => {}); }, []);
+  useEffect(() => { void AsyncStorage.getItem(SIMPLE_KEY).then(value => setSimpleOn(value !== '0')).catch(() => {}); }, []);
   // Version 1 glasses are splits of tab groups; an earlier member's glasses are a shape this app no longer reads.
   const glassesGranted = caps?.capabilities.some(capability => capability.id === 'glasses' && capability.version >= 1 && capability.state === 'granted') ?? false;
   useEffect(() => {
@@ -306,6 +310,10 @@ function useAppStore() {
       void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated));
     },
     reconnect() { feed?.reconnect(); },
+    setSimpleOn(on: boolean) {
+      setSimpleOn(on);
+      void AsyncStorage.setItem(SIMPLE_KEY, on ? '1' : '0').catch(() => {});
+    },
     setGlassesOn(on: boolean) {
       setGlassesOn(on);
       void AsyncStorage.setItem(GLASSES_KEY, on ? '1' : '0').catch(() => {});
@@ -322,7 +330,7 @@ function useAppStore() {
     error, setError, pairingIssue, setPairingIssue, busy, historicalSessions, conversationCache, draftCache, client,
     gatewayMachineId, gatewayHost, canControlTerminal, loadLists, actions,
     treeView, setTreeView, scrollRequest, requestScroll: (y: number) => setScrollRequest({ y, at: Date.now() }),
-    glassesOn, glassesGranted, glasses, glassesIssue,
+    glassesOn, glassesGranted, glasses, glassesIssue, simpleOn,
   };
 }
 

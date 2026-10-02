@@ -104,3 +104,18 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.equal(entryMatches(tool, 'harbor'), false);
   assert.equal(entryMatches(tool, '  '), true, 'an empty query keeps everything');
 }
+
+// "Older entries are not shown" heads the conversation, though st stamps it with the time it was
+// read, later than every entry it shows.
+{
+  const at = (seconds) => `2026-10-02T09:00:${String(seconds).padStart(2, '0')}Z`;
+  const timeline = [
+    { id: 'e1', sequence: 10, revision: 1, timestamp: at(1), role: 'assistant', final: true, type: 'content', body: { media_type: 'text/plain', text: 'first' } },
+    { id: 'e2', sequence: 11, revision: 1, timestamp: at(2), role: 'assistant', final: true, type: 'content', body: { media_type: 'text/plain', text: 'second' } },
+    { id: 'cut', sequence: 0, revision: 1, timestamp: at(30), role: 'system', final: true, type: 'truncation', body: { from_sequence: 0, to_sequence: 9, reason: 'outside the window' } },
+  ];
+  const shown = conversationEntries(timeline, new Map());
+  assert.equal(shown[0].body.text, 'older entries are not shown');
+  assert.equal(shown[0].at, '');
+  assert.deepEqual(shown.slice(1).map(entry => entry.body.text), ['first', 'second']);
+}
