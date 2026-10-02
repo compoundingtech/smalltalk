@@ -2245,6 +2245,7 @@ impl Ui {
         {
             match key.code {
                 KeyCode::Esc => self.close_home(),
+                KeyCode::Char('h') if control => self.close_home(),
                 KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
                 _ => return false,
             }
@@ -2272,6 +2273,14 @@ impl Ui {
         match key.code {
             KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
             KeyCode::Char('s') if control => self.toggle_sidebar(),
+            // Home over the glass, and away again; in a text box Ctrl+H stays backspace.
+            KeyCode::Char('h') if control => {
+                if self.home_open() {
+                    self.close_home();
+                } else {
+                    self.open_home();
+                }
+            }
             KeyCode::Char('t') if control => self.open_palette(None, Open::Tab),
             KeyCode::Char('v') if control => self.split_group(Side::Right),
             KeyCode::Char('x') if control => self.split_group(Side::Below),
@@ -4532,6 +4541,15 @@ mod tests {
             "{:?}",
             ui.effects
         );
+    }
+
+    #[test]
+    fn ctrl_h_opens_home_and_closes_it_again() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'h');
+        assert!(ui.home_open());
+        ctrl(&mut ui, 'h');
+        assert!(!ui.home_open());
     }
 
     #[test]
