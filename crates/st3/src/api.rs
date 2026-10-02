@@ -624,6 +624,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/agent-queue-moves", post(move_agent_queue))
+        .route("/v1/sekrets/node", get(sekrets_node))
+        .route("/v1/sekrets/attest", post(sekrets_attest))
         .route("/v1/lanes", get(list_lanes))
         .route("/v1/lanes/{*lane}", get(get_lane))
         .route("/v1/lane-changes", post(change_lane))
@@ -4279,6 +4281,12 @@ async fn serve_unix_with_ancestor(
                 let delivery_peer = delivery_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
+                    if let Some(pid) = peer_pid {
+                        request.extensions_mut().insert(LocalPeer {
+                            pid,
+                            ancestor: bound_agent.clone(),
+                        });
+                    }
                     if let Some(peer) = delivery_peer {
                         request.extensions_mut().insert(peer);
                     }
@@ -10950,6 +10958,59 @@ struct LaneListQuery {
 }
 
 /// Every open lane, every declared lane with `?all=true`, or the lanes of one `?run=`.
+/// The process at the other end of a local socket connection, as the kernel reports it, and
+/// the agent its ancestry names.
+#[derive(Clone, Debug)]
+struct LocalPeer {
+    pid: u32,
+    ancestor: Option<String>,
+}
+
+/// This node's key for sekrets attestations, for `st sekrets enable` to register.
+async fn sekrets_node(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let (node, key) =
+        crate::sekrets::daemon::node_key(&state.store, &state.node).map_err(ApiError::bad)?;
+    Ok(Json(json!({
+        "node": node,
+        "key": key,
+        "person": crate::sekrets::daemon::PERSON.get(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct SekretsAttestRequest {
+    nonce: String,
+}
+
+/// Sign which seat the calling process is, for the sekrets gateway. Only over the local socket,
+/// where the kernel names the caller.
+async fn sekrets_attest(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<LocalPeer>>,
+    Json(request): Json<SekretsAttestRequest>,
+) -> Result<Json<crate::sekrets::protocol::Attestation>, ApiError> {
+    let Some(axum::Extension(peer)) = peer else {
+        return Err(ApiError::bad(St3Error::new(
+            "sekrets-attestation-refused",
+            "attestations are only given over the local socket",
+        )));
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::sekrets::daemon::attest(
+            &state.store,
+            &state.node,
+            &state.pty_root,
+            peer.pid,
+            peer.ancestor.as_deref(),
+            &request.nonce,
+        )
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map(Json)
+    .map_err(ApiError::bad)
+}
+
 async fn list_lanes(
     State(state): State<AppState>,
     Query(query): Query<LaneListQuery>,

@@ -399,3 +399,21 @@ jobs:
           "$RUNNER_TEMP/vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/vm-out"
           jq -r '"| VM boot | \(.boot_seconds)s |\n| systemd-scope tests in VM (extract and run) | \(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
           printf '| VM test driver total | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the st binary for the sekrets VM
+        run: |
+          start=$SECONDS
+          nix develop -c cargo build --locked -p st3 --bin st3
+          printf '| st build | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the sekrets VM test driver
+        run: |
+          start=$SECONDS
+          nix build --print-build-logs --out-link "$RUNNER_TEMP/sekrets-vm-driver" .#legacyPackages.x86_64-linux.sekrets-vm.driver
+          printf '| sekrets VM driver build | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run the sekrets gateway test in the VM
+        env:
+          ST_SEKRETS_BINARY: "${{ github.workspace }}/target/debug/st3"
+        run: |
+          start=$SECONDS
+          mkdir -p "$RUNNER_TEMP/sekrets-vm-out"
+          "$RUNNER_TEMP/sekrets-vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/sekrets-vm-out"
+          printf '| sekrets VM test | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"

@@ -213,6 +213,8 @@ enum Command {
         #[command(subcommand)]
         command: RuleCommand,
     },
+    /// Run any CLI with credentials no seat can read, through the sekrets gateway.
+    Sekrets(st3::sekrets::cli::SekretsArgs),
     /// Discover native harness sessions and move one under durable st ownership.
     Import {
         #[command(subcommand)]
@@ -3531,6 +3533,13 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Skill(args) = cli.command {
         return run_skill(args);
     }
+    // The gateway runs as the sekrets user, which has no st configuration.
+    if let Command::Sekrets(args) = cli.command {
+        let code = st3::sekrets::cli::run(args, cli.json).await?;
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
     if let Command::ReplicationWorker(args) = cli.command {
         let mut config = Config::load_unvalidated(args.config.as_deref())?;
         if let Some(value) = args.node {
@@ -3574,6 +3583,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
+        Command::Sekrets(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
         Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
@@ -4058,6 +4068,16 @@ async fn run_up(args: UpArgs) -> Result<()> {
         None => st_runtime::resolve_executable("pty", &login_environment)?,
     };
     let recorder = install_recorder(&config, &login_environment);
+    if let Some(person) = &config.person {
+        let _ = st3::sekrets::daemon::PERSON.set(person.clone());
+    }
+    // Sekrets is opt-in: this records a gateway's calls once one listens on this host.
+    st3::sekrets::daemon::spawn_importer(
+        store.clone(),
+        config.node.clone(),
+        config.state_dir.clone(),
+        st3::sekrets::client::socket_path(),
+    );
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),

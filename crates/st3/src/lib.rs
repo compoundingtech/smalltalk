@@ -41,6 +41,8 @@ pub mod remote_terminal;
 pub mod render;
 pub mod resource;
 pub mod seat_queue;
+/// Runs any CLI with credentials no seat can read, through a gateway the sekrets user owns.
+pub mod sekrets;
 pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
