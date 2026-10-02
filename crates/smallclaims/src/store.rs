@@ -2782,6 +2782,20 @@ pub const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 /// request timeout, and a first sync needs a few dozen exchanges instead of hundreds.
 pub const REPLICATION_PAGE_LIMIT: u32 = 4_096;
 
+/// The page this node asks peers for: `REPLICATION_PAGE_LIMIT`, or less when
+/// `ST3_REPLICATION_PAGE_LIMIT` caps it, so tests can make a backlog of several pages cheaply.
+pub fn replication_accepts() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ST3_REPLICATION_PAGE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map_or(REPLICATION_PAGE_LIMIT, |cap| {
+                cap.clamp(1, REPLICATION_PAGE_LIMIT)
+            })
+    })
+}
+
 /// How many envelopes one exchange carries to a peer, from the inventory it sent. An older
 /// peer says nothing and takes the classic 512.
 pub fn replication_page_limit(remote: &ReplicationInventory) -> usize {
@@ -4658,7 +4672,7 @@ impl Store {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
                 buckets: snapshot.buckets.clone(),
-                accepts: Some(REPLICATION_PAGE_LIMIT),
+                accepts: Some(replication_accepts()),
                 checkpoint: self.trimmed_checkpoint()?,
             },
             envelopes: Vec::new(),
@@ -4717,7 +4731,7 @@ impl Store {
                     digest: snapshot.inventory.digest.clone(),
                     envelopes: listed,
                     buckets: snapshot.buckets.clone(),
-                    accepts: Some(REPLICATION_PAGE_LIMIT),
+                    accepts: Some(replication_accepts()),
                     checkpoint: self.trimmed_checkpoint()?,
                 },
                 envelopes: self.replica_envelopes(missing)?,
@@ -4756,7 +4770,7 @@ impl Store {
             graph_digest: snapshot.legacy_graph_digest.clone(),
             projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
-                accepts: Some(REPLICATION_PAGE_LIMIT),
+                accepts: Some(replication_accepts()),
                 checkpoint: self.trimmed_checkpoint()?,
                 ..if same {
                     ReplicationInventory {

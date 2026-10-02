@@ -934,6 +934,9 @@ async fn dial_peer<B: Backend>(
     let mut activity_changes = fleet.activity_changed.subscribe();
     let mut connectivity = fleet.connectivity_changed.subscribe();
     let mut must_send = false;
+    // The last exchange moved envelopes, so more may wait on either side: exchange again at
+    // once, even though the peer dialed in recently.
+    let mut moving = false;
     let mut route = 0_usize;
     let mut last_http_success = None;
     let mut refused = Vec::<(Route, tokio::time::Instant)>::new();
@@ -966,7 +969,8 @@ async fn dial_peer<B: Backend>(
             .expect("inbound lock poisoned")
             .get(&name)
             .copied();
-        if let Some(at) = inbound_at {
+        let continuing = std::mem::take(&mut moving);
+        if let Some(at) = inbound_at.filter(|_| !continuing) {
             if must_send && at.elapsed() < worker_interval(Duration::from_secs(30)) {
                 let offered = fleet
                     .inbound_authority
@@ -1096,8 +1100,10 @@ async fn dial_peer<B: Backend>(
                 }
                 if moved {
                     // One exchange carries a bounded batch. Keep going at once while envelopes
-                    // still move instead of leaving the rest of a backlog to the timer.
+                    // still move instead of leaving the rest of a backlog to the timer, or to
+                    // the quiet window after the peer's last inbound exchange.
                     notify.borrow_and_update();
+                    moving = true;
                 } else {
                     // A busy harness can write several observations while one exchange is in
                     // flight. Keep the first exchange immediate, then coalesce the resulting
