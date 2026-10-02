@@ -143,6 +143,22 @@ mod tests {
         receive_and_project(target, &source.origin, &exchange);
     }
     #[test]
+    fn split_ratios_survive_replication_and_projection_replay() {
+        let a = Store::open_memory("alder").unwrap();
+        let b = Store::open_memory("birch").unwrap();
+        let mut claim = input(1, "Main");
+        let body = json!({"name":"Main","layout":{"split":"right","ratio":0.3,"children":[{"tabs":[]},{"split":"below","ratio":0.9,"children":[{"tabs":[]},{"tabs":[]}]}]}});
+        claim.fields.insert("body".into(), body.clone());
+        a.append_claim(&claim).unwrap();
+        sync(&a, &b);
+        assert_eq!(
+            a.glasses("person/ada", u64::MAX).unwrap(),
+            b.glasses("person/ada", u64::MAX).unwrap()
+        );
+        b.rebuild_claim_projections().unwrap();
+        assert_eq!(b.glasses("person/ada", u64::MAX).unwrap()[0]["body"], body);
+    }
+    #[test]
     fn legacy_glasses_survive_reopen_replication_and_replacement_with_their_revision() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("claims.sqlite");

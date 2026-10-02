@@ -3066,6 +3066,7 @@ fn to_wire(layout: &Layout) -> GlassLayout {
                     Side::Right => GlassSplit::Right,
                     Side::Below => GlassSplit::Below,
                 },
+                ratio: None,
                 children: [
                     Box::new(to_wire(first)),
                     Box::new(to_wire(&Layout::Split {
@@ -3091,7 +3092,9 @@ fn from_wire(layout: GlassLayout) -> Layout {
                 .collect(),
             current: 0,
         }),
-        GlassLayout::Split { split, children } => {
+        GlassLayout::Split {
+            split, children, ..
+        } => {
             let [first, second] = children;
             Layout::Split {
                 split: match split {

@@ -30,7 +30,8 @@
             }
           ]
         }
-      ]
+      ],
+      "ratio": 0.3
     }
   },
   "base_revision": null

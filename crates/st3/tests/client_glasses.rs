@@ -141,7 +141,27 @@ async fn glasses_routes_enforce_owner_and_mutation_contract_and_hide_raw_history
     let app = st3::api::router(state.clone());
     let id = "019a0000-0000-7000-8000-000000000001";
     let path = format!("/v1/client/glasses/{id}");
-    let body = json!({"name":"Main workspace", "layout":{"split":"right","children":[{"tabs":[{"title":"Work","pane":"agent:opaque"},{"pane":"mission:opaque"}]},{"tabs":[]}]}});
+    let body = json!({"name":"Main workspace", "layout":{"split":"right","ratio":0.3,"children":[{"tabs":[{"title":"Work","pane":"agent:opaque"},{"pane":"mission:opaque"}]},{"tabs":[]}]}});
+    for (index, ratio) in [json!(0.099), json!(0.901), json!(null), json!("0.3")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut invalid = body.clone();
+        invalid["layout"]["ratio"] = ratio;
+        assert_eq!(
+            request(
+                app.clone(),
+                "PUT",
+                &path,
+                Some("person/ada"),
+                Some(&format!("invalid-ratio-{index}")),
+                json!({"body":invalid,"base_revision":null})
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
     for person in [None, Some("agent/worker")] {
         assert_eq!(
             request(
@@ -293,7 +313,7 @@ async fn glasses_routes_enforce_owner_and_mutation_contract_and_hide_raw_history
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c["id"] == "glasses" && c["version"] == 1 && c["state"] == "granted")
+            .any(|c| c["id"] == "glasses" && c["version"] == 2 && c["state"] == "granted")
     );
     let empty_body = json!({"name":"Home only","layout":{"tabs":[]}});
     let (empty_status, empty) = request(
