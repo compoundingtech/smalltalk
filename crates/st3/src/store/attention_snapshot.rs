@@ -54,6 +54,16 @@ impl Store {
                         .unwrap_or(ask.accepted_at_unix_ms)
                 },
             );
+            let request = ask
+                .as_ref()
+                .and_then(|ask| ask.body["fields"].get("request"))
+                .filter(|request| request.is_object())
+                .cloned();
+            let response: &[&str] = match request.as_ref().and_then(|r| r["type"].as_str()) {
+                Some("decision" | "choice") => &["--answer", "ANSWER_ID"],
+                Some(_) => &["--text", "FEEDBACK"],
+                None => &["--summary", "RESPONSE"],
+            };
             items.push(AttentionItemView {
                 episode,
                 priority: "normal".into(),
@@ -83,10 +93,11 @@ impl Store {
                         &subject,
                         "--as",
                         person,
-                        "--summary",
-                        "RESPONSE",
+                        response[0],
+                        response[1],
                     ],
                 )],
+                request,
             });
         }
         Ok(items)
@@ -435,6 +446,7 @@ impl Store {
                     "inspect source",
                     &["st", "subject", &source],
                 )],
+                request: None,
             });
         }
         Ok(items)
@@ -550,6 +562,7 @@ impl Store {
                 "inspect source",
                 &["st", "subject", &view.subject],
             )],
+            request: None,
         }))
     }
 
@@ -602,6 +615,7 @@ impl Store {
                 detail: format!("{source}: {}. Inspect the seat and revise its desired declaration before restarting.", decision.body["fields"]["reason"].as_str().unwrap_or("the runtime is parked")),
                 mission: None, mission_run: desired.owner_run, step: None, targets: vec![source.clone()], requested_at_unix_ms: decision.accepted_at_unix_ms,
                 actions: vec![attention_action("inspect source", &["st", "subject", &source])],
+                request: None,
             });
         }
         Ok(items)
@@ -759,6 +773,7 @@ impl Store {
                     "inspect source",
                     &["st", "subject", &source],
                 )],
+                request: None,
             });
         }
         Ok(items)

@@ -1063,6 +1063,10 @@ fn client_error_code(code: Option<&str>) -> String {
         "lane-not-found" => "not-found".into(),
         "invalid-person-ask"
         | "invalid-person-response"
+        | "invalid-person-request"
+        | "invalid-person-answer"
+        | "answer-required"
+        | "unsupported-person-request"
         | "missing-ask-owner"
         | "ambiguous-ask-owner" => "validation-failed".into(),
         "stale-work-ask"
@@ -1724,6 +1728,7 @@ fn client_work_values(
                 "timeout_ms": work.timeout_ms,
                 "goals": work.goals,
                 "constraints": work.constraints,
+                "person_answers": work.person_answers,
                 "blocked_reason": work.blocked_reason,
                 "blockers": work.blockers,
                 "usage": usage,
@@ -2494,6 +2499,9 @@ fn client_attention_resources(
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
+            if let Some(request) = item.request {
+                resource["request"] = request;
+            }
         }
         if item.kind == "fault" {
             resource["what"] = json!(item.title);
@@ -8222,7 +8230,7 @@ async fn post_claim(
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
             signal_local_change(&state);
-        } else if kind == "harness.usage" {
+        } else if kind == "harness.usage" || kind == "subagent.renewed" {
             signal_visible_change(&state);
         } else if kind.starts_with("message.") {
             let store = state.store.clone();
@@ -18699,7 +18707,10 @@ agent "seat" { workspace "/tmp"; command "true" }
         assert_eq!(again["status"], "completed");
         let (_, empty) = get_request(app, "/v1/client/now?person=person%2Favery").await;
         assert_eq!(empty["items"], json!([]));
-        assert!(state.store.messages(Some(&actor), true).unwrap().is_empty());
+        // No step waits on a new-run ask; its requester hears the answer once, by message.
+        let told = state.store.messages(Some(&actor), true).unwrap();
+        assert_eq!(told.len(), 1);
+        assert!(told[0].content.contains("Friday"));
     }
 
     #[tokio::test]

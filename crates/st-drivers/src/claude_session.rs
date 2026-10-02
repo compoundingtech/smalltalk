@@ -1270,6 +1270,10 @@ fn observe_payload(
         // must not hold up the hook process Claude is waiting on.
         tracing::warn!("st claude-observe: harness-timeline write failed: {error:#}");
     }
+    // The seat's driver records each subagent from this ledger. Fail-open like the timeline.
+    if let Err(error) = crate::subagents::observe_claude(agent_dir, event, &payload) {
+        tracing::warn!("st claude-observe: subagent ledger write failed: {error:#}");
+    }
     if event == "Stop" {
         // Responses are read from the transcript at Stop, so the account is read here too: the
         // one this Claude config is signed in to when its responses are recorded.

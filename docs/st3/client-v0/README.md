@@ -270,7 +270,16 @@ in `waiting-person`, with no lease, timeout, or retry consumption. A named small
 live requester declaration or owning run and rejects ambiguous claimed work. Repeating the same
 ask key returns the same step. Retirement and generation replacement invalidate the ask.
 
-`work.done` takes `target_id`, `episode`, nonempty `summary`, and optional string `evidence`.
+`work.ask` may also carry a `request`: a `StructuredRequest` decision, choice or feedback with
+named answers (see [the runtime guide](../mission-graph-runtime.md#structured-requests)). The
+person-step attention card then includes the same `request`; a card without one is a free-text
+ask, and clients should not infer answers from its title.
+
+`work.done` takes `target_id`, `episode`, nonempty `summary`, optional string `evidence`, and
+an optional `answer` (`id` and/or `text`). A structured decision or choice needs `answer.id`,
+or text for an allowed custom choice; requesting changes and feedback need text. Validation
+failures return `validation-failed` with the answer IDs in the message. The asker reads the
+typed answer from the `work` resource's `person_answers`.
 Only the assigned person or a session explicitly delegated by that person completes it. The
 requester may instead use `work.cancel-ask`. Completion resumes a live origin in the same attempt
 with a new readiness epoch; the response and evidence stay on the source. CLI equivalents are
@@ -425,6 +434,7 @@ The v0 action discriminators are:
 | Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
+| Agent desired state | `agent.stop`, `agent.start` | snapshot and `runtime_desired_revision`, the agent's selected desired claim ID; no runtime incarnation required |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; input and resize also require the screen sequence |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
@@ -434,6 +444,20 @@ incarnation. `runtime.reset` publishes a restart-window reset for a run-owned me
 submits the runtime resource ID as `target_id` and copies its `incarnation_id` and
 `desired_revision` into the action fence. Runtimes with no selected desired state have a null
 `desired_revision` and cannot use these controls.
+
+`agent.stop` takes `{ "agent": "agent/NAME", "reason": "optional explanation" }`;
+`agent.start` takes `{ "agent": "agent/NAME" }`. These require `control.runtimes` and the
+same authority as `agent.create`: the session's concrete person, or a local agent acting as
+itself (free mode).
+Stop publishes the same desired stop as `st agents stop`, even if no runtime is live, and
+preserves the immutable declaration. Start restores the unambiguous preceding agent
+declaration with its original identity and host, like `st agents start` without overrides.
+Mission-owned agents must instead be changed through their mission. Both actions copy the
+selected desired claim ID into `fence.runtime_desired_revision`, reject stale fences, and
+use the normal audited action receipt/idempotency key; exact retries return the saved result.
+Rust exposes `agent_stop`/`agent_start`; TypeScript and Swift expose `agentStop`/`agentStart`.
+All generated clients' `Fence` models also carry the desired revision required by
+`runtime.stop` and `runtime.restart`.
 
 `agent.queue-move` takes `agent_id`, `mission_run_id`, `placement` (`top`, `bottom`, `before`, or
 `after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one

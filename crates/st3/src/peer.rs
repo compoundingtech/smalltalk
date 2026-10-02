@@ -805,6 +805,7 @@ async fn receive_client_read(
                     attempt: None,
                     readiness_epoch: None,
                     runtime_incarnation: Some(runtime_incarnation),
+                    runtime_desired_revision: None,
                     terminal_sequence: Some(expected_sequence),
                     preview_token: None,
                 };

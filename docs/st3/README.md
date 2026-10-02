@@ -23,6 +23,8 @@ Use these documents for implementation details:
   read latency, overdue attention, and the replicated results in `st doctor`.
 - [Live-path priority](priority.md) explains how the daemon and each PTY server outrank the builds
   and tests their harnesses run, on Linux and macOS, and what needs root.
+- [Subagents](subagents.md) explains how st records the subagents a seat's harness runs as claims
+  on the seat, with a lease, and ends them when their harness, session or seat goes away.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits

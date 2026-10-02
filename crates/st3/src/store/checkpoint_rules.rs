@@ -15,8 +15,10 @@ use smallclaims::store::checkpoint::*;
 use smallclaims::store::checkpoint_agreement::*;
 
 /// The rule engine's version. It is part of the rules digest, so nodes agree on a checkpoint only
-/// when they run the same rules.
-pub const RULES_VERSION: u32 = 4;
+/// when they run the same rules. Version 5 leaves repaired originals out of the sealed set and
+/// proves on the sealed claims' blobs only, so a node on an earlier version seals different terms
+/// instead of verifying a different set or graph.
+pub const RULES_VERSION: u32 = 5;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -69,6 +71,8 @@ harness.limits slot=subject keep=newest
 resource.observed actor=null observer=set slot=subject keep=newest
 render.applied slot=subject keep=newest min-age-before-cut=5d
 runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
+sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
+proof=the-sealed-claims-and-the-blobs-they-reference
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
 witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
@@ -906,6 +910,7 @@ impl Store {
             detail: "Bring the waiting machines back, upgrade them, or excuse a machine that stays away.".into(),
             mission: None, mission_run: None, step: None, targets: vec![checkpoint.clone()], requested_at_unix_ms: since,
             actions: vec![attention_action("inspect checkpoint", &["st", "replication", "checkpoint", "status"])],
+            request: None,
         }])
     }
 }
