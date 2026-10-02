@@ -22,6 +22,7 @@ members = [
   "crates/st3-conversation-ui",
   "crates/st3-migrate",
   "crates/st3-schema",
+  "crates/st3-ui-model",
   "crates/stui",
 ]
 default-members = [
@@ -37,6 +38,7 @@ default-members = [
   "crates/st3-conversation-ui",
   "crates/st3-migrate",
   "crates/st3-schema",
+  "crates/st3-ui-model",
   "crates/stui",
 ]
 
