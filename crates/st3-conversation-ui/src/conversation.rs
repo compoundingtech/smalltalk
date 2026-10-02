@@ -29,6 +29,20 @@ pub struct Cache {
     entries: RefCell<HashMap<u64, Rc<Doc>>>,
 }
 
+/// How much of a conversation's tool work shows: every call with its output, or (simplified)
+/// each call on one line and a run of calls on one line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Density {
+    #[default]
+    Full,
+    Simple,
+}
+
+/// The id that opens a run of tool calls starting at `first`, in the expanded set.
+pub fn bundle_id(first: &str) -> String {
+    format!("bundle:{first}")
+}
+
 impl Cache {
     /// Every line of the conversation at `width`, with the click targets for tool boxes.
     pub fn render(
@@ -39,6 +53,23 @@ impl Cache {
         spinner: &str,
         theme: &Theme,
     ) -> Doc {
+        self.render_as(entries, width, expanded, spinner, theme, Density::Full)
+    }
+
+    /// The conversation at `density`. Simplified, a tool call is one line and consecutive calls
+    /// are one line until opened; everything else reads as it does in full.
+    pub fn render_as(
+        &self,
+        entries: &[Entry],
+        width: usize,
+        expanded: &HashSet<String>,
+        spinner: &str,
+        theme: &Theme,
+        density: Density,
+    ) -> Doc {
+        if density == Density::Simple {
+            return self.render_simple(entries, width, expanded, spinner, theme);
+        }
         let mut doc = Doc::new();
         let mut cache = self.entries.borrow_mut();
         if cache.len() > 4096 {
@@ -78,6 +109,173 @@ impl Cache {
         }
         doc
     }
+}
+
+impl Cache {
+    fn render_simple(
+        &self,
+        entries: &[Entry],
+        width: usize,
+        expanded: &HashSet<String>,
+        spinner: &str,
+        theme: &Theme,
+    ) -> Doc {
+        let mut doc = Doc::new();
+        let mut index = 0;
+        while index < entries.len() {
+            if index > 0 {
+                doc.blank();
+            }
+            // A run of tool calls, or one other entry drawn as in full.
+            let run = entries[index..]
+                .iter()
+                .take_while(|entry| matches!(entry.body, Body::Tool { .. }))
+                .count();
+            if run == 0 {
+                let entry = &entries[index];
+                doc.entries.push((entry.id.clone(), doc.lines.len()));
+                let one = self.render_as(
+                    std::slice::from_ref(entry),
+                    width,
+                    expanded,
+                    spinner,
+                    theme,
+                    Density::Full,
+                );
+                doc.append(one, 0);
+                index += 1;
+                continue;
+            }
+            let calls = &entries[index..index + run];
+            let bundle = bundle_id(&calls[0].id);
+            for entry in calls {
+                doc.entries.push((entry.id.clone(), doc.lines.len()));
+            }
+            let open = expanded.contains(&bundle);
+            if run > 1 {
+                doc.append(bundle_line(calls, &bundle, open, width, spinner, theme), 0);
+            }
+            if run == 1 || open {
+                for entry in calls {
+                    if expanded.contains(&entry.id) {
+                        doc.append(render_entry(entry, width, true, spinner, theme), 0);
+                    } else {
+                        doc.append(call_line(entry, width, spinner, theme), 0);
+                    }
+                }
+            }
+            index += run;
+        }
+        doc
+    }
+}
+
+/// The glyph and colour of a call's outcome.
+fn outcome(state: &ToolState, spinner: &str, theme: &Theme) -> (String, ratatui::style::Color) {
+    let rules = RULES.tool;
+    match state {
+        ToolState::Running => (spinner.to_owned(), rules.running.color(theme)),
+        ToolState::Ok => (rules.ok.text.to_owned(), rules.ok.color.color(theme)),
+        ToolState::Failed => (
+            rules.failed.text.to_owned(),
+            rules.failed.color.color(theme),
+        ),
+    }
+}
+
+/// One tool call on one line, never wrapped: "▎ ✓ $ cat src/main.rs". It opens like a call.
+fn call_line(entry: &Entry, width: usize, spinner: &str, theme: &Theme) -> Doc {
+    let mut doc = Doc::new();
+    let Body::Tool { title, state, .. } = &entry.body else {
+        return doc;
+    };
+    let (glyph, color) = outcome(state, spinner, theme);
+    doc.targets.push(Target {
+        line: 0,
+        column: 0,
+        width: width as u16,
+        hit: PaneIntent::Expand(entry.id.clone()),
+    });
+    let title = text::truncate(&text::sanitize(title), width.saturating_sub(6));
+    doc.line(Line::from(vec![
+        Span::styled("▎ ", theme::fg(color)),
+        Span::styled(format!("{glyph} "), theme::fg(color)),
+        Span::styled(title, fg(RULES.tool.quiet.title, theme)),
+    ]));
+    doc
+}
+
+/// A run of calls on one line: "▸ 7 tool calls · ✓6 ✕1 · last: $ cargo test".
+fn bundle_line(
+    calls: &[Entry],
+    id: &str,
+    open: bool,
+    width: usize,
+    spinner: &str,
+    theme: &Theme,
+) -> Doc {
+    let mut doc = Doc::new();
+    let rules = RULES.bundle;
+    let count = |wanted: fn(&ToolState) -> bool| {
+        calls
+            .iter()
+            .filter(|entry| matches!(&entry.body, Body::Tool { state, .. } if wanted(state)))
+            .count()
+    };
+    let ok = count(|state| matches!(state, ToolState::Ok));
+    let failed = count(|state| matches!(state, ToolState::Failed));
+    let running = count(|state| matches!(state, ToolState::Running));
+    // The whole run reads as its worst call: running, then failed, then passed.
+    let edge = if running > 0 {
+        RULES.tool.running.color(theme)
+    } else if failed > 0 {
+        RULES.tool.failed.color.color(theme)
+    } else {
+        RULES.tool.ok.color.color(theme)
+    };
+    let mut spans = vec![
+        Span::styled("▎ ", theme::fg(edge)),
+        Span::styled(
+            format!(
+                "{} {} tool calls",
+                if open { rules.opened } else { rules.folded },
+                calls.len()
+            ),
+            fg(rules.label, theme),
+        ),
+    ];
+    for (shown, glyph, color) in [
+        (running, spinner, RULES.tool.running.color(theme)),
+        (ok, RULES.tool.ok.text, RULES.tool.ok.color.color(theme)),
+        (
+            failed,
+            RULES.tool.failed.text,
+            RULES.tool.failed.color.color(theme),
+        ),
+    ] {
+        if shown > 0 {
+            spans.push(Span::styled(" · ", fg(rules.last, theme)));
+            spans.push(Span::styled(format!("{glyph}{shown}"), theme::fg(color)));
+        }
+    }
+    if let Some(Body::Tool { title, .. }) = calls.last().map(|entry| &entry.body) {
+        let used: usize = spans.iter().map(|span| text::width(&span.content)).sum();
+        let room = width.saturating_sub(used + 9);
+        if room > 8 {
+            spans.push(Span::styled(
+                format!(" · last: {}", text::truncate(&text::sanitize(title), room)),
+                fg(rules.last, theme),
+            ));
+        }
+    }
+    doc.targets.push(Target {
+        line: 0,
+        column: 0,
+        width: width as u16,
+        hit: PaneIntent::Expand(id.to_owned()),
+    });
+    doc.line(Line::from(spans));
+    doc
 }
 
 fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &Theme) -> Doc {
@@ -465,6 +663,70 @@ mod tests {
         entries.push(entry("3", Body::Event("step ready".into())));
         let grown = cache.render(&entries, 40, &HashSet::new(), "⠋", &crate::tests::theme());
         assert_eq!(&grown.lines[..first.lines.len()], &first.lines[..]);
+    }
+
+    #[test]
+    fn simplified_a_run_of_calls_is_one_line_and_one_call_never_wraps() {
+        let call = |id: &str, title: &str, state: ToolState| {
+            entry(
+                id,
+                Body::Tool {
+                    title: title.into(),
+                    state,
+                    output: vec!["line one".into(), "line two".into()],
+                },
+            )
+        };
+        let entries = vec![
+            entry("a", Body::User("check the build".into())),
+            call("t1", "$ cargo build", ToolState::Ok),
+            call("t2", "$ cargo test", ToolState::Failed),
+            call("t3", "$ cargo test -p stui", ToolState::Ok),
+            entry("b", Body::Assistant("One test failed; fixed.".into())),
+            call("t4", &format!("$ cat {}", "src/".repeat(40)), ToolState::Ok),
+        ];
+        let theme = crate::tests::theme();
+        let text = |expanded: &HashSet<String>| {
+            Cache::default()
+                .render_as(&entries, 60, expanded, "⠋", &theme, Density::Simple)
+                .lines
+                .iter()
+                .map(text::plain)
+                .collect::<Vec<_>>()
+        };
+        let folded = text(&HashSet::new());
+        let joined = folded.join("\n");
+        assert!(
+            joined.contains("▸ 3 tool calls · ✓2 · ✕1 · last: $ cargo test -p stui"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("line one"),
+            "no output until opened: {joined}"
+        );
+        assert!(joined.contains("check the build") && joined.contains("One test failed"));
+        // One call is one line, cut to the width.
+        let lone = folded.iter().find(|line| line.contains("$ cat")).unwrap();
+        assert!(text::width(lone) <= 60 && lone.ends_with('…'), "{lone}");
+        // Opened, the run lists its calls; an opened call shows its output.
+        let opened = text(&HashSet::from([bundle_id("t1"), "t2".to_owned()])).join("\n");
+        assert!(opened.contains("▾ 3 tool calls"), "{opened}");
+        assert!(
+            opened.contains("$ cargo build") && opened.contains("line two"),
+            "{opened}"
+        );
+        // Full density is untouched.
+        let full = Cache::default()
+            .render(&entries, 60, &HashSet::new(), "⠋", &theme)
+            .lines
+            .iter()
+            .map(text::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !full.contains("tool calls") && full.contains("line one"),
+            "{full}"
+        );
     }
 
     #[test]
