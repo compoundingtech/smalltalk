@@ -72,12 +72,14 @@ impl Rule {
 
     /// The option of this rule that appears after its prefix, if any.
     fn option_in<'a>(&self, argv: &'a [String]) -> Option<&'a str> {
+        // Git takes any unambiguous abbreviation of a long option (`--exe` for `--exec`).
+        let abbreviated = self.prefix.first().is_some_and(|tool| tool == "git");
         argv[self.prefix.len()..]
             .iter()
             .find(|arg| {
                 self.options
                     .iter()
-                    .any(|option| option_matches(option, arg))
+                    .any(|option| option_matches(option, arg, abbreviated))
             })
             .map(String::as_str)
     }
@@ -95,16 +97,15 @@ impl fmt::Display for Rule {
 
 /// Whether `arg` uses `option`. A long option matches itself and `--name=value`. A short option
 /// matches any single-dash argument that contains its letter, because tools accept bundled short
-/// flags (`-dF file`); this refuses some arguments that only look like flags, never fewer.
-fn option_matches(option: &str, arg: &str) -> bool {
+/// flags (`-dF file`); this refuses some arguments that only look like flags, never fewer. With
+/// `abbreviated`, a long option also matches any prefix of its name, as git reads one.
+fn option_matches(option: &str, arg: &str, abbreviated: bool) -> bool {
     if let Some(name) = option.strip_prefix("--") {
         let Some(given) = arg.strip_prefix("--") else {
             return false;
         };
-        given == name
-            || given
-                .strip_prefix(name)
-                .is_some_and(|rest| rest.starts_with('='))
+        let given = given.split_once('=').map_or(given, |(name, _)| name);
+        given == name || (abbreviated && !given.is_empty() && name.starts_with(given))
     } else if let Some(letters) = option.strip_prefix('-') {
         arg.starts_with('-')
             && !arg.starts_with("--")
@@ -390,6 +391,36 @@ mod tests {
             policy.judge(&argv("gh api /user")),
             Verdict::Refused(_)
         ));
+    }
+
+    #[test]
+    fn git_option_abbreviations_are_denied_like_the_option() {
+        let git = policy(&["git-push"], &[], &[]);
+        assert_eq!(
+            git.judge(&argv("git push -u origin HEAD")),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            git.judge(&argv("git push --force-with-lease")),
+            Verdict::Allowed
+        );
+        for refused in [
+            "git push --exe=x origin",
+            "git push --receive-p=x origin",
+            "git push --mirr origin",
+            "git push --prune origin",
+        ] {
+            assert!(
+                matches!(git.judge(&argv(refused)), Verdict::Refused(_)),
+                "{refused} was allowed"
+            );
+        }
+        // gh takes no abbreviations, so `--body` stays allowed beside a denied `--body-file`.
+        let gh = policy(&["gh-pr"], &[], &[]);
+        assert_eq!(
+            gh.judge(&argv("gh pr create --body text")),
+            Verdict::Allowed
+        );
     }
 
     #[test]

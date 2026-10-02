@@ -321,6 +321,11 @@ impl Sandbox<'_> {
             ("TMPDIR".into(), "/tmp".into()),
             ("LANG".into(), "C.UTF-8".into()),
             ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            // Git looks for a repository no higher than the passed checkout.
+            (
+                "GIT_CEILING_DIRECTORIES".into(),
+                std::env::join_paths(self.hidden).unwrap_or_default(),
+            ),
             ("GIT_TERMINAL_PROMPT".into(), "0".into()),
             ("GIT_PAGER".into(), "cat".into()),
             ("PAGER".into(), "cat".into()),
@@ -365,6 +370,8 @@ impl Sandbox<'_> {
             "/home",
             "--tmpfs",
             "/root",
+            "--tmpfs",
+            "/var/tmp",
         ]);
         if self.new_session {
             command.arg("--new-session");
@@ -376,8 +383,10 @@ impl Sandbox<'_> {
         }
         // The trusted tool directories stay visible even under a hidden directory.
         for directory in self.path {
-            if directory.is_dir() {
-                command.arg("--ro-bind").arg(directory).arg(directory);
+            if let Ok(directory) = fs::canonicalize(directory)
+                && directory.is_dir()
+            {
+                command.arg("--ro-bind").arg(&directory).arg(&directory);
             }
         }
         command.arg("--bind").arg(self.home).arg(self.home);
@@ -437,18 +446,32 @@ fn host_path(directories: &[BoundDirectory], path: &Path) -> Option<PathBuf> {
 }
 
 /// The git directory a `.git` entry at `level` names, and its common directory.
-fn git_dirs_at(directories: &[BoundDirectory], level: &Path) -> Option<Vec<PathBuf>> {
+/// The git directory a `.git` entry at `level` names, and its common directory. Each must be a
+/// real directory inside the passed checkout: git follows a symbolic link or a `gitdir:` line
+/// anywhere it can see, including directories every user may write such as `/var/tmp`, and a
+/// git directory there would keep its own configuration.
+fn git_dirs_at(directories: &[BoundDirectory], level: &Path) -> Result<Option<Vec<PathBuf>>> {
     let entry = level.join(".git");
-    let host = host_path(directories, &entry)?;
-    let metadata = fs::symlink_metadata(&host).ok()?;
+    let Some(host) = host_path(directories, &entry) else {
+        return Ok(None);
+    };
+    let Ok(metadata) = fs::symlink_metadata(&host) else {
+        return Ok(None);
+    };
     let git_dir = if metadata.is_dir() {
         entry
     } else if metadata.is_file() {
-        let text = fs::read_to_string(&host).ok()?;
-        let named = text.trim().strip_prefix("gitdir:")?.trim();
-        clean(&level.join(named))
+        let text =
+            fs::read_to_string(&host).with_context(|| format!("read {}", entry.display()))?;
+        let Some(named) = text.trim().strip_prefix("gitdir:") else {
+            bail!("{} is not a git directory pointer", entry.display());
+        };
+        clean(&level.join(named.trim()))
     } else {
-        return None;
+        bail!(
+            "{} is a symbolic link; the gateway serves only a checkout whose .git is a directory or a gitdir file",
+            entry.display()
+        );
     };
     let mut found = vec![git_dir.clone()];
     if let Some(host) = host_path(directories, &git_dir.join("commondir"))
@@ -456,7 +479,18 @@ fn git_dirs_at(directories: &[BoundDirectory], level: &Path) -> Option<Vec<PathB
     {
         found.push(clean(&git_dir.join(text.trim())));
     }
-    Some(found)
+    for git_dir in &found {
+        let real = host_path(directories, git_dir)
+            .and_then(|host| fs::symlink_metadata(host).ok())
+            .is_some_and(|metadata| metadata.is_dir());
+        if !real {
+            bail!(
+                "{} is not a directory inside the checkout passed to the gateway",
+                git_dir.display()
+            );
+        }
+    }
+    Ok(Some(found))
 }
 
 /// Find every git directory a command in `cwd` could open and plan its sanitized view: the
@@ -472,7 +506,7 @@ pub fn prepare_checkout(
         if host_path(directories, level).is_none() {
             break;
         }
-        if let Some(found) = git_dirs_at(directories, level) {
+        if let Some(found) = git_dirs_at(directories, level)? {
             git_dirs.extend(found);
             break;
         }
