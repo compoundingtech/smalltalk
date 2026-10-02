@@ -9757,13 +9757,19 @@ impl Store {
 
     pub(crate) fn conversation_search_messages(&self, person: &str, through: u64) -> Result<Vec<MessageView>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "WITH sent AS (
-                SELECT subject,store_index FROM claims INDEXED BY claims_message_to_index
+        let mut statement = connection.prepare(&canonical_sql(
+            "WITH candidates AS (
+                SELECT id FROM claims INDEXED BY claims_message_to_index
                 WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1 AND store_index<=?2
-                UNION SELECT subject,store_index FROM claims INDEXED BY claims_message_from_index
+                UNION SELECT id FROM claims INDEXED BY claims_message_from_index
                 WHERE kind='message.sent' AND json_extract(body,'$.fields.from')=?1 AND store_index<=?2
-            ) SELECT subject, MIN(store_index) FROM sent GROUP BY subject ORDER BY MIN(store_index) DESC LIMIT 50001")?;
+            ), ranked AS (
+                SELECT claims.id,claims.batch_id,claims.subject,claims.store_index,claims.accepted_at_unix_ms,
+                    MIN(claims.store_index) OVER (PARTITION BY claims.subject) AS created_index,
+                    ROW_NUMBER() OVER (PARTITION BY claims.subject ORDER BY CANONICAL_ASC(claims)) AS ordinal
+                FROM claims JOIN candidates ON candidates.id=claims.id
+            ) SELECT sent.subject,sent.created_index FROM ranked AS sent
+              WHERE ordinal=1 ORDER BY CANONICAL_DESC(sent) LIMIT 50001"))?;
         let rows = statement.query_map(params![person,through], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
         })?;

@@ -375,6 +375,18 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
     if messages(expected) != messages(actual) {
         mismatches.push(format!("{phase}: selected person messages and reminders"));
     }
+    let search_messages = |store: &Store| {
+        let mut value = serde_json::to_value(
+            store.conversation_search_messages("person/avery", store.index().unwrap()).unwrap(),
+        ).unwrap();
+        for message in value.as_array_mut().unwrap() {
+            message.as_object_mut().unwrap().remove("created_index");
+        }
+        value
+    };
+    if search_messages(expected) != search_messages(actual) {
+        mismatches.push(format!("{phase}: canonically bounded search messages"));
+    }
     let proposal_views = |store: &Store| {
         let connection = store.readers.get();
         let runs = connection
