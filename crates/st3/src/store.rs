@@ -11215,6 +11215,10 @@ impl Store {
                                         mention.get(name).and_then(Value::as_str).unwrap_or_default()
                                     };
                                     let login = text("login");
+                                    // A login that mentions itself tells its person nothing.
+                                    if text("by").eq_ignore_ascii_case(login) {
+                                        continue;
+                                    }
                                     let Some((_, person)) = subscription
                                         .mentions
                                         .iter()

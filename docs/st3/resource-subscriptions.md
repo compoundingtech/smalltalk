@@ -261,7 +261,7 @@ the delivery's usual path.
 `delivery "person"` hears `on "mentions"`. Each `mention` names a GitHub login and the person it
 is. A new mention of a named login becomes one request on that person's home, titled with who
 mentioned them and where, unless the item's owner gets it. A mention of a login that no `mention`
-names reaches nobody. A mention is new when its item is new, or when a recorded item did not know
+names reaches nobody, and so does a login's mention of itself. A mention is new when its item is new, or when a recorded item did not know
 it and it was made no earlier than five minutes before the item's previous observation. Turning
 mentions on, reading a body again, or an edit to an old comment never reports an old mention. The
 baseline delivers nothing.

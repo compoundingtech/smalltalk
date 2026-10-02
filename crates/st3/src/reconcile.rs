@@ -23261,6 +23261,7 @@ subscription "reviews" {{
 subscription "mentions" {{
   observer "observer/repo"; on "mentions"
   mention "orchid" "person/orchid"
+  mention "fern" "person/fern"
   delivery "person" {{ owner "message" }}
 }}"#
             ),
@@ -23406,7 +23407,10 @@ subscription "mentions" {{
         // orchid's home; a mention of someone the subscription does not name reaches nobody.
         let now = chrono::Utc::now().to_rfc3339();
         let mut mentioned = pull(3, 'c', None);
-        mentioned["mentions"] = serde_json::json!([mention("orchid", &now), mention("moss", &now)]);
+        let mut own = mention("fern", &now);
+        own["by"] = Value::String("FERN".into());
+        mentioned["mentions"] =
+            serde_json::json!([mention("orchid", &now), mention("moss", &now), own]);
         observe(serde_json::json!([mentioned.clone()]));
         assert_eq!(
             asks(),
