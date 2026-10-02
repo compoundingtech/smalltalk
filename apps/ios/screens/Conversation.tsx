@@ -8,7 +8,7 @@ import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
 import { tokenColor, type ConversationRules } from '../conversationStyle';
-import { COLLAPSED_TOOL_LINES, conversationEntries, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
+import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
 import { rememberBounded } from '../boundedCache';
 import { simplify, type SimpleRow } from '../conversationSimple';
 import { sessionPerson } from '../homeView';
@@ -46,6 +46,14 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   // Whether st has answered at all: until it has, the screen says it is loading, never "nothing".
   const [loaded, setLoaded] = useState(() => conversationCache.current.has(target));
   const [issue, setIssue] = useState('');
+  // When st last sent this conversation, so a view that may be stale says how old it is.
+  const [lastFrame, setLastFrame] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!issue) return;
+    const timer = setInterval(() => setNow(Date.now()), 5_000);
+    return () => clearInterval(timer);
+  }, [issue]);
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
   const [pending, setPending] = useState<Pending[]>([]);
   const [find, setFind] = useState('');
@@ -89,6 +97,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     setIssue('');
     const follow = feed.followConversation(target, {
       onEntries: frame => setTimeline(previous => {
+        setLastFrame(Date.now());
         setLoaded(true);
         const next = applyConversation(previous, frame);
         rememberBounded(conversationCache.current, target, next, 24);
@@ -159,7 +168,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={headerHeight}>
     <Banners />
     {agent ? <AgentStrip agent={agent} onMission={(id, missionTitle) => navigation.navigate('Mission', { id, title: missionTitle })} /> : session ? <View style={styles.strip}><T dim numberOfLines={1}>{session.driver ?? 'harness'} · {session.state} · {session.id}</T></View> : null}
-    {issue ? <View style={styles.strip}><T color={theme.waiting}>{issue}</T></View> : null}
+    {issue ? <View style={styles.strip}><T color={theme.waiting}>{staleLine(issue, loaded, lastFrame, now)}</T></View> : null}
     {findOpen ? <View style={[styles.strip, { flexDirection: 'row', alignItems: 'center', gap: 8 }]}>
       <Field value={find} onChangeText={setFind} placeholder="Find in this conversation" autoFocus autoCapitalize="none" autoCorrect={false} spellCheck={false} returnKeyType="search" style={{ flex: 1 }} />
       <Pressable accessibilityRole="button" onPress={() => { setFinding(false); setFind(''); }}><T color={theme.accent}>Done</T></Pressable>
@@ -177,7 +186,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
         : row.kind === 'call' && !open.has(row.entry.id) ? <CallView entry={row.entry} tool={row.tool} onToggle={toggle} />
         // A long press opens the entry's text to select any part of it; iOS text selects only whole.
         : <Pressable onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} /></Pressable>}
-      ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
+      ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (issue ? `Not loaded yet: ${issue}. Trying again.` : status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 60 }}
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
