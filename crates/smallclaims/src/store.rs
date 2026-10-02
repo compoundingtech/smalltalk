@@ -1010,6 +1010,10 @@ pub fn insert_claim(
     predecessors: &[String],
     now: u128,
 ) -> Result<u64> {
+    // Every local write comes through here; rules see each one that names its writer.
+    if let Some(actor) = actor {
+        principals::rules_gate_tx(transaction, origin, actor, kind, subject)?;
+    }
     promote_claim_blobs(transaction, body)?;
     transaction.execute(
         "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
@@ -3974,7 +3978,6 @@ impl Store {
         if let Some(actor) = &input.actor {
             self.ensure_principal_key(actor)?;
         }
-        self.apply_rules(input)?;
         let appended = self.runtime.append_claim(self, input);
         if input.kind == crate::rules::RULE_SET {
             self.rules_stale.store(true, Ordering::Release);
@@ -4018,6 +4021,19 @@ impl Store {
         bytes: &[u8],
         expected_document: &Option<String>,
         idempotency_key: &str,
+    ) -> Result<DocumentVersion, St3Error> {
+        self.put_document_as(name, bytes, expected_document, idempotency_key, None)
+    }
+
+    /// Store a document for `writer`, whom the rules judge as the publisher. The binding claim
+    /// itself is the node's, as every document binding is.
+    pub fn put_document_as(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        expected_document: &Option<String>,
+        idempotency_key: &str,
+        writer: Option<&str>,
     ) -> Result<DocumentVersion, St3Error> {
         validate_document_name(name)?;
         if bytes.len() > 1024 * 1024 {
@@ -4069,6 +4085,10 @@ impl Store {
                         params![hash, bytes, bytes.len() as u64],
                     )
                     .map_err(internal)?;
+                if let Some(writer) = writer {
+                    principals::rules_gate_tx(transaction, &self.origin, writer, "doc.bound", name)
+                        .map_err(crate::error::typed)?;
+                }
                 let body = json!({ "name": name, "hash": hash, "size": bytes.len() });
                 let record = self.runtime.append_claim_tx(
                     transaction,

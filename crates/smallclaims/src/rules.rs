@@ -4,7 +4,11 @@
 //! order, is the rule. It restricts a write when the writer matches its `actors` (and none of its
 //! `except`), the claim's kind matches its `kinds`, and the subject matches its `subjects` and
 //! none of its `unless_subjects`. A subject pattern may say `{actor}`, the writer's name without
-//! its family: `doc/{actor}/**` is everything under an agent's own prefix.
+//! its family, or `{namespace}`, the first two segments of that name: for
+//! `agent/fleet/web/reviewer`, `doc/{namespace}/**` is everything under `doc/fleet/web/`.
+//!
+//! Only a person sets a rule. An agent's `rule.set` is refused whatever the rules say, so no
+//! lockdown can be undone by the agents it restricts.
 //!
 //! A rule's mode says what a restricted write does:
 //!
@@ -73,10 +77,16 @@ impl Rule {
     /// Whether this rule restricts `actor` writing `kind` on `subject`, whatever its mode.
     pub fn restricts(&self, actor: &str, kind: &str, subject: &str) -> bool {
         let name = actor.split_once('/').map_or(actor, |(_, name)| name);
+        let namespace = name.splitn(3, '/').take(2).collect::<Vec<_>>().join("/");
         let any = |patterns: &[String], value: &str| {
-            patterns
-                .iter()
-                .any(|pattern| glob(&pattern.replace("{actor}", name), value))
+            patterns.iter().any(|pattern| {
+                glob(
+                    &pattern
+                        .replace("{actor}", name)
+                        .replace("{namespace}", &namespace),
+                    value,
+                )
+            })
         };
         any(&self.actors, actor)
             && !any(&self.except, actor)
@@ -186,6 +196,20 @@ mod tests {
             "agent/example/reviewer",
             "message.sent",
             "doc/elsewhere/notes"
+        ));
+        let namespace = Rule {
+            unless_subjects: vec!["doc/{namespace}/**".into()],
+            ..rule
+        };
+        assert!(!namespace.restricts(
+            "agent/fleet/web/reviewer",
+            "doc.bound",
+            "doc/fleet/web/plan"
+        ));
+        assert!(namespace.restricts(
+            "agent/fleet/web/reviewer",
+            "doc.bound",
+            "doc/fleet/api/plan"
         ));
     }
 

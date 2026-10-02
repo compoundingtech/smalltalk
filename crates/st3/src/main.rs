@@ -208,6 +208,11 @@ enum Command {
         #[command(subcommand)]
         command: DocCommand,
     },
+    /// Restrict what agents may write, and read what each rule would have refused.
+    Rules {
+        #[command(subcommand)]
+        command: RuleCommand,
+    },
     /// Discover native harness sessions and move one under durable st ownership.
     Import {
         #[command(subcommand)]
@@ -2349,6 +2354,35 @@ enum DocCommand {
 }
 
 #[derive(Subcommand)]
+enum RuleCommand {
+    /// List the rules, each with its mode: off, audit or enforce.
+    Ls,
+    /// List the writes the rules in audit mode would have refused, newest first.
+    Audit {
+        /// Only this rule's records.
+        rule: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Set the lockdown rules, each in audit mode until you enforce it.
+    Lockdown {
+        #[arg(long = "as")]
+        actor: Option<String>,
+        /// An agent that may still start agents, such as agent/example/planner. Repeatable.
+        #[arg(long = "starter")]
+        starters: Vec<String>,
+    },
+    /// Turn one rule off, to audit, or to enforce.
+    Mode {
+        name: String,
+        #[arg(value_parser = ["off", "audit", "enforce"])]
+        mode: String,
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ImportCommand {
     /// List running native sessions; use --all for resumable saved history.
     Ls {
@@ -3562,6 +3596,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Trace { command } => run_trace_command(&client, command, cli.json).await,
         Command::Schema { command } => run_schema(&client, command, cli.json).await,
         Command::Documents { command } => run_doc(&client, command, cli.json).await,
+        Command::Rules { command } => run_rules(&client, &config, command, cli.json).await,
         Command::Import { command } => run_import(&endpoint, command, cli.json).await,
         Command::Completions(args) => {
             let shell = match args.shell {
@@ -8536,6 +8571,114 @@ fn normalize_member_subject(subject: &str, namespace: &str) -> String {
         subject.into()
     } else {
         format!("{namespace}/{subject}")
+    }
+}
+
+async fn run_rules(
+    client: &Client,
+    config: &Config,
+    command: RuleCommand,
+    json_output: bool,
+) -> Result<()> {
+    use smallclaims::rules::{Mode, NamedRule};
+    let person = |actor: Option<String>| -> Result<String> {
+        actor
+            .or_else(|| config.person.clone())
+            .context("rules are set by a person: set person in config.toml or pass --as person/NAME")
+    };
+    let set = |actor: &str, name: &str, rule: smallclaims::rules::Rule| {
+        let request = st3::api::RuleSetRequest {
+            actor: actor.to_owned(),
+            name: name.to_owned(),
+            rule,
+        };
+        async move {
+            let _: Value = client.post("/v1/rules/set", &request).await?;
+            anyhow::Ok(())
+        }
+    };
+    match command {
+        RuleCommand::Ls => {
+            let rules: Vec<NamedRule> = client.get("/v1/rules").await?;
+            if json_output {
+                return print_value(&rules, true);
+            }
+            if rules.is_empty() {
+                println!("no rules: every principal may write what its person may (st rules lockdown sets the presets)");
+            }
+            for rule in rules {
+                println!(
+                    "{}\t{}\t{}",
+                    rule.name,
+                    rule.rule.mode.as_str(),
+                    rule.rule.description
+                );
+            }
+            Ok(())
+        }
+        RuleCommand::Audit { rule, limit } => {
+            let mut path = format!("/v1/rules/audit?limit={limit}");
+            if let Some(rule) = &rule {
+                path.push_str(&format!("&rule={}", urlencoding::encode(rule)));
+            }
+            let audits: Vec<st3::api::RuleAudit> = client.get(&path).await?;
+            if json_output {
+                return print_value(&audits, true);
+            }
+            if audits.is_empty() {
+                println!("no write has been refused or audited");
+            }
+            for audit in audits {
+                println!(
+                    "{}\t{}\t{} {} on {}",
+                    audit.at_unix_ms, audit.rule, audit.actor, audit.action, audit.target
+                );
+            }
+            Ok(())
+        }
+        RuleCommand::Lockdown { actor, starters } => {
+            let actor = person(actor)?;
+            let rules = st3::rules::lockdown(&starters);
+            for (name, rule) in &rules {
+                set(&actor, name, rule.clone()).await?;
+            }
+            if json_output {
+                return print_value(
+                    &rules
+                        .iter()
+                        .map(|(name, rule)| json!({"name": name, "rule": rule}))
+                        .collect::<Vec<_>>(),
+                    true,
+                );
+            }
+            for (name, rule) in &rules {
+                println!("{name}\taudit\t{}", rule.description);
+            }
+            println!(
+                "Each rule logs what it would refuse; read the log with st rules audit, then st rules mode NAME enforce."
+            );
+            Ok(())
+        }
+        RuleCommand::Mode { name, mode, actor } => {
+            let actor = person(actor)?;
+            let rules: Vec<NamedRule> = client.get("/v1/rules").await?;
+            let mut rule = rules
+                .into_iter()
+                .find(|rule| rule.name == name)
+                .with_context(|| format!("no rule is named `{name}`; st rules ls lists them"))?
+                .rule;
+            rule.mode = match mode.as_str() {
+                "off" => Mode::Off,
+                "enforce" => Mode::Enforce,
+                _ => Mode::Audit,
+            };
+            set(&actor, &name, rule).await?;
+            if json_output {
+                return print_value(&json!({"name": name, "mode": mode}), true);
+            }
+            println!("{name}\t{mode}");
+            Ok(())
+        }
     }
 }
 

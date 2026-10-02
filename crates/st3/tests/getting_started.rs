@@ -172,6 +172,30 @@ fn a_newcomer_gets_signed_claims_with_no_new_step_or_prompt() {
             args.join(" ")
         );
     }
+    // Locking down is one command, and every rule starts in audit.
+    let rules = newcomer.try_run(&["rules", "ls"]).unwrap();
+    assert!(rules.starts_with("no rules"), "{rules}");
+    let lockdown = newcomer.try_run(&["rules", "lockdown"]).unwrap();
+    assert!(lockdown.contains("st rules audit"), "{lockdown}");
+    let rules = newcomer.try_run(&["rules", "ls"]).unwrap();
+    assert_eq!(
+        rules
+            .lines()
+            .filter(|line| line.contains("\taudit\t"))
+            .count(),
+        3,
+        "{rules}"
+    );
+    newcomer
+        .try_run(&["rules", "mode", "agents-create-no-missions", "enforce"])
+        .unwrap();
+    let rules = newcomer.try_run(&["rules", "ls"]).unwrap();
+    assert!(
+        rules.contains("agents-create-no-missions\tenforce"),
+        "{rules}"
+    );
+    let audits = newcomer.try_run(&["rules", "audit"]).unwrap();
+    assert!(audits.starts_with("no write"), "{audits}");
     let check = newcomer.signatures();
     assert_eq!(check["status"], "pass", "{check}");
     let message = check["message"].as_str().unwrap();
