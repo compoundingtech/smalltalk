@@ -685,11 +685,19 @@ pub fn api_error_code(error: &anyhow::Error) -> Option<&str> {
         .map(|error| error.code.as_str())
 }
 
-/// The status, code, and message of the API error that an API call failed with, if it did.
-pub fn api_error_parts(error: &anyhow::Error) -> Option<(u16, &str, &str)> {
-    error
-        .downcast_ref::<ApiResponseError>()
-        .map(|error| (error.status, error.code.as_str(), error.message.as_str()))
+/// The status, code, message, and details of the API error that an API call failed with, if it
+/// did.
+pub fn api_error_parts(
+    error: &anyhow::Error,
+) -> Option<(u16, &str, &str, &serde_json::Map<String, serde_json::Value>)> {
+    error.downcast_ref::<ApiResponseError>().map(|error| {
+        (
+            error.status,
+            error.code.as_str(),
+            error.message.as_str(),
+            &error.details,
+        )
+    })
 }
 
 fn terminal_reconnect_is_refused(error: &anyhow::Error) -> bool {
@@ -717,6 +725,7 @@ struct ApiResponseError {
     status: u16,
     code: String,
     message: String,
+    details: serde_json::Map<String, serde_json::Value>,
 }
 
 impl fmt::Display for ApiResponseError {
@@ -1099,6 +1108,7 @@ fn api_error(status: u16, bytes: &[u8]) -> anyhow::Error {
             status,
             code: error.code,
             message: error.message,
+            details: error.details,
         }
         .into();
     }
@@ -1110,6 +1120,11 @@ fn api_error(status: u16, bytes: &[u8]) -> anyhow::Error {
                 status,
                 code: code.into(),
                 message: message.into(),
+                details: value
+                    .get("details")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default(),
             }
             .into();
         }

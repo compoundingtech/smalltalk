@@ -647,8 +647,31 @@ same way, at most four times and never through a node it already passed, and rel
 answer or refusal back unchanged. Every hop checks that its sender is a fleet member, and the owner
 applies its own grants to the person the read carries. A laptop peered only with a desktop
 therefore reads a conversation on a server that only the desktop dials. Each hop waits longer than
-the next one, so a long poll's answer is never cut short on its way back. A read that no peer can
-carry fails with `remote-unavailable`.
+the next one, so a long poll's answer is never cut short on its way back.
+
+A read that no peer can carry fails with `remote-unavailable`, and its `details` say why, so a
+client can tell a host nobody reaches from a slow or refusing one: `reason` is `no-route` (this node
+cannot dial the owner and no peer reaches it), `dial-failed`, `timed-out`, `refused` (a peer does
+not accept this node's reads), `hop-limit`, `owner-error` or `transport-error`; `owner_host_id`
+names the owner; `hops` counts the nodes the furthest route handed the read to; `attempts` lists
+each next hop tried with its own `reason`; and `elapsed_ms` is how long the gateway spent. An
+owner's own refusal, such as `stale-fence`, carries `owner_host_id`, `elapsed_ms` and
+`fence_conflicts` (how many of this gateway's reads that owner refused as stale in the last
+minute). The gateway logs one warning per unreachable owner with the same fields.
+
+`GET /v1/client/terminals/{id}/screen` answers a remote terminal with a `relay` object beside the
+screen: `owner_host_id`, `via` (the first node the gateway sent the read to), `direct` (that node
+is the owner), `transport` (`fabric` or `http`), `rtt_ms` (the gateway's wait for the owner),
+`capability_ttl_s` (how long an attach capability from this gateway lives) and `fence_conflicts`.
+It is provenance, not authority: it never enters `revision`, and a screen from the owner's own host
+has none.
+
+With `?facts=true`, the owner also returns best-effort `facts` read from the session itself:
+`rows`, `columns`, `clients` (`total`, `attached`, `read_only`), `process` (`alive`, `exit_code`),
+`uptime_s` and `tags`. A remote screen carries the owner's facts, so one read fills a fleet
+client's Session view. Facts are left out, not an error, when the session does not answer within a
+second; they stay out of `revision`, appear only on this read and never on a stream's frames, and
+no action's admission depends on them.
 
 Read-only terminal scope permits screens but rejects input and resize. Screen payloads obey
 negotiated byte limits: at most 200 lines and 4096 bytes of text per line, with explicit

@@ -1753,7 +1753,52 @@
         "modes": { "$ref": "#/$defs/TerminalModes" },
         "lines": { "type": "array", "items": { "$ref": "#/$defs/TerminalLine" } },
         "next_sequence": { "type": "integer", "minimum": 0 },
-        "truncated": { "type": "boolean" }
+        "truncated": { "type": "boolean" },
+        "facts": { "$ref": "#/$defs/TerminalFacts" },
+        "relay": { "$ref": "#/$defs/TerminalRelay" }
+      }
+    },
+    "TerminalFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rows": { "type": "integer", "minimum": 1 },
+        "columns": { "type": "integer", "minimum": 1 },
+        "clients": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["total", "attached", "read_only"],
+          "properties": {
+            "total": { "type": "integer", "minimum": 0 },
+            "attached": { "type": "integer", "minimum": 0 },
+            "read_only": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "process": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["alive"],
+          "properties": {
+            "alive": { "type": "boolean" },
+            "exit_code": { "type": "integer" }
+          }
+        },
+        "uptime_s": { "type": "integer", "minimum": 0 },
+        "tags": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "TerminalRelay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner_host_id", "via", "direct", "transport", "rtt_ms", "capability_ttl_s", "fence_conflicts"],
+      "properties": {
+        "owner_host_id": { "$ref": "#/$defs/Id" },
+        "via": { "$ref": "#/$defs/Id" },
+        "direct": { "type": "boolean" },
+        "transport": { "enum": ["fabric", "http"] },
+        "rtt_ms": { "type": "integer", "minimum": 0 },
+        "capability_ttl_s": { "type": "integer", "minimum": 0 },
+        "fence_conflicts": { "type": "integer", "minimum": 0 }
       }
     },
     "ErrorEnvelope": {
