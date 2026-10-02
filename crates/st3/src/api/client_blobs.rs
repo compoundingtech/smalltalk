@@ -650,6 +650,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_replicated_claim_cannot_name_a_path_as_an_attachment() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::tests::state(root.path());
+        let good = "a".repeat(64);
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/hostile".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/alex")),
+                    ("to".into(), json!("person/ada")),
+                    ("content".into(), json!("x")),
+                    ("status".into(), json!("sent")),
+                    (
+                        "attachments".into(),
+                        json!([
+                            {"sha256": "../../etc/passwd", "media_type": "image/png", "size": 1, "origin": "host/a"},
+                            {"sha256": good, "media_type": "text/html", "size": 1, "origin": "host/a"},
+                            {"sha256": good, "media_type": "image/png", "size": 1, "origin": "elsewhere"},
+                            {"sha256": good, "media_type": "image/png", "size": 1, "origin": "host/a"},
+                        ]),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("hostile".into()),
+            })
+            .unwrap();
+        let attachments = state.store.message("message/hostile").unwrap().unwrap().attachments;
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].origin, "host/a");
+    }
+
     #[tokio::test]
     async fn uploads_are_limited_per_person_and_expire() {
         let root = tempfile::tempdir().unwrap();

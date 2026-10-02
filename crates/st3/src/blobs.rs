@@ -246,6 +246,10 @@ pub async fn materialize(
     files.sweep(DEFAULT_RETENTION);
     let client = st3_client::Client::unix_as(socket, actor);
     for attachment in &message.attachments {
+        anyhow::ensure!(
+            is_sha256(&attachment.sha256),
+            "a message names an attachment with an invalid hash"
+        );
         let path = directory.join(format!(
             "{}.{}",
             attachment.sha256,
