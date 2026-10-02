@@ -14,6 +14,7 @@ pub mod demo;
 pub mod doc;
 mod edit;
 mod glass;
+pub use glass::set_glasses_version;
 mod glass_store;
 pub mod layout;
 pub mod live;

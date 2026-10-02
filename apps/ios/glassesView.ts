@@ -51,6 +51,25 @@ export function groups(layout: GlassLayout): GlassTab[][] {
   return layout.children.flatMap(groups);
 }
 
+/** Each group's place in the glass as fractions of its width and height, in `groups` order. A split
+ * shares its room by its ratio (st keeps it from glasses version 2), evenly without one. */
+export type GroupBox = { x: number; y: number; width: number; height: number };
+export function groupBoxes(layout: GlassLayout, box: GroupBox = { x: 0, y: 0, width: 1, height: 1 }): GroupBox[] {
+  if ('tabs' in layout) return [box];
+  const shares = layout.children.length === 2 && typeof layout.ratio === 'number'
+    ? [Math.min(0.9, Math.max(0.1, layout.ratio)), 1 - Math.min(0.9, Math.max(0.1, layout.ratio))]
+    : layout.children.map(() => 1 / layout.children.length);
+  let at = 0;
+  return layout.children.flatMap((child, index) => {
+    const share = shares[index];
+    const part = layout.split === 'right'
+      ? { x: box.x + box.width * at, y: box.y, width: box.width * share, height: box.height }
+      : { x: box.x, y: box.y + box.height * at, width: box.width, height: box.height * share };
+    at += share;
+    return groupBoxes(child, part);
+  });
+}
+
 /** The glasses to choose between, by name, live ones only. */
 export function glassChoices(glasses: Glass[]): Array<{ id: string; name: string }> {
   return glasses
