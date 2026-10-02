@@ -67,7 +67,41 @@ pub fn from_path(text: &str) -> Option<Attachment> {
     if !image || !path.is_absolute() || text.contains('\n') {
         return None;
     }
-    describe(&path)
+    describe(&path)?;
+    // Tests keep their files where they made them, not in the person's state.
+    let dir = if cfg!(test) { None } else { dir() };
+    describe(&kept(&path, dir.as_deref()))
+}
+
+/// A copy of a pasted or dropped image in stui's own folder, named for its bytes. macOS hands
+/// screenshots over from a temporary folder that it soon empties and that its privacy protection
+/// guards from other programs, so an agent could not read the original even on this machine
+/// (cos, 2026-10-02). Where no copy can be made, the original.
+fn kept(path: &Path, dir: Option<&Path>) -> PathBuf {
+    let copy = || -> Option<PathBuf> {
+        let dir = dir?;
+        if path.starts_with(dir) {
+            return Some(path.to_owned());
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        let name = format!("{}.{extension}", &sha256_hex(&bytes)[..16]);
+        std::fs::create_dir_all(dir).ok()?;
+        let kept = dir.join(name);
+        if !kept.exists() {
+            std::fs::write(&kept, &bytes).ok()?;
+        }
+        Some(kept)
+    };
+    copy().unwrap_or_else(|| path.to_owned())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The image on this machine's clipboard, saved as a PNG file, if there is one.
@@ -251,6 +285,26 @@ mod tests {
     fn kittys_clipboard_answer_is_its_data_packets_joined() {
         let answer = "\x1b]5522;type=read:status=OK\x1b\\\x1b]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;iVBO\x1b\\\x1b]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;Rw0K\x1b\\\x1b]5522;type=read:status=DONE\x1b\\";
         assert_eq!(osc_payload(answer), "iVBORw0K");
+    }
+
+    #[test]
+    fn a_pasted_image_is_kept_in_stuis_own_folder_by_its_bytes() {
+        let from = tempfile::tempdir().unwrap();
+        let keep = tempfile::tempdir().unwrap();
+        let shot = from.path().join("Screenshot 2026-10-02 at 22.20.50.png");
+        std::fs::write(&shot, b"\x89PNG\r\n\x1a\nnot really").unwrap();
+        let kept = kept(&shot, Some(keep.path()));
+        assert!(kept.starts_with(keep.path()), "{}", kept.display());
+        assert_eq!(std::fs::read(&kept).unwrap(), std::fs::read(&shot).unwrap());
+        // The temporary original can go; the kept copy stays.
+        std::fs::remove_file(&shot).unwrap();
+        assert!(kept.exists());
+        // The same bytes are kept once; an image already kept stays where it is.
+        std::fs::write(&shot, b"\x89PNG\r\n\x1a\nnot really").unwrap();
+        assert_eq!(super::kept(&shot, Some(keep.path())), kept);
+        assert_eq!(super::kept(&kept, Some(keep.path())), kept);
+        // Nowhere to keep it: the original.
+        assert_eq!(super::kept(&shot, None), shot);
     }
 
     #[test]
