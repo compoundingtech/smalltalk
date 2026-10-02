@@ -427,7 +427,7 @@ pub struct Message {
 }
 
 /// A file a message carries. The bytes stay on `origin`; read them with `Client::blob`.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Attachment {
     pub blob: String,
     pub sha256: String,
@@ -1406,6 +1406,8 @@ pub struct TimelineMessageBody {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

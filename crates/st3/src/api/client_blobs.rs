@@ -533,18 +533,18 @@ mod tests {
                     attachments: vec![AttachmentInput {
                         blob,
                         media_type: "image/png".into(),
-                        name: Some("/Users/alex/Screen Shot.png".into()),
+                        name: Some("/Users/example/Screen Shot.png".into()),
                     }],
                 },
                 None,
                 None,
             )
         };
-        let stolen = send("person/bea", "person/carol", "stolen", format!("blob/{hash}"));
+        let stolen = send("person/ada", "person/robin", "stolen", format!("blob/{hash}"));
         assert_eq!(stolen.unwrap_err().code, "blob-not-found");
-        let missing = send("person/alex", "person/carol", "missing", format!("blob/{}", "0".repeat(64)));
+        let missing = send("person/alex", "person/robin", "missing", format!("blob/{}", "0".repeat(64)));
         assert_eq!(missing.unwrap_err().code, "blob-not-found");
-        let sent = send("person/alex", "person/carol", "with-image", format!("blob/{hash}"))
+        let sent = send("person/alex", "person/robin", "with-image", format!("blob/{hash}"))
             .unwrap()
             .0;
         assert_eq!(sent.attachments.len(), 1);
@@ -578,7 +578,7 @@ mod tests {
             MessageSendRequest {
                 idempotency_key: "many".into(),
                 from: "person/alex".into(),
-                to: "person/carol".into(),
+                to: "person/robin".into(),
                 content: "x".into(),
                 title: None,
                 in_reply_to: None,
@@ -597,16 +597,16 @@ mod tests {
 
         // The sender and the recipient read it through the message; a bystander does not.
         let path = format!("/v1/client/blobs/{hash}?message={}", sent.subject);
-        let (status, headers, bytes) = call(&app, "GET", &path, "person/carol", None, vec![]).await;
+        let (status, headers, bytes) = call(&app, "GET", &path, "person/robin", None, vec![]).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers["content-type"], "image/png");
         assert_eq!(bytes, image);
         let (status, _, bytes) = call(&app, "GET", &path, "person/alex", None, vec![]).await;
         assert_eq!((status, bytes), (StatusCode::OK, image.clone()));
-        let (status, _, body) = call(&app, "GET", &path, "person/dana", None, vec![]).await;
+        let (status, _, body) = call(&app, "GET", &path, "person/blair", None, vec![]).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{}", json_of(&body));
         let bare = format!("/v1/client/blobs/{hash}");
-        let (status, _, _) = call(&app, "GET", &bare, "person/dana", None, vec![]).await;
+        let (status, _, _) = call(&app, "GET", &bare, "person/blair", None, vec![]).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "a bystander cannot read it unnamed");
         let (status, _, bytes) = call(&app, "GET", &bare, "person/alex", None, vec![]).await;
         assert_eq!(
@@ -624,7 +624,7 @@ mod tests {
         let mut collected = Vec::new();
         loop {
             let chunk_path = format!("{bare}/chunk?message={}&offset={}", sent.subject, collected.len());
-            let (status, _, body) = call(&app, "GET", &chunk_path, "person/carol", None, vec![]).await;
+            let (status, _, body) = call(&app, "GET", &chunk_path, "person/robin", None, vec![]).await;
             assert_eq!(status, StatusCode::OK);
             let chunk = &json_of(&body)["value"];
             assert_eq!(chunk["size"], image.len());
@@ -641,7 +641,7 @@ mod tests {
 
         // After the retention window the bytes are gone and the message is not.
         assert_eq!(BlobDir::under(root.path()).sweep(Duration::ZERO), 1);
-        let (status, _, body) = call(&app, "GET", &path, "person/carol", None, vec![]).await;
+        let (status, _, body) = call(&app, "GET", &path, "person/robin", None, vec![]).await;
         assert_eq!(status, StatusCode::GONE, "{}", json_of(&body));
         assert_eq!(json_of(&body)["code"], "blob-expired");
         assert_eq!(
@@ -670,7 +670,7 @@ mod tests {
         assert_eq!(refused.code, "blob-quota-exceeded");
         state
             .store
-            .record_blob_upload("person/bea", &"b".repeat(64), "image/png", 100, 150, 60_000)
+            .record_blob_upload("person/ada", &"b".repeat(64), "image/png", 100, 150, 60_000)
             .unwrap();
         // Past the window the record goes, and with it the limit it counted against.
         std::thread::sleep(Duration::from_millis(5));

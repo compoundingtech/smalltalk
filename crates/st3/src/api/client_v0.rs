@@ -3377,6 +3377,14 @@ fn session_message_body(claim: &ClaimRecord) -> Value {
     {
         body["tags"] = Value::Array(tags.clone());
     }
+    let attachments: Vec<crate::model::MessageAttachment> = fields
+        .get("attachments")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    if !attachments.is_empty() {
+        body["attachments"] = attachments.iter().map(super::client_attachment).collect();
+    }
     body
 }
 
@@ -8499,6 +8507,79 @@ mod tests {
 
     fn test_state(root: &Path) -> AppState {
         test_state_named(root, "terminal-test")
+    }
+
+    #[test]
+    fn a_timeline_message_entry_lists_the_attachments_its_claim_carries() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
+        image.extend([7; 32]);
+        let hash = crate::blobs::BlobDir::under(root.path()).put(&image).unwrap();
+        state
+            .store
+            .record_blob_upload("person/alex", &hash, "image/png", image.len() as u64, 1 << 20, 60_000)
+            .unwrap();
+        let sent = accept_message(
+            &state,
+            MessageSendRequest {
+                idempotency_key: "timeline-attachment".into(),
+                from: "person/alex".into(),
+                to: "agent/terminal-test.seat".into(),
+                content: "see image".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                attachments: vec![crate::model::AttachmentInput {
+                    blob: format!("blob/{hash}"),
+                    media_type: "image/png".into(),
+                    name: Some("paste.png".into()),
+                }],
+            },
+            None,
+            None,
+        )
+        .unwrap()
+        .0;
+        let claim = state
+            .store
+            .claims_for(&sent.subject, Some("message.sent"))
+            .unwrap()
+            .remove(0);
+        let body = session_message_body(&claim);
+        assert_eq!(
+            body["attachments"],
+            json!([{
+                "blob": format!("blob/{hash}"), "sha256": hash, "media_type": "image/png",
+                "name": "paste.png", "size": image.len(), "origin": "host/terminal-test"
+            }])
+        );
+        let typed: st3_client::TimelineMessageBody = serde_json::from_value(body).unwrap();
+        assert_eq!(typed.attachments[0].blob, format!("blob/{hash}"));
+        // A message without attachments has no such key.
+        let plain = accept_message(
+            &state,
+            MessageSendRequest {
+                idempotency_key: "timeline-plain".into(),
+                from: "person/alex".into(),
+                to: "agent/terminal-test.seat".into(),
+                content: "no image".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            },
+            None,
+            None,
+        )
+        .unwrap()
+        .0;
+        let claim = state
+            .store
+            .claims_for(&plain.subject, Some("message.sent"))
+            .unwrap()
+            .remove(0);
+        assert!(session_message_body(&claim).get("attachments").is_none());
     }
 
     #[tokio::test]
