@@ -2381,10 +2381,29 @@ impl Ui {
     }
 
     fn draw_help(&self, buf: &mut Buffer, area: Rect) {
-        let width = 64.min(area.width.saturating_sub(4));
-        let mut inner = Doc::new();
-        let w = width as usize - 4;
-        inner.section("what the marks mean", None, w);
+        // Two columns where they fit, so the whole list shows at once.
+        let width = 124.min(area.width.saturating_sub(4));
+        let columns = if width >= 100 { 2 } else { 1 };
+        let column = (width as usize - 4 - 3 * (columns - 1)) / columns;
+        let keys = |doc: &mut Doc, title: &str, entries: &[(&str, &str)]| {
+            doc.section(title, None, column);
+            for (key, meaning) in entries {
+                doc.lines(text::wrap(
+                    &[text::run(*meaning, theme::soft())],
+                    column,
+                    &[text::run(
+                        format!(" {key:<19} "),
+                        theme::strong(theme::ACCENT),
+                    )],
+                    &[text::run(" ".repeat(21), theme::dim())],
+                    None,
+                ));
+            }
+            doc.blank();
+        };
+        // The marks also show in the footer's legend, so a single column puts the keys first.
+        let mut marks = Doc::new();
+        marks.section("what the marks mean", None, column);
         for (glyph, color, meaning) in [
             (
                 "◆",
@@ -2408,44 +2427,135 @@ impl Ui {
             ),
             ("✉", theme::SAPPHIRE, "a Small Talk message"),
         ] {
-            inner.lines(text::wrap(
+            marks.lines(text::wrap(
                 &[text::run(meaning, theme::soft())],
-                w,
+                column,
                 &[text::run(format!(" {glyph}  "), theme::strong(color))],
                 &[text::run("    ", theme::dim())],
                 None,
             ));
         }
-        inner.blank();
-        inner.section("keys", None, w);
-        for (key, meaning) in [
-            ("1-5 or click", "switch tabs"),
-            ("ctrl+h", "Home (in a text box it is backspace)"),
-            ("↑↓ j k or click", "select in the list"),
-            ("wheel pgup pgdn", "scroll the pane under the pointer"),
-            ("end", "jump to the newest message and follow it"),
-            ("drag", "select text in one pane; release copies it"),
-            ("o", "expand or collapse tool output"),
-            ("c", "write: a message, feedback, a reply"),
-            (
-                "ctrl+r",
-                "in a message box: speak instead (a Mac with SmallTalk.app's speech helper)",
-            ),
-            ("s", "hide the sidebar"),
-            (
-                "b p",
-                "Usage: group by agent, mission, step...; change the period",
-            ),
-            ("q", "quit"),
-        ] {
-            inner.line(Line::from(vec![
-                Span::styled(format!(" {key:<18}"), theme::strong(theme::ACCENT)),
-                Span::styled(meaning, theme::soft()),
-            ]));
+        marks.blank();
+        let mut left = Doc::new();
+        keys(
+            &mut left,
+            "everywhere",
+            &[
+                ("?", "this help; any key closes it"),
+                (
+                    "ctrl+k",
+                    "open anything: an agent, a mission, a space, an action",
+                ),
+                (
+                    "ctrl+h",
+                    "Home, and again to close it (in a text box it is backspace)",
+                ),
+                ("q", "quit"),
+            ],
+        );
+        if self.glasses.is_some() {
+            keys(
+                &mut left,
+                "spaces",
+                &[
+                    ("ctrl+t", "open something in a new tab"),
+                    ("ctrl+v  ctrl+x", "split right; split below"),
+                    ("ctrl+w", "close the tab"),
+                    ("[ ]  ctrl+pgup pgdn", "previous, next tab in the split"),
+                    ("alt+1-9", "a tab by its number"),
+                    (
+                        "alt+arrows",
+                        "move between splits; left of the first is the sidebar",
+                    ),
+                    ("ctrl+o", "zoom the split, and back"),
+                    ("ctrl+s", "show or hide the sidebar"),
+                    ("ctrl+g", "another space, or a new one"),
+                    ("ctrl+n", "start a new agent"),
+                    ("1-5", "open the palette at a section"),
+                ],
+            );
+        } else {
+            keys(
+                &mut left,
+                "classic",
+                &[("1-5  tab", "switch tabs"), ("s", "hide or show the list")],
+            );
+        }
+        let mut right = Doc::new();
+        keys(
+            &mut right,
+            "lists and cards",
+            &[
+                ("↑↓ j k or click", "select"),
+                ("t", "Agents, Missions: the path tree or the groups"),
+                ("x", "Missions: show st's own missions"),
+                ("n", "Agents: a new agent; Missions: a new mission"),
+                ("y", "confirm what a card asks; Enter never does"),
+                (
+                    "b p",
+                    "Usage: group by agent, mission, step...; change the period",
+                ),
+            ],
+        );
+        keys(
+            &mut right,
+            "a conversation",
+            &[
+                ("c or click", "write: a message, feedback, a reply"),
+                ("wheel pgup pgdn", "scroll the pane under the pointer"),
+                ("end", "jump to the newest message and follow it"),
+                ("/", "find in this conversation"),
+                ("o", "expand or collapse tool output"),
+                (
+                    "shift+o",
+                    "simplified view: tool calls fold to a line (this device)",
+                ),
+                ("i", "the agent's details beside it"),
+                ("drag", "select text in one pane; release copies it"),
+                ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
+                ("r  x", "resend or clear a message that was not sent"),
+            ],
+        );
+        keys(
+            &mut right,
+            "in a message box",
+            &[
+                ("enter", "send"),
+                ("shift+enter ctrl+j", "a new line"),
+                ("ctrl+w  ctrl+u", "delete a word; clear the box"),
+                ("ctrl+v", "attach the clipboard's image"),
+                (
+                    "ctrl+r",
+                    "speak instead of typing (a Mac with SmallTalk.app's speech helper)",
+                ),
+                ("esc", "stop writing; the keys above work again"),
+            ],
+        );
+        let mut inner = Doc::new();
+        if columns == 2 {
+            marks.lines.extend(left.lines);
+            let left = marks;
+            for row in 0..left.lines.len().max(right.lines.len()) {
+                let mut spans = left
+                    .lines
+                    .get(row)
+                    .map(|line| line.spans.clone())
+                    .unwrap_or_default();
+                let used: usize = spans.iter().map(|span| text::width(&span.content)).sum();
+                spans.push(Span::raw(" ".repeat(column.saturating_sub(used) + 3)));
+                if let Some(line) = right.lines.get(row) {
+                    spans.extend(line.spans.clone());
+                }
+                inner.line(Line::from(spans));
+            }
+        } else {
+            inner.lines(left.lines);
+            inner.lines(right.lines);
+            inner.lines(marks.lines);
         }
         let mut doc = Doc::new();
         doc.card(
-            "help · ? or esc closes",
+            "help · any key closes",
             theme::ACCENT,
             false,
             inner,
