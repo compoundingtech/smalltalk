@@ -610,7 +610,7 @@ mod tests {
             &state,
             "message/private",
             "message.sent",
-            json!({"from":"person/blair", "to":"person/casey", "content":"orchid private"}),
+            json!({"from":"person/blair", "to":"person/robin", "content":"orchid private"}),
         );
         claim(
             &state,
