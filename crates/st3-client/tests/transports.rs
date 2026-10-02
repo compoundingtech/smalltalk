@@ -633,20 +633,25 @@ async fn a_terminal_rides_the_collection_socket_and_its_end_leaves_the_rest() {
     };
     assert_eq!(first.value.lines[0].text, "terminal ready");
 
-    // The capability is single use: a second subscription with it is refused on its own.
-    stream
-        .subscribe_terminal(
-            "again",
-            &attachment.terminal_id,
-            Some("terminal-demo-runtime:i1"),
-            attachment.stream_capability.as_deref().unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        next_collection_event(&mut stream, "the refused reuse").await,
-        CollectionEvent::Error { id, .. } if id == "again"
-    ));
+    // The capability is a lease: a client that reconnects reuses it instead of attaching again.
+    assert!(attachment.reusable);
+    assert_eq!(attachment.ttl_s, Some(300));
+    {
+        let mut reconnected = client.collection_stream().await.unwrap();
+        reconnected
+            .subscribe_terminal(
+                "again",
+                &attachment.terminal_id,
+                Some("terminal-demo-runtime:i1"),
+                attachment.stream_capability.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_collection_event(&mut reconnected, "the reused lease's screen").await,
+            CollectionEvent::Screen { id, .. } if id == "again"
+        ));
+    }
 
     assert!(
         tokio::time::timeout(Duration::from_millis(1_500), stream.next_event())
@@ -1409,6 +1414,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
         replacement.value.runtime_incarnation,
         "terminal-demo-runtime:i2"
     );
+    // The capability is a lease, so a client that reconnects opens another stream with it.
     assert!(
         client
             .terminal_stream(
@@ -1417,8 +1423,8 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
                 second_attachment.stream_capability.as_deref().unwrap(),
             )
             .await
-            .is_err(),
-        "a stream capability must be single use"
+            .is_ok(),
+        "a stream capability is a reusable lease until it expires or is detached"
     );
     let detached = attach_terminal(&client, "unix-detach").await;
     detach_terminal(&client, &detached, "unix-first").await;

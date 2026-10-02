@@ -144,6 +144,22 @@ pub struct Page {
     /// as current, and while its graph has diverged from a peer's, so the page can be wrong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncNotice>,
+    /// Present on a list about another host's agent: whether the owner answered or this host's
+    /// replica stood in, and whether the replica can be missing recent items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated: Option<ReplicatedNotice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReplicatedNotice {
+    pub owner_host_id: String,
+    /// `owner` or `replica`.
+    pub source: String,
+    pub complete: bool,
+    /// `current`, `lagging` or `unverified`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2104,6 +2120,16 @@ pub struct TerminalAttachment {
     pub stream_capability: Option<String>,
     pub state: String,
     pub expires_at: String,
+    /// The capability opens any number of streams until it expires or is detached.
+    #[serde(default)]
+    pub reusable: bool,
+    /// How long the capability lives from attach, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_s: Option<u64>,
+    /// `reattach` when the capability can no longer open a stream: attach again with a new
+    /// idempotency key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2237,6 +2263,58 @@ pub struct TerminalScreen {
     pub lines: Vec<TerminalLine>,
     pub next_sequence: u64,
     pub truncated: bool,
+    /// The owner's best-effort facts about the session, present when asked for and answered.
+    /// They are not part of `revision` and never decide admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<TerminalFacts>,
+    /// How a gateway got this screen from a remote owner; absent on the owner's own host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<TerminalRelay>,
+}
+/// Owner-sourced, best-effort facts about a terminal session.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct TerminalFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<TerminalClients>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<TerminalProcess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_s: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TerminalClients {
+    pub total: u64,
+    pub attached: u64,
+    pub read_only: u64,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TerminalProcess {
+    pub alive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+/// How a gateway reached a remote owner for one read, so a client can tell a slow gateway from
+/// a down owner.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TerminalRelay {
+    pub owner_host_id: String,
+    /// The first node the read went to; the owner itself when `direct`.
+    pub via: String,
+    pub direct: bool,
+    /// How that first hop was dialed: `fabric` or `http`.
+    pub transport: String,
+    /// Milliseconds the gateway waited for the owner's answer.
+    pub rtt_ms: u64,
+    /// How long a terminal attach capability from this gateway lives, in seconds.
+    pub capability_ttl_s: u64,
+    /// The owner's stale-fence refusals of this gateway's reads in the last minute.
+    pub fence_conflicts: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

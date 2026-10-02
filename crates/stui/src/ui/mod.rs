@@ -1065,7 +1065,7 @@ impl Ui {
             ]
         } else if self.terminal_focused() {
             vec![
-                ("ctrl+\\", "return"),
+                ("ctrl+\\", "back to stui"),
                 ("keys", "go to the terminal"),
                 ("ctrl-c twice", "interrupt"),
             ]
@@ -1497,9 +1497,16 @@ impl Ui {
         match self.tab {
             0 => Pane::Home(id),
             1 if self.agent_form => Pane::NewAgent,
+            // In spaces an attached terminal is its own tab's: another tab shows what it holds,
+            // and the terminal stays attached behind it (Nathan, 2026-10-02).
             1 => match &self.terminal {
-                Some(view) => Pane::Terminal(view.agent.clone()),
-                None => Pane::Agent(id),
+                Some(view)
+                    if self.glasses.is_none()
+                        || self.focused_pane() == Some(Pane::Terminal(view.agent.clone())) =>
+                {
+                    Pane::Terminal(view.agent.clone())
+                }
+                _ => Pane::Agent(id),
             },
             2 if self.new_mission.is_some() => Pane::NewMission,
             2 if self.kdl => Pane::Declaration(id),
@@ -4051,11 +4058,19 @@ impl Ui {
                 };
                 let (in_sidebar, pane) = {
                     let info = self.frame.borrow();
+                    // Home floats over the glass: under it, only Home scrolls (Nathan,
+                    // 2026-10-02). The pane drawn last is the one on top, as for clicks.
+                    let behind_home = self.home_open()
+                        && info
+                            .home
+                            .is_some_and(|rect| !contains(rect, mouse.column, mouse.row));
                     (
                         contains(info.sidebar, mouse.column, mouse.row),
                         info.panes
                             .iter()
+                            .rev()
                             .find(|pane| contains(pane.rect, mouse.column, mouse.row))
+                            .filter(|_| !behind_home)
                             .map(|pane| pane.key.clone()),
                     )
                 };
@@ -4857,6 +4872,41 @@ mod tests {
         );
         ui.key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
         assert!(!ui.simple);
+    }
+
+    #[test]
+    fn a_failed_mission_ages_out_of_the_list_after_its_day() {
+        let mut world = demo::world();
+        let now = chrono::Local::now();
+        if let Load::Ready(missions) = &mut world.missions {
+            let mut failed = missions[0].clone();
+            failed.word = Word::Failed;
+            failed.system = false;
+            let mut today = failed.clone();
+            today.id = "mission/example/failed-today".into();
+            today.title = "Failed today".into();
+            today.updated_at = now.to_rfc3339();
+            failed.id = "mission/example/failed-yesterday".into();
+            failed.title = "Failed yesterday".into();
+            failed.updated_at = (now - chrono::Duration::days(1)).to_rfc3339();
+            missions.push(today);
+            missions.push(failed);
+        }
+        let shown = screens::missions_list(&world, "⠋", false);
+        assert!(shown.ids.iter().any(|id| id == "mission/example/failed-today"));
+        assert!(!shown.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
+        let note = shown
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Note(line) => Some(text::plain(line)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(note.contains("1 failed before today"), "{note}");
+        // x shows it again.
+        let all = screens::missions_list(&world, "⠋", true);
+        assert!(all.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
     }
 
     #[test]

@@ -213,6 +213,11 @@ enum Command {
         #[command(subcommand)]
         command: BlobCommand,
     },
+    /// Restrict what agents may write, and read what each rule would have refused.
+    Rules {
+        #[command(subcommand)]
+        command: RuleCommand,
+    },
     /// Discover native harness sessions and move one under durable st ownership.
     Import {
         #[command(subcommand)]
@@ -756,6 +761,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
         }
         FleetCommand::Wait { timeout } => {
             let timeout = Duration::from_secs(parse_fleet_duration(&timeout)?);
+            let started = std::time::Instant::now();
+            let since = now_ms();
             let first = wait_for_first_sync(&client, timeout, !json_output)
                 .await?
                 .with_context(|| {
@@ -765,7 +772,36 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                         timeout.as_secs()
                     )
                 })?;
-            report_first_sync(&first, json_output)
+            if first.state != "verified" {
+                return report_first_sync(&first, json_output);
+            }
+            // A first sync is verified once, long ago after a restart. A wait is a gate for now:
+            // it also needs an exchange since it began at which this node held everything.
+            let caught_up = wait_for_caught_up(
+                &client,
+                since,
+                timeout.saturating_sub(started.elapsed()),
+                !json_output,
+            )
+            .await?;
+            let caught_up = match caught_up {
+                Ok(caught_up) => caught_up,
+                Err(waiting) => anyhow::bail!(
+                    "{}\nbut this node has not caught up since this wait began {} s ago: {}; st \
+                     replication status shows how far it got",
+                    render_first_sync(&first, now_ms()),
+                    started.elapsed().as_secs(),
+                    waiting
+                ),
+            };
+            if json_output {
+                let mut value = serde_json::to_value(&first)?;
+                value["caught_up"] = serde_json::to_value(&caught_up)?;
+                return print_value(&value, true);
+            }
+            println!("{}", render_first_sync(&first, now_ms()));
+            println!("{}", render_caught_up(&caught_up, now_ms()));
+            Ok(())
         }
         FleetCommand::Remove(args) => run_fleet_remove(&client, &config, args).await,
         FleetCommand::Migrate(args) => run_fleet_migrate(&client, &config, args).await,
@@ -842,6 +878,9 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 status.fleet_id.as_deref().unwrap_or("none"),
                 status.node
             );
+            if let Some(removed) = &status.removed {
+                println!("REMOVED  {}", removed.describe(status.fleet_id.as_deref()));
+            }
             println!("MEMBER  MODE  STATE  ROUTE-ENDPOINTS");
             for member in &status.view.members {
                 let transports = member
@@ -2383,6 +2422,35 @@ enum DocCommand {
 }
 
 #[derive(Subcommand)]
+enum RuleCommand {
+    /// List the rules, each with its mode: off, audit or enforce.
+    Ls,
+    /// List the writes the rules in audit mode would have refused, newest first.
+    Audit {
+        /// Only this rule's records.
+        rule: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Set the lockdown rules, each in audit mode until you enforce it.
+    Lockdown {
+        #[arg(long = "as")]
+        actor: Option<String>,
+        /// An agent that may still start agents, such as agent/example/planner. Repeatable.
+        #[arg(long = "starter")]
+        starters: Vec<String>,
+    },
+    /// Turn one rule off, to audit, or to enforce.
+    Mode {
+        name: String,
+        #[arg(value_parser = ["off", "audit", "enforce"])]
+        mode: String,
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ImportCommand {
     /// List running native sessions; use --all for resumable saved history.
     Ls {
@@ -3627,6 +3695,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Blobs { command } => {
             run_blobs(&endpoint, config.person.as_deref(), command, cli.json).await
         }
+        Command::Rules { command } => run_rules(&client, &config, command, cli.json).await,
         Command::Import { command } => run_import(&endpoint, command, cli.json).await,
         Command::Completions(args) => {
             let shell = match args.shell {
@@ -7806,6 +7875,10 @@ async fn wait_for_first_sync(
             .get::<ReplicationStatus>("/v1/replication/status")
             .await
         {
+            // A removed node never finishes syncing; say why instead of waiting out the timeout.
+            if let Some(removed) = &status.removed {
+                anyhow::bail!("{}", removed.describe(status.fleet_id.as_deref()));
+            }
             let first = status.first_sync.clone().context(
                 "this node has no first sync to wait for: it did not join with st fleet join",
             )?;
@@ -7847,6 +7920,111 @@ async fn wait_for_first_sync(
     }
 }
 
+/// The peers this node caught up with at exchanges since a wait began, and those it could not
+/// check because they are not up.
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+struct CaughtUp {
+    /// Each peer and when this node last measured that it held every envelope the peer held.
+    peers: Vec<(String, u128)>,
+    not_checked: Vec<String>,
+}
+
+/// Whether this node has caught up since `since`: every peer that is up has exchanged since
+/// then, and at the latest exchange this node held every envelope that peer held. Peers that are
+/// not up cannot be checked, but at least one peer must be. `Err` says what is still missing.
+fn caught_up_since(status: &ReplicationStatus, since: u128) -> Result<CaughtUp, String> {
+    let mut caught_up = CaughtUp::default();
+    let mut waiting = Vec::new();
+    for peer in &status.peers {
+        let fresh = peer
+            .sync
+            .as_ref()
+            .filter(|sync| sync.measured_at_unix_ms >= since);
+        match fresh {
+            Some(sync) if sync.peer_only_envelopes == 0 => caught_up
+                .peers
+                .push((peer.peer.clone(), sync.measured_at_unix_ms)),
+            Some(sync) => waiting.push(format!(
+                "{} has {} this node lacks",
+                peer.peer,
+                envelope_count(sync.peer_only_envelopes)
+            )),
+            None if peer.status == "up" => {
+                waiting.push(format!("no exchange with {} yet", peer.peer));
+            }
+            None => caught_up
+                .not_checked
+                .push(format!("{} ({})", peer.peer, peer.status)),
+        }
+    }
+    if caught_up.peers.is_empty() && waiting.is_empty() {
+        waiting.push(if status.peers.is_empty() {
+            "this node has no peers".into()
+        } else {
+            "no peer has exchanged with this node".into()
+        });
+    }
+    if waiting.is_empty() {
+        Ok(caught_up)
+    } else {
+        Err(waiting.join("; "))
+    }
+}
+
+/// Wait until [`caught_up_since`] holds, printing progress when `progress` is set. Returns what
+/// is still missing at the deadline.
+async fn wait_for_caught_up(
+    client: &Client,
+    since: u128,
+    timeout: Duration,
+    progress: bool,
+) -> Result<Result<CaughtUp, String>> {
+    let started = std::time::Instant::now();
+    let mut reported = None::<std::time::Instant>;
+    let mut missing = "replication status did not answer".to_owned();
+    loop {
+        if let Ok(status) = client
+            .get::<ReplicationStatus>("/v1/replication/status")
+            .await
+        {
+            if let Some(removed) = &status.removed {
+                anyhow::bail!("{}", removed.describe(status.fleet_id.as_deref()));
+            }
+            match caught_up_since(&status, since) {
+                Ok(caught_up) => return Ok(Ok(caught_up)),
+                Err(waiting) => missing = waiting,
+            }
+            if progress && reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(10)) {
+                reported = Some(std::time::Instant::now());
+                println!("catching up: {missing}");
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Ok(Err(missing));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn render_caught_up(caught_up: &CaughtUp, now: u128) -> String {
+    let peers = caught_up
+        .peers
+        .iter()
+        .map(|(peer, at)| format!("{peer} ({})", relative_time(*at, now)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut line = format!(
+        "caught up now: at its latest exchange with {peers}, this node held every envelope the peer held"
+    );
+    if !caught_up.not_checked.is_empty() {
+        line.push_str(&format!(
+            "; not checked, since they are not up: {}",
+            caught_up.not_checked.join(", ")
+        ));
+    }
+    line
+}
+
 /// Print how a first sync ended, and fail when its graphs still differ.
 fn report_first_sync(first: &st3::model::ReplicationFirstSync, json_output: bool) -> Result<()> {
     if json_output {
@@ -7878,12 +8056,12 @@ fn render_first_sync(first: &st3::model::ReplicationFirstSync, now: u128) -> Str
     );
     match first.state.as_str() {
         "verified" if first.authority_digest.is_some() => format!(
-            "first sync verified {when}: this node holds the same {} as {peer}; log digest {}; projection comparison waits for matching builds",
+            "first sync verified {when}: this node then held the same {} as {peer}; log digest {}; projection comparison waits for matching builds",
             envelope_count(first.envelopes.unwrap_or(0)),
             short_digest(first.authority_digest.as_deref().unwrap_or("unknown")),
         ),
         "verified" => format!(
-            "first sync verified {when}: this node holds the same {} as {peer} and projects the same graph ({}){}",
+            "first sync verified {when}: this node then held the same {} as {peer} and projected the same graph ({}){}",
             envelope_count(first.envelopes.unwrap_or(0)),
             short_digest(first.graph_digest.as_deref().unwrap_or("unknown")),
             if first.healed { ", after a heal" } else { "" }
@@ -8156,6 +8334,9 @@ async fn run_replication(
                 "fleet\t{}",
                 status.fleet_id.as_deref().unwrap_or("local-only")
             );
+            if let Some(removed) = &status.removed {
+                println!("removed\t{}", removed.describe(status.fleet_id.as_deref()));
+            }
             println!("authority-digest\t{}", status.authority_digest);
             println!("graph-digest\t{}", status.graph_digest);
             for (table, digest) in &status.projection_digests {
@@ -8741,6 +8922,114 @@ async fn run_blobs(
                     std::io::stdout().write_all(&bytes)?;
                 }
             }
+            Ok(())
+        }
+    }
+}
+
+async fn run_rules(
+    client: &Client,
+    config: &Config,
+    command: RuleCommand,
+    json_output: bool,
+) -> Result<()> {
+    use smallclaims::rules::{Mode, NamedRule};
+    let person = |actor: Option<String>| -> Result<String> {
+        actor
+            .or_else(|| config.person.clone())
+            .context("rules are set by a person: set person in config.toml or pass --as person/NAME")
+    };
+    let set = |actor: &str, name: &str, rule: smallclaims::rules::Rule| {
+        let request = st3::api::RuleSetRequest {
+            actor: actor.to_owned(),
+            name: name.to_owned(),
+            rule,
+        };
+        async move {
+            let _: Value = client.post("/v1/rules/set", &request).await?;
+            anyhow::Ok(())
+        }
+    };
+    match command {
+        RuleCommand::Ls => {
+            let rules: Vec<NamedRule> = client.get("/v1/rules").await?;
+            if json_output {
+                return print_value(&rules, true);
+            }
+            if rules.is_empty() {
+                println!("no rules: every principal may write what its person may (st rules lockdown sets the presets)");
+            }
+            for rule in rules {
+                println!(
+                    "{}\t{}\t{}",
+                    rule.name,
+                    rule.rule.mode.as_str(),
+                    rule.rule.description
+                );
+            }
+            Ok(())
+        }
+        RuleCommand::Audit { rule, limit } => {
+            let mut path = format!("/v1/rules/audit?limit={limit}");
+            if let Some(rule) = &rule {
+                path.push_str(&format!("&rule={}", urlencoding::encode(rule)));
+            }
+            let audits: Vec<st3::api::RuleAudit> = client.get(&path).await?;
+            if json_output {
+                return print_value(&audits, true);
+            }
+            if audits.is_empty() {
+                println!("no write has been refused or audited");
+            }
+            for audit in audits {
+                println!(
+                    "{}\t{}\t{} {} on {}",
+                    audit.at_unix_ms, audit.rule, audit.actor, audit.action, audit.target
+                );
+            }
+            Ok(())
+        }
+        RuleCommand::Lockdown { actor, starters } => {
+            let actor = person(actor)?;
+            let rules = st3::rules::lockdown(&starters);
+            for (name, rule) in &rules {
+                set(&actor, name, rule.clone()).await?;
+            }
+            if json_output {
+                return print_value(
+                    &rules
+                        .iter()
+                        .map(|(name, rule)| json!({"name": name, "rule": rule}))
+                        .collect::<Vec<_>>(),
+                    true,
+                );
+            }
+            for (name, rule) in &rules {
+                println!("{name}\taudit\t{}", rule.description);
+            }
+            println!(
+                "Each rule logs what it would refuse; read the log with st rules audit, then st rules mode NAME enforce."
+            );
+            Ok(())
+        }
+        RuleCommand::Mode { name, mode, actor } => {
+            let actor = person(actor)?;
+            let rules: Vec<NamedRule> = client.get("/v1/rules").await?;
+            let mut rule = rules
+                .into_iter()
+                .find(|rule| rule.name == name)
+                .with_context(|| format!("no rule is named `{name}`; st rules ls lists them"))?
+                .rule;
+            rule.mode = match mode.as_str() {
+                "off" => Mode::Off,
+                "enforce" => Mode::Enforce,
+                _ => Mode::Audit,
+            };
+            set(&actor, &name, rule).await?;
+            if json_output {
+                return print_value(&json!({"name": name, "mode": mode}), true);
+            }
+            println!("{name}\t{mode}");
             Ok(())
         }
     }
@@ -16503,8 +16792,11 @@ async fn forward_projected_messages_reporting(
                 }
                 // Receipt-backed transports advance graph delivery only after their durable ledger proves
                 // that the exact inbox file was consumed by a provider turn. Materialization alone is
-                // merely queued native delivery.
-                if !native_delivery_receipted(&consumed, &filename) {
+                // merely queued native delivery. Delivered-unread mail is reoffered every poll, but
+                // its delivery is already recorded: posting it again on each poll wakes every
+                // mailbox reader in the daemon for nothing (#1085).
+                if message.status == "delivered" || !native_delivery_receipted(&consumed, &filename)
+                {
                     return Ok(());
                 }
                 deliver_message(
@@ -16986,6 +17278,53 @@ mod tests {
             graph_digest: None,
             sync: None,
         }
+    }
+
+    #[test]
+    fn a_wait_counts_only_exchanges_since_it_began() {
+        let since = 10_000;
+        let with = |name: &str, status: &str, measured: Option<(u128, u64)>| {
+            let mut peer = peer_status(name, None);
+            peer.status = status.into();
+            peer.sync = measured.map(|(at, peer_only)| st3::model::ReplicationPeerSync {
+                peer_only_envelopes: peer_only,
+                measured_at_unix_ms: at,
+                ..Default::default()
+            });
+            peer
+        };
+        let status = |peers| ReplicationStatus {
+            peers,
+            ..Default::default()
+        };
+        // An in-sync measurement from before the wait, as after a restart, proves nothing.
+        let error = caught_up_since(&status(vec![with("alder", "up", Some((9_000, 0)))]), since)
+            .unwrap_err();
+        assert_eq!(error, "no exchange with alder yet");
+        let error = caught_up_since(
+            &status(vec![with("alder", "up", Some((11_000, 300)))]),
+            since,
+        )
+        .unwrap_err();
+        assert_eq!(error, "alder has 300 envelopes this node lacks");
+        // A member that is not up cannot be checked, but some member must be.
+        let caught_up = caught_up_since(
+            &status(vec![
+                with("alder", "up", Some((11_000, 0))),
+                with("birch", "last-seen", Some((9_000, 0))),
+            ]),
+            since,
+        )
+        .unwrap();
+        assert_eq!(caught_up.peers, vec![("alder".to_owned(), 11_000)]);
+        assert_eq!(caught_up.not_checked, vec!["birch (last-seen)".to_owned()]);
+        assert!(
+            render_caught_up(&caught_up, 12_000)
+                .contains("not checked, since they are not up: birch")
+        );
+        let error =
+            caught_up_since(&status(vec![with("birch", "last-seen", None)]), since).unwrap_err();
+        assert_eq!(error, "no peer has exchanged with this node");
     }
 
     #[test]
@@ -18337,6 +18676,7 @@ mod tests {
                 cursor_expires_at: None,
             },
             sync: None,
+            replicated: None,
         }
     }
 
@@ -20926,6 +21266,99 @@ mission "review" state="ready" {
         assert_eq!(store.message("message/delivered").unwrap().unwrap().status, "delivered");
         assert_eq!(store.message("message/read").unwrap().unwrap().status, "read");
         assert_eq!(store.message("message/closed").unwrap().unwrap().status, "closed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn consumed_delivered_unread_mail_posts_no_lifecycle_claim_on_any_poll() {
+        use axum::{
+            Json, Router,
+            extract::Path as AxumPath,
+            routing::{get, post},
+        };
+
+        // #1085: a seat holding many delivered-unread messages re-posted `delivered` for every
+        // one of them on every poll, and each repeat woke every mailbox reader in the daemon.
+        let posts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = posts.clone();
+        let app = Router::new()
+            .route(
+                "/v1/messages/page",
+                get(|| async {
+                    let message = |subject: &str, status: &str, index: u64| {
+                        json!({"subject": subject, "from": "agent/sender", "to": "agent/test",
+                            "content": "Signal", "status": status, "created_index": index})
+                    };
+                    Json(json!({"api_version": "st3.v1", "value": {
+                        "items": [message("message/delivered", "delivered", 1),
+                                  message("message/staged", "staged", 2)],
+                        "has_more": false, "next_cursor": null, "limit": 200
+                    }}))
+                }),
+            )
+            .route(
+                "/v1/messages/{message_id}/claims",
+                post(move |AxumPath(message_id): AxumPath<String>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        recorded.lock().unwrap().push(message_id.clone());
+                        Json(json!({"api_version": "st3.v1", "value": {
+                            "id": "claim/1", "store_index": 1, "batch_id": "batch/1",
+                            "subject": message_id, "kind": "message.delivered", "origin": "test",
+                            "actor": "agent/test", "body": {}, "predecessors": [],
+                            "accepted_at_unix_ms": 1
+                        }}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+        let mut writer = st_drivers::harness_timeline::Writer::new(root.path(), "claude", "one");
+        for subject in ["message/delivered", "message/staged"] {
+            let filename = st_drivers::message::send_to_inbox(
+                &inbox,
+                "agent/sender",
+                None,
+                None,
+                &[format!("st3-message:{subject}")],
+                "Signal",
+            )
+            .unwrap();
+            writer
+                .append(
+                    subject,
+                    st_drivers::harness_timeline::Role::User,
+                    st_drivers::harness_timeline::EntryType::Content,
+                    json!({"text": format!("[st3-delivery:{filename}]\nSignal")}),
+                    true,
+                )
+                .unwrap();
+        }
+        for _ in 0..5 {
+            forward_projected_messages(
+                &client,
+                "agent/test",
+                &inbox,
+                &archive,
+                "claude-channel",
+                NativeDeliveryReceipts::ClaudeChannel {
+                    agent_dir: root.path(),
+                    incarnation: "one",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let posts = posts.lock().unwrap().clone();
+        // A consumed message still in `staged` records its delivery (here the mock never
+        // settles it, so it is posted on each poll); an already-delivered one is never posted.
+        assert!(posts.iter().all(|id| id.contains("staged")), "{posts:?}");
+        assert_eq!(posts.len(), 5, "{posts:?}");
         server.abort();
     }
 

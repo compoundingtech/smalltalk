@@ -29,6 +29,7 @@ use crate::archive::hydrate_eval;
 use crate::graph::{parse_intent, resolve_document_references};
 #[cfg(test)]
 use crate::model::AttentionRequest;
+use crate::model::ClientReplicated;
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
@@ -482,6 +483,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/launches/{id}/revise", post(revise_planning_session))
         .route("/v1/launches/{id}/cancel", post(cancel_planning_session))
         .route("/v1/documents", get(list_documents).post(put_document))
+        .route("/v1/rules", get(list_rules))
+        .route("/v1/rules/audit", get(list_rule_audits))
+        .route("/v1/rules/set", post(set_rule))
         .route("/v1/documents/content", get(get_document))
         .route("/v1/diagnostics/harness", post(post_harness_diagnostic))
         .route("/v1/delivery/hold", get(get_delivery_hold).post(post_delivery_hold))
@@ -1308,6 +1312,7 @@ fn client_page_read(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(state),
+        replicated: None,
     })
 }
 
@@ -3433,6 +3438,7 @@ async fn client_work_history(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(state),
+        replicated: None,
     };
     Ok((Extension(snapshot), Json(page)))
 }
@@ -3624,26 +3630,79 @@ async fn forward_client_read(
                 status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::CONFLICT),
                 code: rejected.code.clone(),
                 message: rejected.message.clone(),
-                details: Box::default(),
+                details: Box::new(rejected.details.clone()),
             },
             None => remote_unavailable(&target),
         }
     })
 }
 
+/// A read with no owner to send it to: this node has no relay, or no peer reaches the owner.
 fn remote_unavailable(host: &str) -> ApiError {
+    let mut details = serde_json::Map::new();
+    details.insert("reason".into(), "no-route".into());
+    details.insert("owner_host_id".into(), host.into());
+    details.insert("hops".into(), 0.into());
     ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: "remote-unavailable".into(),
-        message: format!("owner {host} is temporarily unavailable; cached data remains usable"),
-        details: Box::default(),
+        message: format!(
+            "no route to owner {host}: this node cannot dial it and no peer reaches it; cached data remains usable"
+        ),
+        details: Box::new(details),
     }
 }
 
+/// A read that is not sent for a stated reason, in the shape of an unreachable owner.
+fn remote_unavailable_because(host: &str, reason: &str, message: &str) -> ApiError {
+    let mut error = remote_unavailable(host);
+    error.details.insert("reason".into(), reason.into());
+    error.message = message.into();
+    error
+}
+
+/// How many nodes the furthest route a read tried handed it to, from the attempts it records.
+fn attempt_hops(attempts: Option<&Value>) -> u64 {
+    attempts.and_then(Value::as_array).map_or(0, |attempts| {
+        attempts
+            .iter()
+            .map(|attempt| 1 + attempt_hops(attempt.get("next")))
+            .max()
+            .unwrap_or(0)
+    })
+}
+
 fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
-    let Some(rejected) = error.downcast_ref::<crate::peer::ClientReadRejected>() else {
-        return remote_unavailable(host);
+    let rejected = match error.downcast::<crate::peer::ClientReadRejected>() {
+        Ok(rejected) => rejected,
+        Err(error) => crate::peer::ClientReadRejected::unreachable(
+            "transport-error",
+            format!("the read to owner {host} failed: {error:#}"),
+        ),
     };
+    let mut details = rejected.details.clone();
+    details
+        .entry("owner_host_id")
+        .or_insert_with(|| host.into());
+    if rejected.code == "remote-unavailable" {
+        let hops = attempt_hops(details.get("attempts"));
+        details.entry("hops").or_insert_with(|| hops.into());
+        let elapsed_ms = details.get("elapsed_ms").and_then(Value::as_u64);
+        tracing::warn!(
+            owner = host,
+            reason = rejected.reason().unwrap_or("unknown"),
+            hops,
+            elapsed_ms,
+            "a client read could not reach its owner: {}",
+            rejected.message
+        );
+        return ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "remote-unavailable".into(),
+            message: rejected.message,
+            details: Box::new(details),
+        };
+    }
     if !matches!(
         rejected.code.as_str(),
         "page-cursor-expired"
@@ -3659,9 +3718,9 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
     }
     ApiError {
         status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-        code: rejected.code.clone(),
-        message: rejected.message.clone(),
-        details: Box::default(),
+        code: rejected.code,
+        message: rejected.message,
+        details: Box::new(details),
     }
 }
 
@@ -3710,7 +3769,44 @@ async fn client_messages(
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
     let (history, actor) = (query.history, query.actor.clone());
-    client_snapshot_page(
+    // An agent another host owns is listed by that host: its messages can reach this node late,
+    // and a list that shows only what has arrived reads as empty while the replica lags.
+    let owner = match actor.as_deref() {
+        Some(actor) => remote_agent_owner(&state, actor).await?,
+        None => None,
+    };
+    let mut replicated = None;
+    if let (Some(owner), Some(actor)) = (owner.as_deref(), actor.as_deref()) {
+        match relayed_messages_page(&state, &session, owner, actor, &query).await {
+            Ok(mut page) => {
+                page.replicated = Some(ClientReplicated {
+                    owner_host_id: owner.to_owned(),
+                    source: "owner".into(),
+                    complete: true,
+                    state: "current".into(),
+                    reason: None,
+                });
+                return Ok((Extension(snapshot), Json(page)));
+            }
+            Err(error) if error.code == "remote-unavailable" => {
+                let lagging = client_sync_notice(&state)
+                    .is_some_and(|notice| notice.peers.iter().any(|peer| peer.host_id == owner));
+                replicated = Some(ClientReplicated {
+                    owner_host_id: owner.to_owned(),
+                    source: "replica".into(),
+                    complete: false,
+                    state: if lagging { "lagging" } else { "unverified" }.into(),
+                    reason: error
+                        .details
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let (snapshot, Json(mut page)) = client_snapshot_page(
         &state,
         snapshot,
         "messages",
@@ -3720,6 +3816,67 @@ async fn client_messages(
         },
     )
     .await
+    .map(|(Extension(snapshot), page)| (snapshot, page))?;
+    page.replicated = replicated;
+    Ok((Extension(snapshot), Json(page)))
+}
+
+/// The host that owns `actor`'s runtime, when that is another host.
+async fn remote_agent_owner(state: &AppState, actor: &str) -> Result<Option<String>, ApiError> {
+    if !actor.starts_with("agent/") {
+        return Ok(None);
+    }
+    let (store, subject) = (state.store.clone(), actor.to_owned());
+    let origin = blocking_store(move || {
+        Ok(store
+            .status(Some(&subject))?
+            .subjects
+            .first()
+            .and_then(|subject| subject.actual_origin.clone()))
+    })
+    .await?;
+    Ok(origin
+        .filter(|origin| origin != state.store.origin())
+        .map(|origin| client_host_id(&origin)))
+}
+
+/// One page of an agent's messages as its owner lists them.
+async fn relayed_messages_page(
+    state: &AppState,
+    session: &client_v0::ClientSession,
+    owner: &str,
+    actor: &str,
+    query: &ClientListQuery,
+) -> Result<ClientResourcePage, ApiError> {
+    if !client_v0::acting_party(session) {
+        return Err(remote_unavailable_because(
+            owner,
+            "not-relayed",
+            "a remote agent's messages are relayed only for a concrete person or agent",
+        ));
+    }
+    let relay = state
+        .client_relay
+        .as_ref()
+        .filter(|relay| relay.reaches(owner))
+        .ok_or_else(|| remote_unavailable(owner))?;
+    let value = relay
+        .read(
+            owner,
+            &crate::peer::ClientReadRequest {
+                authority_actor: session.authority_actor.clone(),
+                relay: None,
+                request: crate::peer::ClientReadOperation::Messages {
+                    actor: actor.to_owned(),
+                    history: query.history,
+                    limit: query.limit.map(|limit| limit.clamp(1, 200)),
+                    cursor: query.cursor.clone(),
+                },
+            },
+        )
+        .await
+        .map_err(|error| remote_read_error(owner, error))?;
+    serde_json::from_value(value).map_err(ApiError::internal)
 }
 
 async fn client_messages_detail(
@@ -3972,6 +4129,7 @@ async fn client_history(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(&state),
+        replicated: None,
     }))
 }
 
@@ -4154,6 +4312,9 @@ async fn serve_unix_with_ancestor(
                     }
                     if let Some(caller) = caller {
                         request.extensions_mut().insert(caller);
+                    }
+                    if let Some(agent) = &bound_agent {
+                        request.extensions_mut().insert(BoundAgent(agent.clone()));
                     }
                     let client_request = request.uri().path().starts_with("/v1/client/");
                     let request = match guard_bound_request(request, bound_agent.as_deref()).await {
@@ -4432,6 +4593,10 @@ fn record_legacy_poll(
     }
 }
 
+/// The agent whose harness a local request comes from, when it comes from one.
+#[derive(Clone, Debug)]
+pub struct BoundAgent(pub String);
+
 async fn guard_bound_request(
     request: Request<Body>,
     bound_agent: Option<&str>,
@@ -4480,6 +4645,7 @@ async fn guard_bound_request(
         "/v1/reviews/",
         "/v1/claims",
         "/v1/diagnostic",
+        "/v1/rules/",
     ]
     .iter()
     .any(|prefix| path.starts_with(prefix))
@@ -5404,12 +5570,39 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .first_sync
                 .as_ref()
                 .filter(|first| first.state == "failed");
-            let status = if replication.unhealthy_projections != 0
+            // A verified first sync is history. Whether this node is caught up now takes an
+            // exchange since this daemon started, and one that found nothing left to fetch.
+            let catching_up = replication
+                .peers
+                .iter()
+                .filter_map(|peer| {
+                    let sync = peer.sync.as_ref().filter(|sync| sync.catching_up)?;
+                    Some(format!(
+                        "{} has {} envelopes this node lacks",
+                        peer.peer, sync.peer_only_envelopes
+                    ))
+                })
+                .collect::<Vec<_>>();
+            // A peer whose grants refuse this node never exchanges with it directly.
+            let unmeasured = replication.timings.exchanges == 0
+                && replication
+                    .peers
+                    .iter()
+                    .any(|peer| peer.status != "refused");
+            // A removed node is never told by status alone: its peers merely stop answering.
+            let removed = crate::fleet::file::RemovalNotice::load(&state.state_dir);
+            let status = if removed.is_some()
+                || replication.unhealthy_projections != 0
                 || !diverged.is_empty()
                 || first_sync_failed.is_some()
             {
                 "fail"
-            } else if !unavailable.is_empty() || !absent.is_empty() || unresolved != 0 {
+            } else if !unavailable.is_empty()
+                || !absent.is_empty()
+                || unresolved != 0
+                || !catching_up.is_empty()
+                || unmeasured
+            {
                 "warn"
             } else {
                 "pass"
@@ -5418,7 +5611,22 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{}{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    "{}{}{}{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    removed
+                        .map(|notice| format!(
+                            "{}; ",
+                            notice.describe(replication.fleet_id.as_deref())
+                        ))
+                        .unwrap_or_default(),
+                    if !catching_up.is_empty() {
+                        format!("catching up: {}; ", catching_up.join(", "))
+                    } else if unmeasured {
+                        "no exchange with a peer since this daemon started, so whether this \
+                         node is caught up is not known yet; "
+                            .to_owned()
+                    } else {
+                        String::new()
+                    },
                     absent
                         .iter()
                         .chain(&away)
@@ -5644,9 +5852,14 @@ async fn replication_status(
     let configured = state.fleet_id.is_some();
     let fleet = state.fleet_id.clone();
     let peers = replication_peer_names(&state);
-    blocking_store(move || store.replication_status_sealed(configured, fleet.as_deref(), &peers))
-        .await
-        .map(Json)
+    let state_dir = state.state_dir.clone();
+    blocking_store(move || {
+        let mut status = store.replication_status_sealed(configured, fleet.as_deref(), &peers)?;
+        status.removed = crate::fleet::file::RemovalNotice::load(&state_dir);
+        Ok(status)
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -6066,6 +6279,9 @@ pub struct FleetStatus {
     pub view: crate::fleet::FleetView,
     pub peers: Vec<crate::model::ReplicationPeerStatus>,
     pub invites: Vec<crate::store::FleetInviteView>,
+    /// A member refused this node as removed or left, so it no longer syncs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<crate::fleet::file::RemovalNotice>,
 }
 
 fn concrete_person(person: &str) -> Result<(), ApiError> {
@@ -6084,6 +6300,7 @@ async fn fleet_status(State(state): State<AppState>) -> Result<Json<FleetStatus>
     let store = state.store.clone();
     let node = state.node.clone();
     let fleet_id = state.fleet_id.clone();
+    let state_dir = state.state_dir.clone();
     blocking_store(move || {
         let replication =
             store.replication_status_sealed(fleet_id.is_some(), fleet_id.as_deref(), &peers)?;
@@ -6094,6 +6311,7 @@ async fn fleet_status(State(state): State<AppState>) -> Result<Json<FleetStatus>
             view: store.fleet_view_sealed()?,
             peers: replication.peers,
             invites: store.fleet_invites(false)?,
+            removed: crate::fleet::file::RemovalNotice::load(&state_dir),
         })
     })
     .await
@@ -8167,19 +8385,104 @@ async fn get_mission(
 
 async fn put_document(
     State(state): State<AppState>,
+    bound: Option<axum::Extension<BoundAgent>>,
     Json(request): Json<DocumentPutRequest>,
 ) -> Result<Json<DocumentVersion>, ApiError> {
     let response = state
         .store
-        .put_document(
+        .put_document_as(
             &request.name,
             &request.bytes,
             &request.expected_document,
             &request.idempotency_key,
+            bound.as_ref().map(|bound| bound.0.0.as_str()),
         )
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
+}
+
+async fn list_rules(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<smallclaims::rules::NamedRule>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.current_rules().map(|rules| rules.as_ref().clone()))
+        .await
+        .map(Json)
+}
+
+#[derive(Deserialize)]
+struct RuleAuditQuery {
+    rule: Option<String>,
+    limit: Option<usize>,
+}
+
+/// One write a rule in audit mode would have refused.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuleAudit {
+    pub rule: String,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub at_unix_ms: u128,
+    pub claim: String,
+}
+
+async fn list_rule_audits(
+    State(state): State<AppState>,
+    Query(query): Query<RuleAuditQuery>,
+) -> Result<Json<Vec<RuleAudit>>, ApiError> {
+    let store = state.store.clone();
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    blocking_store(move || {
+        Ok(store
+            .rule_audits(query.rule.as_deref(), limit)?
+            .into_iter()
+            .map(|claim| {
+                let field = |name: &str| {
+                    claim.body["fields"][name]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                RuleAudit {
+                    rule: claim
+                        .subject
+                        .strip_prefix("rule/")
+                        .unwrap_or(&claim.subject)
+                        .to_owned(),
+                    actor: field("actor"),
+                    action: field("action"),
+                    target: field("target"),
+                    at_unix_ms: claim.accepted_at_unix_ms,
+                    claim: claim.id,
+                }
+            })
+            .collect())
+    })
+    .await
+    .map(Json)
+}
+
+/// Set one rule as a person.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuleSetRequest {
+    pub actor: String,
+    pub name: String,
+    pub rule: smallclaims::rules::Rule,
+}
+
+async fn set_rule(
+    State(state): State<AppState>,
+    Json(request): Json<RuleSetRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    concrete_person(&request.actor)?;
+    let claim = state
+        .store
+        .set_rule(&request.name, &request.rule, &request.actor)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(claim))
 }
 
 #[derive(Deserialize)]
@@ -9390,8 +9693,8 @@ async fn post_message_claim(
                 fields.insert("runtime_id".into(), Value::String(runtime_id));
             }
         }
-        let record = store
-            .append_claim(&ClaimInput {
+        let (record, appended) = store
+            .append_claim_outcome(&ClaimInput {
                 subject,
                 kind: kind.into(),
                 actor: Some(actor),
@@ -9401,11 +9704,15 @@ async fn post_message_claim(
                 idempotency_key: Some(request.idempotency_key),
             })
             .map_err(ApiError::bad)?;
-        Ok((record, is_work_wake(&message.tags)))
+        Ok((record, appended, is_work_wake(&message.tags)))
     })
     .await?;
-    let (record, work_wake) = record;
-    signal_message_changed(&state, kind, work_wake);
+    let (record, appended, work_wake) = record;
+    // An idempotent repeat or an already-settled transition changes nothing a reader can see.
+    // Signalling it anyway re-reads every subscribed seat's mailbox (#1085).
+    if appended {
+        signal_message_changed(&state, kind, work_wake);
+    }
     Ok(Json(record))
 }
 
@@ -12205,25 +12512,56 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
 
     #[test]
     fn owner_cursor_expiry_remains_a_typed_retryable_gateway_error() {
-        let rejected = crate::peer::ClientReadRejected {
-            code: "page-cursor-expired".into(),
-            status: 410,
-            message: "the owner page expired".into(),
-        };
+        let rejected = crate::peer::ClientReadRejected::new(
+            "page-cursor-expired",
+            StatusCode::GONE,
+            "the owner page expired",
+        );
         let error = remote_read_error("host/owner", rejected.into());
         assert_eq!(error.status, StatusCode::GONE);
         assert_eq!(error.code, "page-cursor-expired");
-        let rejected = crate::peer::ClientReadRejected {
-            code: "validation-failed".into(),
-            status: 422,
-            message: "remote terminal input is invalid".into(),
-        };
+        let rejected = crate::peer::ClientReadRejected::new(
+            "validation-failed",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "remote terminal input is invalid",
+        );
         let terminal_error = remote_read_error("host/owner", rejected.into());
         assert_eq!(terminal_error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(terminal_error.code, "validation-failed");
         let unavailable = remote_read_error("host/owner", anyhow::anyhow!("transport down"));
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.code, "remote-unavailable");
+        assert_eq!(unavailable.details["reason"], "transport-error");
+        assert_eq!(unavailable.details["owner_host_id"], "host/owner");
+    }
+
+    #[test]
+    fn an_unreachable_owner_says_why_and_how_far_the_read_got() {
+        let mut rejected = crate::peer::ClientReadRejected::unreachable(
+            "dial-failed",
+            "owner host/owner did not answer from gateway (dial-failed after 1 attempt(s))",
+        );
+        rejected.details.insert(
+            "attempts".into(),
+            json!([{"via": "host/relay", "reason": "dial-failed", "next": [
+                {"via": "host/owner", "reason": "dial-failed"}
+            ]}]),
+        );
+        rejected.details.insert("elapsed_ms".into(), 7.into());
+        let error = remote_read_error("host/owner", rejected.into());
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "remote-unavailable");
+        assert!(!error.message.contains("temporarily"), "{}", error.message);
+        assert_eq!(error.details["reason"], "dial-failed");
+        assert_eq!(error.details["hops"], 2);
+        assert_eq!(error.details["elapsed_ms"], 7);
+        assert_eq!(error.details["owner_host_id"], "host/owner");
+
+        let none = remote_unavailable("host/owner");
+        assert_eq!(none.code, "remote-unavailable");
+        assert_eq!(none.details["reason"], "no-route");
+        assert_eq!(none.details["hops"], 0);
+        assert!(none.message.starts_with("no route to owner host/owner"));
     }
 
     #[test]
@@ -12608,6 +12946,95 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(check.status, "pass");
         assert!(check.message.contains("intentionally local-only"));
         assert!(check.message.contains("after leaving its fleet"));
+    }
+
+    #[tokio::test]
+    async fn rules_audit_an_agents_write_then_refuse_it_once_enforced() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        for (name, rule) in crate::rules::lockdown(&[]) {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/rules/set",
+                json!({"actor": "person/ada", "name": name, "rule": rule}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (_, rules) = get_request(app.clone(), "/v1/rules").await;
+        assert_eq!(rules.as_array().unwrap().len(), 3, "{rules}");
+        assert!(
+            rules
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|rule| rule["mode"] == "audit"),
+            "{rules}"
+        );
+        let publish = |name: &str| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/documents")
+                .header("content-type", "application/json")
+                .extension(BoundAgent("agent/team/web/reviewer".into()))
+                .body(Body::from(
+                    serde_json::to_vec(&DocumentPutRequest {
+                        name: name.into(),
+                        bytes: b"notes".to_vec(),
+                        expected_document: None,
+                        idempotency_key: format!("put:{name}"),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+            }
+        };
+        // Inside its namespace nothing is logged; outside, the write proceeds and is logged.
+        assert_eq!(publish("doc/team/web/plan").await.0, StatusCode::OK);
+        assert_eq!(publish("doc/team/api/plan").await.0, StatusCode::OK);
+        let (_, audits) = get_request(app.clone(), "/v1/rules/audit").await;
+        let audits = audits.as_array().unwrap();
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0]["rule"], "agents-publish-in-namespace");
+        assert_eq!(audits[0]["actor"], "agent/team/web/reviewer");
+        assert_eq!(audits[0]["action"], "doc.bound");
+        assert_eq!(audits[0]["target"], "doc/team/api/plan");
+
+        // Enforced, the same write is refused with a typed reason and nothing is stored.
+        let mut rule = crate::rules::lockdown(&[])
+            .into_iter()
+            .find(|(name, _)| *name == "agents-publish-in-namespace")
+            .unwrap()
+            .1;
+        rule.mode = smallclaims::rules::Mode::Enforce;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/rules/set",
+            json!({"actor": "person/ada", "name": "agents-publish-in-namespace", "rule": rule}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, refused) = publish("doc/team/api/later").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(refused["code"], "rule-denied", "{refused}");
+        assert!(state.store.claims_for("doc/team/api/later", None).unwrap().is_empty());
+        assert_eq!(publish("doc/team/web/later").await.0, StatusCode::OK);
+
+        // Only a person sets rules.
+        let (status, refused) = json_request(
+            app.clone(),
+            "/v1/rules/set",
+            json!({"actor": "agent/team/web/reviewer", "name": "agents-publish-in-namespace", "rule": rule}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
     }
 
     #[tokio::test]
@@ -13795,6 +14222,22 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "a conversation message's lifecycle woke the reconciler"
         );
         assert!(events.has_changed().unwrap());
+        events.borrow_and_update();
+        // A repeat, or a transition the message has already passed, changes nothing a reader
+        // can see and wakes no reader (#1085).
+        for (lifecycle, key) in [("delivered", "talk-delivered"), ("staged", "talk-staged")] {
+            let (status, claim) = json_request(
+                app.clone(),
+                &format!("/v1/messages/{id}/claims"),
+                json!({"lifecycle": lifecycle, "actor": "agent/receiver", "idempotency_key": key}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{claim}");
+            assert!(
+                !events.has_changed().unwrap(),
+                "a no-op {lifecycle} woke readers"
+            );
+        }
         // A work wake does.
         let (status, sent) = json_request(
             app.clone(),

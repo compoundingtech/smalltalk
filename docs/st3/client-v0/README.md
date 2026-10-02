@@ -95,7 +95,7 @@ HTTPS route after every rollout, then make an authenticated paired-client read.
 
 This provides tailnet-only HTTPS and WebSocket transport at the host's Tailscale name while the
 gateway continues to enforce the same paired credential, scopes, terminal subprotocol, and
-single-use attachment capability. Begin pairing over the trusted local socket with, for example,
+attachment capability. Begin pairing over the trusted local socket with, for example,
 `st devices --as person/alex pair "Alex iPhone"`; complete pairing from the remote device over
 the served gateway. To remove the carrier without changing graph credentials or daemon state:
 
@@ -614,10 +614,16 @@ reach the owner or the owner refuses, the CLI says why and falls back to this pr
 each screen into the local terminal and sends keystrokes and size changes as `terminal.input` (raw
 mode) and `terminal.resize` actions.
 
-`terminal.attach` returns a short-lived, single-use stream capability and URL bound to the
-authenticated session, terminal, and runtime incarnation; `terminal.detach` idempotently invalidates
-that viewer. A client opens the URL on the same Unix or Fabric-loopback gateway with WebSocket
-subprotocol `st3.client.terminal.v0`. Authentication, single-use capability consumption, and
+`terminal.attach` returns a stream capability and URL bound to the authenticated session, terminal,
+and runtime incarnation; `terminal.detach` idempotently invalidates that viewer. The capability is a
+lease: `reusable` is true, `ttl_s` (300) and `expires_at` say how long it lives, and every stream a
+client opens with it before then is accepted, so a reconnecting client reuses it instead of
+attaching again and, for a remote terminal, instead of making the gateway ask the owner again. The
+lease ends at `expires_at`, at `terminal.detach`, or when the runtime incarnation changes; the
+attachment then reports `state` `expired` or `detached` with no capability and `retry_hint`
+`reattach`: attach again with a new idempotency key. A stream already open is not cut off when its
+lease expires. A client opens the URL on the same Unix or Fabric-loopback gateway with WebSocket
+subprotocol `st3.client.terminal.v0`. Authentication, capability validation, and
 runtime-incarnation validation happen before upgrade.
 
 The WebSocket then stays open. The first message is the current screen. After that the server sends
@@ -664,8 +670,41 @@ same way, at most four times and never through a node it already passed, and rel
 answer or refusal back unchanged. Every hop checks that its sender is a fleet member, and the owner
 applies its own grants to the person the read carries. A laptop peered only with a desktop
 therefore reads a conversation on a server that only the desktop dials. Each hop waits longer than
-the next one, so a long poll's answer is never cut short on its way back. A read that no peer can
-carry fails with `remote-unavailable`.
+the next one, so a long poll's answer is never cut short on its way back.
+
+`GET /v1/client/messages?actor=AGENT` lists an agent that another host owns from that host: the
+gateway relays the read for a concrete person or agent, the owner lists the messages it holds, and
+the page carries `replicated` with `source` `owner`, `complete` true and `state` `current`. Messages
+reach a gateway by replication, so its own copy can lag and read as empty. When the owner cannot be
+asked, the gateway returns its replica, never as if it were whole: `replicated` has `source`
+`replica`, `complete` false, `state` `lagging` (this host is still catching up with the owner's
+fleet, see `sync`) or `unverified`, and the `reason` the owner was not asked, such as `no-route` or
+`timed-out`. A client renders that as waiting, not as no messages. A list that names no remote
+agent has no `replicated`. Page cursors of a relayed list belong to the owner.
+
+A read that no peer can carry fails with `remote-unavailable`, and its `details` say why, so a
+client can tell a host nobody reaches from a slow or refusing one: `reason` is `no-route` (this node
+cannot dial the owner and no peer reaches it), `dial-failed`, `timed-out`, `refused` (a peer does
+not accept this node's reads), `hop-limit`, `owner-error` or `transport-error`; `owner_host_id`
+names the owner; `hops` counts the nodes the furthest route handed the read to; `attempts` lists
+each next hop tried with its own `reason`; and `elapsed_ms` is how long the gateway spent. An
+owner's own refusal, such as `stale-fence`, carries `owner_host_id`, `elapsed_ms` and
+`fence_conflicts` (how many of this gateway's reads that owner refused as stale in the last
+minute). The gateway logs one warning per unreachable owner with the same fields.
+
+`GET /v1/client/terminals/{id}/screen` answers a remote terminal with a `relay` object beside the
+screen: `owner_host_id`, `via` (the first node the gateway sent the read to), `direct` (that node
+is the owner), `transport` (`fabric` or `http`), `rtt_ms` (the gateway's wait for the owner),
+`capability_ttl_s` (how long an attach capability from this gateway lives) and `fence_conflicts`.
+It is provenance, not authority: it never enters `revision`, and a screen from the owner's own host
+has none.
+
+With `?facts=true`, the owner also returns best-effort `facts` read from the session itself:
+`rows`, `columns`, `clients` (`total`, `attached`, `read_only`), `process` (`alive`, `exit_code`),
+`uptime_s` and `tags`. A remote screen carries the owner's facts, so one read fills a fleet
+client's Session view. Facts are left out, not an error, when the session does not answer within a
+second; they stay out of `revision`, appear only on this read and never on a stream's frames, and
+no action's admission depends on them.
 
 Read-only terminal scope permits screens but rejects input and resize. Screen payloads obey
 negotiated byte limits: at most 200 lines and 4096 bytes of text per line, with explicit

@@ -20,6 +20,17 @@
       { "row": 1, "text": "Finished", "runs": [{ "text": "Finished", "fg": "#5fd75f" }, { "text": "  ", "bg": 236 }], "redacted": false, "truncated": false },
       { "row": 2, "text": "$", "runs": [{ "text": "$", "fg": 2, "bold": true }], "redacted": false, "truncated": false }
     ],
-    "next_sequence": 41, "truncated": false
+    "next_sequence": 41, "truncated": false,
+    "facts": {
+      "rows": 3, "columns": 80,
+      "clients": { "total": 2, "attached": 1, "read_only": 1 },
+      "process": { "alive": true },
+      "uptime_s": 3120,
+      "tags": { "st3.subject": "agent/release-shell" }
+    },
+    "relay": {
+      "owner_host_id": "host/host-b", "via": "host/host-c", "direct": false, "transport": "fabric",
+      "rtt_ms": 38, "capability_ttl_s": 60, "fence_conflicts": 0
+    }
   }
 }

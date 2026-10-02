@@ -18,6 +18,7 @@ pub mod principal;
 /// Opt-in accounting of where the daemon's time goes, turned on by `ST3_PROFILE_DIR`.
 pub mod profile;
 pub mod replication;
+pub mod rules;
 pub mod sqlite;
 pub mod store;
 pub mod sync;

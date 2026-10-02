@@ -7865,7 +7865,7 @@ impl Store {
                         &predecessors,
                         now,
                     )
-                    .map_err(internal)?;
+                    .map_err(smallclaims::error::typed)?;
                     transaction
                         .execute(
                             "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -7936,7 +7936,7 @@ impl Store {
                         &predecessors,
                         now,
                     )
-                    .map_err(internal)?;
+                    .map_err(smallclaims::error::typed)?;
                     transaction
                         .execute(
                             "INSERT OR IGNORE INTO mission_revisions(mission_id, revision, state, body, claim_id, created_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -8259,13 +8259,23 @@ impl Store {
         self.graph.append_claim_outcome(input)
     }
 
+    #[cfg(test)]
     pub(crate) fn append_mailbox_receipt(
         &self,
         input: &ClaimInput,
         fence: &crate::mailbox::Fence,
     ) -> Result<ClaimRecord, St3Error> {
-        self.append_claim_fenced_outcome(input, Some(fence))
+        self.append_mailbox_receipt_outcome(input, fence)
             .map(|(claim, _)| claim)
+    }
+
+    /// A fenced receipt, and whether it appended a claim rather than repeating or settling one.
+    pub(crate) fn append_mailbox_receipt_outcome(
+        &self,
+        input: &ClaimInput,
+        fence: &crate::mailbox::Fence,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        self.append_claim_fenced_outcome(input, Some(fence))
     }
 
     pub(crate) fn append_claim_fenced_outcome(

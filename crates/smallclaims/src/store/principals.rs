@@ -1046,3 +1046,163 @@ fn set_meta_tx(connection: &Connection, key: &str, value: &str) -> Result<()> {
         .execute(params![key, value])?;
     Ok(())
 }
+
+/// The rules as the graph holds them: for each `rule/NAME`, its latest [`crate::rules::RULE_SET`]
+/// claim in canonical order.
+pub fn current_rules_tx(connection: &Connection) -> Result<Vec<crate::rules::NamedRule>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT claims.subject, claims.id, claims.body FROM claims
+         WHERE claims.kind=?1 ORDER BY {CANONICAL_ORDER}"
+    ))?;
+    let mut latest = BTreeMap::new();
+    for row in statement.query_map([crate::rules::RULE_SET], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (subject, id, body) = row?;
+        latest.insert(subject, (id, body));
+    }
+    Ok(latest
+        .into_iter()
+        .filter_map(|(subject, (claim_id, body))| {
+            let body: Value = serde_json::from_str(&body).ok()?;
+            Some(crate::rules::NamedRule {
+                name: subject.strip_prefix("rule/")?.to_owned(),
+                claim_id,
+                rule: crate::rules::Rule::from_fields(body.get("fields")?)?,
+            })
+        })
+        .collect())
+}
+
+/// Check one local write against the rules, inside the write's own transaction: refuse it with
+/// `rule-denied` under a rule in enforce mode, and record each rule in audit mode that would have
+/// refused it beside the write. Writes without an actor, and the audit records themselves, are
+/// the node's own and pass; a person may always set a rule, so no rule can lock its owner out.
+/// With no rules, one indexed probe.
+pub fn rules_gate_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    actor: &str,
+    kind: &str,
+    subject: &str,
+) -> Result<()> {
+    if kind == crate::rules::RULE_SET {
+        if Family::of(actor) == Some(Family::Person) {
+            return Ok(());
+        }
+        return Err(anyhow::Error::new(St3Error::new(
+            "rule-denied",
+            format!("only a person sets rules, not {actor}"),
+        )));
+    }
+    if kind == crate::rules::RULE_AUDITED {
+        return Ok(());
+    }
+    let any: bool = transaction
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM claims WHERE kind=?1)")?
+        .query_row([crate::rules::RULE_SET], |row| row.get(0))?;
+    if !any {
+        return Ok(());
+    }
+    let rules = current_rules_tx(transaction)?;
+    let decision = crate::rules::decide(&rules, actor, kind, subject);
+    if let Some(denied) = decision.denied {
+        return Err(anyhow::Error::new(St3Error::new(
+            "rule-denied",
+            format!(
+                "rule `{}` refuses {actor} writing {kind} on {subject}{}",
+                denied.name,
+                if denied.rule.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", denied.rule.description)
+                }
+            ),
+        )));
+    }
+    for rule in decision.audited {
+        append_claim_record_tx(
+            transaction,
+            origin,
+            &format!("rule/{}", rule.name),
+            crate::rules::RULE_AUDITED,
+            None,
+            &serde_json::json!({
+                "fields": {
+                    "rule": rule.claim_id,
+                    "actor": actor,
+                    "action": kind,
+                    "target": subject,
+                },
+                "evidence": [],
+            }),
+            &[],
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+impl Store {
+    /// Set `rule/NAME` as `person` sets it.
+    pub fn set_rule(
+        &self,
+        name: &str,
+        rule: &crate::rules::Rule,
+        person: &str,
+    ) -> Result<ClaimRecord, St3Error> {
+        if name.is_empty() || name.contains('/') {
+            return Err(St3Error::new(
+                "invalid-rule-name",
+                "a rule name is one path segment",
+            ));
+        }
+        self.append_claim(&ClaimInput {
+            subject: format!("rule/{name}"),
+            kind: crate::rules::RULE_SET.into(),
+            actor: Some(person.into()),
+            fields: rule.fields(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+    }
+
+    /// The newest audit records, of one rule or of all, newest first.
+    pub fn rule_audits(&self, rule: Option<&str>, limit: usize) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.kind=?1 AND (?2 IS NULL OR claims.subject=?2)
+             ORDER BY claims.store_index DESC LIMIT ?3"
+        ))?;
+        let subject = rule.map(|name| format!("rule/{name}"));
+        Ok(statement
+            .query_map(
+                params![crate::rules::RULE_AUDITED, subject, limit as i64],
+                claim_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The rules, from memory; read again after any rule changes.
+    pub fn current_rules(&self) -> Result<Arc<Vec<crate::rules::NamedRule>>> {
+        if !self.rules_stale.load(Ordering::Acquire)
+            && let Some(rules) = self
+                .rules
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        {
+            return Ok(rules);
+        }
+        self.rules_stale.store(false, Ordering::Release);
+        let rules = Arc::new(current_rules_tx(&self.readers.get())?);
+        *self.rules.write().unwrap_or_else(PoisonError::into_inner) = Some(rules.clone());
+        Ok(rules)
+    }
+}

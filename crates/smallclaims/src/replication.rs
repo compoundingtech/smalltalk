@@ -372,6 +372,9 @@ pub struct ReplicationStatus {
     /// This node's first sync, when it joined a fleet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_sync: Option<ReplicationFirstSync>,
+    /// A member refused this node as removed or left, so it no longer syncs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<crate::fleet::RemovalNotice>,
 }
 
 /// Cumulative replication time in one daemon process since it started, split by stage, for

@@ -452,7 +452,9 @@ continues from the last completed step:
    the heal fails `join` with both graph digests and the reason. The wait lasts up to 30 minutes;
    if it runs out, `join` says the machine is a member and still syncing, and exits 0.
    `--no-wait` returns once the services start. `st fleet wait [--timeout 30m]` waits for the
-   first sync later and fails if it failed.
+   first sync later and fails if it failed. It then also waits until this machine has caught up:
+   an exchange since the wait began, with every member that is up, at which it held everything
+   that member held. After a restart that is what the wait checks.
 
 Until its first exchange brings the membership claims, the new member knows only the sponsor. It
 checks the sponsor's responses against the key from the handshake, which `join.json` keeps. It
@@ -622,11 +624,13 @@ Old builds ignore these headers. After the HMAC check passes, the receiver decid
 The dialer applies the same rules to the response and its signature, so it knows it reached the
 member it meant to reach.
 
-The `member-removed` refusal is a signed response whose body names the removal claim, the key it
-ended, and the person who removed it. A node treats it as about itself only when that key is its
-own current key. It then records `removed` in `fleet.toml`, stops dialing, and `st doctor` fails
-with the next command to run: `st uninstall`, or `st fleet leave --offline` to keep the local
-store. A refusal that names an older key reaches a machine that joined again under the same name
+The `member-removed` refusal is a signed response whose body names the key it ended, and whose
+message names the person who removed it and the reason when the refusing member knows them. A
+node treats it as about itself only when that key is its own current key. It then records
+`removed` in `fleet.toml`, keeps the reporter, message and time in `removal.json` beside it, logs
+the refusal and stops dialing. `st fleet status` and `st replication status` show the removal,
+and `st doctor` fails with the next command to run: `st uninstall`, or `st fleet leave --offline`
+to keep the local store. A refusal that names an older key reaches a machine that joined again under the same name
 from a member that has not yet received the new admission; the node treats it as transient, like
 `not-a-member`.
 
