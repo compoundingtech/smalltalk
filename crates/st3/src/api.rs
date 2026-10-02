@@ -60,6 +60,7 @@ use crate::store::Store;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
+mod harness_events;
 mod mailbox;
 mod terminal_view;
 
@@ -500,6 +501,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/page", get(list_messages_page))
         .route("/v1/mailbox", get(mailbox::subscribe))
+        .route("/v1/harness-events", post(harness_events::publish))
         .route("/v1/mailbox/bind", post(mailbox::bind))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
@@ -19510,5 +19512,64 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, exact) = get_request(app, "/v1/messages/read/message%2Fpage-204").await;
         assert_eq!(status, StatusCode::OK, "{exact}");
         assert_eq!(exact["content"], "body 204");
+    }
+    #[tokio::test]
+    async fn harness_event_endpoint_requires_this_native_seats_local_peer_and_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let subject = "agent/example/event-api";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("incarnation_id".into(), json!("runtime-a")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let request = json!({"runtime_incarnation":"runtime-a", "sequence":1,
+            "claim":{"subject":subject,"kind":"harness.observed","actor":subject,
+                "fields":{"state":"idle","driver":"claude","incarnation_id":"runtime-a"},
+                "evidence":[],"idempotency_key":"fixture-event"}});
+        let app = router(state);
+        let (status, _) = json_request(app.clone(), "/v1/harness-events", request.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let peer = NativeDeliveryPeer {
+            agent: "agent/example/foreign".into(),
+            transport: "claude-channel",
+            pid: 7,
+            archives_inbox: true,
+        };
+        let (status, _) = json_request(
+            app.clone().layer(Extension(peer)),
+            "/v1/harness-events",
+            request.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let peer = NativeDeliveryPeer {
+            agent: subject.into(),
+            transport: "claude-channel",
+            pid: 7,
+            archives_inbox: true,
+        };
+        let app = app.layer(Extension(peer));
+        let (status, first) =
+            json_request(app.clone(), "/v1/harness-events", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let (status, replay) =
+            json_request(app.clone(), "/v1/harness-events", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(first["body"]["fields"], replay["body"]["fields"]);
+        let mut stale = request;
+        stale["runtime_incarnation"] = json!("retired-runtime");
+        let (status, body) = json_request(app, "/v1/harness-events", stale).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
 }

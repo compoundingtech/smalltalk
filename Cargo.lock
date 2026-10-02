@@ -4069,6 +4069,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "parking_lot",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

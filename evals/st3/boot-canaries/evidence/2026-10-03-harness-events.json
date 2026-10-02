@@ -1,0 +1,143 @@
+{
+  "date": "2026-10-03",
+  "base_commit": "34daf437a58d3c21bee567b450b36a2937a7c7c5",
+  "providers": "token-free stand-ins; disposable daemon and PTY state",
+  "boot_matrix": {
+    "passed": 25,
+    "failed": 0,
+    "harnesses": [
+      "claude",
+      "codex",
+      "pi",
+      "omp",
+      "opencode"
+    ],
+    "scenarios": [
+      "fresh",
+      "restart",
+      "daemon-restart",
+      "reexec",
+      "concurrent"
+    ],
+    "checks": [
+      "step claimed by current incarnation",
+      "message read",
+      "no fabricated catalogs",
+      "no polled harness records",
+      "one durable outbox per fresh seat",
+      "committed events acknowledged"
+    ]
+  },
+  "predecessor_binary_sha256": "63532a3b2cace69ca4c66e356297a838b35920b77339efe860f28de5ba236502",
+  "predecessor_upgrade": {
+    "claude": {
+      "verdict": "pass",
+      "harness": "claude",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 7.1,
+        "reexec:a": 3.1
+      },
+      "catalog_files": 2,
+      "harness_record_files": 3,
+      "observation_spools": 0
+    },
+    "codex": {
+      "verdict": "pass",
+      "harness": "codex",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 4.4,
+        "reexec:a": 1.2
+      },
+      "catalog_files": 2,
+      "harness_record_files": 2,
+      "observation_spools": 0
+    },
+    "pi": {
+      "verdict": "pass",
+      "harness": "pi",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 3.3,
+        "reexec:a": 1.3
+      },
+      "catalog_files": 2,
+      "harness_record_files": 1,
+      "observation_spools": 0
+    },
+    "omp": {
+      "verdict": "pass",
+      "harness": "omp",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 3.3,
+        "reexec:a": 1.3
+      },
+      "catalog_files": 2,
+      "harness_record_files": 1,
+      "observation_spools": 0
+    },
+    "opencode": {
+      "verdict": "pass",
+      "harness": "opencode",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 3.3,
+        "reexec:a": 1.2
+      },
+      "catalog_files": 2,
+      "harness_record_files": 1,
+      "observation_spools": 0
+    }
+  },
+  "claude_observation_transcript_usage_doctor_mail": {
+    "verdict": "pass",
+    "checks": {
+      "observed_states": [
+        "idle",
+        "ready",
+        "starting",
+        "working"
+      ],
+      "timeline_items": 6,
+      "usage": {
+        "compactions": 0,
+        "context_used_percent": 7.0,
+        "context_used_tokens": 14000,
+        "context_window_tokens": 200000,
+        "driver": "claude",
+        "incarnation_id": "157648:2026-10-02T22:27:09.951Z",
+        "model": "claude-stub-model",
+        "semantics": "context_occupancy"
+      },
+      "message_status": "read",
+      "projected_message_files": 0,
+      "harness_record_files": [],
+      "snapshot_schemas": {
+        "harness-state": "st.harness-state.v1",
+        "harness-context": "st.harness-context.v1"
+      },
+      "timeline_operations": 9,
+      "legacy_status_files": [],
+      "driver_catalog_files": []
+    }
+  },
+  "protocol_tests": {
+    "outbox": 7,
+    "daemon_admission": 4,
+    "driver_replay_and_idle": 2,
+    "checks": [
+      "durable replay across outage and lost acknowledgement",
+      "current runtime fence in writer transaction",
+      "historical source runtime preserved",
+      "superseded producer ownership",
+      "append/replace/finalize",
+      "full spool transaction rollback",
+      "once-only evidence expiry",
+      "replacement pipe inode ownership",
+      "database reads do not wake driver",
+      "prepared publication fields immutable"
+    ]
+  }
+}
