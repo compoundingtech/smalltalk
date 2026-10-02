@@ -64,6 +64,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "claim_verdict_links",
         "claim_verdict_queue",
         "claim_verdict_fresh",
+        "expected_claim_signatures",
         "held_keys",
         "fleet_invite_tokens",
         "replica_envelope_holds",

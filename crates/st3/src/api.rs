@@ -8837,13 +8837,126 @@ async fn send_message(
     State(state): State<AppState>,
     Json(request): Json<MessageSendRequest>,
 ) -> Result<Json<MessageView>, ApiError> {
-    blocking_api(move || accept_message(&state, request, None)).await
+    blocking_api(move || accept_message(&state, request, None, None)).await
+}
+
+/// The fields a device signs on a message it sends, in the `fields-v1` format.
+pub const SIGNED_MESSAGE_FIELDS: &[&str] = &[
+    "content",
+    "from",
+    "in_reply_to",
+    "session_id",
+    "tags",
+    "title",
+    "to",
+];
+
+/// How far a device's signing time may be from this daemon's clock when it first accepts the
+/// message. Members that receive it later check the signature, never the time.
+pub const DEVICE_SIGNATURE_WINDOW_MS: u128 = 15 * 60 * 1_000;
+
+fn device_signature_error(code: &'static str, message: impl Into<String>) -> ApiError {
+    ApiError::bad(St3Error::new(code, message.into()))
+}
+
+/// Check a device's signature on the message this daemon is about to write, before writing it.
+fn check_device_signature(
+    state: &AppState,
+    signature: &smallclaims::principal::ClaimSignature,
+    request: &MessageSendRequest,
+    subject: &str,
+    from: &str,
+    fields: &BTreeMap<String, Value>,
+) -> Result<(), ApiError> {
+    use smallclaims::principal::{FIELDS_FORMAT, Judged, KeyGrant};
+    let mut signed = signature.signed_fields.clone();
+    signed.sort();
+    if signature.format.as_deref() != Some(FIELDS_FORMAT) || signed != SIGNED_MESSAGE_FIELDS {
+        return Err(device_signature_error(
+            "device-signature-format",
+            format!(
+                "a device signs a message in {FIELDS_FORMAT} over {}",
+                SIGNED_MESSAGE_FIELDS.join(", ")
+            ),
+        ));
+    }
+    if signature.signer != from || signature.on_behalf.is_some() {
+        return Err(device_signature_error(
+            "device-signature-signer",
+            format!("a device signs as the paired person, {from}"),
+        ));
+    }
+    if normalize_message_party(&request.to) != request.to {
+        return Err(device_signature_error(
+            "device-signature-noncanonical",
+            format!(
+                "a signed message names its recipient canonically: `{}`",
+                normalize_message_party(&request.to)
+            ),
+        ));
+    }
+    let now = client_now_ms();
+    if u128::from(signature.signed_at_unix_ms).abs_diff(now) > DEVICE_SIGNATURE_WINDOW_MS {
+        return Err(device_signature_error(
+            "device-signature-stale",
+            "the device signed this message more than 15 minutes from this daemon's clock; check the device's time",
+        ));
+    }
+    // A retry of the same send gets its first answer; any other claim may not reuse the nonce.
+    let repeat = state
+        .store
+        .latest_claim(subject, Some("message.sent"))
+        .map_err(ApiError::internal)?
+        .is_some();
+    if !repeat
+        && state
+            .store
+            .signature_nonce_used(&signature.key, &signature.nonce)
+            .map_err(ApiError::internal)?
+    {
+        return Err(device_signature_error(
+            "device-signature-replayed",
+            "another claim already carries this signature's nonce",
+        ));
+    }
+    let enrolled = signature
+        .chain
+        .first()
+        .and_then(|grant| state.store.claim_by_id(grant).ok().flatten())
+        .and_then(|grant| {
+            let fields = grant.body.get("fields")?;
+            (grant.subject == from).then(|| KeyGrant::from_fields(fields))?
+        })
+        .is_some_and(|grant| grant.key == signature.key);
+    if !enrolled {
+        return Err(device_signature_error(
+            "device-key-not-enrolled",
+            "the signing key is not enrolled for this person; pair the device again",
+        ));
+    }
+    let fields = Value::Object(fields.clone().into_iter().collect());
+    let judged = Judged {
+        id: "",
+        subject,
+        kind: "message.sent",
+        actor: Some(from),
+        content: String::new(),
+        fields: &fields,
+    };
+    if !signature.verifies(&judged) {
+        return Err(device_signature_error(
+            "device-signature-invalid",
+            "the signature does not match this message",
+        ));
+    }
+    Ok(())
 }
 
 fn accept_message(
     state: &AppState,
     request: MessageSendRequest,
     session_id: Option<String>,
+    device_signature: Option<smallclaims::principal::ClaimSignature>,
 ) -> Result<Json<MessageView>, ApiError> {
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
@@ -8922,18 +9035,23 @@ fn accept_message(
             serde_json::to_value(&attachments).map_err(ApiError::internal)?,
         );
     }
-    let record = state
-        .store
-        .append_claim(&ClaimInput {
-            subject: subject.clone(),
-            kind: "message.sent".into(),
-            actor: Some(from.clone()),
-            fields,
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: Some(request.idempotency_key),
-        })
-        .map_err(ApiError::bad)?;
+    if let Some(signature) = &device_signature {
+        check_device_signature(state, signature, &request, &subject, &from, &fields)?;
+    }
+    let input = ClaimInput {
+        subject: subject.clone(),
+        kind: "message.sent".into(),
+        actor: Some(from.clone()),
+        fields,
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(request.idempotency_key),
+    };
+    let record = match &device_signature {
+        Some(signature) => state.store.append_signed_claim(&input, signature).map(|(claim, _)| claim),
+        None => state.store.append_claim(&input),
+    }
+    .map_err(ApiError::bad)?;
     let mut work_wake = is_work_wake(&request.tags);
     if let Some(parent) = request.in_reply_to.as_deref() {
         // Settling the parent writes its lifecycle claims too.

@@ -40,10 +40,78 @@ impl Cache {
     }
 }
 
-pub fn snapshot() -> Result<Environment> {
+/// How long each capture at daemon start may wait for the login shell's startup files. A deploy
+/// restarts the daemon while the machine is busy building, and a shell that takes seconds when idle
+/// can take over a minute then; giving up on the first slow capture leaves the machine without a
+/// daemon. Only a timeout is retried: a missing shell or a failing startup file will not heal.
+const STARTUP_ATTEMPTS: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+const STARTUP_BACKOFF: Duration = Duration::from_secs(2);
+
+impl Cache {
+    /// Capture with growing patience, and keep the result so the daemon's first uses of the cache
+    /// do not capture again.
+    fn start(
+        &mut self,
+        mut capture: impl FnMut(Duration) -> Result<Environment>,
+        attempts: &[Duration],
+        backoff: Duration,
+    ) -> Result<Environment> {
+        let mut result = Err(anyhow::anyhow!("no environment capture was attempted"));
+        for (index, timeout) in attempts.iter().enumerate() {
+            result = capture(*timeout);
+            match &result {
+                Err(error)
+                    if st_runtime::is_shell_startup_timeout(error)
+                        && index + 1 < attempts.len() =>
+                {
+                    eprintln!(
+                        "st: the login shell is slow to start ({error:#}); retrying with {} seconds (attempt {} of {})",
+                        attempts[index + 1].as_secs(),
+                        index + 2,
+                        attempts.len()
+                    );
+                    std::thread::sleep(backoff * (index as u32 + 1));
+                }
+                _ => break,
+            }
+        }
+        self.captured = Some((
+            Instant::now(),
+            result
+                .as_ref()
+                .map(Clone::clone)
+                .map_err(|error| format!("{error:#}")),
+        ));
+        result
+    }
+}
+
+fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| Mutex::new(Cache::default()))
+    CACHE.get_or_init(|| Mutex::new(Cache::default()))
+}
+
+/// The environment the daemon starts with, captured patiently (see [`STARTUP_ATTEMPTS`]).
+pub fn snapshot_at_startup() -> Result<Environment> {
+    cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("daemon environment cache is poisoned"))?
+        .start(
+            st_runtime::login_environment_within,
+            &STARTUP_ATTEMPTS,
+            STARTUP_BACKOFF,
+        )
+        .context(
+            "capture the daemon login-shell environment; check the account's shell startup files",
+        )
+}
+
+pub fn snapshot() -> Result<Environment> {
+    cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("daemon environment cache is poisoned"))?
         .get(st_runtime::login_environment)
@@ -195,6 +263,81 @@ mod tests {
         cache.captured.as_mut().unwrap().0 = Instant::now() - REFRESH_INTERVAL;
         let second = BTreeMap::from([("PATH".into(), "/second".into())]);
         assert_eq!(cache.get(|| Ok(second.clone())).unwrap(), second);
+    }
+
+    fn slow() -> anyhow::Error {
+        st_runtime::ShellStartupTimeout {
+            shell: "/bin/fish".into(),
+            seconds: 10.0,
+        }
+        .into()
+    }
+
+    #[test]
+    fn startup_retries_a_slow_login_shell_with_more_patience_each_time() {
+        let environment = BTreeMap::from([("PATH".into(), "/bin".into())]);
+        let attempts = [
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        ];
+        let mut cache = Cache::default();
+        let mut allowed = Vec::new();
+        let captured = cache
+            .start(
+                |timeout| {
+                    allowed.push(timeout);
+                    if allowed.len() < 3 {
+                        Err(slow().context("capture"))
+                    } else {
+                        Ok(environment.clone())
+                    }
+                },
+                &attempts,
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert_eq!(captured, environment);
+        assert_eq!(allowed, attempts);
+        // The daemon's first uses of the cache reuse the capture rather than run the shell again.
+        assert_eq!(
+            cache.get(|| panic!("reuse the startup capture")).unwrap(),
+            environment
+        );
+    }
+
+    #[test]
+    fn startup_gives_up_after_the_last_slow_attempt_and_names_it() {
+        let mut calls = 0;
+        let error = Cache::default()
+            .start(
+                |_| {
+                    calls += 1;
+                    Err(slow())
+                },
+                &[Duration::from_secs(1), Duration::from_secs(2)],
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(st_runtime::is_shell_startup_timeout(&error), "{error:#}");
+    }
+
+    #[test]
+    fn startup_does_not_retry_what_waiting_cannot_fix() {
+        let mut calls = 0;
+        let error = Cache::default()
+            .start(
+                |_| {
+                    calls += 1;
+                    anyhow::bail!("the default shell /bin/fish exited with exit status: 1")
+                },
+                &[Duration::from_secs(1), Duration::from_secs(2)],
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(!st_runtime::is_shell_startup_timeout(&error));
     }
 
     fn fake_tool(directory: &std::path::Path, name: &str, script: &str) {

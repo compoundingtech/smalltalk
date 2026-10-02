@@ -2597,6 +2597,22 @@ pub struct MessageSendParameters {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentInput>,
+    /// The sending device's signature over the message, as `docs/st3/device-signing.md` lays out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<DeviceSignature>,
+}
+
+/// A device's signature over named fields of a claim it asks the daemon to write.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DeviceSignature {
+    pub signer: String,
+    pub key: String,
+    pub chain: Vec<String>,
+    pub nonce: String,
+    pub signed_at_unix_ms: u64,
+    pub signature: String,
+    pub format: String,
+    pub signed_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2803,6 +2819,9 @@ pub struct PairingComplete {
     pub api_version: String,
     pub code: String,
     pub device_public_key: String,
+    /// Where the device keeps its signing key: `secure-enclave` or `software`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_storage: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PairedSession {
@@ -2813,6 +2832,10 @@ pub struct PairedSession {
     pub credential: String,
     pub scopes: Vec<String>,
     pub expires_at: String,
+    /// The delegation chain a device with a signing key signs with: its grant, then its person's
+    /// root key's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_key_chain: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

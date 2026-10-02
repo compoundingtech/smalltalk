@@ -2350,6 +2350,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                                         session_id: peer.current_session_id.clone(),
                                         tags: vec![],
                                         attachments: Vec::new(),
+                                        signature: None,
                                     },
                                 )
                                 .await

@@ -537,6 +537,7 @@ mod tests {
                     }],
                 },
                 None,
+                None,
             )
         };
         let stolen = send("person/bea", "person/carol", "stolen", format!("blob/{hash}"));
@@ -589,6 +590,7 @@ mod tests {
                     })
                     .collect(),
             },
+            None,
             None,
         );
         assert_eq!(refused.unwrap_err().code, "too-many-attachments");

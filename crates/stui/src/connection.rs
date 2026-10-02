@@ -144,6 +144,7 @@ pub async fn pair(path: &Path, endpoint: &str, pairing_id: &str, code: &str) -> 
                 api_version: st3_client::API_VERSION.into(),
                 code: code.trim().into(),
                 device_public_key: format!("stui-device-{}", uuid::Uuid::now_v7()),
+                key_storage: None,
             },
         )
         .await
@@ -240,6 +241,7 @@ mod tests {
                     credential: "test-only-secret-0000000000000000000000".into(),
                     scopes: vec!["read.projections".into()],
                     expires_at: "2026-10-30T12:00:00Z".into(),
+                    device_key_chain: Vec::new(),
                 },
             }],
         }

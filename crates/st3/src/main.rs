@@ -4005,7 +4005,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .pty_root
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
-    let login_environment = st3::environment::snapshot()?;
+    let login_environment = st3::environment::snapshot_at_startup()?;
     st_runtime::initialize_isolation(&login_environment);
     let pty_binary = match args.pty_binary.clone() {
         Some(pty_binary) => pty_binary,

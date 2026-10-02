@@ -1,7 +1,8 @@
 # Smalltalk binary releases
 
 Every pushed Git tag runs **Smalltalk tag release**. Both native builds must pass before a
-GitHub release is published. Each release contains:
+GitHub release is published. A release is also published once a day when `main` changed since the
+last one (see [Daily releases](#daily-releases)). Each release contains:
 
 - `smalltalk-x86_64-unknown-linux-gnu.tar.gz`: Linux x86_64, built on Ubuntu 22.04 (glibc 2.35 or newer).
 - `smalltalk-aarch64-apple-darwin.tar.gz`: Apple Silicon, macOS 15 or newer. The executables are
@@ -40,13 +41,30 @@ installing files.
 
 ## Build and publication proof
 
-PRs changing release files and manual **Run workflow** invocations run both native builds,
+Every commit on `main`, PRs changing release files and manual **Run workflow** invocations run both native builds,
 archive extraction, a temporary-directory installation, CLI help checks, the TUI PTY smoke suite,
 and combined checksum/source validation. They upload `smalltalk-release` as an Actions artifact
-and never publish a GitHub release. Tag pushes use the same jobs, then verify that the tag still
+(kept 7 days) and never publish a GitHub release, so release breakage fails on `main` and not at tag
+time. Each native job also uploads its own archive and checksum as `release-<target>`, for example
+`release-x86_64-unknown-linux-gnu`; once a main commit's run has succeeded,
+`gh run download RUN_ID --repo compoundingtech/smalltalk --name release-x86_64-unknown-linux-gnu`
+fetches that commit's Linux archive without building it (find RUN_ID with
+`gh run list --workflow release-smalltalk.yml --branch main --commit SHA`). Tag pushes use the same jobs, then verify that the tag still
 points at the built commit, upload a draft, and publish it only after every asset is present.
 Existing releases are not overwritten. If publication fails leaving a draft, inspect and remove
 that draft before rerunning the publish job; never move a published tag.
+
+## Daily releases
+
+**Smalltalk daily release** (`release-daily.yml`) runs at 05:17 UTC and on manual dispatch. It takes the
+newest `main` commit whose release run succeeded; if that commit is not already in the latest
+release, it re-checks the checksums and sources of that run's `smalltalk-release` artifact, publishes
+those same bytes under the next patch tag (the highest `vX.Y.Z` tag plus one; dispatch with `tag` to
+choose another), and lists the merged pull request titles since the previous release in the notes.
+Nothing is rebuilt, and the tag is created at that exact commit with the workflow's own token, so it
+does not start a second tag build. There are no version-bump commits. Archives from these releases
+carry no tag in `BUILD.json`; `source` identifies the commit. `scripts/release-smalltalk-daily
+--dry-run` prints what would be published without publishing.
 
 Tag names are labels, not embedded package versions: use `BUILD.json`/`RELEASE.json` for exact
 source identity. Tag the tested commit (with this workflow in its tree); pushing a tag does not
