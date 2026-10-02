@@ -176,5 +176,17 @@
       "seat stop and removal",
       "daemon restart"
     ]
+  },
+  "daemon_restart_tests": {
+    "passed": 6,
+    "failed": 0,
+    "checks": [
+      "starting and running Claude survives daemon outage",
+      "pi-family state and mail survive outage",
+      "delivered unread mail replays without settled-mail duplication",
+      "omp ask does not poison next incarnation",
+      "CLI daemon-wait behavior",
+      "evidence scan skips IPC endpoints"
+    ]
   }
 }
