@@ -148,16 +148,17 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   ], [found, pending, timeline.hasOlder, finding, simpleOn, open]);
 
   const canSend = !!agent && status === 'online';
-  async function send() {
-    const text = draft.trim();
+  async function send(spoken?: string) {
+    // Words sent straight from dictation (its send button) skip the box.
+    const text = (spoken ?? draft).trim();
     if (!agent || !text) return;
     const item: Pending = { id: `pending-${Date.now()}`, text, at: nowClock() };
     setPending(previous => [...previous, item]);
-    setDraft(''); draftCache.current.delete(target);
+    if (spoken === undefined) { setDraft(''); draftCache.current.delete(target); }
     // To the newest, where the message appears: animated from nearby, a jump from far up, since an
     // animation across the whole conversation reads as the list scrolling everything again.
     list.current?.scrollToOffset({ offset: 0, animated: offset.current < 1200 });
-    const tags = dictated ? ['dictated'] : undefined;
+    const tags = dictated || spoken !== undefined ? ['dictated'] : undefined;
     setDictated(false);
     const failed = await actions.send(agent.id, text, agent.current_session_id ?? undefined, tags);
     if (failed) setPending(previous => previous.map(candidate => candidate.id === item.id ? { ...candidate, failed } : candidate));
@@ -174,16 +175,28 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       setListening(true);
     } catch (error) { setIssue(`Dictation could not start: ${error instanceof Error ? error.message : String(error)}`); }
   }
-  async function finishListening(keep: boolean) {
+  async function finishListening(then: 'cancel' | 'edit' | 'send') {
     const stop = stopListening.current;
     stopListening.current = null;
     setListening(false);
     const words = stop ? (await stop()).trim() : '';
-    if (!keep || !words) return;
+    if (then === 'cancel' || !words) return;
+    if (then === 'send') { await send(draft.trim() ? `${draft.trimEnd()} ${words}` : words); setDraft(''); draftCache.current.delete(target); return; }
     const text = draft.trim() ? `${draft.trimEnd()} ${words}` : words;
     setDraft(text); rememberBounded(draftCache.current, target, text, 24);
     setDictated(true);
   }
+  // Debug builds only: type a message and send it, as a person would, so a recording can show
+  // what the list does on send (EXPO_PUBLIC_ST3_TEST_SEND).
+  const [devSend, setDevSend] = useState(0);
+  useEffect(() => {
+    const text = __DEV__ ? process.env.EXPO_PUBLIC_ST3_TEST_SEND : undefined;
+    if (!text || !loaded || !agent) return;
+    const typed = setTimeout(() => setDraft(`${text} ${new Date().toISOString().slice(11, 19)}`), 3_000);
+    const sent = setTimeout(() => setDevSend(count => count + 1), 4_500);
+    return () => { clearTimeout(typed); clearTimeout(sent); };
+  }, [loaded, agent?.id]);
+  useEffect(() => { if (devSend) void send(); }, [devSend]);
   const toggle = useCallback((id: string) => setOpen(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; }), []);
 
   return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={headerHeight}>
@@ -220,21 +233,27 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       <Waveform levels={levels} />
       <T color={heard ? theme.text : theme.overlay0}>{heard || 'Listening…'}</T>
       <View style={{ flexDirection: 'row', gap: 8, justifyContent: 'flex-end' }}>
-        <Button label="cancel" color={theme.overlay1} onPress={() => void finishListening(false)} />
-        <Button label="done" onPress={() => void finishListening(true)} />
+        <Button label="cancel" color={theme.overlay1} onPress={() => void finishListening('cancel')} />
+        <Button label="done" color={theme.subtext0} onPress={() => void finishListening('edit')} />
+        <Button label="send" disabled={!canSend} onPress={() => void finishListening('send')} />
       </View>
     </View> : agent ? <View style={[styles.composer, { paddingBottom: bottom }]}>
       <T color={theme.accent} style={styles.prompt}>›</T>
-      <Field
-        value={draft}
-        onChangeText={text => { setDraft(text); if (text) rememberBounded(draftCache.current, target, text, 24); else draftCache.current.delete(target); }}
-        placeholder={`Message ${title}`}
-        multiline
-        style={styles.input}
-        editable
-        accessibilityLabel={`Message ${title}`}
-      />
-      {canDictate ? <Button label="mic" color={theme.overlay1} onPress={() => void listen()} style={styles.send} /> : null}
+      {/* The microphone sits inside the box, at its right edge, over the text's padding. */}
+      <View style={{ flex: 1 }}>
+        <Field
+          value={draft}
+          onChangeText={text => { setDraft(text); if (text) rememberBounded(draftCache.current, target, text, 24); else draftCache.current.delete(target); }}
+          placeholder={`Message ${title}`}
+          multiline
+          style={[styles.input, canDictate ? { paddingRight: 36 } : null]}
+          editable
+          accessibilityLabel={`Message ${title}`}
+        />
+        {canDictate ? <Pressable accessibilityRole="button" accessibilityLabel="Dictate a message" hitSlop={8} onPress={() => void listen()} style={styles.mic}>
+          <T style={{ fontSize: 17 }}>🎙</T>
+        </Pressable> : null}
+      </View>
       <Button label="send" disabled={!canSend || !draft.trim()} onPress={() => void send()} style={styles.send} />
     </View> : session ? <View style={[styles.composer, { paddingBottom: bottom }]}><T dim>{session.managed === false ? 'not started by st · read only' : 'this session has ended · read only'}</T></View> : null}
   </KeyboardAvoidingView>;
@@ -373,6 +392,7 @@ const styles = StyleSheet.create({
   composer: { flexDirection: 'row', alignItems: 'flex-end', gap: 6, paddingHorizontal: 10, paddingTop: 6, borderTopColor: theme.surface0, borderTopWidth: StyleSheet.hairlineWidth * 2, backgroundColor: theme.mantle },
   prompt: { paddingBottom: 9, fontFamily: fonts.bold },
   input: { flex: 1, minHeight: 36, maxHeight: 140, marginTop: 0 },
+  mic: { position: 'absolute', right: 6, bottom: 6, zIndex: 1, padding: 2 },
   send: { marginTop: 0, marginBottom: 2 },
   latest: { position: 'absolute', right: 12, bottom: 84, backgroundColor: theme.surface0, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 4 },
 });
