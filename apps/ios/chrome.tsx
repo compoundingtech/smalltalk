@@ -10,11 +10,21 @@ import { Banner, Button, T } from './ui';
 // The navigation bar and tab bar above and below are native and styled only through their options.
 
 /** `● live example-linux · person/alex`, as stui's top-right corner says it. The first line of a list. */
+/** How long ago, as a person says it: 40s, 12m, 5h. */
+function ageOf(ms: number): string | null {
+  if (!Number.isFinite(ms)) return null;
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
+}
+
 export function StatusLine() {
-  const { status, hasSynced, gatewayHost, caps } = useStore();
+  const { status, hasSynced, gatewayHost, caps, snapshot } = useStore();
+  // Not live, what is shown is st's last snapshot: say how old it is.
+  const age = snapshot ? ageOf(Date.now() - Date.parse(snapshot.created_at)) : null;
+  const shown = age ? `showing data from ${age} ago` : 'showing last data';
   const [glyph, color, word] = status === 'online' ? ['●', theme.idle, 'live']
-    : status === 'connecting' ? ['◌', theme.waiting, hasSynced ? 'updating · showing last data' : 'connecting']
-    : status === 'offline' ? ['✕', theme.fault, 'offline']
+    : status === 'connecting' ? ['◌', theme.waiting, hasSynced ? `updating · ${shown}` : 'connecting']
+    : status === 'offline' ? ['✕', theme.fault, hasSynced ? `offline · ${shown}` : 'offline']
     : ['○', theme.quiet, 'not paired'];
   return <View accessibilityLabel={`${word}${gatewayHost ? ` ${gatewayHost}` : ''}`} style={{ flexDirection: 'row', paddingHorizontal: 12, paddingTop: 6 }}>
     <T color={color}>{glyph} {word}</T>

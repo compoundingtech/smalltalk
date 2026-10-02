@@ -375,3 +375,12 @@ export function shownToolLines(body: Extract<Body, { kind: 'tool' }>, open: bool
   if (open || body.output.length <= COLLAPSED_TOOL_LINES) return { hidden: 0, lines: body.output };
   return { hidden: body.output.length - COLLAPSED_TOOL_LINES, lines: body.output.slice(-COLLAPSED_TOOL_LINES) };
 }
+
+/** What a problem means for what is shown: how old it is and that the phone keeps trying. */
+export function staleLine(issue: string, loaded: boolean, lastFrame: number | null, now: number): string {
+  if (!loaded) return `Not loaded yet: ${issue}. Trying again.`;
+  if (lastFrame === null) return `${issue} · trying again`;
+  const seconds = Math.max(0, Math.round((now - lastFrame) / 1000));
+  const age = seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
+  return `${issue} · shown as of ${age} ago · trying again`;
+}

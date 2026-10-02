@@ -12,7 +12,7 @@ import type { MachineView } from './projectionCache';
 /** What a pane opens on the phone. */
 export type PaneTarget = {
   key: string;
-  kind: 'agent' | 'mission' | 'machine' | 'other';
+  kind: 'agent' | 'mission' | 'machine' | 'terminal' | 'usage' | 'other';
   /** The subject's id: `agent/…`, `mission/…`, `machine/…`; the key for anything else. */
   id: string;
   title: string;
@@ -65,6 +65,14 @@ export function paneTarget(key: string, lists: GlassLists, labels = missionLabel
   const kind = split < 0 ? '' : key.slice(0, split);
   const id = split < 0 ? key : key.slice(split + 1);
   const waiting = open(lists.attention);
+  // A shell of its own (`terminal:terminal/…`) opens in the terminal; an agent's terminal opens
+  // the agent, whose terminal is a tap away there.
+  if (kind === 'terminal' && id.startsWith('terminal/')) {
+    return { key, kind: 'terminal', id, title: 'shell', needsYou: false, gone: false };
+  }
+  if (kind === 'usage') {
+    return { key, kind: 'usage', id, title: 'Usage', needsYou: false, gone: false };
+  }
   if (kind === 'agent' || kind === 'terminal') {
     const agent = lists.agents.find(candidate => candidate.id === id);
     return {
@@ -103,4 +111,11 @@ export function glassGroups(glass: Glass, lists: GlassLists): GlassGroupRow[] {
       return { group, index, title: tab.title ?? pane.title, pane };
     }),
   }));
+}
+
+/** A space as the list names it: how many tabs it holds and in how many panes. */
+export function spaceSummary(glass: Glass): string {
+  const panes = groups(glass.body?.layout ?? { tabs: [] });
+  const tabs = panes.reduce((sum, tabs) => sum + tabs.length, 0);
+  return `${tabs} tab${tabs === 1 ? '' : 's'}${panes.length > 1 ? ` in ${panes.length} panes` : ''}`;
 }
