@@ -9166,9 +9166,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 match observed {
                     Ok(mut observation) => {
                         if spec.provider == "github.repository" {
+                            let recorded = recorded_pull_requests(
+                                &store,
+                                &spec.resource,
+                                &observation.facts,
+                                previous_facts.as_ref(),
+                            );
                             crate::resource::attach_pull_request_openers(
                                 &mut observation.facts,
-                                previous_facts.as_ref(),
+                                Some(&recorded),
                                 &agent_workspaces,
                             );
                         }
@@ -10226,6 +10232,47 @@ impl<R: RuntimeControl> Reconciler<R> {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|subject, _| used.contains(subject));
     }
+}
+
+/// What the graph knows about each pull request a repository observation saw, in the listing
+/// shape `attach_pull_request_openers` compares with: each item resource's facts, or the item in
+/// the repository facts that builds before item resources kept.
+fn recorded_pull_requests(
+    store: &Store,
+    repository: &str,
+    facts: &Value,
+    previous: Option<&Value>,
+) -> Value {
+    let legacy = previous
+        .and_then(|facts| facts.get("pull_requests"))
+        .and_then(Value::as_array);
+    let items = facts
+        .get("pull_requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("number").and_then(Value::as_u64))
+        .filter_map(|number| {
+            let recorded = store
+                .latest_actual_value(&format!("{repository}/pull-request/{number}"))
+                .ok()
+                .flatten()
+                .and_then(|actual| actual.get("facts").cloned())
+                .map(|mut facts| {
+                    if let Some(head) = facts.get("head_sha").cloned() {
+                        facts["head"] = head;
+                    }
+                    facts
+                });
+            recorded.or_else(|| {
+                legacy?
+                    .iter()
+                    .find(|item| item.get("number").and_then(Value::as_u64) == Some(number))
+                    .cloned()
+            })
+        })
+        .collect();
+    serde_json::json!({ "pull_requests": Value::Array(items) })
 }
 
 fn permanent_observation_error(code: &str) -> bool {
@@ -22035,16 +22082,15 @@ subscription "reviews" {{
                 &subscriptions,
             )
             .unwrap();
-        let changed_claim = changed
-            .observation_claim
-            .expect("the changed observation creates a resource claim");
+        // The repository's own facts did not change; only the new item records a claim.
+        assert!(changed.observation_claim.is_none());
+        assert_eq!(changed.changed_fields, vec!["pull_requests".to_owned()]);
         let item_claim = store
             .claims_for("resource/repo/pull-request/7", Some("resource.observed"))
             .unwrap()
             .pop()
             .expect("the repository discovery creates one pull request resource")
             .id;
-        assert_ne!(item_claim, changed_claim);
         let request = store
             .pending_subscription_mission_requests("subscription/reviews")
             .unwrap()
@@ -22301,14 +22347,31 @@ subscription "run/{run}/reviews" {{
         let head = |letter: char| letter.to_string().repeat(40);
 
         // The older build listed items without a state and kept every item it had seen.
-        let (revision, old_subject, subscriptions) = publish_watch("old");
+        let (_, old_subject, _) = publish_watch("old");
         let old_listing = serde_json::json!([
             {"number": 24, "head": head('a')},
             {"number": 25, "head": head('b')},
             {"number": 73, "head": head('c')},
             {"number": 75, "head": head('d')},
         ]);
-        observe(&revision, &subscriptions, old_listing);
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/repo".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.repository".into())),
+                    ("observer".into(), Value::String("observer/repo".into())),
+                    (
+                        "facts".into(),
+                        serde_json::json!({"repository_id": 17, "pull_requests": old_listing}),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("legacy-listing".into()),
+            })
+            .unwrap();
         // Before item claims carried `head_sha`, #24 was requested without a delivery key; its
         // item claim cites the listing that named its head.
         let listing = store
@@ -23005,36 +23068,189 @@ subscription "triage" {{
             .unwrap();
     }
 
-    /// List open issues the way the GitHub repository provider does and record the observation.
+    /// Record a complete listing of open issues the way the GitHub repository provider reports
+    /// one: each issue it saw, with the facts it read.
     fn observe_issues(
         store: &Store,
         locator: &str,
         numbers: impl IntoIterator<Item = u64>,
         subscriptions: &[(String, crate::model::SubscriptionSpec)],
     ) {
-        let previous = store
-            .latest_actual_value("resource/repo")
-            .unwrap()
-            .and_then(|actual| actual.get("facts").cloned());
         let issues = numbers
             .into_iter()
             .map(|number| {
                 serde_json::json!({
                     "number": number,
                     "title": format!("Issue {number}"),
-                    "html_url": format!("https://github.com/{locator}/issues/{number}"),
+                    "url": format!("https://github.com/{locator}/issues/{number}"),
+                    "state": "open",
                 })
             })
             .collect::<Vec<_>>();
-        let facts = crate::resource::normalize_github_repository(
-            previous.as_ref(),
-            7,
-            &[],
-            &issues,
-            &BTreeSet::from(["issues".into()]),
-        )
-        .unwrap();
-        record_issues(store, &facts, subscriptions);
+        record_issues(
+            store,
+            &serde_json::json!({"repository_id": 7, "issues": issues}),
+            subscriptions,
+        );
+    }
+
+    /// One repository observer records each item it sees as that item's latest state. An
+    /// unchanged poll records nothing, a poll that read only some facts keeps the others, and the
+    /// repository resource keeps only its own facts.
+    #[test]
+    fn a_repository_observer_records_each_item_as_its_own_latest_state() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" {
+  resource "resource/repo"; provider "github.repository"; locator "acme/garden"
+  field "pull_requests"; field "issues"; field "comments"; field "mentions"
+}
+agent "example.reader" { workspace "/tmp"; command "true" }
+subscription "mentions" { observer "observer/repo"; on "mentions"; to "agent/example.reader"; delivery "message" }"#,
+            "watch",
+        );
+        let desired = store.desired_subjects().unwrap();
+        let subscription = desired
+            .iter()
+            .find(|item| item.subject == "subscription/mentions")
+            .unwrap();
+        let subscriptions = vec![(
+            subscription.subject.clone(),
+            crate::graph::subscription_spec(&subscription.desired).unwrap(),
+        )];
+        let revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let observe = |facts: Value| {
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    &revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &facts,
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap()
+        };
+        let facts_of =
+            |subject: &str| store.latest_actual_value(subject).unwrap().unwrap()["facts"].clone();
+        let head = "a".repeat(40);
+        // An older build kept every item in the repository facts.
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/repo".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.repository".into())),
+                    (
+                        "facts".into(),
+                        serde_json::json!({"repository_id": 7, "pull_requests": [], "issues": [{"number": 3, "title": "Old"}]}),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("legacy-listing".into()),
+            })
+            .unwrap();
+        let first = observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
+            "number": 7, "head": head, "branch": "agent/seven", "state": "open", "draft": false,
+            "checks_state": "pending", "checks": [{"name": "garden/ci", "status": "pending"}],
+        }], "issues": [{"number": 3, "title": "Old", "state": "open", "comments": 0, "new": false}]}));
+        assert_eq!(
+            facts_of("resource/repo"),
+            serde_json::json!({"repository_id": 7}),
+            "the repository keeps only its own facts"
+        );
+        assert!(first.observation_claim.is_some());
+        let pull = facts_of("resource/repo/pull-request/7");
+        assert_eq!(pull["head_sha"], head);
+        assert_eq!(pull["checks_state"], "pending");
+        assert_eq!(facts_of("resource/repo/issue/3")["comments"], 0);
+
+        // Nothing changed: no claim at all.
+        let before = store.index().unwrap();
+        let unchanged = observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
+            "number": 7, "head": head, "state": "open", "checks_state": "pending",
+            "checks": [{"name": "garden/ci", "status": "pending"}],
+        }]}));
+        assert!(unchanged.changed_fields.is_empty());
+        assert_eq!(store.index().unwrap(), before);
+
+        // A comment that mentions someone changes only what the comment read.
+        let comment = serde_json::json!({"number": 7, "new": false,
+            "last_comment": {"id": 91, "author": "fern", "created_at": "2026-09-10T05:00:00Z"},
+            "mentions": [{"login": "orchid-bot", "by": "fern", "at": "2026-09-10T05:00:00Z"}]});
+        let commented =
+            observe(serde_json::json!({"repository_id": 7, "pull_requests": [comment]}));
+        assert!(commented.observation_claim.is_none());
+        assert_eq!(
+            commented.changed_fields,
+            vec!["comments".to_owned(), "mentions".to_owned()]
+        );
+        let pull = facts_of("resource/repo/pull-request/7");
+        assert_eq!(pull["head_sha"], head, "a fact the poll did not read stays");
+        assert_eq!(pull["checks_state"], "pending");
+        assert_eq!(pull["last_comment"]["id"], 91);
+        let item_claims = store
+            .claims_for("resource/repo/pull-request/7", Some("resource.observed"))
+            .unwrap();
+        assert_eq!(item_claims.len(), 2);
+        let changed = item_claims[1].body["fields"]["changed_fields"].clone();
+        assert_eq!(changed, serde_json::json!(["last_comment", "mentions"]));
+        // The mention subscription hears one message naming the item.
+        assert_eq!(commented.message_subjects.len(), 1);
+        let message = store
+            .claims_for(&commented.message_subjects[0], Some("message.sent"))
+            .unwrap()
+            .remove(0);
+        let content: Value =
+            serde_json::from_str(message.body["fields"]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["changed_fields"], serde_json::json!(["mentions"]));
+        assert_eq!(
+            content["items"][0]["resource"],
+            "resource/repo/pull-request/7"
+        );
+        assert_eq!(
+            content["items"][0]["facts"]["mentions"][0]["login"],
+            "orchid-bot"
+        );
+        assert_eq!(content["items_changed"], 1);
+
+        // A check that finishes is a pull request change, which the mention subscription does
+        // not hear.
+        let checked = observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
+            "number": 7, "checks_state": "success",
+            "checks": [{"name": "garden/ci", "status": "completed", "conclusion": "success"}],
+        }]}));
+        assert_eq!(checked.changed_fields, vec!["pull_requests".to_owned()]);
+        assert!(checked.message_subjects.is_empty());
+
+        // An edit to an older comment keeps the last comment, and a later mention of someone
+        // else adds to the mentions.
+        observe(
+            serde_json::json!({"repository_id": 7, "pull_requests": [{"number": 7, "new": false,
+            "last_comment": {"id": 80, "author": "moss", "created_at": "2026-09-09T00:00:00Z"},
+            "mentions": [{"login": "fern", "by": "moss", "at": "2026-09-11T00:00:00Z"}]}]}),
+        );
+        let pull = facts_of("resource/repo/pull-request/7");
+        assert_eq!(pull["last_comment"]["id"], 91);
+        assert_eq!(
+            pull["mentions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|mention| mention["login"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["fern", "orchid-bot"]
+        );
     }
 
     #[test]
@@ -23334,6 +23550,26 @@ subscription "reviews" {
                     // the old head, so migration must cancel it when the new head arrives.
                     let mut facts = discovery.body["fields"]["facts"].clone();
                     facts.as_object_mut().unwrap().remove("head_sha");
+                    // An older build's listing kept every item in the repository facts.
+                    let listing = store
+                        .append_claim(&ClaimInput {
+                            subject: "resource/repo".into(),
+                            kind: "resource.observed".into(),
+                            actor: None,
+                            fields: BTreeMap::from([
+                                ("kind".into(), Value::String("vcs.repository".into())),
+                                (
+                                    "facts".into(),
+                                    serde_json::json!({"repository_id": 7, "pull_requests": [
+                                        {"number": 2, "head": head, "state": "open", "draft": false},
+                                    ]}),
+                                ),
+                            ]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some("legacy-listing".into()),
+                        })
+                        .unwrap();
                     discovery = store
                         .append_claim(&ClaimInput {
                             subject: resource.clone(),
@@ -23343,9 +23579,7 @@ subscription "reviews" {
                                 ("kind".into(), Value::String("vcs.pull-request".into())),
                                 ("facts".into(), facts),
                             ]),
-                            evidence: vec![
-                                discovery.body["evidence"][0].as_str().unwrap().to_owned(),
-                            ],
+                            evidence: vec![listing.id],
                             expected_subject: None,
                             idempotency_key: Some("legacy-headless-item".into()),
                         })

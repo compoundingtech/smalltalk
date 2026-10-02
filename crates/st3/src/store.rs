@@ -1252,13 +1252,59 @@ fn subscription_request_view(
     }
 }
 
-/// One repository item whose recorded facts changed. `deliver` says whether the change asks a
-/// subscription for a review or a triage.
+/// One repository item whose recorded facts changed, with the facts that changed. `deliver` says
+/// whether the change asks a subscription for a review or a triage.
 struct DiscoveredItem {
     subject: String,
     kind: &'static str,
     facts: Value,
+    changed_fields: Vec<String>,
+    /// The data types the change belongs to: the item's collection, `comments`, `reactions` or
+    /// `mentions`.
+    data_types: BTreeSet<String>,
     deliver: bool,
+}
+
+/// The data types a change to an item's facts belongs to. A comment, a reaction and a mention
+/// each have their own; every other fact belongs to the item's collection.
+fn item_data_types(
+    collection: &str,
+    prior: Option<&Value>,
+    facts: &Value,
+    changed_fields: &[String],
+) -> BTreeSet<String> {
+    let mut data_types = BTreeSet::new();
+    for field in changed_fields {
+        match field.as_str() {
+            "comments" => data_types.insert("comments".to_owned()),
+            "reactions" => data_types.insert("reactions".to_owned()),
+            "mentions" => data_types.insert("mentions".to_owned()),
+            "last_comment" => {
+                let reactions = |value: Option<&Value>| {
+                    value
+                        .and_then(|value| value.pointer("/last_comment/reactions"))
+                        .cloned()
+                };
+                if reactions(prior) != reactions(Some(facts)) {
+                    data_types.insert("reactions".to_owned());
+                }
+                let without_reactions = |value: Option<&Value>| {
+                    let mut comment = value.and_then(|value| value.get("last_comment")).cloned();
+                    if let Some(Value::Object(comment)) = comment.as_mut() {
+                        comment.remove("reactions");
+                    }
+                    comment
+                };
+                if without_reactions(prior) != without_reactions(Some(facts)) {
+                    data_types.insert("comments".to_owned())
+                } else {
+                    false
+                }
+            }
+            _ => data_types.insert(collection.to_owned()),
+        };
+    }
+    data_types
 }
 
 /// A pull request is reviewed once for each head it is ready at: when it first appears open and
@@ -1268,7 +1314,14 @@ struct DiscoveredItem {
 /// saw or one nobody can act on. A known item with no known head proves nothing, so a head first
 /// recorded for it is a baseline.
 fn pull_request_needs_review(prior: Option<&Value>, item: &Value) -> bool {
-    let head = item.get("head").filter(|head| !head.is_null());
+    // An item resource names the head `head_sha`; a listing names it `head`.
+    let head_of = |item: &Value| {
+        item.get("head_sha")
+            .or_else(|| item.get("head"))
+            .filter(|head| !head.is_null())
+            .cloned()
+    };
+    let head = head_of(item);
     let open = item
         .get("state")
         .and_then(Value::as_str)
@@ -1280,99 +1333,216 @@ fn pull_request_needs_review(prior: Option<&Value>, item: &Value) -> bool {
     let Some(prior) = prior else {
         return true;
     };
-    let prior_head = prior.get("head").filter(|head| !head.is_null());
+    let prior_head = head_of(prior);
     prior.get("draft").and_then(Value::as_bool) == Some(true)
         || prior_head.is_some_and(|prior_head| Some(prior_head) != head)
 }
 
+/// The most changed items one resource-change message lists.
+const MESSAGE_ITEMS: usize = 20;
+
+/// The repository collections whose items become their own resources, with each item's subject
+/// segment and resource kind.
+const REPOSITORY_COLLECTIONS: [(&str, &str, &str); 2] = [
+    ("pull_requests", "pull-request", "vcs.pull-request"),
+    ("issues", "issue", "vcs.issue"),
+];
+
+/// The most mentions one item resource keeps, newest first.
+const ITEM_MENTIONS: usize = 50;
+
+/// What an item resource records after one sighting: its prior facts with every fact the
+/// sighting read laid over them. A listing names the head commit `head`; the resource calls it
+/// `head_sha`. A fact the sighting read as null is gone, except an unknown head. Only an open
+/// pull request is known to be unmerged: one that closes keeps `merged` only when the sighting
+/// could tell a merge from a closure. An edit to an older comment does not replace the last
+/// comment, and mentions add to the ones known, keeping the newest of each login.
+fn item_facts(
+    repository: &str,
+    field: &str,
+    number: u64,
+    prior: Option<&Value>,
+    seen: &Value,
+) -> serde_json::Map<String, Value> {
+    let mut facts = prior
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (name, value) in seen.as_object().into_iter().flatten() {
+        let name = match name.as_str() {
+            "new" => continue,
+            "head" => "head_sha",
+            name => name,
+        };
+        match (name, facts.get(name)) {
+            (_, _) if value.is_null() => {
+                if name != "head_sha" {
+                    facts.remove(name);
+                }
+            }
+            ("last_comment", Some(known)) if !newer_comment(value, known) => {}
+            ("mentions", Some(Value::Array(known))) => {
+                let mut mentions = BTreeMap::<String, Value>::new();
+                for mention in known.iter().chain(value.as_array().into_iter().flatten()) {
+                    let Some(login) = mention.get("login").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let at = |mention: &Value| {
+                        mention.get("at").and_then(Value::as_str).map(str::to_owned)
+                    };
+                    if mentions
+                        .get(login)
+                        .is_none_or(|kept| at(mention) >= at(kept))
+                    {
+                        mentions.insert(login.to_owned(), mention.clone());
+                    }
+                }
+                let mut mentions = mentions.into_values().collect::<Vec<_>>();
+                mentions.sort_by_key(|mention| {
+                    std::cmp::Reverse(mention.get("at").and_then(Value::as_str).map(str::to_owned))
+                });
+                mentions.truncate(ITEM_MENTIONS);
+                mentions.sort_by_key(|mention| {
+                    mention
+                        .get("login")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+                facts.insert(name.into(), Value::Array(mentions));
+            }
+            _ => {
+                facts.insert(name.into(), value.clone());
+            }
+        }
+    }
+    facts.insert("repository".into(), Value::String(repository.into()));
+    facts.insert("number".into(), Value::from(number));
+    let state = facts
+        .entry("state")
+        .or_insert_with(|| Value::String("open".into()))
+        .clone();
+    if field == "pull_requests" {
+        facts.entry("draft").or_insert_with(|| Value::Bool(false));
+        if state == "open" {
+            facts.insert("merged".into(), Value::Bool(false));
+        } else if seen.get("merged").is_none() && seen.get("state").is_some() {
+            facts.remove("merged");
+        }
+    }
+    facts
+}
+
+/// Whether `seen` is the same comment as `known` or one created after it.
+pub(crate) fn newer_comment(seen: &Value, known: &Value) -> bool {
+    let created = |comment: &Value| {
+        comment
+            .get("created_at")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    seen.get("id") == known.get("id") || created(seen) >= created(known)
+}
+
+/// The items of one repository collection whose recorded facts change with this observation.
+/// `current` names only the items the observation saw, each with only the facts it read; an
+/// item it did not see keeps its facts. `recorded` reads an item resource's latest facts.
+///
+/// An item resource that was never recorded falls back to the item in the previous repository
+/// facts, where builds before item resources kept every item, and a recorded resource takes
+/// what it lacks from there; such an item is recorded once even when nothing changed, so its
+/// resource holds every fact from then on. An item known to neither is new,
+/// unless the observation says it existed before the observer last looked (`"new": false`) or
+/// this is the repository's baseline. Only a new item, or a pull request at a new ready head,
+/// asks a subscription for a review or a triage.
 fn discovered_collection_items(
     repository: &str,
     field: &str,
     previous: Option<&Value>,
     current: &Value,
+    recorded: &mut dyn FnMut(&str) -> Option<Value>,
 ) -> Vec<DiscoveredItem> {
-    // The first listing that names its repository ID is also the first complete listing. The
-    // earlier facts came from a first-page read, so the items this listing adds were missed, not
-    // opened. They become known without a delivery.
-    if current.get("repository_id").is_some()
-        && previous
-            .and_then(|value| value.get("repository_id"))
-            .is_none()
-    {
-        return Vec::new();
-    }
-    let Some(previous_items) = previous
-        .and_then(|value| value.get(field))
-        .and_then(Value::as_array)
+    let Some((_, segment, kind)) = REPOSITORY_COLLECTIONS
+        .iter()
+        .copied()
+        .find(|(name, _, _)| *name == field)
     else {
         return Vec::new();
     };
+    // The first observation is the baseline. The first listing that names its repository ID is
+    // also the first complete listing: the earlier facts came from a first-page read, so the items
+    // this listing adds were missed, not opened. Either way its items become known without a
+    // delivery.
+    let baseline = previous.is_none()
+        || (current.get("repository_id").is_some()
+            && previous
+                .and_then(|value| value.get("repository_id"))
+                .is_none());
     let Some(current_items) = current.get(field).and_then(Value::as_array) else {
         return Vec::new();
     };
+    let legacy_items = previous
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_array);
     current_items
         .iter()
         .filter_map(|item| {
             let number = item.get("number")?.as_u64()?;
-            let prior = previous_items
-                .iter()
-                .find(|old| old.get("number").and_then(Value::as_u64) == Some(number));
-            // A pull request's item resource follows its head and state, so a review that has not
-            // started yet can tell that its head was replaced or its pull request closed.
-            if prior.is_some_and(|old| match field {
-                "pull_requests" => ["head", "state", "draft"]
-                    .iter()
-                    .all(|name| old.get(*name) == item.get(*name)),
-                _ => true,
-            }) {
+            let subject = format!("{repository}/{segment}/{number}");
+            let resource = recorded(&subject);
+            let legacy = legacy_items
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|old| old.get("number").and_then(Value::as_u64) == Some(number))
+                })
+                .map(|old| Value::Object(item_facts(repository, field, number, None, old)));
+            // A resource recorded before items carried `head_sha` takes its head from the listing.
+            let prior = match (&resource, legacy) {
+                (Some(resource), Some(Value::Object(mut legacy))) => {
+                    legacy.extend(resource.as_object().cloned().unwrap_or_default());
+                    Some(Value::Object(legacy))
+                }
+                (Some(resource), _) => Some(resource.clone()),
+                (None, legacy) => legacy,
+            };
+            let prior = prior.as_ref();
+            let facts = Value::Object(item_facts(repository, field, number, prior, item));
+            if resource.as_ref() == Some(&facts) {
                 return None;
             }
-            let (segment, kind, deliver) = match field {
-                "pull_requests" => (
-                    "pull-request",
-                    "vcs.pull-request",
-                    pull_request_needs_review(prior, item),
-                ),
-                "issues" => ("issue", "vcs.issue", true),
-                _ => return None,
+            let deliver = match (field, prior) {
+                ("pull_requests", Some(prior)) => pull_request_needs_review(Some(prior), &facts),
+                (_, Some(_)) => false,
+                _ if baseline || item.get("new") == Some(&Value::Bool(false)) => false,
+                ("pull_requests", None) => pull_request_needs_review(None, &facts),
+                _ => true,
             };
-            let state = item
-                .get("state")
-                .cloned()
-                .unwrap_or_else(|| Value::String("open".into()));
-            let mut facts = serde_json::Map::from_iter([
-                ("repository".into(), Value::String(repository.into())),
-                ("number".into(), Value::from(number)),
-                ("state".into(), state.clone()),
-            ]);
-            for name in ["url", "title"] {
-                if let Some(value) = item.get(name).filter(|value| !value.is_null()) {
-                    facts.insert(name.into(), value.clone());
-                }
-            }
-            if field == "pull_requests" {
-                facts.insert(
-                    "draft".into(),
-                    item.get("draft").cloned().unwrap_or(Value::Bool(false)),
-                );
-                // An open listing cannot tell a merge from a closure, so only an open pull
-                // request is known to be unmerged.
-                if state == "open" {
-                    facts.insert("merged".into(), Value::Bool(false));
-                }
-                if let Some(head) = item.get("head").filter(|head| !head.is_null()) {
-                    facts.insert("head_sha".into(), head.clone());
-                }
-                for name in ["branch", "author", "opened_by", "opened_by_run"] {
-                    if let Some(value) = item.get(name).filter(|value| !value.is_null()) {
-                        facts.insert(name.into(), value.clone());
-                    }
-                }
-            }
+            let changed_fields = facts
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(name, value)| {
+                    prior.and_then(|prior| prior.get(name.as_str())) != Some(*value)
+                })
+                .map(|(name, _)| name.clone())
+                .chain(
+                    prior
+                        .and_then(Value::as_object)
+                        .into_iter()
+                        .flat_map(|prior| {
+                            prior
+                                .keys()
+                                .filter(|name| facts.get(name.as_str()).is_none())
+                                .cloned()
+                        }),
+                )
+                .collect::<Vec<_>>();
             Some(DiscoveredItem {
-                subject: format!("{repository}/{segment}/{number}"),
+                subject,
                 kind,
-                facts: Value::Object(facts),
+                data_types: item_data_types(field, prior, &facts, &changed_fields),
+                changed_fields,
+                facts,
                 deliver,
             })
         })
@@ -10486,14 +10656,61 @@ impl Store {
                         "resource observation facts must be an object",
                     )
                 })?;
+                // A repository's collections name the items an observation saw. Each item is its
+                // own resource, so the repository resource keeps only its own facts and a change
+                // to one item records only that item.
+                let collection = |field: &str| {
+                    REPOSITORY_COLLECTIONS
+                        .iter()
+                        .any(|(name, _, _)| *name == field)
+                };
+                let repository_facts = Value::Object(
+                    current_object
+                        .iter()
+                        .filter(|(field, _)| !collection(field))
+                        .map(|(field, value)| (field.clone(), value.clone()))
+                        .collect(),
+                );
+                let legacy_collections = previous_object
+                    .is_some_and(|previous| previous.keys().any(|field| collection(field)));
                 let mut changed_fields = BTreeSet::new();
                 for field in current_object
                     .keys()
                     .chain(previous_object.into_iter().flat_map(serde_json::Map::keys))
+                    .filter(|field| !collection(field))
                 {
                     if previous_object.and_then(|object| object.get(field)) != current_object.get(field) {
                         changed_fields.insert(field.clone());
                     }
+                }
+                let repository_changed_fields = changed_fields.iter().cloned().collect::<Vec<_>>();
+                let mut recorded_items = HashMap::new();
+                for (field, segment, _) in REPOSITORY_COLLECTIONS {
+                    for number in current_object
+                        .get(field)
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|item| item.get("number").and_then(Value::as_u64))
+                    {
+                        let subject = format!("{resource}/{segment}/{number}");
+                        let recorded = latest_actual(transaction, &subject)
+                            .map_err(internal)?
+                            .and_then(|actual| actual.get("facts").cloned());
+                        recorded_items.insert(subject, recorded);
+                    }
+                }
+                let mut discovered = Vec::new();
+                for (field, _, _) in REPOSITORY_COLLECTIONS {
+                    let items = discovered_collection_items(
+                        resource,
+                        field,
+                        previous.as_ref(),
+                        &facts,
+                        &mut |subject| recorded_items.get(subject).cloned().flatten(),
+                    );
+                    changed_fields.extend(items.iter().flat_map(|item| item.data_types.iter().cloned()));
+                    discovered.extend(items.into_iter().map(|item| (field, item)));
                 }
                 let changed_fields = changed_fields.into_iter().collect::<Vec<_>>();
                 let observer_health_is_current = latest_actual(transaction, observer)
@@ -10536,8 +10753,9 @@ impl Store {
                         ),
                     );
                 }
-                let changed = baseline || !changed_fields.is_empty();
+                let changed = baseline || !changed_fields.is_empty() || !discovered.is_empty();
                 let should_record = changed
+                    || legacy_collections
                     || attempt.is_some()
                     || !observer_health_is_current
                     || subscription_states.values().any(|(_, _, changed)| *changed);
@@ -10618,7 +10836,12 @@ impl Store {
                     )
                     .map_err(internal)?;
                 }
-                let observation_claim = if baseline || !changed_fields.is_empty() {
+                // Builds before item resources kept every item in the repository facts. The first
+                // observation without them records the repository's own facts once more.
+                let observation_claim = if baseline
+                    || !repository_changed_fields.is_empty()
+                    || legacy_collections
+                {
                     let predecessors = latest_claim_id_tx(transaction, resource)
                         .map_err(internal)?
                         .into_iter()
@@ -10632,10 +10855,10 @@ impl Store {
                             None,
                             &json!({"fields": {
                                 "kind": resource_kind,
-                                "facts": facts,
+                                "facts": repository_facts,
                                 "observer": observer,
                                 "baseline": baseline,
-                                "changed_fields": changed_fields,
+                                "changed_fields": repository_changed_fields,
                             }}),
                             &predecessors,
                             Some(&batch_id),
@@ -10646,60 +10869,62 @@ impl Store {
                     None
                 };
                 let mut collection_discoveries = BTreeMap::<String, Vec<(String, String)>>::new();
-                if !baseline {
-                    for field in ["pull_requests", "issues"] {
-                        for DiscoveredItem {
-                            subject,
-                            kind,
-                            facts: mut item_facts,
-                            deliver,
-                        } in discovered_collection_items(resource, field, previous.as_ref(), &facts)
-                        {
-                            // An agent's checkout names the opener first. An authoring run's own pull
-                            // request resource names the run when no agent was found.
-                            if deliver
-                                && field == "pull_requests"
-                                && item_facts.get("opened_by").is_none()
-                                && item_facts.get("opened_by_run").is_none()
-                                && let Some(run) = authoring_pull_request_runs_tx(transaction, &item_facts)
-                                    .map_err(internal)?
-                                    .into_iter()
-                                    .next()
-                            {
-                                item_facts["opened_by_run"] = Value::String(run);
-                            }
-                            let predecessors = latest_claim_id_tx(transaction, &subject)
-                                .map_err(internal)?
-                                .into_iter()
-                                .collect::<Vec<_>>();
-                            let evidence = observation_claim
-                                .as_ref()
-                                .map(|claim| vec![claim.id.clone()])
-                                .unwrap_or_default();
-                            let claim = append_claim_tx(
-                                transaction,
-                                &self.origin,
-                                &subject,
-                                "resource.observed",
-                                None,
-                                &json!({"fields": {
-                                    "kind": kind,
-                                    "facts": item_facts,
-                                    "observer": observer,
-                                    "baseline": false,
-                                    "changed_fields": [field],
-                                }, "evidence": evidence}),
-                                &predecessors,
-                                Some(&batch_id),
-                            )
-                            .map_err(internal)?;
-                            if deliver {
-                                collection_discoveries
-                                    .entry(field.into())
-                                    .or_default()
-                                    .push((subject, claim.id));
-                            }
-                        }
+                let mut item_claims = Vec::new();
+                for (field, item) in discovered {
+                    let DiscoveredItem {
+                        subject,
+                        kind,
+                        facts: mut item_facts,
+                        changed_fields: item_changed_fields,
+                        data_types,
+                        deliver,
+                    } = item;
+                    // An agent's checkout names the opener first. An authoring run's own pull
+                    // request resource names the run when no agent was found.
+                    if deliver
+                        && field == "pull_requests"
+                        && item_facts.get("opened_by").is_none()
+                        && item_facts.get("opened_by_run").is_none()
+                        && let Some(run) = authoring_pull_request_runs_tx(transaction, &item_facts)
+                            .map_err(internal)?
+                            .into_iter()
+                            .next()
+                    {
+                        item_facts["opened_by_run"] = Value::String(run);
+                    }
+                    let predecessors = latest_claim_id_tx(transaction, &subject)
+                        .map_err(internal)?
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let evidence = observation_claim
+                        .as_ref()
+                        .map(|claim| vec![claim.id.clone()])
+                        .unwrap_or_default();
+                    let claim = append_claim_tx(
+                        transaction,
+                        &self.origin,
+                        &subject,
+                        "resource.observed",
+                        None,
+                        &json!({"fields": {
+                            "kind": kind,
+                            "facts": item_facts,
+                            "observer": observer,
+                            "baseline": false,
+                            "changed_fields": item_changed_fields,
+                        }, "evidence": evidence}),
+                        &predecessors,
+                        Some(&batch_id),
+                    )
+                    .map_err(internal)?;
+                    if !data_types.is_empty() {
+                        item_claims.push((data_types, subject.clone(), claim.id.clone(), item_facts));
+                    }
+                    if deliver {
+                        collection_discoveries
+                            .entry(field.into())
+                            .or_default()
+                            .push((subject, claim.id));
                     }
                 }
                 let mut available_subscriptions = BTreeSet::new();
@@ -10751,7 +10976,8 @@ impl Store {
                             continue;
                         }
                         if let Some(condition) = &subscription.condition {
-                            let condition_is_true = subscription_condition_matches(condition, &facts);
+                            let condition_is_true =
+                                subscription_condition_matches(condition, &repository_facts);
                             let condition_was_true = previous
                                 .as_ref()
                                 .is_some_and(|facts| subscription_condition_matches(condition, facts));
@@ -10759,10 +10985,25 @@ impl Store {
                                 continue;
                             }
                         }
-                        let stable = canonical_hash(&(
-                            observation_claim.as_ref().map(|claim| claim.id.as_str()),
-                            subscription_subject,
-                        ))
+                        let selected_items = item_claims
+                            .iter()
+                            .filter(|(data_types, ..)| selected.iter().any(|name| data_types.contains(name)))
+                            .collect::<Vec<_>>();
+                        let stable = if selected_items.is_empty() {
+                            canonical_hash(&(
+                                observation_claim.as_ref().map(|claim| claim.id.as_str()),
+                                subscription_subject,
+                            ))
+                        } else {
+                            canonical_hash(&(
+                                observation_claim.as_ref().map(|claim| claim.id.as_str()),
+                                subscription_subject,
+                                selected_items
+                                    .iter()
+                                    .map(|(_, _, claim, _)| claim.as_str())
+                                    .collect::<Vec<_>>(),
+                            ))
+                        }
                         .map_err(internal)?;
                         if subscription.delivery == "mission" {
                             let Some(mission) = subscription.mission.as_deref() else {
@@ -10866,6 +11107,13 @@ impl Store {
                                         .expect("subscription request fields are an object")
                                         .insert("requester".into(), Value::String(requester.into()));
                                 }
+                                // A request cites the item version it was made for, so a checkpoint
+                                // keeps that version while the request needs it.
+                                let evidence = if uses_collection {
+                                    vec![discovery.clone()]
+                                } else {
+                                    evidence.clone()
+                                };
                                 append_claim_tx(
                                     transaction,
                                     &self.origin,
@@ -10881,13 +11129,37 @@ impl Store {
                             continue;
                         }
                         let message_subject = format!("message/resource-{}", &stable[..20]);
-                        let content = serde_json::to_string(&json!({
+                        let mut content = json!({
                             "resource": resource,
                             "observer": observer,
                             "changed_fields": selected,
-                            "facts": facts,
-                        }))
-                        .map_err(internal)?;
+                            "facts": repository_facts,
+                        });
+                        // A message names the items that changed, up to a bound; each item's
+                        // resource holds the rest.
+                        if !selected_items.is_empty() {
+                            content["items"] = Value::Array(
+                                selected_items
+                                    .iter()
+                                    .take(MESSAGE_ITEMS)
+                                    .map(|(_, subject, _, facts)| {
+                                        json!({"resource": subject, "facts": facts})
+                                    })
+                                    .collect(),
+                            );
+                            content["items_changed"] = Value::from(selected_items.len());
+                        }
+                        let content = serde_json::to_string(&content).map_err(internal)?;
+                        let evidence = evidence
+                            .iter()
+                            .cloned()
+                            .chain(
+                                selected_items
+                                    .iter()
+                                    .take(MESSAGE_ITEMS)
+                                    .map(|(_, _, claim, _)| claim.clone()),
+                            )
+                            .collect::<Vec<_>>();
                         append_claim_tx(
                             transaction,
                             &self.origin,
@@ -16292,12 +16564,13 @@ fn check_mailbox_incarnation(
     let fields = runtime.get("fields").unwrap_or(&runtime);
     let live = fields.get("status").and_then(Value::as_str) == Some("running")
         && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
-    let predecessor = fields
-        .get("incarnation_id")
-        .and_then(Value::as_str)
-        .is_some_and(|incarnation| incarnation != fence.incarnation);
+    // A runtime observation that does not name this incarnation describes something older: a
+    // predecessor, or the daemon's own "exited" for a seat that died while no daemon watched,
+    // which names no incarnation at all. Only an observation of this very incarnation is final.
+    let describes_another = fields.get("incarnation_id").and_then(Value::as_str)
+        != Some(fence.incarnation.as_str());
     if !live
-        && (predecessor
+        && (describes_another
             || matches!(
                 fields.get("status").and_then(Value::as_str),
                 None | Some("starting")
@@ -39861,6 +40134,7 @@ mission "review-guardrail" state="ready" {
             "pull_requests",
             Some(&previous),
             &current,
+            &mut |_| None,
         );
         assert_eq!(pulls.len(), 1);
         assert_eq!(pulls[0].subject, "resource/github/acme/demo/pull-request/7");
@@ -39874,6 +40148,7 @@ mission "review-guardrail" state="ready" {
             "issues",
             Some(&previous),
             &current,
+            &mut |_| None,
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].subject, "resource/github/acme/demo/issue/8");
@@ -39899,6 +40174,7 @@ mission "review-guardrail" state="ready" {
             "pull_requests",
             Some(&before),
             &after,
+            &mut |_| None,
         );
         assert_eq!(changes.len(), 1);
         assert_eq!(
@@ -39925,12 +40201,26 @@ mission "review-guardrail" state="ready" {
         st3_schema::registry()
             .validate_resource_facts("vcs.pull-request", &facts)
             .unwrap();
+        // An item that only an older build's repository facts knew is recorded once, without a
+        // review. Once its resource holds the same facts, the same sighting records nothing.
+        let recorded = changes[0].facts.clone();
+        let materialized = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&after),
+            &after,
+            &mut |_| None,
+        );
+        assert_eq!(materialized.len(), 1);
+        assert!(!materialized[0].deliver);
+        assert!(materialized[0].changed_fields.is_empty());
         assert!(
             discovered_collection_items(
                 "resource/github/acme/demo",
                 "pull_requests",
-                Some(&after),
+                Some(&json!({"repository_id": 7})),
                 &after,
+                &mut |_| Some(recorded.clone()),
             )
             .is_empty()
         );
@@ -39943,6 +40233,7 @@ mission "review-guardrail" state="ready" {
             "pull_requests",
             Some(&after),
             &closed,
+            &mut |_| None,
         );
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].facts["state"], "closed");
@@ -39965,6 +40256,7 @@ mission "review-guardrail" state="ready" {
                 "pull_requests",
                 Some(&previous),
                 &current,
+                &mut |_| None,
             );
             assert!(changes.len() <= 1);
             changes.first().map(|change| change.deliver)

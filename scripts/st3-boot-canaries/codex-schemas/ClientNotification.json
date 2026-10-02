@@ -1,0 +1,18 @@
+{
+  "oneOf": [
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "initialized"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    }
+  ]
+}

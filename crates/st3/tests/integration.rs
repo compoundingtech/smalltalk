@@ -4,6 +4,7 @@
 //! `mod NAME;` line here or an explicit test target for every new file.
 
 mod agents_restart;
+mod boot_canaries;
 mod client_creation;
 mod client_glasses;
 mod client_v0_cli;

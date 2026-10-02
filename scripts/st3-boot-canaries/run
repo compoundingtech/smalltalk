@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""Boot canary: a real st3 daemon boots seats of one harness against a token-free stand-in provider.
+
+    run BINARY EVIDENCE_DIR HARNESS SCENARIO
+
+HARNESS is claude, codex, pi, omp or opencode. The stand-in provider (stub-*) speaks the real wire
+contract of that harness and does what a model does when woken: reads the message and claims the
+step it names. SCENARIO is one of
+
+    fresh           a new seat boots
+    restart         the seat is restarted and the new incarnation boots
+    daemon-restart  the daemon dies with the seat's provider; the new daemon, whose latest
+                    observation of the seat is still the dead predecessor, boots a replacement
+    reexec          the st binary is replaced; the seat's driver re-execs into it and still
+                    takes a message
+    concurrent      five seats launch at once
+
+Every seat must, within the time bound, claim its step with its current incarnation and read an
+st message, and none may park in the crash-loop guard. The verdict is in EVIDENCE_DIR/result.json.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+
+HERE = Path(__file__).resolve().parent
+HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
+SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent")
+RUN_ID = "c1"
+MISSION = "canary/boot"
+LETTERS = "abcde"
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message):
+    raise Failure(message)
+
+
+def until(predicate, timeout, message, alive=lambda: None):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        alive()
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.25)
+    fail(message)
+
+
+def install_stub(bin_dir, harness):
+    """Put the stand-in on PATH under the provider's own name, with absolute interpreters."""
+    python, node = shutil.which("python3"), shutil.which("node")
+    interpreter, script = {
+        "claude": (python, "stub-claude.py"),
+        "codex": (python, "stub-codex.py"),
+        "opencode": (python, "stub-opencode.py"),
+        "pi": (node, "stub-pi-family.mjs"),
+        "omp": (node, "stub-pi-family.mjs"),
+    }[harness]
+    if not interpreter:
+        raise SystemExit(f"{harness}'s stand-in needs {'node' if harness in ('pi', 'omp') else 'python3'} on PATH")
+    wrapper = bin_dir / harness
+    wrapper.write_text(f'#!/bin/sh\nexec env PYTHONDONTWRITEBYTECODE=1 STUB_HARNESS={harness} "{interpreter}" "{HERE / script}" "$@"\n')
+    wrapper.chmod(0o755)
+
+
+class Node:
+    def __init__(self, root, binary, harness):
+        self.root, self.harness = root, harness
+        for sub in ("bin", "home", "run", "ws", "state"):
+            (root / sub).mkdir(parents=True, exist_ok=True)
+        # The seat's driver follows ST3_BIN, so re-pointing this link is how a deploy swaps the
+        # binary. A link, because a debug st3 is hundreds of megabytes and /tmp is a small tmpfs.
+        self.binary = root / "bin/st3"
+        self.binary.symlink_to(binary)
+        pty = shutil.which("pty")
+        if not pty:
+            raise SystemExit("pty must be on PATH")
+        (root / "bin/pty").symlink_to(pty)
+        install_stub(root / "bin", harness)
+        self.path = f"{root / 'bin'}:/usr/bin:/bin"
+        self.endpoint = root / "run/st.sock"
+        self.env = {"PATH": self.path, "HOME": str(root / "home"), "SHELL": "/bin/bash",
+                    "USER": os.environ.get("USER", "eval"), "LOGNAME": os.environ.get("USER", "eval"),
+                    "LANG": "C.UTF-8", "XDG_STATE_HOME": str(root / "home/.local/state"),
+                    "XDG_CONFIG_HOME": str(root / "home/.config"),
+                    "XDG_DATA_HOME": str(root / "home/.local/share"),
+                    "XDG_RUNTIME_DIR": str(root / "run"), "ST3_ENDPOINT": str(self.endpoint),
+                    "ST3_DAEMON_WAIT": "0"}
+        # The daemon rebuilds PATH from a login shell; pin it to the isolated one.
+        profile = f"export PATH='{self.path}'\n"
+        for name in (".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshenv"):
+            (root / "home" / name).write_text(profile)
+        (root / "config.toml").write_text(f'''node = "canary"
+person = "person/eval"
+state_dir = "{root / 'state'}"
+pty_root = "{root / 'pty'}"
+socket = "{self.endpoint}"
+client_gateway_socket = "{root / 'run/client.sock'}"
+''')
+        self.log = (root / "daemon.log").open("ab")
+        self.daemon = None
+
+    def start(self):
+        self.daemon = subprocess.Popen([str(self.binary), "up", "--config", str(self.root / "config.toml")],
+                                       env=self.env, cwd=self.root / "ws", stdin=subprocess.DEVNULL,
+                                       stdout=self.log, stderr=self.log, start_new_session=True)
+        until(lambda: self.api("/v1/health"), 60, "the daemon did not answer: " + self.tail("daemon.log"),
+              lambda: self.daemon.poll() is None or fail("daemon exited: " + self.tail("daemon.log")))
+
+    def kill_daemon(self):
+        os.killpg(self.daemon.pid, signal.SIGKILL)
+        self.daemon.wait()
+
+    def tail(self, name):
+        path = self.root / name
+        return path.read_text(errors="replace")[-3000:] if path.exists() else ""
+
+    def cli(self, *args, check=True):
+        result = subprocess.run([str(self.binary), "--endpoint", str(self.endpoint), *args], env=self.env,
+                                capture_output=True, text=True, timeout=120)
+        if check and result.returncode:
+            raise Failure(f"st {' '.join(args)}: {result.stderr.strip()} {result.stdout.strip()}")
+        return result.stdout
+
+    def json(self, *args):
+        return json.loads(self.cli(*args, "--json"))
+
+    def api(self, path):
+        result = subprocess.run(["curl", "-sf", "--max-time", "10", "--unix-socket", str(self.endpoint),
+                                 "http://localhost" + path], capture_output=True, text=True)
+        if result.returncode:
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            return None
+        return payload.get("value", payload) if isinstance(payload, dict) else payload
+
+    def pty(self, *args):
+        return subprocess.run(["pty", *args], env={**self.env, "PTY_ROOT": str(self.root / "pty")},
+                              capture_output=True, text=True)
+
+    def seat_processes(self):
+        """Every process launched for a seat, by this daemon's private endpoint."""
+        rows = []
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                environ = (proc / "environ").read_bytes().split(b"\0")
+                if f"ST3_ENDPOINT={self.endpoint}".encode() not in environ:
+                    continue
+                if not any(item.startswith(b"ST_AGENT=agent/") for item in environ):
+                    continue
+                argv = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+                rows.append((int(proc.name), argv))
+            except (OSError, UnicodeError):
+                pass
+        return rows
+
+    def stop(self):
+        if self.daemon and self.daemon.poll() is None:
+            os.killpg(self.daemon.pid, signal.SIGTERM)
+            try:
+                self.daemon.wait(15)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.daemon.pid, signal.SIGKILL)
+        listed = self.pty("list", "--json")
+        try:
+            for row in json.loads(listed.stdout or "[]"):
+                self.pty("kill", row["name"])
+        except (ValueError, KeyError):
+            pass
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid, _ in self.seat_processes():
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+            time.sleep(0.3)
+
+
+def seat_subject(letter):
+    return f"agent/{RUN_ID}/seat-{letter}"
+
+
+def mission_source(node, count, harness):
+    seats = ""
+    steps = ""
+    for letter in LETTERS[:count]:
+        seats += f'''
+  agent "seat-{letter}" {{
+    workspace "{node.root / 'ws'}"
+    restart "always"
+    harness "{harness}" {{}}
+  }}'''
+        steps += f'''
+  step "work-{letter}" {{
+    assigned-to "agent/${{ST_MISSION_RUN}}/seat-{letter}"
+    goal "Boot canary: claim this step."
+  }}'''
+    return f'''version 2
+mission "{MISSION}" state="ready" {{
+  goal "Boot canary."{seats}{steps}
+}}
+'''
+
+
+def trace(node, subject):
+    rows = []
+    for line in node.cli("trace", "show", subject, "--json", "--limit", "500", check=False).splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    return rows
+
+
+def parked(node, subject):
+    """The crash-loop guard's decision for this seat, if it parked it."""
+    for row in trace(node, subject):
+        body = row.get("body", row)
+        fields = body.get("fields", body)
+        if row.get("kind") == "runtime.reconcile-decision" and "crash-loop" in str(fields.get("key", "")):
+            return fields
+    return None
+
+
+class Seats:
+    """The seats of one run and what each must show to count as booted."""
+
+    def __init__(self, node, letters, bound):
+        self.node, self.letters, self.bound = node, letters, bound
+        self.incarnations = {}
+        self.timings = {}
+
+    def step(self, letter):
+        listed = self.node.cli("work", "ls", "--all")
+        for line in listed.splitlines():
+            if line.startswith("step-run/") and line.split()[0].endswith(f"/work-{letter}"):
+                return line.split()[0]
+        return None
+
+    def view(self, letter):
+        """The seat and its step as the daemon shows them; empty until the run has created them."""
+        try:
+            agent = (self.node.json("agents", "show", seat_subject(letter)) or {}).get("value") or {}
+            ref = self.step(letter)
+            work = (self.node.json("work", "show", ref) or {}).get("value") if ref else {}
+        except Failure:
+            return {}, {}
+        return agent, work or {}
+
+    def prove(self, label, fresh_incarnation=True):
+        """Each seat claims its step with a new incarnation and reads a message, in time."""
+        started = time.monotonic()
+        pending = set(self.letters)
+        probes = {}
+        deadline = started + self.bound
+        while pending:
+            self.node.daemon.poll() is None or fail("the daemon exited: " + self.node.tail("daemon.log"))
+            for letter in sorted(pending):
+                subject = seat_subject(letter)
+                guard = parked(self.node, subject)
+                if guard:
+                    fail(f"{subject} parked in the crash-loop guard during {label}: {guard}")
+                agent, work = self.view(letter)
+                incarnation = work.get("claim_incarnation")
+                if work.get("state") != "claimed" or not incarnation:
+                    continue
+                if fresh_incarnation and incarnation == self.incarnations.get(letter):
+                    continue
+                if incarnation != agent.get("incarnation_id"):
+                    continue
+                if letter not in probes:
+                    sent = self.node.json("conversations", "send", subject, "--from", "person/eval",
+                                          "--subject", f"probe {label}", "--body", f"boot canary {label}")
+                    probes[letter] = sent["subject"]
+                view = self.node.api("/v1/messages/read/" + probes[letter]) or {}
+                if view.get("status") in ("read", "closed"):
+                    self.incarnations[letter] = incarnation
+                    self.timings[f"{label}:{letter}"] = round(time.monotonic() - started, 1)
+                    pending.discard(letter)
+            if pending and time.monotonic() > deadline:
+                detail = {letter: {"agent": {k: self.view(letter)[0].get(k) for k in
+                                             ("state", "harness_state", "incarnation_id", "fault", "reason")},
+                                   "work": {k: self.view(letter)[1].get(k) for k in
+                                            ("state", "claim_incarnation")},
+                                   "probe": probes.get(letter)} for letter in sorted(pending)}
+                fail(f"{label}: {sorted(pending)} did not claim a step and read a message within "
+                     f"{self.bound:.0f}s: {json.dumps(detail)}")
+            time.sleep(0.5)
+        for letter in self.letters:
+            if parked(self.node, seat_subject(letter)):
+                fail(f"{seat_subject(letter)} parked after {label}")
+
+
+def driver_processes(node):
+    """The seat's long-lived st3 processes (driver and channels), by pid and the inode they execute."""
+    rows = {}
+    for pid, argv in node.seat_processes():
+        if " driver-hook " in argv:
+            continue
+        try:
+            exe = Path(f"/proc/{pid}/exe").resolve()
+            if exe.name.startswith("st3"):
+                rows[pid] = (argv, os.stat(f"/proc/{pid}/exe").st_ino)
+        except OSError:
+            pass
+    return rows
+
+
+def scenario(node, seats, name, scratch):
+    seats.prove("boot")
+    if name in ("fresh", "concurrent"):
+        return
+    if name == "restart":
+        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+        seats.prove("restart")
+    elif name == "daemon-restart":
+        # The provider dies with the daemon, so the new daemon's latest observation of the seat is
+        # still the running predecessor.
+        node.kill_daemon()
+        for row in json.loads(node.pty("list", "--json").stdout or "[]"):
+            node.pty("kill", row["name"])
+        node.start()
+        seats.prove("daemon-restart")
+    elif name == "reexec":
+        before = driver_processes(node)
+        if not before:
+            fail("no seat driver process to re-exec")
+        # A deploy installs the new binary, then restarts the daemon from it; the daemon re-points
+        # the link every seat follows, and each driver and channel re-execs in place.
+        replacement = scratch / "st3-replacement"
+        shutil.copy2(node.binary.resolve(), replacement)
+        staging = node.root / "bin/st3.staged"
+        staging.symlink_to(replacement)
+        os.replace(staging, node.binary)
+        new_inode = os.stat(replacement).st_ino
+        node.daemon.terminate()
+        node.daemon.wait(30)
+        node.start()
+
+        def swapped():
+            alive = [pid for pid in before if Path(f"/proc/{pid}").exists()]
+            return alive and all(os.stat(f"/proc/{pid}/exe").st_ino == new_inode for pid in alive)
+        until(swapped, 60, "the seat's st processes did not re-exec into the replacement: "
+                           + json.dumps({str(pid): argv[:80] for pid, (argv, _) in before.items()}))
+        seats.prove("reexec", fresh_incarnation=False)
+    else:
+        fail(f"unknown scenario {name}")
+
+
+def run(args, root, evidence):
+    node = Node(root, args.binary, args.harness)
+    count = 5 if args.scenario == "concurrent" else 1
+    letters = LETTERS[:count]
+    seats = Seats(node, letters, args.bound)
+    try:
+        node.start()
+        source = root / "mission.kdl"
+        source.write_text(mission_source(node, count, args.harness))
+        node.cli("missions", "publish", str(source), "--as", "person/eval")
+        node.cli("missions", "start", MISSION, "--id", RUN_ID, "--workspace", str(root / "ws"),
+                 "--as", "person/eval")
+        scenario(node, seats, args.scenario, args.scratch)
+        return {"verdict": "pass", "harness": args.harness, "scenario": args.scenario,
+                "seconds_to_boot": seats.timings}
+    except (Failure, subprocess.TimeoutExpired) as error:
+        return {"verdict": "fail", "harness": args.harness, "scenario": args.scenario,
+                "failure": str(error), "seconds_to_boot": seats.timings}
+    finally:
+        for letter in letters:
+            terminal = node.pty("peek", "--plain", "--full", f"c1.seat-{letter}")
+            (evidence / f"terminal-{letter}.txt").write_text(terminal.stdout + terminal.stderr)
+            if node.daemon.poll() is None:
+                (evidence / f"trace-{letter}.jsonl").write_text(
+                    node.cli("trace", "show", seat_subject(letter), "--json", "--limit", "500", check=False))
+        for index, record in enumerate(sorted((root / "state").rglob("harness-state"))):
+            (evidence / f"harness-state-{index}.json").write_text(record.read_text(errors="replace"))
+        node.stop()
+        for path in [root / "daemon.log", *sorted((root / "ws").glob("receipts-*.jsonl"))]:
+            if path.exists():
+                (evidence / path.name).write_text(path.read_text(errors="replace"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("evidence", type=Path)
+    parser.add_argument("harness", choices=HARNESSES)
+    parser.add_argument("scenario", choices=SCENARIOS)
+    parser.add_argument("--bound", type=float, default=90, help="seconds each phase may take")
+    parser.add_argument("--scratch", type=Path, default=None,
+                        help="a directory on a real disk for the replacement binary (reexec)")
+    args = parser.parse_args()
+    args.binary = args.binary.resolve()
+    args.evidence.mkdir(parents=True, exist_ok=True)
+    args.scratch = (args.scratch or args.evidence).resolve()
+    args.scratch.mkdir(parents=True, exist_ok=True)
+    # Short, private paths: Unix socket paths are limited to about 100 bytes.
+    root = Path(tempfile.mkdtemp(prefix="bc-", dir="/tmp"))
+    try:
+        result = run(args, root, args.evidence)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    (args.evidence / "result.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result["verdict"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

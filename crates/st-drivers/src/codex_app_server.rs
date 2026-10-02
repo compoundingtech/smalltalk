@@ -1291,7 +1291,13 @@ impl CodexInboxDelivery {
         if !due {
             return Ok(());
         }
-        let unread = crate::push_mailbox::messages(&self.config.agent_dir, &self.config.inbox)?;
+        // Codex can bind its thread before the daemon's first mailbox replay lands. Until then
+        // nothing is known, so nothing is pruned or delivered, and the next pass asks again.
+        let unread = match crate::push_mailbox::messages(&self.config.agent_dir, &self.config.inbox)
+        {
+            Err(error) if crate::push_mailbox::is_not_replayed(&error) => return Ok(()),
+            unread => unread?,
+        };
         self.reconcile_inbox(&unread)?;
         if self.rejected.as_ref().is_some_and(|rejected| {
             unread
@@ -5346,6 +5352,10 @@ fn wait_for_binding(
     }
 }
 
+fn stop_raised() -> bool {
+    crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn monitor_bound_tui(tui: &mut ProviderProcess, events: &Receiver<ControlEvent>) -> Result<TuiEnd> {
     loop {
         if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
@@ -5370,14 +5380,27 @@ fn monitor_bound_tui(tui: &mut ProviderProcess, events: &Receiver<ControlEvent>)
             | Ok(ControlEvent::SafeFallbackActivated { .. }) => {}
             Ok(ControlEvent::Bound) => {}
             Ok(ControlEvent::Observed) => {}
+            // A stop signals the whole process group: the app-server can end the control
+            // connection before this loop reads the flag the same signal raised. That race is a
+            // stop, not a control failure; a failure would leave the predecessor's "failed" record
+            // for the replacement to inherit.
             Ok(ControlEvent::Closed) => {
+                if stop_raised() {
+                    continue;
+                }
                 anyhow::bail!("Codex control connection closed while the TUI was live")
             }
             Ok(ControlEvent::Failed(error)) => {
+                if stop_raised() {
+                    continue;
+                }
                 anyhow::bail!("Codex control failed while the TUI was live: {error}")
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if stop_raised() {
+                    continue;
+                }
                 anyhow::bail!("Codex control observer ended while the TUI was live")
             }
         }

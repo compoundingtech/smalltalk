@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `2b6be4d1cdd5f80de1bbd4ad80961cee4492b62c067b7ff9920696b3fe19e376`
+Digest: `6f741bec9d469438ee9d4291b556b886a976404544b85af191931da709968fb4`
 
 ## Subject families
 
@@ -51,8 +51,8 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `harness.session-file` | `agent:subject-reference`, `harness:string immutable`, `incarnation_id:string`, `modified_at:string`, `path:string`, `session_id:string`, `status:string` | A harness session file that can outlive one runtime incarnation. |
 | `human.review` | `decision:string`, `document:string`, `reason:string`, `reviewer:subject-reference`, `submitted_at:string`, `target:subject-reference` | A human review of another graph subject. |
 | `vcs.commit` | `author:string`, `committed_at:string`, `committer:string`, `message:string`, `parents:array`, `repository:subject-reference immutable`, `sha:string immutable`, `state:string`, `tree:string immutable`, `url:string` | An immutable version control commit. |
-| `vcs.issue` | `author:string`, `created_at:string`, `labels:array`, `number:integer`, `repository:subject-reference`, `state:string`, `title:string`, `updated_at:string`, `url:string` | A version control issue. |
-| `vcs.pull-request` | `author:string`, `base:subject-reference`, `branch:string`, `checks:array`, `created_at:string`, `draft:boolean`, `head:subject-reference`, `head_sha:string`, `merged:boolean`, `number:integer`, `opened_by:subject-reference`, `opened_by_run:subject-reference`, `repository:subject-reference`, `reviews:array`, `state:string`, `title:string`, `updated_at:string`, `url:string` | A version control pull request. |
+| `vcs.issue` | `author:string`, `comments:integer`, `created_at:string`, `labels:array`, `last_comment:object`, `mentions:array`, `number:integer`, `reactions:object`, `repository:subject-reference`, `state:string`, `state_reason:string`, `title:string`, `updated_at:string`, `url:string` | A version control issue. |
+| `vcs.pull-request` | `author:string`, `base:subject-reference`, `branch:string`, `checks:array`, `checks_state:string`, `comments:integer`, `created_at:string`, `draft:boolean`, `head:subject-reference`, `head_sha:string`, `last_comment:object`, `mentions:array`, `merge_queue:object`, `merged:boolean`, `number:integer`, `opened_by:subject-reference`, `opened_by_run:subject-reference`, `reactions:object`, `repository:subject-reference`, `review_decision:string`, `reviews:array`, `state:string`, `title:string`, `updated_at:string`, `url:string` | A version control pull request. |
 | `vcs.ref` | `ancestors:array`, `head:string`, `name:string immutable`, `ref_type:string`, `repository:subject-reference immutable`, `target:subject-reference`, `url:string` | A named version control reference. |
 | `vcs.repository` | `default_ref:subject-reference`, `github_http_requests_since_start:integer`, `head:subject-reference`, `issues:array`, `pull_requests:array`, `repository_id:integer`, `state:string`, `url:string`, `vcs:string` | A version control repository. |
 | `custom.NAMESPACE.NAME` | open fact bag | A namespaced custom resource. |

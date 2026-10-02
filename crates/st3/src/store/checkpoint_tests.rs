@@ -1412,3 +1412,65 @@ fn plan_a_copy_of_a_real_store() {
         }
     }
 }
+
+#[test]
+fn an_observed_item_keeps_its_latest_state_and_every_version_still_read_by_id() {
+    let mut sealed = Sealed::default();
+    let item = "resource/github/acme/garden/pull-request/7";
+    let observed = |head: &str| {
+        draft(
+            "resource.observed",
+            item,
+            json!({
+                "kind": "vcs.pull-request",
+                "facts": {"number": 7, "head_sha": head, "state": "open"},
+                "observer": "observer/run/garden/repository",
+                "baseline": false,
+                "changed_fields": ["head_sha"],
+            }),
+        )
+    };
+    let replaced = sealed.add("alder", T + 1, observed("aaaa"));
+    // A version that a review request was made for stays with the request.
+    let requested = sealed.envelope(
+        "alder",
+        T + 2,
+        vec![
+            observed("bbbb"),
+            Draft {
+                kind: "subscription.mission-requested",
+                subject: "subscription/run/garden/reviews",
+                actor: None,
+                body: json!({"fields": {"mission": "mission/review", "resource": item}}),
+            },
+        ],
+    );
+    // A version pinned as a run's input stays while the run names it.
+    let pinned = sealed.add("alder", T + 3, observed("cccc"));
+    sealed.add(
+        "alder",
+        T + 4,
+        draft(
+            "mission-run.created",
+            "mission-run/review/7",
+            json!({"inputs": {"source": {"kind": "resource", "value": item, "claim_id": pinned}}}),
+        ),
+    );
+    let latest = sealed.add("alder", T + 5, observed("dddd"));
+    // A resource that a person or agent records is not an observer's, and stays.
+    let mut authored = observed("eeee");
+    authored.subject = "resource/mission-run/review/7/pull-request";
+    authored.actor = Some(AGENT);
+    let authored = [
+        sealed.add("alder", T + 6, authored),
+        sealed.add("alder", T + 7, {
+            let mut again = observed("ffff");
+            again.subject = "resource/mission-run/review/7/pull-request";
+            again.actor = Some(AGENT);
+            again
+        }),
+    ];
+    let plan = plan_drops(&sealed.build());
+    assert_eq!(dropped(&plan), ids([&replaced]));
+    let _ = (requested, latest, authored);
+}

@@ -1,0 +1,70 @@
+// A token-free `pi` or `omp` for the boot canaries. st's real extension (-e FILE) runs unchanged in
+// a minimal host; only the provider API and the model turn are replaced. The host does what pi does
+// at each boundary: starts the session, hands the extension idle state, takes native user messages
+// and raises the `context` event for them, and acts on a message as a model would.
+import childProcess from 'node:child_process';
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+
+const harness = process.env.STUB_HARNESS;
+if (process.argv.includes('--version')) {
+  // omp's launcher admits only some releases; pi has no version gate.
+  console.log(harness === 'omp' ? 'omp v18.4.4' : 'pi 0.0.0-stub');
+  process.exit(0);
+}
+const agent = process.env.ST_AGENT ?? 'unknown';
+const receiptPath = `${process.cwd()}/receipts-${agent.replace(/[^A-Za-z0-9]/g, '-')}.jsonl`;
+const record = (event, fields = {}) => fs.appendFileSync(receiptPath,
+  JSON.stringify({ event, at: Date.now() / 1000, pid: process.pid, ...fields }) + '\n');
+const st = (...args) => childProcess.spawnSync(process.env.ST3_BIN, args, { encoding: 'utf8', timeout: 60000 });
+
+// What a model does when woken: read the message and claim the step it names.
+const act = (content) => {
+  const message = content.match(/graph="(message\/[0-9a-f]+)"/) ?? content.match(/message\/[0-9a-f]+/);
+  const step = content.match(/st work claim (step-run\/[^\s`]+)/);
+  if (message) {
+    const reference = message[1] ?? message[0];
+    const result = st('conversations', 'read', reference, '--as', agent, '--json');
+    record('read', { reference, exit: result.status, stderr: (result.stderr ?? '').slice(-1000) });
+  }
+  if (step) {
+    const result = st('work', 'claim', step[1], '--as', agent);
+    record('claim', { step: step[1], exit: result.status, stderr: (result.stderr ?? '').slice(-1000) });
+  }
+};
+
+record('started', { argv: process.argv.slice(2), harness });
+const events = new Map();
+let title = '';
+const ctx = {
+  isIdle: () => true,
+  sessionManager: { getSessionId: () => `stub-${process.pid}`, getEntries: () => [] },
+  ui: { notify: (message, level) => record('notification', { message, level }) },
+};
+const api = {
+  on: (event, callback) => events.set(event, callback),
+  sendMessage: () => {},
+  setSessionName: (label) => { title = label; record('seat-title', { label }); },
+  // The native handoff: the provider takes the text as a user turn, raises `context` with it, and
+  // the model answers. Delivered and read evidence come from the extension, not from here.
+  sendUserMessage: async (content) => {
+    record('turn', { text: content });
+    await events.get('context')?.({ messages: [{ role: 'user', content }] }, ctx);
+    setTimeout(() => act(content), 0);
+  },
+};
+const index = process.argv.findIndex((arg) => arg === '--extension' || arg === '-e');
+if (index < 0) throw new Error('the driver did not supply its extension');
+const { default: extension } = await import(pathToFileURL(process.argv[index + 1]));
+extension(api);
+await events.get('session_start')?.({}, ctx);
+record('ready');
+const keepalive = setInterval(() => {}, 1000);
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(signal, async () => {
+    // pi's extension closes its channel only for a quit.
+    await events.get('session_shutdown')?.({ reason: 'quit' }, ctx);
+    clearInterval(keepalive);
+    process.exit(0);
+  });
+}

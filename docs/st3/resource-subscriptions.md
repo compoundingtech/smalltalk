@@ -13,18 +13,34 @@ local file.
 
 The GitHub provider supports `head`, `state`, `review`, and `checks`.
 
-The repository provider supports `pull_requests` and `issues`. It retains discoveries and filters draft pull requests.
-Each listed pull request records its `number`, `url`, `title`, `head` SHA, `branch`, `author` login,
-`state`, and `draft`. A retained pull request that leaves the open listing becomes `closed`; an open
-listing cannot tell a merge from a closure.
+One `github.repository` observer covers one repository. Its fields name the data types it emits:
+`pull_requests`, `issues`, `comments`, `reactions`, and `mentions`. Each subscription on it adds the
+types it selects, and the observer emits nothing else. One poll serves every type, however many
+items the repository has, so no pull request or issue needs an observer of its own.
+
+Each pull request and issue is its own resource, `RESOURCE/pull-request/NUMBER` (kind
+`vcs.pull-request`) or `RESOURCE/issue/NUMBER` (kind `vcs.issue`). Each item resource holds the item's
+latest state. The repository resource keeps only its own facts, such as `repository_id`.
+
+| Data type | Facts on each item |
+|---|---|
+| `pull_requests` | `number`, `url`, `title`, `author`, `created_at`, `state`, `merged` once closed, `draft`, `head_sha`, `branch`, `checks_state`, `checks` (each `name`, `status`, `conclusion`), `review_decision`, `reviews` (each reviewer's latest `state` and `commit`), `merge_queue` (`state`, `position`) while queued, and `opened_by`/`opened_by_run` |
+| `issues` | `number`, `url`, `title`, `author`, `created_at`, `state`, `state_reason` |
+| `comments` | `comments` (the count), and `last_comment` (`id`, `author`, `url`, `created_at`, `updated_at`, `body_digest`) |
+| `reactions` | `reactions` (each reaction's count), and `last_comment.reactions` |
+| `mentions` | `mentions`: the newest mention of each GitHub login in the item's body or comments (`login`, `by`, `url`, `at`), up to 50 |
+
+A comment body never enters the graph. `body_digest` tells one body from another, and `url` leads to
+the text. A subscription that selects `comments`, `reactions`, or `mentions` hears a change of that
+type only; a check, a review, or a new head is a `pull_requests` change.
 
 The `github.ref` provider supports `head` and `ancestors`. `head` is the selected branch's commit SHA.
 `ancestors` contains the full `refs/heads/NAME` name of every other repository branch whose head is
 reachable from the selected branch.
 
-Each newly ready pull request becomes one `vcs.pull-request` resource. Each new issue becomes one `vcs.issue` resource.
-A pull request resource follows its item: a new head, a closure, and a return to draft each record
-one more observation of it, with `head_sha`, `branch`, `author`, and `state`.
+Every item the observer sees becomes its resource, including a draft pull request and every open
+item at the baseline. Only a change records an observation: an unchanged item records nothing, and
+an observation that read only some facts, such as a new comment, keeps the others.
 
 Agents open pull requests with a shared GitHub identity, so the author login cannot say which agent
 opened one. When a pull request appears or moves to a new head, the observing host looks for the
@@ -151,13 +167,35 @@ A registered provider converts one locator into normalized resource fields.
 
 The provider returns an unchanged result or one complete observation. A partial response cannot replace the last good observation.
 
-The GitHub repository provider reads every page of the open pull request and issue listings, up to
-10 pages each. A larger listing fails the observation instead of recording part of it, because a
-partial listing makes older items look new later. The provider also records the repository's
-numeric ID. A renamed repository answers its old locator through a redirect with the same ID, so
-every item keeps its identity. A different ID fails the observation. An item is identified by its
-number within the observed resource. A listing never removes a previous item or a field that the
-observation did not request.
+The GitHub repository provider reads what changed since its cursor. Its first poll reads every open
+item, up to 10 pages; a larger open listing fails the observation instead of recording part of it.
+After that, it reads the issues listing for items updated since its watermark, which also names
+each closed pull request's merge, and the repository's comments updated since a second watermark.
+A comment watermark starts at the first poll, so st does not read old comments. Each read is
+conditional and its URL changes only when something changed, so an idle repository answers 304
+and costs nothing. A read longer than 10 pages records what it read and continues at once.
+
+Pull request heads, checks, reviews, and merge-queue state come from one GraphQL query for every
+open pull request. GraphQL has no conditional request and spends its own hourly budget, so the
+query runs at the first poll, when the issues listing shows an open pull request changed, while a
+pull request has pending checks or a place in the merge queue, and otherwise every 15 minutes.
+Every observer of the repository on a host shares the answer.
+
+A reaction changes no update time. With `reactions`, the provider also reads the open issues
+listing, which names each open item's reactions, and the newest 100 comments for theirs.
+
+The cursor holds both watermarks and the version of each listing whose items were already
+recorded, so an unchanged listing returns nothing to record. A cursor from an older build holds
+neither, so its next poll is a first poll.
+
+The provider also records the repository's numeric ID. A renamed repository answers its old locator
+through a redirect with the same ID, so every item keeps its identity. A different ID fails the
+observation. An item is identified by its number within the observed resource.
+
+Builds before item resources kept every item in the repository facts. The first observation
+without them records each listed item that had no resource, closes each pull request that was open
+there and left the open listing, and records the repository facts without the items. A delivery
+compares an item against that older listing, so the upgrade starts no review and no triage.
 
 The provider can use a webhook, a stream, or a conditional request. A conditional provider returns one next-check deadline.
 
@@ -188,6 +226,13 @@ An unchanged failure creates no new claim. A later success replaces the complete
 An observer checks its declared fields. Its effective field set also includes the union of its subscription fields.
 
 st does not fetch once for each target. A subscription update can expand or reduce the observer field set.
+
+## Retention
+
+Each item resource keeps its latest state. An observation replicates only a change, and a checkpoint
+drops each observer observation that a newer one replaced. It keeps a version that a subscription
+request, a message, or a mission run input names. Comment bodies and other high-volume history stay
+out of the replicated log.
 
 ## Change and delivery rules
 
@@ -249,7 +294,7 @@ five-request cap close automatically, including while the queue is waiting for c
 
 An optional `requester` names one exact agent or person as the run's requester.
 
-A draft pull request does not create a resource. Its first ready observation creates one resource and one mission request.
+A draft pull request creates a resource and no request. Its first ready observation creates one mission request.
 
 A pull request review request that has not started, including a legacy hold or one waiting for
 capacity, starts only while its head is the open pull request's current head. When the pull request
@@ -277,6 +322,8 @@ A later observed field change creates one `resource.observed` claim. An unchange
 A scheduled unchanged observation creates no durable observer claim. A manual refresh creates one `observer.observed` receipt for its exact attempt.
 
 Each subscription that selected a changed field creates one message. Its stable key uses the observation claim and subscription subject.
+For a repository observer, the message lists up to 20 changed items with their facts, cites their
+claims, and counts them in `items_changed`.
 
 An optional `when` block changes this from delivery on every selected change to delivery on a
 false-to-true predicate transition:
@@ -351,7 +398,14 @@ mission cancellation to stop it.
 - New requests cannot pass an older request waiting on a capacity retry.
 - Legacy held requests migrate automatically; current requests start and stale requests cancel with a reason.
 - Stored held-request attention closes even while the queue waits for capacity.
-- A draft-to-ready transition creates one pull request resource and one mission request.
+- A draft-to-ready transition creates one mission request.
+- One repository observer records each item as its own resource; an unchanged poll records no
+  claim, and a poll that read only a comment keeps the item's other facts.
+- An unchanged repository costs only 304 answers, and GraphQL runs again only while a pull request
+  settles or after 15 minutes.
+- An item first seen through a comment, or created before the watermark, is not new and asks for
+  no triage.
+- A mention subscription hears a mention and not a finished check.
 - Pull requests from the GitHub issues endpoint do not create issue resources.
 - An unselected field change creates an observation claim and no message for that subscription.
 - A daemon restart creates no duplicate message.

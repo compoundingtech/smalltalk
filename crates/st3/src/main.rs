@@ -14672,6 +14672,15 @@ async fn drive_codex_native(
     } = paths.clone();
     let root = paths.state_root();
     let state_dir = root.join("state");
+    let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
+    if matches!(start, ProviderStart::Launch(_)) {
+        // The path can still hold the predecessor's terminal record. It is the predecessor's, never
+        // this incarnation's: only a byte change after this point is the new wrapper's claim.
+        loop_state.predecessor_harness_record = fs::read(&harness_state_path).ok();
+        loop_state.harness_record_started = false;
+    } else {
+        loop_state.harness_record_started = true;
+    }
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
@@ -14799,10 +14808,17 @@ async fn drive_codex_native(
                         }).await?;
                         loop_state.ready = true;
                     }
-                    if let Some(observed) = st_drivers::harness_state::read(
-                        &st_drivers::harness_state::harness_state_path(&agent_dir),
-                        None,
-                    ) {
+                    let current_record = fs::read(&harness_state_path).ok();
+                    loop_state.harness_record_started = harness_record_belongs_to_current_session(
+                        loop_state.harness_record_started,
+                        loop_state.predecessor_harness_record.as_deref(),
+                        current_record.as_deref(),
+                    );
+                    if let Some(observed) = loop_state
+                        .harness_record_started
+                        .then(|| st_drivers::harness_state::read(&harness_state_path, None))
+                        .flatten()
+                    {
                         publish_harness_activity(
                             client,
                             subject,
