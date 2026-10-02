@@ -4204,6 +4204,7 @@ dependencies = [
  "st-drivers",
  "st-runtime",
  "st3-client",
+ "st3-conversation-ui",
  "st3-schema",
  "tar",
  "tempfile",

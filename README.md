@@ -411,7 +411,9 @@ key. If delivery remains unconfirmed, the error prints the key: rerun the same c
 for a new message.
 
 `st conversations sessions` lists harness sessions and `st conversations timeline SESSION`
-shows one session's messages and tool calls.
+shows one conversation as stui shows it: messages, Small Talk, and tool calls folded to a line
+or two. `--raw` prints every stored entry instead (message boundaries, tool input and output in
+full), and `--json` prints the page.
 
 ## Bring in sessions st does not own
 
