@@ -86,6 +86,8 @@ pub fn st3_message_reference(msg: &Message) -> Option<&str> {
 /// projected inbox file, because the inbox round trip may add a trailing newline to the body.
 pub const ST3_TO_TAG: &str = "st3-to:";
 pub const ST3_SHA256_TAG: &str = "st3-sha256:";
+/// One tag per attachment on a projected message: [`AttachmentNotice`] as percent-escaped JSON.
+pub const ST3_ATTACHMENT_TAG: &str = "st3-attachment:";
 
 fn st3_tag<'a>(msg: &'a Message, prefix: &str) -> Option<&'a str> {
     msg.tags.iter().find_map(|tag| tag.strip_prefix(prefix))
@@ -140,6 +142,66 @@ pub fn st3_notification_text(
     body: &str,
     body_sha256: &str,
 ) -> String {
+    st3_notification_with_attachments(reference, from, to, subject, body, body_sha256, &[])
+}
+
+/// A file a message carries, as the seat's harness is told about it: where this machine keeps
+/// it, so the harness can open it. A file that cannot be had says why instead.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachmentNotice {
+    pub path: Option<String>,
+    pub media_type: String,
+    pub name: Option<String>,
+    pub size: u64,
+    /// Why there is no `path`, such as `expired`.
+    pub unavailable: Option<String>,
+}
+
+impl AttachmentNotice {
+    /// The tag a projected message carries this notice in. Tags are comma-separated text, so
+    /// every byte outside a plain word is escaped.
+    pub fn to_tag(&self) -> String {
+        let json = serde_json::to_string(self).unwrap_or_default();
+        let mut tag = String::from(ST3_ATTACHMENT_TAG);
+        for byte in json.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/') {
+                tag.push(char::from(byte));
+            } else {
+                tag.push_str(&format!("%{byte:02x}"));
+            }
+        }
+        tag
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        let escaped = tag.strip_prefix(ST3_ATTACHMENT_TAG)?.as_bytes();
+        let mut bytes = Vec::with_capacity(escaped.len());
+        let mut index = 0;
+        while index < escaped.len() {
+            if escaped[index] == b'%' {
+                let pair = escaped.get(index + 1..index + 3)?;
+                bytes.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
+                index += 3;
+            } else {
+                bytes.push(escaped[index]);
+                index += 1;
+            }
+        }
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+/// [`st3_notification_text`] with one `<attachment/>` element per file inside the envelope, after
+/// the body. Each value is escaped like the envelope's own attributes.
+pub fn st3_notification_with_attachments(
+    reference: &str,
+    from: &str,
+    to: &str,
+    subject: Option<&str>,
+    body: &str,
+    body_sha256: &str,
+    attachments: &[AttachmentNotice],
+) -> String {
     let person_message = from.starts_with("person/");
     let graph = normalize_field(Some(reference), "message/unknown", ADDRESS_MAX_CHARS);
     let id = graph.strip_prefix("message/").unwrap_or(&graph);
@@ -163,6 +225,24 @@ pub fn st3_notification_text(
             envelope.push('…');
         }
         envelope.push('\n');
+    }
+    for attachment in attachments {
+        envelope.push_str("<attachment");
+        if let Some(path) = &attachment.path {
+            envelope.push_str(&format!(" path=\"{}\"", xml_escape(&normalize_line(path), true)));
+        }
+        envelope.push_str(&format!(
+            " media_type=\"{}\" bytes=\"{}\"",
+            xml_escape(&normalize_line(&attachment.media_type), true),
+            attachment.size
+        ));
+        if let Some(name) = attachment.name.as_deref().map(normalize_line).filter(|name| !name.is_empty()) {
+            envelope.push_str(&format!(" name=\"{}\"", xml_escape(&name, true)));
+        }
+        if let Some(reason) = &attachment.unavailable {
+            envelope.push_str(&format!(" unavailable=\"{}\"", xml_escape(&normalize_line(reason), true)));
+        }
+        envelope.push_str("/>\n");
     }
     envelope.push_str("</smalltalk-message>");
     if truncated {
@@ -322,14 +402,20 @@ fn poke_text_with_resolver(
         let sha256 = st3_tag(msg, ST3_SHA256_TAG)
             .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
             .map_or_else(|| st3_body_sha256(&msg.body), str::to_owned);
+        let attachments: Vec<AttachmentNotice> = msg
+            .tags
+            .iter()
+            .filter_map(|tag| AttachmentNotice::from_tag(tag))
+            .collect();
         return with_dictation_notice(
-            st3_notification_text(
+            st3_notification_with_attachments(
                 reference,
                 msg.from.as_deref().unwrap_or_default(),
                 st3_tag(msg, ST3_TO_TAG).unwrap_or(recipient),
                 msg.subject.as_deref(),
                 &msg.body,
                 &sha256,
+                &attachments,
             ),
             &msg.tags,
         );

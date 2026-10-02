@@ -1507,6 +1507,7 @@ async fn send_message(
         in_reply_to,
         session_id,
         tags,
+        attachments: Vec::new(),
         signature: None,
     };
     let message_id = |result: st3_client::Envelope<st3_client::ActionResult>| {

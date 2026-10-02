@@ -16,6 +16,8 @@ Use these documents for implementation details:
   are recorded and replicated.
 - [Lanes](lanes.md) defines the ordered lanes a mission run works through, such as the merge
   train, and `st lanes`.
+- [Attachments](attachments.md) defines the images a message carries between machines: where the
+  bytes live (never in sync), the limits, upload and read, and delivery to a seat.
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
 - [Seats across deploys](seat-deploys.md) explains how a running seat's driver and channels follow
   a replaced st binary without ending the provider session, and how st reports a stale message path.

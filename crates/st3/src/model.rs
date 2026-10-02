@@ -1671,6 +1671,31 @@ pub struct AttentionRequestView {
     pub closed_by: Option<String>,
 }
 
+/// One file a message carries, by reference. The claim holds this record and never the bytes:
+/// they stay on `origin`, the member that took the upload, and travel only to the members that
+/// read or deliver the message, one direct hop at a time. `sha256` is their hash in hex.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MessageAttachment {
+    pub sha256: String,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub size: u64,
+    /// The member holding the bytes, such as `host/laptop`.
+    pub origin: String,
+}
+
+/// An attachment as a sender names it: an upload it made, `blob/<sha256>`, with the type it gave.
+/// The daemon completes it into a [`MessageAttachment`] with the size and the member holding it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AttachmentInput {
+    pub blob: String,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MessageSendRequest {
     pub idempotency_key: String,
@@ -1683,6 +1708,8 @@ pub struct MessageSendRequest {
     pub in_reply_to: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentInput>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1714,6 +1741,8 @@ pub struct MessageView {
     pub in_reply_to: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachment>,
     pub created_index: u64,
 }
 

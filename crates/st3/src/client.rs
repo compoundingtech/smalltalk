@@ -211,6 +211,14 @@ impl Client {
         Self::new(Endpoint::Unix(path.into()))
     }
 
+    /// The daemon's Unix socket, when this client talks to one.
+    pub fn socket_path(&self) -> Option<&std::path::Path> {
+        match &self.endpoint {
+            Endpoint::Unix(path) => Some(path),
+            Endpoint::Http(_) => None,
+        }
+    }
+
     /// Name the concrete human authority carried over the trusted Unix boundary.
     /// Ordinary [`Client::unix`] sessions intentionally remain read-only.
     pub fn unix_as(path: impl Into<PathBuf>, person: impl Into<String>) -> Result<Self> {
@@ -1342,6 +1350,7 @@ mod tests {
             title: Some("A greeting".into()),
             in_reply_to: None,
             tags: vec!["example".into()],
+            attachments: Vec::new(),
         };
         let mut client = fast_client(Endpoint::Unix(socket));
         client.deadlines.request = Duration::from_millis(200);
@@ -1399,6 +1408,7 @@ mod tests {
                 title: None,
                 in_reply_to: None,
                 tags: vec![],
+                attachments: Vec::new(),
             })
             .await
             .unwrap_err()

@@ -208,6 +208,11 @@ enum Command {
         #[command(subcommand)]
         command: DocCommand,
     },
+    /// Upload or read the images a message carries between machines.
+    Blobs {
+        #[command(subcommand)]
+        command: BlobCommand,
+    },
     /// Restrict what agents may write, and read what each rule would have refused.
     Rules {
         #[command(subcommand)]
@@ -2361,6 +2366,35 @@ enum CheckpointCommand {
 }
 
 #[derive(Subcommand)]
+enum BlobCommand {
+    /// Keep one PNG, JPEG, GIF or WebP image (at most 10 MiB) on this member and print its
+    /// reference. Name it in `conversations send --attach`, or pass the file there directly.
+    Put {
+        file: PathBuf,
+        /// The image type; by default the file's own bytes decide.
+        #[arg(long)]
+        media_type: Option<String>,
+        /// Who uploads; defaults to ST_AGENT, then the configured person.
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
+    /// Read one attachment. A member that does not hold it asks the member that took the upload.
+    Get {
+        /// `blob/<sha256>` or the hash.
+        reference: String,
+        /// The message that carries it; a person reads an attachment through its message.
+        #[arg(long)]
+        message: Option<String>,
+        /// Write the image here instead of standard output.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Who reads; defaults to ST_AGENT, then the configured person.
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DocCommand {
     /// Store a regular file as one immutable named document version.
     Put {
@@ -3207,6 +3241,10 @@ struct MessageSendArgs {
     tags: Vec<String>,
     #[arg(long = "from", alias = "as")]
     from: String,
+    /// Attach an image (PNG, JPEG, GIF or WebP, at most 10 MiB, up to 4). It is uploaded to this
+    /// member and fetched by the machine that reads or delivers the message.
+    #[arg(long = "attach", value_name = "FILE")]
+    attach: Vec<PathBuf>,
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -3251,6 +3289,9 @@ struct MessageReplyArgs {
     subject: Option<String>,
     #[arg(long = "from", alias = "as")]
     from: String,
+    /// Attach an image (PNG, JPEG, GIF or WebP, at most 10 MiB, up to 4).
+    #[arg(long = "attach", value_name = "FILE")]
+    attach: Vec<PathBuf>,
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -3651,6 +3692,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Trace { command } => run_trace_command(&client, command, cli.json).await,
         Command::Schema { command } => run_schema(&client, command, cli.json).await,
         Command::Documents { command } => run_doc(&client, command, cli.json).await,
+        Command::Blobs { command } => {
+            run_blobs(&endpoint, config.person.as_deref(), command, cli.json).await
+        }
         Command::Rules { command } => run_rules(&client, &config, command, cli.json).await,
         Command::Import { command } => run_import(&endpoint, command, cli.json).await,
         Command::Completions(args) => {
@@ -8767,6 +8811,122 @@ fn normalize_member_subject(subject: &str, namespace: &str) -> String {
     }
 }
 
+/// The identity an attachment command acts as: the one named, the seat's, or the configured person.
+fn blob_actor(named: Option<String>, configured_person: Option<&str>) -> Result<String> {
+    let actor = named
+        .or_else(|| std::env::var("ST_AGENT").ok().filter(|agent| !agent.is_empty()))
+        .or_else(|| configured_person.map(str::to_owned))
+        .context("name who acts with --as, or run inside a seat or with a configured person")?;
+    reject_foreign_agent_actor(&actor)?;
+    Ok(normalize_message_subject(&actor))
+}
+
+/// Upload a file as an attachment for `actor`, and name it for a message.
+async fn upload_attachment(
+    endpoint: &Endpoint,
+    actor: &str,
+    file: &Path,
+    media_type: Option<&str>,
+) -> Result<st3::model::AttachmentInput> {
+    let metadata = fs::symlink_metadata(file)
+        .with_context(|| format!("inspect attachment {}", file.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        file.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= st3::blobs::MAX_BLOB_BYTES as u64,
+        "{} is larger than the {} MiB an attachment may be",
+        file.display(),
+        st3::blobs::MAX_BLOB_BYTES / (1024 * 1024)
+    );
+    let bytes = fs::read(file).with_context(|| format!("read attachment {}", file.display()))?;
+    let media_type = media_type
+        .map(str::to_owned)
+        .or_else(|| st3::blobs::sniff_media_type(&bytes).map(str::to_owned))
+        .with_context(|| {
+            format!(
+                "{} is not a PNG, JPEG, GIF or WebP image",
+                file.display()
+            )
+        })?;
+    let uploaded = generated_client(endpoint, Some(actor))?
+        .upload_blob(bytes, &media_type)
+        .await
+        .map_err(|error| anyhow::anyhow!("{}", error.plain()))?
+        .value;
+    Ok(st3::model::AttachmentInput {
+        blob: uploaded.blob,
+        media_type: uploaded.media_type,
+        name: file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+    })
+}
+
+async fn upload_attachments(
+    endpoint: &Endpoint,
+    actor: &str,
+    files: &[PathBuf],
+) -> Result<Vec<st3::model::AttachmentInput>> {
+    let mut attachments = Vec::new();
+    for file in files {
+        attachments.push(upload_attachment(endpoint, actor, file, None).await?);
+    }
+    Ok(attachments)
+}
+
+async fn run_blobs(
+    endpoint: &Endpoint,
+    configured_person: Option<&str>,
+    command: BlobCommand,
+    json_output: bool,
+) -> Result<()> {
+    match command {
+        BlobCommand::Put {
+            file,
+            media_type,
+            actor,
+        } => {
+            let actor = blob_actor(actor, configured_person)?;
+            let attachment =
+                upload_attachment(endpoint, &actor, &file, media_type.as_deref()).await?;
+            if json_output {
+                print_value(&attachment, true)
+            } else {
+                println!("{}", attachment.blob);
+                Ok(())
+            }
+        }
+        BlobCommand::Get {
+            reference,
+            message,
+            output,
+            actor,
+        } => {
+            let actor = blob_actor(actor, configured_person)?;
+            let hash = st3::blobs::parse_reference(&reference)?;
+            let bytes = generated_client(endpoint, Some(&actor))?
+                .blob(&hash, message.as_deref())
+                .await
+                .map_err(|error| anyhow::anyhow!("{}", error.plain()))?;
+            match output {
+                Some(path) => {
+                    fs::write(&path, &bytes)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    println!("{}", path.display());
+                }
+                None => {
+                    use std::io::Write as _;
+                    std::io::stdout().write_all(&bytes)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn run_rules(
     client: &Client,
     config: &Config,
@@ -12265,7 +12425,13 @@ async fn run_message(
     sync_message_projection(client).await?;
     match command {
         MessageCommand::Send(args) => {
-            let Some(message) = send_message(client, args).await? else {
+            let attachments = if args.attach.is_empty() {
+                Vec::new()
+            } else {
+                let from = blob_actor(Some(args.from.clone()), None)?;
+                upload_attachments(endpoint, &from, &args.attach).await?
+            };
+            let Some(message) = send_message(client, args, attachments).await? else {
                 return Ok(());
             };
             sync_message_projection(client).await?;
@@ -12396,6 +12562,21 @@ async fn run_message(
                         }
                         println!();
                         println!("{}", message.content);
+                        for attachment in &message.attachments {
+                            println!(
+                                "Attachment: blob/{} ({}, {} bytes{}); read it with `st blobs get blob/{} --message {} -o FILE`",
+                                attachment.sha256,
+                                attachment.media_type,
+                                attachment.size,
+                                attachment
+                                    .name
+                                    .as_deref()
+                                    .map(|name| format!(", {name}"))
+                                    .unwrap_or_default(),
+                                attachment.sha256,
+                                message.subject,
+                            );
+                        }
                     }
                 }
             }
@@ -12405,10 +12586,17 @@ async fn run_message(
         MessageCommand::Reply(args) => {
             let original = read_message(client, &args.reference).await?;
             let recipient = message_reply_recipient(&original, &args.from)?;
+            let attachments = if args.attach.is_empty() {
+                Vec::new()
+            } else {
+                let from = blob_actor(Some(args.from.clone()), None)?;
+                upload_attachments(endpoint, &from, &args.attach).await?
+            };
             let message = send_message(
                 client,
                 MessageSendArgs {
                     to: recipient,
+                    attach: Vec::new(),
                     body: args.body,
                     subject: args
                         .subject
@@ -12419,6 +12607,7 @@ async fn run_message(
                     print_kdl: args.print_kdl,
                     idempotency_key: args.idempotency_key,
                 },
+                attachments,
             )
             .await?;
             let Some(message) = message else {
@@ -12553,7 +12742,11 @@ async fn run_message(
     }
 }
 
-async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<MessageView>> {
+async fn send_message(
+    client: &Client,
+    args: MessageSendArgs,
+    attachments: Vec<st3::model::AttachmentInput>,
+) -> Result<Option<MessageView>> {
     let id = uuid::Uuid::now_v7().simple().to_string();
     let mission_id = format!("message/{id}");
     reject_foreign_agent_actor(&args.from)?;
@@ -12584,6 +12777,7 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<M
             title: args.subject,
             in_reply_to: args.in_reply_to,
             tags: args.tags,
+            attachments,
         })
         .await
         .map(Some)
@@ -14527,17 +14721,23 @@ async fn publish_harness_state(
 /// read the queued messages during its turn, the queue then re-delivered them as new prompts, and
 /// seats that answered those stale prompts declined the next real task in three of six
 /// cross-harness runs.
-fn pi_family_message_frame(message: &st3::model::MessageView, body: &str, identity: &str) -> Value {
+fn pi_family_message_frame(
+    message: &st3::model::MessageView,
+    body: &str,
+    identity: &str,
+    attachments: &[st_drivers::ding::AttachmentNotice],
+) -> Value {
     json!({
         "type": "message",
         "deliverAs": "steer",
-        "content": st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_text(
+        "content": st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_with_attachments(
             &message.subject,
             &message.from,
             &message.to,
             message.title.as_deref(),
             body,
             &st_drivers::ding::st3_body_sha256(body),
+            attachments,
         ), &message.tags),
         "meta": {
             "from": message.from,
@@ -14816,7 +15016,16 @@ async fn run_pi_channel(
                             }
                         }
                     }
-                    let frame = pi_family_message_frame(&message, &body, identity);
+                    // Files first: a message that names an image is delivered once the image is here.
+                    let attachments = match st3::blobs::materialize_for_seat(client, subject, &catalog.join("attachments"), &message).await {
+                        Ok(attachments) => attachments,
+                        Err(error) => {
+                            state.delivered.remove(&message.subject);
+                            warn_pi_channel(subject, &error, &mut last_warning);
+                            continue;
+                        }
+                    };
+                    let frame = pi_family_message_frame(&message, &body, identity, &attachments);
                     stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
@@ -16230,8 +16439,18 @@ impl NativeMailbox {
                 }
                 if !self.queued.contains_key(&view.subject) {
                     let body = message_content(client, view).await?;
-                    self.queued
-                        .insert(view.subject.clone(), native_queued_message(view, body));
+                    // Files first: a message that names an image is queued once the image is here.
+                    let attachments = st3::blobs::materialize_for_seat(
+                        client,
+                        &self.fence.subject,
+                        &agent_dir.join("attachments"),
+                        view,
+                    )
+                    .await?;
+                    self.queued.insert(
+                        view.subject.clone(),
+                        native_queued_message(view, body, &attachments),
+                    );
                 }
                 Ok(())
             }
@@ -16251,8 +16470,12 @@ impl NativeMailbox {
     }
 }
 
-fn native_queued_message(view: &MessageView, body: String) -> st_drivers::message::Message {
-    let tags = vec![
+fn native_queued_message(
+    view: &MessageView,
+    body: String,
+    attachments: &[st_drivers::ding::AttachmentNotice],
+) -> st_drivers::message::Message {
+    let mut tags = vec![
         format!("st3-message:{}", view.subject),
         format!("{}{}", st_drivers::ding::ST3_TO_TAG, view.to),
         format!(
@@ -16261,6 +16484,11 @@ fn native_queued_message(view: &MessageView, body: String) -> st_drivers::messag
             st_drivers::ding::st3_body_sha256(&body)
         ),
     ];
+    tags.extend(
+        attachments
+            .iter()
+            .map(st_drivers::ding::AttachmentNotice::to_tag),
+    );
     st_drivers::message::Message {
         filename: view.subject.clone(),
         ts_ms: view.created_index,
@@ -17267,8 +17495,9 @@ mod tests {
             in_reply_to: None,
             tags: vec![],
             created_index: 1,
+            attachments: Vec::new(),
         };
-        let omp = pi_family_message_frame(&message, "FACT QUARTZ", "run-1/wake.omp-2");
+        let omp = pi_family_message_frame(&message, "FACT QUARTZ", "run-1/wake.omp-2", &[]);
         assert_eq!(omp["deliverAs"], "steer");
         assert_eq!(
             omp["content"],
@@ -17458,6 +17687,7 @@ mod tests {
                 in_reply_to: None,
                 tags: Vec::new(),
                 created_index: 1,
+                attachments: Vec::new(),
             };
             let mut mailbox = NativeMailbox {
                 subscription: None,
@@ -19783,6 +20013,7 @@ mod tests {
             in_reply_to: None,
             tags: Vec::new(),
             created_index: 1,
+            attachments: Vec::new(),
         };
 
         assert_eq!(
@@ -19890,6 +20121,7 @@ mod tests {
                     title: None,
                     in_reply_to: None,
                     tags: Vec::new(),
+                    attachments: Vec::new(),
                 },
             )
             .await
@@ -19910,6 +20142,7 @@ mod tests {
                     title: None,
                     in_reply_to: None,
                     tags: Vec::new(),
+                    attachments: Vec::new(),
                 },
             )
             .await

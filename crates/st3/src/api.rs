@@ -58,6 +58,7 @@ use crate::model::{
 use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
+mod client_blobs;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
@@ -411,6 +412,12 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::collection_stream),
         )
         .route("/v1/client/actions", post(client_v0::action))
+        .route(
+            "/v1/client/blobs",
+            post(client_blobs::upload).layer(DefaultBodyLimit::max(client_blobs::UPLOAD_BODY_LIMIT)),
+        )
+        .route("/v1/client/blobs/{id}", get(client_blobs::get))
+        .route("/v1/client/blobs/{id}/chunk", get(client_blobs::chunk))
         .route("/v1/client/pairings", post(client_v0::pairing_begin))
         .route(
             "/v1/client/pairings/{id}/complete",
@@ -1060,7 +1067,14 @@ fn client_error_code(code: Option<&str>) -> String {
         | "remote-unavailable"
         | "terminal-unavailable"
         | "terminal-ended"
+        | "blob-too-large"
+        | "unsupported-media-type"
+        | "blob-content-mismatch"
+        | "blob-quota-exceeded"
+        | "blob-not-found"
+        | "blob-expired"
         | "internal" => code.unwrap_or("internal").to_owned(),
+        "too-many-attachments" | "invalid-blob-reference" => "validation-failed".into(),
         "launch-review-not-authorized"
         | "wrong-message-recipient"
         | "lane-approval-denied"
@@ -2591,6 +2605,19 @@ fn client_attention_resources_with_previews(
     Ok(items)
 }
 
+/// A message's attachment as clients see it. `blob` names it in `message.send` and
+/// `GET /v1/client/blobs/{sha256}`; read it with the message that carries it.
+fn client_attachment(attachment: &crate::model::MessageAttachment) -> Value {
+    json!({
+        "blob": format!("blob/{}", attachment.sha256),
+        "sha256": attachment.sha256,
+        "media_type": attachment.media_type,
+        "name": attachment.name,
+        "size": attachment.size,
+        "origin": attachment.origin,
+    })
+}
+
 fn client_message_resources(
     store: &Store,
     person: Option<&str>,
@@ -2653,6 +2680,7 @@ fn client_message_resources(
             "session_id": session_id,
             "in_reply_to": message.in_reply_to,
             "tags": message.tags,
+            "attachments": message.attachments.iter().map(client_attachment).collect::<Vec<_>>(),
             "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
         }));
     }
@@ -9308,7 +9336,7 @@ fn accept_message(
     session_id: Option<String>,
     device_signature: Option<smallclaims::principal::ClaimSignature>,
 ) -> Result<Json<MessageView>, ApiError> {
-    if request.content.trim().is_empty() {
+    if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
             "a message needs nonempty content",
@@ -9347,6 +9375,7 @@ fn accept_message(
     }
     let from = normalize_message_party(&request.from);
     let to = normalize_message_party(&request.to);
+    let attachments = client_blobs::resolve_attachments(state, &from, &request.attachments)?;
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()))[..16].to_owned();
     let subject = format!("message/{id}");
     let mut fields = BTreeMap::from([
@@ -9377,6 +9406,12 @@ fn accept_message(
     ]);
     if let Some(session_id) = session_id {
         fields.insert("session_id".into(), Value::String(session_id));
+    }
+    if !attachments.is_empty() {
+        fields.insert(
+            "attachments".into(),
+            serde_json::to_value(&attachments).map_err(ApiError::internal)?,
+        );
     }
     if let Some(signature) = &device_signature {
         check_device_signature(state, signature, &request, &subject, &from, &fields)?;
@@ -9416,6 +9451,7 @@ fn accept_message(
         in_reply_to: request.in_reply_to,
         tags: request.tags,
         created_index: record.store_index,
+        attachments,
     }))
 }
 
@@ -14157,6 +14193,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 title: None,
                 in_reply_to: None,
                 tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                attachments: Vec::new(),
             })
             .unwrap()
         };
@@ -16745,6 +16782,7 @@ version 2
                 title: None,
                 in_reply_to: None,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap(),
         )
@@ -16768,6 +16806,7 @@ version 2
                 title: Some("Mission step ready".into()),
                 in_reply_to: None,
                 tags: vec!["st3-work:step-run/run/build@1@1@incarnation".into()],
+                attachments: Vec::new(),
             })
             .unwrap(),
         )
@@ -16792,6 +16831,7 @@ version 2
                 title: None,
                 in_reply_to: None,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap(),
         )
@@ -16822,6 +16862,7 @@ version 2
                     title: None,
                     in_reply_to: None,
                     tags: Vec::new(),
+                    attachments: Vec::new(),
                 })
                 .unwrap(),
             )
@@ -16858,6 +16899,7 @@ version 2
                 title: None,
                 in_reply_to: Some(subject.into()),
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap();
             let (status, sent) = json_request(app.clone(), "/v1/messages", reply.clone()).await;
@@ -16892,6 +16934,7 @@ version 2
                 title: None,
                 in_reply_to: parent,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap()
         };
@@ -16940,6 +16983,7 @@ version 2
                 title: None,
                 in_reply_to: None,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap(),
         )
