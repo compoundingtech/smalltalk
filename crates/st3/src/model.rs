@@ -1505,6 +1505,9 @@ pub struct AttentionItemView {
     pub message_id: Option<String>,
     pub title: String,
     pub detail: String,
+    /// The structured request a person-step ask carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2066,6 +2069,10 @@ pub struct StepRunView {
     pub goals: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraints: Vec<String>,
+    /// Responses to person asks: this attempt's asks on a step that asked, or the step's own
+    /// response on a person ask.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub person_answers: Vec<PersonAnswerView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub under: Vec<UnderSpec>,
     pub worker_reported: bool,
@@ -2264,6 +2271,10 @@ pub struct PersonAskRequest {
     pub new_run: Option<String>,
     #[serde(default)]
     pub incarnation: Option<String>,
+    /// A structured request (`crate::person_request::StructuredRequest`). Without one, the ask
+    /// is free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
     pub idempotency_key: String,
 }
 
@@ -2276,7 +2287,26 @@ pub struct PersonStepResponse {
     pub evidence: Vec<String>,
     #[serde(default)]
     pub episode: Option<String>,
+    /// A named answer or text for a structured request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<crate::person_request::AnswerInput>,
     pub idempotency_key: String,
+}
+
+/// A person's response to an ask, as data: the typed answer when the ask was structured.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PersonAnswerView {
+    pub ask: String,
+    /// `completed` when the person answered, `cancelled` when the ask was withdrawn.
+    pub status: String,
+    pub summary: String,
+    pub respondent: String,
+    pub answered_at_unix_ms: u128,
+    /// The typed answer: `type`, `outcome`, and `id`, `label` and `text` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

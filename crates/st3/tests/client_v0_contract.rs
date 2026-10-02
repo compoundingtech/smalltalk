@@ -516,6 +516,7 @@ async fn attention_socket_evicts_completed_sources_and_reconnects_without_cached
             new_run: Some("choose-date".into()),
             incarnation: None,
             idempotency_key: "socket-ask".into(),
+            request: None,
         })
         .unwrap();
     let server_state = state.clone();
@@ -1212,6 +1213,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
                 new_run: Some(person.into()),
                 incarnation: None,
                 idempotency_key: format!("paired-{person}"),
+                request: None,
             })
             .unwrap()
     };
@@ -2300,6 +2302,7 @@ mission "ios-proof" state="ready" {
             new_run: None,
             incarnation: Some("ios-owner-one".into()),
             idempotency_key: "client-simulator-question".into(),
+            request: None,
         })
         .unwrap();
     let app = st3::api::router(state.clone());
@@ -2325,6 +2328,7 @@ mission "ios-proof" state="ready" {
                 evidence: vec![],
                 episode: None,
                 idempotency_key: "client-simulator-response".into(),
+                answer: None,
             },
             false,
         )
@@ -2781,6 +2785,103 @@ mission "example/merge-train" state="ready" {
 
     let (status, absent) = client_json(app, "/v1/client/lanes/lane/absent/app").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{absent}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_structured_decision_carries_named_answers_both_ways() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        state.store.origin(),
+    )
+    .unwrap();
+    state
+        .store
+        .apply_internal(&intent, "structured-person-asker")
+        .unwrap();
+    let actor = format!("agent/{}.asker", state.store.origin());
+    let app = st3::api::router(state.clone());
+    let request = serde_json::json!({
+        "version": 1,
+        "type": "decision",
+        "question": "Land the three parser PRs in order?",
+        "why_person": "The owner approves merges to the public repository.",
+        "recommendation": {"answer": "land", "reason": "Checks are green on every head."},
+        "subjects": [
+            {"kind": "pull_request", "label": "#11", "url": "https://example.com/pull/11", "revision": "aaa111"},
+            {"kind": "pull_request", "label": "#12", "url": "https://example.com/pull/12", "revision": "bbb222"}
+        ],
+        "answers": [
+            {"id": "land", "label": "Land #11 then #12", "outcome": "accept", "consequence": "The asker queues #11, then #12."},
+            {"id": "keep-open", "label": "Keep both open", "outcome": "decline", "consequence": "Nothing merges."}
+        ]
+    });
+    let (_, snapshot) = client_json(app.clone(), "/v1/client/attention").await;
+    let mut ask = serde_json::json!({"api_version":"st3.client.v0", "id":"action/structured-ask", "type":"work.ask",
+        "idempotency_key":"structured-ask-0001", "fence":{"snapshot_id":snapshot["snapshot"]["id"]}, "parameters":{"person_id":"person/avery",
+        "title":"Land the parser PRs?", "reason":"Land the three parser PRs in order?", "new_run":"parser-prs", "request": request}});
+    ask["parameters"]["request"]["answers"][1]["outcome"] = serde_json::json!("accept");
+    let (status, rejected) =
+        client_post_json_person(app.clone(), "/v1/client/actions", &actor, ask.clone()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+    ask["parameters"]["request"]["answers"][1]["outcome"] = serde_json::json!("decline");
+    let (status, response) =
+        client_post_json_person(app.clone(), "/v1/client/actions", &actor, ask).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (status, attention) = client_json(app.clone(), "/v1/client/attention").await;
+    assert_eq!(status, StatusCode::OK, "{attention}");
+    let card = &attention["value"]["items"][0];
+    assert_eq!(card["attention_kind"], "person-step");
+    assert_eq!(card["request"], request);
+    let subject = card["source_id"].as_str().unwrap().to_owned();
+    let episode = card["episode"].as_str().unwrap().to_owned();
+    let done = |id: &str, parameters: Value| {
+        serde_json::json!({"api_version":"st3.client.v0", "id": format!("action/{id}"), "type":"work.done",
+            "idempotency_key": format!("{id}-0001"), "fence":{"snapshot_id":attention["snapshot"]["id"]},
+            "parameters": parameters})
+    };
+    // A summary alone cannot choose between land and keep-open.
+    let (status, rejected) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "person/avery",
+        done(
+            "structured-words",
+            serde_json::json!({"target_id": subject, "episode": episode, "summary": "yes"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+    assert_eq!(rejected["code"], "validation-failed");
+    assert!(
+        rejected["message"]
+            .as_str()
+            .unwrap()
+            .contains("land, keep-open"),
+        "{rejected}"
+    );
+    let (status, response) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "person/avery",
+        done(
+            "structured-answer",
+            serde_json::json!({"target_id": subject, "episode": episode, "summary": "Keep both open",
+                "answer": {"id": "keep-open", "text": "Wait for the schema change."}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (status, work) = client_json(app, &format!("/v1/client/work/{subject}")).await;
+    assert_eq!(status, StatusCode::OK, "{work}");
+    let answer = &work["value"]["person_answers"][0];
+    assert_eq!(answer["respondent"], "person/avery");
+    assert_eq!(
+        answer["answer"],
+        serde_json::json!({"type": "decision", "outcome": "decline", "id": "keep-open",
+            "label": "Keep both open", "text": "Wait for the schema change."})
+    );
 }
 
 #[tokio::test]

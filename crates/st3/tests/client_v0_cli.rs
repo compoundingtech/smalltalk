@@ -860,6 +860,128 @@ async fn cli_person_ask_is_completed_by_its_assigned_person() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_structured_choice_returns_the_selected_option_as_data() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        store.origin(),
+    )
+    .unwrap();
+    store
+        .apply_internal(&intent, "cli-structured-asker")
+        .unwrap();
+    let actor = format!("agent/{}.asker", store.origin());
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let request = root.path().join("request.json");
+    std::fs::write(
+        &request,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "type": "choice",
+            "question": "How should an oversized missions tree load?",
+            "why_person": "It changes what every client shows.",
+            "recommendation": {"answer": "paged", "reason": "Nothing fails for a large fleet."},
+            "answers": [
+                {"id": "paged", "label": "Page it", "consequence": "Clients read pages with explicit metadata."},
+                {"id": "limit", "label": "Fail past a limit", "consequence": "Large trees return an error."}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ask = value(
+        &run_cli(
+            &socket,
+            &[
+                "work",
+                "ask",
+                "--for",
+                "person/avery",
+                "--title",
+                "Oversized missions tree",
+                "--request",
+                request.to_str().unwrap(),
+                "--new-run",
+                "tree-size",
+                "--as",
+                &actor,
+                "--idempotency-key",
+                "tree-size",
+            ],
+        )
+        .await,
+    );
+    let subject = ask["subject"].as_str().unwrap();
+    // Without --reason, the person reads the request's question.
+    assert_eq!(
+        ask["goals"][0],
+        "How should an oversized missions tree load?"
+    );
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
+    let item = &listed["value"]["items"][0];
+    assert_eq!(item["source_id"], subject);
+    assert_eq!(item["request"]["type"], "choice");
+    assert_eq!(item["request"]["answers"][0]["id"], "paged");
+    let words = run_cli(
+        &socket,
+        &[
+            "work",
+            "done",
+            subject,
+            "--as",
+            "person/avery",
+            "--summary",
+            "paged please",
+        ],
+    )
+    .await;
+    assert!(!words.status.success());
+    assert!(String::from_utf8_lossy(&words.stderr).contains("answer-required"));
+    let done = value(
+        &run_cli(
+            &socket,
+            &[
+                "work",
+                "done",
+                subject,
+                "--as",
+                "person/avery",
+                "--answer",
+                "paged",
+            ],
+        )
+        .await,
+    );
+    assert_eq!(done["status"], "completed");
+    let shown = value(&run_cli(&socket, &["work", "show", subject]).await);
+    let answer = &shown["value"]["person_answers"][0];
+    assert_eq!(answer["respondent"], "person/avery");
+    assert_eq!(answer["summary"], "Page it");
+    assert_eq!(
+        answer["answer"],
+        serde_json::json!({"type": "choice", "outcome": "selected", "id": "paged", "label": "Page it"})
+    );
+    let human = run_cli_human(&socket, &["work", "show", subject]).await;
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("Person answer: selected paged: Page it")
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

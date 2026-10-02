@@ -2245,6 +2245,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("waiting_since", string()),
             ("legacy_request", string()),
             ("requester_declaration", string()),
+            ("request", object()),
         ],
         "work.person-done" | "work.person-cancelled" => &[
             ("attempt", integer()),
@@ -2252,6 +2253,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("summary", string()),
             ("key", string()),
             ("episode", string()),
+            ("answer", object()),
         ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
         | "work.released" => &[

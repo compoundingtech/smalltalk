@@ -270,7 +270,16 @@ in `waiting-person`, with no lease, timeout, or retry consumption. A named small
 live requester declaration or owning run and rejects ambiguous claimed work. Repeating the same
 ask key returns the same step. Retirement and generation replacement invalidate the ask.
 
-`work.done` takes `target_id`, `episode`, nonempty `summary`, and optional string `evidence`.
+`work.ask` may also carry a `request`: a `StructuredRequest` decision, choice or feedback with
+named answers (see [the runtime guide](../mission-graph-runtime.md#structured-requests)). The
+person-step attention card then includes the same `request`; a card without one is a free-text
+ask, and clients should not infer answers from its title.
+
+`work.done` takes `target_id`, `episode`, nonempty `summary`, optional string `evidence`, and
+an optional `answer` (`id` and/or `text`). A structured decision or choice needs `answer.id`,
+or text for an allowed custom choice; requesting changes and feedback need text. Validation
+failures return `validation-failed` with the answer IDs in the message. The asker reads the
+typed answer from the `work` resource's `person_answers`.
 Only the assigned person or a session explicitly delegated by that person completes it. The
 requester may instead use `work.cancel-ask`. Completion resumes a live origin in the same attempt
 with a new readiness epoch; the response and evidence stay on the source. CLI equivalents are

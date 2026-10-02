@@ -157,6 +157,7 @@
             "source_kind": {"type": "string"},
             "episode": {"type": "string"},
             "action_parameters": {"type": "object"},
+            "request": { "$ref": "#/$defs/StructuredRequest", "description": "A person-step ask's structured request; absent on a free-text ask." },
             "source_id": { "$ref": "#/$defs/Id" },
             "person_id": { "$ref": "#/$defs/Id" },
             "requester_id": { "$ref": "#/$defs/Id" },
@@ -654,6 +655,7 @@
             "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "goals": { "type": "array", "items": { "type": "string" } },
             "constraints": { "type": "array", "items": { "type": "string" } }
+            ,"person_answers": { "type": "array", "items": { "$ref": "#/$defs/PersonAnswerRecord" }, "description": "Responses to the asks this attempt made, or a person ask's own response." }
             ,"usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }
           }
         }
@@ -1294,11 +1296,74 @@
     "TerminalCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1}, "host": {"type": "string", "minLength": 1}, "cwd": {"type": "string", "minLength": 1}}},
     "PersonAskParameters": {
       "type": "object", "additionalProperties": false, "required": ["person_id", "title", "reason"],
-      "properties": {"person_id": {"$ref": "#/$defs/Id"}, "title": {"type": "string"}, "reason": {"type": "string"}, "step_id": {"$ref": "#/$defs/Id"}, "new_run": {"type": "string"}}
+      "properties": {"person_id": {"$ref": "#/$defs/Id"}, "title": {"type": "string"}, "reason": {"type": "string"}, "step_id": {"$ref": "#/$defs/Id"}, "new_run": {"type": "string"}, "request": {"$ref": "#/$defs/StructuredRequest"}}
     },
     "PersonStepParameters": {
       "type": "object", "additionalProperties": false, "required": ["target_id", "summary", "episode"],
-      "properties": {"target_id": {"$ref": "#/$defs/Id"}, "summary": {"type": "string", "minLength": 1}, "episode": {"type": "string"}, "evidence": {"type": "array", "items": {"$ref": "#/$defs/Id"}}}
+      "properties": {"target_id": {"$ref": "#/$defs/Id"}, "summary": {"type": "string", "minLength": 1}, "episode": {"type": "string"}, "evidence": {"type": "array", "items": {"$ref": "#/$defs/Id"}}, "answer": {"$ref": "#/$defs/PersonAnswerInput"}}
+    },
+    "StructuredRequest": {
+      "type": "object", "additionalProperties": false, "required": ["version", "type", "question", "why_person"],
+      "description": "A typed question with named answers. A decision names one accept, one decline and at most one request_changes answer; a choice names 2 to 5 options; feedback asks for text.",
+      "properties": {
+        "version": {"const": 1},
+        "type": {"enum": ["decision", "choice", "feedback"]},
+        "question": {"type": "string", "minLength": 1},
+        "why_person": {"type": "string", "minLength": 1, "description": "Why only this person can answer."},
+        "summary": {"type": "string"},
+        "reasons": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+        "recommendation": {"type": "object", "additionalProperties": false, "required": ["answer", "reason"], "properties": {"answer": {"type": "string"}, "reason": {"type": "string"}}, "description": "Absent means no recommendation."},
+        "subjects": {"type": "array", "maxItems": 12, "items": {"$ref": "#/$defs/RequestSubject"}},
+        "answers": {"type": "array", "maxItems": 5, "items": {"$ref": "#/$defs/RequestAnswerOption"}},
+        "custom": {"type": "boolean", "description": "A choice also takes an answer in the person's own words."}
+      }
+    },
+    "RequestSubject": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "label"],
+      "properties": {
+        "kind": {"enum": ["pull_request", "issue", "document", "mission", "run", "step", "agent", "host", "commit", "link"]},
+        "label": {"type": "string"},
+        "ref": {"type": "string", "description": "A graph reference."},
+        "url": {"type": "string"},
+        "revision": {"type": "string", "description": "The revision the question is about, such as a reviewed head."}
+      }
+    },
+    "RequestAnswerOption": {
+      "type": "object", "additionalProperties": false, "required": ["id", "label", "consequence"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,47}$"},
+        "label": {"type": "string"},
+        "consequence": {"type": "string", "description": "What happens next when the person gives this answer."},
+        "outcome": {"enum": ["accept", "decline", "request_changes"], "description": "Required on a decision answer; absent on a choice option."},
+        "conditions": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "PersonAnswerInput": {
+      "type": "object", "additionalProperties": false,
+      "description": "A named answer id for a decision or choice; text for feedback, a custom choice, or the changes requested.",
+      "properties": {"id": {"type": "string"}, "text": {"type": "string"}}
+    },
+    "PersonAnswer": {
+      "type": "object", "required": ["type", "outcome"],
+      "properties": {
+        "type": {"enum": ["decision", "choice", "feedback"]},
+        "outcome": {"enum": ["accept", "decline", "request_changes", "selected", "custom", "feedback"]},
+        "id": {"type": "string"},
+        "label": {"type": "string"},
+        "text": {"type": "string"}
+      }
+    },
+    "PersonAnswerRecord": {
+      "type": "object", "required": ["ask", "status", "summary", "respondent", "answered_at_unix_ms"],
+      "properties": {
+        "ask": {"$ref": "#/$defs/Id"},
+        "status": {"enum": ["completed", "cancelled"]},
+        "summary": {"type": "string"},
+        "respondent": {"$ref": "#/$defs/Id"},
+        "answered_at_unix_ms": {"type": "integer", "minimum": 0},
+        "answer": {"$ref": "#/$defs/PersonAnswer"},
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/Id"}}
+      }
     },
     "TargetParameters": {
       "type": "object", "additionalProperties": false, "required": ["target_id"],

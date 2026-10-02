@@ -272,6 +272,9 @@ pub struct Attention {
     pub mission_id: Option<String>,
     pub mission_run_id: Option<String>,
     pub step_run_id: Option<String>,
+    /// A person-step ask's structured request; absent on a free-text ask.
+    #[serde(default)]
+    pub request: Option<StructuredRequest>,
     pub title: String,
     pub detail: String,
     pub priority: String,
@@ -767,6 +770,9 @@ pub struct Work {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    /// Responses to the asks this attempt made, or a person ask's own response.
+    #[serde(default)]
+    pub person_answers: Vec<PersonAnswerRecord>,
     #[serde(default)]
     pub usage: Option<UsageSummary>,
 }
@@ -2384,6 +2390,8 @@ pub struct PersonAskParameters {
     pub step_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<StructuredRequest>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PersonStepParameters {
@@ -2391,6 +2399,95 @@ pub struct PersonStepParameters {
     pub summary: String,
     pub episode: String,
     #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<PersonAnswerInput>,
+}
+/// A typed question with named answers: a `decision`, a `choice` or `feedback`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct StructuredRequest {
+    pub version: u32,
+    /// `decision`, `choice` or `feedback`.
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub question: String,
+    /// Why only this person can answer.
+    pub why_person: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    /// Absent means the asker makes no recommendation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<RequestRecommendation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<RequestSubject>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<RequestAnswerOption>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub custom: bool,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct RequestRecommendation {
+    pub answer: String,
+    pub reason: String,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct RequestSubject {
+    pub kind: String,
+    pub label: String,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct RequestAnswerOption {
+    pub id: String,
+    pub label: String,
+    /// What happens next when the person gives this answer.
+    pub consequence: String,
+    /// `accept`, `decline` or `request_changes` on a decision; absent on a choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<String>,
+}
+/// A named answer `id`, text, or both.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct PersonAnswerInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+/// The typed answer a person gave to a structured request.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct PersonAnswer {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    /// `accept`, `decline`, `request_changes`, `selected`, `custom` or `feedback`.
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+/// A response to a person ask, as the asker reads it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct PersonAnswerRecord {
+    pub ask: String,
+    pub status: String,
+    pub summary: String,
+    pub respondent: String,
+    pub answered_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<PersonAnswer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
