@@ -34,38 +34,6 @@ fn fixture(name: &str) -> Value {
 /// Draft 2020-12 unevaluatedProperties closes their union without flattening or duplicating it.
 fn contract_validator(definition: &str) -> jsonschema::Validator {
     let mut schema = json(asset_root().join("schemas/client-v0.schema.json"));
-    // Consumers can preserve future cases, but this daemon must emit only declared cases.
-    // Tighten the native open-enum pattern in a test-only copy, including named definitions.
-    fn strict_known_cases(value: &mut Value) {
-        match value {
-            Value::Object(object) => {
-                let known = object.get("anyOf").and_then(Value::as_array).and_then(|cases| {
-                    if cases.len() == 2 && cases[1]["type"] == "string" {
-                        cases[0].get("enum").cloned()
-                    } else {
-                        None
-                    }
-                });
-                if let Some(known) = known {
-                    object.remove("anyOf");
-                    object.insert("enum".into(), known);
-                }
-                for child in object.values_mut() {
-                    strict_known_cases(child);
-                }
-            }
-            Value::Array(array) => {
-                for child in array {
-                    strict_known_cases(child);
-                }
-            }
-            _ => {}
-        }
-    }
-    strict_known_cases(&mut schema);
-    if let Some(cases) = schema["$defs"]["Resource"]["oneOf"].as_array_mut() {
-        cases.retain(|case| case["$ref"] != "#/$defs/UnknownResource");
-    }
     for resource in schema["$defs"].as_object_mut().unwrap().values_mut() {
         if resource["allOf"].as_array().is_some_and(|branches| {
             branches
@@ -77,7 +45,6 @@ fn contract_validator(definition: &str) -> jsonschema::Validator {
     }
     schema.as_object_mut().unwrap().remove("oneOf");
     schema["$ref"] = Value::String(format!("#/$defs/{definition}"));
-    // Unknown x-st-* annotation keywords are ignored by the standard validator.
     jsonschema::options()
         .with_draft(jsonschema::Draft::Draft202012)
         .should_validate_formats(true)
