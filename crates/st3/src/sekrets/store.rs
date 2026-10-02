@@ -610,7 +610,7 @@ mod tests {
         let grant = store
             .add_grant(
                 "ada/agent-gh",
-                "agent/fleet/**",
+                "agent/fleet/fixture-web/**",
                 &policy,
                 None,
                 "person/ada",
@@ -630,20 +630,20 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .lock_for("person/bob", "person/ada")
+                .lock_for("person/robin", "person/ada")
                 .unwrap()
                 .is_some()
         );
         assert!(
             store
-                .lock_for("person/bob", "person/bob")
+                .lock_for("person/robin", "person/robin")
                 .unwrap()
                 .is_none()
         );
-        store.lock("*", "person/bob", None).unwrap();
+        store.lock("*", "person/robin", None).unwrap();
         assert_eq!(
             store
-                .lock_for("person/bob", "person/bob")
+                .lock_for("person/robin", "person/robin")
                 .unwrap()
                 .unwrap()
                 .scope,
@@ -651,7 +651,7 @@ mod tests {
         );
         let seq = store
             .log(
-                Some("person/bob"),
+                Some("person/robin"),
                 Some("person/ada"),
                 "call",
                 Some("agent/x"),
@@ -662,9 +662,9 @@ mod tests {
         let entries = store.log_for("person/ada", 0, 10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].seq, seq);
-        assert_eq!(entries[0].caller_person.as_deref(), Some("person/bob"));
-        assert_eq!(store.log_for("person/bob", 0, 10).unwrap().len(), 1);
-        assert!(store.log_for("person/cy", 0, 10).unwrap().is_empty());
+        assert_eq!(entries[0].caller_person.as_deref(), Some("person/robin"));
+        assert_eq!(store.log_for("person/robin", 0, 10).unwrap().len(), 1);
+        assert!(store.log_for("person/avery", 0, 10).unwrap().is_empty());
         store.remove_profile("ada/agent-gh").unwrap();
         assert!(store.profile("ada/agent-gh").unwrap().is_none());
         assert!(store.env("ada/agent-gh").unwrap().is_empty());

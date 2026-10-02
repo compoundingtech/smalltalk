@@ -371,7 +371,7 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
     );
 
     // An attestation counts only with a registered key.
-    let unregistered = fixture.seat(&key, "agent/fleet/web/builder");
+    let unregistered = fixture.seat(&key, "agent/fleet/fixture-web/builder");
     assert!(
         matches!(&unregistered.caller, CallerView::Unidentified { reason, .. } if reason.contains("registered no daemon key")),
         "{:?}",
@@ -380,7 +380,7 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
     // Only a person registers it.
     assert!(
         fixture
-            .seat(&key, "agent/fleet/web/builder")
+            .seat(&key, "agent/fleet/fixture-web/builder")
             .manage(&Request::Register {
                 node: "host/example".into(),
                 key: key.public().into(),
@@ -394,11 +394,11 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
             key: key.public().into(),
         })
         .unwrap();
-    let seat = fixture.seat(&key, "agent/fleet/web/builder");
+    let seat = fixture.seat(&key, "agent/fleet/fixture-web/builder");
     assert_eq!(
         seat.caller,
         CallerView::Agent {
-            agent: "agent/fleet/web/builder".into(),
+            agent: "agent/fleet/fixture-web/builder".into(),
             person: "person/ada".into()
         }
     );
@@ -411,14 +411,14 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
     );
     // Another key's signature is no one's word.
     let (forged, _) = MemberKey::generate().unwrap();
-    let forged = fixture.seat(&forged, "agent/fleet/web/builder");
+    let forged = fixture.seat(&forged, "agent/fleet/fixture-web/builder");
     assert!(matches!(forged.caller, CallerView::Unidentified { .. }));
 
     // A grant to an agent lists subcommands, never a whole command.
     fixture.as_person();
     let broad = fixture.manage(Request::GrantAdd {
         profile: "ada/agent-gh".into(),
-        to: "agent/fleet/web/**".into(),
+        to: "agent/fleet/fixture-web/**".into(),
         policy: policy(&[], &["gh"]),
         until_unix_ms: None,
     });
@@ -426,13 +426,13 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
     fixture
         .manage(Request::GrantAdd {
             profile: "ada/agent-gh".into(),
-            to: "agent/fleet/web/**".into(),
+            to: "agent/fleet/fixture-web/**".into(),
             policy: policy(&["gh-pr"], &[]),
             until_unix_ms: None,
         })
         .unwrap();
     let output = run(
-        fixture.seat(&key, "agent/fleet/web/builder"),
+        fixture.seat(&key, "agent/fleet/fixture-web/builder"),
         None,
         &["gh", "pr", "create", "--draft", "--title", "Example"],
         &cwd,
@@ -451,7 +451,7 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
         ),
     ] {
         let refused = run(
-            fixture.seat(&key, "agent/fleet/web/builder"),
+            fixture.seat(&key, "agent/fleet/fixture-web/builder"),
             None,
             argv,
             &cwd,
@@ -464,7 +464,7 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
     }
     // The grant covers its pattern only.
     let outside = run(
-        fixture.seat(&key, "agent/fleet/app/builder"),
+        fixture.seat(&key, "agent/fleet/fixture-app/builder"),
         None,
         &["gh", "pr", "list"],
         &cwd,
@@ -473,7 +473,7 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
     // A seat changes nothing.
     assert!(
         fixture
-            .seat(&key, "agent/fleet/web/builder")
+            .seat(&key, "agent/fleet/fixture-web/builder")
             .manage(&Request::PolicySet {
                 profile: "ada/agent-gh".into(),
                 policy: policy(&["everything"], &[]),
@@ -490,7 +490,7 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
         })
         .unwrap();
     let locked = run(
-        fixture.seat(&key, "agent/fleet/web/builder"),
+        fixture.seat(&key, "agent/fleet/fixture-web/builder"),
         None,
         &["gh", "pr", "list"],
         &cwd,
@@ -499,7 +499,7 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
     fixture.as_person();
     fixture.manage(Request::Unlock { person: None }).unwrap();
     let unlocked = run(
-        fixture.seat(&key, "agent/fleet/web/builder"),
+        fixture.seat(&key, "agent/fleet/fixture-web/builder"),
         None,
         &["gh", "pr", "list"],
         &cwd,
