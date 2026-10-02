@@ -717,6 +717,19 @@ mod tests {
     }
 
     #[test]
+    fn vim_mouse_a_turns_tracking_on() {
+        // vim -u NONE -c 'set mouse=a ttymouse=sgr' (9.1), as written to its terminal: SGR and
+        // click tracking in one DECSET, then drag; set, reset and set again (issue #1013).
+        let vim = b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[?12h\x1b[?12l\
+            \x1b[?1006;1000h\x1b[?1002h\x1b[?1006;1000l\x1b[?1002l\
+            \x1b[?1006;1000h\x1b[?1002h\x1b[?1006;1000l\x1b[?1002l\
+            \x1b[?1006;1000h\x1b[?1002h\x1b[?25l\x1b[?25h";
+        let screen = screen_of(4, 20, vim);
+        assert_eq!(screen["modes"]["mouse_tracking"], "drag");
+        assert_eq!(screen["modes"]["mouse_encoding"], "sgr");
+    }
+
+    #[test]
     fn wide_characters_hidden_text_and_long_lines_are_bounded() {
         let screen = screen_of(2, 8, "漢字ok\r\n\x1b[8msecret\x1b[0m".as_bytes());
         assert_eq!(screen["lines"][0]["text"], "漢字ok");
