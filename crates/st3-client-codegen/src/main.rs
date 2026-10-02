@@ -425,7 +425,17 @@ fn validate_model(
         .with_context(|| format!("client schema `{definition}` has no properties"))?;
     let rust_block = struct_block(rust, &format!("pub struct {rust_name} {{"))?;
     let swift_block = struct_block(swift, &format!("public struct {swift_name}:"))?;
-    for property in properties.keys().filter(|name| name.as_str() != "kind") {
+    // Resource branches may narrow a header field such as `id` to its family reference;
+    // generated clients model that field once through the shared header.
+    let header_backed = model["allOf"].as_array().is_some_and(|branches| {
+        branches
+            .iter()
+            .any(|branch| branch["$ref"] == "#/$defs/ResourceHeader")
+    }) && rust_block.contains("pub header: ResourceHeader,");
+    let header = &schema["$defs"]["ResourceHeader"]["properties"];
+    for property in properties.keys().filter(|name| {
+        name.as_str() != "kind" && !(header_backed && header.get(name.as_str()).is_some())
+    }) {
         let rust_field = rust_field(property);
         let rust_discriminated_timeline = definition == "TimelineEntry"
             && property == "type"
@@ -463,6 +473,11 @@ fn validate_surfaces(
             .as_str()
             .and_then(|value| value.rsplit('/').next())
             .context("Resource reference")?;
+        // The open schema branch preserves future kinds for schema consumers; it has no
+        // concrete generated resource model.
+        if definition == "UnknownResource" {
+            continue;
+        }
         validate_model(
             schema,
             definition,
@@ -911,7 +926,17 @@ fn typescript_models(schema: &Value, operations: &Value, digest: &str) -> Result
         if name == "ActionRequest" {
             continue;
         }
-        let shape = ts_conditional_body(definition)?.unwrap_or(ts_type(definition)?);
+        let shape = if name == "Resource" {
+            // UnknownResource's open `kind: string` would defeat discriminant narrowing in the
+            // raw union; like the Rust and Swift clients, raw TypeScript models known kinds only.
+            let mut known = definition.clone();
+            if let Some(branches) = known["oneOf"].as_array_mut() {
+                branches.retain(|branch| branch["$ref"] != "#/$defs/UnknownResource");
+            }
+            ts_type(&known)?
+        } else {
+            ts_conditional_body(definition)?.unwrap_or(ts_type(definition)?)
+        };
         writeln!(out, "export type {name} = {shape};\n")?;
     }
     let actions = operations["actions"]
