@@ -5,7 +5,7 @@
 //! `except`), the claim's kind matches its `kinds`, and the subject matches its `subjects` and
 //! none of its `unless_subjects`. A subject pattern may say `{actor}`, the writer's name without
 //! its family, or `{namespace}`, the first two segments of that name: for
-//! `agent/fleet/web/reviewer`, `doc/{namespace}/**` is everything under `doc/fleet/web/`.
+//! `agent/team/web/reviewer`, `doc/{namespace}/**` is everything under `doc/team/web/`.
 //!
 //! Only a person sets a rule. An agent's `rule.set` is refused whatever the rules say, so no
 //! lockdown can be undone by the agents it restricts.
@@ -202,14 +202,14 @@ mod tests {
             ..rule
         };
         assert!(!namespace.restricts(
-            "agent/fleet/web/reviewer",
+            "agent/team/web/reviewer",
             "doc.bound",
-            "doc/fleet/web/plan"
+            "doc/team/web/plan"
         ));
         assert!(namespace.restricts(
-            "agent/fleet/web/reviewer",
+            "agent/team/web/reviewer",
             "doc.bound",
-            "doc/fleet/api/plan"
+            "doc/team/api/plan"
         ));
     }
 

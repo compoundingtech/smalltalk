@@ -12467,7 +12467,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 .method("POST")
                 .uri("/v1/documents")
                 .header("content-type", "application/json")
-                .extension(BoundAgent("agent/fleet/web/reviewer".into()))
+                .extension(BoundAgent("agent/team/web/reviewer".into()))
                 .body(Body::from(
                     serde_json::to_vec(&DocumentPutRequest {
                         name: name.into(),
@@ -12487,15 +12487,15 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             }
         };
         // Inside its namespace nothing is logged; outside, the write proceeds and is logged.
-        assert_eq!(publish("doc/fleet/web/plan").await.0, StatusCode::OK);
-        assert_eq!(publish("doc/fleet/api/plan").await.0, StatusCode::OK);
+        assert_eq!(publish("doc/team/web/plan").await.0, StatusCode::OK);
+        assert_eq!(publish("doc/team/api/plan").await.0, StatusCode::OK);
         let (_, audits) = get_request(app.clone(), "/v1/rules/audit").await;
         let audits = audits.as_array().unwrap();
         assert_eq!(audits.len(), 1, "{audits:?}");
         assert_eq!(audits[0]["rule"], "agents-publish-in-namespace");
-        assert_eq!(audits[0]["actor"], "agent/fleet/web/reviewer");
+        assert_eq!(audits[0]["actor"], "agent/team/web/reviewer");
         assert_eq!(audits[0]["action"], "doc.bound");
-        assert_eq!(audits[0]["target"], "doc/fleet/api/plan");
+        assert_eq!(audits[0]["target"], "doc/team/api/plan");
 
         // Enforced, the same write is refused with a typed reason and nothing is stored.
         let mut rule = crate::rules::lockdown(&[])
@@ -12511,17 +12511,17 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let (status, refused) = publish("doc/fleet/api/later").await;
+        let (status, refused) = publish("doc/team/api/later").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
         assert_eq!(refused["code"], "rule-denied", "{refused}");
-        assert!(state.store.claims_for("doc/fleet/api/later", None).unwrap().is_empty());
-        assert_eq!(publish("doc/fleet/web/later").await.0, StatusCode::OK);
+        assert!(state.store.claims_for("doc/team/api/later", None).unwrap().is_empty());
+        assert_eq!(publish("doc/team/web/later").await.0, StatusCode::OK);
 
         // Only a person sets rules.
         let (status, refused) = json_request(
             app.clone(),
             "/v1/rules/set",
-            json!({"actor": "agent/fleet/web/reviewer", "name": "agents-publish-in-namespace", "rule": rule}),
+            json!({"actor": "agent/team/web/reviewer", "name": "agents-publish-in-namespace", "rule": rule}),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
