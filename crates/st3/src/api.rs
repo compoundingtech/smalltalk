@@ -4954,9 +4954,7 @@ fn unread_current_seat_counts(
             .and_then(|owner| owner.member.as_ref())
             .map(|member| member.host.as_str())
             && host != store.origin()
-            && !store
-                .replication_peer_last_success(host)?
-                .is_some_and(|at| now.saturating_sub(at) < 90_000)
+            && !store.replication_peer_up(host)?.0
         {
             continue;
         }
@@ -5318,6 +5316,58 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 })
                 .map(|peer| format!("{}={}", peer.peer, peer.status))
                 .collect::<Vec<_>>();
+            // A member that listens is meant to answer, so its absence warns. A dial-out
+            // member, or a config peer outside membership, can be away for hours, as a sleeping
+            // laptop is; its absence is reported without a warning.
+            let now = client_now_ms();
+            let listening = state
+                .store
+                .fleet_view_sealed()
+                .map(|view| {
+                    view.members
+                        .into_iter()
+                        .filter(|member| member.state == "current" && member.mode == "listening")
+                        .map(|member| member.name)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let (absent, away): (Vec<_>, Vec<_>) = replication
+                .peers
+                .iter()
+                .filter(|peer| peer.status == "last-seen")
+                .partition(|peer| listening.contains(&peer.peer));
+            let describe = |peers: Vec<&crate::model::ReplicationPeerStatus>| {
+                peers
+                    .into_iter()
+                    .map(|peer| {
+                        format!(
+                            "{} {}{}{}",
+                            peer.peer,
+                            peer.last_success_at_unix_ms
+                                .map(|at| format!(
+                                    "has not exchanged for {}",
+                                    elapsed_words(now.saturating_sub(at))
+                                ))
+                                .unwrap_or_else(|| "has never exchanged with this node".into()),
+                            peer.sync
+                                .as_ref()
+                                .map(|sync| sync.local_only_envelopes
+                                    + sync.added_since_measured_envelopes)
+                                .filter(|unsent| *unsent != 0)
+                                .map(|unsent| format!(
+                                    "; this node has not sent it {unsent} envelopes"
+                                ))
+                                .unwrap_or_default(),
+                            peer.last_error
+                                .as_deref()
+                                .map(|error| format!(" (last attempt: {error})"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let absent = describe(absent);
+            let away = describe(away);
             let unresolved = replication.invalid_records;
             let diverged = replication
                 .peers
@@ -5353,7 +5403,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 || first_sync_failed.is_some()
             {
                 "fail"
-            } else if !unavailable.is_empty() || unresolved != 0 {
+            } else if !unavailable.is_empty() || !absent.is_empty() || unresolved != 0 {
                 "warn"
             } else {
                 "pass"
@@ -5362,7 +5412,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    "{}{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    absent
+                        .iter()
+                        .chain(&away)
+                        .map(|peer| format!("{peer}; "))
+                        .collect::<String>(),
                     first_sync_failed
                         .map(|first| format!(
                             "the first sync with {} ended with a different graph, and a heal \
@@ -5882,6 +5937,17 @@ async fn replication_heal_next(
         signal_changed(&state);
     }
     Ok(Json(step))
+}
+
+/// A span such as `45s`, `12m` or `3h` for a doctor message.
+fn elapsed_words(ms: u128) -> String {
+    let seconds = ms / 1_000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
 }
 
 fn replication_receive_has_new_data(received: usize) -> bool {
@@ -9164,13 +9230,126 @@ async fn send_message(
     State(state): State<AppState>,
     Json(request): Json<MessageSendRequest>,
 ) -> Result<Json<MessageView>, ApiError> {
-    blocking_api(move || accept_message(&state, request, None)).await
+    blocking_api(move || accept_message(&state, request, None, None)).await
+}
+
+/// The fields a device signs on a message it sends, in the `fields-v1` format.
+pub const SIGNED_MESSAGE_FIELDS: &[&str] = &[
+    "content",
+    "from",
+    "in_reply_to",
+    "session_id",
+    "tags",
+    "title",
+    "to",
+];
+
+/// How far a device's signing time may be from this daemon's clock when it first accepts the
+/// message. Members that receive it later check the signature, never the time.
+pub const DEVICE_SIGNATURE_WINDOW_MS: u128 = 15 * 60 * 1_000;
+
+fn device_signature_error(code: &'static str, message: impl Into<String>) -> ApiError {
+    ApiError::bad(St3Error::new(code, message.into()))
+}
+
+/// Check a device's signature on the message this daemon is about to write, before writing it.
+fn check_device_signature(
+    state: &AppState,
+    signature: &smallclaims::principal::ClaimSignature,
+    request: &MessageSendRequest,
+    subject: &str,
+    from: &str,
+    fields: &BTreeMap<String, Value>,
+) -> Result<(), ApiError> {
+    use smallclaims::principal::{FIELDS_FORMAT, Judged, KeyGrant};
+    let mut signed = signature.signed_fields.clone();
+    signed.sort();
+    if signature.format.as_deref() != Some(FIELDS_FORMAT) || signed != SIGNED_MESSAGE_FIELDS {
+        return Err(device_signature_error(
+            "device-signature-format",
+            format!(
+                "a device signs a message in {FIELDS_FORMAT} over {}",
+                SIGNED_MESSAGE_FIELDS.join(", ")
+            ),
+        ));
+    }
+    if signature.signer != from || signature.on_behalf.is_some() {
+        return Err(device_signature_error(
+            "device-signature-signer",
+            format!("a device signs as the paired person, {from}"),
+        ));
+    }
+    if normalize_message_party(&request.to) != request.to {
+        return Err(device_signature_error(
+            "device-signature-noncanonical",
+            format!(
+                "a signed message names its recipient canonically: `{}`",
+                normalize_message_party(&request.to)
+            ),
+        ));
+    }
+    let now = client_now_ms();
+    if u128::from(signature.signed_at_unix_ms).abs_diff(now) > DEVICE_SIGNATURE_WINDOW_MS {
+        return Err(device_signature_error(
+            "device-signature-stale",
+            "the device signed this message more than 15 minutes from this daemon's clock; check the device's time",
+        ));
+    }
+    // A retry of the same send gets its first answer; any other claim may not reuse the nonce.
+    let repeat = state
+        .store
+        .latest_claim(subject, Some("message.sent"))
+        .map_err(ApiError::internal)?
+        .is_some();
+    if !repeat
+        && state
+            .store
+            .signature_nonce_used(&signature.key, &signature.nonce)
+            .map_err(ApiError::internal)?
+    {
+        return Err(device_signature_error(
+            "device-signature-replayed",
+            "another claim already carries this signature's nonce",
+        ));
+    }
+    let enrolled = signature
+        .chain
+        .first()
+        .and_then(|grant| state.store.claim_by_id(grant).ok().flatten())
+        .and_then(|grant| {
+            let fields = grant.body.get("fields")?;
+            (grant.subject == from).then(|| KeyGrant::from_fields(fields))?
+        })
+        .is_some_and(|grant| grant.key == signature.key);
+    if !enrolled {
+        return Err(device_signature_error(
+            "device-key-not-enrolled",
+            "the signing key is not enrolled for this person; pair the device again",
+        ));
+    }
+    let fields = Value::Object(fields.clone().into_iter().collect());
+    let judged = Judged {
+        id: "",
+        subject,
+        kind: "message.sent",
+        actor: Some(from),
+        content: String::new(),
+        fields: &fields,
+    };
+    if !signature.verifies(&judged) {
+        return Err(device_signature_error(
+            "device-signature-invalid",
+            "the signature does not match this message",
+        ));
+    }
+    Ok(())
 }
 
 fn accept_message(
     state: &AppState,
     request: MessageSendRequest,
     session_id: Option<String>,
+    device_signature: Option<smallclaims::principal::ClaimSignature>,
 ) -> Result<Json<MessageView>, ApiError> {
     if request.content.trim().is_empty() {
         return Err(ApiError::bad(St3Error::new(
@@ -9242,18 +9421,23 @@ fn accept_message(
     if let Some(session_id) = session_id {
         fields.insert("session_id".into(), Value::String(session_id));
     }
-    let record = state
-        .store
-        .append_claim(&ClaimInput {
-            subject: subject.clone(),
-            kind: "message.sent".into(),
-            actor: Some(from.clone()),
-            fields,
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: Some(request.idempotency_key),
-        })
-        .map_err(ApiError::bad)?;
+    if let Some(signature) = &device_signature {
+        check_device_signature(state, signature, &request, &subject, &from, &fields)?;
+    }
+    let input = ClaimInput {
+        subject: subject.clone(),
+        kind: "message.sent".into(),
+        actor: Some(from.clone()),
+        fields,
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(request.idempotency_key),
+    };
+    let record = match &device_signature {
+        Some(signature) => state.store.append_signed_claim(&input, signature).map(|(claim, _)| claim),
+        None => state.store.append_claim(&input),
+    }
+    .map_err(ApiError::bad)?;
     let mut work_wake = is_work_wake(&request.tags);
     if let Some(parent) = request.in_reply_to.as_deref() {
         // Settling the parent writes its lifecycle claims too.

@@ -2292,9 +2292,7 @@ fn machine_resources(
             operational_actionable,
             operational_reasons,
         ) = if host_id != local_host && configured_hosts.contains(&host_id) {
-            let last_success_at = state.store.replication_peer_last_success(&name)?;
-            let recent =
-                last_success_at.is_some_and(|at| client_now_ms().saturating_sub(at) < 90_000);
+            let (recent, last_success_at) = state.store.replication_peer_up(&name)?;
             (
                 if recent { "reachable" } else { "last-seen" },
                 vec![json!({
@@ -3578,11 +3576,16 @@ fn managed_codex_transcript(
     // The wrapper owns this path; never resolve a path from client input. A reused
     // driver directory is only authoritative when its runtime and a durable
     // observation both name the same exact provider incarnation.
-    let directory = state
+    let root = state
         .state_dir
         .join("drivers")
-        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
-        .join("state");
+        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24]);
+    let native = root.join("sessions/codex");
+    let directory = if native.exists() {
+        native
+    } else {
+        root.join("state")
+    };
     let runtime = std::fs::read(directory.join("runtime.json"))
         .map_err(|_| "the Codex driver has not written its runtime record".to_owned())?;
     let binding = std::fs::read(directory.join("binding.json"))
@@ -3642,15 +3645,11 @@ fn managed_claude_transcript(
     let Some(evidence) = evidence else {
         return Err("the Claude driver has not reported which process owns the seat".into());
     };
-    let identity = owner.strip_prefix("agent/").unwrap_or(owner);
-    let directory = state
-        .state_dir
-        .join("drivers")
-        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
-        .join("catalog")
-        .join("agents")
-        .join(st_drivers::run::detect_host())
-        .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
+    let directory = crate::hooks::claude_agent_dir(
+        &state.state_dir.join("drivers"),
+        owner,
+        &st_drivers::run::detect_host(),
+    );
     // The current wrapper's SessionStart hook binds the Claude session it started. A previous
     // provider's binding can survive a restart, so it counts only when it names the same
     // provider incarnation as the seat's current observation; neither its presence nor the
@@ -3723,16 +3722,21 @@ fn managed_omp_transcript(
             };
         }
     }
-    let identity = owner.strip_prefix("agent/").unwrap_or(owner);
-    let directory = state
+    let root = state
         .state_dir
         .join("drivers")
-        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
-        .join("catalog")
-        .join("agents")
-        .join(st_drivers::run::detect_host())
-        .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
-        .join("provider-sessions");
+        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24]);
+    let native = root.join("sessions/omp/provider-sessions");
+    let directory = if root.join("sessions/omp").exists() {
+        native
+    } else {
+        crate::hooks::legacy_claude_agent_dir(
+            &state.state_dir.join("drivers"),
+            owner,
+            &st_drivers::run::detect_host(),
+        )
+        .join("provider-sessions")
+    };
     match crate::external_sessions::find_managed_omp_transcript(
         &directory,
         (started_at.timestamp_millis().max(0) as u128).saturating_sub(2_000),
@@ -5192,6 +5196,28 @@ pub(super) struct PairingComplete {
     api_version: String,
     code: String,
     device_public_key: String,
+    /// Where the device keeps its signing key: `secure-enclave` or `software`.
+    #[serde(default)]
+    key_storage: Option<String>,
+}
+
+/// A device's signing key, when its public key is one: `p256:` and the base64url of an
+/// uncompressed P-256 point, or a bare base64url Ed25519 key. Anything else is a legacy device
+/// that pairs without signing.
+pub(super) fn device_signing_key(public_key: &str) -> Option<&str> {
+    let decode = |text: &str| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(text.as_bytes())
+            .ok()
+    };
+    match public_key.strip_prefix("p256:") {
+        Some(point) => decode(point)
+            .is_some_and(|point| point.len() == 65 && point[0] == 4)
+            .then_some(public_key),
+        None => decode(public_key)
+            .is_some_and(|key| key.len() == 32)
+            .then_some(public_key),
+    }
 }
 
 pub(super) async fn pairing_complete(
@@ -5243,6 +5269,7 @@ pub(super) async fn pairing_complete(
             "the pairing code is invalid, expired, or already used",
         ));
     }
+    let device_public_key = request.device_public_key.clone();
     let mut secret = [0_u8; 32];
     getrandom::fill(&mut secret).map_err(ApiError::internal)?;
     let credential = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
@@ -5285,7 +5312,7 @@ pub(super) async fn pairing_complete(
             ),
             (
                 "device_public_key".into(),
-                Value::String(request.device_public_key),
+                Value::String(device_public_key.clone()),
             ),
             ("scopes".into(), json!(scopes)),
             ("delegated_scopes".into(), json!(scopes)),
@@ -5303,10 +5330,34 @@ pub(super) async fn pairing_complete(
         }
         return Err(ApiError::bad(error));
     }
+    // A device with a real key is enrolled: the person's root key grants it as a device key.
+    let chain = match device_signing_key(&device_public_key) {
+        Some(key) => {
+            let name = begun
+                .body
+                .pointer("/fields/device_name")
+                .and_then(Value::as_str)
+                .unwrap_or("device");
+            let storage = match request.key_storage.as_deref() {
+                Some("secure-enclave") => " (secure enclave)",
+                Some("software") => " (software key)",
+                _ => "",
+            };
+            Some(
+                state
+                    .store
+                    .enroll_device_key(&person_id, key, &format!("{name}{storage}"))
+                    .map_err(ApiError::bad)?,
+            )
+        }
+        None => None,
+    };
     signal_changed(&state);
-    Ok(Json(
-        json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "credential": credential, "scopes": scopes, "expires_at": client_timestamp(expires_at) }),
-    ))
+    let mut session = json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "credential": credential, "scopes": scopes, "expires_at": client_timestamp(expires_at) });
+    if let Some(chain) = chain {
+        session["device_key_chain"] = json!(chain);
+    }
+    Ok(Json(session))
 }
 
 fn terminal_subject(id: &str) -> String {
@@ -7255,6 +7306,13 @@ async fn dispatch_action(
                         .collect(),
                 },
                 session_id,
+                p.get("signature")
+                    .map(|signature| {
+                        serde_json::from_value(signature.clone()).map_err(|error| {
+                            validation(format!("the message signature is malformed: {error}"))
+                        })
+                    })
+                    .transpose()?,
             )?
             .0;
             Ok(vec![result.subject])
@@ -7964,6 +8022,14 @@ async fn dispatch_action(
                     idempotency_key: Some(request.idempotency_key.clone()),
                 })
                 .map_err(ApiError::bad)?;
+            // A revoked device's key signs nothing more, on every member.
+            let field = |name: &str| paired.body.pointer(&format!("/fields/{name}")).and_then(Value::as_str);
+            if let (Some(key), Some(person)) = (field("device_public_key").and_then(device_signing_key), field("person_id")) {
+                state
+                    .store
+                    .revoke_device_key(person, key, &format!("pairing of {device} revoked"))
+                    .map_err(ApiError::bad)?;
+            }
             signal_changed(state);
             Ok(vec![device])
         }
@@ -11248,6 +11314,7 @@ mission "example/zero-run" state="ready" {
                 tags: Vec::new(),
             },
             Some("session/older-incarnation".into()),
+            None,
         )
         .unwrap();
 
@@ -11303,6 +11370,7 @@ mission "example/zero-run" state="ready" {
                 in_reply_to: None,
                 tags: Vec::new(),
             },
+            None,
             None,
         )
         .unwrap();

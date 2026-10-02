@@ -4,13 +4,19 @@ A seat that cannot start must never ship. `run` boots seats of one harness again
 daemon and a stand-in provider, and checks that each seat reaches a claimed step and reads an st
 message.
 
-    run BINARY EVIDENCE_DIR HARNESS SCENARIO [--bound SECONDS] [--scratch DIR]
+    run BINARY EVIDENCE_DIR HARNESS SCENARIO [--bound SECONDS] [--scratch DIR] [--replacement-binary BINARY]
 
 `HARNESS` is `claude`, `codex`, `pi`, `omp` or `opencode`. `SCENARIO` is `fresh`, `restart`,
 `daemon-restart`, `reexec`, `concurrent` or `suspend`; `run --help` says what each does. Each
 stand-in keeps its sessions the way its harness does, so `suspend` proves that a resumed seat comes
 back on the session it suspended on. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
+
+Every scenario also checks that the native driver creates no `catalog.kdl` or `agent.kdl`.
+Re-execution must preserve the provider processes as well as the seat incarnation. To check a
+rolling upgrade, give `run` the predecessor binary and use `--replacement-binary` for the new
+binary with the `reexec` scenario. That mode allows predecessor catalogs, but checks their bytes
+remain unchanged after adoption and a new message reaches the same provider session.
 
 ## What is real and what is not
 

@@ -3998,7 +3998,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .pty_root
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
-    let login_environment = st3::environment::snapshot()?;
+    let login_environment = st3::environment::snapshot_at_startup()?;
     st_runtime::initialize_isolation(&login_environment);
     let pty_binary = match args.pty_binary.clone() {
         Some(pty_binary) => pty_binary,
@@ -7981,10 +7981,36 @@ fn render_replication_peers(
         } else {
             let _ = writeln!(output, "  no exchange yet");
         }
+        if let Some(at) = peer.last_failure_at_unix_ms {
+            let _ = writeln!(
+                output,
+                "  last attempt failed {}{}",
+                relative_time(at, now),
+                peer.last_error
+                    .as_deref()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            );
+        }
         let Some(sync) = &peer.sync else {
             let _ = writeln!(output, "  difference not measured yet");
             continue;
         };
+        if sync.stale {
+            let _ = writeln!(
+                output,
+                "  stale: no exchange since the measurement below ({}), so it says what both held then, not now{}",
+                relative_time(sync.measured_at_unix_ms, now),
+                if sync.added_since_measured_envelopes == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; this node has gained {} since",
+                        envelope_count(sync.added_since_measured_envelopes)
+                    )
+                }
+            );
+        }
         if let Some(report) = &sync.heal {
             let _ = writeln!(output, "  {}", render_heal(&peer.peer, report, now));
         }
@@ -12740,21 +12766,26 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             .subject
             .as_deref()
             .context("the Claude channel has no subject")?;
-        let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+        let identity = subject.strip_prefix("agent/").unwrap_or(subject);
+        let paths = match st_drivers::driver_paths::Paths::from_environment(identity, &|name| {
+            std::env::var(name).ok()
+        })? {
+            Some(paths) => NativePaths::from_resolved(subject, paths),
+            None => NativePaths::legacy(subject, "claude")?,
+        };
         if push_mailbox_enabled() {
             let incarnation = wait_for_agent_incarnation(client, subject).await?;
             return st3::claude_channel::run(
                 client,
                 subject,
                 &incarnation,
-                &catalog,
-                &agent_dir,
-                &identity,
-                &runtime_id,
+                &paths.resolved(),
+                &paths.identity,
+                &paths.runtime_id,
             )
             .await;
         }
-        return st_drivers::claude_mcp::run_st3(&catalog, &identity);
+        return st_drivers::claude_mcp::run_st3(&paths.driver_root, &paths.identity);
     }
     if matches!(args.driver.as_str(), "pi-channel" | "omp-channel") {
         let identity = args
@@ -12770,8 +12801,17 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         } else {
             "pi"
         };
-        let catalog = catalog.context("the pi-family channel has no native driver catalog")?;
-        return run_pi_channel(client, &normalize_agent_subject(identity), driver, catalog).await;
+        let subject = normalize_agent_subject(identity);
+        let paths = st_drivers::driver_paths::Paths::from_environment(
+            subject.strip_prefix("agent/").unwrap_or(&subject),
+            &|name| std::env::var(name).ok(),
+        )?;
+        let root = paths
+            .as_ref()
+            .map(|paths| paths.root.as_path())
+            .or(catalog)
+            .context("the pi-family channel has no driver root")?;
+        return run_pi_channel(client, &normalize_agent_subject(identity), driver, root).await;
     }
     let subject = args
         .subject
@@ -12878,7 +12918,7 @@ async fn run_st2_native_driver(
     if driver == "claude" {
         reject_noninteractive_claude_argv(&argv)?;
     }
-    let paths = NativePaths::prepare(subject)?;
+    let paths = NativePaths::prepare(subject, driver)?;
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
     // A driver launched while the daemon restarts waits for it; exiting here would end the seat.
     retry_while_daemon_unreachable(subject, || {
@@ -12938,6 +12978,7 @@ async fn run_st2_native_driver(
     }
     let harness_state_path = st_drivers::harness_state::harness_state_path(&paths.agent_dir);
     let loop_state = NativeLoopState {
+        paths: Some(paths.resolved()),
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
         ..NativeLoopState::default()
     };
@@ -12954,36 +12995,109 @@ async fn run_st2_native_driver(
     .await
 }
 
-/// The private catalog paths a native driver derives from its subject.
+/// Resolved observation and session paths for one native driver.
 #[derive(Clone)]
 struct NativePaths {
     delivery_gate: st_drivers::session_control::DeliveryGate,
     pending_hold_adoption: Option<st3::delivery_hold::HoldRequest>,
-    catalog: PathBuf,
+    driver_root: PathBuf,
+    session_dir: PathBuf,
     agent_dir: PathBuf,
     identity: String,
     runtime_id: String,
 }
 
 impl NativePaths {
-    fn prepare(subject: &str) -> Result<Self> {
-        let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+    fn prepare(subject: &str, driver: &str) -> Result<Self> {
+        let (driver_root, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+        let session_dir = driver_root.join("sessions").join(driver);
+        fs::create_dir_all(&session_dir)?;
         Ok(Self {
             delivery_gate: st_drivers::session_control::DeliveryGate::default(),
             pending_hold_adoption: None,
-            catalog,
+            driver_root,
+            session_dir,
             agent_dir,
             identity,
             runtime_id,
         })
     }
 
-    /// The driver's own state root, where it leaves its resume state for its next image.
+    fn resolved(&self) -> st_drivers::driver_paths::Paths {
+        st_drivers::driver_paths::Paths {
+            root: self.driver_root.clone(),
+            agent_dir: self.agent_dir.clone(),
+            session_dir: self.session_dir.clone(),
+        }
+    }
+
+    fn from_resolved(subject: &str, paths: st_drivers::driver_paths::Paths) -> Self {
+        let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
+        Self {
+            delivery_gate: st_drivers::session_control::DeliveryGate::default(),
+            pending_hold_adoption: None,
+            driver_root: paths.root,
+            agent_dir: paths.agent_dir,
+            session_dir: paths.session_dir,
+            runtime_id: identity.clone(),
+            identity,
+        }
+    }
+
+    /// A pre-change resume record adopts existing files without fabricating declarations.
+    fn legacy(subject: &str, driver: &str) -> Result<Self> {
+        let drivers = PathBuf::from(
+            std::env::var_os("ST3_DRIVER_STATE_DIR")
+                .context("the native driver has no ST3_DRIVER_STATE_DIR")?,
+        );
+        Self::legacy_in(subject, driver, &drivers)
+    }
+
+    fn legacy_in(subject: &str, driver: &str, drivers: &Path) -> Result<Self> {
+        let driver_root = drivers
+            .join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24])
+            .join("catalog");
+        let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
+        let agent_dir =
+            st3::hooks::legacy_claude_agent_dir(&drivers, subject, &st_drivers::run::detect_host());
+        let session_dir = match driver {
+            "claude" => st_drivers::claude_session::state_dir(&driver_root, &identity),
+            "opencode" => st_drivers::opencode_session::state_dir(&driver_root, &identity),
+            "codex" => driver_root.parent().unwrap().join("state"),
+            _ => driver_root.parent().unwrap().join("sessions").join(driver),
+        };
+        Ok(Self::from_resolved(
+            subject,
+            st_drivers::driver_paths::Paths {
+                root: driver_root,
+                agent_dir,
+                session_dir,
+            },
+        ))
+    }
+
+    fn resumed(
+        subject: &str,
+        driver: &str,
+        paths: Option<st_drivers::driver_paths::Paths>,
+    ) -> Result<Self> {
+        match paths {
+            Some(paths) => Ok(Self::from_resolved(subject, paths)),
+            None => Self::legacy(subject, driver),
+        }
+    }
+
+    /// Predecessor drivers wrote resume state beside their private catalog.
     fn state_root(&self) -> PathBuf {
-        self.catalog
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.catalog.clone())
+        if self
+            .driver_root
+            .file_name()
+            .is_some_and(|name| name == "catalog")
+        {
+            self.driver_root.parent().unwrap().to_path_buf()
+        } else {
+            self.driver_root.clone()
+        }
     }
 }
 
@@ -13006,17 +13120,30 @@ fn spawn_st2_provider(
     tokio::task::spawn_blocking(move || match start {
         ProviderStart::Launch(argv) => match driver.as_str() {
             "claude" => st_drivers::claude_session::run_controlled_paths(
-                &paths.catalog,
-                &paths.agent_dir,
+                &paths.resolved(),
                 paths.identity,
                 paths.runtime_id,
                 argv,
             ),
-            "pi" => st_drivers::pi_session::run_native(&paths.catalog, paths.identity, paths.runtime_id, argv),
-            "omp" => st_drivers::omp_session::run_native(&paths.catalog, paths.identity, paths.runtime_id, argv),
-            "opencode" => {
-                st_drivers::opencode_session::run_with_control(&paths.catalog, paths.identity, paths.runtime_id, argv, st_drivers::session_control::SessionControl::Graph(paths.delivery_gate))
-            }
+            "pi" => st_drivers::pi_session::run_native(
+                &paths.resolved(),
+                paths.identity,
+                paths.runtime_id,
+                argv,
+            ),
+            "omp" => st_drivers::omp_session::run_native(
+                &paths.resolved(),
+                paths.identity,
+                paths.runtime_id,
+                argv,
+            ),
+            "opencode" => st_drivers::opencode_session::run_with_paths(
+                &paths.resolved(),
+                paths.identity,
+                paths.runtime_id,
+                argv,
+                st_drivers::session_control::SessionControl::Graph(paths.delivery_gate),
+            ),
             _ => unreachable!("the native driver was checked"),
         },
         ProviderStart::Adopt(session) => match (driver.as_str(), session) {
@@ -13030,22 +13157,26 @@ fn spawn_st2_provider(
                     seq,
                 )
             }
-            ("pi", DetachedSession::Provider { pid, session, seq }) => st_drivers::pi_session::adopt_native(
-                &paths.catalog,
-                paths.identity,
-                paths.runtime_id,
-                pid,
-                session,
-                seq,
-            ),
-            ("omp", DetachedSession::Provider { pid, session, seq }) => st_drivers::omp_session::adopt_native(
-                &paths.catalog,
-                paths.identity,
-                paths.runtime_id,
-                pid,
-                session,
-                seq,
-            ),
+            ("pi", DetachedSession::Provider { pid, session, seq }) => {
+                st_drivers::pi_session::adopt_native(
+                    &paths.resolved(),
+                    paths.identity,
+                    paths.runtime_id,
+                    pid,
+                    session,
+                    seq,
+                )
+            }
+            ("omp", DetachedSession::Provider { pid, session, seq }) => {
+                st_drivers::omp_session::adopt_native(
+                    &paths.resolved(),
+                    paths.identity,
+                    paths.runtime_id,
+                    pid,
+                    session,
+                    seq,
+                )
+            }
             (
                 "opencode",
                 DetachedSession::OpenCode {
@@ -13057,8 +13188,8 @@ fn spawn_st2_provider(
                     version_ok,
                     producer_version,
                 },
-            ) => st_drivers::opencode_session::adopt_with_control(
-                &paths.catalog,
+            ) => st_drivers::opencode_session::adopt_with_paths(
+                &paths.resolved(),
                 paths.identity,
                 paths.runtime_id,
                 pid,
@@ -13081,6 +13212,8 @@ fn spawn_st2_provider(
 /// image already published nor forgets that the harness already reported ready.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct NativeLoopState {
+    #[serde(default)]
+    paths: Option<st_drivers::driver_paths::Paths>,
     ready: bool,
     /// Whether the harness-state file already belongs to this session. A resumed driver adopts a
     /// running session, so its record is always current.
@@ -13139,10 +13272,11 @@ async fn resume_native_driver(
         )
         .await;
     }
-    let mut paths = NativePaths::prepare(subject)?;
+    let mut paths = NativePaths::resumed(subject, driver, resume.loop_state.paths.clone())?;
     if driver == "opencode" {
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
+    resume.loop_state.paths = Some(paths.resolved());
     let task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(resume.session));
     drive_st2_native(
         client,
@@ -13273,7 +13407,7 @@ async fn drive_st2_native(
     mut task: tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
     let NativePaths {
-        catalog,
+        session_dir,
         agent_dir,
         identity,
         runtime_id,
@@ -13442,7 +13576,7 @@ async fn drive_st2_native(
                 if mailbox.subscription.is_some() {
                     if driver == "opencode" {
                         if let Err(error) = mailbox.pump(client, &agent_dir,
-                            NativeDeliveryReceipts::OpenCode { catalog_root: &catalog, identity: &identity, runtime_id: &runtime_id }).await {
+                            NativeDeliveryReceipts::OpenCode { session_dir: &session_dir, identity: &identity, runtime_id: &runtime_id }).await {
                             note_driver_tick_failure(subject, error, &mut last_control_warning);
                         }
                     }
@@ -13472,7 +13606,7 @@ async fn drive_st2_native(
                         &archive,
                         "opencode-server",
                         NativeDeliveryReceipts::OpenCode {
-                            catalog_root: &catalog,
+                            session_dir: &session_dir,
                             identity: &identity,
                             runtime_id: &runtime_id,
                         },
@@ -13717,28 +13851,16 @@ fn prepare_native_driver_in(
     subject: &str,
     state_root: &Path,
 ) -> Result<(PathBuf, PathBuf, String, String)> {
-    let state_root = state_root.join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24]);
-    let catalog = state_root.join("catalog");
-    fs::create_dir_all(&catalog)?;
-    // This private catalog exists for st2 hook resolution, not for PTY ownership.
-    // Its deeply nested state path would otherwise fail st2's portable socket-path
-    // validation for slash-qualified st identities, silently disabling hooks.
-    fs::write(
-        catalog.join("catalog.kdl"),
-        "catalog { pty-root \"/tmp/st3-native\" }\n",
-    )?;
-    let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
-    let host = st_drivers::run::detect_host();
-    let leaf = &hex::encode(Sha256::digest(identity.as_bytes()))[..16];
-    let agent_dir = catalog.join("agents").join(&host).join(leaf);
+    let state_root = fs::canonicalize(state_root)
+        .or_else(|_| {
+            fs::create_dir_all(state_root)?;
+            fs::canonicalize(state_root)
+        })?
+        .join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24]);
+    let agent_dir = state_root.join("observations");
     fs::create_dir_all(&agent_dir)?;
-    let workspace = std::env::current_dir()?;
-    let declaration = format!(
-        "agent {identity:?} {{\n  identity {identity:?}\n  host {host:?}\n  workspace {:?}\n  command \"true\"\n}}\n",
-        workspace.to_string_lossy()
-    );
-    fs::write(agent_dir.join("agent.kdl"), declaration)?;
-    Ok((catalog, agent_dir, identity.clone(), identity))
+    let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
+    Ok((state_root, agent_dir, identity.clone(), identity))
 }
 
 fn harness_activity_state(activity: st_drivers::harness_state::Activity) -> &'static str {
@@ -14648,7 +14770,7 @@ async fn run_pi_channel(
                             .await;
                     }
                     stdout.flush().await?;
-                    let state_root = catalog.parent().unwrap_or(catalog);
+                    let state_root = if std::env::var_os(st_drivers::driver_paths::ROOT_ENV).is_some() { catalog } else { catalog.parent().unwrap_or(catalog) };
                     let _ = write_driver_log(
                         subject,
                         &format!(
@@ -15158,7 +15280,7 @@ fn spawn_codex_provider(
     tokio::task::spawn_blocking(move || match start {
         // A resumed seat's launch environment names the thread it suspended on.
         ProviderStart::Launch(_) => st_drivers::codex_app_server::run_controlled_paths(
-            &paths.catalog,
+            &paths.driver_root,
             &state_dir,
             &paths.agent_dir,
             paths.identity,
@@ -15175,7 +15297,7 @@ fn spawn_codex_provider(
             socket_path,
             safe_fallback,
         }) => st_drivers::codex_app_server::adopt_controlled_paths(
-            &paths.catalog,
+            &paths.driver_root,
             &state_dir,
             &paths.agent_dir,
             paths.identity,
@@ -15203,7 +15325,12 @@ async fn drive_codex_native(
     start: ProviderStart,
     mut loop_state: NativeLoopState,
 ) -> Result<()> {
-    let mut paths = NativePaths::prepare(subject)?;
+    let mut paths = if matches!(start, ProviderStart::Launch(_)) {
+        NativePaths::prepare(subject, "codex")?
+    } else {
+        NativePaths::resumed(subject, "codex", loop_state.paths.clone())?
+    };
+    loop_state.paths = Some(paths.resolved());
     let NativePaths {
         agent_dir,
         identity,
@@ -15211,7 +15338,7 @@ async fn drive_codex_native(
         ..
     } = paths.clone();
     let root = paths.state_root();
-    let state_dir = root.join("state");
+    let state_dir = paths.session_dir.clone();
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     if matches!(start, ProviderStart::Launch(_)) {
         // The path can still hold the predecessor's terminal record. It is the predecessor's, never
@@ -16118,11 +16245,11 @@ impl NativeMailbox {
                 state_dir, identity, runtime_id,
             )?,
             NativeDeliveryReceipts::OpenCode {
-                catalog_root,
+                session_dir,
                 identity,
                 runtime_id,
-            } => st_drivers::opencode_session::consumed_delivery_filenames(
-                catalog_root,
+            } => st_drivers::opencode_session::consumed_delivery_paths(
+                session_dir,
                 identity,
                 runtime_id,
             )?,
@@ -16411,10 +16538,12 @@ async fn forward_projected_messages_reporting(
             incarnation,
         } => claude_channel_consumed_delivery_filenames(agent_dir, incarnation),
         NativeDeliveryReceipts::OpenCode {
-            catalog_root,
+            session_dir,
             identity,
             runtime_id,
-        } => st_drivers::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
+        } => {
+            st_drivers::opencode_session::consumed_delivery_paths(session_dir, identity, runtime_id)
+        }
     }?;
     let mut cursor = None;
     let mut failures = Vec::new();
@@ -16553,7 +16682,7 @@ enum NativeDeliveryReceipts<'a> {
         incarnation: &'a str,
     },
     OpenCode {
-        catalog_root: &'a Path,
+        session_dir: &'a Path,
         identity: &'a str,
         runtime_id: &'a str,
     },
@@ -16968,6 +17097,7 @@ mod tests {
             status: "up".into(),
             last_success_at_unix_ms: None,
             last_error: None,
+            last_failure_at_unix_ms: None,
             refusal_reason: None,
             schema_digest: None,
             authority_digest: digest.map(str::to_owned),
@@ -17362,7 +17492,7 @@ mod tests {
                     }
                 } else {
                     NativeDeliveryReceipts::OpenCode {
-                        catalog_root: root.path(),
+                        session_dir: root.path(),
                         identity: "eval.worker",
                         runtime_id: "worker",
                     }
@@ -17556,6 +17686,7 @@ mod tests {
                 seq: 3,
             },
             loop_state: NativeLoopState {
+                paths: None,
                 mailbox_fence: None,
                 ready: true,
                 harness_record_started: true,
@@ -18360,6 +18491,7 @@ mod tests {
                     status: "up".into(),
                     last_success_at_unix_ms: Some(now - 2_000),
                     last_error: None,
+                    last_failure_at_unix_ms: None,
                     refusal_reason: None,
                     schema_digest: None,
                     authority_digest: None,
@@ -20471,24 +20603,63 @@ mission "review" state="ready" {
     }
 
     #[test]
-    fn a_native_driver_gets_one_graph_message_projection() {
+    fn a_native_driver_has_explicit_paths_without_catalogs() {
         let root = tempfile::tempdir().unwrap();
-        let (catalog, agent_dir, identity, runtime_id) =
-            prepare_native_driver_in("agent/node.worker", root.path()).unwrap();
-        let discovery = agent_spec::discovery::discover_strict(&catalog);
-        assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
-        assert_eq!(discovery.specs.len(), 1);
-        assert_eq!(discovery.specs[0].identity, "node.worker");
+        for subject in [
+            "agent/node.worker",
+            "agent/example/app-web/standing/app-web",
+        ] {
+            let (driver_root, agent_dir, identity, runtime_id) =
+                prepare_native_driver_in(subject, root.path()).unwrap();
+            assert_eq!(agent_dir, driver_root.join("observations"));
+            assert!(agent_dir.is_dir());
+            assert!(!driver_root.join("catalog").exists());
+            assert!(!driver_root.join("catalog.kdl").exists());
+            assert!(!agent_dir.join("agent.kdl").exists());
+            assert_eq!(identity, subject.strip_prefix("agent/").unwrap());
+            assert_eq!(runtime_id, identity);
+            assert_eq!(
+                prepare_native_driver_in(subject, root.path()).unwrap().1,
+                agent_dir
+            );
+        }
+    }
+
+    #[test]
+    fn predecessor_layout_survives_resume_without_rewriting_catalogs() {
+        let drivers = tempfile::tempdir().unwrap();
+        let subject = "agent/example/worker";
+        let old = NativePaths::legacy_in(subject, "codex", drivers.path()).unwrap();
+        fs::create_dir_all(&old.agent_dir).unwrap();
+        fs::write(old.driver_root.join("catalog.kdl"), "predecessor bytes").unwrap();
+        fs::write(old.agent_dir.join("agent.kdl"), "predecessor declaration").unwrap();
+        fs::create_dir_all(&old.session_dir).unwrap();
+        fs::write(old.session_dir.join("binding.json"), "provider binding").unwrap();
+        let state = NativeLoopState {
+            paths: Some(old.resolved()),
+            ..NativeLoopState::default()
+        };
+        let encoded = serde_json::to_value(&state).unwrap();
+        let back: NativeLoopState = serde_json::from_value(encoded.clone()).unwrap();
+        let adopted = NativePaths::resumed(subject, "codex", back.paths).unwrap();
+        assert_eq!(adopted.resolved(), old.resolved());
         assert_eq!(
-            discovery.specs[0].path.parent().unwrap(),
-            agent_dir.as_path()
+            fs::read(adopted.session_dir.join("binding.json")).unwrap(),
+            b"provider binding"
         );
-        assert_eq!(identity, "node.worker");
-        assert_eq!(runtime_id, "node.worker");
-        let (long_catalog, _, _, _) =
-            prepare_native_driver_in("agent/example/app-web/standing/app-web", root.path()).unwrap();
-        let report = st_drivers::validate::validate_for_host(&long_catalog, &st_drivers::run::detect_host());
-        assert!(report.issues.is_empty(), "{report:?}");
+        assert_eq!(
+            fs::read(old.driver_root.join("catalog.kdl")).unwrap(),
+            b"predecessor bytes"
+        );
+        assert!(!old.state_root().join("observations").exists());
+        let mut predecessor = encoded;
+        predecessor.as_object_mut().unwrap().remove("paths");
+        assert!(
+            serde_json::from_value::<NativeLoopState>(predecessor)
+                .unwrap()
+                .paths
+                .is_none()
+        );
     }
 
     #[test]
@@ -20664,7 +20835,8 @@ mission "review" state="ready" {
         };
         let deadline = request.until_unix_ms;
         let mut paths = NativePaths {
-            catalog: root.path().into(),
+            driver_root: root.path().into(),
+            session_dir: root.path().join("sessions"),
             agent_dir: root.path().into(),
             identity: "h.gated".into(),
             runtime_id: "gated".into(),

@@ -9,7 +9,9 @@ use serde_json::Value;
 #[cfg(test)]
 use st3_client::TimelineEntry;
 use st3_client::{MissionStep, WorkLabel};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 /// What the live loop has fetched beside the model: conversations and launch previews.
 #[derive(Default)]
@@ -47,41 +49,6 @@ fn gateway(model: &Model) -> Option<String> {
         .map(|snapshot| snapshot.host_id.clone())
 }
 
-/// The steps st sent with a mission: its open runs' steps, or its latest run's when none is open.
-fn mission_steps(mission: &st3_client::Mission) -> Vec<&MissionStep> {
-    let finished = |status: &str| matches!(status, "completed" | "failed" | "cancelled");
-    let open = mission
-        .run_details
-        .iter()
-        .filter(|run| !finished(&run.status))
-        .collect::<Vec<_>>();
-    let runs = if open.is_empty() {
-        mission.run_details.last().into_iter().collect()
-    } else {
-        open
-    };
-    runs.into_iter()
-        .flat_map(|run| run.steps.iter().flatten())
-        .collect()
-}
-
-/// Who set the outcome of the mission's finished latest run, from what, and why.
-fn run_outcome(mission: &st3_client::Mission) -> Option<String> {
-    let outcome = mission.run_details.last()?.outcome.as_ref()?;
-    let was = outcome
-        .previous_status
-        .as_deref()
-        .map(|previous| format!(" (was {previous})"))
-        .unwrap_or_default();
-    Some(format!(
-        "{}{was} · set by {} {} ago: {}",
-        outcome.status,
-        outcome.actor,
-        age(&outcome.at),
-        clean_message_text(&outcome.reason)
-    ))
-}
-
 /// A step st sent with some mission, and that mission.
 fn find_step<'a>(model: &'a Model, id: &str) -> Option<(&'a st3_client::Mission, &'a MissionStep)> {
     model.missions().find_map(|mission| {
@@ -108,6 +75,21 @@ fn short(id: &str) -> String {
     id.trim_start_matches("mission/")
         .trim_start_matches("agent/")
         .to_owned()
+}
+
+fn missions(model: &Model) -> Vec<Mission> {
+    st3_ui_model::missions::adapt(
+        model.missions(),
+        model.agents(),
+        model.attention(),
+        &now(),
+        &st3_ui_model::missions::Display {
+            mission_label: &crate::mission_display_label,
+            agent_label: &crate::agent_label,
+            age_label: &crate::age_label,
+            clean_text: &clean_message_text,
+        },
+    )
 }
 
 pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
@@ -253,7 +235,12 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                             })
                             .unwrap_or_else(|| "An agent".into()),
                         from_id: item.requester_id.clone().unwrap_or_default(),
-                        question: clean_message_text(&item.detail),
+                        question: clean_message_text(
+                            item.request
+                                .as_ref()
+                                .map_or(&item.detail, |request| &request.question),
+                        ),
+                        structured: item.request.clone().map(Box::new),
                     },
                 ),
                 // Home holds only requests and reviews. Messages stay in conversations, and st
@@ -586,238 +573,6 @@ fn agents(model: &Model) -> Vec<Agent> {
     agents
 }
 
-/// Whether an agentless step only holds its run open (so the run's observers keep watching).
-/// st does not say whether an agentless step waits on a flag or runs a command, so this goes
-/// by the names the fleet uses for keep-open steps; anything else counts as work.
-fn keeps_open(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    matches!(
-        name,
-        "keep-watch" | "retire" | "steward-intake" | "standing" | "keep-open"
-    ) || name.ends_with("-retirement")
-}
-
-/// The agent whose queue holds this work, if st says.
-fn queued_for<'a>(model: &'a Model, work: &str) -> Option<&'a st3_client::Agent> {
-    model.agents().find(|agent| {
-        agent.next_work_id.as_deref() == Some(work)
-            || agent.upcoming_work_ids.iter().any(|id| id == work)
-    })
-}
-
-// ------------------------------------------------------------------- missions
-
-/// Who holds or will take a step: its claimant, else its assignee, named.
-fn step_owner(model: &Model, step: &MissionStep) -> Option<String> {
-    if step.agentless {
-        return Some("st".into());
-    }
-    let id = step.claimant.as_deref().or(step.assignee.as_deref())?;
-    Some(
-        model
-            .agents()
-            .find(|agent| agent.header.id == id)
-            .map(|agent| format!("{} · {id}", crate::agent_label(agent)))
-            .unwrap_or_else(|| id.to_owned()),
-    )
-}
-
-fn missions(model: &Model) -> Vec<Mission> {
-    // A step a person's gate holds: its attention item is about the step itself.
-    let gated = model
-        .attention()
-        .filter(|item| item.attention_kind == "human-gate")
-        .map(|item| item.source_id.as_str())
-        .collect::<BTreeSet<_>>();
-    model
-        .missions()
-        .map(|mission| {
-            let work = mission_steps(mission);
-            let decision = model
-                .attention()
-                .find(|item| {
-                    item.attention_kind == "human-gate"
-                        && item.mission_id.as_deref() == Some(mission.header.id.as_str())
-                })
-                .map(|item| item.header.id.clone());
-            let states = work
-                .iter()
-                .map(|step| step.state.as_str())
-                .collect::<Vec<_>>();
-            let word = if decision.is_some() {
-                Word::Decision
-            } else if mission.runs.is_empty() && mission.run_details.is_empty() && work.is_empty() {
-                Word::NotStarted
-            } else if mission.state == "blocked" || states.contains(&"blocked") {
-                Word::Stalled
-            } else if mission.state == "completed" {
-                // A run someone set to completed keeps the steps that failed.
-                Word::Done
-            } else if mission.state == "failed"
-                || states.iter().any(|state| matches!(*state, "failed"))
-            {
-                Word::Failed
-            } else if mission.state == "cancelled" {
-                Word::Cancelled
-            } else if !work.is_empty()
-                && work.iter().all(|step| {
-                    step.state == "completed"
-                        || (matches!(
-                            step.state.as_str(),
-                            "claimed" | "working" | "running" | "verifying"
-                        ) && step.agentless
-                            && keeps_open(&step.path))
-                })
-                && work.iter().any(|step| step.state != "completed")
-            {
-                // Only st's own keep-open steps are running: an intake that watches.
-                Word::Watching
-            } else if states
-                .iter()
-                .any(|state| matches!(*state, "claimed" | "working" | "running" | "verifying"))
-            {
-                Word::Working
-            } else if let Some(ready) = work
-                .iter()
-                .find(|step| step.state == "ready" && step.claimant.is_none())
-            {
-                // Who has this step queued decides whether a person is needed.
-                match queued_for(model, &ready.id) {
-                    Some(agent)
-                        if matches!(agent.state.as_str(), "failed" | "stopped")
-                            || agent.fault.is_some() =>
-                    {
-                        Word::Unstaffed
-                    }
-                    Some(_) => Word::Queued,
-                    None => Word::Unclaimed,
-                }
-            } else if states
-                .iter()
-                .any(|state| matches!(*state, "waiting" | "pending"))
-            {
-                Word::Held
-            } else if matches!(
-                mission.state.as_str(),
-                "standing" | "running" | "ready" | "draft"
-            ) {
-                Word::Idle
-            } else {
-                Word::Done
-            };
-            let steps = work
-                .iter()
-                .map(|step| {
-                    let state = match step.state.as_str() {
-                        _ if gated.contains(step.id.as_str()) => StepState::NeedsYou,
-                        "completed" => StepState::Done,
-                        "claimed" | "working" | "running" | "verifying" => StepState::Working,
-                        "ready" => StepState::Ready,
-                        "waiting" | "pending" | "blocked" => StepState::Waiting,
-                        "cancelled" => StepState::Cancelled,
-                        "failed" => StepState::Failed,
-                        _ => StepState::Pending,
-                    };
-                    let note = if step.state == "ready" && step.claimant.is_none() {
-                        queued_for(model, &step.id).map(|agent| {
-                            let label = crate::agent_label(agent);
-                            match agent.current_work.first() {
-                                Some(current)
-                                    if !matches!(agent.state.as_str(), "failed" | "stopped") =>
-                                {
-                                    format!(
-                                        "queued for {label}, which is busy with {}",
-                                        label_text(model, current)
-                                    )
-                                }
-                                _ => format!("queued for {label}, which is {}", agent.state),
-                            }
-                        })
-                    } else {
-                        None
-                    };
-                    Step {
-                        name: step.path.clone(),
-                        state,
-                        owner: if state == StepState::NeedsYou {
-                            Some("you".into())
-                        } else {
-                            step_owner(model, step)
-                        },
-                        // st keeps a step's last reason after it moves on; only a step still
-                        // waiting is held up by it.
-                        note: note.or_else(|| {
-                            matches!(step.state.as_str(), "waiting" | "blocked")
-                                .then(|| step.blocked_reason.clone())
-                                .flatten()
-                        }),
-                        after: vec![],
-                        age: age(&step.since),
-                        goals: step
-                            .goals
-                            .iter()
-                            .map(|goal| clean_message_text(goal))
-                            .collect(),
-                        constraints: step
-                            .constraints
-                            .iter()
-                            .map(|constraint| clean_message_text(constraint))
-                            .collect(),
-                        gates: vec![],
-                        attempt: step.attempt,
-                        blockers: step.blockers.clone(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            // Read a mission like a pipeline: what finished, what is happening, what is next.
-            // st says nothing about declaration order, so a later step must not sit above the
-            // one working now.
-            let mut steps = steps;
-            steps.sort_by_key(|step| match step.state {
-                StepState::Done | StepState::Cancelled => 0,
-                StepState::NeedsYou | StepState::Failed => 1,
-                StepState::Working => 2,
-                StepState::Ready => 3,
-                StepState::Waiting => 4,
-                StepState::Pending => 5,
-            });
-            let agents = model
-                .agents()
-                .filter(|agent| {
-                    agent
-                        .current_work_ids
-                        .iter()
-                        .any(|id| work.iter().any(|step| &step.id == id))
-                })
-                .map(|agent| agent.header.id.clone())
-                .collect();
-            Mission {
-                id: mission.header.id.clone(),
-                title: crate::mission_display_label(mission),
-                word,
-                age: age(&mission.header.updated_at),
-                host: String::new(),
-                goals: vec![],
-                steps,
-                agents,
-                kdl: None,
-                outcome: run_outcome(mission),
-                decision,
-                worktree: None,
-                parent: None,
-                system: is_system_mission(&mission.header.id),
-            }
-        })
-        .collect()
-}
-
-/// Plumbing the Missions tab folds away until `x` shows it: st's own loop rounds, and CI
-/// (a `ci` segment, as in `mission/fleet/smalltalk/ci/run`). The graph has no mark for this
-/// yet, so the name decides. What needs a person still reaches Home as attention.
-fn is_system_mission(id: &str) -> bool {
-    id.starts_with("mission/__st3/") || id.split('/').any(|segment| segment == "ci")
-}
-
 // ------------------------------------------------------------------- machines
 
 /// A member heard from within this long is online, even without a direct link.
@@ -898,9 +653,9 @@ pub fn names(model: &Model, person: &str) -> BTreeMap<String, String> {
     names
 }
 
-pub use st3_conversation_ui::adapt::{conversation, unreadable_transcript};
 #[cfg(test)]
 use st3_conversation_ui::adapt::from_harness;
+pub use st3_conversation_ui::adapt::{conversation, unreadable_transcript};
 
 #[cfg(test)]
 mod tests {
@@ -1452,42 +1207,6 @@ mod tests {
     }
 
     #[test]
-    fn a_run_set_to_completed_reads_done_and_says_who_set_it_and_why() {
-        let mut model = Model::default();
-        model.missions = window(vec![serde_json::json!({
-            "id": "mission/fleet/harbor/ship", "kind": "mission", "revision": "r1",
-            "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/ship",
-            "state": "completed", "mission_revision": "r1",
-            "runs": ["mission-run/ship-1"],
-            "run_details": [{
-                "id": "mission-run/ship-1", "requester": "person/avery", "status": "completed",
-                "phase": "terminal", "progress": {"done": 1, "total": 2}, "current_steps": [],
-                "must_act": "nobody", "state_since": "2026-09-29T09:58:00Z",
-                "outcome": {
-                    "status": "completed", "previous_status": "failed",
-                    "reason": "the change merged after its gate was fixed",
-                    "actor": "person/avery", "at": "2026-09-29T09:58:00Z",
-                },
-                "steps": [{
-                    "id": "step-run/ship-1/gate", "path": "gate", "state": "failed", "attempt": 1,
-                    "since": "2026-09-29T09:50:00Z", "goals": [], "constraints": [], "blockers": [],
-                }],
-            }],
-        })]);
-        let world = world(&model, "person/avery", &Extras::default());
-        let Load::Ready(missions) = &world.missions else {
-            panic!("missions load from the missions window alone")
-        };
-        assert_eq!(missions[0].word, Word::Done);
-        let outcome = missions[0].outcome.as_deref().expect("the outcome shows");
-        assert!(
-            outcome.starts_with("completed (was failed) · set by person/avery ")
-                && outcome.ends_with(" ago: the change merged after its gate was fixed"),
-            "{outcome}"
-        );
-    }
-
-    #[test]
     fn machines_say_how_they_are_reached_and_never_call_a_heard_member_offline() {
         let now = chrono::Utc::now();
         let ago = |minutes: i64| (now - chrono::Duration::minutes(minutes)).to_rfc3339();
@@ -1555,126 +1274,16 @@ mod tests {
     }
 
     #[test]
-    fn a_mission_nobody_started_says_so_and_a_moving_step_drops_its_old_reason() {
-        let mut model = Model::default();
-        model.missions = window(vec![
-            json!({
-                "id": "mission/fleet/harbor/someday", "kind": "mission", "revision": "r",
-                "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/someday",
-                "state": "ready", "mission_revision": "r", "runs": [], "run_details": [],
-            }),
-            json!({
-                "id": "mission/fleet/harbor/gate", "kind": "mission", "revision": "r",
-                "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/gate",
-                "state": "running", "mission_revision": "r", "runs": ["mission-run/gate-1"],
-                "run_details": [{
-                    "id": "mission-run/gate-1", "requester": "person/avery", "status": "running",
-                    "phase": "normal", "progress": {"done": 0, "total": 1}, "current_steps": [],
-                    "must_act": "person", "state_since": "2026-09-29T09:58:00Z",
-                    "steps": [{
-                        "id": "step-run/gate-1/answer", "path": "answer", "state": "working",
-                        "attempt": 1, "assignee": null, "claimant": null, "agentless": true,
-                        "since": "2026-09-29T09:58:00Z",
-                        "blocked_reason": "the eligible agentless execution started",
-                        "goals": [], "constraints": [], "blockers": [],
-                    }],
-                }],
-            }),
-        ]);
-        let world = world(&model, "person/avery", &Extras::default());
-        let Load::Ready(missions) = &world.missions else {
-            panic!("missions load")
-        };
-        let someday = missions
-            .iter()
-            .find(|mission| mission.title.contains("Someday"))
-            .unwrap();
-        assert_eq!(someday.word, Word::NotStarted);
-        let gate = missions
-            .iter()
-            .find(|mission| mission.title.contains("Gate"))
-            .unwrap();
-        assert_eq!(gate.steps[0].note, None);
-        assert_eq!(
-            gate.steps[0].state,
-            StepState::Working,
-            "st calls it working"
-        );
-
-        // The same step, once st asks a person to answer it.
-        model.actor = "person/avery".into();
-        model.now = window(vec![json!({
-            "id": "attention/gate", "kind": "attention", "revision": "r",
-            "updated_at": "2026-09-29T09:58:00Z", "attention_kind": "human-gate",
-            "source_id": "step-run/gate-1/answer", "person_id": "person/avery",
-            "mission_id": "mission/fleet/harbor/gate", "title": "answer",
-            "detail": "Which tide table?", "priority": "normal", "state": "open",
-            "requested_at": "2026-09-29T09:58:00Z", "targets": [], "target_states": [],
-        })]);
-        let world = super::world(&model, "person/avery", &Extras::default());
-        let Load::Ready(missions) = &world.missions else {
-            panic!("missions load")
-        };
-        let gate = missions
-            .iter()
-            .find(|mission| mission.title.contains("Gate"))
-            .unwrap();
-        assert_eq!(gate.steps[0].state, StepState::NeedsYou);
-        assert_eq!(gate.steps[0].owner.as_deref(), Some("you"));
-    }
-
-    #[test]
-    fn mission_steps_map_every_contract_state_and_held_work_is_working() {
-        for (state, expected) in [
-            ("waiting", StepState::Waiting),
-            ("ready", StepState::Ready),
-            ("claimed", StepState::Working),
-            ("blocked", StepState::Waiting),
-            ("verifying", StepState::Working),
-            ("completed", StepState::Done),
-            ("failed", StepState::Failed),
-            ("cancelled", StepState::Cancelled),
-            // Cached projections from older daemons keep their meaning.
-            ("working", StepState::Working),
-            ("pending", StepState::Waiting),
-        ] {
-            let mut model = Model::default();
-            model.missions = window(vec![serde_json::json!({
-                "id": "mission/fleet/harbor/build", "kind": "mission", "revision": "r1",
-                "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/build",
-                "state": "running", "mission_revision": "r1", "runs": ["mission-run/build-1"],
-                "run_details": [{
-                    "id": "mission-run/build-1", "requester": "person/avery", "status": "running",
-                    "phase": "normal", "progress": {"done": 0, "total": 2}, "current_steps": [],
-                    "must_act": "agent", "state_since": "2026-09-29T09:58:00Z",
-                    "steps": [
-                        {"id": "step-run/build-1/build", "path": "build", "state": state, "attempt": 1,
-                         "claimant": "agent/example/harbor/builder", "since": "2026-09-29T09:58:00Z"},
-                        {"id": "step-run/build-1/deploy", "path": "deploy", "state": "waiting", "attempt": 0,
-                         "since": "2026-09-29T09:58:00Z"}
-                    ],
-                }],
-            })]);
-            let world = world(&model, "person/avery", &Extras::default());
-            let Load::Ready(missions) = &world.missions else {
-                panic!("missions loaded")
-            };
-            assert_eq!(missions[0].steps[0].state, expected, "{state}");
-            if expected == StepState::Working {
-                assert_eq!(missions[0].word, Word::Working, "{state}");
-            }
-        }
-    }
-
-    #[test]
     fn a_waiting_human_ask_needs_you_even_while_the_harness_activity_is_working() {
         let mut model = Model::default();
-        let resource = |state: &str, activity: &str, blocked_on: Option<&str>| serde_json::json!({
-            "id": "agent/human-omp", "kind": "agent", "revision": "r1",
-            "updated_at": "2026-09-30T12:00:00Z", "name": "human-omp",
-            "state": state, "reachability": "local", "harness_state": activity,
-            "blocked_on": blocked_on, "runtime_ids": [], "under": [],
-        });
+        let resource = |state: &str, activity: &str, blocked_on: Option<&str>| {
+            serde_json::json!({
+                "id": "agent/human-omp", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-09-30T12:00:00Z", "name": "human-omp",
+                "state": state, "reachability": "local", "harness_state": activity,
+                "blocked_on": blocked_on, "runtime_ids": [], "under": [],
+            })
+        };
         model.agents = window(vec![resource("waiting", "working", Some("human"))]);
         assert_eq!(agents(&model)[0].state, AgentState::NeedsYou);
         model.agents = window(vec![resource("running", "working", None)]);
@@ -1718,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn missions_and_agents_read_what_st_joined_without_work_or_runtime_lists() {
+    fn agents_read_joined_work_without_work_or_runtime_lists() {
         let step = |id: &str, path: &str, state: &str, claimant: Option<&str>| {
             serde_json::json!({
                 "id": id, "path": path, "state": state, "attempt": 1,
@@ -1772,26 +1381,6 @@ mod tests {
         })]);
         assert!(model.work.items.is_empty() && model.runtimes.items.is_empty());
         let world = world(&model, "person/avery", &Extras::default());
-
-        let Load::Ready(missions) = &world.missions else {
-            panic!("missions load from the missions window alone")
-        };
-        let mission = &missions[0];
-        assert_eq!(mission.word, Word::Working);
-        assert_eq!(
-            mission
-                .steps
-                .iter()
-                .map(|step| (step.name.as_str(), step.state))
-                .collect::<Vec<_>>(),
-            [("scan", StepState::Working), ("report", StepState::Ready)]
-        );
-        assert_eq!(mission.steps[0].goals, ["Do scan."]);
-        assert_eq!(mission.agents, ["agent/example/harbor/keeper"]);
-        assert_eq!(
-            mission.steps[1].note.as_deref(),
-            Some("queued for Keeper, which is busy with fleet/harbor · Audit › scan")
-        );
 
         let Load::Ready(agents) = &world.agents else {
             panic!("agents load from the agents window alone")

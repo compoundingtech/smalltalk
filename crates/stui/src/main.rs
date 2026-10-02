@@ -1935,7 +1935,8 @@ async fn run_attention_action(
     reason: Option<String>,
 ) -> Result<String> {
     anyhow::ensure!(app.live_ready, "Reconnect before acting");
-    let outcome = attention_action(client, &app.model.actor, attention_id, action, reason).await?;
+    let outcome =
+        attention_action(client, &app.model.actor, attention_id, action, reason, None).await?;
     match app.model.reload(client).await {
         Ok(()) => Ok(outcome),
         Err(error) => Ok(format!("{outcome}; refresh failed: {error}")),
@@ -1949,6 +1950,7 @@ async fn attention_action(
     attention_id: &str,
     action: &str,
     reason: Option<String>,
+    answer: Option<String>,
 ) -> Result<String> {
     let current = client.attention_get(attention_id).await?;
     let Resource::Attention(attention) = &current.value else {
@@ -1997,7 +1999,10 @@ async fn attention_action(
                         episode: attention.episode.clone(),
                         summary,
                         evidence: vec![],
-                        answer: None,
+                        answer: answer.map(|id| st3_client::PersonAnswerInput {
+                            id: Some(id),
+                            text: None,
+                        }),
                     },
                 )
                 .await?
@@ -2349,6 +2354,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                                         in_reply_to: None,
                                         session_id: peer.current_session_id.clone(),
                                         tags: vec![],
+                                        signature: None,
                                     },
                                 )
                                 .await

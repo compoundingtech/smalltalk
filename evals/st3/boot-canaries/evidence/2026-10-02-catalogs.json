@@ -1,0 +1,160 @@
+{
+  "date": "2026-10-02",
+  "providers": "token-free stand-ins; disposable daemon and PTY state",
+  "predecessor_binary_sha256": "a576160b4e9536da84914567b028debcc7facb71deeaf9f17e7e22a4c35aabcb",
+  "checks": {
+    "fresh_launch_creates_no_catalogs": true,
+    "reexec_preserves_provider_processes_and_incarnation": true,
+    "predecessor_adoption_preserves_catalog_bytes": true
+  },
+  "native_reexec": {
+    "claude": {
+      "verdict": "pass",
+      "harness": "claude",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 8.4,
+        "reexec:a": 2.8
+      },
+      "catalog_files": 0
+    },
+    "codex": {
+      "verdict": "pass",
+      "harness": "codex",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 7.6,
+        "reexec:a": 1.5
+      },
+      "catalog_files": 0
+    },
+    "pi": {
+      "verdict": "pass",
+      "harness": "pi",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 3.0,
+        "reexec:a": 3.2
+      },
+      "catalog_files": 0
+    },
+    "omp": {
+      "verdict": "pass",
+      "harness": "omp",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 3.0,
+        "reexec:a": 4.6
+      },
+      "catalog_files": 0
+    },
+    "opencode": {
+      "verdict": "pass",
+      "harness": "opencode",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 3.4,
+        "reexec:a": 3.0
+      },
+      "catalog_files": 0
+    }
+  },
+  "predecessor_upgrade": {
+    "claude": {
+      "verdict": "pass",
+      "harness": "claude",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 11.1,
+        "reexec:a": 3.2
+      },
+      "catalog_files": 2
+    },
+    "codex": {
+      "verdict": "pass",
+      "harness": "codex",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 8.6,
+        "reexec:a": 3.2
+      },
+      "catalog_files": 2
+    },
+    "pi": {
+      "verdict": "pass",
+      "harness": "pi",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 2.5,
+        "reexec:a": 4.4
+      },
+      "catalog_files": 2
+    },
+    "omp": {
+      "verdict": "pass",
+      "harness": "omp",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 2.5,
+        "reexec:a": 5.8
+      },
+      "catalog_files": 2
+    },
+    "opencode": {
+      "verdict": "pass",
+      "harness": "opencode",
+      "scenario": "reexec",
+      "seconds_to_boot": {
+        "boot:a": 3.7,
+        "reexec:a": 3.2
+      },
+      "catalog_files": 2
+    }
+  },
+  "claude_observation_transcript_usage_doctor_mail": {
+    "verdict": "pass",
+    "observed_states": [
+      "idle",
+      "ready",
+      "starting",
+      "working"
+    ],
+    "timeline_items": 8,
+    "usage": {
+      "compactions": 0,
+      "context_used_percent": 7.0,
+      "context_used_tokens": 14000,
+      "context_window_tokens": 200000,
+      "driver": "claude",
+      "model": "claude-stub-model",
+      "semantics": "context_occupancy"
+    },
+    "message_status": "read",
+    "doctor_status": "pass",
+    "record_schemas": {
+      "harness-state": "st.harness-state.v1",
+      "harness-context": "st.harness-context.v1",
+      "harness-timeline": "st.harness-timeline.v1"
+    },
+    "projected_message_files": 0,
+    "legacy_status_files": [],
+    "driver_catalog_files": []
+  },
+  "historical_pre_reexec_channel": {
+    "verdict": "pass",
+    "fault_duration_ms": 3754,
+    "read_after_clear_ms": 1764,
+    "projected_message_files": 0,
+    "driver_catalog_files": 0,
+    "received_copies": 1,
+    "graph_read_claims": 1,
+    "provider_starts": 1,
+    "sender_message_status": "closed",
+    "delivered_during_outage": false,
+    "read_receipt_matches_graph": true,
+    "old_binary_sha256": "c594658a3b08daf82ca83da605a32bcc23f444414594b1b01ba8385f1d60180a",
+    "same_provider_pids": true,
+    "same_incarnation": true,
+    "delivery_state": "legacy"
+  }
+}

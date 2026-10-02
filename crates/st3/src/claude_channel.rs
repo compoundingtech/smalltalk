@@ -30,11 +30,11 @@ pub async fn run(
     client: &Client,
     subject: &str,
     incarnation: &str,
-    catalog: &Path,
-    agent_dir: &Path,
+    paths: &st_drivers::driver_paths::Paths,
     identity: &str,
     runtime_id: &str,
 ) -> Result<()> {
+    let agent_dir = &paths.agent_dir;
     let ledger_path = agent_dir.join("native-channel-handoffs.json");
     let mut state = if let Some(path) =
         st_drivers::reexec::resume_path(st_drivers::reexec::CHANNEL_RESUME_ENV)
@@ -145,7 +145,7 @@ pub async fn run(
                     // not delivery or read, and a daemon outage creates neither fact.
                     let mut dirty = false;
                     if !content.is_empty()
-                        && let Ok(Some(path)) = st_drivers::claude_session::channel_transcript(catalog, identity, runtime_id, &wrapper)
+                        && let Ok(Some(path)) = st_drivers::claude_session::channel_transcript_paths(&paths.session_dir, identity, runtime_id, &wrapper)
                         && let Ok(records) = transcript.appended(&path) {
                         for record in records {
                             for (message, envelope) in &content {

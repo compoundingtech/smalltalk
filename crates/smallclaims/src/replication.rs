@@ -422,7 +422,12 @@ pub struct ReplicationPeerStatus {
     pub peer: String,
     pub status: String,
     pub last_success_at_unix_ms: Option<u128>,
+    /// The last attempt to reach the peer that failed after its last exchange; cleared by the
+    /// next exchange in either direction.
     pub last_error: Option<String>,
+    /// When `last_error` happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at_unix_ms: Option<u128>,
     /// A direct Fabric route was refused by the member's service grants, not an outage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_reason: Option<String>,
@@ -451,6 +456,14 @@ pub struct ReplicationPeerSync {
     /// Envelopes this node holds that the peer lacks.
     pub local_only_envelopes: u64,
     pub measured_at_unix_ms: u128,
+    /// The peer has not exchanged since a quiet interval passed, so the measurement may no
+    /// longer hold: it says what the two nodes held then, not now.
+    #[serde(default)]
+    pub stale: bool,
+    /// Envelopes this node gained since the measurement, which the counts above leave out.
+    /// Until the next exchange, the peer has not seen them from this node.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub added_since_measured_envelopes: u64,
     /// Envelopes received from the peer per second over recent exchanges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receive_rate_per_second: Option<f64>,
@@ -517,4 +530,8 @@ pub struct ReplicaRange {
     pub origin: String,
     pub from: u64,
     pub through: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }

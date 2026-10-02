@@ -107,6 +107,24 @@ pub fn run_with_control(
     let this_host = crate::run::detect_host();
     let agent_dir = message::resolve_declared_dir(catalog_root, &identity, &this_host)?
         .with_context(|| format!("opencode driver agent '{identity}' is not declared"))?;
+    let paths = crate::driver_paths::Paths {
+        root: catalog_root.to_path_buf(),
+        agent_dir,
+        session_dir: state_dir(catalog_root, &identity),
+    };
+    run_with_paths(&paths, identity, runtime_id, opencode_argv, control)
+}
+
+pub fn run_with_paths(
+    paths: &crate::driver_paths::Paths,
+    identity: String,
+    runtime_id: String,
+    opencode_argv: Vec<String>,
+    control: SessionControl,
+) -> Result<()> {
+    let catalog_root = &paths.root;
+    let agent_dir = &paths.agent_dir;
+    let this_host = crate::run::detect_host();
     anyhow::ensure!(
         !opencode_argv.is_empty(),
         "opencode driver '{runtime_id}' has no provider argv"
@@ -160,9 +178,9 @@ pub fn run_with_control(
     // left — a still-fresh live record included — before this wrapper's first observation.
     let mut session = {
         let session = harness_state::session_token();
-        let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
+        let seq = harness_state::claim(agent_dir, identity.clone(), "opencode", &session)?;
         let mut diagnostics = DiagnosticPublisher::new(
-            &agent_dir,
+            agent_dir,
             DiagnosticDriver::OpenCode,
             producer_version.clone(),
             support,
@@ -179,12 +197,12 @@ pub fn run_with_control(
         Session {
             client,
             version_ok,
-            status_path: status::status_path(&agent_dir),
+            status_path: status::status_path(agent_dir),
             control: control.clone(),
             // The pty session vouching for the record is the wrapper's task: the runtime ID
             // names the registry entry, and only aliases the identity on driver-expanded seats.
             writer: Writer::new(
-                &agent_dir,
+                agent_dir,
                 identity.clone(),
                 "opencode",
                 Some(runtime_id.clone()),
@@ -193,8 +211,10 @@ pub fn run_with_control(
             // The same incarnation token as the state record beside it, carried as provenance
             // only (HC-R15): nothing on this record is fenced on it. The claim above already
             // removed any predecessor's context record, so no second removal belongs here.
-            spend: SpendProducer::new(&agent_dir, &session),
-            context: match ContextProducer::new(&agent_dir, &identity, &session) {
+            spend: SpendProducer::new(agent_dir, &session),
+            context: match ContextProducer::new_for_control(
+                agent_dir, &identity, &session, &control,
+            ) {
                 Ok(producer) => Some(producer),
                 Err(error) => {
                     tracing::warn!(
@@ -204,8 +224,14 @@ pub fn run_with_control(
                 }
             },
             delivery: {
-                let mut delivery =
-                    Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id);
+                let mut delivery = Delivery::with_state_path(
+                    catalog_root,
+                    agent_dir,
+                    &this_host,
+                    &identity,
+                    &runtime_id,
+                    paths.session_dir.join(delivery_ledger::LEDGER_FILE),
+                );
                 delivery.control = control;
                 delivery.pinned_session = selected_session(&argv);
                 // A predecessor's record names the predecessor's session, never this one's.
@@ -238,7 +264,7 @@ pub fn run_with_control(
         }
     };
 
-    run_session(session, &mut ProviderProcess::Spawned(child), &agent_dir)
+    run_session(session, &mut ProviderProcess::Spawned(child), agent_dir)
 }
 
 /// Resume supervising an OpenCode provider a predecessor driver image launched through [`run`] and
@@ -289,6 +315,43 @@ pub fn adopt_with_control(
     let this_host = crate::run::detect_host();
     let agent_dir = message::resolve_declared_dir(catalog_root, &identity, &this_host)?
         .with_context(|| format!("opencode driver agent '{identity}' is not declared"))?;
+    let paths = crate::driver_paths::Paths {
+        root: catalog_root.to_path_buf(),
+        agent_dir,
+        session_dir: state_dir(catalog_root, &identity),
+    };
+    adopt_with_paths(
+        &paths,
+        identity,
+        runtime_id,
+        pid,
+        session,
+        seq,
+        port,
+        password,
+        version_ok,
+        producer_version,
+        control,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn adopt_with_paths(
+    paths: &crate::driver_paths::Paths,
+    identity: String,
+    runtime_id: String,
+    pid: u32,
+    session: String,
+    seq: u64,
+    port: u16,
+    password: String,
+    version_ok: bool,
+    producer_version: Option<String>,
+    control: SessionControl,
+) -> Result<()> {
+    let catalog_root = &paths.root;
+    let agent_dir = &paths.agent_dir;
+    let this_host = crate::run::detect_host();
     let support = match (&producer_version, version_ok) {
         (_, true) => DiagnosticSupport::Supported,
         (Some(_), false) => DiagnosticSupport::Unsupported,
@@ -297,25 +360,31 @@ pub fn adopt_with_control(
     let session_state = Session {
         client: Client::new(port, &password),
         version_ok,
-        status_path: status::status_path(&agent_dir),
+        status_path: status::status_path(agent_dir),
         control: control.clone(),
         writer: Writer::new(
-            &agent_dir,
+            agent_dir,
             identity.clone(),
             "opencode",
             Some(runtime_id.clone()),
         )
         .with_ownership(session.clone(), seq),
-        context: ContextProducer::new(&agent_dir, &identity, &session).ok(),
-        spend: SpendProducer::new(&agent_dir, &session),
+        context: ContextProducer::new_for_control(agent_dir, &identity, &session, &control).ok(),
+        spend: SpendProducer::new(agent_dir, &session),
         delivery: {
-            let mut delivery =
-                Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id);
+            let mut delivery = Delivery::with_state_path(
+                catalog_root,
+                agent_dir,
+                &this_host,
+                &identity,
+                &runtime_id,
+                paths.session_dir.join(delivery_ledger::LEDGER_FILE),
+            );
             delivery.control = control;
             delivery
         },
         diagnostics: DiagnosticPublisher::new(
-            &agent_dir,
+            agent_dir,
             DiagnosticDriver::OpenCode,
             producer_version.clone(),
             support,
@@ -328,11 +397,7 @@ pub fn adopt_with_control(
             producer_version,
         },
     };
-    run_session(
-        session_state,
-        &mut ProviderProcess::adopted(pid),
-        &agent_dir,
-    )
+    run_session(session_state, &mut ProviderProcess::adopted(pid), agent_dir)
 }
 
 // ---- wrapper session loop --------------------------------------------------------------------
@@ -1269,14 +1334,31 @@ struct ContextProducer {
 }
 
 impl ContextProducer {
+    #[cfg(test)]
     fn new(agent_dir: &Path, identity: &str, session: &str) -> Result<Self> {
-        Ok(Self {
-            writer: harness_context::Writer::new(
+        Self::new_for_control(agent_dir, identity, session, &SessionControl::Catalog)
+    }
+
+    fn new_for_control(
+        agent_dir: &Path,
+        identity: &str,
+        session: &str,
+        control: &SessionControl,
+    ) -> Result<Self> {
+        let writer = match control {
+            SessionControl::Catalog => harness_context::Writer::new(
                 agent_dir,
                 identity,
                 harness_context::Harness::OpenCode,
-            )?
-            .with_session(session),
+            )?,
+            SessionControl::Graph(_) => harness_context::Writer::new_paths(
+                agent_dir,
+                identity,
+                harness_context::Harness::OpenCode,
+            )?,
+        };
+        Ok(Self {
+            writer: writer.with_session(session),
             windows: BTreeMap::new(),
             model: None,
             configured_model: None,
@@ -1621,24 +1703,6 @@ struct Delivery {
 }
 
 impl Delivery {
-    fn new(
-        catalog_root: &Path,
-        agent_dir: &Path,
-        this_host: &str,
-        identity: &str,
-        runtime_id: &str,
-    ) -> Self {
-        let ledger_path = state_dir(catalog_root, identity).join(delivery_ledger::LEDGER_FILE);
-        Self::with_state_path(
-            catalog_root,
-            agent_dir,
-            this_host,
-            identity,
-            runtime_id,
-            ledger_path,
-        )
-    }
-
     fn with_state_path(
         catalog_root: &Path,
         agent_dir: &Path,
@@ -2048,7 +2112,16 @@ pub fn consumed_delivery_filenames(
     identity: &str,
     runtime_id: &str,
 ) -> Result<BTreeSet<String>> {
-    let path = state_dir(catalog_root, identity).join(delivery_ledger::LEDGER_FILE);
+    consumed_delivery_paths(&state_dir(catalog_root, identity), identity, runtime_id)
+}
+
+/// Read receipts from the host's explicit session directory.
+pub fn consumed_delivery_paths(
+    session_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+) -> Result<BTreeSet<String>> {
+    let path = session_dir.join(delivery_ledger::LEDGER_FILE);
     if !path.is_file() {
         return Ok(BTreeSet::new());
     }

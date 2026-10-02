@@ -3129,18 +3129,17 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
         ensure_no_properties(mention)?;
         ensure_no_children(mention)?;
         let entries = positional_values(mention);
-        let [login, person] = entries.as_slice() else {
+        let [login] = entries.as_slice() else {
             return Err(St3Error::new(
                 "invalid-subscription-mention",
-                "a subscription mention names a GitHub login and the person it is",
+                "a subscription mention names one GitHub login",
             ));
         };
-        let (login, person) = (value_string(login)?, value_string(person)?);
-        validate_full_subject(&person)?;
-        if login.trim().is_empty() || !person.starts_with("person/") {
+        let login = value_string(login)?;
+        if login.trim().is_empty() {
             return Err(St3Error::new(
                 "invalid-subscription-mention",
-                "a subscription mention names a GitHub login and a `person/` subject",
+                "a subscription mention names one GitHub login",
             ));
         }
         if !logins.insert(login.to_ascii_lowercase()) {
@@ -3165,9 +3164,57 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
     let kind = first_string(delivery)?;
     match kind.as_str() {
         "message" => {
-            ensure_no_children(delivery)?;
             let target = required_child_string(body, "to", "subscription")?;
             validate_full_subject(&target)?;
+            // `every` batches: new repository items and mentions collect and reach the target
+            // together at most this often, and only when something arrived.
+            let every = match delivery.children() {
+                None => None,
+                Some(delivery_body) => {
+                    reject_unknown_children(
+                        delivery_body,
+                        &["every", "owner"],
+                        "message delivery",
+                        "delivery",
+                    )?;
+                    unique_child(delivery_body, "every")?;
+                    unique_child(delivery_body, "owner")?;
+                    validate_owner_route(delivery_body)?;
+                    let every = child_string(delivery_body, "every")?.ok_or_else(|| {
+                        St3Error::new(
+                            "invalid-batch-delivery",
+                            "a message delivery with a body batches `every` some interval",
+                        )
+                    })?;
+                    parse_duration(&every, true)?;
+                    Some(every)
+                }
+            };
+            if every.is_some()
+                && let Some(field) = fields.iter().find(|field| {
+                    !matches!(field.as_str(), "pull_requests" | "issues" | "mentions")
+                })
+            {
+                return Err(St3Error::new(
+                    "invalid-batch-delivery",
+                    format!("a batched delivery hears repository items, not `{field}`"),
+                ));
+            }
+            if every.is_some()
+                && fields.iter().any(|field| field == "mentions")
+                && logins.is_empty()
+            {
+                return Err(St3Error::new(
+                    "invalid-mention-delivery",
+                    "a batched delivery hears the mentions of at least one `mention`",
+                ));
+            }
+            if !logins.is_empty() && every.is_none() {
+                return Err(St3Error::new(
+                    "invalid-subscription-mention",
+                    "only a batched delivery hears the mentions a `mention` names",
+                ));
+            }
         }
         "mission" => {
             if child_string(body, "to")?.is_some() {
@@ -3184,14 +3231,50 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
             })?;
             reject_unknown_children(
                 delivery_body,
-                &["mission", "resource", "workspace", "requester", "owner"],
+                &[
+                    "mission",
+                    "resource",
+                    "workspace",
+                    "requester",
+                    "owner",
+                    "text",
+                ],
                 "mission delivery",
                 "delivery",
             )?;
-            for name in ["mission", "resource", "workspace", "requester", "owner"] {
+            for name in [
+                "mission",
+                "resource",
+                "workspace",
+                "requester",
+                "owner",
+                "text",
+            ] {
                 unique_child(delivery_body, name)?;
             }
             validate_owner_route(delivery_body)?;
+            // `text` batches: one run per observation receives every new item and mention as a
+            // text input, so its agent sees a burst together. Mentions arrive only that way.
+            let text = child_string(delivery_body, "text")?;
+            if let Some(text) = &text {
+                validate_name(text, false)?;
+                if let Some(field) = fields.iter().find(|field| {
+                    !matches!(field.as_str(), "pull_requests" | "issues" | "mentions")
+                }) {
+                    return Err(St3Error::new(
+                        "invalid-batch-delivery",
+                        format!("a batched delivery hears repository items, not `{field}`"),
+                    ));
+                }
+            }
+            if fields.iter().any(|field| field == "mentions")
+                && (text.is_none() || logins.is_empty())
+            {
+                return Err(St3Error::new(
+                    "invalid-mention-delivery",
+                    "a mission delivery hears the mentions of at least one `mention` through a `text` input",
+                ));
+            }
             let reference = required_child_string(delivery_body, "mission", "mission delivery")?;
             validate_subscription_mission_reference(&reference)?;
             let input = required_child_string(delivery_body, "resource", "mission delivery")?;
@@ -3213,29 +3296,10 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
                 }
             }
         }
-        "person" => {
-            if child_string(body, "to")?.is_some() {
-                return Err(St3Error::new(
-                    "invalid-subscription-target",
-                    "a person delivery names its people with `mention`, not `to`",
-                ));
-            }
-            if fields != ["mentions"] || logins.is_empty() {
-                return Err(St3Error::new(
-                    "invalid-person-delivery",
-                    "a person delivery hears `on \"mentions\"` of at least one `mention`",
-                ));
-            }
-            if let Some(delivery_body) = delivery.children() {
-                reject_unknown_children(delivery_body, &["owner"], "person delivery", "delivery")?;
-                unique_child(delivery_body, "owner")?;
-                validate_owner_route(delivery_body)?;
-            }
-        }
         _ => {
             return Err(St3Error::new(
                 "unsupported-subscription-delivery",
-                "a subscription delivery must be `message`, `mission`, or `person`",
+                "a subscription delivery must be `message` or `mission`",
             ));
         }
     }
@@ -3957,6 +4021,8 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             requester: None,
             owner_message: false,
             mentions: Vec::new(),
+            text_input: None,
+            batch_every_ms: None,
             stopped: true,
         });
     }
@@ -4005,13 +4071,22 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             .iter()
             .filter(|child| child.get("name").and_then(Value::as_str) == Some("mention"))
             .filter_map(|child| {
-                let arguments = child.get("arguments")?.as_array()?;
-                Some((
-                    arguments.first()?.as_str()?.to_owned(),
-                    arguments.get(1)?.as_str()?.to_owned(),
-                ))
+                Some(
+                    child
+                        .get("arguments")?
+                        .as_array()?
+                        .first()?
+                        .as_str()?
+                        .to_owned(),
+                )
             })
             .collect(),
+        text_input: canonical_child_value(delivery_node, "text")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        batch_every_ms: canonical_child_value(delivery_node, "every")
+            .and_then(Value::as_str)
+            .and_then(|value| parse_duration(value, true).ok()),
         stopped: false,
     })
 }
@@ -5975,9 +6050,9 @@ observer "github" {{ resource "resource/repo"; provider "github.repository"; loc
 }
 subscription "mentions" {
   observer "observer/github"; on "mentions"
-  mention "orchid" "person/robin"
-  mention "fern" "person/lichen"
-  delivery "person" { owner "message" }
+  mention "orchid"
+  mention "fern"
+  delivery "mission" { mission "example/mentions"; resource "source"; text "mentions"; workspace "/srv/mentions"; owner "message" }
 }"#,
             ),
             "node",
@@ -5987,39 +6062,52 @@ subscription "mentions" {
             subscription_spec(&intent.subjects[&format!("subscription/{name}")].desired).unwrap()
         };
         assert!(spec("reviews").owner_message);
+        assert_eq!(spec("reviews").text_input, None);
         let mentions = spec("mentions");
-        assert_eq!(mentions.delivery, "person");
+        assert_eq!(mentions.delivery, "mission");
         assert!(mentions.owner_message);
-        assert_eq!(
-            mentions.mentions,
-            [
-                ("orchid".to_owned(), "person/robin".to_owned()),
-                ("fern".to_owned(), "person/lichen".to_owned()),
-            ]
-        );
+        assert_eq!(mentions.text_input.as_deref(), Some("mentions"));
+        assert_eq!(mentions.mentions, ["orchid", "fern"]);
+        let delivery = r#"delivery "mission" { mission "example/mentions"; resource "source"; text "mentions"; workspace "/srv/mentions" }"#;
         for (subscription, code) in [
             (
-                r#"subscription "s" { observer "observer/github"; on "mentions"; delivery "person" }"#,
-                "invalid-person-delivery",
+                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid"; delivery "mission" { mission "example/mentions"; resource "source"; workspace "/srv/mentions" } }"#.to_owned(),
+                "invalid-mention-delivery",
             ),
             (
-                r#"subscription "s" { observer "observer/github"; on "pull_requests"; mention "orchid" "person/robin"; delivery "person" }"#,
+                format!(r#"subscription "s" {{ observer "observer/github"; on "mentions"; {delivery} }}"#),
+                "invalid-mention-delivery",
+            ),
+            (
+                r#"subscription "s" { observer "observer/github"; on "head"; delivery "mission" { mission "example/review"; resource "source"; text "items"; workspace "/srv/reviews" } }"#.to_owned(),
+                "invalid-batch-delivery",
+            ),
+            (
+                r#"subscription "s" { observer "observer/github"; on "pull_requests"; mention "orchid"; delivery "mission" { mission "example/review"; resource "source"; workspace "/srv/reviews" } }"#.to_owned(),
                 "invalid-subscription-mention",
             ),
             (
-                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid" "agent/orchid"; delivery "person" }"#,
+                format!(r#"subscription "s" {{ observer "observer/github"; on "mentions"; mention "orchid" "person/robin"; {delivery} }}"#),
                 "invalid-subscription-mention",
             ),
             (
-                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid" "person/one"; mention "Orchid" "person/two"; delivery "person" }"#,
+                format!(r#"subscription "s" {{ observer "observer/github"; on "mentions"; mention "orchid"; mention "Orchid"; {delivery} }}"#),
                 "duplicate-subscription-mention",
             ),
             (
-                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid" "person/robin"; delivery "person" { owner "person" } }"#,
+                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid"; to "agent/example"; delivery "message" }"#.to_owned(),
+                "invalid-subscription-mention",
+            ),
+            (
+                r#"subscription "s" { observer "observer/github"; on "pull_requests"; delivery "mission" { mission "example/review"; resource "source"; workspace "/srv/reviews"; owner "person" } }"#.to_owned(),
                 "invalid-owner-route",
             ),
+            (
+                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid"; delivery "person" }"#.to_owned(),
+                "unsupported-subscription-delivery",
+            ),
         ] {
-            let error = parse_test_intent(&source(subscription), "node").unwrap_err();
+            let error = parse_test_intent(&source(&subscription), "node").unwrap_err();
             assert_eq!(error.code, code, "{subscription}");
         }
     }
