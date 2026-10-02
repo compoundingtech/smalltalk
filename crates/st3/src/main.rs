@@ -3031,7 +3031,8 @@ enum MessageCommand {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Render one normalized session timeline, including tools and usage.
+    /// Show one conversation as stui shows it: messages, folded tools, Small Talk. `--raw`
+    /// prints every normalized entry (ids, message boundaries, tool JSON); `--json` the page.
     Timeline {
         session: String,
         #[arg(long = "as", value_parser = parse_actor_subject)]
@@ -3041,6 +3042,9 @@ enum MessageCommand {
         /// Continue toward older entries using the preceding response's next cursor.
         #[arg(long)]
         cursor: Option<String>,
+        /// Every normalized entry as it is stored, instead of the conversation as it reads.
+        #[arg(long)]
+        raw: bool,
     },
     /// Follow the visible normalized conversation; JSON output is one entry per line.
     Follow {
@@ -6914,6 +6918,74 @@ fn print_timeline_page(
     }
     print!("{output}");
     Ok(())
+}
+
+/// A conversation page as stui draws it, through the shared renderer: in colour on a terminal
+/// (unless `NO_COLOR` is set), plain text otherwise.
+fn print_conversation_page(response: &ClientEnvelope<ClientTimelinePage>) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let stdout = std::io::stdout();
+    let color = stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let width = terminal_columns().unwrap_or(100).clamp(40, 160);
+    let mut output = conversation_text(
+        &response.value.session_id,
+        &response.value.items,
+        width,
+        color,
+    );
+    if response.value.page.has_more
+        && let Some(cursor) = &response.value.page.next_cursor
+    {
+        output.push_str(&format!(
+            "\nOlder entries: st conversations timeline {} --cursor {}\n",
+            response.value.session_id,
+            shell_argument(cursor)
+        ));
+    }
+    print!("{output}");
+    Ok(())
+}
+
+fn conversation_text(
+    session_id: &str,
+    items: &[ClientTimelineEntry],
+    width: usize,
+    color: bool,
+) -> String {
+    let mut output = format!("CONVERSATION  {session_id}\n\n");
+    if let Some(reason) = st3_conversation_ui::adapt::unreadable_transcript(items) {
+        output.push_str(&format!("{reason}\n"));
+    }
+    let entries = st3_conversation_ui::adapt::conversation(items, &Default::default());
+    if entries.is_empty() {
+        output.push_str("Nothing in this conversation yet.\n");
+        return output;
+    }
+    let rendered = st3_conversation_ui::Cache::default().render(
+        &entries,
+        width,
+        &Default::default(),
+        "",
+        &st3_conversation_ui::Theme::default(),
+    );
+    for line in &rendered.lines {
+        output.push_str(&st3_conversation_ui::ansi::line(line, color));
+        output.push('\n');
+    }
+    output
+}
+
+/// The terminal's width in columns, when stdout is one.
+fn terminal_columns() -> Option<usize> {
+    if let Some(columns) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return Some(columns);
+    }
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
+    (ok && size.ws_col > 0).then_some(size.ws_col as usize)
 }
 
 fn timeline_entries_text(session_id: &str, items: &[ClientTimelineEntry]) -> String {
@@ -11818,6 +11890,7 @@ async fn run_message(
             actor,
             limit,
             cursor,
+            raw,
         } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -11826,7 +11899,11 @@ async fn run_message(
             let response = generated_client(endpoint, actor.as_deref().or(configured_person))?
                 .timeline(&session, cursor.as_deref(), Some(limit))
                 .await?;
-            print_timeline_page(&response, json_output)
+            if raw || json_output {
+                print_timeline_page(&response, json_output)
+            } else {
+                print_conversation_page(&response)
+            }
         }
         MessageCommand::Follow {
             session,
@@ -16268,6 +16345,23 @@ mod tests {
                 command: MissionViewCommand::Tree
             }
         ));
+    }
+
+    #[test]
+    fn a_conversation_reads_as_stui_shows_it_and_raw_keeps_every_entry() {
+        let items: Vec<ClientTimelineEntry> = serde_json::from_str(include_str!(
+            "../../../fixtures/clients/transcripts/claude.json"
+        ))
+        .unwrap();
+        let pretty = conversation_text("session/example", &items, 80, false);
+        assert!(pretty.starts_with("CONVERSATION  session/example"), "{pretty}");
+        assert!(pretty.contains("Please check why the n"), "{pretty}");
+        // The harness's own wrappers are cleaned away, as in stui; no escapes without colour.
+        for noise in ["<task-notification>", "<channel", "<command-name>", "\x1b["] {
+            assert!(!pretty.contains(noise), "{noise}: {pretty}");
+        }
+        let raw = timeline_entries_text("session/example", &items);
+        assert!(raw.contains("<task-notification>"), "raw keeps what was stored");
     }
 
     #[test]

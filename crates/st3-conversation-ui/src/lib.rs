@@ -6,6 +6,7 @@
 //! No terminal acquisition, daemon connection or application-wide shortcuts live here.
 
 pub mod adapt;
+pub mod ansi;
 mod clean;
 pub mod conversation;
 pub mod doc;

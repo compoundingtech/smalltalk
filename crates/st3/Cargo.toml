@@ -39,6 +39,7 @@ sha2 = "0.10"
 smallclaims = { path = "../smallclaims" }
 st-runtime = { path = "../st-runtime" }
 st3-client = { path = "../st3-client" }
+st3-conversation-ui = { path = "../st3-conversation-ui" }
 st3-schema = { path = "../st3-schema" }
 st-drivers = { path = "../st-drivers" }
 tempfile = "3"
