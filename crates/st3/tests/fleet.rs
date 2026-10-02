@@ -565,6 +565,16 @@ async fn invite_and_join_sync_full_history() {
         let status = node.st_json(&["replication", "status"]);
         assert_eq!(status["unsigned_envelopes"], 0, "{status}");
         assert_eq!(status["fenced_envelopes"], 0, "{status}");
+        // Every member verifies every other member's signed claims through membership.
+        let doctor = node.st_json(&["doctor"]);
+        let signatures = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "claim-signatures")
+            .cloned()
+            .unwrap();
+        assert_eq!(signatures["status"], "pass", "{}: {signatures}", node.name);
         let members = node.st_json(&["fleet", "status"])["view"]["members"].clone();
         for name in ["a", "b", "c"] {
             assert!(
