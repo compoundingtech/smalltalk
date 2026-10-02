@@ -24,8 +24,5 @@ pub(super) async fn publish(
     let store = state.store.clone();
     let kind = request.claim.kind.clone();
     let (record, changed) = blocking_action(move || store.append_harness_event(&request)).await?;
-    if changed {
-        signal_claim_changed(&state, &kind);
-    }
-    Ok(Json(record))
+    finish_claim_publication(&state, &kind, record, changed).await
 }

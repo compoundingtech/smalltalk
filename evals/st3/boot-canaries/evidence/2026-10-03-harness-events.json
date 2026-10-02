@@ -137,7 +137,8 @@
       "once-only evidence expiry",
       "replacement pipe inode ownership",
       "database reads do not wake driver",
-      "prepared publication fields immutable"
+      "prepared publication fields immutable",
+      "native timeline response usage reaches cumulative rollup once across exact replay"
     ]
   },
   "historical_pre_reexec_channel": {
@@ -163,5 +164,17 @@
     "cli_tests_passed": 163,
     "admission_tests_passed": 4,
     "historical_channel_passed": true
+  },
+  "subagents_evaluation": {
+    "verdict": "pass",
+    "parent_usage_minimum_tokens": 24860,
+    "checks": [
+      "one appearance and end per subagent",
+      "parent usage rollup includes child responses",
+      "lease renewal and expiry",
+      "killed harness and seat restart",
+      "seat stop and removal",
+      "daemon restart"
+    ]
   }
 }
