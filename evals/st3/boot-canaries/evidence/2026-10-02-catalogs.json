@@ -139,5 +139,22 @@
     "projected_message_files": 0,
     "legacy_status_files": [],
     "driver_catalog_files": []
+  },
+  "historical_pre_reexec_channel": {
+    "verdict": "pass",
+    "fault_duration_ms": 3754,
+    "read_after_clear_ms": 1764,
+    "projected_message_files": 0,
+    "driver_catalog_files": 0,
+    "received_copies": 1,
+    "graph_read_claims": 1,
+    "provider_starts": 1,
+    "sender_message_status": "closed",
+    "delivered_during_outage": false,
+    "read_receipt_matches_graph": true,
+    "old_binary_sha256": "c594658a3b08daf82ca83da605a32bcc23f444414594b1b01ba8385f1d60180a",
+    "same_provider_pids": true,
+    "same_incarnation": true,
+    "delivery_state": "legacy"
   }
 }
