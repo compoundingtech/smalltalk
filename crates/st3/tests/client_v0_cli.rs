@@ -981,6 +981,121 @@ async fn cli_structured_choice_returns_the_selected_option_as_data() {
     server.abort();
 }
 
+/// An update brings a person what they asked for: it reaches their home without stopping the
+/// poster, only for the person's own work, and opening it reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_update_reaches_home_only_for_asked_work_and_opening_reads_it() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let intent = st3::graph::parse_intent(
+        r#"version 2
+agent "reporter" { workspace "/tmp"; command "true" }
+mission "release-report" state="ready" {
+  goal "Report on the release.";
+  step "report" { assigned-to "agent/reporter"; goal "Report on the release."; }
+}
+"#,
+        store.origin(),
+    )
+    .unwrap();
+    store.apply_internal(&intent, "cli-update").unwrap();
+    let run = store
+        .create_mission_run(&st3::model::MissionRunRequest {
+            mission: "release-report".into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/avery".into()),
+            mode: Some("run".into()),
+            inputs: Default::default(),
+            idempotency_key: "release-report".into(),
+        })
+        .unwrap();
+    let actor = format!("agent/{}.reporter", store.origin());
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let update = |person: &'static str| {
+        let socket = socket.clone();
+        let actor = actor.clone();
+        let run = run.subject.clone();
+        async move {
+            run_cli(
+                &socket,
+                &[
+                    "work",
+                    "update",
+                    "--for",
+                    person,
+                    "--about",
+                    &run,
+                    "--title",
+                    "Release notes are ready",
+                    "--body",
+                    "The notes cover all three fixes.",
+                    "--as",
+                    &actor,
+                    "--idempotency-key",
+                    "release-notes",
+                ],
+            )
+            .await
+        }
+    };
+    let refused = update("person/blake").await;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("update-not-asked"));
+    let posted = value(&update("person/avery").await);
+    let subject = posted["subject"].as_str().unwrap().to_owned();
+
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
+    let item = &listed["value"]["items"][0];
+    assert_eq!(item["source_id"], subject);
+    assert_eq!(item["attention_kind"], "person-step");
+    assert_eq!(item["title"], "Release notes are ready");
+    // Not a request: clients that predate updates read it as a free-text card.
+    assert!(item["request"].is_null(), "{item}");
+    assert_eq!(item["update"]["about"], run.subject);
+    assert_eq!(
+        item["action_parameters"]["work.done"]["answer"],
+        serde_json::json!({"id": "read"})
+    );
+
+    let opened = run_cli_human(
+        &socket,
+        &["attention", "show", &subject, "--as", "person/avery"],
+    )
+    .await;
+    assert!(opened.status.success(), "{opened:?}");
+    let text = String::from_utf8_lossy(&opened.stdout);
+    assert!(text.contains("The notes cover all three fixes."), "{text}");
+    assert!(
+        text.contains(&format!("UPDATE  you asked in {}", run.subject)),
+        "{text}"
+    );
+    assert!(
+        text.contains("Read: this update has left your home."),
+        "{text}"
+    );
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
+    assert_eq!(listed["value"]["items"], serde_json::json!([]));
+    let shown = value(&run_cli(&socket, &["work", "show", &subject]).await);
+    assert_eq!(
+        shown["value"]["person_answers"][0]["answer"],
+        serde_json::json!({"type": "update", "outcome": "read"})
+    );
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     let root = tempfile::tempdir().unwrap();
