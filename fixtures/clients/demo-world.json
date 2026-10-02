@@ -1155,6 +1155,7 @@
         ],
         "system": false,
         "title": "Move the atlas store",
+        "updated_at": "",
         "word": "decision",
         "worktree": "~/src/atlas--store-move"
       },
@@ -1212,6 +1213,7 @@
         ],
         "system": false,
         "title": "A new pricing page",
+        "updated_at": "",
         "word": "decision",
         "worktree": "~/src/site--pricing"
       },
@@ -1290,6 +1292,7 @@
         ],
         "system": false,
         "title": "Weekly release",
+        "updated_at": "",
         "word": "stalled",
         "worktree": "~/src/atlas"
       },
@@ -1347,6 +1350,7 @@
         ],
         "system": false,
         "title": "Review harbor #218",
+        "updated_at": "",
         "word": "working",
         "worktree": "~/src/harbor--review-218"
       },
@@ -1423,6 +1427,7 @@
         ],
         "system": false,
         "title": "Rotate harbor's signing keys",
+        "updated_at": "",
         "word": "queued",
         "worktree": "~/src/harbor"
       },
@@ -1461,6 +1466,7 @@
         ],
         "system": false,
         "title": "Keep the handbook current",
+        "updated_at": "",
         "word": "idle",
         "worktree": null
       },
@@ -1516,6 +1522,7 @@
         ],
         "system": false,
         "title": "Atlas nightly build",
+        "updated_at": "",
         "word": "done",
         "worktree": null
       }

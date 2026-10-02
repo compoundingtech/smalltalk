@@ -751,6 +751,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
         }
         FleetCommand::Wait { timeout } => {
             let timeout = Duration::from_secs(parse_fleet_duration(&timeout)?);
+            let started = std::time::Instant::now();
+            let since = now_ms();
             let first = wait_for_first_sync(&client, timeout, !json_output)
                 .await?
                 .with_context(|| {
@@ -760,7 +762,36 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                         timeout.as_secs()
                     )
                 })?;
-            report_first_sync(&first, json_output)
+            if first.state != "verified" {
+                return report_first_sync(&first, json_output);
+            }
+            // A first sync is verified once, long ago after a restart. A wait is a gate for now:
+            // it also needs an exchange since it began at which this node held everything.
+            let caught_up = wait_for_caught_up(
+                &client,
+                since,
+                timeout.saturating_sub(started.elapsed()),
+                !json_output,
+            )
+            .await?;
+            let caught_up = match caught_up {
+                Ok(caught_up) => caught_up,
+                Err(waiting) => anyhow::bail!(
+                    "{}\nbut this node has not caught up since this wait began {} s ago: {}; st \
+                     replication status shows how far it got",
+                    render_first_sync(&first, now_ms()),
+                    started.elapsed().as_secs(),
+                    waiting
+                ),
+            };
+            if json_output {
+                let mut value = serde_json::to_value(&first)?;
+                value["caught_up"] = serde_json::to_value(&caught_up)?;
+                return print_value(&value, true);
+            }
+            println!("{}", render_first_sync(&first, now_ms()));
+            println!("{}", render_caught_up(&caught_up, now_ms()));
+            Ok(())
         }
         FleetCommand::Remove(args) => run_fleet_remove(&client, &config, args).await,
         FleetCommand::Migrate(args) => run_fleet_migrate(&client, &config, args).await,
@@ -2881,6 +2912,8 @@ struct AttentionWithdrawArgs {
 enum WorkCommand {
     /// Ask a person through a runtime step owned by live work.
     Ask(WorkAskArgs),
+    /// Bring a person information they asked for. Nothing waits on it; it clears once read.
+    Update(WorkUpdateArgs),
     /// Complete a person-assigned step with a response.
     Done(WorkDoneArgs),
     /// Cancel your own ask and resume its live origin.
@@ -2961,6 +2994,25 @@ struct WorkAskArgs {
     actor: String,
     #[arg(long, env = "ST3_INCARNATION")]
     incarnation: Option<String>,
+    #[arg(long)]
+    idempotency_key: String,
+}
+
+#[derive(Args)]
+struct WorkUpdateArgs {
+    #[arg(long = "for")]
+    person: String,
+    /// Where the person asked for this: their own mission run or step run, or their message to
+    /// you. An update about anything else is refused.
+    #[arg(long, value_name = "RUN|STEP|MESSAGE")]
+    about: String,
+    #[arg(long)]
+    title: String,
+    /// The information itself.
+    #[arg(long)]
+    body: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
     #[arg(long)]
     idempotency_key: String,
 }
@@ -7819,6 +7871,108 @@ async fn wait_for_first_sync(
     }
 }
 
+/// The peers this node caught up with at exchanges since a wait began, and those it could not
+/// check because they are not up.
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+struct CaughtUp {
+    /// Each peer and when this node last measured that it held every envelope the peer held.
+    peers: Vec<(String, u128)>,
+    not_checked: Vec<String>,
+}
+
+/// Whether this node has caught up since `since`: every peer that is up has exchanged since
+/// then, and at the latest exchange this node held every envelope that peer held. Peers that are
+/// not up cannot be checked, but at least one peer must be. `Err` says what is still missing.
+fn caught_up_since(status: &ReplicationStatus, since: u128) -> Result<CaughtUp, String> {
+    let mut caught_up = CaughtUp::default();
+    let mut waiting = Vec::new();
+    for peer in &status.peers {
+        let fresh = peer
+            .sync
+            .as_ref()
+            .filter(|sync| sync.measured_at_unix_ms >= since);
+        match fresh {
+            Some(sync) if sync.peer_only_envelopes == 0 => caught_up
+                .peers
+                .push((peer.peer.clone(), sync.measured_at_unix_ms)),
+            Some(sync) => waiting.push(format!(
+                "{} has {} this node lacks",
+                peer.peer,
+                envelope_count(sync.peer_only_envelopes)
+            )),
+            None if peer.status == "up" => {
+                waiting.push(format!("no exchange with {} yet", peer.peer));
+            }
+            None => caught_up
+                .not_checked
+                .push(format!("{} ({})", peer.peer, peer.status)),
+        }
+    }
+    if caught_up.peers.is_empty() && waiting.is_empty() {
+        waiting.push(if status.peers.is_empty() {
+            "this node has no peers".into()
+        } else {
+            "no peer has exchanged with this node".into()
+        });
+    }
+    if waiting.is_empty() {
+        Ok(caught_up)
+    } else {
+        Err(waiting.join("; "))
+    }
+}
+
+/// Wait until [`caught_up_since`] holds, printing progress when `progress` is set. Returns what
+/// is still missing at the deadline.
+async fn wait_for_caught_up(
+    client: &Client,
+    since: u128,
+    timeout: Duration,
+    progress: bool,
+) -> Result<Result<CaughtUp, String>> {
+    let started = std::time::Instant::now();
+    let mut reported = None::<std::time::Instant>;
+    let mut missing = "replication status did not answer".to_owned();
+    loop {
+        if let Ok(status) = client
+            .get::<ReplicationStatus>("/v1/replication/status")
+            .await
+        {
+            match caught_up_since(&status, since) {
+                Ok(caught_up) => return Ok(Ok(caught_up)),
+                Err(waiting) => missing = waiting,
+            }
+            if progress && reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(10)) {
+                reported = Some(std::time::Instant::now());
+                println!("catching up: {missing}");
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Ok(Err(missing));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn render_caught_up(caught_up: &CaughtUp, now: u128) -> String {
+    let peers = caught_up
+        .peers
+        .iter()
+        .map(|(peer, at)| format!("{peer} ({})", relative_time(*at, now)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut line = format!(
+        "caught up now: at its latest exchange with {peers}, this node held every envelope the peer held"
+    );
+    if !caught_up.not_checked.is_empty() {
+        line.push_str(&format!(
+            "; not checked, since they are not up: {}",
+            caught_up.not_checked.join(", ")
+        ));
+    }
+    line
+}
+
 /// Print how a first sync ended, and fail when its graphs still differ.
 fn report_first_sync(first: &st3::model::ReplicationFirstSync, json_output: bool) -> Result<()> {
     if json_output {
@@ -7850,12 +8004,12 @@ fn render_first_sync(first: &st3::model::ReplicationFirstSync, now: u128) -> Str
     );
     match first.state.as_str() {
         "verified" if first.authority_digest.is_some() => format!(
-            "first sync verified {when}: this node holds the same {} as {peer}; log digest {}; projection comparison waits for matching builds",
+            "first sync verified {when}: this node then held the same {} as {peer}; log digest {}; projection comparison waits for matching builds",
             envelope_count(first.envelopes.unwrap_or(0)),
             short_digest(first.authority_digest.as_deref().unwrap_or("unknown")),
         ),
         "verified" => format!(
-            "first sync verified {when}: this node holds the same {} as {peer} and projects the same graph ({}){}",
+            "first sync verified {when}: this node then held the same {} as {peer} and projected the same graph ({}){}",
             envelope_count(first.envelopes.unwrap_or(0)),
             short_digest(first.graph_digest.as_deref().unwrap_or("unknown")),
             if first.healed { ", after a heal" } else { "" }
@@ -11124,14 +11278,38 @@ async fn run_attention(
                     format!("attention item `{normalized}` is not currently actionable")
                 })?;
             if json_output {
-                print_value(&item, true)
+                print_value(&item, true)?;
             } else {
                 print!(
                     "{}",
                     render_attention_show(&item, OutputStyle::stdout(), now_ms())
                 );
-                Ok(())
             }
+            // The person opening an update reads it, which clears it from their home. An agent
+            // seat looking at the person's home reads nothing for them.
+            if item.request.as_ref().is_some_and(|r| r["type"] == "update")
+                && item.person == actor
+                && std::env::var_os("ST_AGENT").is_none()
+            {
+                let _: StepRunView = client
+                    .post(
+                        "/v1/work/done",
+                        &PersonStepResponse {
+                            subject: item.subject.clone(),
+                            actor: actor.clone(),
+                            summary: String::new(),
+                            evidence: Vec::new(),
+                            episode: Some(item.episode.clone()),
+                            idempotency_key: format!("update-read:{}", item.episode),
+                            answer: None,
+                        },
+                    )
+                    .await?;
+                if !json_output {
+                    println!("\nRead: this update has left your home.");
+                }
+            }
+            Ok(())
         }
         AttentionCommand::Request(args) => {
             let actor = args
@@ -11244,7 +11422,8 @@ A `decision` proposes one action: exactly one `accept` answer, one `decline` ans
 one `request_changes` answer, each naming what happens next. A `choice` names 2 to 5 options,
 and `"custom": true` also takes the person's own words. `feedback` asks for text and has no
 answers. `why_person` says why no runtime fact or standing instruction settles it. Omit
-`recommendation` to make none. Subject kinds: pull_request, issue, document, mission, run,
+`recommendation` to make none. An `update` asks nothing: it names `about`, the person's own
+run or step or their message to you, and clears once read (`st work update` builds one). Subject kinds: pull_request, issue, document, mission, run,
 step, agent, host, commit, link; `revision` pins what was reviewed.
 
   {"version": 1, "type": "decision",
@@ -11298,7 +11477,7 @@ async fn run_work(
                 (Some(reason), _) => reason,
                 (None, Some(request)) => request["question"]
                     .as_str()
-                    .context("the request needs a question")?
+                    .context("the request needs a question; an update's text goes in --reason")?
                     .to_owned(),
                 (None, None) => unreachable!("clap requires --reason or --request"),
             };
@@ -11316,6 +11495,29 @@ async fn run_work(
                         incarnation: args.incarnation,
                         idempotency_key: args.idempotency_key,
                         request,
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+        WorkCommand::Update(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: StepRunView = client
+                .post(
+                    "/v1/work/ask",
+                    &PersonAskRequest {
+                        legacy_request: None,
+                        person: args.person,
+                        title: args.title,
+                        reason: args.body,
+                        actor: args.actor,
+                        step: None,
+                        new_run: None,
+                        incarnation: None,
+                        idempotency_key: args.idempotency_key,
+                        request: Some(
+                            serde_json::json!({"version": 1, "type": "update", "about": args.about}),
+                        ),
                     },
                 )
                 .await?;
@@ -17128,6 +17330,53 @@ mod tests {
             graph_digest: None,
             sync: None,
         }
+    }
+
+    #[test]
+    fn a_wait_counts_only_exchanges_since_it_began() {
+        let since = 10_000;
+        let with = |name: &str, status: &str, measured: Option<(u128, u64)>| {
+            let mut peer = peer_status(name, None);
+            peer.status = status.into();
+            peer.sync = measured.map(|(at, peer_only)| st3::model::ReplicationPeerSync {
+                peer_only_envelopes: peer_only,
+                measured_at_unix_ms: at,
+                ..Default::default()
+            });
+            peer
+        };
+        let status = |peers| ReplicationStatus {
+            peers,
+            ..Default::default()
+        };
+        // An in-sync measurement from before the wait, as after a restart, proves nothing.
+        let error = caught_up_since(&status(vec![with("alder", "up", Some((9_000, 0)))]), since)
+            .unwrap_err();
+        assert_eq!(error, "no exchange with alder yet");
+        let error = caught_up_since(
+            &status(vec![with("alder", "up", Some((11_000, 300)))]),
+            since,
+        )
+        .unwrap_err();
+        assert_eq!(error, "alder has 300 envelopes this node lacks");
+        // A member that is not up cannot be checked, but some member must be.
+        let caught_up = caught_up_since(
+            &status(vec![
+                with("alder", "up", Some((11_000, 0))),
+                with("birch", "last-seen", Some((9_000, 0))),
+            ]),
+            since,
+        )
+        .unwrap();
+        assert_eq!(caught_up.peers, vec![("alder".to_owned(), 11_000)]);
+        assert_eq!(caught_up.not_checked, vec!["birch (last-seen)".to_owned()]);
+        assert!(
+            render_caught_up(&caught_up, 12_000)
+                .contains("not checked, since they are not up: birch")
+        );
+        let error =
+            caught_up_since(&status(vec![with("birch", "last-seen", None)]), since).unwrap_err();
+        assert_eq!(error, "no peer has exchanged with this node");
     }
 
     #[test]

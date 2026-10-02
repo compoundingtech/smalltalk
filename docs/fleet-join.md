@@ -452,7 +452,9 @@ continues from the last completed step:
    the heal fails `join` with both graph digests and the reason. The wait lasts up to 30 minutes;
    if it runs out, `join` says the machine is a member and still syncing, and exits 0.
    `--no-wait` returns once the services start. `st fleet wait [--timeout 30m]` waits for the
-   first sync later and fails if it failed.
+   first sync later and fails if it failed. It then also waits until this machine has caught up:
+   an exchange since the wait began, with every member that is up, at which it held everything
+   that member held. After a restart that is what the wait checks.
 
 Until its first exchange brings the membership claims, the new member knows only the sponsor. It
 checks the sponsor's responses against the key from the handshake, which `join.json` keeps. It

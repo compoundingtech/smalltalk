@@ -1073,7 +1073,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "answer-required"
         | "unsupported-person-request"
         | "missing-ask-owner"
-        | "ambiguous-ask-owner" => "validation-failed".into(),
+        | "ambiguous-ask-owner"
+        | "update-not-asked" => "validation-failed".into(),
         "stale-work-ask"
         | "stale-subject"
         | "missing-subject-token"
@@ -2557,8 +2558,16 @@ fn client_attention_resources(
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
-            if let Some(request) = item.request {
-                resource["request"] = request;
+            match item.request {
+                // An update asks nothing, so it is not a `request`: a client that predates
+                // updates shows a free-text card, and any response to it reads it.
+                Some(update) if update["type"] == "update" => {
+                    resource["action_parameters"]["work.done"]["summary"] = json!("Read");
+                    resource["action_parameters"]["work.done"]["answer"] = json!({"id": "read"});
+                    resource["update"] = update;
+                }
+                Some(request) => resource["request"] = request,
+                None => {}
             }
         }
         if item.kind == "fault" {
@@ -5398,12 +5407,36 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .first_sync
                 .as_ref()
                 .filter(|first| first.state == "failed");
+            // A verified first sync is history. Whether this node is caught up now takes an
+            // exchange since this daemon started, and one that found nothing left to fetch.
+            let catching_up = replication
+                .peers
+                .iter()
+                .filter_map(|peer| {
+                    let sync = peer.sync.as_ref().filter(|sync| sync.catching_up)?;
+                    Some(format!(
+                        "{} has {} envelopes this node lacks",
+                        peer.peer, sync.peer_only_envelopes
+                    ))
+                })
+                .collect::<Vec<_>>();
+            // A peer whose grants refuse this node never exchanges with it directly.
+            let unmeasured = replication.timings.exchanges == 0
+                && replication
+                    .peers
+                    .iter()
+                    .any(|peer| peer.status != "refused");
             let status = if replication.unhealthy_projections != 0
                 || !diverged.is_empty()
                 || first_sync_failed.is_some()
             {
                 "fail"
-            } else if !unavailable.is_empty() || !absent.is_empty() || unresolved != 0 {
+            } else if !unavailable.is_empty()
+                || !absent.is_empty()
+                || unresolved != 0
+                || !catching_up.is_empty()
+                || unmeasured
+            {
                 "warn"
             } else {
                 "pass"
@@ -5412,7 +5445,16 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{}{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    "{}{}{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    if !catching_up.is_empty() {
+                        format!("catching up: {}; ", catching_up.join(", "))
+                    } else if unmeasured {
+                        "no exchange with a peer since this daemon started, so whether this \
+                         node is caught up is not known yet; "
+                            .to_owned()
+                    } else {
+                        String::new()
+                    },
                     absent
                         .iter()
                         .chain(&away)

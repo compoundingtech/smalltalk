@@ -582,6 +582,12 @@ or `failed` with the heal's reason. `join` waits for it by default and fails whe
 `st fleet wait` waits for it later. A failed first sync fails `st doctor`'s replication check,
 and `st replication status` prints it as a `first-sync` line with both digests.
 
+A verified first sync says what was true then. `st fleet wait`, the gate after a restart or a
+deploy, also waits for an exchange since it began, with every peer that is up, at which this node
+held every envelope that peer held; peers that are not up are named as not checked. Doctor warns
+while a peer says this node is catching up, and while the daemon has not exchanged with any peer
+since it started.
+
 Repair publishes a new claim. It does not delete or change the bad record.
 
 ```sh

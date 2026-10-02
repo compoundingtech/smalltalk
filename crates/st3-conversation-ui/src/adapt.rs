@@ -282,6 +282,22 @@ fn fold_events(
         .collect()
 }
 
+/// How Claude Code opens the summary it continues from after compacting a conversation.
+const COMPACTED: &str = "This session is being continued from a previous conversation";
+
+/// A line that is only a self-closing harness tag, such as `<artifact-content-authored-by-others/>`.
+fn self_closing_tag(line: &str) -> bool {
+    let line = line.trim();
+    line.strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix("/>"))
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+}
+
 /// Blocks harnesses add to a transcript for the model's benefit. None of it is conversation.
 const CONTEXT_BLOCKS: &[&str] = &[
     "system-reminder",
@@ -408,6 +424,21 @@ fn harness_bodies(
     delivered: &mut BTreeSet<String>,
 ) -> Vec<Body> {
     let mut text = raw.replace("\r\n", "\n");
+    // A harness that ran out of context continues from a summary it writes as the person's turn.
+    // It is the agent's own notes, kilobytes long: one folded line that opens like a tool call
+    // (Nathan, 2026-10-02).
+    if is_user && text.contains(COMPACTED) {
+        let output = text
+            .lines()
+            .filter(|line| !self_closing_tag(line))
+            .map(str::to_owned)
+            .collect();
+        return vec![Body::Tool {
+            title: "context summary · the conversation was compacted".into(),
+            state: ToolState::Ok,
+            output,
+        }];
+    }
     let mut bodies = Vec::new();
     // st's own envelope, as codex and the pi family receive it.
     let envelopes = heads(&text, "smalltalk-message");

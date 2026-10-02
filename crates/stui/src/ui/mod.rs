@@ -14,6 +14,7 @@ pub mod demo;
 pub mod doc;
 mod edit;
 mod glass;
+pub use glass::set_glasses_version;
 mod glass_store;
 pub mod layout;
 pub mod live;
@@ -4050,11 +4051,19 @@ impl Ui {
                 };
                 let (in_sidebar, pane) = {
                     let info = self.frame.borrow();
+                    // Home floats over the glass: under it, only Home scrolls (Nathan,
+                    // 2026-10-02). The pane drawn last is the one on top, as for clicks.
+                    let behind_home = self.home_open()
+                        && info
+                            .home
+                            .is_some_and(|rect| !contains(rect, mouse.column, mouse.row));
                     (
                         contains(info.sidebar, mouse.column, mouse.row),
                         info.panes
                             .iter()
+                            .rev()
                             .find(|pane| contains(pane.rect, mouse.column, mouse.row))
+                            .filter(|_| !behind_home)
                             .map(|pane| pane.key.clone()),
                     )
                 };
@@ -4856,6 +4865,41 @@ mod tests {
         );
         ui.key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
         assert!(!ui.simple);
+    }
+
+    #[test]
+    fn a_failed_mission_ages_out_of_the_list_after_its_day() {
+        let mut world = demo::world();
+        let now = chrono::Local::now();
+        if let Load::Ready(missions) = &mut world.missions {
+            let mut failed = missions[0].clone();
+            failed.word = Word::Failed;
+            failed.system = false;
+            let mut today = failed.clone();
+            today.id = "mission/example/failed-today".into();
+            today.title = "Failed today".into();
+            today.updated_at = now.to_rfc3339();
+            failed.id = "mission/example/failed-yesterday".into();
+            failed.title = "Failed yesterday".into();
+            failed.updated_at = (now - chrono::Duration::days(1)).to_rfc3339();
+            missions.push(today);
+            missions.push(failed);
+        }
+        let shown = screens::missions_list(&world, "⠋", false);
+        assert!(shown.ids.iter().any(|id| id == "mission/example/failed-today"));
+        assert!(!shown.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
+        let note = shown
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Note(line) => Some(text::plain(line)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(note.contains("1 failed before today"), "{note}");
+        // x shows it again.
+        let all = screens::missions_list(&world, "⠋", true);
+        assert!(all.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
     }
 
     #[test]

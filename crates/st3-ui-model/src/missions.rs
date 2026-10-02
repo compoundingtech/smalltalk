@@ -111,6 +111,9 @@ pub struct Mission {
     pub kdl: Option<String>,
     /// The outcome a person or an authorized agent set on its finished run, and why.
     pub outcome: Option<String>,
+    /// When st last changed the mission (RFC 3339), so a list can age out what ended long ago.
+    /// Empty when unknown.
+    pub updated_at: String,
 }
 
 impl Mission {
@@ -423,6 +426,7 @@ pub fn adapt<'a>(
                 agents: active_agents,
                 kdl: None,
                 outcome: run_outcome(mission, now, display),
+                updated_at: mission.header.updated_at.clone(),
                 decision,
                 worktree: None,
                 parent: None,
