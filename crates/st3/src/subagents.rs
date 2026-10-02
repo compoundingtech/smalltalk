@@ -7,6 +7,10 @@
 //! for each end. A subagent leaves the ledger only once its end is recorded, so an st outage
 //! delays these claims and loses none. The store answers a repeated appearance or end with the
 //! claim it has, so a retry after a lost answer records nothing twice.
+//!
+//! Claude records a subagent's responses in its parent's usage itself. A Codex subagent's are
+//! counted here from its own rollout once its run has settled, added to the parent's harness
+//! timeline as one response, and recorded with its end.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -21,6 +25,12 @@ use crate::model::{ClaimInput, ClaimRecord, StepRunView};
 use crate::store::SUBAGENT_LEASE_MS;
 
 const PUBLISHED_FILE: &str = ".harness-subagents-published";
+
+/// Codex writes a run's last token count just before the parent hears that it completed, so its
+/// tokens are counted this long after the end.
+const SETTLE_MS: u64 = 2_000;
+/// A run whose rollout cannot be found by then ends without tokens.
+const ROLLOUT_WAIT_MS: u64 = 60_000;
 
 /// A running subagent's lease. `ST3_SUBAGENT_LEASE_MS` can only shorten it, so tests of an
 /// unrenewed lease need not wait out the default.
@@ -50,6 +60,9 @@ pub struct Publisher {
     incarnation: String,
     agent_dir: PathBuf,
     home: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    /// The incarnation stamped on the harness timeline, which a subagent's usage joins.
+    timeline_incarnation: Option<String>,
     lease_ms: u64,
     published: Published,
 }
@@ -102,9 +115,24 @@ impl Publisher {
             incarnation: incarnation.into(),
             agent_dir: agent_dir.into(),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            codex_home: st_drivers::codex_app_server::codex_home(),
+            timeline_incarnation: None,
             lease_ms: lease_ms(),
             published,
         }
+    }
+
+    /// Read transcripts beneath these homes instead of this process's (`HOME`, `CODEX_HOME`).
+    pub fn with_homes(mut self, home: Option<PathBuf>, codex_home: Option<PathBuf>) -> Self {
+        self.home = home;
+        self.codex_home = codex_home;
+        self
+    }
+
+    /// The harness timeline's current incarnation. A Codex subagent's tokens join the parent's
+    /// usage only through it.
+    pub fn set_timeline_incarnation(&mut self, incarnation: Option<String>) {
+        self.timeline_incarnation = incarnation;
     }
 
     /// End every running subagent, as when the harness exits, and record the ends.
@@ -167,24 +195,34 @@ impl Publisher {
             }
         }
         let mut recorded = BTreeSet::new();
+        let mut counted = current.counted.clone();
         for ended in &current.ended {
-            if self.published.closed.contains(&ended.subagent.id) {
-                recorded.insert(ended.subagent.id.clone());
+            let id = &ended.subagent.id;
+            let closed = self.published.closed.contains(id);
+            if !closed && !self.published.open.contains_key(id) {
                 continue;
             }
-            if !self.published.open.contains_key(&ended.subagent.id) {
-                continue;
-            }
-            match self.end(client, ended).await {
-                Ok(()) => {}
-                Err(error) if refused(&error) => {}
+            // Its responses reach the parent's usage even when st already ended it.
+            let ended = match self.settle(ended, &mut counted, now) {
+                Ok(Some(ended)) => ended,
+                Ok(None) => continue,
                 Err(error) => {
                     failure.get_or_insert(error);
                     continue;
                 }
+            };
+            if !closed {
+                match self.end(client, &ended).await {
+                    Ok(()) => {}
+                    Err(error) if refused(&error) => {}
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                        continue;
+                    }
+                }
+                self.published.open.remove(id);
             }
-            self.published.open.remove(&ended.subagent.id);
-            recorded.insert(ended.subagent.id.clone());
+            recorded.insert(id.clone());
         }
         let renewing = self
             .published
@@ -231,6 +269,7 @@ impl Publisher {
                 reason: Some("the driver lost its record of this subagent".into()),
                 ended_at_ms: now,
                 tokens: None,
+                parent_usage: false,
             };
             match self.end(client, &ended).await {
                 Ok(()) => {}
@@ -253,6 +292,78 @@ impl Publisher {
             .closed
             .retain(|id| current.running.contains_key(id) && !recorded.contains(id));
         failure.map_or(Ok(()), Err)
+    }
+
+    /// Count a Codex run's tokens from its rollout, add them to the parent's usage, and keep them
+    /// with its end, so a retried end records the same tokens. `None` until the run has settled.
+    fn settle(
+        &self,
+        ended: &Ended,
+        counted: &mut BTreeMap<String, Tokens>,
+        now: u64,
+    ) -> Result<Option<Ended>> {
+        if !ended.parent_usage {
+            return Ok(Some(ended.clone()));
+        }
+        let waited = now.saturating_sub(ended.ended_at_ms);
+        if waited < SETTLE_MS {
+            return Ok(None);
+        }
+        let id = ended.subagent.id.clone();
+        let thread = ledger::subagent_thread(&id).to_owned();
+        let rollout = match &self.codex_home {
+            Some(home) => st_drivers::codex_app_server::latest_codex_transcript_in(home, &thread)?,
+            None => None,
+        };
+        let Some(rollout) = rollout else {
+            if waited < ROLLOUT_WAIT_MS {
+                return Ok(None);
+            }
+            // Without its rollout the run's tokens are unknown, never zero.
+            ledger::update(&self.agent_dir, |ledger| {
+                if let Some(entry) = ledger
+                    .ended
+                    .iter_mut()
+                    .find(|entry| entry.subagent.id == id)
+                {
+                    entry.parent_usage = false;
+                }
+            })?;
+            return Ok(Some(Ended {
+                parent_usage: false,
+                ..ended.clone()
+            }));
+        };
+        let Some(incarnation) = self.timeline_incarnation.as_deref() else {
+            return Ok(None);
+        };
+        let (total, model) = ledger::codex_rollout_tokens(&rollout)?;
+        let run = total.since(counted.get(&thread).copied().unwrap_or_default());
+        ledger::record_parent_usage(
+            &self.agent_dir,
+            &self.driver,
+            incarnation,
+            &id,
+            model.as_deref(),
+            run,
+        )?;
+        counted.insert(thread.clone(), total);
+        ledger::update(&self.agent_dir, |ledger| {
+            ledger.counted.insert(thread, total);
+            if let Some(entry) = ledger
+                .ended
+                .iter_mut()
+                .find(|entry| entry.subagent.id == id)
+            {
+                entry.tokens = Some(run);
+                entry.parent_usage = false;
+            }
+        })?;
+        Ok(Some(Ended {
+            tokens: Some(run),
+            parent_usage: false,
+            ..ended.clone()
+        }))
     }
 
     /// The step this seat holds now, newest first among more than one.

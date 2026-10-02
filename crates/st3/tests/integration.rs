@@ -29,6 +29,7 @@ mod operational_state_contract;
 mod reconcile_pass_perf;
 mod recorder_report;
 mod seat_queue_perf;
+mod subagent_publisher;
 mod subagents_seat;
 mod terminal_attach;
 

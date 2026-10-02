@@ -5,6 +5,10 @@
 //! `running` only into `ended`, and leaves `ended` only once the driver has recorded its end, so
 //! no end is lost between the two. Prompts and transcripts stay on the host: the ledger keeps a
 //! transcript path only so the driver can count the subagent's tokens when it ends.
+//!
+//! Claude reports subagents to its hooks. Codex reports each subagent thread's tasks on the
+//! parent thread; a thread given a follow-up task after it completed runs again, and each run is
+//! one subagent here, `THREAD` and then `THREAD#2` and on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -49,6 +53,13 @@ pub struct Ledger {
     /// Subagent launches seen before their subagent started, oldest first.
     #[serde(default)]
     pub launches: Vec<Launch>,
+    /// How many runs each harness subagent thread has had, for a harness whose subagents run
+    /// again (Codex).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runs: BTreeMap<String, u32>,
+    /// The tokens already recorded for each such thread, so a run counts only its own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub counted: BTreeMap<String, Tokens>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +93,10 @@ pub struct Ended {
     /// driver counts its transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<Tokens>,
+    /// The parent's usage does not include this subagent's responses yet, so the driver adds its
+    /// tokens there when it counts them. Claude records them itself; Codex does not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parent_usage: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +123,7 @@ impl Ledger {
             reason,
             ended_at_ms: at_ms,
             tokens: None,
+            parent_usage: false,
         });
         if self.ended.len() > MAX_ENDED {
             let excess = self.ended.len() - MAX_ENDED;
@@ -405,6 +421,223 @@ fn claude_subagent_transcript(payload: &Value, id: &str) -> Option<PathBuf> {
     )
 }
 
+/// The harness thread a subagent run belongs to: `THREAD#N` is run N of `THREAD`.
+pub fn subagent_thread(id: &str) -> &str {
+    id.split_once('#').map_or(id, |(thread, _)| thread)
+}
+
+const MAX_THREADS: usize = 1_024;
+
+/// Record one Codex app-server notification from the parent thread `parent`. Each subagent
+/// thread's task is a run: it starts when the thread starts or takes a follow-up task while idle,
+/// and ends when the parent hears it completed or was interrupted, or a collab call reports it
+/// errored, shut down or gone.
+pub fn observe_codex(agent_dir: &Path, message: &Value, parent: &str) -> Result<()> {
+    if !matches!(
+        message.get("method").and_then(Value::as_str),
+        Some("item/started" | "item/completed")
+    ) || message.pointer("/params/threadId").and_then(Value::as_str) != Some(parent)
+        || !matches!(
+            message.pointer("/params/item/type").and_then(Value::as_str),
+            Some("subAgentActivity" | "collabAgentToolCall")
+        )
+    {
+        return Ok(());
+    }
+    let now = now_ms();
+    update(agent_dir, |ledger| {
+        apply_codex(ledger, message, parent, now)
+    })
+}
+
+fn apply_codex(ledger: &mut Ledger, message: &Value, parent: &str, now: u64) {
+    let item = message.pointer("/params/item").unwrap_or(&Value::Null);
+    ledger.change_session(parent, now);
+    let run_id = |ledger: &Ledger, thread: &str| match ledger.runs.get(thread) {
+        Some(1) | None => thread.to_owned(),
+        Some(run) => format!("{thread}#{run}"),
+    };
+    match item.get("type").and_then(Value::as_str) {
+        Some("subAgentActivity") => {
+            let Some(thread) = text(item, "agentThreadId") else {
+                return;
+            };
+            let current = run_id(ledger, &thread);
+            match item.get("kind").and_then(Value::as_str) {
+                Some("started" | "interacted") => {
+                    if ledger.running.contains_key(&current) {
+                        return;
+                    }
+                    // A thread seen before and idle now takes a new task.
+                    let run = ledger.runs.get(&thread).map_or(1, |run| run + 1);
+                    ledger.runs.insert(thread.clone(), run);
+                    if ledger.runs.len() > MAX_THREADS {
+                        let oldest = ledger.runs.keys().next().cloned();
+                        if let Some(oldest) = oldest {
+                            ledger.runs.remove(&oldest);
+                            ledger.counted.remove(&oldest);
+                        }
+                    }
+                    let id = run_id(ledger, &thread);
+                    // Codex names a subagent by its task path, such as `/root/review_docs`.
+                    let description = text(item, "agentPath")
+                        .and_then(|path| path.rsplit('/').next().map(str::to_owned))
+                        .and_then(|name| one_line(&name.replace('_', " ")));
+                    ledger.start(Subagent {
+                        id,
+                        subagent_type: None,
+                        description,
+                        session_id: Some(parent.into()),
+                        started_at_ms: now,
+                        transcript: None,
+                        unlisted_since_ms: None,
+                    });
+                }
+                Some("completed") => end_codex_run(ledger, &current, "completed", None, now),
+                Some("interrupted") => end_codex_run(ledger, &current, "interrupted", None, now),
+                _ => {}
+            }
+        }
+        Some("collabAgentToolCall") => {
+            // A finished wait or close reports each target's last state; only a terminal one ends
+            // the run it names.
+            if message.get("method").and_then(Value::as_str) != Some("item/completed") {
+                return;
+            }
+            let Some(states) = item.get("agentsStates").and_then(Value::as_object) else {
+                return;
+            };
+            for (thread, state) in states {
+                let (outcome, reason) = match state.get("status").and_then(Value::as_str) {
+                    Some("errored") => ("failed", state.get("message").and_then(Value::as_str)),
+                    Some("interrupted") => ("interrupted", None),
+                    Some("notFound") => ("interrupted", Some("Codex no longer finds it")),
+                    Some("completed" | "shutdown") => ("completed", None),
+                    _ => continue,
+                };
+                let current = run_id(ledger, thread);
+                let reason = reason.and_then(one_line);
+                end_codex_run(ledger, &current, outcome, reason, now);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn end_codex_run(ledger: &mut Ledger, id: &str, outcome: &str, reason: Option<String>, now: u64) {
+    if ledger.end(id, outcome, reason, now)
+        && let Some(ended) = ledger.ended.last_mut()
+    {
+        ended.parent_usage = true;
+    }
+}
+
+/// A Codex rollout's newest token total and model. Codex counts cached and cache-written input
+/// inside its input and reasoning inside its output; these buckets are disjoint, as Claude's are.
+pub fn codex_rollout_tokens(rollout: &Path) -> Result<(Tokens, Option<String>)> {
+    let mut total = None;
+    let mut model = None;
+    for line in BufReader::new(fs::File::open(rollout)?).lines() {
+        let Ok(value) = serde_json::from_str::<Value>(&line?) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("turn_context") => {
+                if let Some(name) = value.pointer("/payload/model").and_then(Value::as_str) {
+                    model = Some(name.to_owned());
+                }
+            }
+            Some("event_msg")
+                if value.pointer("/payload/type").and_then(Value::as_str)
+                    == Some("token_count") =>
+            {
+                if let Some(usage) = value.pointer("/payload/info/total_token_usage") {
+                    total = Some(usage.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let usage = total.unwrap_or(Value::Null);
+    let field = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let cached = field("cached_input_tokens");
+    let cache_writes = field("cache_write_input_tokens");
+    let input = field("input_tokens");
+    let output = field("output_tokens");
+    Ok((
+        Tokens {
+            input_tokens: input.saturating_sub(cached).saturating_sub(cache_writes),
+            output_tokens: output,
+            cache_write_tokens: cache_writes,
+            cached_tokens: cached,
+            total_tokens: field("total_tokens").max(input.saturating_add(output)),
+        },
+        model,
+    ))
+}
+
+impl Tokens {
+    /// What `self` adds to an earlier total `before` of the same counter.
+    pub fn since(self, before: Tokens) -> Tokens {
+        Tokens {
+            input_tokens: self.input_tokens.saturating_sub(before.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(before.output_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_sub(before.cache_write_tokens),
+            cached_tokens: self.cached_tokens.saturating_sub(before.cached_tokens),
+            total_tokens: self.total_tokens.saturating_sub(before.total_tokens),
+        }
+    }
+}
+
+/// Add a subagent's tokens to its parent seat's usage, as one response of `driver` in the
+/// harness timeline of incarnation `incarnation`. Its source ID names the subagent, so it counts
+/// once however often it is recorded.
+pub fn record_parent_usage(
+    agent_dir: &Path,
+    driver: &str,
+    incarnation: &str,
+    subagent: &str,
+    model: Option<&str>,
+    tokens: Tokens,
+) -> Result<()> {
+    // A writer of another incarnation would start the record over, so add only to this one's.
+    let record = crate::harness_timeline::read(&crate::harness_timeline::timeline_path(agent_dir));
+    anyhow::ensure!(
+        record
+            .as_ref()
+            .is_none_or(|record| record.driver == driver && record.incarnation_id == incarnation),
+        "the harness timeline belongs to another incarnation"
+    );
+    // The parent's newest response names the account that pays for its subagents too.
+    let account = record.and_then(|record| {
+        record.operations.iter().rev().find_map(|operation| {
+            (operation.entry_type == "usage")
+                .then(|| operation.body.get("account")?.as_str().map(str::to_owned))
+                .flatten()
+        })
+    });
+    let mut writer =
+        crate::harness_timeline::Writer::new(agent_dir, driver, incarnation).with_account(account);
+    writer.append(
+        format!("{driver}:subagent:{subagent}:usage"),
+        crate::harness_timeline::Role::System,
+        crate::harness_timeline::EntryType::Usage,
+        serde_json::json!({
+            "semantics": "response", "driver": driver,
+            "model": model,
+            "turn_id": format!("subagent:{subagent}"),
+            "input_tokens": tokens.input_tokens,
+            "output_tokens": tokens.output_tokens,
+            "cached_tokens": tokens.cached_tokens,
+            "cache_write_tokens": tokens.cache_write_tokens,
+            "total_tokens": tokens.total_tokens,
+        }),
+        true,
+    )
+}
+
 /// A subagent's description and type as Claude recorded them beside its transcript.
 pub fn claude_subagent_meta(transcript: &Path) -> Option<(Option<String>, Option<String>)> {
     let meta = transcript.with_extension("meta.json");
@@ -669,6 +902,226 @@ mod tests {
             read(directory.path()).running["a"].subagent_type.as_deref(),
             Some("t")
         );
+    }
+
+    fn activity(kind: &str, thread: &str) -> Value {
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "parent", "turnId": "turn-1",
+                "item": {
+                    "type": "subAgentActivity", "id": format!("call-{kind}-{thread}"),
+                    "kind": kind, "agentThreadId": thread, "agentPath": "/root/review_docs",
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn each_codex_task_of_a_subagent_thread_is_one_run() {
+        let mut ledger = Ledger::default();
+        apply_codex(&mut ledger, &activity("started", "child"), "parent", 1);
+        let run = &ledger.running["child"];
+        assert_eq!(run.description.as_deref(), Some("review docs"));
+        assert_eq!(run.session_id.as_deref(), Some("parent"));
+        // A message to a running thread is part of its run.
+        apply_codex(&mut ledger, &activity("interacted", "child"), "parent", 2);
+        assert_eq!(ledger.running.len(), 1);
+        apply_codex(&mut ledger, &activity("completed", "child"), "parent", 3);
+        assert!(ledger.running.is_empty());
+        assert_eq!(ledger.ended[0].outcome, "completed");
+        assert!(
+            ledger.ended[0].parent_usage,
+            "Codex leaves the parent's usage to st"
+        );
+        // A follow-up task to the idle thread is its second run.
+        apply_codex(&mut ledger, &activity("interacted", "child"), "parent", 4);
+        assert!(ledger.running.contains_key("child#2"));
+        assert_eq!(subagent_thread("child#2"), "child");
+        apply_codex(&mut ledger, &activity("interrupted", "child"), "parent", 5);
+        assert_eq!(ledger.ended[1].subagent.id, "child#2");
+        assert_eq!(ledger.ended[1].outcome, "interrupted");
+    }
+
+    #[test]
+    fn a_codex_collab_call_ends_the_runs_it_reports_finished() {
+        let mut ledger = Ledger::default();
+        for thread in ["ok", "broken", "gone", "busy"] {
+            apply_codex(&mut ledger, &activity("started", thread), "parent", 1);
+        }
+        let wait = |method: &str| {
+            json!({
+                "method": method,
+                "params": {
+                    "threadId": "parent",
+                    "item": {
+                        "type": "collabAgentToolCall", "id": "call-wait", "tool": "wait",
+                        "status": "completed", "senderThreadId": "parent",
+                        "receiverThreadIds": ["ok", "broken", "gone", "busy"],
+                        "agentsStates": {
+                            "ok": {"status": "completed"},
+                            "broken": {"status": "errored", "message": "model refused\nmore"},
+                            "gone": {"status": "notFound"},
+                            "busy": {"status": "running"},
+                        },
+                    },
+                },
+            })
+        };
+        apply_codex(&mut ledger, &wait("item/started"), "parent", 2);
+        assert_eq!(
+            ledger.running.len(),
+            4,
+            "only a finished call reports states"
+        );
+        apply_codex(&mut ledger, &wait("item/completed"), "parent", 3);
+        let ends = ledger
+            .ended
+            .iter()
+            .map(|ended| (ended.subagent.id.as_str(), ended.outcome.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            ends,
+            BTreeMap::from([
+                ("broken", "failed"),
+                ("gone", "interrupted"),
+                ("ok", "completed")
+            ])
+        );
+        let broken = ledger
+            .ended
+            .iter()
+            .find(|ended| ended.subagent.id == "broken");
+        assert_eq!(broken.unwrap().reason.as_deref(), Some("model refused"));
+        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), ["busy"]);
+        // A new parent thread is a new session.
+        apply_codex(
+            &mut ledger,
+            &json!({"method": "item/completed", "params": {"threadId": "other",
+                "item": {"type": "subAgentActivity", "kind": "started",
+                    "agentThreadId": "x", "agentPath": "/root/x", "id": "c"}}}),
+            "other",
+            4,
+        );
+        assert_eq!(ledger.ended.last().unwrap().outcome, "session-ended");
+    }
+
+    #[test]
+    fn codex_events_from_another_thread_or_item_change_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        observe_codex(
+            directory.path(),
+            &activity("started", "child"),
+            "someone-else",
+        )
+        .unwrap();
+        observe_codex(
+            directory.path(),
+            &json!({"method": "item/completed", "params": {"threadId": "parent",
+                "item": {"type": "agentMessage", "id": "m"}}}),
+            "parent",
+        )
+        .unwrap();
+        assert!(!ledger_path(directory.path()).exists());
+        observe_codex(directory.path(), &activity("started", "child"), "parent").unwrap();
+        assert!(read(directory.path()).running.contains_key("child"));
+    }
+
+    #[test]
+    fn a_codex_rollout_reports_its_newest_disjoint_total() {
+        let directory = tempfile::tempdir().unwrap();
+        let rollout = directory.path().join("rollout-child.jsonl");
+        let count = |input: u64, cached: u64, output: u64| {
+            json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {
+                    "input_tokens": input, "cached_input_tokens": cached,
+                    "cache_write_input_tokens": 0, "output_tokens": output,
+                    "reasoning_output_tokens": 3, "total_tokens": input + output,
+                },
+            }}})
+            .to_string()
+        };
+        fs::write(
+            &rollout,
+            [
+                json!({"type": "turn_context", "payload": {"model": "gpt-example"}}).to_string(),
+                count(100, 60, 10),
+                count(300, 200, 25),
+                json!({"type": "event_msg", "payload": {"type": "task_complete"}}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let (total, model) = codex_rollout_tokens(&rollout).unwrap();
+        assert_eq!(model.as_deref(), Some("gpt-example"));
+        assert_eq!(
+            total,
+            Tokens {
+                input_tokens: 100,
+                output_tokens: 25,
+                cache_write_tokens: 0,
+                cached_tokens: 200,
+                total_tokens: 325,
+            }
+        );
+        let earlier = Tokens {
+            input_tokens: 40,
+            output_tokens: 10,
+            cache_write_tokens: 0,
+            cached_tokens: 60,
+            total_tokens: 110,
+        };
+        assert_eq!(total.since(earlier).total_tokens, 215);
+    }
+
+    #[test]
+    fn a_subagents_usage_joins_only_its_own_incarnations_timeline() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut parent = crate::harness_timeline::Writer::new(directory.path(), "codex", "inc-1")
+            .with_account(Some("codex/aaaaaaaaaaaaaaaa".into()));
+        parent
+            .append(
+                "codex:usage:turn-1:5",
+                crate::harness_timeline::Role::System,
+                crate::harness_timeline::EntryType::Usage,
+                json!({"semantics": "response", "model": "gpt-example", "total_tokens": 5}),
+                true,
+            )
+            .unwrap();
+        let tokens = Tokens {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_write_tokens: 0,
+            cached_tokens: 3,
+            total_tokens: 6,
+        };
+        assert!(
+            record_parent_usage(directory.path(), "codex", "inc-2", "child", None, tokens).is_err()
+        );
+        record_parent_usage(
+            directory.path(),
+            "codex",
+            "inc-1",
+            "child",
+            Some("gpt-example"),
+            tokens,
+        )
+        .unwrap();
+        // Recording it again adds nothing.
+        record_parent_usage(directory.path(), "codex", "inc-1", "child", None, tokens).unwrap();
+        let record = crate::harness_timeline::read(&crate::harness_timeline::timeline_path(
+            directory.path(),
+        ))
+        .unwrap();
+        let usage = record
+            .operations
+            .iter()
+            .filter(|operation| operation.entry_type == "usage")
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[1].body["turn_id"], "subagent:child");
+        assert_eq!(usage[1].body["total_tokens"], 6);
+        assert_eq!(usage[1].body["account"], "codex/aaaaaaaaaaaaaaaa");
     }
 
     #[test]

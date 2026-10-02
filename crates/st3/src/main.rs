@@ -14683,6 +14683,14 @@ async fn drive_codex_native(
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
+    // The Codex control pump keeps the subagent ledger; this driver records it on the seat.
+    let mut subagents = st3::subagents::Publisher::start(
+        subject,
+        "codex",
+        &incarnation,
+        &agent_dir,
+        st_drivers::subagents::now_ms(),
+    );
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -14715,6 +14723,12 @@ async fn drive_codex_native(
                     task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
                     continue;
                 }
+                // The harness is gone, and its subagents with it.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    subagents.end_all(client, "harness-exited", "its harness exited"),
+                )
+                .await;
                 if let Err(error) = &outcome {
                     let reason = format!("{error:#}").chars().take(2_000).collect::<String>();
                     let _: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
@@ -14860,6 +14874,16 @@ async fn drive_codex_native(
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+                subagents.set_timeline_incarnation(
+                    st_drivers::codex_app_server::current_runtime_incarnation(
+                        &state_dir,
+                        &identity,
+                        &runtime_id,
+                    ),
+                );
+                if let Err(error) = subagents.tick(client).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 // Only a bound session can be adopted, so wait for the binding before following
