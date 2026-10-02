@@ -12,7 +12,7 @@ export type Body =
   | { kind: 'assistant'; text: string }
   | { kind: 'tool'; title: string; state: ToolState; output: string[] }
   /** `delivered`: the recipient's harness has it, seen in the agent's own transcript. */
-  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean }
+  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean }
   | { kind: 'event'; text: string; tone: 'quiet' | 'warning' | 'fault' };
 export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body };
 
@@ -257,6 +257,8 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
           to: !from && !to ? '' : name(to ?? ''),
           subject: str(message.title) ?? '',
           text: text || '(notification)',
+          // Spoken, then transcribed: marked so a reader allows for transcription mistakes.
+          ...(Array.isArray(message.tags) && message.tags.includes('dictated') ? { dictated: true } : {}),
         });
       }
       continue;
