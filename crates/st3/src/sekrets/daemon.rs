@@ -269,7 +269,7 @@ mod tests {
             caller_person: Some(caller_person.into()),
             owner_person: Some("person/ada".into()),
             event: event.into(),
-            actor: Some("agent/fleet/web/builder".into()),
+            actor: Some("agent/fleet/fixture-web/builder".into()),
             profile: Some("ada/agent-gh".into()),
             detail,
         }
@@ -283,7 +283,7 @@ mod tests {
             &entry(
                 "call",
                 "person/ada",
-                json!({"argv": ["gh", "pr", "list"], "cwd": "/home/ada/web", "grant": null, "login": false, "tty": false}),
+                json!({"argv": ["gh", "pr", "list"], "cwd": "/home/example/web", "grant": null, "login": false, "tty": false}),
             ),
         )
         .unwrap();
@@ -312,12 +312,12 @@ mod tests {
         .unwrap();
         assert_eq!(changed.kind, "sekret.changed");
         assert_eq!(changed.fields["change"], "put");
-        // Bob's daemon records Bob's calls with Ada's profile; Ada's does not.
+        // Robin's daemon records Robin's calls with Ada's profile; Ada's does not.
         assert!(
             claim_for(
                 "example",
                 "person/ada",
-                &entry("call", "person/bob", json!({}))
+                &entry("call", "person/robin", json!({}))
             )
             .is_none()
         );

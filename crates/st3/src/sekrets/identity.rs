@@ -207,7 +207,7 @@ mod tests {
             version: STATEMENT_VERSION,
             node: "host/example".into(),
             person: "person/ada".into(),
-            agent: "agent/fleet/web/builder".into(),
+            agent: "agent/fleet/fixture-web/builder".into(),
             revision: None,
             cgroup: "/a".into(),
             pid: 7,
@@ -231,23 +231,26 @@ mod tests {
     #[test]
     fn grant_patterns_match_segments() {
         assert!(principal_matches(
-            "agent/fleet/**",
-            "agent/fleet/web/builder"
+            "agent/fleet/fixture-web/**",
+            "agent/fleet/fixture-web/team/builder"
         ));
         assert!(principal_matches(
-            "agent/fleet/*/builder",
-            "agent/fleet/web/builder"
+            "agent/fleet/fixture-web/*/builder",
+            "agent/fleet/fixture-web/team/builder"
         ));
         assert!(!principal_matches(
-            "agent/fleet/*",
-            "agent/fleet/web/builder"
+            "agent/fleet/fixture-web/*",
+            "agent/fleet/fixture-web/team/builder"
         ));
         assert!(principal_matches(
-            "agent/fleet/web/build*",
-            "agent/fleet/web/builder"
+            "agent/fleet/fixture-web/team/build*",
+            "agent/fleet/fixture-web/team/builder"
         ));
-        assert!(!principal_matches("agent/fleet/**", "person/ada"));
+        assert!(!principal_matches(
+            "agent/fleet/fixture-web/**",
+            "person/ada"
+        ));
         assert!(principal_matches("person/ada", "person/ada"));
-        assert!(!principal_matches("person/ada", "person/adam"));
+        assert!(!principal_matches("person/ada", "person/alex"));
     }
 }

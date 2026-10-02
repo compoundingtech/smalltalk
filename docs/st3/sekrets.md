@@ -25,7 +25,7 @@ resource graph plan; this document describes what is built.
   command is allowed when some allow rule matches and no deny rule does. `*` matches exactly one
   argument. Options before a subcommand (`gh -R other/repo pr create`) match no allow prefix
   unless one names them. Presets make a policy one word; `st sekrets presets` lists them.
-- **Grant.** The owner gives an agent, a pattern of agents (`agent/fleet/web/**`) or another
+- **Grant.** The owner gives an agent, a pattern of agents (`agent/web/**`) or another
   person the use of a profile, with a policy and an optional expiry. A call through a grant must
   pass both the profile's policy and the grant's, so a grant can only narrow. A grant to an agent
   must list subcommands: a rule that allows a whole command (`gh`, `*`) is refused, because a
@@ -87,6 +87,9 @@ The gateway runs each command as the sekrets user inside bubblewrap:
   (remotes, branches, identity, format extensions), and its `hooks` and `modules` directories by
   empty ones. Command-line configuration then turns off hooks, the file system monitor, local and
   external transports, submodule recursion and signing.
+- The checkout is read-only to the command, so `git push` through sekrets pushes the branch and
+  exits 0 but cannot record the remote-tracking ref or `-u` upstream in the checkout; run
+  `git fetch` and `git branch --set-upstream-to` as the caller afterwards.
 - The command and every tool it runs come from the gateway's configured path. Each directory and
   file on the way must belong to root (or the sekrets user) and be writable by no one else, so no
   person or seat can change what runs as sekrets. A command is a name, never a path.
@@ -109,7 +112,7 @@ st sekrets profile create ada/gh --preset everything --preset no-credential-prin
 st sekrets login gh --profile ada/gh                       # gh's own device-code login, as sekrets
 st sekrets profile create ada/agent-gh --preset gh-pr --preset git-push
 printf %s "$TOKEN" | st sekrets put GH_TOKEN --profile ada/agent-gh
-st sekrets grant ada/agent-gh --to 'agent/fleet/web/**' --preset gh-pr --preset git-push --until 2026-11-01
+st sekrets grant ada/agent-gh --to 'agent/web/**' --preset gh-pr --preset git-push --until 2026-11-01
 st sekrets -- gh pr list                                   # a person: their default profile
 st sekrets -- gh pr create --draft --title "..."           # a seat: the one granted profile that allows it
 st sekrets lock --reason "token leaked"                    # stop all use; st sekrets unlock lifts it

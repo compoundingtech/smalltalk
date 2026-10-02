@@ -1,6 +1,6 @@
 # Proves the sekrets gateway with real Unix users in a VM: the gateway runs as the `sekrets` user
 # with its store closed to everyone else; ada calls it from an ssh login session as herself and
-# from a seat-like process in her service manager that her st daemon vouches for; bob, another
+# from a seat-like process in her service manager that her st daemon vouches for; robin, another
 # person, gets nothing of ada's unless she grants it. The isolation-vm CI job builds this test's
 # driver and runs it outside the Nix sandbox with a prebuilt st binary:
 #
@@ -16,11 +16,11 @@ let
   gatewayConfig = pkgs.writeText "gateway.toml" ''
     bwrap = "${pkgs.bubblewrap}/bin/bwrap"
     path = ["/run/current-system/sw/bin"]
-    checkout_roots = ["/home"]
+    checkout_roots = ["/srv/people"]
 
     [people]
     "1000" = "person/ada"
-    "1001" = "person/bob"
+    "1001" = "person/robin"
   '';
 in
 pkgs.testers.runNixOSTest {
@@ -30,14 +30,17 @@ pkgs.testers.runNixOSTest {
     virtualisation.cores = 2;
     virtualisation.memorySize = 2048;
     virtualisation.diskSize = 4096;
+    # Homes outside /home: the gateway serves the checkout roots its configuration names.
     users.users.ada = {
       isNormalUser = true;
       uid = 1000;
+      home = "/srv/people/ada";
       linger = true;
     };
-    users.users.bob = {
+    users.users.robin = {
       isNormalUser = true;
       uid = 1001;
+      home = "/srv/people/robin";
     };
     users.users.sekrets = {
       isSystemUser = true;
@@ -84,10 +87,10 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_file("/run/st-sekrets/gateway.sock")
 
     machine.succeed("mkdir -p /root/.ssh && ssh-keygen -q -t ed25519 -N ''' -f /root/.ssh/id_ed25519")
-    for user in ["ada", "bob"]:
+    for user in ["ada", "robin"]:
         machine.succeed(
-            f"install -d -o {user} -m 0700 /home/{user}/.ssh"
-            f" && install -o {user} -m 0600 /root/.ssh/id_ed25519.pub /home/{user}/.ssh/authorized_keys"
+            f"install -d -o {user} -m 0700 /srv/people/{user}/.ssh"
+            f" && install -o {user} -m 0600 /root/.ssh/id_ed25519.pub /srv/people/{user}/.ssh/authorized_keys"
         )
 
     def login(user, command, succeed=True):
@@ -126,26 +129,26 @@ pkgs.testers.runNixOSTest {
     assert "denied by rule `gh auth token`" in login("ada", f"{st} sekrets -- gh auth token", succeed=False)
 
     # No one but the sekrets user reads the store; the token appears in no output or log.
-    for user in ["ada", "bob"]:
+    for user in ["ada", "robin"]:
         login(user, "ls /var/lib/st-sekrets", succeed=False)
         login(user, "cat /var/lib/st-sekrets/sekrets.db", succeed=False)
     assert "example-token" not in login("ada", f"{st} sekrets log --limit 200")
 
-    # Bob has nothing of Ada's until she grants it, and then only what the grant allows.
-    assert "owns no profile and has been granted none" in login("bob", f"{st} sekrets -- gh pr list", succeed=False)
-    login("ada", f"{st} sekrets grant ada/agent-gh --to person/bob --preset gh-read")
-    assert "token=set" in login("bob", f"{st} sekrets -- gh pr view 1")
-    assert "no allow rule matches" in login("bob", f"{st} sekrets -- gh pr create --draft", succeed=False)
-    login("bob", f"{st} sekrets grant ada/agent-gh --to person/bob --preset gh-pr", succeed=False)
+    # Robin has nothing of Ada's until she grants it, and then only what the grant allows.
+    assert "owns no profile and has been granted none" in login("robin", f"{st} sekrets -- gh pr list", succeed=False)
+    login("ada", f"{st} sekrets grant ada/agent-gh --to person/robin --preset gh-read")
+    assert "token=set" in login("robin", f"{st} sekrets -- gh pr view 1")
+    assert "no allow rule matches" in login("robin", f"{st} sekrets -- gh pr create --draft", succeed=False)
+    login("robin", f"{st} sekrets grant ada/agent-gh --to person/robin --preset gh-pr", succeed=False)
 
     # A process in the service manager without its daemon's word is refused.
     assert "not identified" in manager(f"{st} sekrets -- gh pr list", succeed=False)
 
     # Ada's st daemon vouches for her seats once she registers its key from a login session.
     machine.succeed(
-        "install -d -o ada -m 0700 /home/ada/.config /home/ada/.config/st3"
-        " && echo 'person = \"person/ada\"' > /home/ada/.config/st3/config.toml"
-        " && chown ada /home/ada/.config/st3/config.toml"
+        "install -d -o ada -m 0700 /srv/people/ada/.config /srv/people/ada/.config/st3"
+        " && echo 'person = \"person/ada\"' > /srv/people/ada/.config/st3/config.toml"
+        " && chown ada /srv/people/ada/.config/st3/config.toml"
     )
     machine.succeed(
         "su ada -s /bin/sh -c "
@@ -158,7 +161,7 @@ pkgs.testers.runNixOSTest {
     assert "can now use the profiles granted to them" in login("ada", f"{st} sekrets enable")
     login(
         "ada",
-        f"{st} sekrets grant ada/agent-gh --to 'agent/fleet/example/**' --preset gh-pr --preset git-push --allow 'git status'",
+        f"{st} sekrets grant ada/agent-gh --to 'agent/fleet/fixture-example/**' --preset gh-pr --preset git-push --allow 'git status'",
     )
 
     # A seat: a terminal in its own scope, tagged as st tags a seat's terminal, in a checkout
@@ -169,8 +172,8 @@ pkgs.testers.runNixOSTest {
             "cd ~ && git init -q -b main web && cd web"
             " && git -c user.email=ada@example.com -c user.name=Ada commit -q --allow-empty -m first"
             " && git remote add origin https://example.com/web.git"
-            " && printf '#!/bin/sh\\necho PWNED >&2\\n' > /home/ada/hook.sh && chmod +x /home/ada/hook.sh"
-            " && git config core.fsmonitor /home/ada/hook.sh"
+            " && printf '#!/bin/sh\\necho PWNED >&2\\n' > /srv/people/ada/hook.sh && chmod +x /srv/people/ada/hook.sh"
+            " && git config core.fsmonitor /srv/people/ada/hook.sh"
         )
     )
     seat = (
@@ -183,23 +186,23 @@ pkgs.testers.runNixOSTest {
     machine.succeed(
         "su ada -s /bin/sh -c "
         + shlex.quote(
-            "XDG_RUNTIME_DIR=/run/user/1000 PTY_ROOT=/home/ada/.local/state/st3/pty "
+            "XDG_RUNTIME_DIR=/run/user/1000 PTY_ROOT=/srv/people/ada/.local/state/st3/pty "
             "systemd-run --user --scope --unit st3-seat-web.scope --quiet "
             "--setenv=PATH=/run/current-system/sw/bin "
-            "-- pty run -d --force --id seat-web --cwd /home/ada/web "
-            "--tag st3.scope-unit=st3-seat-web.scope --tag st3.subject=agent/fleet/example/web "
-            "--env ST_AGENT=agent/fleet/example/web --env XDG_RUNTIME_DIR=/run/user/1000 "
+            "-- pty run -d --force --id seat-web --cwd /srv/people/ada/web "
+            "--tag st3.scope-unit=st3-seat-web.scope --tag st3.subject=agent/fleet/fixture-example/web "
+            "--env ST_AGENT=agent/fleet/fixture-example/web --env XDG_RUNTIME_DIR=/run/user/1000 "
             "--env PATH=/run/current-system/sw/bin:/usr/local/bin "
-            f"-- sh -c {shlex.quote(seat + ' > /home/ada/seat.out 2>&1; echo done >> /home/ada/seat.out; sleep 600')}"
+            f"-- sh -c {shlex.quote(seat + ' > /srv/people/ada/seat.out 2>&1; echo done >> /srv/people/ada/seat.out; sleep 600')}"
         )
     )
-    machine.wait_until_succeeds("grep -q '^done' /home/ada/seat.out", timeout=120)
-    out = machine.succeed("cat /home/ada/seat.out")
+    machine.wait_until_succeeds("grep -q '^done' /srv/people/ada/seat.out", timeout=120)
+    out = machine.succeed("cat /srv/people/ada/seat.out")
     print(out)
-    assert "agent/fleet/example/web, working for person/ada" in out, out
+    assert "agent/fleet/fixture-example/web, working for person/ada" in out, out
     assert "gh pr create --draft --title Example token=set home=/var/lib/st-sekrets/profiles/ada/agent-gh/home" in out, out
     assert "no allow rule matches `gh auth status`" in out, out
-    assert "profile ada/gh is not agent/fleet/example/web's" in out, out
+    assert "profile ada/gh is not agent/fleet/fixture-example/web's" in out, out
     assert "PWNED" not in out, out
     # gh pr create and git status ran; gh auth status and ada's own profile were refused.
     assert out.count("exit=0") == 2, out
@@ -210,7 +213,7 @@ pkgs.testers.runNixOSTest {
             "su ada -s /bin/sh -c "
             + shlex.quote(f"XDG_RUNTIME_DIR=/run/user/1000 {st} subject history sekret/machine/ada/agent-gh --json")
         )
-        return "sekret.called" in history and "sekret.refused" in history and "agent/fleet/example/web" in history
+        return "sekret.called" in history and "sekret.refused" in history and "agent/fleet/fixture-example/web" in history
     retry(recorded, timeout_seconds=120)
   '';
 }

@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn checkout_paths_stay_under_their_roots() {
         let roots = vec![PathBuf::from("/home")];
-        assert!(check_checkout_path(Path::new("/home/ada/src/web"), &roots).is_ok());
+        assert!(check_checkout_path(Path::new("/home/example/src/web"), &roots).is_ok());
         assert!(check_checkout_path(Path::new("/home"), &roots).is_err());
         assert!(check_checkout_path(Path::new("/usr/bin"), &roots).is_err());
         assert!(check_checkout_path(Path::new("/home/../usr/bin"), &roots).is_err());
