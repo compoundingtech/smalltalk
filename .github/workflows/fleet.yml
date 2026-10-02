@@ -165,6 +165,7 @@ jobs:
           path: |
             ${{ runner.temp }}/ci-logs/
             target/messaging-faults/
+            target/boot-canaries/
           if-no-files-found: ignore
   linux-clippy:
     name: linux-clippy

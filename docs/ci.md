@@ -71,6 +71,24 @@ channel build remains independently pinned in `.github/messaging-compat-baseline
 provider stand-in runs the omp channel hook's TypeScript with Node 24's built-in type stripping;
 the default devShell supplies that `node`. See [the eval contract](../evals/st3/messaging-faults/README.md).
 
+### Boot canaries
+
+`boot_canaries::*` in `linux-tests` boots real seats of every harness st drives (Claude, Codex, pi,
+omp, OpenCode) against a real st3 daemon and real `pty` sessions, with a token-free stand-in for
+the provider (`scripts/st3-boot-canaries`; see its README). Five scenarios per harness: a fresh
+seat, a restarted seat, a daemon restart while the predecessor is still the latest runtime
+observation, a driver re-exec into a replaced binary, and five seats launching at once. Each seat
+must claim its step with its current incarnation and read an st message within the time bound, and
+must not park in the crash-loop guard. The stand-ins answer instantly, where real providers take
+seconds, so a race between a provider and the daemon fails here every time instead of on whichever
+launch loses it. These cases never retry: a pass on the second attempt is the race the canary
+exists to catch (`.config/nextest.toml`). A failed case keeps its daemon log, the seat's terminal,
+its claim trace and the stand-in's receipts under `target/boot-canaries/`, which the stage uploads.
+
+The Codex stand-in's schema files are generated from the protocol gate's own fixture; when the
+required Codex methods change, `ST_REGENERATE_CODEX_STUB_SCHEMAS=1 cargo test -p st-drivers
+the_boot_canary_codex_stub_schemas` rewrites them.
+
 ### Gate scope
 
 The gate covers st3 and the code st3 uses. The `ci` profile's `default-filter` in

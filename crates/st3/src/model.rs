@@ -855,6 +855,13 @@ pub struct SubscriptionSpec {
     pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requester: Option<String>,
+    /// An item that a live agent owns goes to that agent as one message instead (`owner
+    /// "message"`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_message: bool,
+    /// The GitHub logins whose mentions the subscription hears, each with the person it names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<(String, String)>,
     pub stopped: bool,
 }
 

@@ -1704,10 +1704,14 @@ impl Delivery {
         client: &Client,
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
-        let unread = crate::push_mailbox::messages(
+        let unread = match crate::push_mailbox::messages(
             self.inbox.parent().and_then(Path::parent).unwrap(),
             &self.inbox,
-        )?;
+        ) {
+            // The daemon's first replay has not arrived; ask again on the next pass.
+            Err(error) if crate::push_mailbox::is_not_replayed(&error) => return Ok(()),
+            unread => unread?,
+        };
         // Archive is the recipient agent's act and the only settlement authority. An entry whose
         // file left the inbox releases ownership here; this pump never moves a file itself.
         self.ledger
@@ -1826,10 +1830,14 @@ impl Delivery {
         if Instant::now() < self.next_attempt {
             return Ok(());
         }
-        let unread = crate::push_mailbox::messages(
+        let unread = match crate::push_mailbox::messages(
             self.inbox.parent().and_then(Path::parent).unwrap(),
             &self.inbox,
-        )?;
+        ) {
+            // The daemon's first replay has not arrived; ask again on the next pass.
+            Err(error) if crate::push_mailbox::is_not_replayed(&error) => return Ok(()),
+            unread => unread?,
+        };
         let Some(head) = unread
             .into_iter()
             .find(|message| message.filename == entry.filename)

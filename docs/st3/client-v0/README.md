@@ -434,6 +434,7 @@ The v0 action discriminators are:
 | Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
+| Agent desired state | `agent.stop`, `agent.start` | snapshot and `runtime_desired_revision`, the agent's selected desired claim ID; no runtime incarnation required |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; input and resize also require the screen sequence |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
@@ -443,6 +444,20 @@ incarnation. `runtime.reset` publishes a restart-window reset for a run-owned me
 submits the runtime resource ID as `target_id` and copies its `incarnation_id` and
 `desired_revision` into the action fence. Runtimes with no selected desired state have a null
 `desired_revision` and cannot use these controls.
+
+`agent.stop` takes `{ "agent": "agent/NAME", "reason": "optional explanation" }`;
+`agent.start` takes `{ "agent": "agent/NAME" }`. These require `control.runtimes` and the
+same authority as `agent.create`: the session's concrete person, or a local agent acting as
+itself (free mode).
+Stop publishes the same desired stop as `st agents stop`, even if no runtime is live, and
+preserves the immutable declaration. Start restores the unambiguous preceding agent
+declaration with its original identity and host, like `st agents start` without overrides.
+Mission-owned agents must instead be changed through their mission. Both actions copy the
+selected desired claim ID into `fence.runtime_desired_revision`, reject stale fences, and
+use the normal audited action receipt/idempotency key; exact retries return the saved result.
+Rust exposes `agent_stop`/`agent_start`; TypeScript and Swift expose `agentStop`/`agentStart`.
+All generated clients' `Fence` models also carry the desired revision required by
+`runtime.stop` and `runtime.restart`.
 
 `agent.queue-move` takes `agent_id`, `mission_run_id`, `placement` (`top`, `bottom`, `before`, or
 `after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one

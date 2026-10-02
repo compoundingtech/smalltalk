@@ -227,6 +227,50 @@ An observer checks its declared fields. Its effective field set also includes th
 
 st does not fetch once for each target. A subscription update can expand or reduce the observer field set.
 
+## The intake pipeline
+
+A repository observer's items reach whoever owns them, each once.
+
+```kdl
+subscription "pull-request-reviews" {
+  observer "observer/repository"
+  on "pull_requests"
+  delivery "mission" {
+    mission "fleet/example/pull-request-review"
+    resource "source"
+    workspace "/srv/reviews"
+    owner "message"
+  }
+}
+
+subscription "mentions" {
+  observer "observer/repository"
+  on "mentions"
+  mention "orchid-login" "person/robin"
+  delivery "person" { owner "message" }
+}
+```
+
+`owner "message"` routes an item that a live agent owns to that agent as one message, and the
+delivery does nothing else: no review, triage, or person request. An item's owner is its
+`opened_by` agent while that agent's declaration is live. Otherwise it is an agent of a live
+mission run that opened the item (`opened_by_run`) or published its pull request resource,
+preferring the agent working on one of the run's steps. An item that no live agent owns takes
+the delivery's usual path.
+
+`delivery "person"` hears `on "mentions"`. Each `mention` names a GitHub login and the person it
+is. A new mention of a named login becomes one request on that person's home, titled with who
+mentioned them and where, unless the item's owner gets it. A mention of a login that no `mention`
+names reaches nobody, and so does a login's mention of itself. A mention is new when its item is new, or when a recorded item did not know
+it and it was made no earlier than five minutes before the item's previous observation. Turning
+mentions on, reading a body again, or an edit to an old comment never reports an old mention. The
+baseline delivers nothing.
+
+Each delivery has a stable key: the subscription's local name, the repository ID, the item, and
+its head or the mention. The owner's message and the person's request take their subjects from
+the key, so a repeated observation, a replacement watch, or a daemon restart delivers nothing
+more. A review or triage request keeps the key as before.
+
 ## Retention
 
 Each item resource keeps its latest state. An observation replicates only a change, and a checkpoint
@@ -406,6 +450,10 @@ mission cancellation to stop it.
 - An item first seen through a comment, or created before the watermark, is not new and asks for
   no triage.
 - A mention subscription hears a mention and not a finished check.
+- A new head of a pull request that a live agent opened reaches that agent as one message and
+  requests no review; one whose opener is gone requests a review.
+- A new mention of a named login becomes one request on that person's home, or one message to the
+  item's owner; an old mention, an unnamed login, and the baseline reach nobody.
 - Pull requests from the GitHub issues endpoint do not create issue resources.
 - An unselected field change creates an observation claim and no message for that subscription.
 - A daemon restart creates no duplicate message.
