@@ -11,6 +11,7 @@ pub struct SearchEntry {
     pub conversation_id: String,
     pub entry_id: String,
     pub agent_id: Option<String>,
+    /// An RFC3339 timestamp; the index normalizes offsets and fractional precision.
     pub timestamp: String,
     pub entry_type: String,
     pub text: String,
@@ -24,6 +25,12 @@ pub struct SearchHit {
     pub timestamp: String,
     pub entry_type: String,
     pub excerpt: String,
+}
+
+fn normalized_timestamp(value: &str) -> Result<String> {
+    Ok(chrono::DateTime::parse_from_rfc3339(value)?
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
 }
 
 /// A single owner's disposable index. Keep it behind a mutex when sharing it.
@@ -53,7 +60,7 @@ impl SearchIndex {
                     entry.conversation_id,
                     entry.entry_id,
                     entry.agent_id,
-                    entry.timestamp,
+                    normalized_timestamp(&entry.timestamp)?,
                     entry.entry_type,
                     entry.text
                 ])?;
@@ -88,7 +95,12 @@ impl SearchIndex {
             "search limit must be 1 through 201"
         );
         let phrase = format!("\"{}\"", text.replace('"', "\"\""));
-        let (stamp, conversation, entry) = before.unwrap_or(("", "", ""));
+        let since = since.map(normalized_timestamp).transpose()?;
+        let before_stamp = before
+            .map(|(stamp, _, _)| normalized_timestamp(stamp))
+            .transpose()?;
+        let (_, conversation, entry) = before.unwrap_or(("", "", ""));
+        let stamp = before_stamp.as_deref().unwrap_or("");
         let mut statement = self.connection.prepare(
             "SELECT conversation_id, entry_id, agent_id,
             timestamp, entry_type, snippet(entries, 6, '', '', ' … ', 48)
@@ -123,7 +135,11 @@ mod tests {
             conversation_id: "session/test".into(),
             entry_id: id.into(),
             agent_id: Some("agent/test".into()),
-            timestamp: time.into(),
+            timestamp: if time.len() == 10 {
+                format!("{time}T00:00:00Z")
+            } else {
+                time.into()
+            },
             entry_type: "content".into(),
             text: text.into(),
         }
@@ -162,7 +178,7 @@ mod tests {
         );
         assert_eq!(
             index
-                .search("hello", None, Some("2026-10-02"), None, 200)
+                .search("hello", None, Some("2026-10-02T00:00:00Z"), None, 200)
                 .unwrap()
                 .len(),
             2
@@ -195,6 +211,61 @@ mod tests {
                 .search("revised", None, None, None, 200)
                 .unwrap()
                 .is_empty()
+        );
+    }
+    #[test]
+    fn timestamps_order_filter_and_page_across_offsets_and_precision() {
+        let mut index = SearchIndex::new().unwrap();
+        index
+            .replace(
+                "test",
+                &[
+                    entry("whole", "2026-10-01T12:00:00Z", "orchid"),
+                    entry("fraction", "2026-10-01T12:00:00.1Z", "orchid"),
+                    entry("offset", "2026-10-01T14:00:00.15+02:00", "orchid"),
+                ],
+            )
+            .unwrap();
+        let hits = index.search("orchid", None, None, None, 200).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.entry_id.as_str())
+                .collect::<Vec<_>>(),
+            ["offset", "fraction", "whole"]
+        );
+        assert_eq!(
+            index
+                .search(
+                    "orchid",
+                    None,
+                    Some("2026-10-01T12:00:00.100000001Z"),
+                    None,
+                    200
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        let last = &hits[1];
+        let older = index
+            .search(
+                "orchid",
+                None,
+                None,
+                Some((&last.timestamp, &last.conversation_id, &last.entry_id)),
+                200,
+            )
+            .unwrap();
+        assert_eq!(older[0].entry_id, "whole");
+        assert!(
+            index
+                .replace("test", &[entry("bad", "yesterday", "orchid")])
+                .is_err()
+        );
+        assert_eq!(
+            index.search("orchid", None, None, None, 200).unwrap(),
+            hits,
+            "an invalid replacement rolls back"
         );
     }
 }

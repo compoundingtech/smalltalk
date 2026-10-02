@@ -19,6 +19,8 @@ The query is a literal Unicode word phrase, case insensitive. Punctuation separa
 FTS operators are ordinary query text. It has at most 512 UTF-8 bytes and must contain a word.
 `--since` takes an RFC3339 timestamp and includes entries at that instant. Results sort by
 timestamp descending, then conversation ID and entry ID descending for stable ties.
+The index normalizes RFC3339 timestamps to UTC with fixed fractional precision so native
+offsets and timestamps within the same second sort, filter and page chronologically.
 Each hit gives `conversation_id`, `entry_id`, optional `agent_id`, `timestamp`, `entry_type`,
 and an excerpt of at most 512 characters. Message hits use the canonical message ID for both
 targets; transcript hits preserve their normalized session and timeline entry IDs. `--agent`

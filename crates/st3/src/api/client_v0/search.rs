@@ -197,7 +197,11 @@ fn refresh(
         }
         if owner.starts_with("agent/") && remote.is_none() {
             // Joined Small Talk message entries also change this normalized conversation.
-            stamp.push_str(&state.store.conversation_search_mail_stamp(owner, snapshot.store_index)?);
+            stamp.push_str(
+                &state
+                    .store
+                    .conversation_search_mail_stamp(owner, snapshot.store_index)?,
+            );
             stamp.push_str(&state.store.conversation_search_timeline_stamp(
                 owner,
                 resource["runtime_incarnation"].as_str().unwrap_or_default(),
@@ -388,7 +392,7 @@ pub(in crate::api) async fn search(
             chrono::DateTime::parse_from_rfc3339(since)
                 .map_err(|_| validation("since must be an RFC3339 timestamp"))?
                 .with_timezone(&chrono::Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         );
     }
     if query
@@ -428,6 +432,12 @@ pub(in crate::api) async fn search(
         return Err(validation(
             "search cursor does not belong to this reader and query",
         ));
+    }
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| chrono::DateTime::parse_from_rfc3339(&cursor.timestamp).is_err())
+    {
+        return Err(validation("invalid search cursor timestamp"));
     }
     let held = index_for(&state, &session)?;
     {
