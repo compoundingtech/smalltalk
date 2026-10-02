@@ -1011,12 +1011,23 @@ fn client_error_envelope(status: StatusCode, raw: &Value, request_id: &str) -> V
         "request_id": request_id,
         "code": client_error_code(raw.get("code").and_then(Value::as_str)),
         "message": raw.get("message").and_then(Value::as_str).unwrap_or("the request failed"),
-        "retryable": client_error_retryable(status, raw.get("code").and_then(Value::as_str)),
+        "retryable": client_error_retryable(status, raw.get("code").and_then(Value::as_str), raw.get("details").and_then(Value::as_object)),
         "details": raw.get("details").cloned().unwrap_or_else(|| json!({})),
     })
 }
 
-fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
+fn client_error_retryable(
+    status: StatusCode,
+    code: Option<&str>,
+    details: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    // A fresh snapshot cannot restore an append which is absent from retained history.
+    if code == Some("cursor-gap")
+        && details.and_then(|details| details.get("retained_history_incomplete"))
+            == Some(&Value::Bool(true))
+    {
+        return false;
+    }
     matches!(
         code,
         Some(

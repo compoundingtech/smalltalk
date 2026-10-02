@@ -197,7 +197,8 @@ async fn deliver_collection(
     let (snapshot, items, has_more) = match read {
         Ok(read) => read,
         Err(error) => {
-            let retryable = client_error_retryable(error.status, Some(&error.code));
+            let retryable =
+                client_error_retryable(error.status, Some(&error.code), Some(&error.details));
             let kind = if retryable { "resync" } else { "error" };
             let sent = send_collection(
                 socket,
@@ -422,6 +423,11 @@ async fn conversation_changes_value(
 
 /// Follow one conversation for a collection socket: its newest page, then each change, until
 /// the socket stops listening. A change the server can no longer replay sends the page again.
+fn conversation_stream_error(id: &str, error: &ApiError) -> Value {
+    json!({"kind":"error", "id":id, "collection":"conversation", "code":client_error_code(Some(&error.code)), "message":error.message,
+        "retryable":client_error_retryable(error.status, Some(&error.code), Some(&error.details))})
+}
+
 async fn follow_conversation(
     state: AppState,
     session: ClientSession,
@@ -431,10 +437,7 @@ async fn follow_conversation(
     outbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
 ) {
     let remote = remote.as_deref();
-    let failed = |error: &ApiError| {
-        json!({"kind":"error", "id":id, "collection":"conversation", "code":client_error_code(Some(&error.code)), "message":error.message,
-        "retryable":client_error_retryable(error.status, Some(&error.code))})
-    };
+    let failed = |error: &ApiError| conversation_stream_error(&id, error);
     loop {
         // The cursor first, so nothing that lands while the page is read is lost.
         let start = match conversation_changes_value(&state, &session, &session_id, remote, None, 0)
@@ -442,7 +445,7 @@ async fn follow_conversation(
         {
             Ok(start) => start,
             Err(error) => {
-                if client_error_retryable(error.status, Some(&error.code)) {
+                if client_error_retryable(error.status, Some(&error.code), Some(&error.details)) {
                     if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true}))).is_err() { return; }
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     continue;
@@ -454,7 +457,7 @@ async fn follow_conversation(
         let page = match conversation_page(&state, &session, &session_id, remote).await {
             Ok(page) => page,
             Err(error) => {
-                if client_error_retryable(error.status, Some(&error.code)) {
+                if client_error_retryable(error.status, Some(&error.code), Some(&error.details)) {
                     if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true}))).is_err() { return; }
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     continue;
@@ -512,7 +515,13 @@ async fn follow_conversation(
                 {
                     break;
                 }
-                Err(error) if client_error_retryable(error.status, Some(&error.code)) => {
+                Err(error)
+                    if client_error_retryable(
+                        error.status,
+                        Some(&error.code),
+                        Some(&error.details),
+                    ) =>
+                {
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     break;
                 }
@@ -3843,12 +3852,12 @@ pub(super) fn timeline_value(
         return Err(ApiError {
             status: StatusCode::GONE,
             code: "cursor-gap".into(),
-            message: "older timeline history was omitted without a typed truncation interval"
+            message: "the retained transcript start is incomplete: older history has no truncation interval"
                 .into(),
-            details: Box::new(serde_json::Map::from_iter([(
-                "full_resync".into(),
-                Value::Bool(true),
-            )])),
+            details: Box::new(serde_json::Map::from_iter([
+                ("full_resync".into(), Value::Bool(false)),
+                ("retained_history_incomplete".into(), Value::Bool(true)),
+            ])),
         });
     }
     let mut retained_entries = BTreeSet::new();
@@ -3862,11 +3871,11 @@ pub(super) fn timeline_value(
             return Err(ApiError {
                 status: StatusCode::GONE,
                 code: "cursor-gap".into(),
-                message: "the retained timeline begins after an entry's append operation".into(),
-                details: Box::new(serde_json::Map::from_iter([(
-                    "full_resync".into(),
-                    Value::Bool(true),
-                )])),
+                message: "the retained transcript start is incomplete: an entry's append operation is missing".into(),
+                details: Box::new(serde_json::Map::from_iter([
+                    ("full_resync".into(), Value::Bool(false)),
+                    ("retained_history_incomplete".into(), Value::Bool(true)),
+                ])),
             });
         }
         retained_entries.insert(entry_id.to_owned());
@@ -6286,7 +6295,7 @@ fn terminal_stream_error(error: &ApiError) -> Value {
         "request_id": format!("request/{}", new_request_id()),
         "code": client_error_code(Some(&error.code)),
         "message": error.message,
-        "retryable": client_error_retryable(error.status, Some(&error.code)),
+        "retryable": client_error_retryable(error.status, Some(&error.code), Some(&error.details)),
         "details": error.details,
     })
 }
@@ -12227,6 +12236,100 @@ mission "example/zero-run" state="ready" {
     }
 
     #[test]
+    fn timeline_missing_append_is_permanent_on_http_and_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "timeline-retention-node");
+        let subject = "agent/timeline-retention-owner";
+        let incarnation = "timeline-retention-runtime:i1";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("timeline-retention-runtime".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("terminal".into(), Value::Bool(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("timeline-retention-runtime".into()),
+            })
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.timeline".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("operation".into(), json!("replace")),
+                    ("entry_id".into(), json!("timeline-entry/orphan")),
+                    ("sequence".into(), json!(1)),
+                    ("revision".into(), json!(2)),
+                    ("role".into(), json!("assistant")),
+                    ("entry_type".into(), json!("content")),
+                    ("final".into(), json!(false)),
+                    ("body".into(), json!({"text":"retained update"})),
+                    ("driver".into(), json!("codex")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let session_id = client_session_resources(
+            &state.store,
+            true,
+            &snapshot.created_at,
+            snapshot.store_index,
+            state.native_session_home.as_deref(),
+            false,
+        )
+        .unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for _ in 0..2 {
+            let snapshot = new_client_snapshot(&state);
+            let gap = timeline_value(
+                &state,
+                &snapshot,
+                &session,
+                session_id.trim_start_matches("session/"),
+                &ClientListQuery::default(),
+            )
+            .unwrap_err();
+            assert_eq!(gap.code, "cursor-gap");
+            assert!(gap.message.contains("append operation is missing"));
+            assert_eq!(gap.details["full_resync"], false);
+            let raw = json!({"code":gap.code,"message":gap.message,"details":gap.details});
+            assert_eq!(
+                client_error_envelope(gap.status, &raw, "test")["retryable"],
+                false
+            );
+            assert_eq!(
+                conversation_stream_error("conversation", &gap)["retryable"],
+                false
+            );
+        }
+        // An actual cursor/window race still admits a fresh read.
+        assert!(client_error_retryable(
+            StatusCode::GONE,
+            Some("cursor-gap"),
+            None
+        ));
+    }
+
+    #[test]
     fn timeline_retention_requires_an_actual_typed_gap_interval() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "timeline-retention-node");
@@ -12318,7 +12421,12 @@ mission "example/zero-run" state="ready" {
         .unwrap_err();
         assert_eq!(gap.status, StatusCode::GONE);
         assert_eq!(gap.code, "cursor-gap");
-        assert_eq!(gap.details.get("full_resync"), Some(&Value::Bool(true)));
+        assert_eq!(gap.details.get("full_resync"), Some(&Value::Bool(false)));
+        assert!(!client_error_retryable(
+            gap.status,
+            Some(&gap.code),
+            Some(&gap.details)
+        ));
 
         append_entry(
             4_098,
