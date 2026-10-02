@@ -360,7 +360,10 @@ async fn serve_static(web: &ClientWeb, relative: &str, head: bool) -> Response {
         Ok(file) if file.starts_with(root) => file,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let document = web.security.as_ref().and_then(|security| security.html.get(&file));
+    let document = web
+        .security
+        .as_ref()
+        .and_then(|security| security.html.get(&file));
     let (length, mut response) = if file.extension().is_some_and(|value| value == "html") {
         // HTML added after startup has not passed the build security boundary.
         let Some(document) = document else {
@@ -368,7 +371,11 @@ async fn serve_static(web: &ClientWeb, relative: &str, head: bool) -> Response {
         };
         (
             document.len() as u64,
-            if head { StatusCode::OK.into_response() } else { document.clone().into_response() },
+            if head {
+                StatusCode::OK.into_response()
+            } else {
+                document.clone().into_response()
+            },
         )
     } else if head {
         let meta = match tokio::fs::metadata(&file).await {
@@ -973,7 +980,10 @@ mod tests {
     fn sri(bytes: &[u8]) -> String {
         use base64::Engine as _;
         use sha2::{Digest as _, Sha384};
-        format!("sha384-{}", base64::engine::general_purpose::STANDARD.encode(Sha384::digest(bytes)))
+        format!(
+            "sha384-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha384::digest(bytes))
+        )
     }
 
     fn asset_loads(html: &str) -> Vec<(String, String, String)> {
@@ -981,20 +991,29 @@ mod tests {
         lol_html::rewrite_str(
             html,
             lol_html::RewriteStrSettings {
-                element_content_handlers: vec![lol_html::element!("script[src], link[href]", |element| {
-                    let source = element.get_attribute("src")
-                        .or_else(|| element.get_attribute("href")).unwrap();
-                    loads.push((
-                        element.tag_name(),
-                        html_escape::decode_html_entities(&source).into_owned(),
-                        element.get_attribute("integrity").unwrap_or_default(),
-                    ));
-                    assert_eq!(element.get_attribute("crossorigin").as_deref(), Some("anonymous"));
-                    Ok(())
-                })],
+                element_content_handlers: vec![lol_html::element!(
+                    "script[src], link[href]",
+                    |element| {
+                        let source = element
+                            .get_attribute("src")
+                            .or_else(|| element.get_attribute("href"))
+                            .unwrap();
+                        loads.push((
+                            element.tag_name(),
+                            html_escape::decode_html_entities(&source).into_owned(),
+                            element.get_attribute("integrity").unwrap_or_default(),
+                        ));
+                        assert_eq!(
+                            element.get_attribute("crossorigin").as_deref(),
+                            Some("anonymous")
+                        );
+                        Ok(())
+                    }
+                )],
                 ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
         loads
     }
 
@@ -1013,33 +1032,64 @@ mod tests {
         std::fs::write(root.path().join("assets/main.js"), main).unwrap();
         std::fs::write(root.path().join("assets/lazy.mjs"), chunk).unwrap();
         std::fs::write(root.path().join("assets/site.css"), stylesheet).unwrap();
-        std::fs::write(root.path().join("index.html"), concat!(
-            "<!doctype html><html><head>",
-            "<script type=module src='./assets/main.js?x=1&amp;y=2' integrity=stale></script>",
-            "<link rel='style&#115;heet' href='./assets/site.css'>",
-            "<link rel=modulepreload href='./assets/lazy.mjs'>",
-            "<link rel=preload as=style href='./assets/site.css'>",
-            "</head><body>client</body></html>"
-        )).unwrap();
-        std::fs::write(root.path().join("tools/index.html"),
-            "<script type=module src='../assets/main.js'></script>").unwrap();
+        std::fs::write(
+            root.path().join("index.html"),
+            concat!(
+                "<!doctype html><html><head>",
+                "<script type=module src='./assets/main.js?x=1&amp;y=2' integrity=stale></script>",
+                "<link rel='style&#115;heet' href='./assets/site.css'>",
+                "<link rel=modulepreload href='./assets/lazy.mjs'>",
+                "<link rel=preload as=style href='./assets/site.css'>",
+                "</head><body>client</body></html>"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("tools/index.html"),
+            "<script type=module src='../assets/main.js'></script>",
+        )
+        .unwrap();
         std::fs::write(root.path().join("plain.html"), "<main>no scripts</main>").unwrap();
-        let app = wrap(Router::new(), web(ClientWebConfig {
-            static_dir: Some(root.path().into()),
-            mount: "/client".into(),
-            ..Default::default()
-        }, None));
+        let app = wrap(
+            Router::new(),
+            web(
+                ClientWebConfig {
+                    static_dir: Some(root.path().into()),
+                    mount: "/client".into(),
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
         let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(css));
         let policy = format!(
             "default-src 'none'; script-src 'self'; style-src 'self' 'sha256-{hash}'; style-src-attr 'none'; connect-src 'self' ws://gateway.example:8443 wss://gateway.example:8443; img-src 'self' data:; font-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'"
         );
         let mut document = None;
         for path in ["/client/", "/client/index.html", "/client/missions/one"] {
-            let response = app.clone().oneshot(Request::builder().uri(path)
-                .header(HOST, "gateway.example:8443").body(Body::empty()).unwrap()).await.unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(HOST, "gateway.example:8443")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap(), policy);
-            let length = response.headers()[CONTENT_LENGTH].to_str().unwrap().parse::<usize>().unwrap();
+            assert_eq!(
+                response.headers()[CONTENT_SECURITY_POLICY]
+                    .to_str()
+                    .unwrap(),
+                policy
+            );
+            let length = response.headers()[CONTENT_LENGTH]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
             let bytes = body(response).await;
             assert_eq!(length, bytes.len());
             if let Some(expected) = &document {
@@ -1047,37 +1097,125 @@ mod tests {
             } else {
                 document = Some(bytes);
             }
-            let head = app.clone().oneshot(Request::builder().method(Method::HEAD).uri(path)
-                .header(HOST, "gateway.example:8443").body(Body::empty()).unwrap()).await.unwrap();
+            let head = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri(path)
+                        .header(HOST, "gateway.example:8443")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(head.status(), StatusCode::OK);
-            assert_eq!(head.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap(), policy);
-            assert_eq!(head.headers()[CONTENT_LENGTH].to_str().unwrap(), length.to_string());
+            assert_eq!(
+                head.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap(),
+                policy
+            );
+            assert_eq!(
+                head.headers()[CONTENT_LENGTH].to_str().unwrap(),
+                length.to_string()
+            );
             assert!(body(head).await.is_empty());
         }
         let html = std::str::from_utf8(document.as_ref().unwrap()).unwrap();
         let loads = asset_loads(html);
-        assert_eq!(loads[0], ("link".into(), "/client/assets/lazy.mjs".into(), sri(chunk.as_bytes())));
-        assert_eq!(loads[1], ("link".into(), "/client/assets/main.js".into(), sri(main.as_bytes())));
-        assert!(loads.contains(&("script".into(), "/client/assets/main.js?x=1&y=2".into(), sri(main.as_bytes()))));
-        assert!(loads.contains(&("link".into(), "/client/assets/site.css".into(), sri(stylesheet.as_bytes()))));
+        assert_eq!(
+            loads[0],
+            (
+                "link".into(),
+                "/client/assets/lazy.mjs".into(),
+                sri(chunk.as_bytes())
+            )
+        );
+        assert_eq!(
+            loads[1],
+            (
+                "link".into(),
+                "/client/assets/main.js".into(),
+                sri(main.as_bytes())
+            )
+        );
+        assert!(loads.contains(&(
+            "script".into(),
+            "/client/assets/main.js?x=1&y=2".into(),
+            sri(main.as_bytes())
+        )));
+        assert!(loads.contains(&(
+            "link".into(),
+            "/client/assets/site.css".into(),
+            sri(stylesheet.as_bytes())
+        )));
         for (path, expected) in [
-            ("/client/tools/", ("script".into(), "/client/assets/main.js".into(), sri(main.as_bytes()))),
-            ("/client/plain.html", ("link".into(), "/client/assets/lazy.mjs".into(), sri(chunk.as_bytes()))),
+            (
+                "/client/tools/",
+                (
+                    "script".into(),
+                    "/client/assets/main.js".into(),
+                    sri(main.as_bytes()),
+                ),
+            ),
+            (
+                "/client/plain.html",
+                (
+                    "link".into(),
+                    "/client/assets/lazy.mjs".into(),
+                    sri(chunk.as_bytes()),
+                ),
+            ),
         ] {
-            let response = app.clone().oneshot(Request::builder().uri(path)
-                .body(Body::empty()).unwrap()).await.unwrap();
-            assert!(asset_loads(std::str::from_utf8(&body(response).await).unwrap()).contains(&expected));
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert!(
+                asset_loads(std::str::from_utf8(&body(response).await).unwrap())
+                    .contains(&expected)
+            );
         }
-        for path in ["/", "/client", "/client/missing.css", "/client/%2e%2e/secret"] {
-            let response = app.clone().oneshot(Request::builder().uri(path)
-                .header(HOST, "gateway.example:8443").body(Body::empty()).unwrap()).await.unwrap();
-            assert_eq!(response.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap(), policy);
+        for path in [
+            "/",
+            "/client",
+            "/client/missing.css",
+            "/client/%2e%2e/secret",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(HOST, "gateway.example:8443")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers()[CONTENT_SECURITY_POLICY]
+                    .to_str()
+                    .unwrap(),
+                policy
+            );
         }
         // A changed on-disk asset cannot silently receive a new trusted hash in
         // the installed document. The browser will reject its stale SRI.
-        std::fs::write(root.path().join("assets/main.js"), "export const changed = true;").unwrap();
-        let response = app.oneshot(Request::builder().uri("/client/assets/main.js")
-            .body(Body::empty()).unwrap()).await.unwrap();
+        std::fs::write(
+            root.path().join("assets/main.js"),
+            "export const changed = true;",
+        )
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/client/assets/main.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_ne!(sri(&body(response).await), sri(main.as_bytes()));
     }
 
@@ -1087,7 +1225,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("main.js"), "export default 1;").unwrap();
         std::fs::write(outside.path().join("secret.css"), "body{}").unwrap();
-        std::os::unix::fs::symlink(outside.path().join("secret.css"), root.path().join("escape.css")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.css"),
+            root.path().join("escape.css"),
+        )
+        .unwrap();
         for html in [
             "<script src='https://cdn.example/main.js'></script>",
             "<script src='//cdn.example/main.js'></script>",
@@ -1099,41 +1241,80 @@ mod tests {
             "<base href='/app/'><script src='main.js'></script>",
         ] {
             std::fs::write(root.path().join("index.html"), html).unwrap();
-            assert!(ClientWeb::build(ClientWebConfig {
-                static_dir: Some(root.path().into()),
-                ..Default::default()
-            }, None, "test".into()).is_err(), "{html}");
+            assert!(
+                ClientWeb::build(
+                    ClientWebConfig {
+                        static_dir: Some(root.path().into()),
+                        ..Default::default()
+                    },
+                    None,
+                    "test".into()
+                )
+                .is_err(),
+                "{html}"
+            );
         }
     }
 
     #[test]
     fn unsupported_pressable_style_never_relaxes_csp() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("index.html"), "<script src='main.js'></script>").unwrap();
-        std::fs::write(root.path().join("main.js"),
-            "const id='react-aria-pressable-style'; const css=`body{color:red}`.trim();").unwrap();
-        let result = ClientWeb::build(ClientWebConfig {
-            static_dir: Some(root.path().into()),
-            ..Default::default()
-        }, None, "test".into());
-        assert!(result.err().unwrap().to_string().contains("unsupported React Aria pressable style"));
+        std::fs::write(
+            root.path().join("index.html"),
+            "<script src='main.js'></script>",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("main.js"),
+            "const id='react-aria-pressable-style'; const css=`body{color:red}`.trim();",
+        )
+        .unwrap();
+        let result = ClientWeb::build(
+            ClientWebConfig {
+                static_dir: Some(root.path().into()),
+                ..Default::default()
+            },
+            None,
+            "test".into(),
+        );
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unsupported React Aria pressable style")
+        );
     }
 
     #[test]
     fn websocket_csp_rejects_untrusted_authorities_and_preserves_ipv6_ports() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("index.html"), "<main>client</main>").unwrap();
-        let runtime = web(ClientWebConfig {
-            static_dir: Some(root.path().into()),
-            ..Default::default()
-        }, None);
+        let runtime = web(
+            ClientWebConfig {
+                static_dir: Some(root.path().into()),
+                ..Default::default()
+            },
+            None,
+        );
         let security = runtime.security.as_ref().unwrap();
-        for authority in [None, Some("gateway;script-src *"), Some("user@gateway"), Some("*.example"), Some("gateway:443/elsewhere")] {
+        for authority in [
+            None,
+            Some("gateway;script-src *"),
+            Some("user@gateway"),
+            Some("*.example"),
+            Some("gateway:443/elsewhere"),
+        ] {
             let policy = security.csp(authority);
             assert!(policy.to_str().unwrap().contains("connect-src 'self';"));
         }
         let policy = security.csp(Some("[::1]:8443"));
-        assert!(policy.to_str().unwrap().contains("connect-src 'self' ws://[::1]:8443 wss://[::1]:8443;"));
+        assert!(
+            policy
+                .to_str()
+                .unwrap()
+                .contains("connect-src 'self' ws://[::1]:8443 wss://[::1]:8443;")
+        );
         assert!(policy.to_str().unwrap().contains("style-src 'self';"));
     }
 
@@ -1412,5 +1593,4 @@ mod tests {
         }
         assert_eq!(traceparent_query(None), None);
     }
-
 }

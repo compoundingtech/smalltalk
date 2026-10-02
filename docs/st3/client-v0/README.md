@@ -144,6 +144,34 @@ using the same expiry, revocation, actor and scopes as native bearers. The serve
 echoes only the normal stream protocol, never the credential. An explicit Authorization header
 retains precedence. Redact this credential protocol from reverse-proxy handshake logs.
 
+The gateway sends this CSP on bundle responses, including HEAD, SPA fallbacks and errors:
+
+```text
+default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'none';
+connect-src 'self' ws://GATEWAY_AUTHORITY wss://GATEWAY_AUTHORITY;
+img-src 'self' data:; font-src 'self'; manifest-src 'self'; worker-src 'self';
+base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'
+```
+
+`GATEWAY_AUTHORITY` is the validated request authority, including its port. Explicit WebSocket
+sources avoid browsers' inconsistent treatment of `'self'` for socket schemes; neither source
+allows another host or a wildcard. There are no inline/eval script allowances or third-party
+scripts. Inline scripts and inline style attributes are blocked. For React Aria's
+`react-aria-pressable-style`, `style-src` additionally contains the SHA256 hash of its exact
+known touch-action template, derived from the installed JavaScript. Unrecognized representations
+fail startup instead of relaxing CSP; externalize the style for other React Aria builds.
+
+At startup the gateway parses every installed HTML document, rejects external, missing or escaping
+script/style references and base overrides, and computes SHA384 `integrity` attributes on script,
+stylesheet, script/style preload and modulepreload tags. Asset URLs become mount-absolute paths
+so deep SPA routes retain the same resolution. Every built `.js`/`.mjs` chunk receives an
+integrity-bearing modulepreload before entry execution. This eagerly fetches chunks and requires
+native modulepreload support. Bundle CSS must be flattened, and module imports must use ordinary
+built chunk paths without runtime-added query variants: browsers cannot apply HTML SRI metadata
+to arbitrary runtime-created loads or CSS `@import` subrequests. HTML is cached with these pinned
+hashes until daemon restart; changing an asset in place then fails browser integrity checks.
+Deploy the directory as a complete immutable build and restart to regenerate security metadata.
+
 The two usage GET relays are `/v1/client/usage/quota` and `/v1/client/usage/history?account=ACCOUNT`.
 Only `/api/v1/quota` and `/api/v1/lens/usage_over_time` on the configured upstream are contacted;
 history pins `window=all`, `group_by=account`, `bucket=day` and the requested account as `group`.
