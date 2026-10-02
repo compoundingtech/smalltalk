@@ -11,6 +11,7 @@ import { tokenColor, type ConversationRules } from '../conversationStyle';
 import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
 import { rememberBounded } from '../boundedCache';
 import { simplify, type SimpleRow } from '../conversationSimple';
+import { dictationAvailable, startDictation } from '../modules/st-dictation';
 import { sessionPerson } from '../homeView';
 import type { RootScreen } from '../navigation';
 import { applyConversation, isUnresolved, type Conversation } from '../sessionView';
@@ -60,6 +61,12 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const [findOpen, setFinding] = useState(false);
   const [draft, setDraft] = useState(() => draftCache.current.get(target) ?? '');
   const [away, setAway] = useState(false);
+  // Dictation: listening, what is heard so far, the microphone's recent levels for a waveform,
+  // and whether the draft came from dictation (it is sent tagged so, as it may hold mistakes).
+  const [listening, setListening] = useState(false), [heard, setHeard] = useState(''), [levels, setLevels] = useState<number[]>([]);
+  const [dictated, setDictated] = useState(false);
+  const stopListening = useRef<(() => Promise<string>) | null>(null);
+  const canDictate = useMemo(() => dictationAvailable(), []);
   // How far from the newest entry the list is scrolled (it is inverted: 0 is the newest).
   const offset = useRef(0);
   const list = useRef<FlatList<Row>>(null);
@@ -159,9 +166,32 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     // To the newest, where the message appears: animated from nearby, a jump from far up, since an
     // animation across the whole conversation reads as the list scrolling everything again.
     list.current?.scrollToOffset({ offset: 0, animated: offset.current < 1200 });
-    const failed = await actions.send(agent.id, text, agent.current_session_id ?? undefined);
+    const tags = dictated ? ['dictated'] : undefined;
+    setDictated(false);
+    const failed = await actions.send(agent.id, text, agent.current_session_id ?? undefined, tags);
     if (failed) setPending(previous => previous.map(candidate => candidate.id === item.id ? { ...candidate, failed } : candidate));
     else setTimeout(() => setPending(previous => previous.filter(candidate => candidate.id !== item.id)), 60_000);
+  }
+  async function listen() {
+    setHeard(''); setLevels([]);
+    try {
+      stopListening.current = await startDictation({
+        onText: setHeard,
+        onLevel: level => setLevels(previous => [...previous.slice(-39), level]),
+        onError: message => setIssue(`Dictation stopped: ${message}`),
+      });
+      setListening(true);
+    } catch (error) { setIssue(`Dictation could not start: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  async function finishListening(keep: boolean) {
+    const stop = stopListening.current;
+    stopListening.current = null;
+    setListening(false);
+    const words = stop ? (await stop()).trim() : '';
+    if (!keep || !words) return;
+    const text = draft.trim() ? `${draft.trimEnd()} ${words}` : words;
+    setDraft(text); rememberBounded(draftCache.current, target, text, 24);
+    setDictated(true);
   }
   const toggle = useCallback((id: string) => setOpen(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; }), []);
 
@@ -195,7 +225,14 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       contentContainerStyle={{ paddingVertical: 8 }}
     />
     {away ? <Pressable accessibilityRole="button" accessibilityLabel="Scroll to latest" style={styles.latest} onPress={() => list.current?.scrollToOffset({ offset: 0, animated: true })}><T bold color={theme.accent}>↓ latest</T></Pressable> : null}
-    {agent ? <View style={[styles.composer, { paddingBottom: bottom }]}>
+    {agent && listening ? <View style={[styles.composer, { paddingBottom: bottom, flexDirection: 'column', alignItems: 'stretch' }]}>
+      <Waveform levels={levels} />
+      <T color={heard ? theme.text : theme.overlay0}>{heard || 'Listening…'}</T>
+      <View style={{ flexDirection: 'row', gap: 8, justifyContent: 'flex-end' }}>
+        <Button label="cancel" color={theme.overlay1} onPress={() => void finishListening(false)} />
+        <Button label="done" onPress={() => void finishListening(true)} />
+      </View>
+    </View> : agent ? <View style={[styles.composer, { paddingBottom: bottom }]}>
       <T color={theme.accent} style={styles.prompt}>›</T>
       <Field
         value={draft}
@@ -206,6 +243,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
         editable
         accessibilityLabel={`Message ${title}`}
       />
+      {canDictate ? <Button label="mic" color={theme.overlay1} onPress={() => void listen()} style={styles.send} /> : null}
       <Button label="send" disabled={!canSend || !draft.trim()} onPress={() => void send()} style={styles.send} />
     </View> : session ? <View style={[styles.composer, { paddingBottom: bottom }]}><T dim>{session.managed === false ? 'not started by st · read only' : 'this session has ended · read only'}</T></View> : null}
   </KeyboardAvoidingView>;
@@ -271,6 +309,14 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
     }
   }
 });
+
+/** The microphone's last few levels as bars, newest on the right. */
+function Waveform({ levels }: { levels: number[] }) {
+  const bars = [...Array(Math.max(0, 40 - levels.length)).fill(0), ...levels];
+  return <View style={{ flexDirection: 'row', alignItems: 'center', height: 32, gap: 2 }}>
+    {bars.map((level, index) => <View key={index} style={{ flex: 1, height: 3 + level * 28, borderRadius: 2, backgroundColor: theme.accent, opacity: 0.4 + level * 0.6 }} />)}
+  </View>;
+}
 
 type Tool = Extract<ConversationEntry['body'], { kind: 'tool' }>;
 
