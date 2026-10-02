@@ -1410,7 +1410,7 @@
             "type": { "const": "message.send" },
             "parameters": {
               "type": "object", "additionalProperties": false, "required": ["to", "content"],
-              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true } }
+              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "signature": { "$ref": "#/$defs/DeviceSignature" } }
             }
           }
         },
@@ -1662,7 +1662,8 @@
       "properties": {
         "api_version": { "const": "st3.client.v0" },
         "code": { "type": "string", "pattern": "^[A-Z2-9]{8}$" },
-        "device_public_key": { "type": "string", "minLength": 32 }
+        "device_public_key": { "type": "string", "minLength": 32 },
+        "key_storage": { "enum": ["secure-enclave", "software"] }
       }
     },
     "PairedSession": {
@@ -1676,7 +1677,23 @@
         "session_actor": { "$ref": "#/$defs/Id" },
         "credential": { "type": "string", "minLength": 32 },
         "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-        "expires_at": { "$ref": "#/$defs/Timestamp" }
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "device_key_chain": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "DeviceSignature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signer", "key", "chain", "nonce", "signed_at_unix_ms", "signature", "format", "signed_fields"],
+      "properties": {
+        "signer": { "type": "string", "pattern": "^person/[^/]+$" },
+        "key": { "type": "string" },
+        "chain": { "type": "array", "items": { "type": "string" } },
+        "nonce": { "type": "string", "minLength": 16 },
+        "signed_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "signature": { "type": "string" },
+        "format": { "const": "fields-v1" },
+        "signed_fields": { "type": "array", "items": { "type": "string" } }
       }
     },
     "TerminalLine": {

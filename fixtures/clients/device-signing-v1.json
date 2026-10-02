@@ -1,0 +1,81 @@
+{
+  "format": "fields-v1",
+  "about": "Test vectors for device signing (docs/st3/device-signing.md). The key is test-only.",
+  "key_pkcs8_hex": "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104200d66531918bd906e9596cd1df3d6a73dfbdf710fb9cb9a4821ea708a463e5b98a14403420004554271887db66916dbb98a8f1c9841a0418a1902bbf84dc442331f9d5816d9e80402fb3dd41cd4374535efb3ca5f022fb454d71e3d6c94f01db15e6354f2302f",
+  "cases": [
+    {
+      "name": "plain",
+      "idempotency_key": "vector-message-plain",
+      "subject": "message/21772b5b2279c4db",
+      "kind": "message.sent",
+      "actor": "person/avery",
+      "fields": {
+        "content": "on my way",
+        "from": "person/avery",
+        "in_reply_to": null,
+        "session_id": null,
+        "tags": [],
+        "title": null,
+        "to": "agent/alder"
+      },
+      "signed_fields": [
+        "content",
+        "from",
+        "in_reply_to",
+        "session_id",
+        "tags",
+        "title",
+        "to"
+      ],
+      "signer": "person/avery",
+      "key": "p256:BFVCcYh9tmkW27mKjxyYQaBBihkCu_hNxEIzH51YFtnoBAL7PdQc1DdFNe-zyl8CL7RU1x49bJTwHbFeY1TyMC8",
+      "chain": [
+        "4f6b8a0d2c1e3f5a7b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a",
+        "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d"
+      ],
+      "nonce": "vector-nonce-plain-00",
+      "signed_at_unix_ms": 1791000000000,
+      "signed_bytes": "smallclaims-claim-fields-v1\nmessage/21772b5b2279c4db\nmessage.sent\nperson/avery\ncontent=\"on my way\"\nfrom=\"person/avery\"\nin_reply_to=null\nsession_id=null\ntags=[]\ntitle=null\nto=\"agent/alder\"\nperson/avery\n\np256:BFVCcYh9tmkW27mKjxyYQaBBihkCu_hNxEIzH51YFtnoBAL7PdQc1DdFNe-zyl8CL7RU1x49bJTwHbFeY1TyMC8\n4f6b8a0d2c1e3f5a7b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a,9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d\nvector-nonce-plain-00\n1791000000000",
+      "signature": "-vcTclZXxhR5AZEGuyxzmR5yzzyqf_gbHRSDqdHmW0PRNAw2gNI3kAO0hHYEEgPTLQPkMFwyYB24wtTmKJ_cQg"
+    },
+    {
+      "name": "escapes",
+      "idempotency_key": "vector-message-escapes",
+      "subject": "message/09b8b915950a8a24",
+      "kind": "message.sent",
+      "actor": "person/avery",
+      "fields": {
+        "content": "a/b \"quoted\"\nnext line 🎉 naïve Ωmega\ttab \\ back",
+        "from": "person/avery",
+        "in_reply_to": null,
+        "session_id": "session/phone-1",
+        "tags": [
+          "dictated",
+          "zeta",
+          "alpha"
+        ],
+        "title": "Ünïcödé title",
+        "to": "person/robin"
+      },
+      "signed_fields": [
+        "content",
+        "from",
+        "in_reply_to",
+        "session_id",
+        "tags",
+        "title",
+        "to"
+      ],
+      "signer": "person/avery",
+      "key": "p256:BFVCcYh9tmkW27mKjxyYQaBBihkCu_hNxEIzH51YFtnoBAL7PdQc1DdFNe-zyl8CL7RU1x49bJTwHbFeY1TyMC8",
+      "chain": [
+        "4f6b8a0d2c1e3f5a7b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a",
+        "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d"
+      ],
+      "nonce": "vector-nonce-escapes-00",
+      "signed_at_unix_ms": 1791000000000,
+      "signed_bytes": "smallclaims-claim-fields-v1\nmessage/09b8b915950a8a24\nmessage.sent\nperson/avery\ncontent=\"a/b \\\"quoted\\\"\\nnext line 🎉 naïve Ωmega\\ttab \\\\ back\"\nfrom=\"person/avery\"\nin_reply_to=null\nsession_id=\"session/phone-1\"\ntags=[\"dictated\",\"zeta\",\"alpha\"]\ntitle=\"Ünïcödé title\"\nto=\"person/robin\"\nperson/avery\n\np256:BFVCcYh9tmkW27mKjxyYQaBBihkCu_hNxEIzH51YFtnoBAL7PdQc1DdFNe-zyl8CL7RU1x49bJTwHbFeY1TyMC8\n4f6b8a0d2c1e3f5a7b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a,9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d\nvector-nonce-escapes-00\n1791000000000",
+      "signature": "G6HsJ5N57Lham3RfFdDvnybUwys3do7EkP_P8EjhVD0PDbY8ogkdpSdDcrVWLf8IBcl0nf2Dl0tvpOQWNMGjMg"
+    }
+  ]
+}
