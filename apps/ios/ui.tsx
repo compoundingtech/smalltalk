@@ -50,8 +50,10 @@ export function Button({ label, onPress, disabled = false, color = theme.accent,
   </Pressable>;
 }
 
+/** A text input. Prose (messages, titles, requests) gets iOS's autocorrect and spell check;
+ *  a field for an identifier (a URL, a code, a path) turns them off. */
 export function Field(props: TextInputProps) {
-  return <TextInput placeholderTextColor={theme.overlay0} autoCorrect={false} {...props} style={[styles.field, props.multiline && styles.fieldMultiline, props.style]} />;
+  return <TextInput placeholderTextColor={theme.overlay0} autoCorrect spellCheck {...props} style={[styles.field, props.multiline && styles.fieldMultiline, props.style]} />;
 }
 
 /** A banner under the header: a problem to read, tap to dismiss when it can be. */

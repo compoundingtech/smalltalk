@@ -87,13 +87,13 @@ export function PairScreen() {
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, paddingBottom: 48 }} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
       <T soft>Use the paired-only gateway: its HTTPS URL; http:// with the host's Tailscale address (100.x.y.z), which Tailscale encrypts; or http:// with its .local name or private LAN address, which is not encrypted. Begin pairing on a trusted st machine, then enter its short-lived ID and code.</T>
-      <Field autoCapitalize="none" keyboardType="url" placeholder="https://gateway, http://100.x.y.z:port, or http://host.local:port" value={urlDraft} onChangeText={setUrlDraft} />
+      <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} keyboardType="url" placeholder="https://gateway, http://100.x.y.z:port, or http://host.local:port" value={urlDraft} onChangeText={setUrlDraft} />
       {gatewayTransport(urlDraft) === 'lan' ? <T color={theme.waiting}>{LAN_HTTP_WARNING}</T> : null}
       <Button label="save gateway" onPress={() => void actions.saveUrl()} />
       {url ? <>
         <SectionHeader title="pair" />
-        <Field autoCapitalize="none" placeholder="pairing ID" value={id} onChangeText={setId} />
-        <Field autoCapitalize="none" placeholder="pairing code" value={code} onChangeText={setCode} />
+        <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="pairing ID" value={id} onChangeText={setId} />
+        <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="pairing code" value={code} onChangeText={setCode} />
         <Button label="pair this device" disabled={busy} onPress={() => void actions.pair(id, code).then(done => { if (done) { setId(''); setCode(''); } })} />
       </> : null}
     </ScrollView>
