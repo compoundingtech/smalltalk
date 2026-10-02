@@ -42,3 +42,14 @@ assert.deepEqual(shown.map(row => row.tabs.map(tab => [tab.group, tab.title, tab
   [[1, 'Audit', true], [1, 'hosts', false]],
 ]);
 assert.deepEqual(glassGroups(glass('1', 'main', group()), lists), [{ index: 0, tabs: [] }], 'a glass may be Home alone');
+
+// A shell opens in the terminal and a usage tab in Usage; a space says what it holds.
+{
+  const { paneTarget, spaceSummary } = await import('./glassesView.ts');
+  const lists = { agents: [], missions: [], attention: [], machines: [] };
+  assert.deepEqual([paneTarget('terminal:terminal/pty/person/robin/abc', lists).kind, paneTarget('usage:agent/x', lists).kind], ['terminal', 'usage']);
+  assert.equal(paneTarget('terminal:agent/example/harbor/keeper', lists).kind, 'agent');
+  const glass = { id: 'glass/person/robin/1', revision: 'r', body: { name: 'main', layout: { split: 'right', children: [{ tabs: [{ pane: 'agent:agent/a' }, { pane: 'mission:mission/m' }] }, { tabs: [{ pane: 'usage:' }] }] } } };
+  assert.equal(spaceSummary(glass), '3 tabs in 2 panes');
+  assert.equal(spaceSummary({ ...glass, body: { name: 'one', layout: { tabs: [{ pane: 'agent:agent/a' }] } } }), '1 tab');
+}
