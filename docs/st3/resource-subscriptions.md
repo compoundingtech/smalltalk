@@ -246,7 +246,7 @@ subscription "pull-request-reviews" {
 subscription "mentions" {
   observer "observer/repository"
   on "mentions"
-  mention "orchid-login" "person/orchid"
+  mention "orchid-login" "person/robin"
   delivery "person" { owner "message" }
 }
 ```

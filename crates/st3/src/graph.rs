@@ -5975,8 +5975,8 @@ observer "github" {{ resource "resource/repo"; provider "github.repository"; loc
 }
 subscription "mentions" {
   observer "observer/github"; on "mentions"
-  mention "orchid" "person/orchid"
-  mention "fern" "person/fern"
+  mention "orchid" "person/robin"
+  mention "fern" "person/lichen"
   delivery "person" { owner "message" }
 }"#,
             ),
@@ -5993,8 +5993,8 @@ subscription "mentions" {
         assert_eq!(
             mentions.mentions,
             [
-                ("orchid".to_owned(), "person/orchid".to_owned()),
-                ("fern".to_owned(), "person/fern".to_owned()),
+                ("orchid".to_owned(), "person/robin".to_owned()),
+                ("fern".to_owned(), "person/lichen".to_owned()),
             ]
         );
         for (subscription, code) in [
@@ -6003,7 +6003,7 @@ subscription "mentions" {
                 "invalid-person-delivery",
             ),
             (
-                r#"subscription "s" { observer "observer/github"; on "pull_requests"; mention "orchid" "person/orchid"; delivery "person" }"#,
+                r#"subscription "s" { observer "observer/github"; on "pull_requests"; mention "orchid" "person/robin"; delivery "person" }"#,
                 "invalid-subscription-mention",
             ),
             (
@@ -6011,11 +6011,11 @@ subscription "mentions" {
                 "invalid-subscription-mention",
             ),
             (
-                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid" "person/a"; mention "Orchid" "person/b"; delivery "person" }"#,
+                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid" "person/one"; mention "Orchid" "person/two"; delivery "person" }"#,
                 "duplicate-subscription-mention",
             ),
             (
-                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid" "person/orchid"; delivery "person" { owner "person" } }"#,
+                r#"subscription "s" { observer "observer/github"; on "mentions"; mention "orchid" "person/robin"; delivery "person" { owner "person" } }"#,
                 "invalid-owner-route",
             ),
         ] {

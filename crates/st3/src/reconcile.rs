@@ -23260,8 +23260,8 @@ subscription "reviews" {{
 }}
 subscription "mentions" {{
   observer "observer/repo"; on "mentions"
-  mention "orchid" "person/orchid"
-  mention "fern" "person/fern"
+  mention "orchid" "person/robin"
+  mention "fern" "person/lichen"
   delivery "person" {{ owner "message" }}
 }}"#
             ),
@@ -23415,7 +23415,7 @@ subscription "mentions" {{
         assert_eq!(
             asks(),
             [(
-                "person/orchid".to_owned(),
+                "person/robin".to_owned(),
                 "fern mentioned @orchid on #3: Pull 3".to_owned()
             )]
         );
