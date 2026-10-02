@@ -93,7 +93,20 @@ enum Drop {
 }
 
 /// The sidebar's sections, what the number keys were in the old stui.
-pub(crate) const SIDEBAR_SECTIONS: [&str; 5] = ["Home", "Agents", "Missions", "Fleet", "Usage"];
+/// The sidebar's sections, by the tab whose list each shows. Home is not one: it opens from
+/// the status line's ⌂ and "need you", over the glass.
+pub(crate) const SIDEBAR_SECTIONS: [(usize, &str); 4] =
+    [(1, "Agents"), (2, "Missions"), (3, "Fleet"), (4, "Usage")];
+
+/// The section `step` places along from `section`, wrapping.
+fn sidebar_step(section: usize, step: isize) -> usize {
+    let count = SIDEBAR_SECTIONS.len() as isize;
+    let at = SIDEBAR_SECTIONS
+        .iter()
+        .position(|(tab, _)| *tab == section)
+        .unwrap_or(0) as isize;
+    SIDEBAR_SECTIONS[(at + step).rem_euclid(count) as usize].0
+}
 
 /// The Ctrl+S sidebar. It keeps its section and each section's selection while hidden.
 #[derive(Clone, Debug)]
@@ -320,7 +333,7 @@ impl Glasses {
         let stored = store.as_deref().map(glass_store::load).unwrap_or_default();
         // A device that never chose shows the sidebar, as the old stui's list always was.
         let sidebar = Sidebar {
-            shown: stored.sidebar.unwrap_or(store.is_some()),
+            shown: stored.sidebar.unwrap_or(false),
             ..Sidebar::default()
         };
         let mut all = stored
@@ -915,15 +928,7 @@ impl Ui {
         let mut spans = vec![Span::raw(" ")];
         let names = SIDEBAR_SECTIONS
             .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                let count = self.world.attention.items().len();
-                if index == 0 && count > 0 {
-                    format!("{name} ◆{count}")
-                } else {
-                    name.to_string()
-                }
-            })
+            .map(|(_, name)| name.to_string())
             .collect::<Vec<_>>();
         // Each section padded when they all fit; in a narrow sidebar only the chosen one is.
         let roomy = 1 + names
@@ -931,10 +936,13 @@ impl Ui {
             .map(|name| text::width(name) + 2)
             .sum::<usize>()
             <= area.width as usize;
-        for (index, name) in names.iter().enumerate() {
+        for (position, name) in names.iter().enumerate() {
+            let index = SIDEBAR_SECTIONS[position].0;
             let label = if roomy || index == sidebar.section {
                 format!(" {name} ")
-            } else if index + 1 == sidebar.section {
+            } else if SIDEBAR_SECTIONS.get(position + 1).map(|(tab, _)| *tab)
+                == Some(sidebar.section)
+            {
                 name.clone()
             } else {
                 format!("{name} ")
@@ -1406,14 +1414,10 @@ impl Ui {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
         };
+        // Ctrl+S shows and hides it, nothing else: shown, it has the keys; hidden, the splits do.
         let sidebar = &mut glasses.sidebar;
-        if sidebar.shown && sidebar.focused {
-            sidebar.shown = false;
-            sidebar.focused = false;
-        } else {
-            sidebar.shown = true;
-            sidebar.focused = true;
-        }
+        sidebar.shown = !sidebar.shown;
+        sidebar.focused = sidebar.shown;
         glasses.save();
     }
 
@@ -1459,24 +1463,19 @@ impl Ui {
                 sidebar.shown = false;
                 sidebar.focused = false;
             }
-            KeyCode::Esc => {
-                sidebar.shown = false;
-                sidebar.focused = false;
-            }
+            // Esc and Alt+→ give the keys back to the splits and leave the sidebar showing.
+            KeyCode::Esc => sidebar.focused = false,
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => sidebar.focused = false,
             KeyCode::Up | KeyCode::Char('k') if !control => *selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') if !control => {
                 *selected = (*selected + 1).min(count.saturating_sub(1))
             }
             KeyCode::Home if !control => *selected = 0,
             KeyCode::End if !control => *selected = count.saturating_sub(1),
-            KeyCode::Left | KeyCode::BackTab => {
-                sidebar.section = (section + SIDEBAR_SECTIONS.len() - 1) % SIDEBAR_SECTIONS.len()
-            }
-            KeyCode::Right | KeyCode::Tab => {
-                sidebar.section = (section + 1) % SIDEBAR_SECTIONS.len()
-            }
-            KeyCode::Char(digit @ '1'..='5') if !control => {
-                sidebar.section = digit as usize - '1' as usize
+            KeyCode::Left | KeyCode::BackTab => sidebar.section = sidebar_step(section, -1),
+            KeyCode::Right | KeyCode::Tab => sidebar.section = sidebar_step(section, 1),
+            KeyCode::Char(digit @ '1'..='4') if !control => {
+                sidebar.section = SIDEBAR_SECTIONS[digit as usize - '1' as usize].0
             }
             KeyCode::Char('b') if section == 4 && !control => self.usage_by_next(),
             KeyCode::Char('p') if section == 4 && !control => self.usage_period_next(),
@@ -2863,6 +2862,12 @@ impl Ui {
             .map(|(index, _)| index);
         if let Some(index) = best {
             self.focus_group(index);
+        } else if direction == KeyCode::Left
+            && let Some(glasses) = self.glasses.as_mut()
+            && glasses.sidebar.shown
+        {
+            // Left of the leftmost split is the sidebar, when it shows.
+            glasses.sidebar.focused = true;
         }
     }
 
@@ -3519,7 +3524,7 @@ mod tests {
         let mut ui = glass();
         assert_eq!(ui.usage_wanted(), None, "nothing shows usage yet");
         ctrl(&mut ui, 's');
-        press(&mut ui, KeyCode::Char('5'), KeyModifiers::NONE);
+        press(&mut ui, KeyCode::Char('4'), KeyModifiers::NONE);
         assert_eq!(ui.usage_wanted(), Some(24));
         press(&mut ui, KeyCode::Char('b'), KeyModifiers::NONE);
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
@@ -3546,9 +3551,13 @@ mod tests {
         let sidebar = |ui: &Ui| ui.glasses.as_ref().unwrap().sidebar.clone();
         assert!(sidebar(&ui).shown && sidebar(&ui).focused);
         let shown = screen(&ui);
-        for section in SIDEBAR_SECTIONS {
+        for (_, section) in SIDEBAR_SECTIONS {
             assert!(shown.contains(section), "{shown}");
         }
+        assert!(
+            !shown.contains(" Home "),
+            "Home opens from the status line: {shown}"
+        );
         // Agents first; the arrows move, Enter opens the selection as a tab and gives the keys
         // back to the glass, with the sidebar still shown.
         let agents = ui.listing_for(1, 40).ids;
@@ -3559,13 +3568,15 @@ mod tests {
         typed(&mut ui, "c");
         assert!(ui.editing, "keys reach the opened pane");
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
-        // Ctrl+S takes the keys again, then hides it; shown again it remembers where it was.
-        ctrl(&mut ui, 's');
+        // Alt+← from the leftmost split takes the keys back to it; Ctrl+S only shows and hides,
+        // and shown again it remembers where it was.
+        press(&mut ui, KeyCode::Left, KeyModifiers::ALT);
         assert!(sidebar(&ui).focused);
         press(&mut ui, KeyCode::Right, KeyModifiers::NONE);
         ctrl(&mut ui, 's');
         assert!(!sidebar(&ui).shown);
         ctrl(&mut ui, 's');
+        assert!(sidebar(&ui).shown && sidebar(&ui).focused);
         assert_eq!((sidebar(&ui).section, sidebar(&ui).selected[1]), (2, 1));
         // A mission opens as a tab beside the agent; opening never replaces it.
         let missions = ui.listing_for(2, 40).ids;
@@ -3577,9 +3588,14 @@ mod tests {
                 format!("mission:{}", missions[0])
             ]]
         );
-        // Esc hides it; the glass's keys work again.
-        ctrl(&mut ui, 's');
+        // Esc and Alt+→ give the keys back and leave it showing; Ctrl+S hides it.
+        press(&mut ui, KeyCode::Left, KeyModifiers::ALT);
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(sidebar(&ui).shown && !sidebar(&ui).focused);
+        press(&mut ui, KeyCode::Left, KeyModifiers::ALT);
+        press(&mut ui, KeyCode::Right, KeyModifiers::ALT);
+        assert!(sidebar(&ui).shown && !sidebar(&ui).focused);
+        ctrl(&mut ui, 's');
         assert!(!sidebar(&ui).shown);
         assert!(!screen(&ui).contains(" Fleet "));
     }
