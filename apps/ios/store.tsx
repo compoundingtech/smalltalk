@@ -3,7 +3,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, notApplied, plainError, retryTransient, type Attention, type Capabilities, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { isSnapshotChurn, listSessionPages, type Conversation, type SessionView } from './sessionView';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
 import { listCollectionPages } from './collectionPages';
@@ -14,6 +14,8 @@ import { ForegroundGate } from './foreground';
 import { gatewayFetch } from './gatewayFetch';
 import { normalizeGatewayUrl } from './gatewayUrl';
 import { tabOrder, type Tab } from './tabs';
+import { fetch as expoFetch } from 'expo/fetch';
+import { decodeBase64, encodeBase64, type Picked } from './images';
 
 // Everything the screens share: the paired gateway, the one collections socket, the lists it keeps
 // current, the lists a screen loads when it opens, and the actions. Screens follow a conversation
@@ -66,8 +68,12 @@ function useAppStore() {
   const [scrollRequest, setScrollRequest] = useState<{ y: number; at: number } | null>(null);
   const cachedActor = useRef(''), cacheSavedAt = useRef(0), cacheGeneration = useRef(0);
   const conversationCache = useRef(new Map<string, Conversation<TimelineEntry>>()), draftCache = useRef(new Map<string, string>());
+  // Images messages carry, as data URIs, so a conversation scrolled back to does not read them again.
+  const imageCache = useRef(new Map<string, Promise<string>>());
   const missionDetailCache = useRef(new Map<string, Mission>());
   const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch() }) : null, [url, credential]);
+  // Image bytes go up through Expo's fetch: React Native's cannot send a byte array as a body.
+  const uploader = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(expoFetch as unknown as typeof fetch) }) : null, [url, credential]);
 
   useEffect(() => { Promise.allSettled([AsyncStorage.getItem(URL_KEY), AsyncStorage.getItem(ORDER_KEY), SecureStore.getItemAsync(CREDENTIAL_KEY), AsyncStorage.getItem(PROJECTION_CACHE_KEY)]).then(([u, o, c, p]) => {
     if (u.status === 'fulfilled' && u.value) { setUrl(u.value); setUrlDraft(u.value); }
@@ -231,15 +237,38 @@ function useAppStore() {
       if (!client) return false;
       return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(answer ? { answer: { id: answer } } : {}) } }); });
     },
+    /** An image a message carries, as a data URI; st reads it from the member that has it. */
+    image(image: { sha256: string; message: string; mediaType: string }): Promise<string> {
+      const known = imageCache.current.get(image.sha256);
+      if (known) return known;
+      if (!client || status !== 'online') return Promise.reject(new Error(status === 'online' ? 'not connected' : 'offline'));
+      const reading = client.blob(image.sha256, image.message).then(bytes => `data:${image.mediaType};base64,${encodeBase64(bytes)}`);
+      // A failed read is tried again next time it is shown.
+      reading.catch(() => { if (imageCache.current.get(image.sha256) === reading) imageCache.current.delete(image.sha256); });
+      rememberBounded(imageCache.current, image.sha256, reading, 24);
+      return reading;
+    },
     /** Send Small Talk to an agent, as stui does: fenced to a fresh snapshot, once more if it moved. */
-    async send(to: string, content: string, sessionId?: string, tags?: string[]): Promise<string | null> {
-      if (!client) return 'not connected';
+    async send(to: string, content: string, sessionId?: string, tags?: string[], images: Picked[] = []): Promise<string | null> {
+      if (!client || !uploader) return 'not connected';
       if (status !== 'online') return 'offline';
+      // Images are kept on this member first; the message names them, and st fetches each from
+      // here for a reader on another machine (docs/st3/attachments.md).
+      const attachments: AttachmentInput[] = [];
+      for (const image of images) {
+        try {
+          const kept = (await uploader.uploadBlob(decodeBase64(image.base64), image.mediaType)).value;
+          attachments.push({ blob: kept.blob, media_type: image.mediaType, ...(image.name ? { name: image.name } : {}) });
+        } catch (e) {
+          if (e instanceof ClientError && e.status === 404) return 'the st this phone is paired with cannot carry images yet; it needs a newer st';
+          return `the image could not be sent: ${errorText(e)}`;
+        }
+      }
       try {
         // Each try is a new request on a fresh fence, made only after st said the last applied nothing.
         await retryTransient(8, async () => {
           const id = actionId();
-          await client.messageSend({ id, idempotency_key: id, fence: await fence(), parameters: { to, content, ...(sessionId ? { session_id: sessionId } : {}), ...(tags?.length ? { tags } : {}) } });
+          await client.messageSend({ id, idempotency_key: id, fence: await fence(), parameters: { to, content, ...(sessionId ? { session_id: sessionId } : {}), ...(tags?.length ? { tags } : {}), ...(attachments.length ? { attachments } : {}) } });
         }, notApplied);
         return null;
       } catch (e) { return errorText(e); }

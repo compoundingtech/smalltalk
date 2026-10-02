@@ -12,7 +12,7 @@ export type Body =
   | { kind: 'assistant'; text: string }
   | { kind: 'tool'; title: string; state: ToolState; output: string[] }
   /** `delivered`: the recipient's harness has it, seen in the agent's own transcript. */
-  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean }
+  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean; images?: MailImage[] }
   | { kind: 'event'; text: string; tone: 'quiet' | 'warning' | 'fault' };
 export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body };
 
@@ -230,6 +230,21 @@ export function unreadableTranscript(timeline: Entry[]): string | null {
  * One conversation as st joined it: the harness's turns and the agent's Small Talk, in time
  * order. `names` maps graph ids to what a person calls them; the viewer is `you`.
  */
+/** An image a message carries; its bytes are read from st by `sha256`, naming `message`. */
+export type MailImage = { sha256: string; message: string; mediaType: string; name?: string; size: number };
+
+function mailImages(message: Record<string, unknown>): MailImage[] {
+  const id = str(message.message_id) ?? '';
+  const list = Array.isArray(message.attachments) ? message.attachments : [];
+  return list.flatMap((item): MailImage[] => {
+    const attachment = item as Record<string, unknown>;
+    const sha256 = str(attachment.sha256), mediaType = str(attachment.media_type);
+    if (!sha256 || !mediaType?.startsWith('image/')) return [];
+    const name = str(attachment.name);
+    return [{ sha256, message: id, mediaType, ...(name ? { name } : {}), size: typeof attachment.size === 'number' ? attachment.size : 0 }];
+  });
+}
+
 export function conversationEntries(timeline: Entry[], names: Names): ConversationEntry[] {
   const name = (id: string): string => names.get(id) ?? (id === 'daemon/runtime' ? 'st' : id.startsWith('person/') ? id.slice('person/'.length) : short(id));
   const stamped: ConversationEntry[] = [];
@@ -257,14 +272,17 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
         push(entry, str(message.message_id)!, { kind: 'event', tone: 'quiet', text: str(message.title) ?? text.split('\n')[0] ?? '' });
       } else {
         const to = str(message.to);
+        const images = mailImages(message);
         push(entry, str(message.message_id)!, {
           kind: 'mail',
           from: !from && !to ? 'Small Talk' : name(from),
           to: !from && !to ? '' : name(to ?? ''),
           subject: str(message.title) ?? '',
-          text: text || '(notification)',
+          // A message may be only its images.
+          text: text || (images.length ? '' : '(notification)'),
           // Spoken, then transcribed: marked so a reader allows for transcription mistakes.
           ...(Array.isArray(message.tags) && message.tags.includes('dictated') ? { dictated: true } : {}),
+          ...(images.length ? { images } : {}),
         });
       }
       continue;
