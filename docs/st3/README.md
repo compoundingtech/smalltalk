@@ -25,6 +25,8 @@ Use these documents for implementation details:
   and tests their harnesses run, on Linux and macOS, and what needs root.
 - [Subagents](subagents.md) explains how st records the subagents a seat's harness runs as claims
   on the seat, with a lease, and ends them when their harness, session or seat goes away.
+- [Sekrets](sekrets.md) explains the opt-in gateway that runs any CLI with a credential no seat
+  can read: profiles, policies, grants, how it tells a seat from its person, and its sandbox.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits

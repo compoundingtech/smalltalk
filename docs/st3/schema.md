@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `39ea92840ada2c10bc57944de963d430bd95b3be42a50c3553eacdde2219572c`
+Digest: `310f65fb024b25335200da127609b8a22ccce34045ee5ab7a9b947cdb4c3019a`
 
 ## Subject families
 
@@ -38,6 +38,7 @@ Digest: `39ea92840ada2c10bc57944de963d430bd95b3be42a50c3553eacdde2219572c`
 | `rule` | `rule/NAME` | no | A permission rule, its mode, and the writes it audited. |
 | `run-generation` | `run-generation/ID` | no | An immutable mission-run generation. |
 | `schedule` | `schedule/RUN/LOCAL_ID` | no | A mission-run schedule. |
+| `sekret` | `sekret/HOST or sekret/HOST/OWNER/NAME` | no | A host's sekrets gateway, or one of its profiles: calls run with a credential the caller never reads. |
 | `step-run` | `step-run/GENERATION/PATH` | no | One step attempt lineage. |
 | `subscription` | `subscription/RUN/LOCAL_ID` | no | A mission-run observer subscription. |
 
@@ -158,6 +159,10 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `schedule.work-failed` | `schedule` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `request!:string` | `schedule` |
 | `schedule.work-requested` | `schedule` | `system-only` | `append` | `durable` | `inputs!:object`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `occurrence!:integer`, `revision!:string`, `workspace!:string` | `schedule` |
 | `schedule.work-started` | `schedule` | `system-only` | `append` | `durable` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `schedule` |
+| `sekret.called` | `sekret` | `system-only` | `append` | `durable` | `argv:array`, `at_unix_ms!:integer`, `caller!:subject-reference(agent|person)`, `cwd:string`, `grant:string`, `login:boolean`, `person!:subject-reference(person)`, `profile!:string`, `seq!:integer`, `tty:boolean` |  |
+| `sekret.changed` | `sekret` | `system-only` | `append` | `durable` | `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `change!:string`, `detail:object`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer` |  |
+| `sekret.exited` | `sekret` | `system-only` | `append` | `durable` | `at_unix_ms!:integer`, `call!:integer`, `caller:subject-reference(agent|person)`, `error:string`, `exit_code:integer`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer`, `signal:integer` |  |
+| `sekret.refused` | `sekret` | `system-only` | `append` | `durable` | `argv:array`, `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `person!:subject-reference(person)`, `profile:string`, `reason!:string`, `seq!:integer` |  |
 | `step-run.carried` | `step-run` | `system-only` | `once` | `durable` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |
 | `step-run.retried` | `step-run` | `system-only` | `append` | `durable` | `attempt:integer`, `goals:array`, `not_before_unix_ms:integer`, `reason:string`, `status:string` | `step` |
 | `step-run.state` | `step-run` | `system-only` | `state-transition` | `durable` | `attempt:integer`, `readiness_epoch:integer`, `reason:string`, `status:string` | `step` |
