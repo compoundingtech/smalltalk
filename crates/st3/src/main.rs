@@ -13991,14 +13991,14 @@ fn pi_family_message_frame(message: &st3::model::MessageView, body: &str, identi
     json!({
         "type": "message",
         "deliverAs": "steer",
-        "content": st_drivers::ding::st3_notification_text(
+        "content": st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_text(
             &message.subject,
             &message.from,
             &message.to,
             message.title.as_deref(),
             body,
             &st_drivers::ding::st3_body_sha256(body),
-        ),
+        ), &message.tags),
         "meta": {
             "from": message.from,
             "messageId": message.subject,

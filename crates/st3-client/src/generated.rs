@@ -1242,7 +1242,7 @@ pub enum TimelineType {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TimelineBody {
-    Message(TimelineMessageBody),
+    Message(Box<TimelineMessageBody>),
     Content(TimelineContentBody),
     ToolCall(TimelineToolCallBody),
     ToolResult(TimelineToolResultBody),
@@ -1276,7 +1276,7 @@ impl<'de> Deserialize<'de> for TimelineBody {
 
         let tagged = TaggedBody::deserialize(deserializer)?;
         match tagged.entry_type.as_str() {
-            "message" => decode(tagged.body).map(Self::Message),
+            "message" => decode(tagged.body).map(|body| Self::Message(Box::new(body))),
             "content" => decode(tagged.body).map(Self::Content),
             "tool_call" => decode(tagged.body).map(Self::ToolCall),
             "tool_result" => decode(tagged.body).map(Self::ToolResult),
@@ -1375,6 +1375,8 @@ pub struct TimelineMessageBody {
     pub to: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

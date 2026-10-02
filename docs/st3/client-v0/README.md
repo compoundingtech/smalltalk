@@ -830,3 +830,7 @@ for its crash boundary.
 
 Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and Swift expose
 `agentCreate`, `terminalCreate`, `terminalEnd` with generated typed parameter bodies.
+
+Messages tagged `dictated` carry a delivery-only line explaining that voice transcription may
+contain mistakes. The stored text and body digest stay unchanged. Timeline message bodies carry
+the message's optional `tags` array so clients can mark dictation without inspecting its text.
