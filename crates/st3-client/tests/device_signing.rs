@@ -188,6 +188,7 @@ async fn send(
                 in_reply_to: None,
                 session_id: None,
                 tags: vec![],
+                attachments: Vec::new(),
                 signature: Some(signature),
             },
         )

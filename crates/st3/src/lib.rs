@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod archive;
+pub mod blobs;
 pub mod boot;
 pub(crate) mod checkout;
 pub mod claude_channel;

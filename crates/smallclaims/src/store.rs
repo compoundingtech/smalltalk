@@ -137,6 +137,17 @@ CREATE TABLE IF NOT EXISTS local_blobs (
     size INTEGER NOT NULL
 );
 
+-- Who uploaded an attachment file the daemon holds outside the graph, for the per-actor quota and
+-- for who may fetch it before a message names it. Local only: never replicated, in no digest.
+CREATE TABLE IF NOT EXISTS local_blob_uploads (
+    hash TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    uploaded_ms INTEGER NOT NULL,
+    PRIMARY KEY(hash, actor)
+);
+
 CREATE TABLE IF NOT EXISTS documents (
     name TEXT NOT NULL,
     hash TEXT NOT NULL REFERENCES blobs(hash),
@@ -4347,6 +4358,80 @@ impl Store {
             params![hash, bytes, bytes.len() as u64],
         )?;
         Ok(hash)
+    }
+
+    /// Record that `actor` uploaded `size` bytes of `hash`, for the per-actor quota and for who
+    /// may fetch them before a message names them. Rows older than `ttl_ms` are dropped first.
+    /// The same bytes uploaded again by the same actor cost nothing. The bytes themselves are
+    /// not here: they are files the daemon owns, and never part of replication.
+    pub fn record_blob_upload(
+        &self,
+        actor: &str,
+        hash: &str,
+        media_type: &str,
+        size: u64,
+        quota: u64,
+        ttl_ms: u64,
+    ) -> Result<(), St3Error> {
+        let now = now_ms() as u64;
+        let connection = self.connection.write();
+        let result = (|| -> rusqlite::Result<Result<(), St3Error>> {
+            connection.execute(
+                "DELETE FROM local_blob_uploads WHERE uploaded_ms<?1",
+                [now.saturating_sub(ttl_ms)],
+            )?;
+            let already: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_blob_uploads WHERE hash=?1 AND actor=?2)",
+                params![hash, actor],
+                |row| row.get(0),
+            )?;
+            if !already {
+                let held: u64 = connection.query_row(
+                    "SELECT COALESCE(SUM(size),0) FROM local_blob_uploads WHERE actor=?1",
+                    [actor],
+                    |row| row.get(0),
+                )?;
+                if held.saturating_add(size) > quota {
+                    return Ok(Err(St3Error::new(
+                        "blob-quota-exceeded",
+                        format!(
+                            "{actor} already holds {held} bytes of uploads; the limit is {quota}"
+                        ),
+                    )));
+                }
+            }
+            connection.execute(
+                "INSERT INTO local_blob_uploads(hash, actor, media_type, size, uploaded_ms)
+                 VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(hash, actor) DO UPDATE SET uploaded_ms=excluded.uploaded_ms",
+                params![hash, actor, media_type, size, now],
+            )?;
+            Ok(Ok(()))
+        })();
+        match result {
+            Ok(outcome) => outcome,
+            Err(error) => Err(internal(error)),
+        }
+    }
+
+    /// The type `actor` gave when it uploaded these bytes, if it did within the retention window.
+    pub fn blob_upload_media_type(&self, hash: &str, actor: &str) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT media_type FROM local_blob_uploads WHERE hash=?1 AND actor=?2",
+                params![hash, actor],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Forget uploads older than `ttl_ms`; the daemon deletes the files in the same sweep.
+    pub fn expire_blob_uploads(&self, ttl_ms: u64) -> Result<usize> {
+        let cutoff = (now_ms() as u64).saturating_sub(ttl_ms);
+        let connection = self.connection.write();
+        Ok(connection.execute("DELETE FROM local_blob_uploads WHERE uploaded_ms<?1", [cutoff])?)
     }
 
     pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {

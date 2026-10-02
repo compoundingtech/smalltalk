@@ -11606,6 +11606,7 @@ pub(crate) fn append_work_wake_message(
             .latest_claim(&format!("message/{message_id}"), Some("message.sent"))?
             .map(|claim| claim.store_index)
             .unwrap_or_default(),
+            attachments: Vec::new(),
     })
 }
 
@@ -27961,6 +27962,7 @@ mission "ios-proof-blocked" state="ready" {
             in_reply_to: None,
             tags: vec![],
             created_index: 1,
+            attachments: Vec::new(),
         };
         assert!(!work_wake_acknowledged(&[(1_000, &wake)], None));
         wake.status = "delivered".into();
@@ -27983,6 +27985,7 @@ mission "ios-proof-blocked" state="ready" {
             in_reply_to: None,
             tags: vec![],
             created_index: 1,
+            attachments: Vec::new(),
         };
         let mut harness: CurrentHarnessView = serde_json::from_value(serde_json::json!({
             "state": "working",
@@ -28014,6 +28017,7 @@ mission "ios-proof-blocked" state="ready" {
             in_reply_to: None,
             tags: vec![],
             created_index: 1,
+            attachments: Vec::new(),
         };
         let harness: CurrentHarnessView = serde_json::from_value(serde_json::json!({
             "state": "working", "driver": "omp", "incarnation_id": "1:turn",

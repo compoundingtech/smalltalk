@@ -124,8 +124,11 @@ pub async fn run(
                             && !prepare_handoff(client, &state.fence, message).await.unwrap_or(false) { continue; }
                         let envelope = if let Some(envelope) = content.get(&message.subject) { envelope.clone() } else {
                             let Ok(body) = body(client, message).await else { continue; };
-                            let envelope = st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_text(&message.subject, &message.from, &message.to,
-                                message.title.as_deref(), &body, &st_drivers::ding::st3_body_sha256(&body)), &message.tags);
+                            // The image files come first: a message that names a file is delivered
+                            // once the file is here, never without it.
+                            let Ok(attachments) = crate::blobs::materialize_for_seat(client, subject, &agent_dir.join("attachments"), message).await else { continue; };
+                            let envelope = st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_with_attachments(&message.subject, &message.from, &message.to,
+                                message.title.as_deref(), &body, &st_drivers::ding::st3_body_sha256(&body), &attachments), &message.tags);
                             // A body can become available after reexec has already scanned the native
                             // transcript for other messages. Revisit retained proof once for this identity.
                             transcript.body_available(state.attempted.contains(&message.subject));
@@ -372,6 +375,7 @@ mod tests {
                 in_reply_to: None,
                 tags: Vec::new(),
                 created_index: 1,
+                attachments: Vec::new(),
             };
             assert_eq!(
                 prepare_handoff(&client, &fence, &message).await.unwrap(),

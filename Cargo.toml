@@ -42,8 +42,15 @@ default-members = [
   "crates/stui",
 ]
 
+exclude = ["vendor/libghostty-vt-sys"]
+
 [workspace.dependencies]
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+
+# The published 0.2.1 crate with one build-script change so Zig 0.15.2 can link against current
+# macOS SDKs; see vendor/libghostty-vt-sys/README.md.
+[patch.crates-io]
+libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
 
 [profile.dev]
 debug = 1
