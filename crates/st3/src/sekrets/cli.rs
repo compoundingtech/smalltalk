@@ -155,7 +155,7 @@ enum ProfileCommand {
 #[derive(Args, Debug)]
 struct GrantArgs {
     profile: String,
-    /// The agent or person, or a pattern such as agent/fleet/web/**.
+    /// The agent or person, or a pattern such as agent/web/**.
     #[arg(long)]
     to: String,
     #[command(flatten)]
@@ -733,13 +733,13 @@ mod tests {
         let script = setup_script(&SetupArgs {
             person: "person/ada".into(),
             uid: Some(1000),
-            also: vec!["1001=person/bob".into()],
+            also: vec!["1001=person/robin".into()],
             st: Some("/bin/sh".into()),
             checkout_roots: vec!["/home".into(), "/srv/work".into()],
         })
         .unwrap();
         assert!(script.contains("\"1000\" = \"person/ada\""));
-        assert!(script.contains("\"1001\" = \"person/bob\""));
+        assert!(script.contains("\"1001\" = \"person/robin\""));
         assert!(script.contains("checkout_roots = [\"/home\", \"/srv/work\"]"));
         assert!(script.contains("install -o root -g root -m 0755"));
         assert!(script.contains("User=sekrets"));
