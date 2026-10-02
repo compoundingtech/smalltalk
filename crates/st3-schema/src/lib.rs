@@ -848,6 +848,8 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("url", string()),
                 ("title", string()),
                 ("author", string()),
+                ("opened_by", reference()),
+                ("opened_by_run", reference()),
                 ("state", string()),
                 ("state_reason", string()),
                 ("created_at", string()),
@@ -3657,6 +3659,34 @@ mod tests {
         registry()
             .validate_claim("gate-operation/run/step/gate", "gate.result", &fields)
             .unwrap();
+    }
+
+    #[test]
+    fn issue_openers_are_optional_subject_references() {
+        registry()
+            .validate_resource_facts("vcs.issue", &BTreeMap::new())
+            .unwrap();
+        let facts = BTreeMap::from([
+            ("opened_by".into(), Value::String("agent/node.author".into())),
+            ("opened_by_run".into(), Value::String("mission-run/author".into())),
+        ]);
+        registry().validate_resource_facts("vcs.issue", &facts).unwrap();
+        registry()
+            .validate_public_claim(
+                "resource/github/acme/demo/issue/8",
+                "resource.observed",
+                &BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.issue".into())),
+                    ("facts".into(), serde_json::to_value(&facts).unwrap()),
+                ]),
+                Some("agent/node.author"),
+            )
+            .unwrap();
+        for name in ["opened_by", "opened_by_run"] {
+            let mut invalid = facts.clone();
+            invalid.insert(name.into(), Value::String("not-a-subject".into()));
+            assert!(registry().validate_resource_facts("vcs.issue", &invalid).is_err());
+        }
     }
 
     #[test]

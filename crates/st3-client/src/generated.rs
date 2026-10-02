@@ -837,6 +837,29 @@ pub struct Agent {
     pub under: Vec<AgentRelationship>,
     #[serde(default)]
     pub delivery: Option<AgentDelivery>,
+    /// The subagents this seat's harness runs now, oldest first. An older daemon omits them.
+    #[serde(default)]
+    pub subagents: Vec<AgentSubagent>,
+}
+/// A subagent a seat's harness runs inside its own session: open, with a lease that runs on.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentSubagent {
+    /// The harness's own subagent ID, unique within its seat.
+    pub id: String,
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    /// One line.
+    #[serde(default)]
+    pub description: Option<String>,
+    pub driver: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The step the seat held when the subagent appeared.
+    #[serde(default)]
+    pub work_id: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    pub lease_expires_at: String,
 }
 /// Whether the process that carries a local seat's messages is live and current.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

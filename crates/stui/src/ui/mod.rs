@@ -765,7 +765,7 @@ impl Ui {
     fn listing_for(&self, tab: usize, width: usize) -> Listing {
         match tab {
             0 => screens::home_list(&self.world, &self.snoozed),
-            1 if self.tree => screens::agents_tree(&self.world, self.spinner()),
+            1 if self.tree => screens::agents_tree(&self.world, self.spinner(), width),
             1 => screens::agents_list(&self.world, self.spinner(), width),
             2 if self.tree => screens::missions_tree(&self.world, self.spinner(), self.system),
             2 => screens::missions_list(&self.world, self.spinner(), self.system),
@@ -1307,10 +1307,11 @@ impl Ui {
                     first,
                     right,
                     second,
+                    children,
                 } => {
                     let is_selected = *index == selected;
                     if is_selected {
-                        let height = if second.is_empty() { 1 } else { 2 };
+                        let height = 1 + usize::from(!second.is_empty()) + children.len();
                         selected_range = (rows.len(), rows.len() + height);
                     }
                     let right_width = right.iter().map(Span::width).sum::<usize>();
@@ -1325,6 +1326,14 @@ impl Ui {
                         rows.push((
                             Some(*index),
                             Line::from(truncate_spans(second, width)),
+                            is_selected,
+                        ));
+                    }
+                    // Beneath the row and part of it: they select and click as the row.
+                    for child in children {
+                        rows.push((
+                            Some(*index),
+                            Line::from(truncate_spans(&child.spans, width)),
                             is_selected,
                         ));
                     }
@@ -4769,6 +4778,48 @@ mod tests {
                 .join("\n")
                 .contains("a reply arrives below")
         );
+    }
+
+    #[test]
+    fn a_click_on_a_subagent_line_only_selects_its_agent() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let ids = ui.ids();
+        let builder = ids
+            .iter()
+            .position(|id| id == "agent/example/atlas/builder")
+            .unwrap();
+        let other = ids.iter().position(|id| id == "agent/example/cos").unwrap();
+        ui.select(other);
+        let screen = frame(&ui, 140, 40);
+        let line = screen
+            .iter()
+            .position(|line| line.contains("run the slow tests"))
+            .expect("the builder's subagent is drawn beneath it");
+        let (rect, hit) = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .find(|(rect, _)| rect.y == line as u16 && rect.x == 0)
+            .map(|(rect, hit)| (*rect, hit.clone()))
+            .unwrap();
+        assert_eq!(
+            hit,
+            Hit::Row(builder),
+            "the line belongs to its agent's row"
+        );
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 2,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            ui.selected_id().as_deref(),
+            Some("agent/example/atlas/builder")
+        );
+        assert_eq!(ui.tab, 1);
     }
 
     #[test]

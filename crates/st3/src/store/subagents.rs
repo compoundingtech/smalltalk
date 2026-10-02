@@ -78,26 +78,47 @@ enum Scope<'a> {
     Seat(&'a str),
     /// Recorded on this node from this claim on.
     RecordedOn(&'a str, u64),
+    /// Whose lease runs past this time.
+    Running(u64),
     All,
 }
 
 /// Open subagents in `scope`, oldest first in the canonical claim order.
 fn open_subagents_at(connection: &Connection, scope: Scope<'_>) -> Result<Vec<SubagentView>> {
-    let filter = match scope {
-        Scope::Seat(_) => "AND claims.subject=?1",
+    let (live, from, filter) = match scope {
+        Scope::Seat(_) => ("", "FROM claims", "AND claims.subject=?1"),
         // The sweep's own bound on this node's claims, not an order.
-        Scope::RecordedOn(..) => "AND claims.origin=?1 AND claims.store_index>=?2",
-        Scope::All => "",
+        Scope::RecordedOn(..) => (
+            "",
+            "FROM claims",
+            "AND claims.origin=?1 AND claims.store_index>=?2",
+        ),
+        // Only a lease that runs on finds a running subagent, so the read starts from the
+        // leases, through their indexes, and costs what runs rather than all history.
+        Scope::Running(_) => (
+            "WITH live(subject, subagent_id) AS (
+                 SELECT subject, json_extract(body, '$.fields.subagent_id') FROM claims
+                 WHERE kind='subagent.appeared'
+                   AND CAST(json_extract(body, '$.fields.lease_expires_at_unix_ms') AS INTEGER)>?1
+                 UNION
+                 SELECT subject, json_extract(body, '$.fields.subagent_id') FROM claims
+                 WHERE kind='subagent.renewed'
+                   AND CAST(json_extract(body, '$.fields.lease_expires_at_unix_ms') AS INTEGER)>?1)",
+            "FROM live JOIN claims ON claims.subject=live.subject
+               AND json_extract(claims.body, '$.fields.subagent_id')=live.subagent_id",
+            "",
+        ),
+        Scope::All => ("", "FROM claims", ""),
     };
     let mut statement = connection.prepare_cached(&canonical_sql(&format!(
-        "SELECT claims.subject, claims.id, claims.origin, claims.body, claims.store_index,
+        "{live} SELECT claims.subject, claims.id, claims.origin, claims.body, claims.store_index,
              (SELECT MAX(CAST(json_extract(renewed.body, '$.fields.lease_expires_at_unix_ms')
                   AS INTEGER))
               FROM claims renewed
               WHERE renewed.kind='subagent.renewed' AND renewed.subject=claims.subject
                 AND json_extract(renewed.body, '$.fields.subagent_id')
                     =json_extract(claims.body, '$.fields.subagent_id'))
-         FROM claims
+         {from}
          WHERE claims.kind='subagent.appeared' {filter}
            AND NOT EXISTS (
                SELECT 1 FROM claims ended
@@ -118,6 +139,9 @@ fn open_subagents_at(connection: &Connection, scope: Scope<'_>) -> Result<Vec<Su
     };
     let rows = match scope {
         Scope::Seat(agent) => statement.query_map([agent], read)?.collect::<Vec<_>>(),
+        Scope::Running(now) => statement
+            .query_map([i64::try_from(now).unwrap_or(i64::MAX)], read)?
+            .collect::<Vec<_>>(),
         Scope::RecordedOn(origin, after) => statement
             .query_map(params![origin, after], read)?
             .collect::<Vec<_>>(),
@@ -303,6 +327,14 @@ impl Store {
     /// Every open subagent, oldest first.
     pub fn all_open_subagents(&self) -> Result<Vec<SubagentView>> {
         open_subagents_at(&self.readers.get(), Scope::All)
+    }
+
+    /// Every subagent running at `now`: open, with a lease that runs past it. Oldest first.
+    pub fn running_subagents(&self, now: u64) -> Result<Vec<SubagentView>> {
+        let mut running = open_subagents_at(&self.readers.get(), Scope::Running(now))?;
+        // A renewal that ran out leaves only the appearance's lease to check.
+        running.retain(|subagent| !subagent.expired_at(now));
+        Ok(running)
     }
 
     /// End each subagent recorded on this node from `low_water` on whose seat was stopped or
@@ -567,6 +599,42 @@ mod tests {
             .code,
             "invalid-claim-field"
         );
+    }
+
+    #[test]
+    fn running_subagents_are_open_with_a_lease_that_runs_on() {
+        let store = running_seat();
+        appear(&store, "ended", 50_000).unwrap();
+        claim(
+            &store,
+            "subagent.ended",
+            "ended",
+            &[("outcome", json!("completed"))],
+        )
+        .unwrap();
+        appear(&store, "lapsed", 9_000).unwrap();
+        appear(&store, "renewed", 9_000).unwrap();
+        claim(
+            &store,
+            "subagent.renewed",
+            "renewed",
+            &[("lease_expires_at_unix_ms", json!(30_000))],
+        )
+        .unwrap();
+        appear(&store, "fresh", 20_000).unwrap();
+        let running = |now| {
+            store
+                .running_subagents(now)
+                .unwrap()
+                .into_iter()
+                .map(|subagent| subagent.subagent_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(running(10_000), ["renewed", "fresh"]);
+        assert_eq!(running(25_000), ["renewed"]);
+        assert!(running(30_000).is_empty());
+        // The open ones still include the lapsed subagent until its node ends it.
+        assert_eq!(ids(&store), ["lapsed", "renewed", "fresh"]);
     }
 
     #[test]

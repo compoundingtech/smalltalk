@@ -253,6 +253,33 @@ pub struct Agent {
     pub details: AgentDetails,
     /// A live terminal the person can open.
     pub terminal: bool,
+    /// The subagents its harness runs now, oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<Subagent>,
+}
+
+/// A subagent an agent's harness runs inside its own session. It belongs to the agent and is not
+/// a seat: it has no conversation, terminal or actions of its own.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Subagent {
+    /// The harness's own ID for it.
+    pub id: String,
+    pub kind: Option<String>,
+    pub description: Option<String>,
+    /// How long it has run, as an agent's activity reads ("3m"); empty when st does not say.
+    pub age: String,
+}
+
+impl Subagent {
+    /// What it does, else its ID, then its type.
+    pub fn label(&self) -> String {
+        let mut label = self.description.clone().unwrap_or_else(|| self.id.clone());
+        if let Some(kind) = &self.kind {
+            label.push_str(" · ");
+            label.push_str(kind);
+        }
+        label
+    }
 }
 
 /// What the details pane shows about an agent. Every field is optional: st may not say.
