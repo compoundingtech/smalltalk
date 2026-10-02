@@ -1085,7 +1085,20 @@
         "filters": { "type": "object", "additionalProperties": { "type": "string" } },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
         "page": { "$ref": "#/$defs/PageInfo" },
-        "sync": { "$ref": "#/$defs/SyncNotice" }
+        "sync": { "$ref": "#/$defs/SyncNotice" },
+        "replicated": { "$ref": "#/$defs/ReplicatedNotice" }
+      }
+    },
+    "ReplicatedNotice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner_host_id", "source", "complete", "state"],
+      "properties": {
+        "owner_host_id": { "$ref": "#/$defs/Id" },
+        "source": { "enum": ["owner", "replica"] },
+        "complete": { "type": "boolean" },
+        "state": { "enum": ["current", "lagging", "unverified"] },
+        "reason": { "type": "string" }
       }
     },
     "SyncNotice": {
@@ -1628,7 +1641,10 @@
         "stream_url": { "type": "string" },
         "stream_capability": { "type": ["string", "null"], "minLength": 32 },
         "state": { "enum": ["available", "consumed", "detached", "expired"] },
-        "expires_at": { "$ref": "#/$defs/Timestamp" }
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "reusable": { "type": "boolean" },
+        "ttl_s": { "type": "integer", "minimum": 0 },
+        "retry_hint": { "type": ["string", "null"], "enum": ["reattach", null] }
       }
     },
     "ActionResult": {

@@ -8308,13 +8308,23 @@ impl Store {
         self.graph.append_claim_outcome(input)
     }
 
+    #[cfg(test)]
     pub(crate) fn append_mailbox_receipt(
         &self,
         input: &ClaimInput,
         fence: &crate::mailbox::Fence,
     ) -> Result<ClaimRecord, St3Error> {
-        self.append_claim_fenced_outcome(input, Some(fence))
+        self.append_mailbox_receipt_outcome(input, fence)
             .map(|(claim, _)| claim)
+    }
+
+    /// A fenced receipt, and whether it appended a claim rather than repeating or settling one.
+    pub(crate) fn append_mailbox_receipt_outcome(
+        &self,
+        input: &ClaimInput,
+        fence: &crate::mailbox::Fence,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        self.append_claim_fenced_outcome(input, Some(fence))
     }
 
     pub(crate) fn append_claim_fenced_outcome(
