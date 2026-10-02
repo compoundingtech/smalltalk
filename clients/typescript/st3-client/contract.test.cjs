@@ -177,6 +177,33 @@ test('collection stream holds commands until the socket opens and passes frames 
     assert.deepEqual(socket.closed, [1000]);
 });
 
+test('collection commands preserve omitted and nullable options and failure metadata', async () => {
+    const socket = collectionSocket();
+    const frames = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), socket: () => socket });
+    socket.onopen();
+    stream.subscribe('agents', 'agents');
+    stream.subscribe('nullable', 'work', 100, { person: null, actor: null, status: null });
+    stream.subscribeTerminal('current', 'terminal/example', undefined, 'capability-proof');
+    stream.subscribeTerminal('nullable-terminal', 'terminal/example', null, 'capability-proof');
+    assert.deepEqual(socket.sent, [
+        { kind: 'subscribe', id: 'agents', collection: 'agents' },
+        { kind: 'subscribe', id: 'nullable', collection: 'work', limit: 100, person: null, actor: null, status: null },
+        { kind: 'subscribe', id: 'current', collection: 'terminal', terminal: 'terminal/example', capability: 'capability-proof' },
+        { kind: 'subscribe', id: 'nullable-terminal', collection: 'terminal', terminal: 'terminal/example', incarnation: null, capability: 'capability-proof' },
+    ]);
+    const failures = [
+        { kind: 'resync', id: 'agents', code: 'internal', message: 'Retry the read', retryable: true },
+        { kind: 'resync', id: 'chat', collection: 'conversation', retryable: true },
+        { kind: 'error', id: 'chat', collection: 'conversation', code: 'timeline-history-incomplete', message: 'History missing', retryable: false },
+        { kind: 'error', id: 'current', collection: 'terminal', code: 'stale-fence', message: 'Restarted', retryable: false },
+    ];
+    for (const frame of failures) socket.onmessage({ data: JSON.stringify(frame) });
+    assert.deepEqual(frames, failures);
+    stream.close();
+});
+
 test('closing the collection stream sends nothing more and reports no end', async () => {
     const socket = collectionSocket();
     const ends = [];

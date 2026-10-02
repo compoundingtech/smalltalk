@@ -69,6 +69,92 @@ fn assert_conforms(validator: &jsonschema::Validator, context: &str, value: &Val
 }
 
 #[tokio::test]
+async fn outbound_rust_collection_commands_conform_with_none_options() {
+    use axum::extract::ws::WebSocketUpgrade;
+    use futures_util::StreamExt as _;
+    let validator = contract_validator("CollectionCommand");
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().route(
+        "/v1/client/collections/stream",
+        axum::routing::get(move |upgrade: WebSocketUpgrade| {
+            let sender = sender.clone();
+            async move {
+                upgrade.protocols(["st3.client.collections.v0"]).on_upgrade(
+                    move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.next().await {
+                            if let Ok(text) = message.to_text() {
+                                sender
+                                    .send(serde_json::from_str::<Value>(text).unwrap())
+                                    .unwrap();
+                            }
+                        }
+                    },
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client =
+        st3_client::Client::fabric_loopback(format!("http://{address}"), "synthetic-token");
+    let mut stream = client.collection_stream().await.unwrap();
+    stream
+        .subscribe("agents", "agents", 100, None, None)
+        .await
+        .unwrap();
+    stream.subscribe_glasses("glasses").await.unwrap();
+    stream
+        .subscribe_terminal("term", "terminal/example", None, "synthetic-capability")
+        .await
+        .unwrap();
+    for expected in ["agents", "glasses", "term"] {
+        let command = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(command["id"], expected);
+        assert_conforms(&validator, "actual Rust None command", &command);
+        let mut omitted = command.clone();
+        if expected == "term" {
+            assert_eq!(command.get("incarnation"), Some(&Value::Null));
+            omitted.as_object_mut().unwrap().remove("incarnation");
+            let mut missing_capability = omitted.clone();
+            missing_capability
+                .as_object_mut()
+                .unwrap()
+                .remove("capability");
+            assert!(!validator.is_valid(&missing_capability));
+        } else {
+            assert_eq!(command.get("actor"), Some(&Value::Null));
+            assert_eq!(command.get("status"), Some(&Value::Null));
+            omitted.as_object_mut().unwrap().remove("actor");
+            omitted.as_object_mut().unwrap().remove("status");
+            let mut person = omitted.clone();
+            person["person"] = Value::Null;
+            assert_conforms(&validator, "nullable person filter", &person);
+            person["person"] = serde_json::json!(42);
+            assert!(!validator.is_valid(&person));
+        }
+        assert_conforms(&validator, "omitted optional command values", &omitted);
+        let mut extra = command.clone();
+        extra["undeclared"] = Value::Bool(true);
+        assert!(!validator.is_valid(&extra));
+        let mut bad_type = command;
+        bad_type[if expected == "term" {
+            "incarnation"
+        } else {
+            "actor"
+        }] = serde_json::json!(false);
+        assert!(!validator.is_valid(&bad_type));
+    }
+    stream.close().await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn strict_daemon_contract_rejects_undeclared_fields_and_unknown_known_cases() {
     let root = tempfile::tempdir().unwrap();
     let app = st3::api::router(test_state(root.path()));
@@ -294,6 +380,37 @@ async fn daemon_conversation_and_terminal_frames_conform_to_client_v0() {
     assert_eq!(frame["kind"], "screen");
     assert_conforms(&frame_validator, "multiplexed terminal screen", &frame);
     assert_eq!(frame["value"]["lines"], screen["value"]["lines"]);
+    state
+        .store
+        .append_claim(&st3::model::ClaimInput {
+            subject: agent.into(),
+            kind: "runtime.observed".into(),
+            actor: Some(agent.into()),
+            fields: serde_json::from_value(serde_json::json!({
+                "runtime_id": runtime, "incarnation_id": "contract-terminal:i2",
+                "status": "running", "terminal": true, "reachability": "local"
+            }))
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    state
+        .event_notify
+        .send_replace(state.store.index().unwrap());
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended["kind"], "error", "{ended}");
+    assert_eq!(ended["collection"], "terminal");
+    assert_eq!(ended["retryable"], false);
+    assert_conforms(&frame_validator, "terminal stale-fence error", &ended);
+    let mut extra = ended.clone();
+    extra["undeclared"] = serde_json::json!(true);
+    assert!(!frame_validator.is_valid(&extra));
     stream.close().await;
     pty.abort();
     server.abort();

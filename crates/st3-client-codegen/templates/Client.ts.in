@@ -42,7 +42,7 @@ export type TerminalStreamOptions = {
 export type TerminalStream = { close(): void };
 
 /** `person` applies to attention, `actor` to work, and `status` to agents. */
-export type CollectionFilters = { person?: string; actor?: string; status?: string };
+export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null };
 /** The WebSocket surface the collections socket uses: a terminal socket that also sends. */
 export type CollectionSocket = TerminalSocket & {
     onopen: (() => void) | null;
@@ -61,7 +61,7 @@ export type CollectionStream = {
     subscribeGlasses(id: string): void;
     subscribe(id: string, collection: CollectionName, limit?: number, filters?: CollectionFilters): void;
     /** Follow a terminal with the incarnation and single-use capability `terminal.attach` returned. */
-    subscribeTerminal(id: string, terminal: string, incarnation: string, capability: string): void;
+    subscribeTerminal(id: string, terminal: string, incarnation: string | null | undefined, capability: string): void;
     /** Follow the conversation of an agent or a session. */
     subscribeConversation(id: string, conversation: string): void;
     unsubscribe(id: string): void;
