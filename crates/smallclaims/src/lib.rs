@@ -19,6 +19,7 @@ pub mod profile;
 pub mod replication;
 pub mod sqlite;
 pub mod store;
+pub mod sync;
 
 pub use claim::{
     ClaimInput, ClaimRecord, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,

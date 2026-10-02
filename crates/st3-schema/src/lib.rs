@@ -46,6 +46,20 @@ pub enum Cardinality {
     StateTransition,
 }
 
+/// How a subagent ended: as its harness reported (`completed`, `failed`, `interrupted`), or as st
+/// closed it when its lease ran out (`expired`), its parent session ended (`session-ended`), its
+/// harness exited or restarted (`harness-exited`), or its seat was stopped or removed
+/// (`seat-stopped`).
+pub const SUBAGENT_OUTCOMES: &[&str] = &[
+    "completed",
+    "failed",
+    "interrupted",
+    "expired",
+    "session-ended",
+    "harness-exited",
+    "seat-stopped",
+];
+
 /// Where a claim kind lives once written.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -834,6 +848,8 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("url", string()),
                 ("title", string()),
                 ("author", string()),
+                ("opened_by", reference()),
+                ("opened_by_run", reference()),
                 ("state", string()),
                 ("state_reason", string()),
                 ("created_at", string()),
@@ -1233,6 +1249,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "work.extended",
+            &["step-run"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("work"),
+            true,
+            &[],
+        ),
+        (
             "gate.requested",
             &["gate-operation"],
             WritePolicy::SystemOnly,
@@ -1526,6 +1551,36 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             WritePolicy::SameSubjectActor,
             Cardinality::Append,
             Some("harnesses"),
+            false,
+            &[],
+        ),
+        // A subagent a seat's harness started, its lease renewals while it runs, and its end.
+        // The parent seat records them as itself; the reconciler on the node that recorded an
+        // appearance ends a subagent whose lease ran out or whose seat went away.
+        (
+            "subagent.appeared",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            Some("subagents"),
+            false,
+            &[],
+        ),
+        (
+            "subagent.renewed",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            Some("subagents"),
+            false,
+            &[],
+        ),
+        (
+            "subagent.ended",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            Some("subagents"),
             false,
             &[],
         ),
@@ -2245,6 +2300,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("waiting_since", string()),
             ("legacy_request", string()),
             ("requester_declaration", string()),
+            ("request", object()),
         ],
         "work.person-done" | "work.person-cancelled" => &[
             ("attempt", integer()),
@@ -2252,9 +2308,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("summary", string()),
             ("key", string()),
             ("episode", string()),
+            ("answer", object()),
         ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
-        | "work.released" => &[
+        | "work.released" | "work.extended" => &[
             ("attempt", integer()),
             ("status", string()),
             ("summary", string()),
@@ -2264,6 +2321,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("claim_incarnation", string()),
             ("claim_expires_at_unix_ms", integer()),
             ("readiness_epoch", integer()),
+            ("extend_ms", integer()),
         ],
         "gate.requested" => &[
             ("status", string()),
@@ -2659,6 +2717,37 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("weekly_percent", number()),
             ("weekly_resets_at_unix_ms", integer()),
             ("measured_at_unix_ms", required_integer()),
+        ],
+        // The harness's own subagent ID names the subagent within its parent seat. The prompt and
+        // transcript stay on the host.
+        "subagent.appeared" => &[
+            ("subagent_id", required_string()),
+            ("subagent_type", string()),
+            ("description", string()),
+            ("driver", required_string()),
+            ("session_id", string()),
+            ("incarnation_id", required_string()),
+            ("step_run", reference_to(&["step-run"])),
+            ("started_at_unix_ms", integer()),
+            ("lease_expires_at_unix_ms", required_integer()),
+        ],
+        "subagent.renewed" => &[
+            ("subagent_id", required_string()),
+            ("incarnation_id", string()),
+            ("lease_expires_at_unix_ms", required_integer()),
+        ],
+        // Token buckets are the subagent's own responses, which also count in the parent's usage.
+        "subagent.ended" => &[
+            ("subagent_id", required_string()),
+            ("outcome", required_enum(SUBAGENT_OUTCOMES)),
+            ("reason", string()),
+            ("ended_at_unix_ms", integer()),
+            ("duration_ms", integer()),
+            ("input_tokens", integer()),
+            ("output_tokens", integer()),
+            ("cache_write_tokens", integer()),
+            ("cached_tokens", integer()),
+            ("total_tokens", integer()),
         ],
         "harness.telemetry" => &[
             ("driver", required_enum(&["claude"])),
@@ -3279,6 +3368,9 @@ mod tests {
                 "step-run.carried",
                 "step-run.retried",
                 "step-run.state",
+                "subagent.appeared",
+                "subagent.ended",
+                "subagent.renewed",
                 "subscription.mission-deferred",
                 "subscription.mission-failed",
                 "subscription.mission-request-cancelled",
@@ -3290,6 +3382,7 @@ mod tests {
                 "terminal.input.result",
                 "transport.observed",
                 "work.claimed",
+                "work.extended",
                 "work.failed",
                 "work.person-asked",
                 "work.person-cancelled",
@@ -3464,6 +3557,7 @@ mod tests {
                 "subscription.mission-request-cancelled",
                 "subscription.mission-request-released",
                 "work.claimed",
+                "work.extended",
                 "work.failed",
                 "work.person-asked",
                 "work.person-cancelled",
@@ -3577,6 +3671,34 @@ mod tests {
         registry()
             .validate_claim("gate-operation/run/step/gate", "gate.result", &fields)
             .unwrap();
+    }
+
+    #[test]
+    fn issue_openers_are_optional_subject_references() {
+        registry()
+            .validate_resource_facts("vcs.issue", &BTreeMap::new())
+            .unwrap();
+        let facts = BTreeMap::from([
+            ("opened_by".into(), Value::String("agent/node.author".into())),
+            ("opened_by_run".into(), Value::String("mission-run/author".into())),
+        ]);
+        registry().validate_resource_facts("vcs.issue", &facts).unwrap();
+        registry()
+            .validate_public_claim(
+                "resource/github/acme/demo/issue/8",
+                "resource.observed",
+                &BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.issue".into())),
+                    ("facts".into(), serde_json::to_value(&facts).unwrap()),
+                ]),
+                Some("agent/node.author"),
+            )
+            .unwrap();
+        for name in ["opened_by", "opened_by_run"] {
+            let mut invalid = facts.clone();
+            invalid.insert(name.into(), Value::String("not-a-subject".into()));
+            assert!(registry().validate_resource_facts("vcs.issue", &invalid).is_err());
+        }
     }
 
     #[test]

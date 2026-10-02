@@ -1997,6 +1997,7 @@ async fn attention_action(
                         episode: attention.episode.clone(),
                         summary,
                         evidence: vec![],
+                        answer: None,
                     },
                 )
                 .await?

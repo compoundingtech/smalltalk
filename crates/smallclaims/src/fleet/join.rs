@@ -7,21 +7,28 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use super::code::{CodeEndpoint, JoinCode};
+use super::code::{CodeEndpoint, JoinCode, fingerprint};
+use super::file::{FleetFile, FleetMode};
 use super::handshake::{JoinResponse, Joiner, SealedJoin, WriterHead};
 use super::keys::MemberKey;
 use super::transport::{
     Fabric, Route, bindable_tailnet_addresses, local_addresses, parse_route, resolve_tool,
     tailscale_addresses,
 };
-use crate::config::{FleetFile, FleetMode};
-use crate::store::{Store, valid_fleet_node_name};
+use crate::error::Error;
+use crate::store::{Runtime, Store, valid_fleet_node_name};
 
 pub const DEFAULT_PORT: u16 = 31313;
+
+/// The claim store inside a state directory.
+pub fn store_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("claims.sqlite3")
+}
 
 fn fleet_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("fleet")
@@ -167,7 +174,7 @@ fn checkpoint_path(state_dir: &Path) -> PathBuf {
     fleet_dir(state_dir).join("join.json")
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JoinOptions {
     pub state_dir: PathBuf,
     /// The configured node name, used when neither `--name` nor the code names one.
@@ -181,6 +188,10 @@ pub struct JoinOptions {
     pub legacy_secret_file: Option<PathBuf>,
     /// A migration can keep the Fabric exposure name the node already uses.
     pub fabric_protocol: Option<String>,
+    /// The runtime the store is opened with to read its writer head and begin its first sync.
+    pub runtime: Arc<dyn Runtime>,
+    /// The joining build's version, which the handshake tells the sponsor.
+    pub version: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -192,6 +203,121 @@ pub struct Joined {
     pub migrate: bool,
     /// True when this run found the join already redeemed and only resumed it.
     pub resumed: bool,
+}
+
+/// What an invite is for: the name it pins, how long it lasts, which of the sponsor's
+/// endpoints it carries (`auto`, `tailscale`, `fabric` or `loopback`), the person who made it,
+/// and whether it migrates a config-peer node.
+#[derive(Clone, Debug)]
+pub struct InviteOptions {
+    pub name: Option<String>,
+    pub lifetime: std::time::Duration,
+    pub via: String,
+    pub person: String,
+    pub migrate: bool,
+}
+
+/// An invite this node sponsors, and the code that redeems it.
+#[derive(Clone, Debug, Serialize)]
+pub struct Invitation {
+    pub invite: String,
+    pub code: String,
+    pub expires_at_unix_ms: u64,
+}
+
+/// Create an invite that `node`, a current listening member of `fleet_id`, sponsors, and the
+/// join code that carries its advertised endpoints.
+pub fn invite(
+    store: &Store,
+    fleet_id: &str,
+    node: &str,
+    options: &InviteOptions,
+) -> Result<Invitation, Error> {
+    let via = options.via.as_str();
+    if !matches!(via, "auto" | "tailscale" | "fabric" | "loopback") {
+        return Err(Error::new(
+            "invalid-via",
+            "--via is auto, tailscale, fabric, or loopback",
+        ));
+    }
+    let internal = |error: &dyn std::fmt::Display| Error::new("internal", error.to_string());
+    let membership = store.fleet_membership().map_err(|error| internal(&error))?;
+    let super::MemberState::Current(own) = membership.state(node) else {
+        return Err(Error::new(
+            "not-a-member",
+            "this node is not a current fleet member",
+        ));
+    };
+    let wanted = |transport: &str| via == "auto" || via == transport;
+    let text = |value: &serde_json::Value, field: &str| value[field].as_str().map(str::to_owned);
+    let endpoints = own
+        .endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let transport = endpoint["transport"].as_str()?;
+            if !wanted(transport) {
+                return None;
+            }
+            match transport {
+                "tailscale" => Some(CodeEndpoint::Tailscale(text(endpoint, "address")?)),
+                "fabric" => Some(CodeEndpoint::Fabric {
+                    node: text(endpoint, "node")?,
+                    protocol: text(endpoint, "protocol")?,
+                }),
+                "loopback" => Some(CodeEndpoint::Loopback(text(endpoint, "address")?)),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return Err(Error::new(
+            "no-endpoints",
+            format!(
+                "this member advertises no {} endpoint yet; is its replication worker running?",
+                if via == "auto" { "reachable" } else { via }
+            ),
+        ));
+    }
+    let transports = endpoints
+        .iter()
+        .map(|endpoint| match endpoint {
+            CodeEndpoint::Tailscale(_) => "tailscale".to_owned(),
+            CodeEndpoint::Fabric { .. } => "fabric".to_owned(),
+            CodeEndpoint::Loopback(_) => "loopback".to_owned(),
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let member_key = store
+        .member_public_key()
+        .ok_or_else(|| Error::new("no-member-key", "this node has no member key"))?;
+    let invite = store.create_fleet_invite(
+        options.name.as_deref(),
+        options.lifetime,
+        &transports,
+        &options.person,
+        options.migrate,
+    )?;
+    let code = JoinCode {
+        fleet_id: uuid::Uuid::parse_str(fleet_id).map_err(|error| internal(&error))?,
+        invite: hex::decode(&invite.invite)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| Error::new("internal", "the invite ID is damaged"))?,
+        token: invite.token,
+        fingerprint: fingerprint(&member_key),
+        expires_at: invite.expires_at_unix_ms / 1000,
+        name: options.name.clone(),
+        migrate: options.migrate,
+        endpoints,
+    }
+    .encode()
+    .map_err(|error| internal(&error))?;
+    Ok(Invitation {
+        invite: format!("fleet-invite/{}", invite.invite),
+        code,
+        expires_at_unix_ms: invite.expires_at_unix_ms,
+    })
 }
 
 /// Where to send the handshake: `--via`, else Tailscale when this machine is on a tailnet,
@@ -306,7 +432,7 @@ pub async fn join(options: &JoinOptions) -> Result<Joined> {
     let key = MemberKey::load_or_create(&directory.join("node.key"))?;
     let writer_head = {
         fs::create_dir_all(state_dir)?;
-        let store = Store::open(&state_dir.join("claims.sqlite3"), &name)?;
+        let store = Store::open(&store_path(state_dir), &name, options.runtime.clone())?;
         if let Some(bound) = store.bound_fleet()? {
             anyhow::ensure!(
                 bound == code.fleet_id.to_string(),
@@ -319,14 +445,7 @@ pub async fn join(options: &JoinOptions) -> Result<Joined> {
     };
     let (url, sponsor_route) = sponsor_url(&code, options).await?;
     let mode = options.settings.mode.as_str();
-    let session = Joiner::start(
-        &code,
-        &key,
-        &name,
-        mode,
-        writer_head,
-        env!("CARGO_PKG_VERSION"),
-    )?;
+    let session = Joiner::start(&code, &key, &name, mode, writer_head, &options.version)?;
     let http = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(30))
@@ -392,7 +511,8 @@ pub async fn join(options: &JoinOptions) -> Result<Joined> {
     .save(state_dir)?;
     // A new member's first sync ends by checking that it projects the same graph as a peer.
     if !code.migrate {
-        Store::open(&state_dir.join("claims.sqlite3"), &name)?.begin_first_sync(&sealed.sponsor)?;
+        Store::open(&store_path(state_dir), &name, options.runtime.clone())?
+            .begin_first_sync(&sealed.sponsor)?;
     }
     write_private(
         &checkpoint_path(state_dir),
@@ -423,6 +543,7 @@ pub fn migrate_anchor(
     secret_file: &Path,
     settings: &MemberSettings,
     fabric_protocol: Option<String>,
+    runtime: Arc<dyn Runtime>,
 ) -> Result<Founded> {
     anyhow::ensure!(
         FleetFile::load(state_dir)?.is_none(),
@@ -433,7 +554,7 @@ pub fn migrate_anchor(
         "`{node}` cannot name a fleet member"
     );
     {
-        let store = Store::open(&state_dir.join("claims.sqlite3"), node)?;
+        let store = Store::open(&store_path(state_dir), node, runtime)?;
         match store.bound_fleet()? {
             Some(bound) => anyhow::ensure!(
                 bound == fleet_id,

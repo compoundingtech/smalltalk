@@ -250,6 +250,7 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             first,
             right,
             second,
+            children: Vec::new(),
         });
         ids.push(id);
     };

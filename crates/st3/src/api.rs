@@ -616,6 +616,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/work/mission/{*subject}", post(publish_work_mission))
         .route("/v1/work/wake/{*subject}", post(wake_work))
         .route("/v1/work/retry/{*subject}", post(retry_work))
+        .route("/v1/work/extend/{*subject}", post(extend_work))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/agent-queue-moves", post(move_agent_queue))
@@ -1046,6 +1047,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "validation-failed"
         | "idempotency-conflict"
         | "stale-fence"
+        | "timeline-history-incomplete"
         | "cursor-gap"
         | "page-cursor-expired"
         | "rate-limited"
@@ -1063,6 +1065,10 @@ fn client_error_code(code: Option<&str>) -> String {
         "lane-not-found" => "not-found".into(),
         "invalid-person-ask"
         | "invalid-person-response"
+        | "invalid-person-request"
+        | "invalid-person-answer"
+        | "answer-required"
+        | "unsupported-person-request"
         | "missing-ask-owner"
         | "ambiguous-ask-owner" => "validation-failed".into(),
         "stale-work-ask"
@@ -1724,6 +1730,7 @@ fn client_work_values(
                 "timeout_ms": work.timeout_ms,
                 "goals": work.goals,
                 "constraints": work.constraints,
+                "person_answers": work.person_answers,
                 "blocked_reason": work.blocked_reason,
                 "blockers": work.blockers,
                 "usage": usage,
@@ -1827,7 +1834,36 @@ fn client_agent_resources(
         }
         overlay_delivery_presence(item, &local_host);
     }
+    overlay_subagents(store, &mut items)?;
     Ok(items)
+}
+
+/// Each seat's running subagents: open, with a lease that runs past this read. A lease runs out
+/// without a claim, so this is read per request rather than cached with the agents.
+fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
+    let mut running = BTreeMap::<String, Vec<Value>>::new();
+    for subagent in store.running_subagents(client_now_ms() as u64)? {
+        running
+            .entry(subagent.agent.clone())
+            .or_default()
+            .push(json!({
+                "id": subagent.subagent_id,
+                "subagent_type": subagent.subagent_type,
+                "description": subagent.description,
+                "driver": subagent.driver,
+                "session_id": subagent.session_id,
+                "work_id": subagent.step_run,
+                "started_at": (subagent.started_at_unix_ms > 0)
+                    .then(|| client_timestamp(u128::from(subagent.started_at_unix_ms))),
+                "lease_expires_at": client_timestamp(u128::from(subagent.lease_expires_at_unix_ms)),
+            }));
+    }
+    for item in items {
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        let subagents = running.remove(id).unwrap_or_default();
+        item["subagents"] = Value::Array(subagents);
+    }
+    Ok(())
 }
 
 /// Graph state says whether a harness took its ready turn; only this daemon can say whether the
@@ -2494,6 +2530,9 @@ fn client_attention_resources(
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
+            if let Some(request) = item.request {
+                resource["request"] = request;
+            }
         }
         if item.kind == "fault" {
             resource["what"] = json!(item.title);
@@ -3572,6 +3611,7 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
     if !matches!(
         rejected.code.as_str(),
         "page-cursor-expired"
+            | "timeline-history-incomplete"
             | "cursor-gap"
             | "not-found"
             | "stale-fence"
@@ -5944,15 +5984,10 @@ async fn fleet_invite_list(
         .map(Json)
 }
 
-fn internal_error(error: impl std::fmt::Display) -> St3Error {
-    St3Error::new("internal", error.to_string())
-}
-
 async fn fleet_invite_create(
     State(state): State<AppState>,
     Json(request): Json<FleetInviteRequest>,
 ) -> Result<Json<FleetInviteCreated>, ApiError> {
-    use crate::fleet::code::{CodeEndpoint, JoinCode, fingerprint};
     concrete_person(&request.person)?;
     let fleet_id = state.fleet_id.clone().ok_or_else(|| {
         ApiError::bad(St3Error::new(
@@ -5964,92 +5999,22 @@ async fn fleet_invite_create(
     let node = state.node.clone();
     let created = blocking_action(move || {
         let via = request.via.clone().unwrap_or_else(|| "auto".into());
-        if !matches!(via.as_str(), "auto" | "tailscale" | "fabric" | "loopback") {
-            return Err(St3Error::new(
-                "invalid-via",
-                "--via is auto, tailscale, fabric, or loopback",
-            ));
-        }
-        let membership = store.fleet_membership().map_err(internal_error)?;
-        let crate::fleet::MemberState::Current(own) = membership.state(&node) else {
-            return Err(St3Error::new(
-                "not-a-member",
-                "this node is not a current fleet member",
-            ));
-        };
-        let wanted = |transport: &str| via == "auto" || via == transport;
-        let text = |value: &Value, field: &str| value[field].as_str().map(str::to_owned);
-        let endpoints = own
-            .endpoints
-            .iter()
-            .filter_map(|endpoint| {
-                let transport = endpoint["transport"].as_str()?;
-                if !wanted(transport) {
-                    return None;
-                }
-                match transport {
-                    "tailscale" => Some(CodeEndpoint::Tailscale(text(endpoint, "address")?)),
-                    "fabric" => Some(CodeEndpoint::Fabric {
-                        node: text(endpoint, "node")?,
-                        protocol: text(endpoint, "protocol")?,
-                    }),
-                    "loopback" => Some(CodeEndpoint::Loopback(text(endpoint, "address")?)),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
-        if endpoints.is_empty() {
-            return Err(St3Error::new(
-                "no-endpoints",
-                format!(
-                    "this member advertises no {} endpoint yet; is its replication worker running?",
-                    if via == "auto" {
-                        "reachable"
-                    } else {
-                        via.as_str()
-                    }
-                ),
-            ));
-        }
-        let transports = endpoints
-            .iter()
-            .map(|endpoint| match endpoint {
-                CodeEndpoint::Tailscale(_) => "tailscale".to_owned(),
-                CodeEndpoint::Fabric { .. } => "fabric".to_owned(),
-                CodeEndpoint::Loopback(_) => "loopback".to_owned(),
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let member_key = store
-            .member_public_key()
-            .ok_or_else(|| St3Error::new("no-member-key", "this node has no member key"))?;
-        let invite = store.create_fleet_invite(
-            request.name.as_deref(),
-            std::time::Duration::from_secs(request.expires_seconds),
-            &transports,
-            &request.person,
-            request.migrate,
+        let invitation = crate::fleet::join::invite(
+            &store,
+            &fleet_id,
+            &node,
+            &crate::fleet::join::InviteOptions {
+                name: request.name.clone(),
+                lifetime: std::time::Duration::from_secs(request.expires_seconds),
+                via,
+                person: request.person.clone(),
+                migrate: request.migrate,
+            },
         )?;
-        let code = JoinCode {
-            fleet_id: uuid::Uuid::parse_str(&fleet_id).map_err(internal_error)?,
-            invite: hex::decode(&invite.invite)
-                .ok()
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(|| St3Error::new("internal", "the invite ID is damaged"))?,
-            token: invite.token,
-            fingerprint: fingerprint(&member_key),
-            expires_at: invite.expires_at_unix_ms / 1000,
-            name: request.name.clone(),
-            migrate: request.migrate,
-            endpoints,
-        }
-        .encode()
-        .map_err(internal_error)?;
         Ok(FleetInviteCreated {
-            invite: format!("fleet-invite/{}", invite.invite),
-            code,
-            expires_at_unix_ms: invite.expires_at_unix_ms,
+            invite: invitation.invite,
+            code: invitation.code,
+            expires_at_unix_ms: invitation.expires_at_unix_ms,
         })
     })
     .await?;
@@ -8297,7 +8262,7 @@ async fn post_claim(
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
             signal_local_change(&state);
-        } else if kind == "harness.usage" {
+        } else if kind == "harness.usage" || kind == "subagent.renewed" {
             signal_visible_change(&state);
         } else if kind.starts_with("message.") {
             let store = state.store.clone();
@@ -10525,6 +10490,34 @@ async fn post_work_action(
     AxumPath((action, subject)): AxumPath<(String, String)>,
     Json(request): Json<WorkRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    work_action_response(state, action, subject, request, None).await
+}
+
+/// Add time to the execution budget of the step attempt this seat holds.
+async fn extend_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<crate::model::WorkExtendRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let extend_ms = request.by_ms;
+    let request = WorkRequest {
+        actor: request.actor,
+        incarnation: request.incarnation,
+        summary: None,
+        reason: request.reason,
+        evidence: Vec::new(),
+        idempotency_key: request.idempotency_key,
+    };
+    work_action_response(state, "extend".into(), subject, request, Some(extend_ms)).await
+}
+
+async fn work_action_response(
+    state: AppState,
+    action: String,
+    subject: String,
+    request: WorkRequest,
+    extend_ms: Option<u64>,
+) -> Result<Json<StepRunView>, ApiError> {
     let actor = request
         .actor
         .as_deref()
@@ -10570,7 +10563,7 @@ async fn post_work_action(
     let quiet_renewal = action == "renew";
     let store = state.store.clone();
     let (mut response, desired) = blocking_action(move || {
-        let response = store.work_action(&subject, &action, &request)?;
+        let response = store.work_action_extending(&subject, &action, &request, extend_ms)?;
         let desired = store.desired_subjects().map_err(|error| {
             St3Error::new("store-read-failed", format!("read desired agents: {error}"))
         })?;
@@ -13632,6 +13625,98 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             .unwrap();
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].kind, "custom.test.recorded");
+    }
+
+    #[test]
+    fn agents_list_the_subagents_their_harness_runs_now() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = format!(
+            "version 2\nagent \"busy\" {{ workspace {0:?}; command \"true\" }}\n\
+             agent \"quiet\" {{ workspace {0:?}; command \"true\" }}\n",
+            root.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "subagents")
+            .unwrap();
+        let now = client_now_ms() as u64;
+        let claim = |kind: &str, id: &str, fields: &[(&str, Value)]| {
+            let mut all = BTreeMap::from([("subagent_id".to_owned(), json!(id))]);
+            for (name, value) in fields {
+                all.insert((*name).to_owned(), value.clone());
+            }
+            state
+                .store
+                .append_client_claim(&ClaimInput {
+                    subject: "agent/node.busy".into(),
+                    kind: kind.into(),
+                    actor: Some("agent/node.busy".into()),
+                    fields: all,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let appear = |id: &str, lease: u64| {
+            claim(
+                "subagent.appeared",
+                id,
+                &[
+                    ("driver", json!("claude")),
+                    ("incarnation_id", json!("inc-1")),
+                    ("subagent_type", json!("Explore")),
+                    ("description", json!("map the code")),
+                    ("session_id", json!("session-1")),
+                    ("step_run", json!("step-run/run-1/build")),
+                    ("started_at_unix_ms", json!(1_790_931_600_000_u64)),
+                    ("lease_expires_at_unix_ms", json!(lease)),
+                ],
+            )
+        };
+        appear("running", now + 600_000);
+        appear("lapsed", now - 1);
+        appear("finished", now + 600_000);
+        claim(
+            "subagent.ended",
+            "finished",
+            &[("outcome", json!("completed"))],
+        );
+
+        let agents =
+            client_agent_resources(&state.store, false, "now", state.store.index().unwrap())
+                .unwrap();
+        let agent = |id: &str| agents.iter().find(|agent| agent["id"] == id).unwrap();
+        assert_eq!(
+            agent("agent/node.busy")["subagents"],
+            json!([{
+                "id": "running", "subagent_type": "Explore", "description": "map the code",
+                "driver": "claude", "session_id": "session-1",
+                "work_id": "step-run/run-1/build",
+                "started_at": "2026-10-02T09:00:00.000Z",
+                "lease_expires_at": client_timestamp(u128::from(now + 600_000)),
+            }])
+        );
+        assert_eq!(agent("agent/node.quiet")["subagents"], json!([]));
+        // Clients read it as the typed field.
+        let typed: st3_client::Resource =
+            serde_json::from_value(agent("agent/node.busy").clone()).unwrap();
+        let st3_client::Resource::Agent(typed) = typed else {
+            panic!("an agent resource");
+        };
+        assert_eq!(typed.subagents.len(), 1);
     }
 
     #[test]
@@ -18774,7 +18859,10 @@ agent "seat" { workspace "/tmp"; command "true" }
         assert_eq!(again["status"], "completed");
         let (_, empty) = get_request(app, "/v1/client/now?person=person%2Favery").await;
         assert_eq!(empty["items"], json!([]));
-        assert!(state.store.messages(Some(&actor), true).unwrap().is_empty());
+        // No step waits on a new-run ask; its requester hears the answer once, by message.
+        let told = state.store.messages(Some(&actor), true).unwrap();
+        assert_eq!(told.len(), 1);
+        assert!(told[0].content.contains("Friday"));
     }
 
     #[tokio::test]

@@ -22,6 +22,10 @@ pub use smallclaims::replication::{
 
 pub const MAX_EVAL_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -855,6 +859,13 @@ pub struct SubscriptionSpec {
     pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requester: Option<String>,
+    /// An item that a live agent owns goes to that agent as one message instead (`owner
+    /// "message"`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_message: bool,
+    /// The GitHub logins whose mentions the subscription hears, each with the person it names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<(String, String)>,
     pub stopped: bool,
 }
 
@@ -1498,6 +1509,9 @@ pub struct AttentionItemView {
     pub message_id: Option<String>,
     pub title: String,
     pub detail: String,
+    /// The structured request a person-step ask carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2059,6 +2073,10 @@ pub struct StepRunView {
     pub goals: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraints: Vec<String>,
+    /// Responses to person asks: this attempt's asks on a step that asked, or the step's own
+    /// response on a person ask.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub person_answers: Vec<PersonAnswerView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub under: Vec<UnderSpec>,
     pub worker_reported: bool,
@@ -2075,6 +2093,9 @@ pub struct StepRunView {
     pub execution_elapsed_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// What `work extend` has added to this attempt's execution budget.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub timeout_extension_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_age_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2242,6 +2263,19 @@ pub struct WorkRequest {
     pub idempotency_key: String,
 }
 
+/// `work extend`: add `by_ms` to the execution budget of the attempt the actor holds.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkExtendRequest {
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    pub by_ms: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PersonAskRequest {
     #[serde(skip)]
@@ -2257,6 +2291,10 @@ pub struct PersonAskRequest {
     pub new_run: Option<String>,
     #[serde(default)]
     pub incarnation: Option<String>,
+    /// A structured request (`crate::person_request::StructuredRequest`). Without one, the ask
+    /// is free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
     pub idempotency_key: String,
 }
 
@@ -2269,7 +2307,26 @@ pub struct PersonStepResponse {
     pub evidence: Vec<String>,
     #[serde(default)]
     pub episode: Option<String>,
+    /// A named answer or text for a structured request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<crate::person_request::AnswerInput>,
     pub idempotency_key: String,
+}
+
+/// A person's response to an ask, as data: the typed answer when the ask was structured.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PersonAnswerView {
+    pub ask: String,
+    /// `completed` when the person answered, `cancelled` when the ask was withdrawn.
+    pub status: String,
+    pub summary: String,
+    pub respondent: String,
+    pub answered_at_unix_ms: u128,
+    /// The typed answer: `type`, `outcome`, and `id`, `label` and `text` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

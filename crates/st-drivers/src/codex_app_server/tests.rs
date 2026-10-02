@@ -413,6 +413,44 @@ fn write_fake_codex(
     path
 }
 
+/// The boot canaries' stand-in `codex` (scripts/st3-boot-canaries/stub-codex.py) answers
+/// `generate-json-schema` with these files. They must stay what this gate admits, so a change to
+/// the required methods fails here, with the command that rewrites them.
+#[test]
+fn the_boot_canary_codex_stub_schemas_are_what_the_protocol_gate_admits() {
+    let schemas = compatible_protocol_schemas();
+    let directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/st3-boot-canaries/codex-schemas");
+    for (filename, schema) in [
+        (
+            "codex_app_server_protocol.v2.schemas.json",
+            &schemas.protocol,
+        ),
+        ("ClientRequest.json", &schemas.client_requests),
+        ("ClientNotification.json", &schemas.client_notifications),
+        ("ServerRequest.json", &schemas.server_requests),
+        ("ServerNotification.json", &schemas.server_notifications),
+    ] {
+        let mut text = serde_json::to_string_pretty(schema).unwrap();
+        text.push('\n');
+        let path = directory.join(filename);
+        if std::env::var_os("ST_REGENERATE_CODEX_STUB_SCHEMAS").is_some() {
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(&path, &text).unwrap();
+        }
+        // Compare as values: key order follows the serde_json feature set of the build.
+        let stored = fs::read_to_string(&path)
+            .ok()
+            .and_then(|stored| serde_json::from_str::<Value>(&stored).ok());
+        assert_eq!(
+            stored.as_ref(),
+            Some(schema),
+            "{filename} is stale: run `ST_REGENERATE_CODEX_STUB_SCHEMAS=1 cargo test -p st-drivers \
+             the_boot_canary_codex_stub_schemas` and commit scripts/st3-boot-canaries/codex-schemas"
+        );
+    }
+}
+
 #[test]
 fn protocol_schema_gate_accepts_a_compatible_release_and_rejects_shape_drift() {
     let tmp = tempfile::tempdir().unwrap();
