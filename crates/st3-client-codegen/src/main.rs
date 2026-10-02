@@ -485,6 +485,7 @@ fn validate_surfaces(
         "SubjectDefinition",
         "UsagePeriod",
         "UsageRow",
+        "UsageLimit",
         "LaunchPreview",
         "MissionRunSummary",
         "AgentQueue",

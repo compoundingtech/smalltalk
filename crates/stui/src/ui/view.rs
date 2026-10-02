@@ -60,6 +60,9 @@ pub struct World {
     /// usage screen yet.
     #[serde(skip)]
     pub usage: Load<Vec<st3_client::UsageRow>>,
+    /// Each account's freshest limits reading, from the same read.
+    #[serde(skip)]
+    pub usage_limits: Vec<st3_client::UsageLimit>,
 }
 
 // ------------------------------------------------------------------ attention

@@ -140,7 +140,7 @@ enum Fetched {
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
     /// Token spend over a period of this many hours, or why st could not say.
-    Usage(u64, Result<Vec<st3_client::UsageRow>, String>),
+    Usage(u64, Result<st3_client::UsagePeriod, String>),
     Devices(Collection),
     /// A send finished: the pending token and st's message id, or why it failed and whether st's
     /// answer is unknown.
@@ -481,7 +481,7 @@ pub fn run(context: Context) -> Result<()> {
                     usage_reading = false;
                     if hours == ui.usage_hours {
                         match outcome {
-                            Ok(rows) => model.usage = Some(Ok(rows)),
+                            Ok(period) => model.usage = Some(Ok(period)),
                             // Rows already shown stay; a passing failure is only mentioned.
                             Err(why) if matches!(model.usage, Some(Ok(_))) => {
                                 ui.flash(format!("Could not read usage again: {why}"))
@@ -629,7 +629,7 @@ pub fn run(context: Context) -> Result<()> {
                     let outcome = client
                         .usage_period(Some(since), None)
                         .await
-                        .map(|envelope| envelope.value.rows)
+                        .map(|envelope| envelope.value)
                         .map_err(|error| usage_error(&error));
                     let _ = tx.send(Fetched::Usage(hours, outcome));
                 });

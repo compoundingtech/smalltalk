@@ -2700,7 +2700,8 @@ impl Ui {
                 self.follow_latest();
                 self.scroll_main(100_000);
             }
-            KeyCode::Char('s') => self.sidebar = !self.sidebar,
+            // Classic's list; in spaces only Ctrl+S has a sidebar.
+            KeyCode::Char('s') if self.glasses.is_none() => self.sidebar = !self.sidebar,
             KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
             KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
             KeyCode::Char('/') if self.tab == 1 => {
@@ -3953,6 +3954,7 @@ impl Ui {
                 self.world.missions = full.missions.clone();
                 self.world.machines = full.machines.clone();
                 self.world.usage = full.usage.clone();
+                self.world.usage_limits = full.usage_limits.clone();
                 self.world.worktrees = full.worktrees.clone();
                 self.world.conversations = full.conversations;
                 if let Some(Load::Ready(entries)) = self
