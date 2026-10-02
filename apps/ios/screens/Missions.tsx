@@ -147,11 +147,11 @@ export function NewMissionScreen({ navigation }: RootScreen<'NewMission'>) {
       <T soft>Say what you want. A planner turns it into a proposed mission, which appears on Home for you to approve; nothing runs before that.</T>
       <Field placeholder="title" value={title} onChangeText={setTitle} />
       <Field placeholder="what should be done?" multiline value={request} onChangeText={setRequest} />
-      <Field placeholder="workspace on the target machine" autoCapitalize="none" value={workspace} onChangeText={setWorkspace} />
+      <Field placeholder="workspace on the target machine" autoCapitalize="none" autoCorrect={false} spellCheck={false} value={workspace} onChangeText={setWorkspace} />
       <SectionHeader title="planner" />
       <SegmentedControl values={PLANNERS} selectedIndex={PLANNERS.indexOf(provider)} onChange={event => setProvider(PLANNERS[event.nativeEvent.selectedSegmentIndex])} appearance="dark" style={{ marginTop: 4 }} />
-      <Field placeholder="model (optional)" autoCapitalize="none" value={model} onChangeText={setModel} />
-      <Field placeholder="effort (optional)" autoCapitalize="none" value={effort} onChangeText={setEffort} />
+      <Field placeholder="model (optional)" autoCapitalize="none" autoCorrect={false} spellCheck={false} value={model} onChangeText={setModel} />
+      <Field placeholder="effort (optional)" autoCapitalize="none" autoCorrect={false} spellCheck={false} value={effort} onChangeText={setEffort} />
       <Button label="create launch" disabled={busy || !ready} onPress={() => void actions.createLaunch({ title: title.trim(), request: request.trim(), workspace: workspace.trim(), provider, model: model.trim() || undefined, effort: effort.trim() || undefined }).then(done => { if (done) navigation.goBack(); })} />
     </ScrollView>
   </Screen>;
