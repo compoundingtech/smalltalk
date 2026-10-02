@@ -125,6 +125,12 @@ function pingId(text: string): string | undefined {
  * `delivered`, and the mail itself says it arrived.
  */
 export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<string> = new Set(), delivered: Set<string> = new Set()): Body[] {
+  // A harness that ran out of context continues from a summary written as the person's turn: the
+  // agent's own notes, kilobytes long. One folded line that opens like a tool call, as stui shows it.
+  if (isUser && raw.includes('This session is being continued from a previous conversation')) {
+    const output = raw.replace(/\r\n/g, '\n').split('\n').filter(line => !/^\s*<[A-Za-z0-9_-]+\/>\s*$/.test(line));
+    return [{ kind: 'tool', title: 'context summary · the conversation was compacted', state: 'ok', output }];
+  }
   const text = { value: raw.replace(/\r\n/g, '\n') };
   const bodies: Body[] = [];
   for (const block of takeBlocks(text, 'task-notification')) {
