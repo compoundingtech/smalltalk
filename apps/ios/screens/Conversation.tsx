@@ -66,6 +66,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const [listening, setListening] = useState(false), [heard, setHeard] = useState(''), [levels, setLevels] = useState<number[]>([]);
   const [dictated, setDictated] = useState(false);
   const stopListening = useRef<(() => Promise<string>) | null>(null);
+  // Leaving the conversation while listening stops it, so the microphone and other audio are freed.
+  useEffect(() => () => { const stop = stopListening.current; stopListening.current = null; void stop?.(); }, []);
   const canDictate = useMemo(() => dictationAvailable(), []);
   // How far from the newest entry the list is scrolled (it is inverted: 0 is the newest).
   const offset = useRef(0);
