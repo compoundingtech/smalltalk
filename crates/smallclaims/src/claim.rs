@@ -89,6 +89,10 @@ pub struct ReplicaBatch {
 pub struct ReplicaEnvelopePayload {
     pub batch: ReplicaBatch,
     pub blobs: BTreeMap<String, Vec<u8>>,
+    /// The signatures of the batch's claims, by claim ID. Older builds neither write nor read
+    /// it; they relay the payload bytes unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub claim_signatures: BTreeMap<String, crate::principal::ClaimSignature>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -65,6 +65,9 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `graph_generation` | Local | Local cache invalidation counter; same graph can have different mutation counts. |
 | `projection_digest_repaired_claims` | Local | Repair exclusion cache over known original claim identities. Repair meaning and replacements are covered by shared claims; raw originals remain authenticated envelope history and do not contribute to source or operation projections. |
 | `replica_envelope_signatures` | Shared storage, with stated local fields | Shared signed envelope identity/member-key/signature; stored_at is local receipt time. Authority/signature inventory is distinct from outcome projection digests. |
+| `claim_signatures` | Shared storage | Each claim's signature exactly as its envelope payload carried it; written once at sealing or admission, never rewritten. Covered by the envelope hash and writer signature, so it adds nothing to any digest. |
+| `claim_verdicts`, `claim_verdict_links`, `claim_verdict_queue`, `claim_verdict_fresh` | Local cache | Signature verdicts folded from admitted claims in canonical order; never synced, outside every digest, rebuilt by `recheck_claim_verdicts`. |
+| `held_keys` | Local | Which principal each key this node holds belongs to, and its delegation chain; the private keys are files in `STATE/keys`. |
 | `fleet_invite_tokens` | Local | Local invite secret/redemption attempt/authorization bookkeeping; fleet.invite-* lifecycle claims are shared. |
 | `replica_envelope_holds` | Local | Local validation/fencing hold state and observation time. |
 | `checkpoint_envelopes` | Shared storage, with stated local fields | Shared immutable dropped-envelope identity. Live and trimmed nodes represent the same inventory using envelopes versus tombstones, so digest their logical union rather than treating trim progress as divergence. |

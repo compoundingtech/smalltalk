@@ -4515,7 +4515,12 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         st_runtime::priority_report(&observations)
     });
     let token = crate::resource::github_token().await;
-    let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
+    let mut report = tokio::task::spawn_blocking(move || {
+        // This node's claims are signed as their batches are sealed; seal them so the
+        // signature counts cover everything written so far.
+        state.store.seal_local_batches().map_err(ApiError::internal)?;
+        doctor_report(&state)
+    })
         .await
         .map_err(ApiError::internal)??
         .0;
@@ -4853,6 +4858,23 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+/// How many claims' signatures verify. Verdicts are recorded, not enforced: a held or invalid
+/// one warns, and unsigned claims (written before signing, or by an older build) are counted.
+fn claim_signatures_check(counts: &std::collections::BTreeMap<String, u64>) -> DoctorCheck {
+    let count = |verdict: &str| counts.get(verdict).copied().unwrap_or_default();
+    let (held, invalid) = (count("held"), count("invalid"));
+    DoctorCheck {
+        name: "claim-signatures".into(),
+        status: if held + invalid == 0 { "pass" } else { "warn" }.into(),
+        message: format!(
+            "{} verified, {} unsigned, {} not yet sealed, {held} waiting for a delegation, {invalid} invalid",
+            count("verified"),
+            count("unsigned"),
+            count("unsealed"),
+        ),
+    }
+}
+
 fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     const LISTED: usize = 20;
     let mut listed = unresolved.iter().take(LISTED).cloned().collect::<Vec<_>>();
@@ -4930,6 +4952,14 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }),
         Err(error) => checks.push(DoctorCheck {
             name: "claim-store".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        }),
+    }
+    match state.store.claim_verdict_counts() {
+        Ok(counts) => checks.push(claim_signatures_check(&counts)),
+        Err(error) => checks.push(DoctorCheck {
+            name: "claim-signatures".into(),
             status: "fail".into(),
             message: error.to_string(),
         }),
