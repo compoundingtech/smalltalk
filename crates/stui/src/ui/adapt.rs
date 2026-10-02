@@ -169,6 +169,11 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         ),
         conversations: extras.conversations.clone(),
         quiet_missions: quiet,
+        usage: match &model.usage {
+            Some(Ok(rows)) => Load::Ready(rows.clone()),
+            Some(Err(why)) => Load::Failed(why.clone()),
+            None => Load::Loading,
+        },
     }
 }
 

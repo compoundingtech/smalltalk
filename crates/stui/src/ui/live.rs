@@ -112,6 +112,23 @@ struct Following {
     incarnation: String,
 }
 
+/// How often usage on screen is read again.
+const USAGE_EVERY: Duration = Duration::from_secs(60);
+
+/// Why usage could not be read, saying so plainly when the daemon predates the read.
+fn usage_error(error: &st3_client::ClientError) -> String {
+    match error {
+        // A daemon from before the read answers its path with a bare 404.
+        st3_client::ClientError::Api(st3_client::ErrorCode::NotFound, _, _) => {
+            "This st does not serve usage yet: its daemon needs an update.".into()
+        }
+        st3_client::ClientError::Protocol(message) if message.starts_with("HTTP 404") => {
+            "This st does not serve usage yet: its daemon needs an update.".into()
+        }
+        error => format!("Could not read usage: {}", error.plain()),
+    }
+}
+
 enum Fetched {
     Read(String, Result<(), String>),
     Preview(String, Load<MissionPreview>),
@@ -122,6 +139,8 @@ enum Fetched {
     Sessions(Collection),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
+    /// Token spend over a period of this many hours, or why st could not say.
+    Usage(u64, Result<Vec<st3_client::UsageRow>, String>),
     Devices(Collection),
     /// A send finished: the pending token and st's message id, or why it failed and whether st's
     /// answer is unknown.
@@ -263,6 +282,9 @@ pub fn run(context: Context) -> Result<()> {
     let mut reattach_tries = 0_u32;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
+    // When usage was last asked for and over how many hours, and whether that read is out.
+    let mut usage_read: Option<(Instant, u64)> = None;
+    let mut usage_reading = false;
     let mut last_cache_save = Instant::now();
     // A closed terminal ends the loop: without this check a detached stui spins and keeps
     // polling the daemon forever.
@@ -455,6 +477,19 @@ pub fn run(context: Context) -> Result<()> {
                     model.sessions = native;
                 }
                 Fetched::Machines(machines) => model.machines = machines,
+                Fetched::Usage(hours, outcome) => {
+                    usage_reading = false;
+                    if hours == ui.usage_hours {
+                        match outcome {
+                            Ok(rows) => model.usage = Some(Ok(rows)),
+                            // Rows already shown stay; a passing failure is only mentioned.
+                            Err(why) if matches!(model.usage, Some(Ok(_))) => {
+                                ui.flash(format!("Could not read usage again: {why}"))
+                            }
+                            Err(why) => model.usage = Some(Err(why)),
+                        }
+                    }
+                }
                 Fetched::Devices(devices) => model.devices = devices,
                 Fetched::GlassSaved { id, key, outcome } => ui.glass_saved(&id, &key, outcome),
                 Fetched::AgentStarted(id) => ui.agent_started(id),
@@ -569,6 +604,34 @@ pub fn run(context: Context) -> Result<()> {
                             }
                         });
                     }
+                });
+            }
+        }
+        // Usage has no stream: it is read while something shows it, again each minute, and at
+        // once over a new period.
+        if let Some(hours) = ui.usage_wanted() {
+            let new_period = usage_read.is_some_and(|(_, read)| read != hours);
+            if new_period {
+                model.usage = None;
+                changed = true;
+            }
+            let due = usage_read.is_none_or(|(at, _)| at.elapsed() >= USAGE_EVERY) || new_period;
+            if due && !usage_reading {
+                usage_read = Some((Instant::now(), hours));
+                usage_reading = true;
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                runtime.spawn(async move {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_millis() as u64);
+                    let since = now.saturating_sub(hours * 3_600_000);
+                    let outcome = client
+                        .usage_period(Some(since), None)
+                        .await
+                        .map(|envelope| envelope.value.rows)
+                        .map_err(|error| usage_error(&error));
+                    let _ = tx.send(Fetched::Usage(hours, outcome));
                 });
             }
         }

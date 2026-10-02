@@ -71,6 +71,9 @@ pub struct Model {
     last_observation_refresh: Option<std::time::Instant>,
     #[serde(skip)]
     last_work_history_refresh: Option<std::time::Instant>,
+    /// Token spend over the Usage tab's period, read while something shows it, or why not.
+    #[serde(skip)]
+    pub usage: Option<std::result::Result<Vec<st3_client::UsageRow>, String>>,
 }
 
 impl Model {

@@ -55,6 +55,11 @@ pub struct World {
     pub conversations: BTreeMap<String, Load<Vec<Entry>>>,
     /// Missions nobody needs the person for, counted so Home can say what it is not showing.
     pub quiet_missions: usize,
+    /// Token spend over the Usage tab's period: one row per agent, mission run, step, model,
+    /// account and host, as st reports it. Not in the shared demo world: the phone has no
+    /// usage screen yet.
+    #[serde(skip)]
+    pub usage: Load<Vec<st3_client::UsageRow>>,
 }
 
 // ------------------------------------------------------------------ attention

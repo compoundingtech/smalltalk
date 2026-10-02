@@ -22,6 +22,7 @@ mod pty;
 pub mod screens;
 pub mod text;
 pub mod theme;
+mod usage;
 // The live client fills the variants and fields the demo does not use.
 #[allow(dead_code)]
 pub mod view;
@@ -229,11 +230,11 @@ struct ChatState {
 pub struct Ui {
     world: World,
     tab: usize,
-    selected: [usize; 5],
-    list_top: RefCell<[usize; 5]>,
+    selected: [usize; 6],
+    list_top: RefCell<[usize; 6]>,
     /// The selection each sidebar last scrolled into view. The wheel may scroll away from
     /// the selection; only a new selection brings it back.
-    list_follows: RefCell<[Option<usize>; 5]>,
+    list_follows: RefCell<[Option<usize>; 6]>,
     conversation_state: st3_conversation_ui::State,
     cache: conversation::Cache,
     editing: bool,
@@ -258,6 +259,9 @@ pub struct Ui {
     kdl: bool,
     /// Agents and Missions list as the graph's path tree instead of grouped by state.
     tree: bool,
+    /// What the Usage tab groups by, and over how many hours.
+    usage_by: usage::By,
+    pub(crate) usage_hours: u64,
     /// An attached terminal shown in place of the conversation.
     pub(crate) terminal: Option<TerminalView>,
     /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
@@ -322,9 +326,9 @@ impl Ui {
         Self {
             world,
             tab: 0,
-            selected: [0; 5],
-            list_top: RefCell::new([0; 5]),
-            list_follows: RefCell::new([None; 5]),
+            selected: [0; 6],
+            list_top: RefCell::new([0; 6]),
+            list_follows: RefCell::new([None; 6]),
             conversation_state: st3_conversation_ui::State::default(),
             cache: conversation::Cache::default(),
             editing: false,
@@ -345,6 +349,8 @@ impl Ui {
             details: true,
             kdl: false,
             tree: false,
+            usage_by: usage::By::default(),
+            usage_hours: usage::PERIODS[0],
             terminal: None,
             terminal_confirm: None,
             new_mission: None,
@@ -411,6 +417,34 @@ impl Ui {
         }
         targets.truncate(crate::feed::MAX_CONVERSATIONS);
         targets
+    }
+
+    /// Usage grouped by the next dimension: agent, mission, step, model, account, host.
+    pub(crate) fn usage_by_next(&mut self) {
+        self.usage_by = self.usage_by.next();
+        self.selected[4] = 0;
+        if let Some(glasses) = self.glasses.as_mut() {
+            glasses.sidebar.selected[4] = 0;
+        }
+    }
+
+    /// Usage over the next period (a day, a week, thirty days); it is read again at once.
+    pub(crate) fn usage_period_next(&mut self) {
+        self.usage_hours = usage::next_period(self.usage_hours);
+        self.world.usage = Load::Loading;
+        self.flash(format!(
+            "Usage over {}",
+            usage::period_name(self.usage_hours)
+        ));
+    }
+
+    /// The period to read usage over while something on screen shows it, or `None`.
+    pub(crate) fn usage_wanted(&self) -> Option<u64> {
+        let shown = match &self.glasses {
+            Some(glasses) => glasses.shows_usage(),
+            None => self.tab == 4,
+        };
+        shown.then_some(self.usage_hours)
     }
 
     /// Details beside the conversation, or in its place when the pane is too narrow for both.
@@ -696,6 +730,7 @@ impl Ui {
             2 if self.tree => screens::missions_tree(&self.world, self.spinner(), self.system),
             2 => screens::missions_list(&self.world, self.spinner(), self.system),
             3 => screens::fleet_list(&self.world),
+            4 => usage::list(&self.world, self.usage_by, self.usage_hours),
             _ => screens::worktrees_list(&self.world),
         }
     }
@@ -887,7 +922,7 @@ impl Ui {
                 );
                 x += text::width(&badge) as u16;
             }
-            if index == 4 {
+            if index == 5 {
                 // The graph has no worktrees yet; this tab shows invented data and says so.
                 buf.set_stringn(
                     x,
@@ -1007,7 +1042,7 @@ impl Ui {
                     vec![("ctrl+k", "open"), ("[ ]", "tabs"), ("ctrl+w", "close")]
                 }
                 Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
-                None => vec![("1-4", "tabs"), ("↑↓", "select")],
+                None => vec![("1-5", "tabs"), ("↑↓", "select")],
             };
             match self.tab {
                 0 => hints.extend([("keys", "on the card"), ("c", "write")]),
@@ -1399,6 +1434,7 @@ impl Ui {
             2 if self.kdl => Pane::Declaration(id),
             2 => Pane::Mission(id),
             3 => Pane::Machine(id.map(|name| format!("machine/{name}"))),
+            4 => Pane::Usage(id),
             _ => Pane::Worktree(id),
         }
     }
@@ -1469,6 +1505,7 @@ impl Ui {
             Pane::Worktree(id) => {
                 screens::worktree_detail(&self.world, id.as_deref(), width, self.spinner())
             }
+            Pane::Usage(id) => usage::detail(&self.world, id.as_deref(), self.usage_hours, width),
         };
         self.pane(buf, &pane.key(), area, doc, false);
     }
@@ -2271,7 +2308,7 @@ impl Ui {
         inner.blank();
         inner.section("keys", None, w);
         for (key, meaning) in [
-            ("1-4 or click", "switch tabs"),
+            ("1-5 or click", "switch tabs"),
             ("↑↓ j k or click", "select in the list"),
             ("wheel pgup pgdn", "scroll the pane under the pointer"),
             ("end", "jump to the newest message and follow it"),
@@ -2279,6 +2316,7 @@ impl Ui {
             ("o", "expand or collapse tool output"),
             ("c", "write: a message, feedback, a reply"),
             ("s", "hide the sidebar"),
+            ("b p", "Usage: group by agent, mission, step...; change the period"),
             ("q", "quit"),
         ] {
             inner.line(Line::from(vec![
@@ -2623,7 +2661,10 @@ impl Ui {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Char(digit @ '1'..='4') => self.switch_tab(digit as usize - '1' as usize),
+            // Without Ctrl: Ctrl+5 is how terminals send Ctrl+], which attaches.
+            KeyCode::Char(digit @ '1'..='5') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.switch_tab(digit as usize - '1' as usize)
+            }
             KeyCode::Tab => self.switch_tab((self.tab + 1) % TABS.len()),
             KeyCode::BackTab => self.switch_tab((self.tab + TABS.len() - 1) % TABS.len()),
             KeyCode::Up | KeyCode::Char('k') => {
@@ -2664,6 +2705,8 @@ impl Ui {
                 }
             }
             KeyCode::Char('i') if self.tab == 1 => self.toggle_details(),
+            KeyCode::Char('b') if self.tab == 4 => self.usage_by_next(),
+            KeyCode::Char('p') if self.tab == 4 => self.usage_period_next(),
             KeyCode::Char('t') if matches!(self.tab, 1 | 2) => {
                 let id = self.selected_id();
                 self.tree = !self.tree;
@@ -3892,6 +3935,7 @@ impl Ui {
             if stage >= 3 {
                 self.world.missions = full.missions.clone();
                 self.world.machines = full.machines.clone();
+                self.world.usage = full.usage.clone();
                 self.world.worktrees = full.worktrees.clone();
                 self.world.conversations = full.conversations;
                 if let Some(Load::Ready(entries)) = self

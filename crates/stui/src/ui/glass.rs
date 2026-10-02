@@ -93,7 +93,7 @@ enum Drop {
 }
 
 /// The sidebar's sections, what the number keys were in the old stui.
-pub(crate) const SIDEBAR_SECTIONS: [&str; 4] = ["Home", "Agents", "Missions", "Fleet"];
+pub(crate) const SIDEBAR_SECTIONS: [&str; 5] = ["Home", "Agents", "Missions", "Fleet", "Usage"];
 
 /// The Ctrl+S sidebar. It keeps its section and each section's selection while hidden.
 #[derive(Clone, Debug)]
@@ -102,7 +102,7 @@ pub(crate) struct Sidebar {
     /// It has the keys: the arrows move through it and Enter opens.
     pub(crate) focused: bool,
     pub(crate) section: usize,
-    pub(crate) selected: [usize; 4],
+    pub(crate) selected: [usize; 5],
 }
 
 impl Default for Sidebar {
@@ -111,7 +111,7 @@ impl Default for Sidebar {
             shown: false,
             focused: false,
             section: 1,
-            selected: [0; 4],
+            selected: [0; 5],
         }
     }
 }
@@ -291,6 +291,17 @@ impl Glasses {
     }
     /// The agents whose conversations show in the shown glass: each group's shown tab, the
     /// focused group first.
+    /// Whether usage is on screen: the sidebar's Usage section or a usage tab in front.
+    pub(crate) fn shows_usage(&self) -> bool {
+        if self.sidebar.shown && self.sidebar.section == 4 {
+            return true;
+        }
+        let glass = self.glass();
+        (0..glass.layout.groups().len())
+            .filter_map(|index| glass.shown(index))
+            .any(|tab| matches!(Pane::parse(&tab.pane), Some(Pane::Usage(_))))
+    }
+
     pub(crate) fn shown_agents(&self) -> Vec<String> {
         let glass = self.glass();
         let count = glass.layout.groups().len();
@@ -902,17 +913,31 @@ impl Ui {
         buf.set_style(area, Style::default().bg(theme::MANTLE));
         self.frame.borrow_mut().glass_sidebar = area;
         let mut spans = vec![Span::raw(" ")];
-        for (index, name) in SIDEBAR_SECTIONS.iter().enumerate() {
-            let label = match index {
-                0 => {
-                    let count = self.world.attention.items().len();
-                    if count > 0 {
-                        format!(" {name} ◆{count} ")
-                    } else {
-                        format!(" {name} ")
-                    }
+        let names = SIDEBAR_SECTIONS
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let count = self.world.attention.items().len();
+                if index == 0 && count > 0 {
+                    format!("{name} ◆{count}")
+                } else {
+                    name.to_string()
                 }
-                _ => format!(" {name} "),
+            })
+            .collect::<Vec<_>>();
+        // Each section padded when they all fit; in a narrow sidebar only the chosen one is.
+        let roomy = 1 + names
+            .iter()
+            .map(|name| text::width(name) + 2)
+            .sum::<usize>()
+            <= area.width as usize;
+        for (index, name) in names.iter().enumerate() {
+            let label = if roomy || index == sidebar.section {
+                format!(" {name} ")
+            } else if index + 1 == sidebar.section {
+                name.clone()
+            } else {
+                format!("{name} ")
             };
             let style = if index == sidebar.section {
                 if sidebar.focused {
@@ -1228,10 +1253,14 @@ impl Ui {
 
     /// Open `id` where a drag from the sidebar let go: as a tab in a strip, or in a new split.
     fn drop_subject(&mut self, id: &str, target: Drop) {
-        let pane = pane_for(id).or_else(|| {
-            let section = self.glasses.as_ref()?.sidebar.section;
-            (section == 3).then(|| Pane::Machine(Some(format!("machine/{id}"))))
-        });
+        let section = self.glasses.as_ref().map(|glasses| glasses.sidebar.section);
+        let pane = if section == Some(4) {
+            Some(Pane::Usage(Some(id.to_owned())))
+        } else {
+            pane_for(id).or_else(|| {
+                (section == Some(3)).then(|| Pane::Machine(Some(format!("machine/{id}"))))
+            })
+        };
         let Some(pane) = pane else { return };
         if let Some(glasses) = self.glasses.as_mut() {
             glasses.sidebar.focused = false;
@@ -1404,6 +1433,9 @@ impl Ui {
             // What needs you opens where it is answered: Home, at that item.
             self.open_home();
             self.selected[0] = sidebar.selected[0];
+        } else if sidebar.section == 4 {
+            // A usage row opens its spend in detail, not the agent or mission it names.
+            self.open_in_glass(Pane::Usage(Some(id)), Open::Tab);
         } else if let Some(pane) = pane_for(&id) {
             self.open_in_glass(pane, Open::Tab);
         } else if sidebar.section == 3 {
@@ -1437,11 +1469,17 @@ impl Ui {
             }
             KeyCode::Home if !control => *selected = 0,
             KeyCode::End if !control => *selected = count.saturating_sub(1),
-            KeyCode::Left | KeyCode::BackTab => sidebar.section = (section + 3) % 4,
-            KeyCode::Right | KeyCode::Tab => sidebar.section = (section + 1) % 4,
-            KeyCode::Char(digit @ '1'..='4') if !control => {
+            KeyCode::Left | KeyCode::BackTab => {
+                sidebar.section = (section + SIDEBAR_SECTIONS.len() - 1) % SIDEBAR_SECTIONS.len()
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                sidebar.section = (section + 1) % SIDEBAR_SECTIONS.len()
+            }
+            KeyCode::Char(digit @ '1'..='5') if !control => {
                 sidebar.section = digit as usize - '1' as usize
             }
+            KeyCode::Char('b') if section == 4 && !control => self.usage_by_next(),
+            KeyCode::Char('p') if section == 4 && !control => self.usage_period_next(),
             KeyCode::Enter => self.open_from_sidebar(),
             // The glass's own keys (Ctrl+K, Ctrl+T...) still work; nothing else reaches a pane.
             _ if control => return false,
@@ -1568,6 +1606,8 @@ impl Ui {
                     theme::dim(),
                 );
             }
+            // A usage tab names its group whatever the list groups by, so it draws from its key.
+            Some(pane @ Pane::Usage(_)) => self.draw_pane(buf, content, &pane),
             Some(_) if focused => self.draw_main(buf, content),
             Some(pane) => self.draw_pane(buf, content, &pane),
         }
@@ -1917,6 +1957,8 @@ impl Ui {
                     .unwrap_or(id)
             }
             Pane::Machine(id) => find(id).trim_start_matches("machine/").to_owned(),
+            Pane::Usage(None) => "Usage".into(),
+            Pane::Usage(Some(id)) => format!("Usage · {}", super::usage::label(&self.world, id)),
             other => other.key(),
         }
     }
@@ -3034,6 +3076,7 @@ fn pane_subject(pane: &Pane) -> Option<(usize, Option<String>)> {
         Pane::Terminal(id) => (1, Some(id.clone())),
         Pane::Mission(id) | Pane::Declaration(id) => (2, id.clone()),
         Pane::NewAgent => (1, None),
+        Pane::Usage(id) => (4, id.clone()),
         Pane::Machine(id) => (
             3,
             id.as_deref()
@@ -3462,6 +3505,31 @@ mod tests {
             Some(shell)
         );
         assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
+    fn a_usage_row_opens_its_spend_in_a_tab_whatever_the_list_groups_by() {
+        let mut ui = glass();
+        assert_eq!(ui.usage_wanted(), None, "nothing shows usage yet");
+        ctrl(&mut ui, 's');
+        press(&mut ui, KeyCode::Char('5'), KeyModifiers::NONE);
+        assert_eq!(ui.usage_wanted(), Some(24));
+        press(&mut ui, KeyCode::Char('b'), KeyModifiers::NONE);
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        let usage = "usage:mission/fleet/atlas/store-move";
+        assert!(
+            tabs(&ui).2.iter().flatten().any(|key| key == usage),
+            "{:?}",
+            tabs(&ui)
+        );
+        // Grouped by agent again, the tab still shows the mission it opened on.
+        ui.usage_by_next();
+        let shown = screen(&ui);
+        assert!(shown.contains("$58.20 API-equivalent"), "{shown}");
+        assert!(
+            ui.usage_wanted().is_some(),
+            "an open usage tab keeps usage read"
+        );
     }
 
     #[test]
