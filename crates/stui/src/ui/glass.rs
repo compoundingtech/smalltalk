@@ -1499,16 +1499,19 @@ impl Ui {
         true
     }
 
-    /// Home over the glass: its list and cards, as large as the glass allows, keys and all.
+    /// Home over the glass: its list and cards, keys and all, inset from the edges with the glass
+    /// dimmed behind it so it reads as floating (Nathan, 2026-10-02).
     fn draw_home_popover(&self, buf: &mut Buffer, body: Rect) {
-        let rect = Rect {
-            x: body.x + 2,
-            y: body.y + 1,
-            width: body.width.saturating_sub(4),
-            height: body.height.saturating_sub(2),
-        };
+        let rect = home_popover_rect(body);
         if rect.width < 30 || rect.height < 8 {
             return;
+        }
+        for y in body.y..body.y + body.height {
+            for x in body.x..body.x + body.width {
+                if !rect.contains((x, y).into()) {
+                    buf[(x, y)].set_fg(theme::SURFACE2).set_bg(theme::CRUST);
+                }
+            }
         }
         buf.set_style(rect, Style::default().bg(theme::BASE).fg(theme::TEXT));
         for y in rect.y..rect.y + rect.height {
@@ -3206,6 +3209,19 @@ pub(crate) fn pane_for(id: &str) -> Option<Pane> {
     }
 }
 
+/// Where Home floats over a glass of this size: a margin that grows with the glass, from 2 columns
+/// and 1 row on a small one up to 8 columns and 3 rows.
+fn home_popover_rect(body: Rect) -> Rect {
+    let side = (body.width / 12).clamp(2, 8);
+    let top = (body.height / 12).clamp(1, 3);
+    Rect {
+        x: body.x + side,
+        y: body.y + top,
+        width: body.width.saturating_sub(side * 2),
+        height: body.height.saturating_sub(top * 2),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4540,6 +4556,17 @@ mod tests {
             )),
             "{:?}",
             ui.effects
+        );
+    }
+
+    #[test]
+    fn home_floats_clear_of_the_edges() {
+        let wide = home_popover_rect(Rect::new(0, 1, 200, 50));
+        assert_eq!((wide.x, wide.y, wide.width, wide.height), (8, 4, 184, 44));
+        let small = home_popover_rect(Rect::new(0, 1, 80, 24));
+        assert_eq!(
+            (small.x, small.y, small.width, small.height),
+            (6, 3, 68, 20)
         );
     }
 
