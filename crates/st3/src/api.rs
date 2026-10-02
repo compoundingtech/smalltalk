@@ -1070,7 +1070,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "answer-required"
         | "unsupported-person-request"
         | "missing-ask-owner"
-        | "ambiguous-ask-owner" => "validation-failed".into(),
+        | "ambiguous-ask-owner"
+        | "update-not-asked" => "validation-failed".into(),
         "stale-work-ask"
         | "stale-subject"
         | "missing-subject-token"
@@ -2529,8 +2530,16 @@ fn client_attention_resources(
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
-            if let Some(request) = item.request {
-                resource["request"] = request;
+            match item.request {
+                // An update asks nothing, so it is not a `request`: a client that predates
+                // updates shows a free-text card, and any response to it reads it.
+                Some(update) if update["type"] == "update" => {
+                    resource["action_parameters"]["work.done"]["summary"] = json!("Read");
+                    resource["action_parameters"]["work.done"]["answer"] = json!({"id": "read"});
+                    resource["update"] = update;
+                }
+                Some(request) => resource["request"] = request,
+                None => {}
             }
         }
         if item.kind == "fault" {

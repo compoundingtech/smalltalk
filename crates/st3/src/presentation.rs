@@ -617,6 +617,20 @@ pub(crate) fn render_structured_request(request: &Value, style: OutputStyle) -> 
     let mut output = String::new();
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
     let list = |value: &Value| value.as_array().cloned().unwrap_or_default();
+    if request["type"] == "update" {
+        // An update asks nothing; it names where the person asked for it.
+        let _ = writeln!(
+            output,
+            "\n{}  you asked in {}",
+            style.heading("UPDATE"),
+            text(&request["about"])
+        );
+        if let Some(summary) = request["summary"].as_str() {
+            let _ = writeln!(output, "  {summary}");
+        }
+        output.push_str(&render_request_subjects(request, style));
+        return output;
+    }
     let _ = writeln!(
         output,
         "\n{}  {}",
@@ -672,7 +686,14 @@ pub(crate) fn render_structured_request(request: &Value, style: OutputStyle) -> 
             let _ = writeln!(output, "  • {}", text(&reason));
         }
     }
-    let subjects = list(&request["subjects"]);
+    output.push_str(&render_request_subjects(request, style));
+    output
+}
+
+fn render_request_subjects(request: &Value, style: OutputStyle) -> String {
+    let mut output = String::new();
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
+    let subjects = request["subjects"].as_array().cloned().unwrap_or_default();
     if !subjects.is_empty() {
         let _ = writeln!(output, "\n{}", style.heading("SUBJECTS"));
         for subject in subjects {

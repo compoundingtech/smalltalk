@@ -276,6 +276,9 @@ pub struct Attention {
     /// A person-step ask's structured request; absent on a free-text ask.
     #[serde(default)]
     pub request: Option<StructuredRequest>,
+    /// Information the person asked for; reading it clears the card.
+    #[serde(default)]
+    pub update: Option<PersonUpdate>,
     pub title: String,
     pub detail: String,
     pub priority: String,
@@ -1751,6 +1754,20 @@ pub struct StructuredRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub custom: bool,
 }
+/// Information an agent brings a person who asked for it. Nothing waits on it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct PersonUpdate {
+    pub version: u32,
+    /// `update`.
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    /// The person's mission run or step run, or their message to the agent.
+    pub about: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<RequestSubject>,
+}
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct RequestRecommendation {
     pub answer: String,
@@ -1792,7 +1809,7 @@ pub struct PersonAnswerInput {
 pub struct PersonAnswer {
     #[serde(rename = "type")]
     pub entry_type: String,
-    /// `accept`, `decline`, `request_changes`, `selected`, `custom` or `feedback`.
+    /// `accept`, `decline`, `request_changes`, `selected`, `custom`, `feedback` or `read`.
     pub outcome: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

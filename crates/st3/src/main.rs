@@ -2846,6 +2846,8 @@ struct AttentionWithdrawArgs {
 enum WorkCommand {
     /// Ask a person through a runtime step owned by live work.
     Ask(WorkAskArgs),
+    /// Bring a person information they asked for. Nothing waits on it; it clears once read.
+    Update(WorkUpdateArgs),
     /// Complete a person-assigned step with a response.
     Done(WorkDoneArgs),
     /// Cancel your own ask and resume its live origin.
@@ -2926,6 +2928,25 @@ struct WorkAskArgs {
     actor: String,
     #[arg(long, env = "ST3_INCARNATION")]
     incarnation: Option<String>,
+    #[arg(long)]
+    idempotency_key: String,
+}
+
+#[derive(Args)]
+struct WorkUpdateArgs {
+    #[arg(long = "for")]
+    person: String,
+    /// Where the person asked for this: their own mission run or step run, or their message to
+    /// you. An update about anything else is refused.
+    #[arg(long, value_name = "RUN|STEP|MESSAGE")]
+    about: String,
+    #[arg(long)]
+    title: String,
+    /// The information itself.
+    #[arg(long)]
+    body: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
     #[arg(long)]
     idempotency_key: String,
 }
@@ -11015,14 +11036,38 @@ async fn run_attention(
                     format!("attention item `{normalized}` is not currently actionable")
                 })?;
             if json_output {
-                print_value(&item, true)
+                print_value(&item, true)?;
             } else {
                 print!(
                     "{}",
                     render_attention_show(&item, OutputStyle::stdout(), now_ms())
                 );
-                Ok(())
             }
+            // The person opening an update reads it, which clears it from their home. An agent
+            // seat looking at the person's home reads nothing for them.
+            if item.request.as_ref().is_some_and(|r| r["type"] == "update")
+                && item.person == actor
+                && std::env::var_os("ST_AGENT").is_none()
+            {
+                let _: StepRunView = client
+                    .post(
+                        "/v1/work/done",
+                        &PersonStepResponse {
+                            subject: item.subject.clone(),
+                            actor: actor.clone(),
+                            summary: String::new(),
+                            evidence: Vec::new(),
+                            episode: Some(item.episode.clone()),
+                            idempotency_key: format!("update-read:{}", item.episode),
+                            answer: None,
+                        },
+                    )
+                    .await?;
+                if !json_output {
+                    println!("\nRead: this update has left your home.");
+                }
+            }
+            Ok(())
         }
         AttentionCommand::Request(args) => {
             let actor = args
@@ -11135,7 +11180,8 @@ A `decision` proposes one action: exactly one `accept` answer, one `decline` ans
 one `request_changes` answer, each naming what happens next. A `choice` names 2 to 5 options,
 and `"custom": true` also takes the person's own words. `feedback` asks for text and has no
 answers. `why_person` says why no runtime fact or standing instruction settles it. Omit
-`recommendation` to make none. Subject kinds: pull_request, issue, document, mission, run,
+`recommendation` to make none. An `update` asks nothing: it names `about`, the person's own
+run or step or their message to you, and clears once read (`st work update` builds one). Subject kinds: pull_request, issue, document, mission, run,
 step, agent, host, commit, link; `revision` pins what was reviewed.
 
   {"version": 1, "type": "decision",
@@ -11189,7 +11235,7 @@ async fn run_work(
                 (Some(reason), _) => reason,
                 (None, Some(request)) => request["question"]
                     .as_str()
-                    .context("the request needs a question")?
+                    .context("the request needs a question; an update's text goes in --reason")?
                     .to_owned(),
                 (None, None) => unreachable!("clap requires --reason or --request"),
             };
@@ -11207,6 +11253,29 @@ async fn run_work(
                         incarnation: args.incarnation,
                         idempotency_key: args.idempotency_key,
                         request,
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+        WorkCommand::Update(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: StepRunView = client
+                .post(
+                    "/v1/work/ask",
+                    &PersonAskRequest {
+                        legacy_request: None,
+                        person: args.person,
+                        title: args.title,
+                        reason: args.body,
+                        actor: args.actor,
+                        step: None,
+                        new_run: None,
+                        incarnation: None,
+                        idempotency_key: args.idempotency_key,
+                        request: Some(
+                            serde_json::json!({"version": 1, "type": "update", "about": args.about}),
+                        ),
                     },
                 )
                 .await?;
