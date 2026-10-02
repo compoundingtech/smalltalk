@@ -12,6 +12,9 @@ assert.equal(plainError(new TypeError('Network request failed')), 'st cannot be 
 
 assert.ok(isTransient(refused('stale-fence')) && !isTransient(refused('not-found')));
 assert.ok(isTransientCode(undefined) && isTransientCode('page-cursor-expired') && !isTransientCode('forbidden'));
+// A terminal out of reach comes back; one whose process exited does not.
+assert.ok(isTransientCode('terminal-unavailable') && !isTransientCode('terminal-ended'));
+assert.equal(plainMessage('terminal-ended', 'the terminal process exited'), 'the terminal ended: its process exited');
 assert.ok(notApplied(refused('stale-fence')) && !notApplied(new TypeError('Network request failed')), 'a lost answer may have applied');
 
 // A race is tried again with a fresh request; a refusal is not.

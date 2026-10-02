@@ -36,6 +36,7 @@ impl Runtime for SmalltalkRuntime {
 
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
+        migrate_local_usage_seen(connection)?;
         backfill_message_index(connection)
     }
 

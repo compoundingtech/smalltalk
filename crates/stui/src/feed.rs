@@ -596,8 +596,8 @@ fn send_window(
         .is_ok()
 }
 
-/// A terminal subscription ended with an error. Transient failures attach again after a
-/// backoff; `stale-fence` means the terminal restarted, and anything else stops following.
+/// A terminal subscription ended with an error. A terminal out of reach attaches again after a
+/// backoff; one whose process exited (`terminal-ended`), or any other refusal, stops following.
 fn terminal_failed(
     updates: &mpsc::Sender<Update>,
     following: &mut Option<Following>,
@@ -610,10 +610,12 @@ fn terminal_failed(
     current.attachment_id = None;
     let plain = st3_client::plain_message(code.as_ref(), &message);
     let update = match code {
-        // st also says stale-fence when the owner is briefly out of reach or the viewer idled:
-        // follow again, and the attach itself refuses a terminal that really restarted.
+        // A daemon from before terminal-unavailable also says stale-fence when the owner is
+        // briefly out of reach or the viewer idled: follow again, and the attach itself refuses a
+        // terminal that really restarted.
         Some(
             ErrorCode::StaleFence
+            | ErrorCode::TerminalUnavailable
             | ErrorCode::Internal
             | ErrorCode::RemoteUnavailable
             | ErrorCode::RateLimited

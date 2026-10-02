@@ -1629,7 +1629,7 @@
         "api_version": { "const": "st3.client.v0" },
         "error_version": { "const": "st3.client.error.v0" },
         "request_id": { "$ref": "#/$defs/Id" },
-        "code": { "enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "internal"] },
+        "code": { "enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "internal"] },
         "message": { "type": "string" },
         "retryable": { "type": "boolean" },
         "retry_after_ms": { "type": "integer", "minimum": 0 },
