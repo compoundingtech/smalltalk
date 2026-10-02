@@ -150,10 +150,10 @@ fn pi_family_header_id(path: &Path) -> Option<String> {
 }
 
 /// The seat's own transcript of pi-family session `id`: `<time>_<id>.jsonl` in its private
-/// session directory, whose header names the same session.
-pub fn pi_family_transcript(agent_dir: &Path, id: &str) -> Option<PathBuf> {
+/// session directory `sessions`, whose header names the same session.
+pub fn pi_family_transcript(sessions: &Path, id: &str) -> Option<PathBuf> {
     let suffix = format!("_{id}.jsonl");
-    fs::read_dir(agent_dir.join("provider-sessions"))
+    fs::read_dir(sessions)
         .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -172,7 +172,7 @@ pub fn pi_family_transcript(agent_dir: &Path, id: &str) -> Option<PathBuf> {
 pub fn pi_family_argv(
     driver: &str,
     argv: Vec<String>,
-    agent_dir: &Path,
+    sessions: &Path,
     id: &str,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
@@ -189,13 +189,10 @@ pub fn pi_family_argv(
             "--no-session",
         ],
     )?;
-    let transcript = pi_family_transcript(agent_dir, id).ok_or_else(|| {
+    let transcript = pi_family_transcript(sessions, id).ok_or_else(|| {
         Refusal::new(
             "transcript-missing",
-            format!(
-                "{driver} session {id} has no transcript in {}",
-                agent_dir.join("provider-sessions").display()
-            ),
+            format!("{driver} session {id} has no transcript in {}", sessions.display()),
         )
     })?;
     Ok(match driver {
@@ -324,8 +321,8 @@ mod tests {
 
     #[test]
     fn pi_family_resume_needs_a_transcript_whose_header_names_the_session() {
-        let agent = tempfile::tempdir().unwrap();
-        let sessions = agent.path().join("provider-sessions");
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("provider-sessions");
         fs::create_dir_all(&sessions).unwrap();
         fs::write(
             sessions.join("2026-10-02_one.jsonl"),
@@ -333,7 +330,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi"]), agent.path(), "one")
+            pi_family_argv("pi", argv(&["pi"]), &sessions, "one")
                 .unwrap_err()
                 .code,
             "transcript-missing"
@@ -345,15 +342,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi", "-e", "x"]), agent.path(), "two").unwrap(),
+            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two").unwrap(),
             argv(&["pi", "--session", &path.to_string_lossy(), "-e", "x"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp"]), agent.path(), "two").unwrap(),
+            pi_family_argv("omp", argv(&["omp"]), &sessions, "two").unwrap(),
             argv(&["omp", "--resume", "two"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp", "--no-session"]), agent.path(), "two")
+            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two")
                 .unwrap_err()
                 .code,
             "authored-session-selection"

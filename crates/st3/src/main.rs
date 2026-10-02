@@ -12943,9 +12943,12 @@ async fn run_st2_native_driver(
                     &std::env::current_dir()?,
                     st3::native_resume::claude_home().as_deref(),
                 ),
-                "pi" | "omp" => {
-                    st3::native_resume::pi_family_argv(driver, argv, &paths.agent_dir, &session)
-                }
+                "pi" | "omp" => st3::native_resume::pi_family_argv(
+                    driver,
+                    argv,
+                    &paths.session_dir.join("provider-sessions"),
+                    &session,
+                ),
                 "opencode" => st3::native_resume::opencode_argv(
                     argv,
                     &session,
