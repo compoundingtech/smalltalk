@@ -141,18 +141,22 @@ impl Publisher {
         ledger::update(&self.agent_dir, |ledger| {
             ledger.end_all(outcome, reason, now)
         })?;
-        self.tick(client).await
+        self.publish_now(client, true).await
     }
 
     /// Record what changed in the ledger since the last tick.
     pub async fn tick(&mut self, client: &Client) -> Result<()> {
+        self.publish_now(client, false).await
+    }
+
+    async fn publish_now(&mut self, client: &Client, final_pass: bool) -> Result<()> {
         let now = ledger::now_ms();
         let current = ledger::update(&self.agent_dir, |ledger| {
             ledger.end_unlisted(now);
             ledger.clone()
         })?;
         let before = self.published.clone();
-        let result = self.publish(client, &current, now).await;
+        let result = self.publish(client, &current, now, final_pass).await;
         if self.published != before {
             let bytes = serde_json::to_vec(&self.published)?;
             std::fs::write(self.agent_dir.join(PUBLISHED_FILE), bytes)?;
@@ -160,7 +164,13 @@ impl Publisher {
         result
     }
 
-    async fn publish(&mut self, client: &Client, current: &Ledger, now: u64) -> Result<()> {
+    async fn publish(
+        &mut self,
+        client: &Client,
+        current: &Ledger,
+        now: u64,
+        final_pass: bool,
+    ) -> Result<()> {
         let mut failure = None;
         let unrecorded = |id: &String| {
             !self.published.open.contains_key(id) && !self.published.closed.contains(id)
@@ -203,7 +213,7 @@ impl Publisher {
                 continue;
             }
             // Its responses reach the parent's usage even when st already ended it.
-            let ended = match self.settle(ended, &mut counted, now) {
+            let ended = match self.settle(ended, &mut counted, now, final_pass) {
                 Ok(Some(ended)) => ended,
                 Ok(None) => continue,
                 Err(error) => {
@@ -269,7 +279,6 @@ impl Publisher {
                 reason: Some("the driver lost its record of this subagent".into()),
                 ended_at_ms: now,
                 tokens: None,
-                parent_usage: false,
             };
             match self.end(client, &ended).await {
                 Ok(()) => {}
@@ -288,25 +297,30 @@ impl Publisher {
                     .retain(|ended| !recorded.contains(&ended.subagent.id));
             })?;
         }
-        self.published
-            .closed
-            .retain(|id| current.running.contains_key(id) && !recorded.contains(id));
+        // A closed subagent is remembered until its end leaves the ledger.
+        self.published.closed.retain(|id| {
+            !recorded.contains(id)
+                && (current.running.contains_key(id)
+                    || current.ended.iter().any(|ended| &ended.subagent.id == id))
+        });
         failure.map_or(Ok(()), Err)
     }
 
     /// Count a Codex run's tokens from its rollout, add them to the parent's usage, and keep them
-    /// with its end, so a retried end records the same tokens. `None` until the run has settled.
+    /// with its end, so a retried end records the same tokens. `None` until the run has settled;
+    /// once its harness has exited (`final_pass`) the rollout is complete at once.
     fn settle(
         &self,
         ended: &Ended,
         counted: &mut BTreeMap<String, Tokens>,
         now: u64,
+        final_pass: bool,
     ) -> Result<Option<Ended>> {
-        if !ended.parent_usage {
+        if !ended.subagent.parent_usage {
             return Ok(Some(ended.clone()));
         }
         let waited = now.saturating_sub(ended.ended_at_ms);
-        if waited < SETTLE_MS {
+        if waited < SETTLE_MS && !final_pass {
             return Ok(None);
         }
         let id = ended.subagent.id.clone();
@@ -315,55 +329,43 @@ impl Publisher {
             Some(home) => st_drivers::codex_app_server::latest_codex_transcript_in(home, &thread)?,
             None => None,
         };
-        let Some(rollout) = rollout else {
-            if waited < ROLLOUT_WAIT_MS {
-                return Ok(None);
+        let counted_run = match (rollout, self.timeline_incarnation.as_deref()) {
+            (Some(rollout), Some(incarnation)) => {
+                let (total, model) = ledger::codex_rollout_tokens(&rollout)?;
+                let run = total.since(counted.get(&thread).copied().unwrap_or_default());
+                ledger::record_parent_usage(
+                    &self.agent_dir,
+                    &self.driver,
+                    incarnation,
+                    &id,
+                    model.as_deref(),
+                    run,
+                )?;
+                counted.insert(thread.clone(), total);
+                Some((total, run))
             }
-            // Without its rollout the run's tokens are unknown, never zero.
-            ledger::update(&self.agent_dir, |ledger| {
-                if let Some(entry) = ledger
-                    .ended
-                    .iter_mut()
-                    .find(|entry| entry.subagent.id == id)
-                {
-                    entry.parent_usage = false;
-                }
-            })?;
-            return Ok(Some(Ended {
-                parent_usage: false,
-                ..ended.clone()
-            }));
+            // Without its rollout or the parent's timeline the run's tokens are unknown, never
+            // zero. Wait a while for them.
+            _ if waited < ROLLOUT_WAIT_MS => return Ok(None),
+            _ => None,
         };
-        let Some(incarnation) = self.timeline_incarnation.as_deref() else {
-            return Ok(None);
-        };
-        let (total, model) = ledger::codex_rollout_tokens(&rollout)?;
-        let run = total.since(counted.get(&thread).copied().unwrap_or_default());
-        ledger::record_parent_usage(
-            &self.agent_dir,
-            &self.driver,
-            incarnation,
-            &id,
-            model.as_deref(),
-            run,
-        )?;
-        counted.insert(thread.clone(), total);
         ledger::update(&self.agent_dir, |ledger| {
-            ledger.counted.insert(thread, total);
+            if let Some((total, _)) = counted_run {
+                ledger.counted.insert(thread, total);
+            }
             if let Some(entry) = ledger
                 .ended
                 .iter_mut()
                 .find(|entry| entry.subagent.id == id)
             {
-                entry.tokens = Some(run);
-                entry.parent_usage = false;
+                entry.tokens = counted_run.map(|(_, run)| run);
+                entry.subagent.parent_usage = false;
             }
         })?;
-        Ok(Some(Ended {
-            tokens: Some(run),
-            parent_usage: false,
-            ..ended.clone()
-        }))
+        let mut settled = ended.clone();
+        settled.tokens = counted_run.map(|(_, run)| run);
+        settled.subagent.parent_usage = false;
+        Ok(Some(settled))
     }
 
     /// The step this seat holds now, newest first among more than one.

@@ -78,6 +78,10 @@ pub struct Subagent {
     /// Since when the harness stopped listing this subagent as running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlisted_since_ms: Option<u64>,
+    /// The parent's usage does not include this subagent's responses yet, so the driver adds its
+    /// tokens there when it counts them at its end. Claude records them itself; Codex does not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parent_usage: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,10 +97,6 @@ pub struct Ended {
     /// driver counts its transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<Tokens>,
-    /// The parent's usage does not include this subagent's responses yet, so the driver adds its
-    /// tokens there when it counts them. Claude records them itself; Codex does not.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub parent_usage: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +123,6 @@ impl Ledger {
             reason,
             ended_at_ms: at_ms,
             tokens: None,
-            parent_usage: false,
         });
         if self.ended.len() > MAX_ENDED {
             let excess = self.ended.len() - MAX_ENDED;
@@ -365,6 +364,7 @@ fn apply_claude(ledger: &mut Ledger, event: &str, payload: &Value, now: u64) {
                 session_id: session,
                 started_at_ms: now,
                 unlisted_since_ms: None,
+                parent_usage: false,
             });
         }
         "SubagentStop" => {
@@ -491,10 +491,15 @@ fn apply_codex(ledger: &mut Ledger, message: &Value, parent: &str, now: u64) {
                         started_at_ms: now,
                         transcript: None,
                         unlisted_since_ms: None,
+                        parent_usage: true,
                     });
                 }
-                Some("completed") => end_codex_run(ledger, &current, "completed", None, now),
-                Some("interrupted") => end_codex_run(ledger, &current, "interrupted", None, now),
+                Some("completed") => {
+                    ledger.end(&current, "completed", None, now);
+                }
+                Some("interrupted") => {
+                    ledger.end(&current, "interrupted", None, now);
+                }
                 _ => {}
             }
         }
@@ -516,19 +521,10 @@ fn apply_codex(ledger: &mut Ledger, message: &Value, parent: &str, now: u64) {
                     _ => continue,
                 };
                 let current = run_id(ledger, thread);
-                let reason = reason.and_then(one_line);
-                end_codex_run(ledger, &current, outcome, reason, now);
+                ledger.end(&current, outcome, reason.and_then(one_line), now);
             }
         }
         _ => {}
-    }
-}
-
-fn end_codex_run(ledger: &mut Ledger, id: &str, outcome: &str, reason: Option<String>, now: u64) {
-    if ledger.end(id, outcome, reason, now)
-        && let Some(ended) = ledger.ended.last_mut()
-    {
-        ended.parent_usage = true;
     }
 }
 
@@ -731,7 +727,7 @@ mod tests {
             "SubagentStart",
             &json!({
                 "session_id": session, "prompt_id": prompt, "agent_id": id, "agent_type": kind,
-                "transcript_path": "/home/someone/.claude/projects/p/s-1.jsonl",
+                "transcript_path": "/claude/projects/p/s-1.jsonl",
                 "hook_event_name": "SubagentStart",
             }),
             at,
@@ -761,9 +757,7 @@ mod tests {
         assert_eq!(subagent.session_id.as_deref(), Some("s-1"));
         assert_eq!(
             subagent.transcript.as_deref(),
-            Some(Path::new(
-                "/home/someone/.claude/projects/p/s-1/subagents/agent-a1.jsonl"
-            ))
+            Some(Path::new("/claude/projects/p/s-1/subagents/agent-a1.jsonl"))
         );
         assert!(ledger.launches.is_empty());
         // The prompt never enters the ledger.
@@ -931,7 +925,7 @@ mod tests {
         assert!(ledger.running.is_empty());
         assert_eq!(ledger.ended[0].outcome, "completed");
         assert!(
-            ledger.ended[0].parent_usage,
+            ledger.ended[0].subagent.parent_usage,
             "Codex leaves the parent's usage to st"
         );
         // A follow-up task to the idle thread is its second run.

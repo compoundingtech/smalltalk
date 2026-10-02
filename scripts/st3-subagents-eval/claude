@@ -7,7 +7,8 @@ payload on stdin), as Claude does, and writes Claude-format transcripts beneath
 per line, applied in order:
 
 - `spawn` {id, type, description, prompt_id?}: PreToolUse for the Agent tool, SubagentStart, and
-  the subagent's transcript and meta file beside the session transcript.
+  the subagent's transcript and meta file beside the session transcript. `spawn-many` and
+  `finish-many` {prefix, count} run one per subagent at once.
 - `finish` {id, responses}: one assistant response per entry ({output} tokens) in the subagent's
   transcript, then SubagentStop.
 - `phantom`: the SubagentStop Claude sends after a turn for an agent that never ran.
@@ -26,6 +27,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -141,18 +143,26 @@ def finish(op):
                                                 for other, other_kind in running.items()]})
 
 
+def together(action, op):
+    """Run one action per subagent at once, as Claude runs parallel subagents' hooks."""
+    threads = [threading.Thread(target=action, args=({**op, "id": f"{op['prefix']}{index}"},))
+               for index in range(op["count"])]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
 def apply(op):
     name = op["op"]
     if name == "spawn":
         spawn(op)
     elif name == "spawn-many":
-        for index in range(op["count"]):
-            spawn({**op, "id": f"{op['prefix']}{index}"})
+        together(spawn, op)
     elif name == "finish":
         finish(op)
     elif name == "finish-many":
-        for index in range(op["count"]):
-            finish({**op, "id": f"{op['prefix']}{index}"})
+        together(finish, op)
     elif name == "phantom":
         hooks("SubagentStop", {"agent_id": uuid.uuid4().hex[:17], "agent_type": "",
                                "stop_hook_active": False})

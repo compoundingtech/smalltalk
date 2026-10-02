@@ -432,6 +432,7 @@ def run(args, root, evidence):
     node = Node(root, args.binary)
     checks = {}
     seats = []
+    started_at = time.monotonic()
     try:
         node.start()
         killed = Seat(node, KILLED, root / "ws-killed")
@@ -487,6 +488,7 @@ mission "eval/subagents" state="ready" {{
         restarted_scenarios(node, restarted, checks)
         worker_scenarios(node, worker, run_subject, checks)
         claim_counts(seats, checks)
+        checks["seconds"] = round(time.monotonic() - started_at)
         return {"verdict": "pass", "checks": checks}
     except (Failure, RuntimeError) as error:
         return {"verdict": "fail", "failure": str(error), "checks": checks}

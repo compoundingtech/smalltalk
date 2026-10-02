@@ -81,30 +81,31 @@ enum Scope<'a> {
     All,
 }
 
-/// Open subagents in `scope`, oldest first.
+/// Open subagents in `scope`, oldest first in the canonical claim order.
 fn open_subagents_at(connection: &Connection, scope: Scope<'_>) -> Result<Vec<SubagentView>> {
     let filter = match scope {
-        Scope::Seat(_) => "AND appeared.subject=?1",
-        Scope::RecordedOn(..) => "AND appeared.origin=?1 AND appeared.store_index>=?2",
+        Scope::Seat(_) => "AND claims.subject=?1",
+        // The sweep's own bound on this node's claims, not an order.
+        Scope::RecordedOn(..) => "AND claims.origin=?1 AND claims.store_index>=?2",
         Scope::All => "",
     };
-    let mut statement = connection.prepare_cached(&format!(
-        "SELECT appeared.subject, appeared.id, appeared.origin, appeared.body, appeared.store_index,
+    let mut statement = connection.prepare_cached(&canonical_sql(&format!(
+        "SELECT claims.subject, claims.id, claims.origin, claims.body, claims.store_index,
              (SELECT MAX(CAST(json_extract(renewed.body, '$.fields.lease_expires_at_unix_ms')
                   AS INTEGER))
               FROM claims renewed
-              WHERE renewed.subject=appeared.subject AND renewed.kind='subagent.renewed'
+              WHERE renewed.kind='subagent.renewed' AND renewed.subject=claims.subject
                 AND json_extract(renewed.body, '$.fields.subagent_id')
-                    =json_extract(appeared.body, '$.fields.subagent_id'))
-         FROM claims appeared
-         WHERE appeared.kind='subagent.appeared' {filter}
+                    =json_extract(claims.body, '$.fields.subagent_id'))
+         FROM claims
+         WHERE claims.kind='subagent.appeared' {filter}
            AND NOT EXISTS (
                SELECT 1 FROM claims ended
-               WHERE ended.subject=appeared.subject AND ended.kind='subagent.ended'
+               WHERE ended.kind='subagent.ended' AND ended.subject=claims.subject
                  AND json_extract(ended.body, '$.fields.subagent_id')
-                     =json_extract(appeared.body, '$.fields.subagent_id'))
-         ORDER BY appeared.store_index"
-    ))?;
+                     =json_extract(claims.body, '$.fields.subagent_id'))
+         ORDER BY CANONICAL_ASC(claims)"
+    )))?;
     let read = |row: &rusqlite::Row<'_>| {
         Ok((
             row.get::<_, String>(0)?,
@@ -157,15 +158,17 @@ fn subagent_claim_tx(
     kind: &str,
     subagent_id: &str,
 ) -> Result<Option<ClaimRecord>, St3Error> {
+    debug_assert!(SUBAGENT_KINDS.contains(&kind));
+    // The kind is written into the statement so SQLite can use that kind's partial index.
     transaction
         .query_row(
             &format!(
                 "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
-                 WHERE claims.subject=?1 AND claims.kind=?2
-                   AND json_extract(claims.body, '$.fields.subagent_id')=?3
+                 WHERE claims.kind='{kind}' AND claims.subject=?1
+                   AND json_extract(claims.body, '$.fields.subagent_id')=?2
                  ORDER BY {CANONICAL_ORDER} LIMIT 1"
             ),
-            params![agent, kind, subagent_id],
+            params![agent, subagent_id],
             claim_from_row,
         )
         .optional()

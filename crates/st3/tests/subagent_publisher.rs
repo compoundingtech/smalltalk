@@ -298,3 +298,45 @@ async fn a_new_driver_incarnation_ends_what_the_last_harness_left_running() {
     assert_eq!(ended[1]["outcome"], "completed");
     server.abort();
 }
+
+#[tokio::test]
+async fn a_codex_run_cut_short_by_its_harness_still_counts_its_tokens() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, client, server) = serve(root.path()).await;
+    let agent_dir = root.path().join("agent");
+    let codex_home = root.path().join("codex");
+    let mut publisher = st3::subagents::Publisher::start(
+        CODEX_SEAT,
+        "codex",
+        "incarnation-1",
+        &agent_dir,
+        ledger::now_ms(),
+    )
+    .with_homes(None, Some(codex_home.clone()));
+    publisher.set_timeline_incarnation(Some("codex-incarnation".into()));
+    ledger::observe_codex(&agent_dir, &activity("started", "child"), "parent-thread").unwrap();
+    publisher.tick(&client).await.unwrap();
+    write_rollout(&codex_home, "child", &[(40, 0, 2)]);
+    // The harness exits: the rollout is complete, so nothing waits for it to settle.
+    publisher
+        .end_all(&client, "harness-exited", "its harness exited")
+        .await
+        .unwrap();
+    let ended = fields(&store, CODEX_SEAT, "subagent.ended");
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0]["outcome"], "harness-exited");
+    assert_eq!(ended[0]["total_tokens"], 42);
+    let record = st_drivers::harness_timeline::read(&st_drivers::harness_timeline::timeline_path(
+        &agent_dir,
+    ))
+    .unwrap();
+    assert!(
+        record
+            .operations
+            .iter()
+            .any(|operation| operation.body["turn_id"] == "subagent:child"
+                && operation.body["total_tokens"] == 42)
+    );
+    assert!(ledger::read(&agent_dir).ended.is_empty());
+    server.abort();
+}

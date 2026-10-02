@@ -179,12 +179,15 @@ WHERE kind IN ('work.progress', 'work.submitted');
 CREATE INDEX IF NOT EXISTS claims_actor_work_activity_index
 ON claims(actor, json_extract(body, '$.fields.claim_incarnation'), store_index)
 WHERE kind IN ('work.claimed', 'work.progress');
-CREATE INDEX IF NOT EXISTS claims_subagent_index
-ON claims(subject, kind, json_extract(body, '$.fields.subagent_id'))
-WHERE kind IN ('subagent.appeared', 'subagent.renewed', 'subagent.ended');
-CREATE INDEX IF NOT EXISTS claims_subagent_origin_index
-ON claims(origin, store_index)
+CREATE INDEX IF NOT EXISTS claims_subagent_appeared_index
+ON claims(subject, json_extract(body, '$.fields.subagent_id'))
 WHERE kind='subagent.appeared';
+CREATE INDEX IF NOT EXISTS claims_subagent_renewed_index
+ON claims(subject, json_extract(body, '$.fields.subagent_id'))
+WHERE kind='subagent.renewed';
+CREATE INDEX IF NOT EXISTS claims_subagent_ended_index
+ON claims(subject, json_extract(body, '$.fields.subagent_id'))
+WHERE kind='subagent.ended';
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
