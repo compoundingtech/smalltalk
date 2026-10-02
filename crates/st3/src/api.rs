@@ -29,6 +29,7 @@ use crate::archive::hydrate_eval;
 use crate::graph::{parse_intent, resolve_document_references};
 #[cfg(test)]
 use crate::model::AttentionRequest;
+use crate::model::ClientReplicated;
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
@@ -1300,6 +1301,7 @@ fn client_page_read(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(state),
+        replicated: None,
     })
 }
 
@@ -3436,6 +3438,7 @@ async fn client_work_history(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(state),
+        replicated: None,
     };
     Ok((Extension(snapshot), Json(page)))
 }
@@ -3650,6 +3653,14 @@ fn remote_unavailable(host: &str) -> ApiError {
     }
 }
 
+/// A read that is not sent for a stated reason, in the shape of an unreachable owner.
+fn remote_unavailable_because(host: &str, reason: &str, message: &str) -> ApiError {
+    let mut error = remote_unavailable(host);
+    error.details.insert("reason".into(), reason.into());
+    error.message = message.into();
+    error
+}
+
 /// How many nodes the furthest route a read tried handed it to, from the attempts it records.
 fn attempt_hops(attempts: Option<&Value>) -> u64 {
     attempts.and_then(Value::as_array).map_or(0, |attempts| {
@@ -3758,7 +3769,44 @@ async fn client_messages(
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
     let (history, actor) = (query.history, query.actor.clone());
-    client_snapshot_page(
+    // An agent another host owns is listed by that host: its messages can reach this node late,
+    // and a list that shows only what has arrived reads as empty while the replica lags.
+    let owner = match actor.as_deref() {
+        Some(actor) => remote_agent_owner(&state, actor).await?,
+        None => None,
+    };
+    let mut replicated = None;
+    if let (Some(owner), Some(actor)) = (owner.as_deref(), actor.as_deref()) {
+        match relayed_messages_page(&state, &session, owner, actor, &query).await {
+            Ok(mut page) => {
+                page.replicated = Some(ClientReplicated {
+                    owner_host_id: owner.to_owned(),
+                    source: "owner".into(),
+                    complete: true,
+                    state: "current".into(),
+                    reason: None,
+                });
+                return Ok((Extension(snapshot), Json(page)));
+            }
+            Err(error) if error.code == "remote-unavailable" => {
+                let lagging = client_sync_notice(&state)
+                    .is_some_and(|notice| notice.peers.iter().any(|peer| peer.host_id == owner));
+                replicated = Some(ClientReplicated {
+                    owner_host_id: owner.to_owned(),
+                    source: "replica".into(),
+                    complete: false,
+                    state: if lagging { "lagging" } else { "unverified" }.into(),
+                    reason: error
+                        .details
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let (snapshot, Json(mut page)) = client_snapshot_page(
         &state,
         snapshot,
         "messages",
@@ -3768,6 +3816,67 @@ async fn client_messages(
         },
     )
     .await
+    .map(|(Extension(snapshot), page)| (snapshot, page))?;
+    page.replicated = replicated;
+    Ok((Extension(snapshot), Json(page)))
+}
+
+/// The host that owns `actor`'s runtime, when that is another host.
+async fn remote_agent_owner(state: &AppState, actor: &str) -> Result<Option<String>, ApiError> {
+    if !actor.starts_with("agent/") {
+        return Ok(None);
+    }
+    let (store, subject) = (state.store.clone(), actor.to_owned());
+    let origin = blocking_store(move || {
+        Ok(store
+            .status(Some(&subject))?
+            .subjects
+            .first()
+            .and_then(|subject| subject.actual_origin.clone()))
+    })
+    .await?;
+    Ok(origin
+        .filter(|origin| origin != state.store.origin())
+        .map(|origin| client_host_id(&origin)))
+}
+
+/// One page of an agent's messages as its owner lists them.
+async fn relayed_messages_page(
+    state: &AppState,
+    session: &client_v0::ClientSession,
+    owner: &str,
+    actor: &str,
+    query: &ClientListQuery,
+) -> Result<ClientResourcePage, ApiError> {
+    if !client_v0::acting_party(session) {
+        return Err(remote_unavailable_because(
+            owner,
+            "not-relayed",
+            "a remote agent's messages are relayed only for a concrete person or agent",
+        ));
+    }
+    let relay = state
+        .client_relay
+        .as_ref()
+        .filter(|relay| relay.reaches(owner))
+        .ok_or_else(|| remote_unavailable(owner))?;
+    let value = relay
+        .read(
+            owner,
+            &crate::peer::ClientReadRequest {
+                authority_actor: session.authority_actor.clone(),
+                relay: None,
+                request: crate::peer::ClientReadOperation::Messages {
+                    actor: actor.to_owned(),
+                    history: query.history,
+                    limit: query.limit.map(|limit| limit.clamp(1, 200)),
+                    cursor: query.cursor.clone(),
+                },
+            },
+        )
+        .await
+        .map_err(|error| remote_read_error(owner, error))?;
+    serde_json::from_value(value).map_err(ApiError::internal)
 }
 
 async fn client_messages_detail(
@@ -4020,6 +4129,7 @@ async fn client_history(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(&state),
+        replicated: None,
     }))
 }
 
@@ -9902,8 +10012,8 @@ async fn post_message_claim(
                 fields.insert("runtime_id".into(), Value::String(runtime_id));
             }
         }
-        let record = store
-            .append_claim(&ClaimInput {
+        let (record, appended) = store
+            .append_claim_outcome(&ClaimInput {
                 subject,
                 kind: kind.into(),
                 actor: Some(actor),
@@ -9913,11 +10023,15 @@ async fn post_message_claim(
                 idempotency_key: Some(request.idempotency_key),
             })
             .map_err(ApiError::bad)?;
-        Ok((record, is_work_wake(&message.tags)))
+        Ok((record, appended, is_work_wake(&message.tags)))
     })
     .await?;
-    let (record, work_wake) = record;
-    signal_message_changed(&state, kind, work_wake);
+    let (record, appended, work_wake) = record;
+    // An idempotent repeat or an already-settled transition changes nothing a reader can see.
+    // Signalling it anyway re-reads every subscribed seat's mailbox (#1085).
+    if appended {
+        signal_message_changed(&state, kind, work_wake);
+    }
     Ok(Json(record))
 }
 
@@ -14525,6 +14639,22 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "a conversation message's lifecycle woke the reconciler"
         );
         assert!(events.has_changed().unwrap());
+        events.borrow_and_update();
+        // A repeat, or a transition the message has already passed, changes nothing a reader
+        // can see and wakes no reader (#1085).
+        for (lifecycle, key) in [("delivered", "talk-delivered"), ("staged", "talk-staged")] {
+            let (status, claim) = json_request(
+                app.clone(),
+                &format!("/v1/messages/{id}/claims"),
+                json!({"lifecycle": lifecycle, "actor": "agent/receiver", "idempotency_key": key}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{claim}");
+            assert!(
+                !events.has_changed().unwrap(),
+                "a no-op {lifecycle} woke readers"
+            );
+        }
         // A work wake does.
         let (status, sent) = json_request(
             app.clone(),

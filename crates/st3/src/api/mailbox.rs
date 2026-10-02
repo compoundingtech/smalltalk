@@ -86,18 +86,21 @@ pub(super) async fn receipt(
     };
     let store = state.store.clone();
     let kind = input.kind.clone();
-    let (record, work_wake) = blocking_action(move || {
-        let record = store.append_mailbox_receipt(&input, &request.fence)?;
+    let (record, appended, work_wake) = blocking_action(move || {
+        let (record, appended) = store.append_mailbox_receipt_outcome(&input, &request.fence)?;
         // A message this store cannot read is treated as a work wake.
         let work_wake = store
             .message(&input.subject)
             .ok()
             .flatten()
             .is_none_or(|message| super::is_work_wake(&message.tags));
-        Ok((record, work_wake))
+        Ok((record, appended, work_wake))
     })
     .await?;
-    super::signal_message_changed(&state, &kind, work_wake);
+    // A repeated or already-settled receipt changes nothing; only a new claim wakes readers.
+    if appended {
+        super::signal_message_changed(&state, &kind, work_wake);
+    }
     Ok(Json(record))
 }
 
@@ -412,8 +415,14 @@ mod tests {
                 } else {
                     client.post("/v1/mailbox/receipts", &receipt).await.unwrap()
                 };
+                let events = state.event_notify.subscribe();
                 let retry: ClaimRecord =
                     client.post("/v1/mailbox/receipts", &receipt).await.unwrap();
+                // A retried receipt appends nothing and wakes no mailbox reader (#1085).
+                assert!(
+                    !events.has_changed().unwrap(),
+                    "retried {lifecycle} woke readers"
+                );
                 assert_eq!(
                     first.id, retry.id,
                     "lost {lifecycle} acknowledgement is idempotent"
@@ -428,7 +437,12 @@ mod tests {
                 message: send.subject.clone(),
                 lifecycle: "delivered".into(),
             };
+            let events = state.event_notify.subscribe();
             let _: ClaimRecord = client.post("/v1/mailbox/receipts", &settled).await.unwrap();
+            assert!(
+                !events.has_changed().unwrap(),
+                "a settled receipt woke readers"
+            );
             assert_eq!(
                 state
                     .store
