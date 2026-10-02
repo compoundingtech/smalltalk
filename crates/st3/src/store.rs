@@ -8248,6 +8248,63 @@ impl Store {
             .map_err(|error| St3Error::new("internal", error))?
     }
 
+    pub(crate) fn append_harness_event(
+        &self,
+        publication: &crate::harness_events::Publication,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        let mut input = publication.claim.clone();
+        if publication.sequence == 0
+            || publication.runtime_incarnation.is_empty()
+            || !matches!(
+                input.kind.as_str(),
+                "harness.observed" | "harness.usage" | "harness.limits" | "harness.timeline"
+            )
+            || input.actor.as_deref() != Some(input.subject.as_str())
+            || input.idempotency_key.is_none()
+        {
+            return Err(St3Error::new(
+                "invalid-harness-event",
+                "invalid native observation envelope",
+            ));
+        }
+        st3_schema::registry()
+            .validate_public_claim(
+                &input.subject,
+                &input.kind,
+                &input.fields,
+                input.actor.as_deref(),
+            )
+            .map_err(|error| St3Error::new(error.code, error.message))?;
+        // A context event can yield two independently acknowledged usage semantics. Its slot
+        // is stable even if a caller mistakenly changes its body on retry.
+        let source_runtime = input
+            .fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            .filter(|runtime| !runtime.is_empty())
+            .ok_or_else(|| {
+                St3Error::new(
+                    "invalid-harness-event",
+                    "event has no source runtime provenance",
+                )
+            })?;
+        let slot = input
+            .fields
+            .get("semantics")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        input.idempotency_key = Some(format!(
+            "harness-event:{}:{}:{}:{}:{}",
+            input.subject, source_runtime, publication.sequence, input.kind, slot
+        ));
+        append_claim_with_fences(
+            &self.graph,
+            &input,
+            None,
+            Some(&publication.runtime_incarnation),
+        )
+    }
+
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
         self.append_claim_outcome(input).map(|(claim, _)| claim)
     }
@@ -13447,7 +13504,6 @@ impl Store {
             )
             .unwrap();
     }
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -43534,20 +43590,30 @@ pub(crate) fn append_claim_fenced_outcome(
     input: &ClaimInput,
     fence: Option<&crate::mailbox::Fence>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_claim_with_fences(graph, input, fence, None)
+}
+
+fn append_claim_with_fences(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    fence: Option<&crate::mailbox::Fence>,
+    event_runtime: Option<&str>,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
         || (input.actor.is_none() && system_local_retention(&input.kind))
     {
-        return append_local_observation(graph, input);
+        return append_local_observation_fenced(graph, input, event_runtime);
     }
     if latest_retention(&input.kind) {
-        return append_latest_observation(graph, input, now_ms());
+        return append_latest_observation_fenced(graph, input, now_ms(), event_runtime);
     }
     let operation = claim_operation(input)?;
     // One claim in a savepoint of the writer's next batch; its caller hears back once that
     // batch commits.
     graph.connection
         .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+            check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let settled_receipt = if let Some(fence) = fence {
                 check_mailbox_fence(transaction, fence)?;
                 let index = transaction.query_row(
@@ -43721,14 +43787,44 @@ pub fn validate_claim_input(input: &ClaimInput) -> Result<(), St3Error> {
 /// Record an observation of `local` retention on this node only. It gets no batch, no
 /// envelope and no idempotency row, and it never replicates. A repeated idempotency key
 /// returns the first observation. The record's ID starts with `local-observation/`.
-fn append_local_observation(
+fn check_harness_event_runtime(
+    connection: &Connection,
+    subject: &str,
+    runtime: Option<&str>,
+) -> Result<(), St3Error> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let body: Option<String> = connection
+        .prepare_cached(&format!(
+            "{} LIMIT 1",
+            newest_claims_of_kind_query("claims.body", "runtime.observed")
+        ))
+        .map_err(internal)?
+        .query_row(params![subject, i64::MAX], |r| r.get(0))
+        .optional()
+        .map_err(internal)?;
+    let body: Value = serde_json::from_str(body.as_deref().unwrap_or("null")).map_err(internal)?;
+    let fields = body.get("fields").unwrap_or(&body);
+    if fields["status"] != "running" || fields["incarnation_id"].as_str() != Some(runtime) {
+        return Err(St3Error::new(
+            "stale-harness-event-session",
+            "the publishing driver is not this seat's running incarnation",
+        ));
+    }
+    Ok(())
+}
+
+fn append_local_observation_fenced(
     graph: &GraphStore,
     input: &ClaimInput,
+    event_runtime: Option<&str>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_local_observation(input)?;
     graph
         .connection
         .batched(|transaction| {
+            check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             insert_local_observation_tx(transaction, &graph.origin, input, now_ms())
         })
         .map_err(|error| St3Error::new("internal", error))?
@@ -43737,15 +43833,26 @@ fn append_local_observation(
 /// Record an observation of `latest` retention. The local observation log keeps every
 /// one. The replicated claim log gets a claim only when the observed state changes; the
 /// returned record is that claim, or the local observation when nothing replicated.
+#[cfg(test)]
 fn append_latest_observation(
     graph: &GraphStore,
     input: &ClaimInput,
     now: u128,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_latest_observation_fenced(graph, input, now, None)
+}
+
+fn append_latest_observation_fenced(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    now: u128,
+    event_runtime: Option<&str>,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_local_observation(input)?;
     graph
         .connection
         .batched(|transaction| {
+            check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let (local, appended) =
                 insert_local_observation_tx(transaction, &graph.origin, input, now)?;
             if !appended {
@@ -43990,4 +44097,167 @@ fn a_malformed_peer_hash_does_not_stop_replication() {
             .iter()
             .any(|envelope| envelope.hash == "NOT-A-SHA256")
     );
+}
+
+#[cfg(test)]
+mod harness_event_tests {
+    use super::*;
+    use crate::harness_events::Publication;
+    const SEAT: &str = "agent/example/event-seat";
+    fn runtime(store: &Store, incarnation: &str, status: &str) {
+        store
+            .append_claim(&ClaimInput {
+                subject: SEAT.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(SEAT.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!(status)),
+                    ("incarnation_id".into(), json!(incarnation)),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    fn event(kind: &str) -> Publication {
+        let fields = match kind {
+            "harness.observed" => BTreeMap::from([
+                ("state".into(), json!("working")),
+                ("driver".into(), json!("claude")),
+                ("incarnation_id".into(), json!("runtime-a")),
+            ]),
+            "harness.usage" => BTreeMap::from([
+                ("semantics".into(), json!("context_occupancy")),
+                ("context_used_tokens".into(), json!(10)),
+                ("driver".into(), json!("claude")),
+                ("incarnation_id".into(), json!("runtime-a")),
+            ]),
+            "harness.limits" => BTreeMap::from([
+                ("driver".into(), json!("claude")),
+                ("measured_at_unix_ms".into(), json!(1)),
+                ("incarnation_id".into(), json!("runtime-a")),
+                ("five_hour_percent".into(), json!(5.0)),
+            ]),
+            "harness.timeline" => BTreeMap::from([
+                ("operation".into(), json!("append")),
+                ("entry_id".into(), json!("entry-a")),
+                ("sequence".into(), json!(1)),
+                ("revision".into(), json!(1)),
+                ("role".into(), json!("assistant")),
+                ("entry_type".into(), json!("content")),
+                ("final".into(), json!(true)),
+                ("body".into(), json!({"text":"hello"})),
+                ("driver".into(), json!("claude")),
+                ("incarnation_id".into(), json!("runtime-a")),
+                ("observed_at_unix_ms".into(), json!(1)),
+            ]),
+            _ => unreachable!(),
+        };
+        Publication {
+            runtime_incarnation: "runtime-a".into(),
+            sequence: 1,
+            claim: ClaimInput {
+                subject: SEAT.into(),
+                kind: kind.into(),
+                actor: Some(SEAT.into()),
+                fields,
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some("producer-event".into()),
+            },
+        }
+    }
+    #[test]
+    fn native_event_admission_fences_every_retention_and_replays_lost_acknowledgements() {
+        for kind in [
+            "harness.observed",
+            "harness.usage",
+            "harness.limits",
+            "harness.timeline",
+        ] {
+            let store = Store::open_memory("amber").unwrap();
+            let mut input = event(kind);
+            assert_eq!(
+                store.append_harness_event(&input).unwrap_err().code,
+                "stale-harness-event-session"
+            );
+            runtime(&store, "runtime-a", "running");
+            let (first, changed) = store.append_harness_event(&input).unwrap();
+            assert!(changed);
+            let (replayed, changed) = store.append_harness_event(&input).unwrap();
+            assert!(!changed);
+            if !latest_retention(kind) {
+                assert_eq!(first.id, replayed.id);
+            }
+            assert_eq!(replayed.body["fields"], json!(input.claim.fields));
+            input.claim.fields.insert("driver".into(), json!("codex"));
+            assert_eq!(
+                store.append_harness_event(&input).unwrap_err().code,
+                "idempotency-mismatch"
+            );
+            input.claim.fields.insert("driver".into(), json!("claude"));
+            runtime(&store, "runtime-b", "running");
+            assert_eq!(
+                store.append_harness_event(&input).unwrap_err().code,
+                "stale-harness-event-session"
+            );
+            input.runtime_incarnation = "runtime-b".into();
+            let (replayed, changed) = store.append_harness_event(&input).unwrap();
+            assert!(!changed);
+            if !latest_retention(kind) {
+                assert_eq!(first.id, replayed.id);
+            }
+            input.sequence = 2;
+            let (historical, _) = store.append_harness_event(&input).unwrap();
+            assert_eq!(
+                historical
+                    .body
+                    .pointer("/fields/incarnation_id")
+                    .and_then(Value::as_str),
+                input
+                    .claim
+                    .fields
+                    .get("incarnation_id")
+                    .and_then(Value::as_str)
+            );
+            runtime(&store, "runtime-b", "exited");
+            input.sequence = 3;
+            assert_eq!(
+                store.append_harness_event(&input).unwrap_err().code,
+                "stale-harness-event-session"
+            );
+        }
+    }
+    #[test]
+    fn terminal_state_can_be_followed_by_its_final_timeline_before_runtime_exit() {
+        let store = Store::open_memory("amber").unwrap();
+        runtime(&store, "runtime-a", "running");
+        let mut state = event("harness.observed");
+        state.claim.fields.insert("state".into(), json!("ended"));
+        store.append_harness_event(&state).unwrap();
+        let mut timeline = event("harness.timeline");
+        timeline.sequence = 2;
+        store.append_harness_event(&timeline).unwrap();
+        runtime(&store, "runtime-a", "exited");
+        timeline.sequence = 3;
+        assert!(store.append_harness_event(&timeline).is_err());
+    }
+    #[test]
+    fn event_envelopes_cannot_publish_foreign_or_non_harness_claims() {
+        let store = Store::open_memory("amber").unwrap();
+        runtime(&store, "runtime-a", "running");
+        let mut input = event("harness.observed");
+        input.claim.actor = Some("agent/example/other".into());
+        assert_eq!(
+            store.append_harness_event(&input).unwrap_err().code,
+            "invalid-harness-event"
+        );
+        input.claim.actor = Some(SEAT.into());
+        input.sequence = 0;
+        assert!(store.append_harness_event(&input).is_err());
+        input.sequence = 1;
+        input.claim.kind = "intent.desired".into();
+        assert!(store.append_harness_event(&input).is_err());
+    }
 }

@@ -509,6 +509,58 @@ fn channel_loop(
     }
 }
 
+/// The managed st channel uses the same measured normalizers as the standalone channel,
+/// but commits to its st-owned outbox. It never creates the retired record transport.
+pub struct EventObserver {
+    state: harness_state::Writer,
+    context: harness_context::Writer,
+    timeline: crate::harness_timeline::Writer,
+    last_heartbeat: std::time::Instant,
+}
+impl EventObserver {
+    pub fn new(
+        agent_dir: &Path,
+        identity: &str,
+        driver: &'static str,
+        session: &str,
+        seq: u64,
+        runtime_id: &str,
+    ) -> Result<Self> {
+        let harness = match driver {
+            "pi" => harness_context::Harness::Pi,
+            "omp" => harness_context::Harness::Omp,
+            _ => anyhow::bail!("unsupported managed channel"),
+        };
+        let mut state =
+            harness_state::Writer::new(agent_dir, identity, driver, Some(runtime_id.into()))
+                .with_ownership(session, seq);
+        state.interrupt();
+        Ok(Self {
+            state,
+            context: harness_context::Writer::new_paths(agent_dir, identity, harness)?
+                .with_session(session),
+            timeline: crate::harness_timeline::Writer::new(agent_dir, driver, session),
+            last_heartbeat: std::time::Instant::now(),
+        })
+    }
+    pub fn observe(&mut self, frame: &Value) -> Result<()> {
+        if let Some(observation) = state_observation(frame) {
+            self.state.observe(observation)?;
+        }
+        if let Some(context) = context_frame(frame) {
+            write_context(&mut self.context, context)?;
+        }
+        crate::harness_timeline::observe_channel_frame(&mut self.timeline, frame)
+    }
+    pub fn heartbeat(&mut self) -> Result<()> {
+        if self.last_heartbeat.elapsed() >= harness_state::HARNESS_STATE_REFRESH {
+            self.state.heartbeat()?;
+            self.last_heartbeat = std::time::Instant::now();
+        }
+        Ok(())
+    }
+}
+
 /// The observed-state frame the shipped extension emits on the harness's own turn boundaries.
 /// Only positively recognized words become observations: an unrecognized state word is dropped
 /// like any other unknown frame, so a newer asset cannot make this channel record something it

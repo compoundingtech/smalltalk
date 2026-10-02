@@ -472,6 +472,9 @@ impl Writer {
         harness: Harness,
     ) -> anyhow::Result<Self> {
         ensure_real_directory(agent_dir, "native observation directory")?;
+        if crate::harness_events::enabled(agent_dir) {
+            return Self::with_staging_dir(agent_dir, agent, harness, agent_dir.into());
+        }
         let staging = agent_dir.join(".harness-context-staging");
         create_or_validate_directory(&staging, "native harness-context staging directory")?;
         anyhow::ensure!(
@@ -741,7 +744,7 @@ pub fn read(path: &Path) -> Option<Observed> {
 }
 
 fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
-    let raw = match fs::read(path) {
+    let raw = match crate::harness_events::read_record(path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
@@ -752,17 +755,22 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
             return None;
         }
     };
-    let Ok(record) = serde_json::from_slice::<Record>(&raw) else {
+    read_raw_at(&raw, now_ms)
+}
+
+/// Decode a committed event with the same measured-time validation as the legacy reader.
+pub fn read_raw_at(raw: &[u8], now_ms: u64) -> Option<Observed> {
+    let Ok(record) = serde_json::from_slice::<Record>(raw) else {
         tracing::warn!(
             "st harness-context: {} is not a readable record",
-            path.display()
+            "committed context event"
         );
         return None;
     };
     if !crate::contracts::schema_matches(&record.schema, SCHEMA) {
         tracing::warn!(
             "st harness-context: {} carries schema `{}`, not `{SCHEMA}`",
-            path.display(),
+            "committed context event",
             record.schema
         );
         return None;
@@ -770,14 +778,14 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
     if record.harness == Harness::Unrecognized {
         tracing::warn!(
             "st harness-context: {} was written by a harness this version cannot interpret",
-            path.display()
+            "committed context event"
         );
         return None;
     }
     if record.observed_at_ms > now_ms.saturating_add(duration_ms(HARNESS_CONTEXT_FUTURE_SKEW)) {
         tracing::warn!(
             "st harness-context: {} is stamped beyond the future-skew bound",
-            path.display()
+            "committed context event"
         );
         return None;
     }
@@ -812,6 +820,9 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
 /// than being swallowed.
 pub fn remove(agent_dir: &Path) -> anyhow::Result<()> {
     let _lock = lock_exclusive(&agent_dir.join(LOCK_NAME))?;
+    if crate::harness_events::enabled(agent_dir) {
+        return crate::harness_events::remove_snapshot(agent_dir, RECORD_NAME);
+    }
     match fs::remove_file(harness_context_path(agent_dir)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -820,7 +831,7 @@ pub fn remove(agent_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn read_record(path: &Path) -> Option<Record> {
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
+    serde_json::from_slice(&crate::harness_events::read_record(path).ok()?).ok()
 }
 
 fn duration_ms(duration: Duration) -> u64 {

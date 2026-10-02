@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -269,16 +270,23 @@ agent "no-st2" {{
         if not hook_set or not all(value.startswith(f"ST_HOOKS={root / 'state/hooks/sets/sha256-'}")
                                    for value in hook_set):
             fail(f"ST_HOOKS is not st3's set: {hook_set}")
-        checks["record_schemas"] = {}
+        checks["harness_record_files"] = []
         for name in ("harness-state", "harness-context", "harness-timeline"):
             paths = list((root / "state").rglob(name))
-            if not paths:
-                fail(f"the fresh seat wrote no {name} record")
-            for path in paths:
-                schema = json.loads(path.read_text())["schema"]
-                if schema != f"st.{name}.v1":
-                    fail(f"fresh {name} record has legacy or unsupported schema {schema!r}")
-                checks["record_schemas"][name] = schema
+            if paths:
+                fail(f"the fresh seat used polled {name} records")
+        spools = list((root / "state/drivers").rglob("st-harness-events.sqlite"))
+        if len(spools) != 1:
+            fail("the fresh seat has no unique st-owned observation outbox")
+        with sqlite3.connect(spools[0]) as connection:
+            snapshots = connection.execute("SELECT kind,body FROM snapshots").fetchall()
+            checks["snapshot_schemas"] = {kind: json.loads(body)["schema"] for kind, body in snapshots}
+            for name in ("harness-state", "harness-context"):
+                if checks["snapshot_schemas"].get(name) != f"st.{name}.v1":
+                    fail(f"fresh {name} snapshot has legacy or unsupported schema")
+            checks["timeline_operations"] = connection.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
+            if not checks["timeline_operations"]:
+                fail("the fresh seat committed no timeline operations")
         status_files = [str(path.relative_to(root)) for path in (root / "state").rglob("status")]
         checks["legacy_status_files"] = status_files
         if status_files:

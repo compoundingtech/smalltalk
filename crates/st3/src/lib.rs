@@ -17,6 +17,7 @@ pub mod environment;
 pub(crate) mod external_sessions;
 pub mod fleet;
 pub mod graph;
+pub mod harness_events;
 /// The lifecycle hook set st3 publishes beneath its own state directory.
 pub mod hooks;
 pub mod lane;
