@@ -217,15 +217,6 @@ pub fn home_list(world: &World, snoozed: &std::collections::HashSet<String>) -> 
             theme::dim(),
         ))));
     }
-    if world.attention.ready().is_some() && world.quiet_missions > 0 {
-        items.push(Item::Note(Line::from(span(
-            format!(
-                " not shown: {} missions that don't need you",
-                world.quiet_missions
-            ),
-            theme::dim(),
-        ))));
-    }
     Listing {
         items,
         ids,
