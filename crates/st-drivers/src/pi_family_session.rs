@@ -114,6 +114,34 @@ pub(crate) fn run_for_with_environment(
     let agent_dir =
         message::resolve_declared_dir(catalog_root, &identity, &crate::run::detect_host())?
             .with_context(|| format!("{label} driver agent '{identity}' is not declared"))?;
+    run_for_paths(
+        catalog_root,
+        &agent_dir,
+        identity,
+        runtime_id,
+        provider_argv,
+        kind,
+        additional_env,
+        removed_env,
+        required_incarnation,
+        legacy_presence,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_for_paths(
+    catalog_root: &Path,
+    agent_dir: &Path,
+    identity: String,
+    runtime_id: String,
+    provider_argv: Vec<String>,
+    kind: &HarnessKind,
+    additional_env: &[(String, String)],
+    removed_env: &[&str],
+    required_incarnation: Option<String>,
+    legacy_presence: bool,
+) -> Result<()> {
+    let label = kind.label;
     anyhow::ensure!(
         !provider_argv.is_empty(),
         "{label} driver '{runtime_id}' has no provider argv"
@@ -128,7 +156,7 @@ pub(crate) fn run_for_with_environment(
     let session = required_incarnation.unwrap_or_else(harness_state::session_token);
     // The claim is written: it supersedes whatever the predecessor left — including a
     // still-fresh live record — before the channel or terminal writer act under it.
-    let seq = harness_state::claim(&agent_dir, identity.clone(), label, &session)?;
+    let seq = harness_state::claim(agent_dir, identity.clone(), label, &session)?;
     // Every fallible step past the claim must end the record honestly on failure — the claim
     // placeholder standing as the last word would read as a takeover, not a launch that never
     // ran.
@@ -142,6 +170,9 @@ pub(crate) fn run_for_with_environment(
             &session,
             seq,
         )?;
+        if !legacy_presence {
+            env.retain(|(name, _)| name != kind.catalog_env);
+        }
         env.extend_from_slice(additional_env);
         env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
         if label == "omp" {
@@ -180,7 +211,15 @@ pub(crate) fn run_for_with_environment(
         // provider accepts a turn without ever creating its transcript. A seat-owned directory is
         // deterministic, exists before launch, and is also the right inventory boundary for
         // listing/importing unmanaged sessions later.
-        let session_dir = agent_dir.join("provider-sessions");
+        let session_dir = match additional_env
+            .iter()
+            .find(|(name, _)| name == crate::driver_paths::SESSION_DIR_ENV)
+        {
+            Some((_, path)) if !legacy_presence => {
+                std::path::PathBuf::from(path).join("provider-sessions")
+            }
+            _ => agent_dir.join("provider-sessions"),
+        };
         std::fs::create_dir_all(&session_dir).with_context(|| {
             format!(
                 "creating {label} driver session directory {}",
@@ -194,7 +233,7 @@ pub(crate) fn run_for_with_environment(
         Ok(prepared) => prepared,
         Err(error) => {
             let mut writer = harness_state::Writer::new(
-                &agent_dir,
+                agent_dir,
                 identity.clone(),
                 label,
                 Some(runtime_id.clone()),
@@ -218,21 +257,25 @@ pub(crate) fn run_for_with_environment(
     // that makes `Stopped(None)` observable at all. Same token as the channel, so the terminal
     // record fences exactly this session's live records.
     let observer = crate::provider_session::SessionObserver::terminal_only(
-        &agent_dir,
+        agent_dir,
         &identity,
         label,
         &runtime_id,
         &session,
         seq,
     );
+    let mut native_removals = removed_env.to_vec();
+    if !legacy_presence {
+        native_removals.extend([kind.catalog_env, "CATALOG", "ST_ROOT"]);
+    }
     let outcome = run_provider_observed_with_env_removals(
         label,
         legacy_presence
-            .then(|| status::status_path(&agent_dir))
+            .then(|| status::status_path(agent_dir))
             .as_deref(),
         &provider_argv,
         &env,
-        removed_env,
+        &native_removals,
         crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
@@ -240,7 +283,7 @@ pub(crate) fn run_for_with_environment(
     )
     .with_context(|| format!("running {label} driver '{runtime_id}'"))?;
     finish_session(
-        &agent_dir,
+        agent_dir,
         &identity,
         &runtime_id,
         &session,
@@ -267,8 +310,32 @@ pub(crate) fn adopt_for(
     let agent_dir =
         message::resolve_declared_dir(catalog_root, &identity, &crate::run::detect_host())?
             .with_context(|| format!("{label} driver agent '{identity}' is not declared"))?;
-    let observer = crate::provider_session::SessionObserver::terminal_only(
+    adopt_paths(
         &agent_dir,
+        identity,
+        runtime_id,
+        kind,
+        pid,
+        session,
+        seq,
+        legacy_presence,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn adopt_paths(
+    agent_dir: &Path,
+    identity: String,
+    runtime_id: String,
+    kind: &HarnessKind,
+    pid: u32,
+    session: String,
+    seq: u64,
+    legacy_presence: bool,
+) -> Result<()> {
+    let label = kind.label;
+    let observer = crate::provider_session::SessionObserver::terminal_only(
+        agent_dir,
         &identity,
         label,
         &runtime_id,
@@ -278,7 +345,7 @@ pub(crate) fn adopt_for(
     let outcome = crate::provider_session::adopt_provider_observed(
         label,
         legacy_presence
-            .then(|| status::status_path(&agent_dir))
+            .then(|| status::status_path(agent_dir))
             .as_deref(),
         pid,
         crate::provider_session::SESSION_REFRESH,
@@ -288,7 +355,7 @@ pub(crate) fn adopt_for(
     )
     .with_context(|| format!("supervising adopted {label} driver '{runtime_id}'"))?;
     finish_session(
-        &agent_dir,
+        agent_dir,
         &identity,
         &runtime_id,
         &session,

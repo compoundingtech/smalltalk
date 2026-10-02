@@ -209,6 +209,18 @@ pub fn claude_settings_registration() -> serde_json::Value {
 /// A Claude seat's private driver directory beneath the daemon's `drivers` directory: where its
 /// hooks write the harness records and the `claude-native-session` binding.
 pub fn claude_agent_dir(drivers_dir: &Path, subject: &str, host: &str) -> PathBuf {
+    let native = drivers_dir
+        .join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24])
+        .join("observations");
+    if native.exists() {
+        native
+    } else {
+        legacy_claude_agent_dir(drivers_dir, subject, host)
+    }
+}
+
+/// Existing providers keep these directories through binary replacement until ordinary restart.
+pub fn legacy_claude_agent_dir(drivers_dir: &Path, subject: &str, host: &str) -> PathBuf {
     let identity = subject.strip_prefix("agent/").unwrap_or(subject);
     drivers_dir
         .join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24])
