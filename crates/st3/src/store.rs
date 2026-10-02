@@ -9723,6 +9723,58 @@ impl Store {
         Ok(records.into_iter().collect())
     }
 
+    /// Search refreshes only a person's private message texts, using the same endpoint
+    /// indexes as the mailbox. Other fleet writes do not invalidate this source.
+    pub(crate) fn conversation_search_mail_stamp(&self, person: &str, through: u64) -> Result<String> {
+        let connection = self.readers.get();
+        let (count, newest): (u64, u64) = connection.query_row(
+            "WITH sent AS (
+                SELECT store_index FROM claims INDEXED BY claims_message_to_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1 AND store_index<=?2
+                UNION SELECT store_index FROM claims INDEXED BY claims_message_from_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.from')=?1 AND store_index<=?2
+            ) SELECT COUNT(*), COALESCE(MAX(store_index),0) FROM sent",
+            params![person,through],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(format!("{count}:{newest}"))
+    }
+
+    pub(crate) fn conversation_search_timeline_stamp(&self, agent: &str, incarnation: &str, through: u64) -> Result<String> {
+        let connection = self.readers.get();
+        let (local_count, local_newest): (u64,u64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(MAX(id),0) FROM local_observations
+             WHERE subject=?1 AND kind='harness.timeline'
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND after_store_index<=?3", params![agent,incarnation,through],
+            |row| Ok((row.get(0)?,row.get(1)?)))?;
+        let (legacy_count, legacy_newest): (u64,u64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(MAX(store_index),0) FROM claims
+             WHERE subject=?1 AND kind='harness.timeline'
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND store_index<=?3", params![agent,incarnation,through],
+            |row| Ok((row.get(0)?,row.get(1)?)))?;
+        Ok(format!("{local_count}:{local_newest}:{legacy_count}:{legacy_newest}"))
+    }
+
+    pub(crate) fn conversation_search_messages(&self, person: &str, through: u64) -> Result<Vec<MessageView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "WITH sent AS (
+                SELECT subject,store_index FROM claims INDEXED BY claims_message_to_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1 AND store_index<=?2
+                UNION SELECT subject,store_index FROM claims INDEXED BY claims_message_from_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.from')=?1 AND store_index<=?2
+            ) SELECT subject, MIN(store_index) FROM sent GROUP BY subject ORDER BY MIN(store_index) DESC LIMIT 50001")?;
+        let rows = statement.query_map(params![person,through], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (subject, index) = row?;
+            messages.push(self.message_view_cached(&connection, &subject, index)?);
+        }
+        Ok(messages)
+    }
+
     pub fn messages(
         &self,
         recipient: Option<&str>,

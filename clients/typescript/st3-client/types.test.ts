@@ -69,3 +69,6 @@ void attachTerminal;
 const dictatedBody: import('./Models.generated').TimelineMessageBody = { message_id: 'message/voice', tags: ['dictated'] };
 const dictatedTags: string[] | undefined = dictatedBody.tags;
 void dictatedTags;
+
+const searchHit: import('./Models.generated').ConversationSearchHit = { conversation_id: 'session/scribe', entry_id: 'timeline-entry/note', agent_id: 'agent/scribe', timestamp: '2026-10-02T00:00:00Z', entry_type: 'content', excerpt: 'orchid' };
+void searchHit;

@@ -250,3 +250,22 @@ test('creation methods submit the shared typed fixtures', async () => {
         assert.deepEqual(JSON.parse(calls.at(-1).init.body), request);
     }
 });
+
+
+test('search encodes text, filters, and cursor and preserves result targets', async () => {
+    const calls = [];
+    const fixture = require('../../../docs/st3/client-v0/fixtures/conversation-search.json');
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async url => {
+        calls.push(url);
+        return response(url.endsWith('/capabilities') ? envelope(capabilities) : fixture);
+    } });
+    const search = await client.conversationSearch('café & orchid', { agent: 'agent/scribe', since: '2026-10-02T00:00:00Z', cursor: 'opaque+/=', limit: 2 });
+    const url = new URL(calls[1]);
+    assert.equal(url.pathname, '/v1/client/conversations/search');
+    assert.equal(url.searchParams.get('text'), 'café & orchid');
+    assert.equal(url.searchParams.get('agent'), 'agent/scribe');
+    assert.equal(url.searchParams.get('since'), '2026-10-02T00:00:00Z');
+    assert.equal(url.searchParams.get('cursor'), 'opaque+/=');
+    assert.equal(search.value.items[0].entry_id, 'timeline-entry/note');
+    assert.deepEqual(search.value.incomplete_sources, ['session/older: truncation']);
+});

@@ -1262,6 +1262,29 @@ impl Client {
     pub async fn sessions_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("sessions", id).await
     }
+    pub async fn conversation_search(
+        &self,
+        text: &str,
+        agent: Option<&str>,
+        since: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<ConversationSearch>, ClientError> {
+        let mut query = vec![format!("text={}", percent_encode(text))];
+        for (name, value) in [("agent", agent), ("since", since), ("cursor", cursor)] {
+            if let Some(value) = value {
+                query.push(format!("{name}={}", percent_encode(value)));
+            }
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        self.get(&format!(
+            "/v1/client/conversations/search?{}",
+            query.join("&")
+        ))
+        .await
+    }
     pub async fn timeline(
         &self,
         session_id: &str,

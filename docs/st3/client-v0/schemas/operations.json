@@ -47,6 +47,7 @@
     { "id": "history.get", "method": "GET", "path": "/v1/client/history/{id}", "response": "Resource" },
     { "id": "sessions.list", "method": "GET", "path": "/v1/client/sessions", "response": "Page" },
     { "id": "sessions.get", "method": "GET", "path": "/v1/client/sessions/{id}", "response": "Resource" },
+    { "id": "conversation.search", "method": "GET", "path": "/v1/client/conversations/search", "response": "ConversationSearch" },
     { "id": "timeline.list", "method": "GET", "path": "/v1/client/sessions/{id}/timeline", "response": "TimelinePage" },
     { "id": "conversation.changes", "method": "GET", "path": "/v1/client/conversations/{id}/changes", "response": "ConversationChanges" },
     { "id": "events.list", "method": "GET", "path": "/v1/client/events", "response": "EventPage" },

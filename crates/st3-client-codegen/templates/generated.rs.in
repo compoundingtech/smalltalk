@@ -1185,6 +1185,27 @@ impl Resource {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ConversationSearchHit {
+    pub conversation_id: String,
+    pub entry_id: String,
+    pub agent_id: Option<String>,
+    pub timestamp: String,
+    pub entry_type: String,
+    pub excerpt: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ConversationSearch {
+    pub kind: String,
+    pub items: Vec<ConversationSearchHit>,
+    pub page: PageInfo,
+    pub indexed_at: String,
+    pub host_id: String,
+    pub incomplete_sources: Vec<String>,
+    pub refreshing: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ConversationChanges {
     pub kind: String,
     pub session_id: String,
