@@ -11,7 +11,52 @@ const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
+const BEARER_PROTOCOL_PREFIX: &str = "st3.bearer.";
 pub(super) const LOCAL_PERSON_HEADER: &str = "x-st3-person";
+
+fn offered_protocols(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+    headers
+        .get_all(SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|protocol| !protocol.is_empty())
+}
+
+fn stream_protocols(headers: &HeaderMap) -> Vec<&str> {
+    offered_protocols(headers)
+        .filter(|protocol| !protocol.starts_with(BEARER_PROTOCOL_PREFIX))
+        .collect()
+}
+
+fn websocket_credential(request: &Request<Body>) -> Result<Option<&str>, ApiError> {
+    let path = request.uri().path();
+    if request.method() != axum::http::Method::GET
+        || !path.starts_with("/v1/client/")
+        || !(path.ends_with("/stream") || path.ends_with("/raw-stream"))
+        || !request
+            .headers()
+            .get(axum::http::header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        return Ok(None);
+    }
+    let mut credentials = offered_protocols(request.headers())
+        .filter_map(|protocol| protocol.strip_prefix(BEARER_PROTOCOL_PREFIX));
+    let credential = credentials.next();
+    if credentials.next().is_some()
+        || credential.is_some_and(|value| {
+            value.is_empty()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return Err(forbidden("the WebSocket bearer protocol is malformed"));
+    }
+    Ok(credential)
+}
 
 pub(super) async fn request_latency(
     Extension(session): Extension<ClientSession>,
@@ -82,14 +127,7 @@ pub(super) async fn collection_stream(
     let trace = super::client_web::traceparent_query(uri.query());
     let limit = limit.map(|Extension(limit)| limit).unwrap_or_default().0;
     require_scope(&session, "read.projections")?;
-    let protocols = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|header| header.to_str().ok())
-        .flat_map(|header| header.split(','))
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
+    let protocols = stream_protocols(&headers);
     if protocols != [COLLECTION_SUBPROTOCOL] {
         return Err(validation(
             "the collection WebSocket requires exactly st3.client.collections.v0",
@@ -1381,16 +1419,12 @@ pub(super) fn authenticate(
     request: &Request<Body>,
     transport: &'static str,
 ) -> Result<ClientSession, ApiError> {
-    // Native bearers take precedence over browser cookies, including malformed bearers.
-    // Ignore a stale cookie while completing a new pairing, and on the Unix transport.
+    // Authenticate at the handshake, before accepting subscriptions. The credential protocol
+    // is never selected or echoed; native Authorization headers retain precedence.
+    let websocket_bearer = websocket_credential(request)?;
     let pairing_completion = request.method() == axum::http::Method::POST
         && request.uri().path().starts_with("/v1/client/pairings/")
         && request.uri().path().ends_with("/complete");
-    let cookie = (transport != "unix"
-        && !pairing_completion
-        && !request.headers().contains_key(AUTHORIZATION))
-    .then(|| super::client_web::device_cookie(request.headers()))
-    .flatten();
     let credential = if let Some(value) = request.headers().get(AUTHORIZATION) {
         value
             .to_str()
@@ -1398,8 +1432,8 @@ pub(super) fn authenticate(
             .strip_prefix("Bearer ")
             .filter(|value| !value.is_empty())
             .ok_or_else(|| forbidden("the client authorization scheme must be Bearer"))?
-    } else if let Some(cookie) = cookie.as_deref() {
-        cookie
+    } else if let Some(bearer) = websocket_bearer {
+        bearer
     } else {
         if transport == "unix" {
             let person = request
@@ -5051,14 +5085,7 @@ pub(super) async fn conversation_stream(
 ) -> Result<Response, ApiError> {
     let started = super::client_web::unix_nanos();
     require_scope(&session, "read.projections")?;
-    let protocols = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|header| header.to_str().ok())
-        .flat_map(|header| header.split(','))
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
+    let protocols = stream_protocols(&headers);
     if protocols != [CONVERSATION_SUBPROTOCOL] {
         return Err(validation(
             "the conversation WebSocket requires exactly st3.client.conversation.v0",
@@ -5637,9 +5664,6 @@ pub(super) struct PairingComplete {
     /// Where the device keeps its signing key: `secure-enclave` or `software`.
     #[serde(default)]
     key_storage: Option<String>,
-    /// Browser delivery keeps the device credential out of the JSON body.
-    #[serde(default)]
-    credential_delivery: CredentialDelivery,
 }
 
 /// A device's signing key, when its public key is one: `p256:` and the base64url of an
@@ -5661,25 +5685,12 @@ pub(super) fn device_signing_key(public_key: &str) -> Option<&str> {
     }
 }
 
-#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum CredentialDelivery {
-    #[default]
-    Body,
-    Cookie,
-}
-
 pub(super) async fn pairing_complete(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
     Json(request): Json<PairingComplete>,
 ) -> Result<Response, ApiError> {
-    if request.credential_delivery == CredentialDelivery::Cookie && session.transport == "unix" {
-        return Err(validation(
-            "cookie credential delivery requires the Fabric gateway",
-        ));
-    }
     if request.api_version != CLIENT_API_VERSION || request.device_public_key.len() < 32 {
         return Err(validation(
             "the pairing completion has an invalid version or public key",
@@ -5813,18 +5824,6 @@ pub(super) async fn pairing_complete(
     let mut body = json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "scopes": scopes, "expires_at": client_timestamp(expires_at) });
     if let Some(chain) = chain {
         body["device_key_chain"] = json!(chain);
-    }
-    if request.credential_delivery == CredentialDelivery::Cookie {
-        body["credential_delivery"] = json!("cookie");
-        let mut response = Json(body).into_response();
-        let max_age = u64::try_from(expires_at.saturating_sub(client_now_ms()) / 1_000)
-            .map_err(ApiError::internal)?;
-        let cookie = super::client_web::device_cookie_header(&credential, max_age);
-        response.headers_mut().insert(
-            axum::http::header::SET_COOKIE,
-            axum::http::HeaderValue::from_str(&cookie).map_err(ApiError::internal)?,
-        );
-        return Ok(response);
     }
     body["credential"] = json!(credential);
     Ok(Json(body).into_response())
@@ -6144,14 +6143,7 @@ pub(super) async fn terminal_stream(
 ) -> Result<Response, ApiError> {
     let started = super::client_web::unix_nanos();
     require_scope(&session, "terminal.read")?;
-    let protocols = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|protocol| !protocol.is_empty())
-        .collect::<Vec<_>>();
+    let protocols = stream_protocols(&headers);
     let normative_count = protocols
         .iter()
         .filter(|protocol| **protocol == TERMINAL_SUBPROTOCOL)
