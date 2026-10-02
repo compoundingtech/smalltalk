@@ -158,6 +158,9 @@ pub enum AttentionKind {
         from: String,
         from_id: String,
         question: String,
+        /// A structured ask's typed fields (#1010): summary, reasons, links, named answers and
+        /// a recommendation. Absent on a free-text ask.
+        structured: Option<Box<st3_client::StructuredRequest>>,
     },
 }
 

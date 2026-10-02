@@ -461,12 +461,40 @@ impl Writer {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             harness != Harness::Unrecognized,
+            "a harness this version does not recognize cannot be written: its numbers would be uninterpretable");
+        Self::with_staging_dir(agent_dir, agent, harness, staging_dir(agent_dir)?)
+    }
+
+    /// Native drivers use their resolved observation directory, without catalog ancestry.
+    pub fn new_paths(
+        agent_dir: &Path,
+        agent: impl Into<String>,
+        harness: Harness,
+    ) -> anyhow::Result<Self> {
+        ensure_real_directory(agent_dir, "native observation directory")?;
+        let staging = agent_dir.join(".harness-context-staging");
+        create_or_validate_directory(&staging, "native harness-context staging directory")?;
+        anyhow::ensure!(
+            fs::metadata(agent_dir)?.dev() == fs::metadata(&staging)?.dev(),
+            "native context staging directory is on another filesystem"
+        );
+        Self::with_staging_dir(agent_dir, agent, harness, staging)
+    }
+
+    fn with_staging_dir(
+        agent_dir: &Path,
+        agent: impl Into<String>,
+        harness: Harness,
+        staging: PathBuf,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            harness != Harness::Unrecognized,
             "a harness this version does not recognize cannot be written: its numbers would be uninterpretable"
         );
         Ok(Self {
             path: harness_context_path(agent_dir),
             lock_path: agent_dir.join(LOCK_NAME),
-            staging_dir: staging_dir(agent_dir)?,
+            staging_dir: staging,
             agent: agent.into(),
             harness,
             session: crate::harness_state::session_token(),
@@ -823,6 +851,32 @@ mod tests {
         let agent_dir = root.join("agents").join("example-linux").join("worker");
         fs::create_dir_all(&agent_dir).unwrap();
         agent_dir
+    }
+
+    #[test]
+    fn native_context_stages_on_the_observation_filesystem_without_a_catalog() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let observations = root.path().join("observations");
+        fs::create_dir(&observations).unwrap();
+        let mut writer = Writer::new_paths(&observations, "example/seat", Harness::Claude)
+            .unwrap()
+            .with_session("current");
+        writer
+            .observe(Reading {
+                used_tokens: Some(120),
+                window_tokens: Some(200),
+                ..Reading::default()
+            })
+            .unwrap();
+        let observed = read(&harness_context_path(&observations)).unwrap();
+        assert_eq!(observed.used_tokens, Some(120));
+        assert_eq!(observed.window_tokens, Some(200));
+        assert!(!root.path().join("agents").exists());
+        assert!(!root.path().join(".st2").exists());
+        let alias = root.path().join("alias");
+        symlink(&observations, &alias).unwrap();
+        assert!(Writer::new_paths(&alias, "example/seat", Harness::Claude).is_err());
     }
 
     #[test]

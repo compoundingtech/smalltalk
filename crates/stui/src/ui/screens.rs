@@ -243,6 +243,8 @@ pub struct Drafts<'a> {
     pub cursor: usize,
     pub editing: bool,
     pub confirm: Option<char>,
+    /// The named answer chosen on a structured request, before Enter sends it.
+    pub answering: Option<usize>,
     /// "Chat about this": who it goes to, the draft, and the thread so far.
     pub chat: Option<Chat<'a>>,
 }
@@ -308,6 +310,159 @@ fn text_box(doc: &mut Doc, title: &str, drafts: &Drafts<'_>, placeholder: &str, 
 
 /// A request whose text is (or ends in) a JSON report: the words before it, then the fields that
 /// say what happened, then the rest folded to a few. `None` when there is no JSON object.
+/// A structured request (#1010) as a person reads it: the asker's recommendation first, then
+/// the question, its summary, the reasons, the links, and each named answer with what it does.
+/// `a` (or a click) chooses an answer, ↑↓ another, Enter sends it (cos, 2026-10-02).
+fn structured_request(
+    card: &mut Doc,
+    from: &str,
+    request: &st3_client::StructuredRequest,
+    drafts: &Drafts<'_>,
+    inner: usize,
+) {
+    card.line(Line::from(vec![
+        span("asks  ", theme::dim()),
+        span(from.to_owned(), theme::strong(theme::PERSON)),
+    ]));
+    card.blank();
+    let label_of = |id: &str| {
+        request
+            .answers
+            .iter()
+            .find(|answer| answer.id == id)
+            .map_or_else(|| id.to_owned(), |answer| answer.label.clone())
+    };
+    if let Some(recommendation) = &request.recommendation {
+        card.lines(text::wrap(
+            &[
+                text::run("recommends  ", theme::dim()),
+                text::run(
+                    label_of(&recommendation.answer),
+                    theme::strong(theme::GREEN),
+                ),
+                text::run(format!("  {}", recommendation.reason), theme::soft()),
+            ],
+            inner,
+            &[],
+            &[text::run("             ", theme::dim())],
+            None,
+        ));
+        card.blank();
+    }
+    card.lines(text::markdown(
+        &spaced(&request.question),
+        inner,
+        theme::text(),
+    ));
+    if let Some(summary) = request
+        .summary
+        .as_deref()
+        .filter(|summary| !summary.is_empty())
+    {
+        card.blank();
+        card.lines(text::markdown(&spaced(summary), inner, theme::soft()));
+    }
+    if !request.reasons.is_empty() {
+        card.blank();
+        for reason in &request.reasons {
+            card.lines(text::wrap(
+                &text::inline(reason, theme::text()),
+                inner,
+                &[text::run(" • ", theme::fg(theme::LAVENDER))],
+                &[text::run("   ", theme::dim())],
+                None,
+            ));
+        }
+    }
+    if !request.subjects.is_empty() {
+        card.blank();
+        for subject in &request.subjects {
+            let target = subject
+                .url
+                .as_deref()
+                .or(subject.reference.as_deref())
+                .unwrap_or_default();
+            card.lines(text::wrap(
+                &[
+                    text::run(subject.label.clone(), theme::text()),
+                    text::run(format!("  {target}"), theme::fg(theme::ACCENT)),
+                ],
+                inner,
+                &[text::run(" ↗ ", theme::fg(theme::ACCENT))],
+                &[text::run("   ", theme::dim())],
+                None,
+            ));
+        }
+    }
+    card.blank();
+    let recommended = request
+        .recommendation
+        .as_ref()
+        .map(|wanted| wanted.answer.as_str());
+    for (index, answer) in request.answers.iter().enumerate() {
+        let chosen = drafts.answering == Some(index);
+        let mut head = vec![
+            text::run(
+                if chosen { " ▸ " } else { "   " },
+                theme::strong(theme::ACCENT),
+            ),
+            text::run(
+                answer.label.clone(),
+                if chosen {
+                    theme::strong(theme::ACCENT)
+                } else {
+                    theme::strong(theme::TEXT)
+                },
+            ),
+        ];
+        if recommended == Some(answer.id.as_str()) {
+            head.push(text::run("  recommended", theme::fg(theme::GREEN)));
+        }
+        head.push(text::run(format!("  {}", answer.consequence), theme::dim()));
+        let from_line = card.lines.len();
+        card.lines(text::wrap(
+            &head,
+            inner,
+            &[],
+            &[text::run("   ", theme::dim())],
+            None,
+        ));
+        card.targets.push(crate::ui::doc::Target {
+            line: from_line,
+            column: 0,
+            width: inner as u16,
+            hit: Hit::Answer(index),
+        });
+    }
+    card.blank();
+    if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
+        text_box(card, &format!("answer {from}"), drafts, "", inner);
+        card.buttons(&[
+            ("enter", "Send the answer", Hit::Enter, theme::ACCENT),
+            ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+        ]);
+    } else if drafts.answering.is_some() {
+        card.buttons(&[
+            ("enter", "Send this answer", Hit::Enter, theme::ACCENT),
+            ("↑↓", "Another", Hit::Key('a'), theme::OVERLAY1),
+            ("esc", "Not now", Hit::Escape, theme::OVERLAY1),
+        ]);
+    } else {
+        let mut buttons = vec![("a", "Choose an answer", Hit::Key('a'), theme::ACCENT)];
+        if request.custom {
+            buttons.push(("c", "Answer in words", Hit::Key('c'), theme::ACCENT));
+        }
+        card.buttons(&buttons);
+    }
+    if !request.why_person.is_empty() {
+        card.blank();
+        card.wrap(
+            &text::inline(&format!("Why you: {}", request.why_person), theme::dim()),
+            inner,
+        );
+    }
+}
+
 /// A question as agents write one, "Recommend: …⏎Why: …⏎Answer …", given room to read: a blank
 /// line between consecutive lines of prose, and a short leading label ("Why:") in bold. Lists,
 /// quotes, tables, headings and code keep their lines together (Nathan, 2026-10-02).
@@ -840,6 +995,11 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 inner,
             );
         }
+        AttentionKind::Request {
+            from,
+            structured: Some(request),
+            ..
+        } => structured_request(&mut card, from, request, drafts, inner),
         AttentionKind::Request { from, question, .. } => {
             card.line(Line::from(vec![
                 span("asks  ", theme::dim()),
@@ -975,6 +1135,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             text: Some(chat.text),
             cursor: chat.cursor,
             editing: chat.editing,
+            answering: None,
             confirm: None,
             chat: None,
         };

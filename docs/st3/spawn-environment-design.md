@@ -115,6 +115,25 @@ PTY members receive a runtime-owned `TERM`. Exec members receive no terminal ide
 
 Provider drivers add only their documented values. They never forward existing `CLAUDE_CODE_*` or `CODEX_*` markers.
 
+Native drivers resolve their own state paths before launching a provider. A seat's root is
+`STATE/drivers/<subject-sha256-prefix>/`, with observations in `observations/` and session
+bindings, ledgers and provider transcripts in `sessions/<harness>/`. They create no catalog
+or agent KDL declaration, and require no PTY root invented for catalog validation.
+
+Claude hooks and managed channels receive `ST_DRIVER_ROOT`, `ST_DRIVER_AGENT_DIR`,
+`ST_DRIVER_SESSION_DIR` and `ST_DRIVER_IDENTITY`. The contract is complete and uses absolute
+paths; a partial contract or an identity mismatch fails instead of falling back to a catalog.
+Wrapper session tokens and ownership sequences still fence observations, and transcript
+binding still validates the native session, managed transcript store and workspace.
+
+A driver carries its resolved paths in its resume state across binary replacement. A resume
+record from before this contract adopts the predecessor's directories and session files;
+existing Claude hook environments and pi/omp extension sets retain their catalog fallback.
+Those files stay untouched until an ordinary provider restart selects the native layout.
+Doctor and managed conversation readers support both layouts and check the current provider
+incarnation before using a binding. Deploy the matching daemon readers before restarting
+providers into the new layout; existing providers need no fleet-wide restart.
+
 The working directory sets `PWD` through process launch. The runtime does not copy an ambient `PWD`.
 
 ## Execution boundary

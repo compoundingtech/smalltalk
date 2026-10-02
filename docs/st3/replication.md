@@ -262,8 +262,14 @@ name = "node-b"
 This accepts node-b's authenticated exchanges and never dials it. The equivalent command-line
 entry is `--peer node-b`. A peer is observed as up after a successful exchange in either
 direction. After 90 seconds without an exchange it is shown as `last-seen`, with the time
-of its last successful exchange, rather than as a fault. Doctor does not warn about absence,
-and delivery probes and their attention streaks wait for the member to exchange again.
+of its last successful exchange, rather than as a fault. It is `last-seen` sooner when an attempt
+to reach it has failed and it has missed a 35-second quiet exchange interval, as a frozen peer
+does; a failure within that interval can be a one-way route while the peer still dials in. The
+last failed attempt stays as the peer's `last_error`, with its time, until the next exchange. A
+sync measurement older than the quiet interval is marked `stale`, with the envelopes this node
+gained since. Doctor names every absent peer and how much this node has not sent it, and warns
+only for an absent listening member; a dial-out member or a config peer can be away for hours.
+Delivery probes and their attention streaks wait for the member to exchange again.
 A config-peer node can omit `peer_listen` and initiate every exchange itself; it still pushes
 and pulls the full graph.
 
@@ -662,6 +668,14 @@ st replication checkpoint excuse node-c --reason "away for a week" --as person/o
 
 An excusal fences nothing. What the excused writer wrote while away still replicates when it
 returns, and its next seal ends the excusal.
+
+Excusing each side of a partition lets each side certify on its own. When they meet again, every
+node applies the same certificate: for one cut, the one with the most participants, and
+otherwise the newest. Adopting its manifest makes a node's tombstones exactly the manifest's. A
+claim that only the other side saw and dropped is then forgotten: no node holds it or its
+tombstone. Only a claim a rule may drop can be forgotten, one a kept claim replaces, so every
+answer stays the same, and the nodes still agree with each other. Person and mission claims are
+never dropped, so they are never forgotten. Issue #1052 tracks keeping those tombstones too.
 
 When verifications differ, that checkpoint never becomes stable, and the next due checkpoint
 tries again. `status` names which digests differ for each participant. Seals that differ in
