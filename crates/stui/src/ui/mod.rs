@@ -1637,10 +1637,24 @@ impl Ui {
         let doc = match self.world.conversations.get(&agent.id) {
             None | Some(Load::Loading) => {
                 let mut doc = Doc::new();
-                doc.line(Line::from(Span::styled(
-                    format!(" {} Loading the conversation…", self.spinner()),
-                    theme::dim(),
-                )));
+                // A first page st keeps refusing says why while stui tries again, rather than
+                // loading forever.
+                match self.stalled.get(&agent.id) {
+                    Some(error) => doc.wrap(
+                        &[
+                            text::run(format!(" {} ", self.spinner()), theme::dim()),
+                            text::run(
+                                format!("Not loaded yet: {error}. Trying again."),
+                                theme::fg(theme::YELLOW),
+                            ),
+                        ],
+                        width.saturating_sub(2),
+                    ),
+                    None => doc.line(Line::from(Span::styled(
+                        format!(" {} Loading the conversation…", self.spinner()),
+                        theme::dim(),
+                    ))),
+                }
                 doc
             }
             Some(Load::Failed(reason)) => {
@@ -2316,7 +2330,10 @@ impl Ui {
             ("o", "expand or collapse tool output"),
             ("c", "write: a message, feedback, a reply"),
             ("s", "hide the sidebar"),
-            ("b p", "Usage: group by agent, mission, step...; change the period"),
+            (
+                "b p",
+                "Usage: group by agent, mission, step...; change the period",
+            ),
             ("q", "quit"),
         ] {
             inner.line(Line::from(vec![
@@ -4444,6 +4461,21 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_first_page_st_keeps_refusing_says_why_while_stui_tries_again() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let agent = ui.selected_id().unwrap();
+        ui.world.conversations.insert(agent.clone(), Load::Loading);
+        ui.conversation_failed(&agent, "the list changed while it was being read");
+        let screen = frame(&ui, 120, 30).join("\n");
+        assert!(
+            screen.contains("Not loaded yet: the list changed"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Loading the conversation"), "{screen}");
     }
 
     #[test]
