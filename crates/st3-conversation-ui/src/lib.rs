@@ -18,7 +18,7 @@ pub mod theme;
 pub mod timeline;
 
 pub use clean::clean_message_text;
-pub use conversation::Cache;
+pub use conversation::{Cache, Density, bundle_id};
 pub use entry::{Body, Entry, ToolState};
 pub use pane::{PaneIntent, PaneState, Selection, State};
 pub use theme::Theme;

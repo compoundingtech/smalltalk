@@ -129,6 +129,18 @@ pub struct Event {
     pub label: Token,
 }
 
+/// The simplified conversation's tool calls: one line each, and a run of them one line that
+/// says how many and how they went ("▸ 7 tool calls · ✓6 ✕1 · last: $ cargo test").
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Bundle {
+    /// Marks a folded run, then an opened one.
+    pub folded: &'static str,
+    pub opened: &'static str,
+    pub label: Token,
+    /// "last:" and the last call's title.
+    pub last: Token,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Rules {
     pub user: User,
@@ -138,6 +150,7 @@ pub struct Rules {
     pub mail: Mail,
     pub pending: Pending,
     pub event: Event,
+    pub bundle: Bundle,
 }
 
 pub const RULES: Rules = Rules {
@@ -217,5 +230,11 @@ pub const RULES: Rules = Rules {
     event: Event {
         rule: Token::Surface1,
         label: Token::Overlay0,
+    },
+    bundle: Bundle {
+        folded: "▸",
+        opened: "▾",
+        label: Token::Overlay1,
+        last: Token::Overlay0,
     },
 };

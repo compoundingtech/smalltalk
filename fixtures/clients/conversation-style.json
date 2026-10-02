@@ -1,5 +1,11 @@
 {
   "assistant": "text",
+  "bundle": {
+    "folded": "▸",
+    "label": "overlay1",
+    "last": "overlay0",
+    "opened": "▾"
+  },
   "event": {
     "label": "overlay0",
     "rule": "surface1"
