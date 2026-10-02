@@ -174,6 +174,7 @@ impl Cache {
 fn outcome(state: &ToolState, spinner: &str, theme: &Theme) -> (String, ratatui::style::Color) {
     let rules = RULES.tool;
     match state {
+        ToolState::Running if spinner.is_empty() => ("…".to_owned(), rules.running.color(theme)),
         ToolState::Running => (spinner.to_owned(), rules.running.color(theme)),
         ToolState::Ok => (rules.ok.text.to_owned(), rules.ok.color.color(theme)),
         ToolState::Failed => (
@@ -255,7 +256,13 @@ fn bundle_line(
     ] {
         if shown > 0 {
             spans.push(Span::styled(" · ", fg(rules.last, theme)));
-            spans.push(Span::styled(format!("{glyph}{shown}"), theme::fg(color)));
+            // A printed conversation has no spinner to show: it says so in words.
+            let count = if glyph.is_empty() {
+                format!("{shown} running")
+            } else {
+                format!("{glyph}{shown}")
+            };
+            spans.push(Span::styled(count, theme::fg(color)));
         }
     }
     if let Some(Body::Tool { title, .. }) = calls.last().map(|entry| &entry.body) {

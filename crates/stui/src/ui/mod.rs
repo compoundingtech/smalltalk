@@ -18,6 +18,7 @@ mod glass_store;
 pub mod layout;
 pub mod live;
 pub mod pane;
+mod prefs;
 mod pty;
 pub mod screens;
 pub mod text;
@@ -262,6 +263,8 @@ pub struct Ui {
     /// What the Usage tab groups by, and over how many hours.
     usage_by: usage::By,
     pub(crate) usage_hours: u64,
+    /// Simplified conversations here (Shift+O): this device's choice, kept in prefs.json.
+    pub(crate) simple: bool,
     /// An attached terminal shown in place of the conversation.
     pub(crate) terminal: Option<TerminalView>,
     /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
@@ -351,6 +354,7 @@ impl Ui {
             tree: false,
             usage_by: usage::By::default(),
             usage_hours: usage::PERIODS[0],
+            simple: false,
             terminal: None,
             terminal_confirm: None,
             new_mission: None,
@@ -417,6 +421,42 @@ impl Ui {
         }
         targets.truncate(crate::feed::MAX_CONVERSATIONS);
         targets
+    }
+
+    /// This device's remembered choices, read once when stui starts.
+    pub(crate) fn load_prefs(&mut self) {
+        if let Some(path) = prefs::path() {
+            self.simple = prefs::load(&path).simple == Some(true);
+        }
+    }
+
+    fn density(&self) -> st3_conversation_ui::Density {
+        if self.simple {
+            st3_conversation_ui::Density::Simple
+        } else {
+            st3_conversation_ui::Density::Full
+        }
+    }
+
+    /// Every conversation simplified (a tool call to a line, a run of calls to one line) or in
+    /// full: this device's choice, remembered.
+    pub(crate) fn toggle_simple(&mut self) {
+        self.simple = !self.simple;
+        // Tests never touch the device's own choice.
+        #[cfg(not(test))]
+        if let Some(path) = prefs::path() {
+            let _ = prefs::save(
+                &path,
+                &prefs::Prefs {
+                    simple: Some(self.simple),
+                },
+            );
+        }
+        self.flash(if self.simple {
+            "Simplified conversations · Shift+O for the full view"
+        } else {
+            "Full conversations · Shift+O to simplify"
+        });
     }
 
     /// Usage grouped by the next dimension: agent, mission, step, model, account, host.
@@ -1396,7 +1436,13 @@ impl Ui {
                         .cloned()
                         .collect::<Vec<_>>();
                     self.cache
-                        .render(&about, width.saturating_sub(4), &self.conversation_state.expanded, self.spinner())
+                        .render(
+                            &about,
+                            width.saturating_sub(4),
+                            &self.conversation_state.expanded,
+                            self.spinner(),
+                            self.density(),
+                        )
                         .lines
                 }
                 _ => Vec::new(),
@@ -1702,7 +1748,8 @@ impl Ui {
                 let mut doc = Doc::new();
                 doc.blank();
                 doc.append(
-                    self.cache.render(entries, width, &expanded, self.spinner()),
+                    self.cache
+                        .render(entries, width, &expanded, self.spinner(), self.density()),
                     0,
                 );
                 doc.blank();
@@ -2704,6 +2751,7 @@ impl Ui {
             KeyCode::Char('s') if self.glasses.is_none() => self.sidebar = !self.sidebar,
             KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
             KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
+            KeyCode::Char('O') => self.toggle_simple(),
             KeyCode::Char('/') if self.tab == 1 => {
                 if let Some(agent) = self.selected_id() {
                     self.find = Some(Find {
@@ -4263,6 +4311,7 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let mut ui = Ui::new(demo::loading());
+    ui.load_prefs();
     // The demo keeps its glasses in memory only, and shows the sidebar as a new device does.
     ui.glasses = glass.map(|name| {
         let mut glasses = glass::Glasses::open(name, None);
@@ -4463,6 +4512,27 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn shift_o_simplifies_every_conversation_and_back() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let agent = ui.selected_id().unwrap();
+        let tools = |ui: &Ui| {
+            let screen = frame(ui, 120, 40).join("\n");
+            (screen.contains("tool calls ·"), screen)
+        };
+        assert!(!tools(&ui).0, "full by default");
+        ui.key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
+        assert!(ui.simple);
+        let (bundled, screen) = tools(&ui);
+        assert!(
+            bundled || !screen.contains("$ "),
+            "a run of calls folds to one line in {agent}: {screen}"
+        );
+        ui.key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
+        assert!(!ui.simple);
     }
 
     #[test]

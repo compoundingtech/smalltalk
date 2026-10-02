@@ -1282,6 +1282,7 @@ mod tests {
             100,
             &Default::default(),
             "⠋",
+            st3_conversation_ui::Density::Full,
         );
         doc.lines
             .iter()
