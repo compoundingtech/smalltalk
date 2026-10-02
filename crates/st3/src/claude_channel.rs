@@ -286,15 +286,15 @@ async fn body(client: &Client, message: &MessageView) -> Result<String> {
         Ok(message.content.clone())
     }
 }
-// Delivered graph mail has already crossed a native handoff, even if this incarnation has
-// no local ledger. Keep attempted mail available for transcript proof, but never restage it.
+// Only read/closed settles graph mail. A new incarnation must reoffer delivered-unread mail;
+// the incarnation-scoped attempted ledger prevents repeating a handoff in the same channel.
 async fn prepare_handoff(client: &Client, fence: &Fence, message: &MessageView) -> Result<bool> {
     match message.status.as_str() {
         "sent" => Ok(receipt(client, fence, &message.subject, "staged")
             .await?
             .kind
             == "message.staged"),
-        "staged" => Ok(true),
+        "staged" | "delivered" => Ok(true),
         _ => Ok(false),
     }
 }
@@ -350,131 +350,34 @@ mod tests {
     use std::io::Write as _;
 
     #[tokio::test]
-    async fn claude_delivered_replay_makes_no_staging_requests_and_settled_mail_is_not_handed_off()
-    {
-        use axum::{Json, Router, routing::post};
-        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let root = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(
-            crate::store::Store::open(&root.path().join("graph.db"), "node").unwrap(),
-        );
-        let message = |subject: &str, status: &str| MessageView {
-            subject: subject.into(),
-            from: "person/eval".into(),
-            to: "agent/eval.worker".into(),
-            content: "Signal".into(),
-            status: status.into(),
-            title: None,
-            in_reply_to: None,
-            tags: Vec::new(),
-            created_index: 1,
-        };
-        let claim = |message: &MessageView, lifecycle: &str| ClaimInput {
-            subject: message.subject.clone(),
-            kind: format!("message.{lifecycle}"),
-            actor: Some(
-                if lifecycle == "sent" {
-                    &message.from
-                } else {
-                    &message.to
-                }
-                .clone(),
-            ),
-            fields: if lifecycle == "sent" {
-                BTreeMap::from([
-                    ("status".into(), json!(lifecycle)),
-                    ("from".into(), json!(message.from)),
-                    ("to".into(), json!(message.to)),
-                    ("content".into(), json!(message.content)),
-                ])
-            } else {
-                BTreeMap::from([("status".into(), json!(lifecycle))])
-            },
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: None,
-        };
-        let sent = message("message/fresh", "sent");
-        let raced = message("message/raced", "sent");
-        store.append_claim(&claim(&sent, "sent")).unwrap();
-        store.append_claim(&claim(&raced, "sent")).unwrap();
-        let settled = store.append_claim(&claim(&raced, "delivered")).unwrap();
-        let graph = store.clone();
-        let captured = requests.clone();
-        let app = Router::new().route(
-            "/v1/mailbox/receipts",
-            post(move |Json(receipt): Json<Receipt>| {
-                let graph = graph.clone();
-                let captured = captured.clone();
-                let settled = settled.clone();
-                async move {
-                    captured
-                        .lock()
-                        .unwrap()
-                        .push((receipt.message.clone(), receipt.lifecycle.clone()));
-                    // The fenced endpoint settles a stale staging view to existing later evidence.
-                    let record = if receipt.message == settled.subject {
-                        settled
-                    } else {
-                        graph
-                            .append_claim(&ClaimInput {
-                                subject: receipt.message,
-                                kind: format!("message.{}", receipt.lifecycle),
-                                actor: Some(receipt.fence.subject),
-                                fields: BTreeMap::from([(
-                                    "status".into(),
-                                    json!(receipt.lifecycle),
-                                )]),
-                                evidence: Vec::new(),
-                                expected_subject: None,
-                                idempotency_key: None,
-                            })
-                            .unwrap()
-                    };
-                    Json(json!({"api_version":"st3.v1", "value":record}))
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = Client::new(crate::client::Endpoint::Http(format!("http://{address}")));
+    async fn claude_unread_replay_needs_no_backward_receipt_and_read_or_closed_mail_is_final() {
+        let client = Client::new(crate::client::Endpoint::Unix(
+            std::path::PathBuf::from("/absent-st889-daemon.sock"),
+        ));
         let fence = Fence::new("agent/eval.worker", "new-incarnation", "delivery");
-        // Sixty replay ticks of one hundred legacy-delivered messages used to make 6,000 POSTs.
-        for _ in 0..60 {
-            for index in 0..100 {
-                assert!(
-                    !prepare_handoff(
-                        &client,
-                        &fence,
-                        &message(&format!("message/legacy-{index}"), "delivered")
-                    )
-                    .await
-                    .unwrap()
-                );
-            }
+        for (status, expected) in [
+            ("staged", true),
+            ("delivered", true),
+            ("read", false),
+            ("closed", false),
+        ] {
+            let message = MessageView {
+                subject: "message/replay".into(),
+                from: "person/eval".into(),
+                to: fence.subject.clone(),
+                content: "Signal".into(),
+                status: status.into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                created_index: 1,
+            };
+            assert_eq!(
+                prepare_handoff(&client, &fence, &message).await.unwrap(),
+                expected,
+                "{status}"
+            );
         }
-        assert!(requests.lock().unwrap().is_empty());
-        assert!(
-            prepare_handoff(&client, &fence, &message("message/pending", "staged"))
-                .await
-                .unwrap()
-        );
-        assert!(requests.lock().unwrap().is_empty());
-        assert!(prepare_handoff(&client, &fence, &sent).await.unwrap());
-        assert!(!prepare_handoff(&client, &fence, &raced).await.unwrap());
-        assert_eq!(
-            *requests.lock().unwrap(),
-            vec![
-                (sent.subject.clone(), "staged".into()),
-                (raced.subject.clone(), "staged".into())
-            ]
-        );
-        assert_eq!(
-            store.message(&raced.subject).unwrap().unwrap().status,
-            "delivered"
-        );
-        server.abort();
     }
 
     #[test]

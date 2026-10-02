@@ -138,7 +138,7 @@ impl Assessment {
     }
 }
 
-/// Assess the delivery path of a local seat whose harness reports it can take work.
+/// Assess the delivery path of a local native seat, independently of harness readiness.
 pub(crate) fn assess(recipient: &str, driver: &str) -> Assessment {
     let presence = presence();
     let beat = presence.beats.lock().ok().and_then(|beats| {
