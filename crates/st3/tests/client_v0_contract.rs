@@ -157,6 +157,8 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
         "work.release",
         "work.retry",
         "work.publish-mission",
+        "agent.stop",
+        "agent.start",
         "agent.queue-move",
         "lane.join",
         "lane.leave",

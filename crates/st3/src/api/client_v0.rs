@@ -995,6 +995,8 @@ const ACTIONS: &[&str] = &[
     "work.retry",
     "work.publish-mission",
     "agent.create",
+    "agent.stop",
+    "agent.start",
     "terminal.create",
     "terminal.end",
     "agent.queue-move",
@@ -1042,6 +1044,8 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "work.release",
     "work.retry",
     "agent.create",
+    "agent.stop",
+    "agent.start",
     "terminal.create",
     "terminal.end",
     "agent.queue-move",
@@ -1152,8 +1156,10 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
         } else if session.allows(scope)
-            && (!matches!(*action, "agent.create" | "terminal.create" | "terminal.end")
-                || require_creation_actor(session).is_ok())
+            && (!matches!(
+                *action,
+                "agent.create" | "agent.stop" | "agent.start" | "terminal.create" | "terminal.end"
+            ) || require_creation_actor(session).is_ok())
         {
             "granted"
         } else {
@@ -6442,7 +6448,7 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
-    if action == "agent.create" {
+    if matches!(action, "agent.create" | "agent.stop" | "agent.start") {
         return Some("control.runtimes");
     }
     if action == "work.done" {
@@ -7626,6 +7632,89 @@ async fn dispatch_action(
             )])
         }
         "terminal.detach" => Ok(vec![detach_terminal_attachment(state, session, request)?]),
+        action @ ("agent.stop" | "agent.start") => {
+            require_creation_actor(session)?;
+            let agent = client_detail_id("agent", &parameter_string(p, "agent")?);
+            if action == "agent.stop" {
+                serde_json::from_value::<st3_client::AgentStopParameters>(p.clone())
+                    .map_err(|error| validation(error.to_string()))?;
+            } else {
+                serde_json::from_value::<st3_client::AgentStartParameters>(p.clone())
+                    .map_err(|error| validation(error.to_string()))?;
+            }
+            let token = state
+                .store
+                .selected_desired_token(&agent)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("agent `{agent}` has no declaration"))
+                })?;
+            if request.fence.runtime_desired_revision.as_deref() != Some(token.as_str()) {
+                return Err(stale("the agent desired revision changed"));
+            }
+            let mut claim = state
+                .store
+                .claim_by_id(&token)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::internal("selected declaration is missing"))?;
+            let declared = loop {
+                let desired: crate::model::DesiredSubject =
+                    serde_json::from_value(claim.body).map_err(ApiError::internal)?;
+                if desired.kind == "agent" {
+                    if desired.owner_run.is_some() {
+                        return Err(validation(
+                            "mission-owned agents must be changed through their mission",
+                        ));
+                    }
+                    break desired;
+                }
+                if desired.kind != "stop" || claim.predecessors.len() != 1 {
+                    return Err(validation("agent has no unambiguous prior declaration"));
+                }
+                claim = state
+                    .store
+                    .claim_by_id(&claim.predecessors[0])
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(|| ApiError::internal("prior declaration is missing"))?;
+            };
+            let kdl = if action == "agent.stop" {
+                format!(
+                    "version 2\nstop {}\n",
+                    serde_json::to_string(&agent).map_err(ApiError::internal)?
+                )
+            } else {
+                let mut node =
+                    crate::graph::render_desired_node(&declared.desired).map_err(ApiError::bad)?;
+                let identity = agent.trim_start_matches("agent/");
+                let mut body = node.children_mut().take().unwrap_or_default();
+                if let Some(child) = body
+                    .nodes_mut()
+                    .iter_mut()
+                    .find(|child| child.name().value() == "identity")
+                {
+                    child.entries_mut()[0] = kdl::KdlEntry::new(identity);
+                } else {
+                    node.entries_mut()[0] = kdl::KdlEntry::new(identity);
+                }
+                if let Some(member) = declared.member {
+                    let mut host = kdl::KdlNode::new("host");
+                    host.entries_mut().push(kdl::KdlEntry::new(member.host));
+                    if let Some(child) = body
+                        .nodes_mut()
+                        .iter_mut()
+                        .find(|child| child.name().value() == "host")
+                    {
+                        *child = host;
+                    } else {
+                        body.nodes_mut().push(host);
+                    }
+                }
+                node.set_children(body);
+                format!("version 2\n{node}\n")
+            };
+            apply_runtime_control_intent(state, snapshot, request, authority_actor, kdl).await?;
+            Ok(vec![agent])
+        }
         "agent.queue-move" => {
             let agent = client_detail_id("agent", &parameter_string(p, "agent_id")?);
             let move_request = crate::model::SeatQueueMoveRequest {
@@ -8666,6 +8755,130 @@ subscription "watch/source" {
     }
 
     #[tokio::test]
+    async fn typed_agent_stop_down_seat_is_idempotent_and_start_restores_declaration() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let source = "version 2\nagent \"example/worker\" { workspace \"/tmp\"; command \"true\"; restart \"always\" }\n";
+        let intent = crate::graph::parse_intent(source, &state.node).unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "agent-control-fixture")
+            .unwrap();
+        let agent = "agent/example/worker";
+        let declaration = state.store.agent_declaration(agent, None).unwrap().unwrap();
+        let person = ClientSession::local(Some("person/alex")).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let stop = st3_client::ActionRequest::agent_stop(
+            "action/stop-down-seat",
+            "stop-down-seat-key-0001",
+            st3_client::Fence {
+                snapshot_id: snapshot.id.clone(),
+                runtime_desired_revision: Some(declaration.0.clone()),
+                ..Default::default()
+            },
+            st3_client::AgentStopParameters {
+                agent: agent.into(),
+                reason: Some("maintenance".into()),
+            },
+        )
+        .unwrap();
+        let stop: ActionRequest =
+            serde_json::from_value(serde_json::to_value(stop).unwrap()).unwrap();
+        let submit = |snapshot: ClientSnapshot, session: ClientSession, request| {
+            action(
+                State(state.clone()),
+                Extension(snapshot),
+                Extension(session),
+                Json(request),
+            )
+        };
+        let first = submit(snapshot.clone(), person.clone(), stop.clone())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            state.store.selected_desired_kind(agent).unwrap().as_deref(),
+            Some("stop")
+        );
+        let stopped = state.store.selected_desired_token(agent).unwrap().unwrap();
+        let replay = submit(new_client_snapshot(&state), person, stop)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(first["operation_id"], replay["operation_id"]);
+        assert_eq!(
+            state
+                .store
+                .selected_desired_token(agent)
+                .unwrap()
+                .as_deref(),
+            Some(stopped.as_str())
+        );
+        assert_eq!(
+            state
+                .store
+                .agent_declaration(agent, Some(&declaration.0))
+                .unwrap()
+                .unwrap()
+                .1,
+            declaration.1
+        );
+        let snapshot = new_client_snapshot(&state);
+        let start = st3_client::ActionRequest::agent_start(
+            "action/start-down-seat",
+            "start-down-seat-key-0001",
+            st3_client::Fence {
+                snapshot_id: snapshot.id.clone(),
+                runtime_desired_revision: Some(stopped),
+                ..Default::default()
+            },
+            st3_client::AgentStartParameters {
+                agent: agent.into(),
+            },
+        )
+        .unwrap();
+        let start: ActionRequest =
+            serde_json::from_value(serde_json::to_value(start).unwrap()).unwrap();
+        // The shared free-mode creation policy permits local agents without authority blocks.
+        let mut actor = ClientSession::local(Some("person/alex")).unwrap();
+        actor.actor = "agent/example/operator".into();
+        actor.authority_actor = actor.actor.clone();
+        assert!(require_creation_actor(&actor).is_ok());
+        let started = submit(snapshot, actor, start).await.unwrap().0;
+        assert_eq!(started["affected_ids"], json!([agent]));
+        assert_eq!(
+            state.store.selected_desired_kind(agent).unwrap().as_deref(),
+            Some("agent")
+        );
+        let restored = state
+            .store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.subject == agent)
+            .unwrap();
+        assert_eq!(restored.member.unwrap().host, state.node);
+        assert!(
+            state
+                .store
+                .claims_for(agent, Some("intent.desired"))
+                .unwrap()
+                .iter()
+                .any(|c| c.actor.as_deref() == Some("agent/example/operator"))
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_stop_uses_the_person_and_rejects_a_stale_desired_fence() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "client-control-test");
@@ -8739,6 +8952,47 @@ subscription "watch/source" {
         );
         let mut current = request;
         current.fence.runtime_desired_revision = Some(desired);
+        let typed_fence = st3_client::Fence {
+            snapshot_id: snapshot.id.clone(),
+            runtime_incarnation: Some(incarnation.into()),
+            runtime_desired_revision: current.fence.runtime_desired_revision.clone(),
+            ..st3_client::Fence::default()
+        };
+        let parameters = st3_client::TargetParameters {
+            target_id: "runtime/client-control-runtime".into(),
+            reason: Some("operator control".into()),
+            ..st3_client::TargetParameters::default()
+        };
+        // Before the generated Rust `Fence` carried the desired revision, these typed requests
+        // reached the daemon without it and were refused with 422.
+        let restart = st3_client::ActionRequest::runtime_restart(
+            "action/restart-worker",
+            "restart-worker-client-0001",
+            typed_fence.clone(),
+            parameters.clone(),
+        )
+        .unwrap();
+        let mut restart: ActionRequest =
+            serde_json::from_value(serde_json::to_value(restart).unwrap()).unwrap();
+        assert_eq!(
+            runtime_control_target(&state, &snapshot, &session, &restart).unwrap()["owner_id"],
+            owner
+        );
+        restart.fence.runtime_desired_revision = None;
+        assert_eq!(
+            runtime_control_target(&state, &snapshot, &session, &restart)
+                .unwrap_err()
+                .message,
+            "runtime control requires a desired revision fence"
+        );
+        let stop = st3_client::ActionRequest::runtime_stop(
+            "action/stop-worker",
+            "stop-worker-client-0001",
+            typed_fence,
+            parameters,
+        )
+        .unwrap();
+        current = serde_json::from_value(serde_json::to_value(stop).unwrap()).unwrap();
         assert_eq!(
             dispatch_action(&state, &snapshot, &session, &current)
                 .await

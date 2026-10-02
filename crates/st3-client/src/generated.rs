@@ -1536,6 +1536,8 @@ pub struct Fence {
     #[serde(default)]
     pub runtime_incarnation: Option<String>,
     #[serde(default)]
+    pub runtime_desired_revision: Option<String>,
+    #[serde(default)]
     pub terminal_sequence: Option<u64>,
     #[serde(default)]
     pub preview_token: Option<String>,
@@ -1603,6 +1605,10 @@ pub enum ActionType {
     WorkPublishMission,
     #[serde(rename = "agent.create")]
     AgentCreate,
+    #[serde(rename = "agent.stop")]
+    AgentStop,
+    #[serde(rename = "agent.start")]
+    AgentStart,
     #[serde(rename = "terminal.create")]
     TerminalCreate,
     #[serde(rename = "terminal.end")]
@@ -1696,6 +1702,34 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::AgentQueueMove,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn agent_start(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentStartParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::AgentStart,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn agent_stop(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentStopParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::AgentStop,
             idempotency_key,
             fence,
             &parameters,
@@ -2359,6 +2393,20 @@ pub struct PersonStepParameters {
     #[serde(default)]
     pub evidence: Vec<String>,
 }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStopParameters {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStartParameters {
+    pub agent: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct TargetParameters {
     pub target_id: String,
