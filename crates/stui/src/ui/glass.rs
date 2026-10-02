@@ -4685,6 +4685,35 @@ mod tests {
     }
 
     #[test]
+    fn an_attached_shell_stays_in_its_own_tab() {
+        let mut ui = glass();
+        ui.live = true;
+        let shell = "terminal/example-shell".to_owned();
+        ui.open_in_glass(Pane::Terminal(shell.clone()), Open::Tab);
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: shell.clone(),
+            title: "shell".into(),
+            name: "shell".into(),
+            lines: vec![ratatui::text::Line::from("$ echo in the shell")],
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: None,
+        });
+        assert!(screen(&ui).contains("echo in the shell"));
+        // Another tab shows its own conversation; the shell stays attached behind it.
+        let agent = ui.world.agents.items()[0].clone();
+        ui.open_in_glass(Pane::Agent(Some(agent.id.clone())), Open::Tab);
+        let shown = screen(&ui);
+        assert!(!shown.contains("echo in the shell"), "{shown}");
+        assert!(shown.contains(&agent.name), "{shown}");
+        assert!(ui.terminal.is_some(), "still attached");
+        // Back on its tab, the shell shows again.
+        ui.open_in_glass(Pane::Terminal(shell), Open::Here);
+        assert!(screen(&ui).contains("echo in the shell"));
+    }
+
+    #[test]
     fn home_opens_over_an_attached_shell_without_detaching_it() {
         let mut ui = glass();
         ui.live = true;

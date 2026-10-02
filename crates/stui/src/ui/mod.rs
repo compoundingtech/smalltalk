@@ -1065,7 +1065,7 @@ impl Ui {
             ]
         } else if self.terminal_focused() {
             vec![
-                ("ctrl+\\", "return"),
+                ("ctrl+\\", "back to stui"),
                 ("keys", "go to the terminal"),
                 ("ctrl-c twice", "interrupt"),
             ]
@@ -1497,9 +1497,16 @@ impl Ui {
         match self.tab {
             0 => Pane::Home(id),
             1 if self.agent_form => Pane::NewAgent,
+            // In spaces an attached terminal is its own tab's: another tab shows what it holds,
+            // and the terminal stays attached behind it (Nathan, 2026-10-02).
             1 => match &self.terminal {
-                Some(view) => Pane::Terminal(view.agent.clone()),
-                None => Pane::Agent(id),
+                Some(view)
+                    if self.glasses.is_none()
+                        || self.focused_pane() == Some(Pane::Terminal(view.agent.clone())) =>
+                {
+                    Pane::Terminal(view.agent.clone())
+                }
+                _ => Pane::Agent(id),
             },
             2 if self.new_mission.is_some() => Pane::NewMission,
             2 if self.kdl => Pane::Declaration(id),
