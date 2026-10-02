@@ -1866,9 +1866,9 @@ fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Graph state says whether a harness took its ready turn; only this daemon can say whether the
-/// process that carries the seat's messages is still polling and runs its binary. A running local
-/// native seat with a stale delivery path is `waiting`, with the reason, rather than `running`.
+/// Delivery presence is independent of harness readiness: a local native seat waiting on a human
+/// still has a transport to assess. A running seat with a stale path becomes `waiting`; an
+/// already-waiting seat retains its harness block and ask details.
 fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     const NATIVE_DRIVERS: [&str; 5] = ["claude", "codex", "opencode", "pi", "omp"];
     let Some(driver) = item
@@ -1880,12 +1880,11 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
         return;
     };
     let local = item.get("host_id").and_then(Value::as_str) == Some(local_host);
-    let takes_work = item.get("state").and_then(Value::as_str) == Some("running")
-        && matches!(
-            item.get("harness_state").and_then(Value::as_str),
-            Some("ready" | "working" | "idle")
-        );
-    if !local || !takes_work {
+    let live = matches!(
+        item.get("state").and_then(Value::as_str),
+        Some("running" | "waiting")
+    );
+    if !local || !live {
         return;
     }
     let Some(recipient) = item.get("id").and_then(Value::as_str) else {
@@ -12258,6 +12257,46 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             message_delivery_value(to, "read", 1_000, 12_000)["state"],
             "read"
         );
+    }
+
+    #[test]
+    fn waiting_native_seats_retain_delivery_presence() {
+        let recipient = "agent/eval/waiting-delivery-presence";
+        delivery_presence::record_legacy(recipient, "omp-channel", std::process::id());
+        for harness in [
+            "ready",
+            "working",
+            "idle",
+            "blocked",
+            "indeterminate",
+            "unauthenticated",
+        ] {
+            let mut item = json!({
+                "id": recipient, "driver": "omp", "host_id": "local",
+                "state": "waiting", "harness_state": harness,
+                "blocked_on": "human", "ask": "approval",
+            });
+            overlay_delivery_presence(&mut item, "local");
+            assert_eq!(item["delivery"]["state"], "legacy", "{harness}: {item}");
+            assert_eq!(item["state"], "waiting");
+            assert_eq!(item["blocked_on"], "human");
+            assert_eq!(item["ask"], "approval");
+        }
+        for (state, host, driver) in [
+            ("stopped", "local", "omp"),
+            ("failed", "local", "omp"),
+            ("desired", "local", "omp"),
+            ("waiting", "remote", "omp"),
+            ("waiting", "local", "shell"),
+        ] {
+            let mut item = json!({
+                "id": recipient, "driver": driver, "host_id": host,
+                "state": state, "harness_state": "working",
+            });
+            overlay_delivery_presence(&mut item, "local");
+            assert!(item.get("delivery").is_none(), "{item}");
+            assert_eq!(item["state"], state);
+        }
     }
 
     #[test]

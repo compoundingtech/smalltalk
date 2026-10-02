@@ -1130,7 +1130,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1938,6 +1938,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "int-enum"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e366a1634cccc76b4cfd3e7580de9b605e4d93f1edac48d786c1f867c0def495"
+dependencies = [
+ "proc-macro2",
+ "proc-macro2-diagnostics",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "ipconfig"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2106,6 +2118,26 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libghostty-vt"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6219ed1c364b3ef5815fb0fd2acc0662f792adc706dabf59b7ca89280ee6d066"
+dependencies = [
+ "bitflags 2.13.1",
+ "int-enum",
+ "libghostty-vt-sys",
+]
+
+[[package]]
+name = "libghostty-vt-sys"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "865fed12a8b2bba3507b3bccd0bef439e06ef1100e652fe6b71d132c41ee8db0"
+dependencies = [
+ "pkg-config",
+]
 
 [[package]]
 name = "libm"
@@ -2441,7 +2473,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2990,6 +3022,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro2-diagnostics"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "version_check",
+]
+
+[[package]]
 name = "proptest"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3034,7 +3078,7 @@ dependencies = [
 [[package]]
 name = "pty-client"
 version = "0.13.0-rust"
-source = "git+https://github.com/compoundingtech/pty-rust?rev=06c303f708a49a8110a5eb640194deab0561fa3a#06c303f708a49a8110a5eb640194deab0561fa3a"
+source = "git+https://github.com/compoundingtech/pty?rev=ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f#ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f"
 dependencies = [
  "libc",
  "pty-core",
@@ -3045,7 +3089,7 @@ dependencies = [
 [[package]]
 name = "pty-core"
 version = "0.13.0-rust"
-source = "git+https://github.com/compoundingtech/pty-rust?rev=06c303f708a49a8110a5eb640194deab0561fa3a#06c303f708a49a8110a5eb640194deab0561fa3a"
+source = "git+https://github.com/compoundingtech/pty?rev=ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f#ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f"
 dependencies = [
  "indexmap",
  "libc",
@@ -3054,6 +3098,16 @@ dependencies = [
  "serde",
  "serde_json",
  "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
+name = "pty-terminal"
+version = "0.13.0-rust"
+source = "git+https://github.com/compoundingtech/pty?rev=ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f#ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f"
+dependencies = [
+ "libghostty-vt",
+ "libghostty-vt-sys",
+ "png",
 ]
 
 [[package]]
@@ -3168,7 +3222,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3613,7 +3667,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4173,7 +4227,6 @@ name = "st3"
 version = "0.1.0"
 dependencies = [
  "agent-spec",
- "alacritty_terminal",
  "anyhow",
  "assert_cmd",
  "axum",
@@ -4194,12 +4247,15 @@ dependencies = [
  "hyper-util",
  "kdl",
  "libc",
+ "libghostty-vt",
+ "libghostty-vt-sys",
  "notify",
  "portable-pty",
  "predicates",
  "proptest",
  "pty-client",
  "pty-core",
+ "pty-terminal",
  "reqwest",
  "ring",
  "rusqlite",
@@ -4489,7 +4545,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5773,7 +5829,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
