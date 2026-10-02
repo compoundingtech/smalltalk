@@ -530,6 +530,8 @@ pub struct Reconciler<R = NativeRuntime> {
     /// When the fault stage last sent faults to their owning agents.
     fault_delivery: Mutex<Option<u128>>,
     fault_delivery_every_ms: u128,
+    /// The claim the subagent stage starts its next look from; see `SubagentSweep::low_water`.
+    subagent_low_water: Mutex<u64>,
     /// How long run cleanup waits for its runtimes to stop before the run ends without them.
     cleanup_deadline: Duration,
     /// Unit tests fail a pass that raises a fault unless they opt in, so an isolated error
@@ -624,6 +626,7 @@ impl Reconciler<NativeRuntime> {
             disk_check_every_ms: DISK_CHECK_EVERY_MS,
             fault_delivery: Mutex::new(None),
             fault_delivery_every_ms: FAULT_DELIVERY_EVERY_MS,
+            subagent_low_water: Mutex::new(0),
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
@@ -669,6 +672,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             disk_check_every_ms: 0,
             fault_delivery: Mutex::new(None),
             fault_delivery_every_ms: 0,
+            subagent_low_water: Mutex::new(0),
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
@@ -850,6 +854,23 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// Send each current fault once to its owning agent, from the host that runs that agent.
     /// No fault waits on a person: the agent retries, revises or cancels, and asks a person
     /// with `st work ask` only for what only a person can give.
+    /// End the subagents this node recorded whose seat, harness or lease went away, and look
+    /// again when the next lease runs out.
+    fn end_stale_subagents(&self) -> Result<()> {
+        let mut low_water = self
+            .subagent_low_water
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let sweep = self
+            .store
+            .end_stale_subagents(now_ms() as u64, *low_water)?;
+        *low_water = sweep.low_water;
+        if let Some(next) = sweep.next_expiry_unix_ms {
+            self.arm_restart("stage/subagents", u128::from(next).saturating_add(1));
+        }
+        Ok(())
+    }
+
     fn deliver_faults(&self, desired: &[DesiredSubject]) -> Result<()> {
         let local_agents = desired
             .iter()
@@ -1731,6 +1752,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.reconcile_disk_space(&desired)
         });
         self.isolate("stage/faults", &daemon, || self.deliver_faults(&desired));
+        self.isolate("stage/subagents", &daemon, || self.end_stale_subagents());
         self.file_watchers_used
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

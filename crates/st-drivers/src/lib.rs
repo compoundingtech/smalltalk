@@ -77,6 +77,7 @@ pub mod run;
 
 pub mod session_control;
 pub mod status;
+pub mod subagents;
 pub mod supervisor_chain;
 pub mod task_inventory;
 pub mod telemetry;

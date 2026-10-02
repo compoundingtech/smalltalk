@@ -8305,7 +8305,7 @@ async fn post_claim(
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
             signal_local_change(&state);
-        } else if kind == "harness.usage" {
+        } else if kind == "harness.usage" || kind == "subagent.renewed" {
             signal_visible_change(&state);
         } else if kind.starts_with("message.") {
             let store = state.store.clone();

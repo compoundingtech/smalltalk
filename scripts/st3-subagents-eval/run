@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""Subagent claims on an isolated daemon, driven through a stand-in Claude with no model.
+
+One isolated daemon (private HOME, XDG dirs, PATH and sockets) runs three Claude seats whose
+`claude` is ./claude, a stand-in that reports subagents through the real hooks. The eval checks,
+from outside the seats, that st records one `subagent.appeared` and one `subagent.ended` per
+subagent on its parent seat, and lease renewals only while one runs:
+- appear then end, with the subagent's type, one-line description, session and held step, and
+  its tokens at the end; the tokens also count in the parent's usage;
+- Claude's phantom stop and many subagents at once;
+- a subagent the turn ended without a stop (interrupted) and one whose session ended;
+- a daemon restart in between: ends and starts while the daemon is down are recorded after it
+  returns, and a subagent running across the restart stays open;
+- a frozen seat: the lease runs out and st ends the subagent as expired;
+- a killed seat: its lease runs out or its restart closes its subagent, whichever comes first;
+  with the default lease, the restart closes it; a killed harness: its driver closes it;
+- a stopped seat and a removed (cancelled mission) seat: their subagents end.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+
+HERE = Path(__file__).resolve().parent
+KILLED = "agent/eval/killed"
+RESTARTED = "agent/eval/restarted"
+STOPPED = "agent/eval/stopped"
+LEASE_MS = 6000
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message):
+    raise Failure(message)
+
+
+def until(predicate, timeout, message, alive=lambda: True):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        alive()
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.25)
+    fail(message)
+
+
+class Node:
+    def __init__(self, root, binary):
+        self.root = root
+        self.binary = binary
+        for sub in ("bin", "home", "run", "state"):
+            (root / sub).mkdir(parents=True, exist_ok=True)
+        pty = shutil.which("pty")
+        if not pty:
+            raise SystemExit("pty must be on PATH")
+        (root / "bin/pty").symlink_to(pty)
+        stub = root / "bin/claude"
+        shutil.copy2(HERE / "claude", stub)
+        stub.chmod(0o755)
+        self.path = f"{root / 'bin'}:/usr/bin:/bin"
+        self.endpoint = root / "run/st.sock"
+        self.env = {"PATH": self.path, "HOME": str(root / "home"), "SHELL": "/bin/bash",
+                    "USER": os.environ.get("USER", "eval"), "LOGNAME": os.environ.get("USER", "eval"),
+                    "LANG": "C.UTF-8", "XDG_STATE_HOME": str(root / "home/.local/state"),
+                    "XDG_CONFIG_HOME": str(root / "home/.config"),
+                    "XDG_DATA_HOME": str(root / "home/.local/share"),
+                    "XDG_RUNTIME_DIR": str(root / "run"), "ST3_ENDPOINT": str(self.endpoint),
+                    "ST3_DAEMON_WAIT": "0"}
+        # The daemon rebuilds PATH from a login shell; pin it to the isolated one.
+        profile = f"export PATH='{self.path}'\n"
+        for name in (".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshenv"):
+            (root / "home" / name).write_text(profile)
+        (root / "config.toml").write_text(f'''node = "subagents"
+person = "person/eval"
+state_dir = "{root / 'state'}"
+pty_root = "{root / 'pty'}"
+socket = "{self.endpoint}"
+client_gateway_socket = "{root / 'run/client.sock'}"
+''')
+        self.log = (root / "daemon.log").open("ab")
+        self.daemon = None
+
+    def start(self):
+        self.daemon = subprocess.Popen([str(self.binary), "up", "--config", str(self.root / "config.toml")],
+                                       env=self.env, cwd=self.root, stdin=subprocess.DEVNULL,
+                                       stdout=self.log, stderr=self.log, start_new_session=True)
+        until(lambda: self.api("/v1/health"), 60, "the isolated daemon did not answer",
+              lambda: self.daemon.poll() is None or fail("daemon exited: " + self.tail()))
+
+    def stop_daemon(self):
+        """Stop only the daemon; the seats run on in their PTYs."""
+        if self.daemon and self.daemon.poll() is None:
+            os.killpg(self.daemon.pid, signal.SIGTERM)
+            try:
+                self.daemon.wait(30)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.daemon.pid, signal.SIGKILL)
+                self.daemon.wait(10)
+
+    def tail(self):
+        path = self.root / "daemon.log"
+        return path.read_text(errors="replace")[-3000:] if path.exists() else ""
+
+    def cli(self, *args, check=True):
+        result = subprocess.run([str(self.binary), "--endpoint", str(self.endpoint), *args], env=self.env,
+                                capture_output=True, text=True, timeout=60)
+        if check and result.returncode:
+            raise RuntimeError(f"st {' '.join(args)}: {result.stderr.strip()}")
+        return result.stdout
+
+    def api(self, path):
+        result = subprocess.run(["curl", "-sf", "--max-time", "10", "--unix-socket", str(self.endpoint),
+                                 "http://localhost" + path], capture_output=True, text=True)
+        if result.returncode:
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            return None
+        return payload.get("value", payload) if isinstance(payload, dict) else payload
+
+    def seat_processes(self, subject):
+        """Every process this daemon launched for one seat, by its exact private endpoint."""
+        rows = []
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                environ = (proc / "environ").read_bytes().split(b"\0")
+                if f"ST3_ENDPOINT={self.endpoint}".encode() not in environ:
+                    continue
+                if f"ST_AGENT={subject}".encode() not in environ:
+                    continue
+                argv = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+                rows.append((int(proc.name), argv))
+            except (OSError, UnicodeError):
+                pass
+        return rows
+
+    def signal_seat(self, subject, sig, only=None):
+        pids = [pid for pid, argv in self.seat_processes(subject) if only is None or only in argv]
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        return pids
+
+    def stop(self):
+        self.stop_daemon()
+        env = {**self.env, "PTY_ROOT": str(self.root / "pty")}
+        listed = subprocess.run(["pty", "list", "--json"], env=env, capture_output=True, text=True)
+        try:
+            for row in json.loads(listed.stdout or "[]"):
+                subprocess.run(["pty", "kill", row["name"]], env=env, capture_output=True)
+        except (ValueError, KeyError):
+            pass
+        for sig in (signal.SIGCONT, signal.SIGTERM, signal.SIGKILL):
+            for subject in self.subjects:
+                self.signal_seat(subject, sig)
+            time.sleep(0.3)
+
+    subjects = []
+
+
+def fields(claim):
+    body = claim.get("body", claim)
+    return body.get("fields", body)
+
+
+class Seat:
+    def __init__(self, node, subject, workspace):
+        self.node = node
+        self.subject = subject
+        self.workspace = workspace
+        workspace.mkdir(parents=True, exist_ok=True)
+        node.subjects.append(subject)
+
+    def receipts(self):
+        path = self.workspace / "receipts.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines() if line] if path.exists() else []
+
+    def control(self, op, **values):
+        with (self.workspace / "control.jsonl").open("a") as stream:
+            stream.write(json.dumps({"op": op, **values}) + "\n")
+
+    def applied(self, timeout=60):
+        """Wait until the stand-in applied every operation sent so far."""
+        def done():
+            rows = [row for row in self.receipts() if row["event"] in ("applied", "failed")]
+            failed = [row for row in rows if row["event"] == "failed"]
+            if failed:
+                fail(f"{self.subject}: the stand-in could not apply {failed[-1]}")
+            sent = len((self.workspace / "control.jsonl").read_text().splitlines())
+            return len(rows) >= sent and rows
+        return until(done, timeout, f"{self.subject}: the stand-in did not apply its operations")
+
+    def ready(self, after=0.0, timeout=120):
+        return until(lambda: [row for row in self.receipts() if row["event"] == "ready" and row["at"] > after],
+                     timeout, f"{self.subject}: the stand-in never started")[-1]
+
+    def claims(self):
+        """The seat's subagent claims, oldest first, a trace page at a time."""
+        rows, after = [], 0
+        while True:
+            text = self.node.cli("trace", "show", self.subject, "--json", "--limit", "500",
+                                 "--after-index", str(after), check=False)
+            page = []
+            for line in text.splitlines():
+                try:
+                    page.append(json.loads(line))
+                except ValueError:
+                    continue
+            rows.extend(row for row in page if str(row.get("kind", "")).startswith("subagent."))
+            if len(page) < 500:
+                return rows
+            after = page[-1]["store_index"]
+
+    def of(self, kind, subagent):
+        return [claim for claim in self.claims()
+                if claim["kind"] == kind and fields(claim).get("subagent_id") == subagent]
+
+    def appeared(self, subagent, timeout=60):
+        return fields(until(lambda: self.of("subagent.appeared", subagent), timeout,
+                            f"{self.subject}: {subagent} never appeared")[0])
+
+    def ended(self, subagent, timeout=60):
+        return fields(until(lambda: self.of("subagent.ended", subagent), timeout,
+                            f"{self.subject}: {subagent} never ended")[0])
+
+
+def expect(condition, message):
+    if not condition:
+        fail(message)
+
+
+def worker_scenarios(node, worker, run, checks):
+    worker.control("claim-ready")
+    worker.applied()
+    step = [row for row in worker.receipts() if row["event"] == "claimed"][-1]["step"]
+    session = worker.ready()["session"]
+
+    # Appear, then end with tokens. Claude's phantom stop names nothing that ran.
+    worker.control("spawn", id="w1", type="Explore", description="map the code\nsecond line")
+    worker.control("phantom")
+    appeared = worker.appeared("w1")
+    expect(appeared.get("subagent_type") == "Explore", f"w1 type: {appeared}")
+    expect(appeared.get("description") == "map the code", f"w1 description: {appeared}")
+    expect(appeared.get("session_id") == session, f"w1 session: {appeared} vs {session}")
+    expect(appeared.get("step_run") == step, f"w1 step: {appeared} vs {step}")
+    expect(appeared.get("driver") == "claude" and appeared.get("incarnation_id"), f"w1: {appeared}")
+    expect("private prompt" not in json.dumps(worker.claims()), "a subagent's prompt left the host")
+    responses = [{"input": 10, "output": 205, "cache_write": 11457},
+                 {"input": 8, "output": 156, "cache_write": 1567, "cached": 11457}]
+    worker.control("finish", id="w1", responses=responses)
+    worker.control("turn-end", running=[])
+    ended = worker.ended("w1")
+    tokens = {"input_tokens": 18, "output_tokens": 361, "cache_write_tokens": 13024,
+              "cached_tokens": 11457, "total_tokens": 24860}
+    expect(ended.get("outcome") == "completed", f"w1 end: {ended}")
+    expect(all(ended.get(name) == value for name, value in tokens.items()), f"w1 tokens: {ended}")
+    expect(isinstance(ended.get("duration_ms"), int), f"w1 duration: {ended}")
+    checks["appear_then_end"] = {"appeared": appeared, "ended": ended}
+    phantom = [claim for claim in worker.claims() if claim["kind"] == "subagent.appeared"
+               and fields(claim)["subagent_id"] != "w1"]
+    expect(not phantom, f"the phantom stop recorded a subagent: {phantom}")
+
+    def counted():
+        rows = (node.api("/v1/usage?since_ms=0") or {}).get("rows", [])
+        total = sum(int(row.get("total_tokens") or 0) for row in rows
+                    if worker.subject in json.dumps(row))
+        return total >= tokens["total_tokens"] and total
+    checks["parent_usage_tokens"] = until(counted, 60, "the subagent's tokens never reached its parent's usage")
+
+    # Many at once.
+    worker.control("spawn-many", prefix="many-", count=20, type="general-purpose", description="one of many")
+    until(lambda: len([claim for claim in worker.claims() if claim["kind"] == "subagent.appeared"
+                       and fields(claim)["subagent_id"].startswith("many-")]) == 20,
+          90, "not every one of many subagents appeared")
+    worker.control("finish-many", prefix="many-", count=20, responses=[{"output": 1}])
+    until(lambda: len([claim for claim in worker.claims() if claim["kind"] == "subagent.ended"
+                       and fields(claim)["subagent_id"].startswith("many-")
+                       and fields(claim)["outcome"] == "completed"]) == 20,
+          90, "not every one of many subagents ended")
+    checks["many"] = 20
+
+    # A turn that ended without the subagent's stop, and a session that ended.
+    worker.control("spawn", id="w2", description="cut short")
+    worker.control("turn-end", running=[])
+    ended = worker.ended("w2", timeout=60)
+    expect(ended.get("outcome") == "interrupted", f"w2 end: {ended}")
+    worker.control("spawn", id="w3", description="outlived its session")
+    worker.appeared("w3")
+    worker.control("session-end", reason="clear")
+    ended = worker.ended("w3")
+    expect(ended.get("outcome") == "session-ended", f"w3 end: {ended}")
+    worker.control("session-start", source="clear")
+    checks["interrupted_and_session_ended"] = True
+
+    # A daemon restart in between.
+    worker.control("spawn", id="w4", description="runs across the restart")
+    worker.control("spawn", id="w5", description="ends while st is down")
+    worker.appeared("w4")
+    worker.appeared("w5")
+    node.stop_daemon()
+    worker.control("finish", id="w5", responses=[{"output": 7}])
+    worker.control("spawn", id="w6", description="starts while st is down")
+    worker.applied()
+    node.start()
+    ended = worker.ended("w5")
+    expect(ended.get("outcome") == "completed" and ended.get("output_tokens") == 7, f"w5 end: {ended}")
+    worker.appeared("w6")
+    time.sleep(3)
+    expect(not worker.of("subagent.ended", "w4"), "w4 ended across a daemon restart")
+    worker.control("finish", id="w4", responses=[{"output": 1}])
+    worker.control("finish", id="w6", responses=[{"output": 1}])
+    for subagent in ("w4", "w6"):
+        expect(worker.ended(subagent).get("outcome") == "completed", f"{subagent} did not complete")
+    checks["daemon_restart"] = True
+
+    # A removed seat: its mission run is cancelled.
+    worker.control("spawn", id="w7", description="its seat goes away")
+    worker.appeared("w7")
+    node.cli("missions", "cancel", run, "--reason", "the eval removes the seat", "--as", "person/eval")
+    ended = worker.ended("w7", timeout=90)
+    expect(ended.get("outcome") in ("seat-stopped", "harness-exited"), f"w7 end: {ended}")
+    checks["removed_seat"] = ended
+
+
+def killed_scenarios(node, seat, checks):
+    # A running subagent is renewed before its lease runs out.
+    seat.control("spawn", id="k1", description="outlives its first lease")
+    seat.appeared("k1")
+    time.sleep(LEASE_MS / 1000 * 1.5)
+    renewed = seat.of("subagent.renewed", "k1")
+    expect(renewed and not seat.of("subagent.ended", "k1"), f"k1 was not renewed: {seat.claims()}")
+    checks["renewals_while_running"] = len(renewed)
+
+    # A frozen seat renews nothing: the lease runs out and st ends the subagent.
+    harness = ("driver claude", "/bin/claude")
+    frozen = [pid for part in harness for pid in seat.node.signal_seat(KILLED, signal.SIGSTOP, only=part)]
+    expect(frozen, "no seat process to freeze")
+    try:
+        ended = seat.ended("k1", timeout=LEASE_MS / 1000 * 4)
+    finally:
+        for part in harness:
+            seat.node.signal_seat(KILLED, signal.SIGCONT, only=part)
+    expect(ended.get("outcome") == "expired", f"k1 end: {ended}")
+    # Thawed, the harness still runs it and then stops it: st records nothing more for it.
+    seat.control("finish", id="k1", responses=[{"output": 1}])
+    time.sleep(3)
+    expect(len(seat.of("subagent.ended", "k1")) == 1, f"k1 ended twice: {seat.of('subagent.ended', 'k1')}")
+    later = [claim for claim in seat.of("subagent.renewed", "k1")
+             if claim.get("store_index", 0) > max(c.get("store_index", 0) for c in seat.of("subagent.ended", "k1"))]
+    expect(not later, f"k1 was renewed after it ended: {later}")
+    checks["expired"] = ended
+
+    # A killed seat records no end: its short lease runs out, or its restart closes it first.
+    seat.control("spawn", id="k2", description="dies with its seat")
+    seat.appeared("k2")
+    killed_at = time.time()
+    kill_seat(seat)
+    ended = seat.ended("k2", timeout=90)
+    expect(ended.get("outcome") in ("expired", "harness-exited"), f"k2 end: {ended}")
+    seat.ready(after=killed_at)
+    checks["killed_seat"] = ended
+
+    # A killed harness: its driver records the end.
+    seat.control("spawn", id="k3", description="dies with its harness")
+    seat.appeared("k3")
+    seat.node.signal_seat(KILLED, signal.SIGKILL, only="/bin/claude")
+    ended = seat.ended("k3", timeout=60)
+    expect(ended.get("outcome") == "harness-exited", f"k3 end: {ended}")
+    checks["killed_harness"] = ended
+
+
+def kill_seat(seat):
+    for part in ("driver claude", "/bin/claude"):
+        seat.node.signal_seat(seat.subject, signal.SIGKILL, only=part)
+
+
+def restarted_scenarios(node, seat, checks):
+    # With the default lease, the restart closes what a killed seat left running.
+    seat.control("spawn", id="r1", description="dies with its seat")
+    seat.appeared("r1")
+    killed_at = time.time()
+    kill_seat(seat)
+    ended = seat.ended("r1", timeout=120)
+    expect(ended.get("outcome") == "harness-exited", f"r1 end: {ended}")
+    seat.ready(after=killed_at)
+    checks["restart_closes"] = ended
+
+
+def stopped_scenarios(node, seat, checks):
+    seat.control("spawn", id="s1", description="its seat stops")
+    seat.control("spawn", id="s2", description="its seat stops too")
+    seat.appeared("s1")
+    seat.appeared("s2")
+    node.cli("agents", "stop", STOPPED, "--as", "person/eval")
+    outcomes = {subagent: seat.ended(subagent, timeout=90).get("outcome") for subagent in ("s1", "s2")}
+    expect(all(outcome in ("seat-stopped", "harness-exited") for outcome in outcomes.values()),
+           f"stopped seat ends: {outcomes}")
+    checks["stopped_seat"] = outcomes
+
+
+def claim_counts(seats, checks):
+    """Two claims per subagent, plus renewals only on the short-lease seat."""
+    counts = {}
+    for seat in seats:
+        per = {}
+        for claim in seat.claims():
+            subagent = fields(claim)["subagent_id"]
+            per.setdefault(subagent, {}).setdefault(claim["kind"], 0)
+            per[subagent][claim["kind"]] += 1
+        for subagent, kinds in per.items():
+            expect(kinds.get("subagent.appeared") == 1 and kinds.get("subagent.ended") == 1,
+                   f"{seat.subject} {subagent}: {kinds}")
+            if seat.subject != KILLED:
+                expect("subagent.renewed" not in kinds, f"{seat.subject} {subagent} renewed: {kinds}")
+        counts[seat.subject] = {"subagents": len(per),
+                                "renewals": sum(kinds.get("subagent.renewed", 0) for kinds in per.values())}
+    checks["claim_counts"] = counts
+
+
+def run(args, root, evidence):
+    node = Node(root, args.binary)
+    checks = {}
+    seats = []
+    started_at = time.monotonic()
+    try:
+        node.start()
+        killed = Seat(node, KILLED, root / "ws-killed")
+        restarted = Seat(node, RESTARTED, root / "ws-restarted")
+        stopped = Seat(node, STOPPED, root / "ws-stopped")
+        (root / "seats.kdl").write_text(f'''version 2
+agent "killed" {{
+  identity "eval/killed"
+  workspace "{killed.workspace}"
+  restart "always"
+  env {{ ST3_SUBAGENT_LEASE_MS "{LEASE_MS}" }}
+  harness "claude" {{}}
+}}
+agent "restarted" {{
+  identity "eval/restarted"
+  workspace "{restarted.workspace}"
+  restart "always"
+  harness "claude" {{}}
+}}
+agent "stopped" {{
+  identity "eval/stopped"
+  workspace "{stopped.workspace}"
+  harness "claude" {{}}
+}}
+''')
+        node.cli("agents", "apply", str(root / "seats.kdl"), "--as", "person/eval")
+        (root / "ws-worker").mkdir()
+        (root / "mission.kdl").write_text(f'''version 2
+mission "eval/subagents" state="ready" {{
+  goal "Run subagents under a held step."
+  agent "worker" {{
+    workspace "{root / 'ws-worker'}"
+    harness "claude" {{}}
+  }}
+  step "work" {{
+    assigned-to "agent/${{ST_MISSION_RUN}}/worker"
+    goal "Run subagents."
+  }}
+}}
+''')
+        node.cli("missions", "publish", str(root / "mission.kdl"), "--as", "person/eval")
+        started = json.loads(node.cli("missions", "start", "eval/subagents", "--id", "eval-subagents",
+                                      "--workspace", str(root / "ws-worker"), "--as", "person/eval", "--json"))
+        run_subject = started.get("subject") or "mission-run/eval-subagents"
+        worker_subject = "agent/eval-subagents/worker"
+        worker = Seat(node, worker_subject, root / "ws-worker")
+        seats = [worker, killed, restarted, stopped]
+        for seat in seats:
+            seat.ready()
+        checks["seats"] = [seat.subject for seat in seats]
+        stopped_scenarios(node, stopped, checks)
+        killed_scenarios(node, killed, checks)
+        restarted_scenarios(node, restarted, checks)
+        worker_scenarios(node, worker, run_subject, checks)
+        claim_counts(seats, checks)
+        checks["seconds"] = round(time.monotonic() - started_at)
+        return {"verdict": "pass", "checks": checks}
+    except (Failure, RuntimeError) as error:
+        return {"verdict": "fail", "failure": str(error), "checks": checks}
+    finally:
+        if node.daemon and node.daemon.poll() is None:
+            for seat in seats:
+                name = seat.subject.replace("/", "_")
+                (evidence / f"{name}.claims.json").write_text(json.dumps(seat.claims(), indent=2))
+                path = seat.workspace / "receipts.jsonl"
+                if path.exists():
+                    (evidence / f"{name}.receipts.jsonl").write_text(path.read_text(errors="replace"))
+        node.stop()
+        path = root / "daemon.log"
+        if path.exists():
+            (evidence / "daemon.log").write_text(path.read_text(errors="replace"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("evidence", type=Path)
+    parser.add_argument("--keep", action="store_true", help="keep the daemon root for inspection")
+    args = parser.parse_args()
+    args.binary = args.binary.resolve()
+    args.evidence.mkdir(parents=True, exist_ok=True)
+    # Short, private paths: Unix socket paths are limited to about 100 bytes.
+    root = Path(tempfile.mkdtemp(prefix="sub-", dir="/tmp"))
+    try:
+        result = run(args, root, args.evidence)
+    finally:
+        if args.keep:
+            print(f"kept {root}")
+        else:
+            shutil.rmtree(root, ignore_errors=True)
+    (args.evidence / "result.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result["verdict"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

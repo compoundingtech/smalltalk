@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `ab76c69c803c612c88dddd165f312e3b8e7fd910aafd5b2c5099a30ef263c7ed`
+Digest: `8f1459c102f8955a752b64797cc81d7147e6c8494d220212f6ce3b3d18088ad1`
 
 ## Subject families
 
@@ -156,6 +156,9 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `step-run.carried` | `step-run` | `system-only` | `once` | `durable` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |
 | `step-run.retried` | `step-run` | `system-only` | `append` | `durable` | `attempt:integer`, `goals:array`, `not_before_unix_ms:integer`, `reason:string`, `status:string` | `step` |
 | `step-run.state` | `step-run` | `system-only` | `state-transition` | `durable` | `attempt:integer`, `readiness_epoch:integer`, `reason:string`, `status:string` | `step` |
+| `subagent.appeared` | `agent` | `same-subject-actor` | `append` | `durable` | `description:string`, `driver!:string`, `incarnation_id!:string`, `lease_expires_at_unix_ms!:integer`, `session_id:string`, `started_at_unix_ms:integer`, `step_run:subject-reference(step-run)`, `subagent_id!:string`, `subagent_type:string` |  |
+| `subagent.ended` | `agent` | `same-subject-actor` | `append` | `durable` | `cache_write_tokens:integer`, `cached_tokens:integer`, `duration_ms:integer`, `ended_at_unix_ms:integer`, `input_tokens:integer`, `outcome!:string`, `output_tokens:integer`, `reason:string`, `subagent_id!:string`, `total_tokens:integer` |  |
+| `subagent.renewed` | `agent` | `same-subject-actor` | `append` | `durable` | `incarnation_id:string`, `lease_expires_at_unix_ms!:integer`, `subagent_id!:string` |  |
 | `subscription.mission-deferred` | `subscription` | `system-only` | `append` | `durable` | `not_before_unix_ms!:integer`, `request!:string` | `subscription` |
 | `subscription.mission-failed` | `subscription` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `request!:string` | `subscription` |
 | `subscription.mission-request-cancelled` | `subscription` | `authorized-participant` | `append` | `durable` | `reason:string`, `request!:string` | `subscription` |

@@ -190,6 +190,10 @@ pub fn claude_settings_registration() -> serde_json::Value {
             "PermissionRequest": observe("PermissionRequest"),
             "PreToolUse": observe("PreToolUse"),
             "PostToolUse": observe("PostToolUse"),
+            // Subagents the seat runs, and the session end that ends them.
+            "SubagentStart": observe("SubagentStart"),
+            "SubagentStop": observe("SubagentStop"),
+            "SessionEnd": observe("SessionEnd"),
         },
         // Claude's status line is the only channel that carries a context window. The slot is
         // single-valued, so the tee chains to the operator's own renderer.

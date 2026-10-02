@@ -4871,6 +4871,14 @@ fn pump_control(
                     _ => None,
                 };
                 delivery.observe_context(&message, state.thread_id(), active_turn);
+                // The subagent axis, for the same reason. Fail-open like the context record.
+                if let Err(error) = crate::subagents::observe_codex(
+                    &delivery.config.agent_dir,
+                    &message,
+                    state.thread_id(),
+                ) {
+                    tracing::warn!("st codex: subagent ledger write failed: {error:#}");
+                }
                 // The credential axis, taken here for the same reason: it reads a typed turn
                 // result no branch below looks at, and every one of them may `continue`.
                 delivery.observe_provider_auth(&message, state.thread_id());
@@ -5083,12 +5091,21 @@ fn model_from_codex_frames(frames: &[Value], turn_id: &str) -> Option<String> {
 }
 
 fn latest_codex_transcript(thread_id: &str) -> Result<Option<PathBuf>> {
-    let Some(home) = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-    else {
+    let Some(home) = codex_home() else {
         return Ok(None);
     };
+    latest_codex_transcript_in(&home, thread_id)
+}
+
+/// `$CODEX_HOME`, else `~/.codex`.
+pub fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+}
+
+/// The newest rollout file of Codex thread `thread_id` beneath `home/sessions`.
+pub fn latest_codex_transcript_in(home: &Path, thread_id: &str) -> Result<Option<PathBuf>> {
     let sessions = home.join("sessions");
     let mut stack = vec![sessions];
     let mut inspected = 0_usize;
