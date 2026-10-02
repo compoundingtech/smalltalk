@@ -1,4 +1,4 @@
-import { useMemo, useRef } from 'react';
+import { useLayoutEffect, useMemo, useRef } from 'react';
 import { Alert, SectionList, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -10,6 +10,7 @@ import { agentName } from '../agentsView';
 import { attentionActionLabel, attentionKindLabel } from '../presentation';
 import { missionTitle } from '../missionsView';
 import { useStore } from '../store';
+import { randomName } from '../launcher';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
 import type { RootScreen } from '../navigation';
@@ -23,6 +24,19 @@ export function HomeScreen() {
   const refresh = useRefresh();
   const agentOf = (row: HomeRow) => [row.item.requester_id, row.item.source_id].find(id => id?.startsWith('agent/'));
   const rows = useMemo(() => homeRows(data.attention, caps?.session_actor), [data.attention, caps?.session_actor]);
+  // Start something, as stui's launcher does: an agent with its first message, or a shell.
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      unstable_headerRightItems: () => [{
+        type: 'menu', label: 'New', icon: { type: 'sfSymbol', name: 'plus' },
+        menu: { items: [
+          { type: 'action', label: 'New agent', icon: { type: 'sfSymbol', name: 'person.badge.plus' }, onPress: () => navigation.navigate('NewAgent') },
+          { type: 'action', label: 'New terminal', icon: { type: 'sfSymbol', name: 'terminal' }, onPress: () => void actions.createTerminal(randomName()).then(terminalId => { if (terminalId) navigation.navigate('Terminal', { terminalId, title: 'shell' }); }) },
+          { type: 'action', label: 'New mission', icon: { type: 'sfSymbol', name: 'point.3.connected.trianglepath.dotted' }, onPress: () => navigation.navigate('NewMission') },
+        ] },
+      }],
+    });
+  }, [navigation, actions]);
   const sections = useMemo(() => homeSections(rows).map(section => ({ ...section, data: section.rows })), [rows]);
   return <Screen>
     <Banners />
