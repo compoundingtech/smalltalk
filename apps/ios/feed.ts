@@ -1,4 +1,4 @@
-import { applyWindow, isTransientCode, plainMessage, type Agent, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { applyWindow, isTransientCode, plainError, plainMessage, type Agent, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { TERMINAL_RESTARTED, withFreshTerminalFence, type Foreground, type TerminalFollowHandlers } from './terminalControls';
 
 // The app holds three windows on one collections socket. It needs no work window: missions carry
@@ -48,12 +48,12 @@ function errorCode(error: unknown): string | undefined {
   const response = (error as { response?: { code?: unknown } }).response;
   return typeof response?.code === 'string' ? response.code : undefined;
 }
+// What the app shows and retries follows the SDK, so no raw code reaches the person.
 function errorMessage(error: unknown): string {
   const code = errorCode(error);
-  const message = error instanceof Error ? error.message : String(error);
-  return code ? `${code}: ${message}` : message;
+  return code ? plainMessage(code, error instanceof Error ? error.message : String(error)) : plainError(error);
 }
-const transient = (code: string | undefined) => code === 'internal' || code === 'remote-unavailable' || code === 'rate-limited' || code === 'terminal-unavailable';
+const transient = (code: string | undefined) => code !== undefined && isTransientCode(code);
 
 // One collections socket per paired gateway and credential. It holds the app's windows, at most one
 // followed terminal, and at most one followed conversation. A dropped socket reconnects after
