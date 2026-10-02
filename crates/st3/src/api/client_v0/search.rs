@@ -482,16 +482,6 @@ fn search_page(
     limit: usize,
 ) -> Result<Json<Value>, ApiError> {
     let index = held.lock().unwrap();
-    let Some(indexed_at) = &index.indexed_at else {
-        return Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "remote-unavailable".into(),
-            message: index.error.clone().unwrap_or_else(|| {
-                "conversation search index is being built; retry shortly".into()
-            }),
-            details: Default::default(),
-        });
-    };
     if cursor
         .as_ref()
         .is_some_and(|cursor| cursor.revision != index.revision)
@@ -503,6 +493,16 @@ fn search_page(
             details: Default::default(),
         });
     }
+    let Some(indexed_at) = &index.indexed_at else {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "remote-unavailable".into(),
+            message: index.error.clone().unwrap_or_else(|| {
+                "conversation search index is being built; retry shortly".into()
+            }),
+            details: Default::default(),
+        });
+    };
     let mut hits = index
         .index
         .search(
@@ -727,6 +727,22 @@ mod tests {
             unavailable["incomplete_sources"]
                 .to_string()
                 .contains("timeline-history-incomplete")
+        );
+        let page = read(&state, "person/alex", query("orchid", 1))
+            .await
+            .unwrap();
+        let mut evicted = query("orchid", 1);
+        evicted.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+        assert!(evicted.cursor.is_some());
+        INDEXES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&(Arc::as_ptr(&state.store) as usize, "person/alex".to_owned()));
+        assert_eq!(
+            read(&state, "person/alex", evicted).await.unwrap_err().code,
+            "cursor-gap"
         );
         let mut session = ClientSession::local(Some("person/alex")).unwrap();
         session.scopes.remove("read.projections");
