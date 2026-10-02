@@ -1249,6 +1249,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "work.extended",
+            &["step-run"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("work"),
+            true,
+            &[],
+        ),
+        (
             "gate.requested",
             &["gate-operation"],
             WritePolicy::SystemOnly,
@@ -2302,7 +2311,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("answer", object()),
         ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
-        | "work.released" => &[
+        | "work.released" | "work.extended" => &[
             ("attempt", integer()),
             ("status", string()),
             ("summary", string()),
@@ -2312,6 +2321,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("claim_incarnation", string()),
             ("claim_expires_at_unix_ms", integer()),
             ("readiness_epoch", integer()),
+            ("extend_ms", integer()),
         ],
         "gate.requested" => &[
             ("status", string()),
@@ -3372,6 +3382,7 @@ mod tests {
                 "terminal.input.result",
                 "transport.observed",
                 "work.claimed",
+                "work.extended",
                 "work.failed",
                 "work.person-asked",
                 "work.person-cancelled",
@@ -3546,6 +3557,7 @@ mod tests {
                 "subscription.mission-request-cancelled",
                 "subscription.mission-request-released",
                 "work.claimed",
+                "work.extended",
                 "work.failed",
                 "work.person-asked",
                 "work.person-cancelled",

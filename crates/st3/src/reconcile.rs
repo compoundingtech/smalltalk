@@ -59,6 +59,9 @@ const CHECKOUT_RETRY_MS: u128 = 30_000;
 // A deadline source that could not be read is read again this soon, so the deadlines it holds
 // are late by at most this much.
 const DEADLINE_SOURCE_RETRY_MS: u128 = 5_000;
+
+// A seat kept running past its run is checked again this soon for unread mail and other work.
+const SEAT_RETENTION_CHECK_MS: u128 = 10_000;
 // Run cleanup ends this long after it began even if an owned runtime never reports stopped.
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const DECLARED_CHECKOUT_LIMIT: usize = 4096;
@@ -519,6 +522,10 @@ pub struct Reconciler<R = NativeRuntime> {
     faults: Mutex<Option<BTreeMap<(String, String), String>>>,
     /// Faults that could not be recorded in the graph during the current pass.
     unrecorded_faults: Mutex<Vec<String>>,
+    /// Step-timeout faults this reconciler has already raised, so a pass records each once.
+    step_timeout_faults: Mutex<BTreeSet<String>>,
+    /// Each seat's last retention reading: when it was taken and why the seat stays.
+    seat_retention: Mutex<HashMap<String, (u128, Option<String>)>>,
     fault_injection: Option<Arc<dyn FaultInjection>>,
     /// Reads free space for the disk stage. Without one the stage does nothing.
     disk_probe: Option<DiskProbe>,
@@ -619,6 +626,8 @@ impl Reconciler<NativeRuntime> {
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
+            step_timeout_faults: Mutex::new(BTreeSet::new()),
+            seat_retention: Mutex::new(HashMap::new()),
             fault_injection: None,
             disk_probe: Some(Arc::new(crate::disk::disk_space)),
             disk_paths: vec![state_dir.to_path_buf()],
@@ -665,6 +674,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
+            step_timeout_faults: Mutex::new(BTreeSet::new()),
+            seat_retention: Mutex::new(HashMap::new()),
             fault_injection: None,
             disk_probe: None,
             disk_paths: Vec::new(),
@@ -2909,6 +2920,25 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             self.record_once(&subject.subject, "runtime.observed", observed_fields)?;
         }
+        // A run's end never stops a seat that still has someone's mail or another run's work.
+        if observation
+            .as_ref()
+            .is_some_and(|item| item.status == "running")
+            && let Some(run) = subject.owner_run.as_deref()
+            && let Some(reason) = self.seat_retention(&subject.subject, run)?
+        {
+            self.record_once(
+                &subject.subject,
+                "harness.diagnostic",
+                BTreeMap::from([
+                    ("severity".into(), Value::String("info".into())),
+                    ("status".into(), Value::String("info".into())),
+                    ("code".into(), Value::String("stop-deferred".into())),
+                    ("reason".into(), Value::String(reason)),
+                ]),
+            )?;
+            return Ok(());
+        }
         let incarnation = observation
             .as_ref()
             .and_then(|value| value.incarnation_id.as_deref())
@@ -4570,11 +4600,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         && view.blocked_reason.as_deref() == Some("the worker lease expired")
                     {
                         if self.step_timed_out(view, &step)? {
-                            changed |= self.store.set_step_state(
-                                &view.subject,
-                                "failed",
-                                Some("the active execution timeout expired"),
-                            )?;
+                            changed |= self.expire_step_timeout(view, &step)?;
                             return Ok(changed);
                         }
                         changed |= self.store.set_step_state(
@@ -4720,12 +4746,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                         return Ok(changed);
                     }
                     if self.step_timed_out(view, &step)? {
-                        changed |= self.store.set_step_state(
-                            &view.subject,
-                            "failed",
-                            Some("the active execution timeout expired"),
-                        )?;
-                        return Ok(changed);
+                        // A worker's step that runs out of time is a fault for that worker to
+                        // extend, complete or fail. Only a step with no worker fails here, and a
+                        // step already submitted for verification has used its time.
+                        if view.agentless
+                            || matches!(view.status.as_str(), "claimed" | "working" | "ready")
+                        {
+                            changed |= self.expire_step_timeout(view, &step)?;
+                            return Ok(changed);
+                        }
                     }
                     if !self.step_declarations_hold(&view.subject)? {
                         return Ok(changed);
@@ -4907,6 +4936,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             if !matches!(status.as_deref(), Some("stopped" | "absent" | "exited")) {
+                // A seat kept for unread mail or another run's work does not hold this run
+                // open. Its stop declaration stays and takes effect once it is free.
+                if subject.kind == "stop"
+                    && self
+                        .seat_retention(&subject.subject, &run.subject)?
+                        .is_some()
+                {
+                    continue;
+                }
                 live.push(subject);
             }
         }
@@ -7311,6 +7349,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         execution_started_at_unix_ms: None,
                         execution_elapsed_ms: 0,
                         timeout_ms: None,
+                        timeout_extension_ms: 0,
                         ready_age_ms: None,
                         wake: None,
                         progress_summary: None,
@@ -8119,6 +8158,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(timeout) = step.spec.timeout_ms else {
             return Ok(false);
         };
+        let timeout = timeout.saturating_add(view.timeout_extension_ms);
         let elapsed = view.execution_elapsed_ms;
         if elapsed >= timeout as u128 {
             return Ok(true);
@@ -8142,6 +8182,118 @@ impl<R: RuntimeControl> Reconciler<R> {
             });
         }
         Ok(false)
+    }
+
+    /// Why a run-owned stop must wait for `seat`: it holds a message nobody has read, or work in a
+    /// run other than the one that is ending. The stop declaration stays, so the seat stops once
+    /// both are gone. Read at most every [`SEAT_RETENTION_CHECK_MS`] per seat.
+    fn seat_retention(&self, seat: &str, owner_run: &str) -> Result<Option<String>> {
+        if !seat.starts_with("agent/") {
+            return Ok(None);
+        }
+        let now = now_ms();
+        if let Some((at, reason)) = self
+            .seat_retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(seat)
+            && now.saturating_sub(*at) < SEAT_RETENTION_CHECK_MS
+        {
+            return Ok(reason.clone());
+        }
+        let unread = self
+            .store
+            .messages(Some(seat), false)?
+            .into_iter()
+            .any(|message| {
+                matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+                    && !message.tags.iter().any(|tag| {
+                        tag.starts_with("st3-work:") || tag.starts_with("st3-wake-source:")
+                    })
+            });
+        let reason = if unread {
+            Some("the seat holds a message nobody has read".to_owned())
+        } else if !self
+            .store
+            .seat_work_in_other_runs(seat, owner_run)?
+            .is_empty()
+        {
+            Some("the seat holds work for another run".to_owned())
+        } else {
+            None
+        };
+        self.seat_retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(seat.to_owned(), (now, reason.clone()));
+        if reason.is_some() {
+            self.arm_restart(
+                &format!("retain:{seat}"),
+                now.saturating_add(SEAT_RETENTION_CHECK_MS),
+            );
+        }
+        Ok(reason)
+    }
+
+    /// A step has used its execution budget. A step with a worker raises one fault for its owner,
+    /// who extends it with `st work extend`, completes it or fails it; the mission goes on. A step
+    /// with no worker has no one to ask and fails.
+    fn expire_step_timeout(
+        &self,
+        view: &crate::model::StepRunView,
+        step: &RuntimeStep<'_>,
+    ) -> Result<bool> {
+        if view.agentless {
+            return self.store.set_step_state(
+                &view.subject,
+                "failed",
+                Some("the active execution timeout expired"),
+            );
+        }
+        let episode = crate::store::step_timeout_episode(
+            &view.subject,
+            view.attempt,
+            view.timeout_extension_ms,
+        );
+        {
+            let mut raised = self
+                .step_timeout_faults
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !raised.insert(episode.clone()) {
+                return Ok(false);
+            }
+        }
+        let budget = step
+            .spec
+            .timeout_ms
+            .unwrap_or_default()
+            .saturating_add(view.timeout_extension_ms);
+        let owner = view
+            .claimant
+            .as_deref()
+            .or(view.assigned_to.as_deref())
+            .unwrap_or("AGENT");
+        let step_id = &view.subject;
+        let key = format!(
+            "step-timeout:{step_id}:{}:{}",
+            view.attempt, view.timeout_extension_ms
+        );
+        self.store.record_operational_failure(
+            &episode,
+            &AttentionRequest {
+                reviewer: "person/operator".into(),
+                title: "A step ran out of time".into(),
+                reason: format!(
+                    "`{step_id}` used its execution budget of {budget}ms. Nothing failed: the mission goes on and the step stays yours. If its goals are met, `st work complete {step_id} --as {owner} --summary TEXT`. If it needs more time, `st work extend {step_id} --as {owner} --by 2h --reason TEXT`. If it cannot finish, `st work fail {step_id} --as {owner} --reason TEXT`."
+                ),
+                severity: "error".into(),
+                targets: vec![view.subject.clone()],
+                actor: RECONCILER_ACTOR.into(),
+                idempotency_key: key,
+            },
+        )?;
+        Ok(true)
     }
 
     fn reconcile_schedules(&self, desired: &[DesiredSubject]) -> Result<()> {
@@ -14800,18 +14952,21 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
             "node".into(),
             Arc::new(Notify::new()),
         );
+        // A seat reads what it is sent; an unread message would keep its seat running.
         let deliver = |subject: &str, recipient: &str| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: subject.into(),
-                    kind: "message.delivered".into(),
-                    actor: Some(recipient.into()),
-                    fields: BTreeMap::from([("status".into(), Value::String("delivered".into()))]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("deliver:{subject}")),
-                })
-                .unwrap();
+            for (kind, status) in [("message.delivered", "delivered"), ("message.read", "read")] {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: kind.into(),
+                        actor: Some(recipient.into()),
+                        fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("{status}:{subject}")),
+                    })
+                    .unwrap();
+            }
         };
 
         for _ in 0..3 {
@@ -17492,6 +17647,57 @@ schedule "unready" {{
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
+        // Running out of time does not fail the step or its run: it is a fault for the worker.
+        let timed_out = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(timed_out.status, "running");
+        let stuck = timed_out
+            .steps
+            .iter()
+            .find(|step| step.step == "result")
+            .unwrap();
+        // The fake runtime has no live worker, so the claim is orphaned and the step is ready again.
+        assert_eq!(stuck.status, "ready");
+        let faults = store.fault_snapshot(now_ms()).unwrap();
+        let fault = faults
+            .iter()
+            .find(|fault| fault.item.subject == stuck.subject)
+            .expect("the timeout is a fault on the step");
+        assert_eq!(fault.item.title, "A step ran out of time");
+        assert_eq!(fault.owner, stuck.assigned_to);
+        assert!(fault.item.detail.contains("st work extend"));
+        // The worker takes it up again and ends it, and the failure then selects cleanup as before.
+        for (action, reason, key) in [
+            ("claim", None, "reclaim-timeout-work"),
+            ("fail", Some("it cannot finish"), "fail-timeout-work"),
+        ] {
+            store
+                .work_action(
+                    &stuck.subject,
+                    action,
+                    &crate::model::WorkRequest {
+                        actor: stuck.assigned_to.clone(),
+                        incarnation: Some("worker-one".into()),
+                        summary: None,
+                        reason: reason.map(str::to_owned),
+                        evidence: Vec::new(),
+                        idempotency_key: key.into(),
+                    },
+                )
+                .unwrap();
+        }
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            store
+                .fault_snapshot(now_ms())
+                .unwrap()
+                .iter()
+                .all(|fault| fault.item.subject != stuck.subject),
+            "a failed step is no longer a fault"
+        );
+
         let run = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(run.status, "failed");
         assert_eq!(run.phase, "terminal");
@@ -17519,6 +17725,146 @@ schedule "unready" {{
                 .unwrap()
                 .iter()
                 .all(|desired| { desired.owner_run.as_deref() != Some(run.subject.as_str()) })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extension_ends_a_timeout_fault_and_a_later_timeout_faults_again() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+            version 2
+
+              mission "demo" state="ready" {
+                goal "Finish the slow step."
+                agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+                step "slow" timeout="1ms" {
+                  assigned-to "agent/${ST_MISSION_RUN}/worker"
+                  title "The slow step"
+                }
+              }
+            "#,
+            "mission-extend",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "demo".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-extend".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let step = store
+            .mission_run(&run.id)
+            .unwrap()
+            .unwrap()
+            .steps
+            .into_iter()
+            .find(|step| step.step == "slow")
+            .unwrap();
+        let request = |key: &str, reason: Option<&str>| crate::model::WorkRequest {
+            actor: step.assigned_to.clone(),
+            incarnation: Some("worker-one".into()),
+            summary: None,
+            reason: reason.map(str::to_owned),
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        let faulted = |subject: &str| {
+            store
+                .fault_snapshot(now_ms())
+                .unwrap()
+                .iter()
+                .any(|fault| fault.item.subject == subject)
+        };
+        // The fake runtime has no live worker, so a claim is orphaned at the next pass and the
+        // step is ready again; its elapsed time still counts, so it ran out of its budget.
+        let settle = || async {
+            for _ in 0..20 {
+                reconciler.reconcile_once().unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        store
+            .work_action(&step.subject, "claim", &request("claim-one", None))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        settle().await;
+        assert!(faulted(&step.subject), "the first budget ran out");
+
+        // An extension needs a reason and a bounded, positive time.
+        store
+            .work_action(&step.subject, "claim", &request("claim-two", None))
+            .unwrap();
+        let refused = |by, reason: Option<&str>, key: &str| {
+            store
+                .work_action_extending(&step.subject, "extend", &request(key, reason), by)
+                .unwrap_err()
+                .code
+        };
+        assert_eq!(
+            refused(Some(1_000), None, "no-reason"),
+            "extension-needs-reason"
+        );
+        assert_eq!(refused(None, Some("why"), "no-time"), "invalid-extension");
+        assert_eq!(refused(Some(0), Some("why"), "zero"), "invalid-extension");
+        assert_eq!(
+            refused(Some(8 * 24 * 3_600_000), Some("why"), "too-long"),
+            "invalid-extension"
+        );
+        assert_eq!(
+            store
+                .work_action_extending(
+                    &step.subject,
+                    "renew",
+                    &request("renew-with-time", None),
+                    Some(1)
+                )
+                .unwrap_err()
+                .code,
+            "invalid-work-action"
+        );
+
+        let extended = store
+            .work_action_extending(
+                &step.subject,
+                "extend",
+                &request("extend-one", Some("the suite is slower on this host")),
+                Some(200),
+            )
+            .unwrap();
+        assert_eq!(extended.status, "claimed");
+        assert_eq!(extended.timeout_extension_ms, 200);
+        assert_eq!(extended.timeout_ms, Some(1));
+        reconciler.reconcile_once().unwrap();
+        assert!(!faulted(&step.subject), "the extension answered the fault");
+        let run_view = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(run_view.status, "running");
+
+        // The step then runs out of the extended budget, which is a new fault.
+        settle().await;
+        store
+            .work_action(&step.subject, "claim", &request("claim-three", None))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        settle().await;
+        assert!(faulted(&step.subject), "the extended budget ran out");
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "running"
         );
     }
 
@@ -20558,6 +20904,216 @@ version 2
             Some("running"),
             "a live incarnation must displace the stale stopped projection"
         );
+    }
+
+    /// A finished run whose seat is live, with the seat's runtime id and the fake runtime.
+    fn finished_run_with_a_live_seat(
+        extra: impl FnOnce(&Store, &str),
+    ) -> (
+        Arc<Store>,
+        Arc<FakeRuntime>,
+        Reconciler<FakeRuntime>,
+        String,
+        String,
+    ) {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+
+  mission "retained" state="ready" {
+    goal "Finish while the seat is wanted elsewhere."
+    completion { when "all-steps-exhausted" }
+    agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+    step "finish" { agentless; depends-on { step "gate" completed } }
+    step "gate" { agentless; title "Waits for the test" }
+  }
+
+"#,
+            "publish-retained",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "retained".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-retained".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let seat = format!("agent/{}/worker", run.id);
+        let member = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.subject == seat)
+            .and_then(|desired| desired.member)
+            .unwrap();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("retained-incarnation".into()),
+        });
+        extra(&store, &seat);
+        (store, runtime, reconciler, run.id, member.runtime_id)
+    }
+
+    #[test]
+    fn a_seat_with_an_unread_message_outlives_the_run_that_declared_it() {
+        let (store, runtime, reconciler, run_id, runtime_id) =
+            finished_run_with_a_live_seat(|store, seat| {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: "message/urgent".into(),
+                        kind: "message.sent".into(),
+                        actor: Some("person/test".into()),
+                        fields: BTreeMap::from([
+                            ("from".into(), Value::String("person/test".into())),
+                            ("to".into(), Value::String(seat.into())),
+                            ("content".into(), Value::String("P0: read me".into())),
+                            ("status".into(), Value::String("sent".into())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some("urgent-message".into()),
+                    })
+                    .unwrap();
+            });
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+        }
+        // Completing the gate lets the run finish and clean up.
+        let gate = store
+            .mission_run(&run_id)
+            .unwrap()
+            .unwrap()
+            .steps
+            .into_iter()
+            .find(|step| step.step == "gate")
+            .unwrap();
+        store
+            .set_step_state(&gate.subject, "completed", None)
+            .unwrap();
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let run = store.mission_run(&run_id).unwrap().unwrap();
+        assert_eq!(
+            run.status, "completed",
+            "the held seat does not hold the run open"
+        );
+        assert!(
+            runtime.stops.lock().unwrap().is_empty(),
+            "the seat still has an unread message"
+        );
+        assert!(store.desired_subjects().unwrap().iter().any(|desired| {
+            desired.subject == format!("agent/{run_id}/worker") && desired.kind == "stop"
+        }));
+
+        // Once the message is read the stop goes ahead.
+        for (kind, status) in [
+            ("message.staged", "staged"),
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/urgent".into(),
+                    kind: kind.into(),
+                    actor: Some(format!("agent/{run_id}/worker")),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("urgent-{status}")),
+                })
+                .unwrap();
+        }
+        reconciler.seat_retention.lock().unwrap().clear();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.stops.lock().unwrap().as_slice(), &[runtime_id]);
+    }
+
+    #[test]
+    fn a_seat_with_work_in_another_run_outlives_the_run_that_declared_it() {
+        let (store, runtime, reconciler, run_id, runtime_id) =
+            finished_run_with_a_live_seat(|store, seat| {
+                apply_source(
+                    store,
+                    &format!(
+                        r#"
+version 2
+
+  mission "elsewhere" state="ready" {{
+    goal "Give the seat other work."
+    step "other" {{ assigned-to "{seat}"; title "Work in another run" }}
+  }}
+
+"#
+                    ),
+                    "publish-elsewhere",
+                );
+                store
+                    .create_mission_run(&MissionRunRequest {
+                        mission: "elsewhere".into(),
+                        revision: None,
+                        workspace: "/tmp".into(),
+                        requester: Some("person/test".into()),
+                        mode: None,
+                        inputs: BTreeMap::new(),
+                        idempotency_key: "run-elsewhere".into(),
+                    })
+                    .unwrap();
+            });
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let gate = store
+            .mission_run(&run_id)
+            .unwrap()
+            .unwrap()
+            .steps
+            .into_iter()
+            .find(|step| step.step == "gate")
+            .unwrap();
+        store
+            .set_step_state(&gate.subject, "completed", None)
+            .unwrap();
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&run_id).unwrap().unwrap().status,
+            "completed"
+        );
+        assert!(
+            runtime.stops.lock().unwrap().is_empty(),
+            "the seat still holds work for another run"
+        );
+
+        // The other run's work ends, and the stop goes ahead.
+        let elsewhere = store
+            .seat_work_in_other_runs(&format!("agent/{run_id}/worker"), &run_id)
+            .unwrap();
+        assert_eq!(elsewhere.len(), 1);
+        store
+            .set_step_state(&elsewhere[0], "completed", None)
+            .unwrap();
+        reconciler.seat_retention.lock().unwrap().clear();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.stops.lock().unwrap().as_slice(), &[runtime_id]);
     }
 
     #[test]
@@ -26354,6 +26910,7 @@ mission "ios-proof-blocked" state="ready" {
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
+            timeout_extension_ms: 0,
             ready_age_ms: None,
             wake: None,
             progress_summary: None,
@@ -26504,6 +27061,7 @@ mission "ios-proof-blocked" state="ready" {
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
+            timeout_extension_ms: 0,
             ready_age_ms: None,
             wake: Some(crate::model::WorkWakeView {
                 assignee: "agent/worker".into(),
@@ -26890,6 +27448,7 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
+            timeout_extension_ms: 0,
             ready_age_ms: Some(1),
             wake: Some(crate::model::WorkWakeView {
                 assignee: "agent/remote.worker".into(),

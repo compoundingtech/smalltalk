@@ -32,8 +32,8 @@ use st3::model::{
     ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
     RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
     SessionInputMode, SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse,
-    StepRunView, SubscriptionRequestDecision, SubscriptionRequestView, WorkRequest,
-    WorkRetryRequest, WorkWakeRequest,
+    StepRunView, SubscriptionRequestDecision, SubscriptionRequestView, WorkExtendRequest,
+    WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -2876,6 +2876,8 @@ enum WorkCommand {
     Renew(WorkActionArgs),
     /// Record a material progress update without changing ownership.
     Progress(WorkActionArgs),
+    /// Add time to the execution budget of claimed work that ran out of it.
+    Extend(WorkExtendArgs),
     /// Finish claimed work and attach its durable evidence.
     Complete(WorkActionArgs),
     /// Fail claimed work with an actionable reason and evidence.
@@ -2985,6 +2987,21 @@ enum WorkRevisionCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+}
+
+#[derive(Args)]
+struct WorkExtendArgs {
+    subject: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+    /// Time to add to this attempt's budget, such as 30m or 2h; at most 7d.
+    #[arg(long)]
+    by: String,
+    /// Why the step needs more time.
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Args)]
@@ -11279,6 +11296,34 @@ async fn run_work(
         WorkCommand::Complete(args) => post_work(client, "complete", args, json_output).await,
         WorkCommand::Fail(args) => post_work(client, "fail", args, json_output).await,
         WorkCommand::Release(args) => post_work(client, "release", args, json_output).await,
+        WorkCommand::Extend(args) => {
+            let actor = args.actor.context("a work extension needs explicit --as")?;
+            reject_foreign_agent_actor(&actor)?;
+            let by_ms = st3::graph::parse_duration(&args.by, true)?;
+            let incarnation = match args.incarnation {
+                Some(incarnation) => Some(incarnation),
+                None => current_agent_incarnation(client, &actor).await?,
+            };
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let response: StepRunView = client
+                .post(
+                    &format!("/v1/work/extend/{}", urlencoding::encode(&args.subject)),
+                    &WorkExtendRequest {
+                        actor: Some(actor.clone()),
+                        incarnation,
+                        by_ms,
+                        reason: Some(args.reason),
+                        idempotency_key: format!("work:extend:{}:{actor}:{nonce}", args.subject),
+                    },
+                )
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                println!("{}\t{}", response.status, response.subject);
+                Ok(())
+            }
+        }
         WorkCommand::Wake(args) => {
             let actor = args
                 .actor
