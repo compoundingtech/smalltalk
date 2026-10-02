@@ -8267,6 +8267,14 @@ impl Store {
                 "invalid native observation envelope",
             ));
         }
+        st3_schema::registry()
+            .validate_public_claim(
+                &input.subject,
+                &input.kind,
+                &input.fields,
+                input.actor.as_deref(),
+            )
+            .map_err(|error| St3Error::new(error.code, error.message))?;
         // A context event can yield two independently acknowledged usage semantics. Its slot
         // is stable even if a caller mistakenly changes its body on retry.
         let source_runtime = input
