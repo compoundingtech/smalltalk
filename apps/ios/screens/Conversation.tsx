@@ -240,7 +240,7 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
     case 'event': {
       const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : c(RULES.event.label);
       return <View style={[styles.entry, { flexDirection: 'row' }]}>
-        <T color={c(RULES.event.rule)}>── </T><T color={color} style={{ flex: 1 }}>{body.text} · {entry.at}</T>
+        <T color={c(RULES.event.rule)}>── </T><T color={color} style={{ flex: 1 }}>{body.text}{entry.at ? ` · ${entry.at}` : ''}</T>
       </View>;
     }
     case 'tool': {
