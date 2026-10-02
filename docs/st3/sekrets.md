@@ -86,7 +86,10 @@ The gateway runs each command as the sekrets user inside bubblewrap:
   directory's `config` and `config.worktree` are replaced by a copy that keeps only data
   (remotes, branches, identity, format extensions), and its `hooks` and `modules` directories by
   empty ones. Command-line configuration then turns off hooks, the file system monitor, local and
-  external transports, submodule recursion and signing.
+  external transports, submodule recursion and signing, and git looks for a repository no higher
+  than the checkout. A `.git` that is a symbolic link, or a gitdir file or `commondir` naming a
+  directory outside the passed checkout, is refused: git would follow it to a configuration the
+  gateway never sanitized.
 - The checkout is read-only to the command, so `git push` through sekrets pushes the branch and
   exits 0 but cannot record the remote-tracking ref or `-u` upstream in the checkout; run
   `git fetch` and `git branch --set-upstream-to` as the caller afterwards.

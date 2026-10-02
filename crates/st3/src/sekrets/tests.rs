@@ -602,6 +602,75 @@ fn git_in_a_checkout_runs_none_of_the_checkouts_programs() {
         );
         assert!(!log.stderr.contains("PWNED"));
     }
+    // A .git the gateway cannot sanitize, because it is a link or names a directory outside the
+    // passed checkout, is refused before anything runs.
+    let linked = fixture.checkout("linked");
+    fs::rename(repo.join(".git"), linked.join("real-git")).unwrap();
+    std::os::unix::fs::symlink("real-git", linked.join(".git")).unwrap();
+    let refused = run(fixture.connect(), None, &["git", "status"], &linked);
+    assert!(
+        refusal(&refused).contains("is a symbolic link"),
+        "{}",
+        refusal(&refused)
+    );
+    // A gitdir outside every checkout root is never bound.
+    let elsewhere = fixture.root.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::rename(linked.join("real-git"), elsewhere.join("real-git")).unwrap();
+    let outside = fixture.checkout("outside");
+    let gitfile = |target: &Path| {
+        fs::write(
+            outside.join(".git"),
+            format!("gitdir: {}\n", target.display()),
+        )
+        .unwrap()
+    };
+    gitfile(&elsewhere.join("real-git"));
+    let refused = run(fixture.connect(), None, &["git", "status"], &outside);
+    assert!(
+        refusal(&refused).contains("is not under a checkout root"),
+        "{}",
+        refusal(&refused)
+    );
+    // A caller that passes the checkout but not the git directory its gitdir file names gets
+    // nothing run: the gateway cannot sanitize what it was not given.
+    fs::rename(elsewhere.join("real-git"), linked.join("real-git")).unwrap();
+    gitfile(&linked.join("real-git"));
+    {
+        use super::protocol::{self, Reply};
+        use std::os::unix::net::UnixStream;
+        let stream = UnixStream::connect(&fixture.socket).unwrap();
+        protocol::send(&stream, &Request::Hello { attestation: None }, &[]).unwrap();
+        let _ = protocol::recv::<Reply>(&stream).unwrap().unwrap();
+        let null: OwnedFd = fs::File::open("/dev/null").unwrap().into();
+        let directory: OwnedFd = fs::File::open(&outside).unwrap().into();
+        protocol::send(
+            &stream,
+            &Request::Run(RunRequest {
+                argv: vec!["git".into(), "status".into()],
+                directories: 1,
+                ..RunRequest::default()
+            }),
+            &[
+                null.as_raw_fd(),
+                null.as_raw_fd(),
+                null.as_raw_fd(),
+                directory.as_raw_fd(),
+            ],
+        )
+        .unwrap();
+        let (reply, _) = protocol::recv::<Reply>(&stream).unwrap().unwrap();
+        let Reply::Refused { reason, .. } = reply else {
+            panic!("ran: {reply:?}");
+        };
+        assert!(
+            reason.contains("is not a directory inside the checkout"),
+            "{reason}"
+        );
+    }
+    fs::remove_file(linked.join(".git")).unwrap();
+    fs::rename(linked.join("real-git"), repo.join(".git")).unwrap();
+
     // The checkout itself is untouched and still runs its own programs for its owner.
     let own = Command::new("git")
         .current_dir(&repo)
