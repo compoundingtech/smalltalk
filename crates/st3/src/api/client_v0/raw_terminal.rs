@@ -108,13 +108,7 @@ pub(crate) async fn stream(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     authorize(&session, query.mode)?;
-    let protocols = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .collect::<Vec<_>>();
+    let protocols = stream_protocols(&headers);
     let capabilities = protocols
         .iter()
         .filter_map(|protocol| protocol.strip_prefix(TERMINAL_CAPABILITY_PROTOCOL_PREFIX))

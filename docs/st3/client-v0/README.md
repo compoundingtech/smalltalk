@@ -74,7 +74,7 @@ mutation queue, push notification service, cached graph authority, or multi-mast
 
 `st up` listens on two different Unix sockets. `st3.sock` is the privileged trusted-local API;
 `st3-client.sock` is the paired-only client gateway backed by `fabric_router`. The latter rejects
-ordinary requests without a paired bearer or device cookie credential, except for pairing completion. The socket
+ordinary requests without a paired bearer credential, except for pairing completion. The socket
 paths can be set with `socket` and `client_gateway_socket` in `config.toml`, or with `--socket` and
 `--client-gateway-socket` for a foreground daemon. They must never name the same path.
 
@@ -147,12 +147,21 @@ fall back to the root index for client-side routing. Missing assets return `404`
 symlinks cannot escape the configured directory. The static bundle is public within the trusted
 tailnet carrier, not an authenticated API, and must not contain credentials or private data.
 
-Browser pairing completion with `credential_delivery: "cookie"` sets `st3_device`, an HttpOnly,
-Secure, SameSite=Strict cookie scoped to `/v1/client`. Browsers therefore need the HTTPS carrier.
-The cookie mode omits the credential from the response body. Bearer credentials
-continue to work for native clients; both authentication forms use the same expiry, revocation,
-person and scopes, including WebSocket upgrades. An explicit bearer header takes precedence.
-This gateway relies on the tailnet trust boundary; it does not add an Origin policy or CSP.
+Browsers complete the same pairing as native clients and receive the same scoped bearer in JSON.
+The TypeScript client's `IndexedDbCredentialStore` keeps it in IndexedDB, keyed by the gateway
+origin and base path, and supplies it through the client's `credential` callback. Delete the entry
+when disconnecting or revoking the device. Do not use cookies, localStorage, URL query parameters,
+or bundle-embedded credentials. The current pairing protocol records a device public key but has
+no signed-challenge authentication; the bearer is therefore script-readable. A non-extractable
+WebCrypto challenge-signing key requires a protocol change rather than wrapping this bearer
+([#1038](https://github.com/compoundingtech/smalltalk/issues/1038)).
+
+HTTP requests use `Authorization: Bearer ...`. Browsers cannot set that header on a WebSocket,
+so they offer one additional `st3.bearer.<credential>` subprotocol alongside the stream's normal
+protocol (and `st3.cap.<capability>` for terminals). Authentication completes before upgrade,
+using the same expiry, revocation, actor and scopes as native bearers. The server selects and
+echoes only the normal stream protocol, never the credential. An explicit Authorization header
+retains precedence. Redact this credential protocol from reverse-proxy handshake logs.
 
 The two usage GET relays are `/v1/client/usage/quota` and `/v1/client/usage/history?account=ACCOUNT`.
 Only `/api/v1/quota` and `/api/v1/lens/usage_over_time` on the configured upstream are contacted;
