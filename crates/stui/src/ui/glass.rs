@@ -3527,6 +3527,9 @@ mod tests {
         press(&mut ui, KeyCode::Char('4'), KeyModifiers::NONE);
         assert_eq!(ui.usage_wanted(), Some(24));
         press(&mut ui, KeyCode::Char('b'), KeyModifiers::NONE);
+        // Past the two accounts to the first mission.
+        press(&mut ui, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut ui, KeyCode::Down, KeyModifiers::NONE);
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
         let usage = "usage:mission/fleet/atlas/store-move";
         assert!(

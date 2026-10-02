@@ -494,7 +494,25 @@
       "properties": {
         "since_ms": { "type": "integer", "minimum": 0 },
         "until_ms": { "type": "integer", "minimum": 0 },
-        "rows": { "type": "array", "items": { "$ref": "#/$defs/UsageRow" } }
+        "rows": { "type": "array", "items": { "$ref": "#/$defs/UsageRow" } },
+        "limits": { "type": "array", "items": { "$ref": "#/$defs/UsageLimit" } }
+      }
+    },
+    "UsageLimit": {
+      "type": "object", "additionalProperties": false,
+      "required": ["account", "driver", "measured_at_unix_ms", "measured_by", "host", "seats"],
+      "properties": {
+        "account": { "type": "string" },
+        "driver": { "type": "string" },
+        "plan": { "type": "string" },
+        "five_hour_percent": { "type": "number", "minimum": 0 },
+        "five_hour_resets_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "weekly_percent": { "type": "number", "minimum": 0 },
+        "weekly_resets_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "measured_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "measured_by": { "type": "string" },
+        "host": { "type": "string" },
+        "seats": { "type": "array", "items": { "type": "string" } }
       }
     },
     "UsageRow": {

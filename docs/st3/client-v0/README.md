@@ -238,7 +238,11 @@ cost: the harness's own figure when it reports one, else st's pricing table, nam
 `reported_cost_microusd` (the part the harness reported) and `unpriced_tokens` (tokens neither
 could price, which a client shows as unknown cost, never as free). An identity st does not know,
 such as the mission run of a standing seat, is absent from the row. A period whose start is after
-its end is `validation-failed`. The Rust method is `Client::usage_period(since_ms, until_ms)`;
+its end is `validation-failed`. `limits` lists each account's freshest limits reading: `account`
+(a label such as `claude/<digest>`, or `DRIVER/unknown`), `driver`, optional `plan`,
+`five_hour_percent`, `weekly_percent` and their `*_resets_at_unix_ms`, when and by which seat and
+host it was measured, and the seats whose newest reading names the account. A harness that does
+not report a value leaves it out. The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
 
 

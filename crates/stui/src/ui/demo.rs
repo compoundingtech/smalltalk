@@ -91,6 +91,7 @@ pub fn world() -> World {
         conversations,
         quiet_missions: 6,
         usage: Load::Ready(usage()),
+        usage_limits: usage_limits(),
     }
 }
 
@@ -110,7 +111,43 @@ pub fn loading() -> World {
         conversations: BTreeMap::new(),
         quiet_missions: 0,
         usage: Load::Loading,
+        usage_limits: Vec::new(),
     }
+}
+
+/// The demo accounts' limits, as their harnesses last reported them.
+fn usage_limits() -> Vec<st3_client::UsageLimit> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+    vec![
+        st3_client::UsageLimit {
+            account: s("anthropic"),
+            driver: s("claude"),
+            plan: Some(s("max")),
+            five_hour_percent: Some(41.0),
+            five_hour_resets_at_unix_ms: Some(now + 2 * 3_600_000),
+            weekly_percent: Some(23.0),
+            weekly_resets_at_unix_ms: Some(now + 3 * 86_400_000),
+            measured_at_unix_ms: now - 180_000,
+            measured_by: s("agent/example/atlas/builder"),
+            host: s("lark"),
+            seats: vec![s("agent/example/atlas/builder"), s("agent/example/cos")],
+        },
+        st3_client::UsageLimit {
+            account: s("openai"),
+            driver: s("codex"),
+            plan: None,
+            five_hour_percent: None,
+            five_hour_resets_at_unix_ms: None,
+            weekly_percent: Some(6.0),
+            weekly_resets_at_unix_ms: Some(now + 6 * 86_400_000),
+            measured_at_unix_ms: now - 3_600_000,
+            measured_by: s("agent/example/release/captain"),
+            host: s("wren"),
+            seats: vec![s("agent/example/release/captain")],
+        },
+    ]
 }
 
 /// A day of spend: the atlas store move's compare reruns lead, as Home's note says.

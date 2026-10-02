@@ -3954,6 +3954,7 @@ impl Ui {
                 self.world.missions = full.missions.clone();
                 self.world.machines = full.machines.clone();
                 self.world.usage = full.usage.clone();
+                self.world.usage_limits = full.usage_limits.clone();
                 self.world.worktrees = full.worktrees.clone();
                 self.world.conversations = full.conversations;
                 if let Some(Load::Ready(entries)) = self

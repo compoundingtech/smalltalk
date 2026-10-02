@@ -838,14 +838,31 @@ pub(super) async fn usage_period(
         )));
     }
     let store = state.store.clone();
-    let mut rows = blocking_store(move || store.usage_period_rows(since_ms, until_ms)).await?;
+    let (mut rows, limits) = blocking_store(move || {
+        Ok((
+            store.usage_period_rows(since_ms, until_ms)?,
+            store.account_limits()?,
+        ))
+    })
+    .await?;
     for row in &mut rows {
         if let Some(fields) = row.as_object_mut() {
             fields.retain(|_, value| value.as_str() != Some(""));
         }
     }
+    // Each account's freshest limits reading; what a harness did not report is left out.
+    let limits = limits
+        .into_iter()
+        .map(|limit| {
+            let mut value = serde_json::to_value(limit).unwrap_or_default();
+            if let Some(fields) = value.as_object_mut() {
+                fields.retain(|_, value| !value.is_null());
+            }
+            value
+        })
+        .collect::<Vec<_>>();
     Ok(Json(
-        json!({ "since_ms": since_ms, "until_ms": until_ms, "rows": rows }),
+        json!({ "since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits }),
     ))
 }
 

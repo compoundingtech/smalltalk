@@ -303,6 +303,29 @@ pub struct UsagePeriod {
     pub since_ms: u64,
     pub until_ms: u64,
     pub rows: Vec<UsageRow>,
+    /// Each account's freshest limits reading; empty from a daemon that reports none.
+    #[serde(default)]
+    pub limits: Vec<UsageLimit>,
+}
+/// An account's 5-hour and weekly limits, as the seat that measured it most recently read them.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsageLimit {
+    pub account: String,
+    pub driver: String,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub five_hour_percent: Option<f64>,
+    #[serde(default)]
+    pub five_hour_resets_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub weekly_percent: Option<f64>,
+    #[serde(default)]
+    pub weekly_resets_at_unix_ms: Option<u64>,
+    pub measured_at_unix_ms: u64,
+    pub measured_by: String,
+    pub host: String,
+    pub seats: Vec<String>,
 }
 /// One group's spend. Costs are API-equivalent micro-dollars; `unpriced_tokens` had no price.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

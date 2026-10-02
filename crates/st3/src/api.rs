@@ -12404,6 +12404,10 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         );
         let typed: st3_client::UsagePeriod = serde_json::from_value(period.clone()).unwrap();
         assert_eq!(typed.rows[0].model.as_deref(), Some("claude-example"));
+        assert!(
+            typed.limits.is_empty(),
+            "no harness has reported limits here"
+        );
         let backwards = app
             .clone()
             .oneshot(

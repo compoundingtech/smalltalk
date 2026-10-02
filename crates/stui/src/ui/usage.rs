@@ -12,7 +12,7 @@ use super::theme;
 use super::view::{Load, World};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use st3_client::UsageRow;
+use st3_client::{UsageLimit, UsageRow};
 use std::collections::BTreeMap;
 
 /// What the Usage list groups by; `b` steps through them.
@@ -186,8 +186,17 @@ pub fn groups<'a>(rows: impl Iterator<Item = &'a UsageRow>, by: By) -> Vec<(Stri
 
 /// A group as a person reads it: an agent's or mission's name, a step with its mission.
 pub fn label(world: &World, id: &str) -> String {
+    if let Some(account) = id.strip_prefix("account/") {
+        // `claude/<digest>`: the provider, and enough of the digest to tell two apart.
+        return match account.split_once('/') {
+            Some((driver, "unknown")) => format!("{driver} · account not named"),
+            Some((driver, digest)) => format!("{driver} · {}", &digest[..digest.len().min(8)]),
+            None => account.to_owned(),
+        };
+    }
     if let Some(rest) = id.strip_prefix("usage/no-") {
         return match rest {
+            "account" => "no account recorded (before st kept accounts)".into(),
             "mission" => "no mission (standing seats)".into(),
             "step" => "no step (standing seats)".into(),
             other => format!("unknown {other}"),
@@ -229,31 +238,98 @@ fn span(text: impl Into<String>, style: Style) -> Span<'static> {
     Span::styled(text.into(), style)
 }
 
-/// The Usage tab's list: the period's spend, then each group, the largest first.
+/// The Usage tab's list: each account's spend and limits, a short summary, then every group
+/// the list is grouped by, the largest first.
 pub fn list(world: &World, by: By, hours: u64) -> Listing {
     let rows = world.usage.items();
     let mut items = Vec::new();
     let mut ids = Vec::new();
-    if !rows.is_empty() {
+    let mut row = |items: &mut Vec<Item>, id: String, first, right, second| {
+        items.push(Item::Row {
+            index: ids.len(),
+            first,
+            right,
+            second,
+        });
+        ids.push(id);
+    };
+    if !rows.is_empty() || !world.usage_limits.is_empty() {
+        let accounts = accounts(world);
+        items.push(Item::Header {
+            title: "accounts".into(),
+            count: accounts.len(),
+            color: theme::ACCENT,
+        });
+        for (id, spent, limit) in accounts {
+            row(
+                &mut items,
+                id.clone(),
+                vec![span(format!(" {}", label(world, &id)), theme::bold())],
+                vec![span(spent.money(), theme::fg(theme::ACCENT))],
+                limit_line(limit, &spent),
+            );
+        }
         let mut total = Total::default();
         rows.iter().for_each(|row| total.add(row));
+        items.push(Item::Header {
+            title: "summary".into(),
+            count: rows.len(),
+            color: theme::OVERLAY1,
+        });
         items.push(Item::Note(Line::from(vec![
-            span(" SPEND ", theme::strong(theme::ACCENT)),
+            span(" ", theme::dim()),
             span(total.money(), theme::bold()),
-            span(format!(" · {} tokens", tokens(total.tokens)), theme::dim()),
+            span(
+                format!(
+                    " · {} tokens · {}",
+                    tokens(total.tokens),
+                    period_name(hours)
+                ),
+                theme::dim(),
+            ),
         ])));
+        for (name, grouping) in [("agent", By::Agent), ("mission", By::Mission)] {
+            if let Some((id, spent)) = groups(rows.iter(), grouping)
+                .into_iter()
+                .find(|(id, _)| !id.starts_with("usage/"))
+            {
+                items.push(Item::Note(Line::from(vec![
+                    span(format!(" most by {name:<8}"), theme::dim()),
+                    span(label(world, &id), theme::text()),
+                    span(format!("  {}", spent.money()), theme::fg(theme::ACCENT)),
+                ])));
+            }
+        }
+        if total.unpriced > 0 {
+            items.push(Item::Note(Line::from(span(
+                format!(
+                    " {} tokens had no price, so the cost is at least this",
+                    tokens(total.unpriced)
+                ),
+                theme::fg(theme::YELLOW),
+            ))));
+        }
     }
-    for (id, total) in groups(rows.iter(), by) {
+    let grouped = groups(rows.iter(), by);
+    if !grouped.is_empty() {
+        items.push(Item::Header {
+            title: format!("by {}", by.name()),
+            count: grouped.len(),
+            color: theme::OVERLAY1,
+        });
+    }
+    for (id, total) in grouped {
         let cached = if total.tokens > 0 {
             total.cached * 100 / total.tokens
         } else {
             0
         };
-        items.push(Item::Row {
-            index: ids.len(),
-            first: vec![span(format!(" {}", label(world, &id)), theme::bold())],
-            right: vec![span(total.money(), theme::fg(theme::ACCENT))],
-            second: vec![span(
+        row(
+            &mut items,
+            id.clone(),
+            vec![span(format!(" {}", label(world, &id)), theme::bold())],
+            vec![span(total.money(), theme::fg(theme::ACCENT))],
+            vec![span(
                 format!(
                     "   {} tokens · {} out · {cached}% cached",
                     tokens(total.tokens),
@@ -261,13 +337,12 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
                 ),
                 theme::dim(),
             )],
-        });
-        ids.push(id);
+        );
     }
     let state = match &world.usage {
         Load::Loading => ListState::Loading("Loading usage…"),
         Load::Failed(why) => ListState::Failed(why.clone()),
-        Load::Ready(rows) if rows.is_empty() => {
+        Load::Ready(rows) if rows.is_empty() && world.usage_limits.is_empty() => {
             ListState::Empty("No spend recorded in this period.")
         }
         Load::Ready(_) => ListState::Ready,
@@ -285,6 +360,89 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             ]),
             Line::from(span("Costs are API-equivalent list prices.", theme::dim())),
         ],
+    }
+}
+
+/// Every account that spent in the period or reported its limits, the largest spender first,
+/// with spend st could not tie to an account last.
+fn accounts(world: &World) -> Vec<(String, Total, Option<&UsageLimit>)> {
+    let mut accounts = groups(world.usage.items().iter(), By::Account)
+        .into_iter()
+        .map(|(id, spent)| {
+            let limit = world
+                .usage_limits
+                .iter()
+                .find(|limit| id == format!("account/{}", limit.account));
+            (id, spent, limit)
+        })
+        .collect::<Vec<_>>();
+    for limit in &world.usage_limits {
+        let id = format!("account/{}", limit.account);
+        if !accounts.iter().any(|(known, _, _)| *known == id) {
+            accounts.push((id, Total::default(), Some(limit)));
+        }
+    }
+    accounts.sort_by_key(|(id, _, _)| id.starts_with("usage/"));
+    accounts
+}
+
+/// An account's limits as one line: weekly first, since that is the one that stops seats.
+fn limit_line(limit: Option<&UsageLimit>, spent: &Total) -> Vec<Span<'static>> {
+    let Some(limit) = limit else {
+        return vec![span(
+            format!("   {} tokens · no limits reported", tokens(spent.tokens)),
+            theme::dim(),
+        )];
+    };
+    let now = now_ms();
+    let share = |percent: Option<f64>| match percent {
+        Some(percent) => (
+            format!("{percent:.0}%"),
+            if percent >= 90.0 {
+                theme::RED
+            } else if percent >= 75.0 {
+                theme::YELLOW
+            } else {
+                theme::GREEN
+            },
+        ),
+        None => ("?".into(), theme::OVERLAY1),
+    };
+    let (weekly, weekly_color) = share(limit.weekly_percent);
+    let (five, five_color) = share(limit.five_hour_percent);
+    let resets = limit
+        .weekly_resets_at_unix_ms
+        .map(|at| format!(" resets in {}", span_of(at.saturating_sub(now))))
+        .unwrap_or_default();
+    vec![
+        span("   weekly ", theme::dim()),
+        span(weekly, theme::strong(weekly_color)),
+        span(format!("{resets} · 5-hour "), theme::dim()),
+        span(five, theme::strong(five_color)),
+        span(
+            format!(
+                " · measured {} ago",
+                span_of(now.saturating_sub(limit.measured_at_unix_ms))
+            ),
+            theme::dim(),
+        ),
+    ]
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+/// A length of time as a person says it: `40s`, `12m`, `5h`, `3d`.
+fn span_of(ms: u64) -> String {
+    let seconds = ms / 1000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..86_400 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
     }
 }
 
@@ -396,9 +554,42 @@ pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc 
             width,
         );
     }
-    if id.is_none() {
+    // An account's limits, or every account's on the whole period.
+    let limits = world
+        .usage_limits
+        .iter()
+        .filter(|limit| id.is_none_or(|id| id == format!("account/{}", limit.account)))
+        .collect::<Vec<_>>();
+    if !limits.is_empty() {
+        let mut card = Doc::new();
+        for limit in limits {
+            let spent = mine
+                .iter()
+                .filter(|row| row.account.as_deref() == Some(limit.account.as_str()))
+                .fold(Total::default(), |mut total, row| {
+                    total.add(row);
+                    total
+                });
+            card.line(Line::from(span(
+                label(world, &format!("account/{}", limit.account)),
+                theme::bold(),
+            )));
+            card.line(Line::from(limit_line(Some(limit), &spent)));
+            card.line(Line::from(span(
+                format!(
+                    "   {} seat{} · measured by {} on {}",
+                    limit.seats.len(),
+                    if limit.seats.len() == 1 { "" } else { "s" },
+                    label(world, &limit.measured_by),
+                    limit.host
+                ),
+                theme::dim(),
+            )));
+        }
+        doc.card("limits", theme::OVERLAY1, false, card, width);
+    } else if id.is_none() || own == Some(By::Account) {
         doc.line(Line::from(span(
-            "Account limits: st does not report them yet.",
+            "No account has reported its limits.",
             theme::dim(),
         )));
     }
@@ -468,6 +659,34 @@ mod tests {
         assert!(mission.contains("compare"), "{mission}");
         assert!(!mission.contains("captain"), "{mission}");
         let all = plain(&detail(&world, None, 24, 60));
-        assert!(all.contains("Account limits"), "{all}");
+        assert!(all.contains("weekly 23%"), "{all}");
+        let listed = list(&world, By::Agent, 24)
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Header { title, .. } => format!("# {title}"),
+                Item::Row { first, second, .. } => {
+                    format!(
+                        "{} {}",
+                        text::plain(&Line::from(first.clone())),
+                        text::plain(&Line::from(second.clone()))
+                    )
+                }
+                Item::Note(line) | Item::Folder(line) => text::plain(line),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Accounts first, then a summary, then every agent.
+        let at = |needle: &str| {
+            listed
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {listed}"))
+        };
+        assert!(
+            at("# accounts") < at("# summary") && at("# summary") < at("# by agent"),
+            "{listed}"
+        );
+        assert!(listed.contains("weekly 23% resets in"), "{listed}");
+        assert!(listed.contains("most by agent   Atlas Builder"), "{listed}");
     }
 }
