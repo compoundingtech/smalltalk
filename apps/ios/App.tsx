@@ -128,10 +128,8 @@ function Main() {
     screenOptions={({ route }) => ({
       headerShown: false,
       tabBarActiveTintColor: theme.accent,
-      // Glasses: two rounded-rect panes and a two-line bridge, drawn as a template so it takes the tab's tint.
-      tabBarIcon: route.name === 'Glasses'
-        ? { type: 'image', source: require('./assets/icons/glasses.png'), tinted: true }
-        : { type: 'sfSymbol', name: ICONS[route.name as Tab] as never },
+      // Spaces: one rounded rect, as stui's ▢.
+      tabBarIcon: { type: 'sfSymbol', name: (route.name === 'Glasses' ? 'app' : ICONS[route.name as Tab]) as never },
       tabBarStyle: { display: tabBarHidden(route) ? 'none' : 'flex' },
     })}
   >
