@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import type { ReactNode, Ref } from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View, type StyleProp, type TextInputProps, type TextStyle, type ViewStyle } from 'react-native';
 import { fonts, theme } from './theme';
 import type { Run } from './markdown';
@@ -52,7 +52,7 @@ export function Button({ label, onPress, disabled = false, color = theme.accent,
 
 /** A text input. Prose (messages, titles, requests) gets iOS's autocorrect and spell check;
  *  a field for an identifier (a URL, a code, a path) turns them off. */
-export function Field(props: TextInputProps) {
+export function Field(props: TextInputProps & { ref?: Ref<TextInput> }) {
   return <TextInput placeholderTextColor={theme.overlay0} autoCorrect spellCheck {...props} style={[styles.field, props.multiline && styles.fieldMultiline, props.style]} />;
 }
 
