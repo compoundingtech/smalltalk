@@ -14251,7 +14251,11 @@ impl NativeObservations {
                             *ready = true;
                         }
                         if observed.reason.as_deref() == Some("providerCapacity") {
-                            let fingerprint = hex::encode(Sha256::digest(&raw));
+                            let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
+                                source_driver,
+                                observed.since_ms,
+                                observed.reason.as_deref(),
+                            ))?));
                             publish_provider_capacity_diagnostic(
                                 client,
                                 subject,
