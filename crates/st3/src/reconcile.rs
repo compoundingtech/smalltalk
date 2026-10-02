@@ -3399,6 +3399,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
+        // Only a resume names a native session. A daemon started inside a resumed seat inherits
+        // that seat's, and must not hand it to every seat it launches.
+        if !member
+            .environment
+            .contains_key(crate::suspension::RESUME_ENV)
+        {
+            launch_member
+                .environment
+                .remove(crate::suspension::RESUME_ENV);
+        }
         launch_member
             .environment
             .insert("ST3_ENDPOINT".into(), self.endpoint.clone());

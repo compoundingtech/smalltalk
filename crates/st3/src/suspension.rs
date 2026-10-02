@@ -98,11 +98,6 @@ impl Suspension {
             "quiescing" | "snapshotting" | "suspended" | "restoring" | "verifying"
         )
     }
-
-    /// The seat is suspended for a reader: it has stopped, or a resume has not yet begun.
-    pub fn is_suspended(&self) -> bool {
-        matches!(self.phase.as_str(), "snapshotting" | "suspended")
-    }
 }
 
 fn field<'a>(claim: &'a ClaimRecord, name: &str) -> Option<&'a str> {
