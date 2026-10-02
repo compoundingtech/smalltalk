@@ -303,6 +303,8 @@ A retry repeats one failed step attempt. It handles a bounded transient failure.
 
 `timeout` is an execution budget for one step attempt. It advances only while a worker holds a live claim in `claimed` or `working`; dependency waits, assignment waits, blocked gates, ready time, verification, and time after lease expiry do not consume it. Release and reclaim resume the same attempt's accumulated budget, while retry starts a new attempt with a fresh budget. Work projections expose the active interval start, accumulated execution milliseconds, and configured timeout so an operator can explain an expiry after restart or replication. A step cannot use a deadline gate because its timeout is its worker-execution budget.
 
+A step with a worker does not fail when its budget runs out. st raises one fault for the step, which arrives as a message to the agent assigned to it, and the step and its mission go on. The owner answers with `st work extend STEP --as AGENT --by 2h --reason TEXT`, which adds up to seven days to this attempt's budget and renews the lease, with `work complete` when the goals are met, or with `work fail`. An extension is a `work.extended` claim. The fault ends when the owner extends, completes, fails or releases the step. A step that runs out of the extended budget raises a new fault. Only a step with no worker, such as an agentless step, fails when its budget runs out, because nobody holds it to answer. A step submitted for verification has already used its time and is never timed out.
+
 If a step produces a native harness driver, the step waits for a ready, working, or idle harness observation from the current runtime incarnation. An observation with another incarnation cannot satisfy the step. An old observation without an incarnation applies only when it was recorded after the current runtime epoch began.
 
 A driver declared with `restart "never"` that exits, vanishes, or fails to start before readiness fails the step immediately. A restartable driver remains pending while its restart policy can still recover it. It fails when that policy raises an unrecoverable decision. Driver readiness is lifecycle state and does not consume the step's claimed-execution budget.
@@ -764,9 +766,40 @@ st work done step-run/release/ask-ID --as person/operator --summary "Friday"
 
 An ask creates a person-assigned runtime step in the live owning generation. Its origin waits in
 `waiting-person`, without a lease or time/retry consumption. Only the assigned person can
-complete it. The response resumes the same origin attempt with a new readiness epoch. A requester
+complete it. The response resumes the same origin attempt with a new readiness epoch, and the
+seat's ready-work wake tells the requester. No step waits on a `--new-run` ask, so the response
+also sends the requester one message from `daemon/runtime` with the answer. A requester
 can use `st work cancel-ask STEP --as AGENT --summary TEXT`. An unclaimed live requester can
 use `--new-run NAME`; claimed work must name `--step`. Repeated keys return the same source.
+
+#### Structured requests
+
+`st work ask --request FILE` (or `request` on the client `work.ask` action) adds a typed question
+to the ask. A `decision` proposes one action and names exactly one `accept` answer, one
+`decline` answer and at most one `request_changes` answer. A `choice` names two to five options;
+`custom: true` also accepts the person's own words. `feedback` asks for text. Every request has a
+`question` and `why_person`, and may carry a `summary`, up to eight `reasons`, a
+`recommendation` naming one of its answers, and `subjects` (pull requests, issues, documents,
+missions, runs, steps, agents, hosts, commits or links) whose `revision` pins what was reviewed.
+Each named answer has a stable `id`, a `label`, the `consequence` that follows, and optional
+`conditions`. Without `--reason`, the person reads the request's question. `st work ask --help`
+shows a complete example.
+
+```sh
+st work done step-run/release/ask-ID --as person/operator --answer land
+st work done step-run/release/ask-ID --as person/operator --answer revise --text "Split the migration"
+```
+
+The person answers with a named `--answer ID`, adding `--text` where the answer needs words:
+requesting changes, a custom choice, or feedback. A reply in words alone does not answer a
+decision or a choice; `answer-required` lists the answer IDs. Feedback also accepts a plain
+`--summary`, so older clients can still send it. The `work.person-done` claim records the typed
+answer as `{type, outcome, id, label, text}`, where `outcome` is `accept`, `decline`,
+`request_changes`, `selected`, `custom` or `feedback`. The resumed origin step lists it in
+`person_answers` with the ask, respondent, time and summary; a person ask's own step does too,
+which is where a `--new-run` asker reads it. `st work show STEP --json` and the client `work`
+resource both carry the field. The summary stays as the `Person response:` constraint for
+history. A free-text ask works as before: it keeps no `request` field and takes no named answer.
 
 A person message leaves on read or archive, without an age expiry. A launch needs its current
 valid preview. Faults describe source recovery and inspection; they have no independent dismiss
@@ -1307,7 +1340,7 @@ Cancellation also cancels active descendant mission runs. Each descendant uses i
 
 The terminal state is `cancelled` after successful final work. A final failure makes the run failed.
 
-After final work, st enters cleanup and stops every runtime owned by the mission run.
+After final work, st enters cleanup and stops every runtime owned by the mission run. A seat is never stopped while it holds a message nobody has read or work in a run outside this one. The run still finishes. The seat keeps its stop declaration, st checks it again every ten seconds, and it stops once the message is read and the other work ends. A person's own stop is not delayed.
 
 The run becomes terminal only after those runtime subjects report a stopped, absent, or exited state.
 

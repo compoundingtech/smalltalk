@@ -43,6 +43,14 @@ test "$(git -C "$work/pty" rev-parse HEAD)" = "$pty_rev"
 cargo build --release --locked --manifest-path "$work/pty/Cargo.toml" \
   --target-dir "$work/pty-target" --target "$target" -p pty --bin pty
 install -m 0755 "$work/pty-target/$target/release/pty" "$work/$package/bin/pty"
+if [[ $target == *apple* ]]; then
+  # stui's speech helper needs Swift with the macOS 26 SDK; without one the release ships without
+  # voice in stui, and says so.
+  if ! apps/macos/listen/build.sh "$work/$package/bin" >/dev/null; then
+    echo "release-smalltalk: the speech helper did not build here; this release has no voice in stui" >&2
+    rm -rf "$work/$package/bin/StListen.app"
+  fi
+fi
 ln -s st3 "$work/$package/bin/st"
 install -m 0755 scripts/install-release "$work/$package/install.sh"
 install -m 0755 scripts/install-macos.py "$work/$package/install-macos.py"

@@ -1332,6 +1332,15 @@ impl Store {
         transaction: &Transaction<'_>,
         after_batch_rowid: Option<i64>,
     ) -> Result<usize> {
+        self.sign_own_envelopes_range_tx(transaction, after_batch_rowid, None)
+    }
+
+    fn sign_own_envelopes_range_tx(
+        &self,
+        transaction: &Transaction<'_>,
+        after_batch_rowid: Option<i64>,
+        through_batch_rowid: Option<i64>,
+    ) -> Result<usize> {
         let _timing = time_stage(&self.replication_timers.signing);
         let Some(key) = self
             .member_key
@@ -1346,9 +1355,9 @@ impl Store {
         };
         let from = if after_batch_rowid.is_some() {
             "FROM batches CROSS JOIN replica_envelopes AS envelopes
-             ON envelopes.batch_id=batches.id WHERE batches.rowid>?2 AND envelopes.writer=?1"
+             ON envelopes.batch_id=batches.id WHERE batches.rowid>?2 AND batches.rowid<=?4 AND envelopes.writer=?1"
         } else {
-            "FROM replica_envelopes AS envelopes WHERE envelopes.writer=?1 AND envelopes.rowid>?2"
+            "FROM replica_envelopes AS envelopes WHERE envelopes.writer=?1 AND envelopes.rowid>?2 AND envelopes.rowid<=?4"
         };
         let mut statement = transaction.prepare(&format!(
             "SELECT envelopes.sequence, envelopes.envelope_hash {from}
@@ -1366,7 +1375,8 @@ impl Store {
                 params![
                     self.origin,
                     after_batch_rowid.unwrap_or(i64::MIN),
-                    key.public()
+                    key.public(),
+                    through_batch_rowid.unwrap_or(i64::MAX),
                 ],
                 |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
             )?
@@ -2513,6 +2523,15 @@ pub fn seed_replica_envelopes_tx(
     relay: &str,
     after_rowid: Option<i64>,
 ) -> Result<()> {
+    seed_replica_envelopes_range_tx(transaction, relay, after_rowid, None)
+}
+
+fn seed_replica_envelopes_range_tx(
+    transaction: &Transaction<'_>,
+    relay: &str,
+    after_rowid: Option<i64>,
+    through_rowid: Option<i64>,
+) -> Result<()> {
     let order = if after_rowid.is_some() {
         "batches.rowid"
     } else {
@@ -2521,7 +2540,7 @@ pub fn seed_replica_envelopes_tx(
     let mut statement = transaction.prepare(&format!(
         "SELECT id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms
          FROM batches
-         WHERE batches.rowid>=?1
+         WHERE batches.rowid>=?1 AND batches.rowid<=?2
            AND NOT EXISTS (
              SELECT 1 FROM replica_envelopes WHERE replica_envelopes.batch_id=batches.id
          )
@@ -2529,7 +2548,10 @@ pub fn seed_replica_envelopes_tx(
     ))?;
     let headers = statement
         .query_map(
-            [after_rowid.map_or(i64::MIN, |rowid| rowid.saturating_add(1))],
+            params![
+                after_rowid.map_or(i64::MIN, |rowid| rowid.saturating_add(1)),
+                through_rowid.unwrap_or(i64::MAX)
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -4257,21 +4279,36 @@ impl Store {
     /// Seal this node's batches that have no envelope yet, and sign them. Only this takes the
     /// writer, and only when there are such batches.
     pub fn seal_local_batches(&self) -> Result<()> {
-        if max_batch_rowid(&self.readers.get())? <= self.seeded_batch_rowid.load(Ordering::Acquire)
-        {
-            return Ok(());
-        }
-        let mut connection = self.connection.write();
-        let _timing = time_stage(&self.replication_timers.snapshot);
-        let seeded_through = self.seeded_batch_rowid.load(Ordering::Acquire);
-        let latest_batch = max_batch_rowid(&connection)?;
-        if latest_batch > seeded_through {
+        // A checkpoint on a standalone busy member can accumulate ten minutes of writes.
+        // Bound each writer loan, not just the scan range, so queued live writes run between
+        // chunks. Capture the target once; concurrent writes belong to the next pass.
+        const SEAL_CHUNK_BATCHES: usize = 64;
+        let target = max_batch_rowid(&self.readers.get())?;
+        while target > self.seeded_batch_rowid.load(Ordering::Acquire) {
+            let mut connection = self.connection.write();
+            let _timing = time_stage(&self.replication_timers.snapshot);
+            let seeded_through = self.seeded_batch_rowid.load(Ordering::Acquire);
+            if seeded_through >= target {
+                break;
+            }
+            let through: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(rowid), ?2) FROM (
+                    SELECT rowid FROM batches WHERE rowid>?1 AND rowid<=?2
+                    ORDER BY rowid LIMIT ?3)",
+                params![seeded_through, target, SEAL_CHUNK_BATCHES],
+                |row| row.get(0),
+            )?;
             let transaction = connection.transaction()?;
-            seed_replica_envelopes_tx(&transaction, &self.origin, Some(seeded_through))?;
-            self.sign_own_envelopes_tx(&transaction, Some(seeded_through))?;
+            seed_replica_envelopes_range_tx(
+                &transaction,
+                &self.origin,
+                Some(seeded_through),
+                Some(through),
+            )?;
+            self.sign_own_envelopes_range_tx(&transaction, Some(seeded_through), Some(through))?;
             transaction.commit()?;
-            self.seeded_batch_rowid
-                .store(latest_batch, Ordering::Release);
+            self.seeded_batch_rowid.store(through, Ordering::Release);
+            // The FIFO writer services any already queued request before the next loan.
         }
         Ok(())
     }

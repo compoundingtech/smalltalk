@@ -63,7 +63,12 @@
     "owner_run_id": "mission-run/release", "driver": "codex", "harness_state": "ready",
     "incarnation_id": "runtime-9:2026-09-20T11:06:30Z", "current_work_ids": ["step-run/release/build"], "active_work_count": 1,
     "next_work_id": "step-run/release/deploy", "upcoming_work_ids": ["step-run/release/deploy"], "queued_work_count": 1,
-    "under": []
+    "under": [],
+    "subagents": [{
+      "id": "019a-thread-review", "subagent_type": null, "description": "review the changelog", "driver": "codex",
+      "session_id": "019a-thread-main", "work_id": "step-run/release/build", "started_at": "2026-09-20T11:07:10Z",
+      "lease_expires_at": "2026-09-20T11:17:10Z"
+    }]
   },
   {
     "id": "runtime/release-agent", "kind": "runtime", "revision": "rt5", "updated_at": "2026-09-20T11:09:00Z",

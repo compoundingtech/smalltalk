@@ -1412,3 +1412,209 @@ fn plan_a_copy_of_a_real_store() {
         }
     }
 }
+
+#[test]
+fn an_observed_item_keeps_its_latest_state_and_every_version_still_read_by_id() {
+    let mut sealed = Sealed::default();
+    let item = "resource/github/acme/garden/pull-request/7";
+    let observed = |head: &str| {
+        draft(
+            "resource.observed",
+            item,
+            json!({
+                "kind": "vcs.pull-request",
+                "facts": {"number": 7, "head_sha": head, "state": "open"},
+                "observer": "observer/run/garden/repository",
+                "baseline": false,
+                "changed_fields": ["head_sha"],
+            }),
+        )
+    };
+    let replaced = sealed.add("alder", T + 1, observed("aaaa"));
+    // A version that a review request was made for stays with the request.
+    let requested = sealed.envelope(
+        "alder",
+        T + 2,
+        vec![
+            observed("bbbb"),
+            Draft {
+                kind: "subscription.mission-requested",
+                subject: "subscription/run/garden/reviews",
+                actor: None,
+                body: json!({"fields": {"mission": "mission/review", "resource": item}}),
+            },
+        ],
+    );
+    // A version pinned as a run's input stays while the run names it.
+    let pinned = sealed.add("alder", T + 3, observed("cccc"));
+    sealed.add(
+        "alder",
+        T + 4,
+        draft(
+            "mission-run.created",
+            "mission-run/review/7",
+            json!({"inputs": {"source": {"kind": "resource", "value": item, "claim_id": pinned}}}),
+        ),
+    );
+    let latest = sealed.add("alder", T + 5, observed("dddd"));
+    // A resource that a person or agent records is not an observer's, and stays.
+    let mut authored = observed("eeee");
+    authored.subject = "resource/mission-run/review/7/pull-request";
+    authored.actor = Some(AGENT);
+    let authored = [
+        sealed.add("alder", T + 6, authored),
+        sealed.add("alder", T + 7, {
+            let mut again = observed("ffff");
+            again.subject = "resource/mission-run/review/7/pull-request";
+            again.actor = Some(AGENT);
+            again
+        }),
+    ];
+    let plan = plan_drops(&sealed.build());
+    assert_eq!(dropped(&plan), ids([&replaced]));
+    let _ = (requested, latest, authored);
+}
+
+#[test]
+fn checkpoint_reads_of_sealed_batches_do_not_wait_for_the_writer() {
+    let store = Arc::new(Store::open_memory("checkpoint-writer-test").unwrap());
+    store
+        .append_claim(&input(
+            "agent/checkpoint-reader",
+            "harness.observed",
+            Some("agent/checkpoint-reader"),
+            json!({"state":"idle", "incarnation_id":"checkpoint-i1"}),
+            "checkpoint-reader",
+        ))
+        .unwrap();
+    store.seal_local_batches().unwrap();
+    let cut = now_ms() + 1;
+    // Holding the writer models an unrelated request without writing uncommitted state.
+    let writer = store.connection.write();
+    let (sent, received) = std::sync::mpsc::channel();
+    let reader = store.clone();
+    let task = std::thread::spawn(move || {
+        let result = reader
+            .checkpoint_sealed_identities(cut, None)
+            .and_then(|identities| {
+                reader
+                    .checkpoint_sealed_set_through(cut, None)
+                    .map(|sealed| (identities.digest, sealed_digest(&sealed)))
+            });
+        sent.send(result).unwrap();
+    });
+    let result = received.recv_timeout(std::time::Duration::from_secs(2));
+    drop(writer);
+    task.join().unwrap();
+    let (identities, sealed) = result
+        .expect("an already sealed checkpoint must not take the writer")
+        .unwrap();
+    assert_eq!(identities, sealed);
+}
+
+#[test]
+fn a_write_queued_during_sealing_runs_before_the_backlog_finishes() {
+    use crate::fleet::{MemberKey, envelope_signature_message, verify_signature};
+    use smallclaims::sqlite::WriterJob;
+    use std::sync::atomic::Ordering;
+    const FLEET: &str = "5b0c1d8e-6a44-4f0e-9d51-2f7f3c9a0b12";
+    let store = Store::open_memory("seal-queue-node").unwrap();
+    store.bind_fleet(FLEET).unwrap();
+    let key = Arc::new(MemberKey::generate().unwrap().0);
+    store.set_member_key(Some(key.clone())).unwrap();
+    store.seal_local_batches().unwrap();
+    for n in 0..200 {
+        store
+            .append_claim(&input(
+                "agent/seal-queue",
+                "harness.observed",
+                Some("agent/seal-queue"),
+                json!({"state":"idle", "incarnation_id":format!("seal-{n}")}),
+                &format!("seal-{n}"),
+            ))
+            .unwrap();
+    }
+    let target = smallclaims::store::max_batch_rowid(&store.readers.get()).unwrap();
+    let jobs = store
+        .connection
+        .jobs
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let (sample, sampled) = std::sync::mpsc::channel();
+    let (done, committed) = std::sync::mpsc::sync_channel(1);
+    // Queue a real write after SQLite bounds the first chunk, while that writer loan is
+    // still held. FIFO order makes the observation deterministic, without sleeping.
+    static QUEUED_WRITE: std::sync::Mutex<Option<(std::sync::mpsc::Sender<WriterJob>, WriterJob)>> =
+        std::sync::Mutex::new(None);
+    fn after_chunk_bound(sql: &str, _: std::time::Duration) {
+        if (sql.contains("ORDER BY rowid LIMIT")
+            || sql.starts_with("SELECT id, origin, replica_sequence, previous_hash"))
+            && let Some((jobs, job)) = QUEUED_WRITE.lock().unwrap().take()
+        {
+            jobs.send(job).unwrap();
+        }
+    }
+    *QUEUED_WRITE.lock().unwrap() = Some((
+        jobs,
+        WriterJob::Batched {
+            run: Box::new(move |tx| {
+                let count: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                sample.send(count).unwrap();
+                append_claim_tx(
+                    tx,
+                    "seal-queue-node",
+                    "agent/queued-write",
+                    "harness.observed",
+                    Some("agent/queued-write"),
+                    &json!({"fields":{"state":"idle", "incarnation_id":"queued-i1"}}),
+                    &[],
+                    None,
+                )
+                .unwrap();
+                true
+            }),
+            profile: None,
+            wait: None,
+            done: done.clone(),
+        },
+    ));
+    store.connection.write().profile(Some(after_chunk_bound));
+    store.seal_local_batches().unwrap();
+    store.connection.write().profile(None);
+    committed.recv().unwrap().unwrap();
+    let count = sampled.recv().unwrap();
+    assert!(
+        count > 0 && count < 200,
+        "the queued write saw {count} envelopes: it must run between seal chunks"
+    );
+    assert_eq!(
+        store.seeded_batch_rowid.load(Ordering::Acquire),
+        target,
+        "a concurrent write is left for the next pass, not skipped by the high water"
+    );
+    store.seal_local_batches().unwrap();
+    assert_eq!(store.seeded_batch_rowid.load(Ordering::Acquire), target + 1);
+    let exchange = store
+        .export_replication_exchange(FLEET, &ReplicationInventory::default())
+        .unwrap();
+    assert!(exchange.envelopes.len() >= 201);
+    for envelope in &exchange.envelopes {
+        assert!(verify_signature(
+            key.public(),
+            &envelope_signature_message(
+                FLEET,
+                "seal-queue-node",
+                envelope.sequence,
+                &envelope.hash
+            ),
+            envelope.signature.as_deref().unwrap()
+        ));
+    }
+}

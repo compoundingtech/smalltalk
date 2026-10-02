@@ -3052,3 +3052,32 @@ fn only_a_changed_deferral_verdict_is_worth_reporting() {
     assert!(!journal.observe(None));
     assert!(journal.observe(Some(unknown)));
 }
+
+#[test]
+fn dictated_deliveries_keep_the_message_body_and_digest() {
+    let mut message = msg(
+        "1785070000000-abc123.md",
+        "person/avery",
+        Some("Please check"),
+    );
+    message.body = "check the quene".into();
+    message.tags = vec![
+        "st3-message:message/dictated-test".into(),
+        "dictated".into(),
+    ];
+    let dictated = render_without_catalog(&message);
+    assert!(dictated.starts_with("(dictated by voice; it may contain transcription mistakes)\n"));
+    assert!(dictated.contains("check the quene\n</smalltalk-message>"));
+    assert!(dictated.contains(&st3_body_sha256(&message.body)));
+    assert_eq!(message.body, "check the quene");
+    message.tags.pop();
+    let ordinary = render_without_catalog(&message);
+    assert_eq!(
+        dictated.strip_prefix("(dictated by voice; it may contain transcription mistakes)\n"),
+        Some(ordinary.as_str())
+    );
+    assert_eq!(
+        with_dictation_notice(ordinary.clone(), &["not-dictated".into()]),
+        ordinary
+    );
+}

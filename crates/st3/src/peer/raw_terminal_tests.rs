@@ -154,16 +154,9 @@ async fn membership_only_gateway_holds_raw_writers_and_fences_capabilities() {
             "test",
         )
         .unwrap();
-    let peer = PeerState {
-        backend: PeerBackend::Main(Client::unix(&owner_socket)),
-        node: "raw-owner".into(),
-        auth: FleetAuth::test(fleet, &[7; 32]).with_member_key(Some(owner_key.clone())),
-        fleet: member_context(&owner.store, &owner_key, &[], &[], false),
-        main_socket: owner_socket.clone(),
-        outbound_notify: watch::channel(0).0,
-    };
+    let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "raw-owner".into(), FleetAuth::test(fleet, &[7; 32]).with_member_key(Some(owner_key.clone())), member_context(&owner.store, &owner_key, &[], &[], false));
     let peer_task = tokio::spawn(async move {
-        axum::serve(listener, peer_router(peer)).await.unwrap();
+        axum::serve(listener, peer_router(peer, smalltalk_routes())).await.unwrap();
     });
     tokio::time::timeout(Duration::from_secs(5), async {
         while tokio::net::UnixStream::connect(&owner_socket)
@@ -179,7 +172,7 @@ async fn membership_only_gateway_holds_raw_writers_and_fences_capabilities() {
     // membership, the owner's advertised endpoint, and the seat's runtime incarnation.
     exchange(
         &replication_http_client(),
-        &PeerBackend::Local(gateway.store.clone()),
+        &Local(gateway.store.clone()),
         "raw-gateway",
         &PeerConfig {
             name: "raw-owner".into(),
@@ -193,7 +186,6 @@ async fn membership_only_gateway_holds_raw_writers_and_fences_capabilities() {
             &[],
             false,
         ),
-        Path::new("/no/such/socket"),
     )
     .await
     .unwrap();

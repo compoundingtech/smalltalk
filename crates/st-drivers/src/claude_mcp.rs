@@ -138,6 +138,7 @@ fn run_named(
                         ),
                         None => channel_content(msg.subject.as_deref(), &msg.body),
                     };
+                    let notice = crate::ding::with_dictation_notice(notice, &msg.tags);
                     let content = format!("[st3-delivery:{}]\n{notice}", msg.filename);
                     write_json(
                         &mut stdout,

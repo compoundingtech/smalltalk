@@ -24,6 +24,7 @@ pub mod mission;
 pub mod model;
 pub mod otlp;
 pub mod peer;
+pub mod person_request;
 pub mod pricing;
 pub use smallclaims::{performance, profile};
 pub mod projection;
@@ -43,6 +44,7 @@ pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
 pub mod store;
+pub mod subagents;
 pub mod telemetry;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;

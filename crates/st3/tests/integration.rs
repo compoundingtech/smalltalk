@@ -4,6 +4,7 @@
 //! `mod NAME;` line here or an explicit test target for every new file.
 
 mod agents_restart;
+mod boot_canaries;
 mod client_creation;
 mod client_glasses;
 mod client_v0_cli;
@@ -29,6 +30,8 @@ mod operational_state_contract;
 mod reconcile_pass_perf;
 mod recorder_report;
 mod seat_queue_perf;
+mod subagent_publisher;
+mod subagents_seat;
 mod terminal_attach;
 
 #[test]

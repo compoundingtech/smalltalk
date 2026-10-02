@@ -536,6 +536,16 @@ fn agents(model: &Model) -> Vec<Agent> {
                             .unwrap_or_else(|| short(&relation.agent_id))
                     }),
                 },
+                subagents: agent
+                    .subagents
+                    .iter()
+                    .map(|subagent| Subagent {
+                        id: subagent.id.clone(),
+                        kind: subagent.subagent_type.clone(),
+                        description: subagent.description.clone(),
+                        age: subagent.started_at.as_deref().map(age).unwrap_or_default(),
+                    })
+                    .collect(),
             }
         })
         .collect::<Vec<_>>();
@@ -570,6 +580,7 @@ fn agents(model: &Model) -> Vec<Agent> {
             parent: None,
             details: AgentDetails::default(),
             terminal: false,
+            subagents: Vec::new(),
         }
     }));
     agents
@@ -1672,6 +1683,38 @@ mod tests {
         assert_eq!(agents(&model)[0].state, AgentState::Fault);
         model.agents = window(vec![resource("waiting", "indeterminate", Some("human"))]);
         assert_eq!(agents(&model)[0].state, AgentState::Starting);
+    }
+
+    #[test]
+    fn an_agents_subagents_come_from_st_as_part_of_it() {
+        let mut model = Model::default();
+        model.agents = window(vec![serde_json::json!({
+            "id": "agent/example/harbor/keeper", "kind": "agent", "revision": "r2",
+            "updated_at": "2026-09-29T09:59:00Z", "name": "fleet/harbor/keeper",
+            "state": "running", "reachability": "local", "harness_state": "working",
+            "runtime_ids": [], "under": [],
+            "subagents": [
+                {"id": "a1", "subagent_type": "Explore", "description": "map the code",
+                 "driver": "claude", "started_at": "2026-09-29T09:58:00Z",
+                 "lease_expires_at": "2026-09-29T10:08:00Z"},
+                {"id": "019a-thread", "driver": "codex",
+                 "lease_expires_at": "2026-09-29T10:08:00Z"}
+            ],
+        })]);
+        let world = world(&model, "person/avery", &Extras::default());
+        let Load::Ready(agents) = &world.agents else {
+            panic!("agents load from the agents window")
+        };
+        let subagents = &agents[0].subagents;
+        assert_eq!(
+            subagents.iter().map(Subagent::label).collect::<Vec<_>>(),
+            ["map the code · Explore", "019a-thread"]
+        );
+        assert!(!subagents[0].age.is_empty());
+        assert!(
+            subagents[1].age.is_empty(),
+            "st did not say when it started"
+        );
     }
 
     #[test]

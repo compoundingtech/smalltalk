@@ -7,10 +7,10 @@
 
 use anyhow::Result;
 use rusqlite::{Connection, Transaction};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::checkpoint::{DropPlan, SealedSet};
-use super::{ReplicatedClaimAdmission, Store};
+use super::{ReplicatedClaimAdmission, Store, append_claim_record_tx};
 use crate::claim::{ClaimInput, ClaimRecord, ReplicaBatch};
 use crate::error::Error;
 
@@ -122,4 +122,149 @@ pub trait Runtime: Send + Sync {
         subject: &str,
         cut: u128,
     ) -> Result<Value>;
+}
+
+/// The runtime of a program that only keeps and syncs claims: it accepts every claim as it is,
+/// keeps no tables of its own, and projects nothing. It has no checkpoint rules, so a fleet of
+/// plain stores never seals a checkpoint.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Plain;
+
+impl Runtime for Plain {
+    fn migrate_schema(&self, _connection: &Connection) -> Result<()> {
+        Ok(())
+    }
+
+    fn create_schema(&self, _connection: &Connection) -> Result<()> {
+        Ok(())
+    }
+
+    fn open_projections(&self, _transaction: &Transaction<'_>, _shared_memory: bool) -> Result<()> {
+        Ok(())
+    }
+
+    fn schema_digest(&self) -> String {
+        "plain".into()
+    }
+
+    fn classify_replicated_claim(
+        &self,
+        _connection: &Connection,
+        _batch: &ReplicaBatch,
+        _claim: &ClaimRecord,
+    ) -> Result<ReplicatedClaimAdmission, Error> {
+        Ok(ReplicatedClaimAdmission::Valid)
+    }
+
+    fn append_claim(
+        &self,
+        store: &Store,
+        input: &ClaimInput,
+    ) -> Result<(ClaimRecord, bool), Error> {
+        let body = json!({ "fields": input.fields, "evidence": input.evidence });
+        store
+            .connection
+            .batched(|transaction| {
+                append_claim_record_tx(
+                    transaction,
+                    &store.origin,
+                    &input.subject,
+                    &input.kind,
+                    input.actor.as_deref(),
+                    &body,
+                    &[],
+                    None,
+                )
+                .map(|claim| (claim, true))
+                .map_err(|error| Error::new("internal", error.to_string()))
+            })
+            .map_err(|error| Error::new("internal", error))?
+    }
+
+    fn apply_repair_tx(
+        &self,
+        _transaction: &Transaction<'_>,
+        _repaired: &str,
+        _replacement: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn append_claim_tx(
+        &self,
+        transaction: &Transaction<'_>,
+        origin: &str,
+        subject: &str,
+        kind: &str,
+        actor: Option<&str>,
+        body: &Value,
+        predecessors: &[String],
+        forced_batch: Option<&str>,
+    ) -> Result<ClaimRecord> {
+        append_claim_record_tx(
+            transaction,
+            origin,
+            subject,
+            kind,
+            actor,
+            body,
+            predecessors,
+            forced_batch,
+        )
+    }
+
+    fn project_incremental(
+        &self,
+        _transaction: &Transaction<'_>,
+        _origin: &str,
+    ) -> Result<bool, Error> {
+        Ok(true)
+    }
+
+    fn replay_from_nothing(&self, _transaction: &Transaction<'_>) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn after_projection(&self, _transaction: &Transaction<'_>) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn forget_views(&self) {}
+
+    fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])] {
+        &[
+            ("operations", &[]),
+            ("blobs", &[]),
+            ("documents", &["created_index"]),
+        ]
+    }
+
+    fn legacy_digest_tables(&self) -> &'static [LegacyDigestTable] {
+        &[]
+    }
+
+    fn checkpoint_rules_digest(&self) -> String {
+        "plain".into()
+    }
+
+    fn plan_checkpoint_drops(&self, _sealed: &SealedSet) -> DropPlan {
+        unimplemented!("the plain runtime has no checkpoint rules")
+    }
+
+    fn clear_checkpoint_projections(&self, _transaction: &Transaction<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn replay_checkpoint_projections(&self, _transaction: &Transaction<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn checkpoint_subject_answers(
+        &self,
+        _connection: &Connection,
+        _subject: &str,
+        _cut: u128,
+    ) -> Result<Value> {
+        Ok(Value::Null)
+    }
 }

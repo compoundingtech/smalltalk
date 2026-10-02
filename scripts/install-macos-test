@@ -165,6 +165,27 @@ class Installer(unittest.TestCase):
             self.assertFalse((bin_dir / 'stui').exists())
             self.assertEqual(service.read_bytes(), original)
 
+    def test_speech_helper_is_nested_signed_before_the_app_and_hashed(self):
+        helper = self.source / m.HELPER
+        executable = m.helper_executable(helper)
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b'listen-one')
+        executable.chmod(0o755)
+        (helper / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'x'}))
+        built = dict(self.built, **{m.HELPER: helper})
+        with patch.object(m, 'command', side_effect=self.command):
+            app, _, payload = m.prepare(self.home, self.job, built)
+        nested = app / 'Contents/Helpers' / m.HELPER
+        self.assertEqual(m.helper_executable(nested).read_bytes(), b'listen-one')
+        self.assertEqual(payload['st-listen'], m.sha(executable))
+        signs = [call for call in self.calls if '--sign' in call]
+        helper_sign = next(index for index, call in enumerate(signs) if 'com.example.smalltalk.listen' in call)
+        app_sign = next(index for index, call in enumerate(signs) if call[-1] == str(app))
+        self.assertLess(helper_sign, app_sign)
+        # macOS asks for the outermost app, so SmallTalk.app carries the usage strings.
+        info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+        self.assertIn('NSMicrophoneUsageDescription', info)
+
     def test_upgrade_restores_previous_whole_app(self):
         with patch.object(m, 'command', side_effect=self.command), patch.object(m, 'exchange', side_effect=self.exchange):
             app, _, _ = m.prepare(self.home, self.job, self.built)

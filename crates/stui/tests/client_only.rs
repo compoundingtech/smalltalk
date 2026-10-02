@@ -154,6 +154,7 @@ fn person_ask(state: &AppState, name: &str, title: &str) -> String {
         legacy_request: None, person: "person/avery".into(), title: title.into(),
         reason: "Confirm on the remote member".into(), actor: format!("agent/{}.asker", state.store.origin()),
         step: None, new_run: Some(name.into()), incarnation: None, idempotency_key: name.into(),
+        request: None,
     }).unwrap();
     state.event_notify.send_modify(|index| *index = state.store.index().unwrap());
     step.subject
