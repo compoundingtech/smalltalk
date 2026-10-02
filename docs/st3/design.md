@@ -83,6 +83,12 @@ not start a duplicate runtime.
 Every started member records its desired declaration, runtime identity, process identity, and
 incarnation. Stop and adoption operations compare the exact incarnation before they act.
 
+Runtime authority compares each origin's latest runtime observation in canonical order, not
+every historical observation. A nonowner's latest stop, absence, exit, or disappearance retires
+its earlier running observations, so a stop followed by a cross-host start restores reachability
+and terminal access. A still-live concurrent origin remains indeterminate unless the selected
+observation causally descends from it; exact-incarnation fencing is unchanged.
+
 Status keeps process facts in `actual`. It keeps the current native harness observation in
 `harness`. The harness view accepts only the current runtime incarnation or a legacy observation
 recorded inside that runtime epoch.

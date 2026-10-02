@@ -1,0 +1,13 @@
+[package]
+name = "st3-ui-model"
+version = "0.1.0"
+edition = "2024"
+description = "Renderer-independent Smalltalk UI models and mission semantics"
+license = "MIT"
+
+[dependencies]
+st3-client = { path = "../st3-client" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

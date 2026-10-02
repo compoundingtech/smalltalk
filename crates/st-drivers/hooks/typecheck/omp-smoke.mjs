@@ -56,7 +56,7 @@ process.env.ST_OMP_CHANNEL_RUNTIME_ID = "smoke.worker";
 process.env.ST_OMP_CHANNEL_SESSION = "smoke-session";
 process.env.ST_OMP_CHANNEL_SEQ = "1";
 
-const mod = await import("./smoke-out/omp-channel.mjs");
+const mod = await import(process.argv[2] ?? "./smoke-out/omp-channel.mjs");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");
 
 const handlers = new Map();
@@ -270,6 +270,37 @@ assert.deepStrictEqual(
   "terminal error must emit the typed turn result and stay actionable",
 );
 
+// A slow final unwind must not strand a working projection after the old five-second
+// settle window. Drive the actual extension and inspect the channel's observed idle edge.
+settleIdle = false;
+await handlers.get("agent_start")({}, settleCtx);
+await handlers.get("agent_end")(successfulEnd, settleCtx);
+await new Promise((resolve) => setTimeout(resolve, 5250));
+beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+settleIdle = true;
+await new Promise((resolve) => setTimeout(resolve, 250));
+assert.deepStrictEqual(
+  readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
+  [{ type: "state", state: "idle" }],
+  "native idle after a slow unwind must replace working without another turn",
+);
+
+// Session replacement fences the retained observer: an old context becoming idle
+// cannot overwrite the new session's genuinely busy state.
+settleIdle = false;
+await handlers.get("agent_end")(successfulEnd, settleCtx);
+await handlers.get("session_start")({}, activeCtx);
+await handlers.get("agent_start")({}, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+settleIdle = true;
+await new Promise((resolve) => setTimeout(resolve, 250));
+assert.deepStrictEqual(
+  readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
+  [],
+  "a retired context cannot mark a busy successor idle",
+);
+
 // Mail that arrives while omp runs a turn is held until the tool batch's last result, where omp
 // injects a steer anyway, so omp never backgrounds a command for it (`HOLD_MAX_MS` in
 // omp-channel.ts). Each case sends message frames through the channel and reads what the extension
@@ -403,6 +434,51 @@ await pause(1000);
 assert.notStrictEqual(Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1)), idlePid);
 assert.ok(readFrames().filter((frame) => frame.type === "state" && frame.state === "idle").length > idleFramesBefore,
   "a replacement channel receives readiness even when no model turn runs");
+
+// Reconnection may sample a context that reports idle while its modal is still
+// awaiting the operator. Ask and approval authority must survive that sample.
+for (const modal of ["ask", "approval"]) {
+  await handlers.get("session_start")({}, bareCtx);
+  await pause(150);
+  if (modal === "ask") {
+    await handlers.get("tool_call")({
+      toolName: "ask",
+      toolCallId: "ask-reconnect",
+      input: { questions: [{ question: "Proceed?" }] },
+    }, bareCtx);
+  } else {
+    await handlers.get("tool_approval_requested")({ toolName: "bash" }, bareCtx);
+  }
+  await pause(50);
+  const modalPid = Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1));
+  const beforeModalReconnect = readFrames().filter((frame) => frame.type === "state").length;
+  const readyBeforeModalReconnect = readFrames().filter((frame) => frame.type === "ready").length;
+  process.kill(modalPid, "SIGKILL");
+  for (let i = 0; i < 50 &&
+    readFrames().filter((frame) => frame.type === "ready").length === readyBeforeModalReconnect; i++) {
+    await pause(100);
+  }
+  assert.strictEqual(readFrames().filter((frame) => frame.type === "ready").length,
+    readyBeforeModalReconnect + 1, "the modal's replacement channel completes its hello");
+  await pause(250);
+  assert.notStrictEqual(Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1)), modalPid);
+  assert.deepStrictEqual(
+    readFrames().filter((frame) => frame.type === "state").slice(beforeModalReconnect),
+    [],
+    `${modal} reconnect must not fabricate idle while waiting for the operator`,
+  );
+  if (modal === "ask") {
+    await handlers.get("tool_result")({ toolCallId: "ask-reconnect" }, bareCtx);
+  } else {
+    await handlers.get("tool_approval_resolved")({}, bareCtx);
+  }
+  await pause(50);
+  assert.deepStrictEqual(
+    readFrames().filter((frame) => frame.type === "state").at(-1),
+    { type: "state", state: "idle" },
+    `${modal} resolution permits a positive idle observation`,
+  );
+}
 
 // The channel may answer after session_start's bounded wait. Its seat context still reaches the
 // next turn, so a slow PTY projection cannot leave an unnamed seat.

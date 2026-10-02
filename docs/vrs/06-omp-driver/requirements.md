@@ -43,9 +43,10 @@ pi's env fallbacks. Measured integration evidence:
   exit edge back to the prior activity. Lost evidence stops the heartbeat per the generic
   record rules.
 - **OMP-R03 Idle edge without `agent_settled`.** Because omp lacks pi's `agent_settled`
-  event, the channel derives idle by bounded polling of `ctx.isIdle()` after `agent_end`; it
-  must not emit idle at `agent_end` itself (measured still false there) nor wait for an
-  event that never fires.
+  event, the channel samples `ctx.isIdle()` after `agent_end` until positive idle evidence
+  or superseding activity, session, or channel ownership. Slow final unwind must not lose
+  the idle edge. Neither `agent_end` itself nor elapsed time proves idle; a pending human
+  ask or approval prevents an idle observation.
 - **OMP-R04 Own channel asset.** omp gets its own `omp-channel.ts`, forked from the pi
   channel's frame discipline, not a shared file parameterized at runtime — the idle-edge and
   approval logic differ, and a shared file would make each harness's correctness depend on

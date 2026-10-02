@@ -1,0 +1,40 @@
+# Generated file - DO NOT EDIT
+# Source: release-daily.yml.genie.ts
+
+name: Smalltalk daily release
+
+on:
+  schedule:
+    - cron: 17 5 * * *
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag; default is the next patch after the highest v tag
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smalltalk-daily-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: daily-release
+    runs-on: namespace-profile-linux-x86-64
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Publish the verified archives of main when it changed
+        run: 'scripts/release-smalltalk-daily ${TAG:+--tag "$TAG"}'

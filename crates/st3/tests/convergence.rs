@@ -20,10 +20,12 @@
 //! 5. the same trimmed checkpoint and the same tombstones, field by field, and tombstones
 //!    that match the drop digest of the certificate it trimmed;
 //! 6. no invalid record, and no record still pending;
-//! 7. for every claim it lacks, a tombstone, and only for claims a rule may drop. When a cut
-//!    ended with two certificates, one per side of an excused partition, the side whose
-//!    certificate lost may have dropped a claim the chosen one keeps, so a node may lack a claim
-//!    without a tombstone, but only a claim some node tombstoned. An old build keeps no
+//! 7. for every claim it lacks, a tombstone, and only for claims a rule may drop. When people
+//!    excused each side of a partition and each side certified, with two certificates for one
+//!    cut or certificates with disjoint participants, every node applies the chosen or newest
+//!    one, and its manifest lacks what only the other side dropped. So a node may lack a claim
+//!    without a tombstone, but only a claim some node tombstoned, and modern nodes compare
+//!    sources and operations with each other rather than with the oracle (#1052). An old build keeps no
 //!    tombstones, so it may lack a claim the others dropped while it was excused, but only
 //!    such a claim.
 //!
@@ -1165,14 +1167,26 @@ impl World {
                     .unwrap()
             })
         });
-        // Only a cut with two certificates, one per side of an excused partition, lets a node
-        // lack a claim without its own tombstone.
+        // Only people excusing each side of a partition let a node lack a claim without its own
+        // tombstone: a cut with two certificates, or certificates with disjoint participants,
+        // one per side. Every node applies the chosen or newest one, and adopting its manifest
+        // forgets the other side's tombstones of claims this side never saw (#1052).
         let split = first_new.is_some_and(|index| {
             let claims = self.nodes[index].store.checkpoint_claims().unwrap();
-            stable_checkpoints(&claims)
-                .values()
-                .any(|certified| certified.len() > 1)
+            let stable = stable_checkpoints(&claims);
+            let certificates = stable.values().flatten().collect::<Vec<_>>();
+            stable.values().any(|certified| certified.len() > 1)
+                || certificates.iter().enumerate().any(|(index, left)| {
+                    certificates[index + 1..].iter().any(|right| {
+                        left.terms
+                            .participants
+                            .is_disjoint(&right.terms.participants)
+                    })
+                })
         });
+        // Then the claims some side forgot are missing from every node's sources and operations,
+        // so modern nodes compare those with each other instead of with the oracle.
+        let reference_graph = first_new.map(|index| status(&self.nodes[index].store));
         let mut failures = Vec::new();
         if oracle.invalid_records != 0 {
             failures.push(format!(
@@ -1205,6 +1219,14 @@ impl World {
                         "{name}: legacy graph digest differs from the oracle's"
                     ));
                 }
+            } else if split {
+                let reference = reference_graph.as_ref().unwrap();
+                if own.graph_digest != reference.graph_digest {
+                    failures.push(format!(
+                        "{name}: complete graph digest differs from {}'s",
+                        self.nodes[first_new.unwrap()].name
+                    ));
+                }
             } else if own.graph_digest != oracle.graph_digest {
                 failures.push(format!(
                     "{name}: complete graph digest differs from the oracle's"
@@ -1212,8 +1234,21 @@ impl World {
             }
             for (table, digest) in &oracle.projection_digests {
                 // An old build may lack facts dropped while it was excused, and cannot adopt
-                // their tombstones. Modern nodes compare every table, including those facts.
-                if node.old_build && matches!(table.as_str(), "claim_sources" | "operations") {
+                // their tombstones. Modern nodes compare every table, including those facts,
+                // with the oracle, or with each other after a split.
+                let facts = matches!(table.as_str(), "claim_sources" | "operations");
+                if node.old_build && facts {
+                    continue;
+                }
+                if split && facts {
+                    let reference = reference_graph.as_ref().unwrap();
+                    if own.projection_digests.get(table) != reference.projection_digests.get(table)
+                    {
+                        failures.push(format!(
+                            "{name}: shared table {table} differs from {}'s",
+                            self.nodes[first_new.unwrap()].name
+                        ));
+                    }
                     continue;
                 }
                 if own.projection_digests.get(table) != Some(digest) {

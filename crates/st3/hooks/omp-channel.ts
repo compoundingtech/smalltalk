@@ -3,7 +3,7 @@
 // Forked from pi-channel.ts: omp is pi-family and loads the same extension shape, but the two
 // diverge where it matters (measured 2026-08-25, omp v18.0.3 — see
 // docs/vrs/06-omp-driver/.experiments/). omp has no `agent_settled` event, so terminal
-// `agent_end` uses a bounded `ctx.isIdle()` poll; structured `ask` tool events and approval events
+// `agent_end` polls `ctx.isIdle()` until proven idle; structured `ask` tool events and approval events
 // carry the blocked-on-human axis pi cannot express; and a failed turn carries omp's own typed
 // error classification, which this asset forwards raw because st — not the asset — decides what
 // a rejected provider credential is. Like the pi asset this file holds no delivery
@@ -102,7 +102,9 @@ type Stash = {
 
   /** The structured `ask` tool call currently waiting for its matching result. */
   pendingAskToolCallId?: string;
-  /** Generation fencing every bounded settle poll against newer activity. */
+  /** An approval modal currently waiting for the operator. */
+  pendingApproval?: boolean;
+  /** Generation fencing every settle poll against newer activity. */
   settleGeneration?: number;
   /** Between `agent_start` and the `agent_end` that does not continue. */
   running?: boolean;
@@ -331,6 +333,7 @@ export default function (pi: ExtensionAPI) {
       state.reconnectAttempt = 0;
       state.lastCostUsd = undefined;
       state.pendingAskToolCallId = undefined;
+      state.pendingApproval = false;
       resetHold();
     }
 
@@ -573,14 +576,13 @@ export default function (pi: ExtensionAPI) {
   };
 
   // The idle edge without `agent_settled`: `ctx.isIdle()` is still false AT `agent_end` and
-  // flips true within ~250ms (measured), so idle is the first true sample of a bounded poll
-  // after `agent_end`. A queued follow-up turn keeps it false, so no spurious idle blip. A
-  // budget exhausted without an idle proof emits nothing: a record nobody can prove ages out
-  // rather than restating a stale active.
+  // normally flips true within ~250ms. Slow unwind can exceed five seconds, so a timeout must
+  // not abandon the only observer while st retains its last active frame. Keep sampling until
+  // positive proof or newer activity; a queued follow-up keeps it false without an idle blip.
   const IDLE_POLL_MS = 100;
-  const IDLE_POLL_BUDGET_MS = 5000;
 
   const watchSettle = (ctx: ExtensionContext) => {
+    if (state.pendingAskToolCallId || state.pendingApproval) return;
     // Starting a newer settle attempt also retires every older one.
     const generation = (state.settleGeneration ?? 0) + 1;
     state.settleGeneration = generation;
@@ -588,19 +590,19 @@ export default function (pi: ExtensionAPI) {
     // replacement inside the polling window would otherwise let a retired
     // context publish `idle` into the SUCCESSOR's channel while it is active.
     const originatingChild = state.child;
-    const startedAt = Date.now();
     const poller = setInterval(() => {
       if (
         state.child !== originatingChild ||
-        state.settleGeneration !== generation
+        state.settleGeneration !== generation ||
+        state.pendingAskToolCallId ||
+        state.pendingApproval
       ) {
         clearInterval(poller);
         return;
       }
-      const idle = idleProof(ctx);
-      if (!idle && Date.now() - startedAt < IDLE_POLL_BUDGET_MS) return;
+      if (!idleProof(ctx)) return;
       clearInterval(poller);
-      if (idle) sendFrame({ type: "state", state: "idle" });
+      sendFrame({ type: "state", state: "idle" });
     }, IDLE_POLL_MS);
     poller.unref?.();
   };
@@ -955,6 +957,7 @@ export default function (pi: ExtensionAPI) {
   // declare them, so register through the same widened `on` view.
   type ApprovalFrame = { toolName?: unknown };
   onWidened("tool_approval_requested", async (rawEvent) => {
+    state.pendingApproval = true;
     if (state.pendingAskToolCallId) return;
     const event = rawEvent as ApprovalFrame;
     const tool = typeof event.toolName === "string" ? event.toolName : "unknown";
@@ -968,6 +971,7 @@ export default function (pi: ExtensionAPI) {
     });
   });
   onWidened("tool_approval_resolved", async (_event, ctx) => {
+    state.pendingApproval = false;
     if (state.pendingAskToolCallId) return;
     if (idleProof(ctx)) {
       sendFrame({ type: "state", state: "idle" });
@@ -1032,6 +1036,7 @@ export default function (pi: ExtensionAPI) {
     state.reconnectTimer = undefined;
     cancelSettle();
     state.pendingAskToolCallId = undefined;
+    state.pendingApproval = false;
     resetHold();
     closeChild(state.child);
   });
