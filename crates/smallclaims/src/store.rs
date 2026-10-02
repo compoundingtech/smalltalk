@@ -351,6 +351,9 @@ pub struct Store {
     pub keyring: crate::principal::Keyring,
     /// Held while this node mints a key for a person or an agent.
     pub principal_minting: Mutex<()>,
+    /// The rules, read from the graph when `rules_stale` says they may have changed.
+    pub rules: std::sync::RwLock<Option<Arc<Vec<crate::rules::NamedRule>>>>,
+    pub rules_stale: AtomicBool,
     /// Admission took in claims whose verdicts the next projection pass judges.
     pub verdicts_due: AtomicBool,
     pub origin: String,
@@ -474,6 +477,8 @@ impl Store {
             member_key: std::sync::RwLock::new(None),
             keyring: crate::principal::Keyring::default(),
             principal_minting: Mutex::new(()),
+            rules: std::sync::RwLock::new(None),
+            rules_stale: AtomicBool::new(true),
             verdicts_due: AtomicBool::new(false),
             origin,
             path,
@@ -1015,6 +1020,10 @@ pub fn insert_claim(
     predecessors: &[String],
     now: u128,
 ) -> Result<u64> {
+    // Every local write comes through here; rules see each one that names its writer.
+    if let Some(actor) = actor {
+        principals::rules_gate_tx(transaction, origin, actor, kind, subject)?;
+    }
     promote_claim_blobs(transaction, body)?;
     transaction.execute(
         "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
@@ -3996,7 +4005,11 @@ impl Store {
         if let Some(actor) = &input.actor {
             self.ensure_principal_key(actor)?;
         }
-        self.runtime.append_claim(self, input)
+        let appended = self.runtime.append_claim(self, input);
+        if input.kind == crate::rules::RULE_SET {
+            self.rules_stale.store(true, Ordering::Release);
+        }
+        appended
     }
 
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
@@ -4035,6 +4048,19 @@ impl Store {
         bytes: &[u8],
         expected_document: &Option<String>,
         idempotency_key: &str,
+    ) -> Result<DocumentVersion, St3Error> {
+        self.put_document_as(name, bytes, expected_document, idempotency_key, None)
+    }
+
+    /// Store a document for `writer`, whom the rules judge as the publisher. The binding claim
+    /// itself is the node's, as every document binding is.
+    pub fn put_document_as(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        expected_document: &Option<String>,
+        idempotency_key: &str,
+        writer: Option<&str>,
     ) -> Result<DocumentVersion, St3Error> {
         validate_document_name(name)?;
         if bytes.len() > 1024 * 1024 {
@@ -4086,6 +4112,10 @@ impl Store {
                         params![hash, bytes, bytes.len() as u64],
                     )
                     .map_err(internal)?;
+                if let Some(writer) = writer {
+                    principals::rules_gate_tx(transaction, &self.origin, writer, "doc.bound", name)
+                        .map_err(crate::error::typed)?;
+                }
                 let body = json!({ "name": name, "hash": hash, "size": bytes.len() });
                 let record = self.runtime.append_claim_tx(
                     transaction,
@@ -5178,8 +5208,9 @@ impl Store {
         // Admitted claims, and any change to membership's trust roots, get their verdicts once
         // they are projected: judging here would hold the writer between admission and
         // projection, and a snapshot taken in between would offer an inventory its projections
-        // do not yet show.
+        // do not yet show. A replicated rule takes effect here.
         if outcome.changed {
+            self.rules_stale.store(true, Ordering::Release);
             self.verdicts_due.store(true, Ordering::Release);
         }
         Ok(outcome)

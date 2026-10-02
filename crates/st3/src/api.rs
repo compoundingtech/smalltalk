@@ -475,6 +475,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/launches/{id}/revise", post(revise_planning_session))
         .route("/v1/launches/{id}/cancel", post(cancel_planning_session))
         .route("/v1/documents", get(list_documents).post(put_document))
+        .route("/v1/rules", get(list_rules))
+        .route("/v1/rules/audit", get(list_rule_audits))
+        .route("/v1/rules/set", post(set_rule))
         .route("/v1/documents/content", get(get_document))
         .route("/v1/diagnostics/harness", post(post_harness_diagnostic))
         .route("/v1/delivery/hold", get(get_delivery_hold).post(post_delivery_hold))
@@ -4172,6 +4175,9 @@ async fn serve_unix_with_ancestor(
                     if let Some(caller) = caller {
                         request.extensions_mut().insert(caller);
                     }
+                    if let Some(agent) = &bound_agent {
+                        request.extensions_mut().insert(BoundAgent(agent.clone()));
+                    }
                     let client_request = request.uri().path().starts_with("/v1/client/");
                     let request = match guard_bound_request(request, bound_agent.as_deref()).await {
                         Ok(request) => request,
@@ -4449,6 +4455,10 @@ fn record_legacy_poll(
     }
 }
 
+/// The agent whose harness a local request comes from, when it comes from one.
+#[derive(Clone, Debug)]
+pub struct BoundAgent(pub String);
+
 async fn guard_bound_request(
     request: Request<Body>,
     bound_agent: Option<&str>,
@@ -4497,6 +4507,7 @@ async fn guard_bound_request(
         "/v1/reviews/",
         "/v1/claims",
         "/v1/diagnostic",
+        "/v1/rules/",
     ]
     .iter()
     .any(|prefix| path.starts_with(prefix))
@@ -8217,19 +8228,104 @@ async fn get_mission(
 
 async fn put_document(
     State(state): State<AppState>,
+    bound: Option<axum::Extension<BoundAgent>>,
     Json(request): Json<DocumentPutRequest>,
 ) -> Result<Json<DocumentVersion>, ApiError> {
     let response = state
         .store
-        .put_document(
+        .put_document_as(
             &request.name,
             &request.bytes,
             &request.expected_document,
             &request.idempotency_key,
+            bound.as_ref().map(|bound| bound.0.0.as_str()),
         )
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
+}
+
+async fn list_rules(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<smallclaims::rules::NamedRule>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.current_rules().map(|rules| rules.as_ref().clone()))
+        .await
+        .map(Json)
+}
+
+#[derive(Deserialize)]
+struct RuleAuditQuery {
+    rule: Option<String>,
+    limit: Option<usize>,
+}
+
+/// One write a rule in audit mode would have refused.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuleAudit {
+    pub rule: String,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub at_unix_ms: u128,
+    pub claim: String,
+}
+
+async fn list_rule_audits(
+    State(state): State<AppState>,
+    Query(query): Query<RuleAuditQuery>,
+) -> Result<Json<Vec<RuleAudit>>, ApiError> {
+    let store = state.store.clone();
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    blocking_store(move || {
+        Ok(store
+            .rule_audits(query.rule.as_deref(), limit)?
+            .into_iter()
+            .map(|claim| {
+                let field = |name: &str| {
+                    claim.body["fields"][name]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                RuleAudit {
+                    rule: claim
+                        .subject
+                        .strip_prefix("rule/")
+                        .unwrap_or(&claim.subject)
+                        .to_owned(),
+                    actor: field("actor"),
+                    action: field("action"),
+                    target: field("target"),
+                    at_unix_ms: claim.accepted_at_unix_ms,
+                    claim: claim.id,
+                }
+            })
+            .collect())
+    })
+    .await
+    .map(Json)
+}
+
+/// Set one rule as a person.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuleSetRequest {
+    pub actor: String,
+    pub name: String,
+    pub rule: smallclaims::rules::Rule,
+}
+
+async fn set_rule(
+    State(state): State<AppState>,
+    Json(request): Json<RuleSetRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    concrete_person(&request.actor)?;
+    let claim = state
+        .store
+        .set_rule(&request.name, &request.rule, &request.actor)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(claim))
 }
 
 #[derive(Deserialize)]
@@ -12681,6 +12777,95 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(check.status, "pass");
         assert!(check.message.contains("intentionally local-only"));
         assert!(check.message.contains("after leaving its fleet"));
+    }
+
+    #[tokio::test]
+    async fn rules_audit_an_agents_write_then_refuse_it_once_enforced() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        for (name, rule) in crate::rules::lockdown(&[]) {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/rules/set",
+                json!({"actor": "person/ada", "name": name, "rule": rule}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (_, rules) = get_request(app.clone(), "/v1/rules").await;
+        assert_eq!(rules.as_array().unwrap().len(), 3, "{rules}");
+        assert!(
+            rules
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|rule| rule["mode"] == "audit"),
+            "{rules}"
+        );
+        let publish = |name: &str| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/documents")
+                .header("content-type", "application/json")
+                .extension(BoundAgent("agent/team/web/reviewer".into()))
+                .body(Body::from(
+                    serde_json::to_vec(&DocumentPutRequest {
+                        name: name.into(),
+                        bytes: b"notes".to_vec(),
+                        expected_document: None,
+                        idempotency_key: format!("put:{name}"),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+            }
+        };
+        // Inside its namespace nothing is logged; outside, the write proceeds and is logged.
+        assert_eq!(publish("doc/team/web/plan").await.0, StatusCode::OK);
+        assert_eq!(publish("doc/team/api/plan").await.0, StatusCode::OK);
+        let (_, audits) = get_request(app.clone(), "/v1/rules/audit").await;
+        let audits = audits.as_array().unwrap();
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0]["rule"], "agents-publish-in-namespace");
+        assert_eq!(audits[0]["actor"], "agent/team/web/reviewer");
+        assert_eq!(audits[0]["action"], "doc.bound");
+        assert_eq!(audits[0]["target"], "doc/team/api/plan");
+
+        // Enforced, the same write is refused with a typed reason and nothing is stored.
+        let mut rule = crate::rules::lockdown(&[])
+            .into_iter()
+            .find(|(name, _)| *name == "agents-publish-in-namespace")
+            .unwrap()
+            .1;
+        rule.mode = smallclaims::rules::Mode::Enforce;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/rules/set",
+            json!({"actor": "person/ada", "name": "agents-publish-in-namespace", "rule": rule}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, refused) = publish("doc/team/api/later").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(refused["code"], "rule-denied", "{refused}");
+        assert!(state.store.claims_for("doc/team/api/later", None).unwrap().is_empty());
+        assert_eq!(publish("doc/team/web/later").await.0, StatusCode::OK);
+
+        // Only a person sets rules.
+        let (status, refused) = json_request(
+            app.clone(),
+            "/v1/rules/set",
+            json!({"actor": "agent/team/web/reviewer", "name": "agents-publish-in-namespace", "rule": rule}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
     }
 
     #[tokio::test]
