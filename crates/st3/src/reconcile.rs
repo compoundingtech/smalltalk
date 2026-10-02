@@ -7300,6 +7300,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         not_before_unix_ms: None,
                         created_at_unix_ms: run.created_at_unix_ms,
                         updated_at_unix_ms: run.updated_at_unix_ms,
+                        person_answers: Vec::new(),
                     };
                     if !matches!(
                         self.evaluate_mission_gate(run, step, &fake, gate)?,
@@ -26020,6 +26021,7 @@ mission "ios-proof-blocked" state="ready" {
                 new_run: None,
                 incarnation: Some("ios-owner-one".into()),
                 idempotency_key: "repair-simulator".into(),
+                request: None,
             })
             .unwrap();
         store
@@ -26065,6 +26067,7 @@ mission "ios-proof-blocked" state="ready" {
                     episode: None,
                     evidence: Vec::new(),
                     idempotency_key: "simulator-repaired".into(),
+                    answer: None,
                 },
                 false,
             )
@@ -26120,6 +26123,7 @@ mission "ios-proof-blocked" state="ready" {
             not_before_unix_ms: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
+            person_answers: Vec::new(),
         };
         let parent = step("step-run/run-1/build", "build", "agent/builder");
         let inherited = step(
@@ -26277,6 +26281,7 @@ mission "ios-proof-blocked" state="ready" {
             not_before_unix_ms: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10,
+            person_answers: Vec::new(),
         };
         let mut second = first.clone();
         second.subject = "step-run/newer/work".into();
@@ -26662,6 +26667,7 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             not_before_unix_ms: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
+            person_answers: Vec::new(),
         };
         let work = [step];
 

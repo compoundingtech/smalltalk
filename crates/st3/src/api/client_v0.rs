@@ -7151,6 +7151,7 @@ async fn dispatch_action(
                         .transpose()?,
                     incarnation: request.fence.runtime_incarnation.clone(),
                     idempotency_key: request.idempotency_key.clone(),
+                    request: p.get("request").cloned(),
                 })
                 .map_err(ApiError::bad)?;
             signal_changed(state);
@@ -7179,6 +7180,17 @@ async fn dispatch_action(
                             .unwrap_or_default(),
                         episode: Some(parameter_string(p, "episode")?),
                         idempotency_key: request.idempotency_key.clone(),
+                        answer: p
+                            .get("answer")
+                            .map(|value| {
+                                serde_json::from_value(value.clone()).map_err(|_| {
+                                    ApiError::bad(St3Error::new(
+                                        "validation-failed",
+                                        "answer takes an optional id and optional text",
+                                    ))
+                                })
+                            })
+                            .transpose()?,
                     },
                     action == "work.cancel-ask",
                 )

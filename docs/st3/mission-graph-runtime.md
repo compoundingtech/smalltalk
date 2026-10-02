@@ -768,6 +768,35 @@ complete it. The response resumes the same origin attempt with a new readiness e
 can use `st work cancel-ask STEP --as AGENT --summary TEXT`. An unclaimed live requester can
 use `--new-run NAME`; claimed work must name `--step`. Repeated keys return the same source.
 
+#### Structured requests
+
+`st work ask --request FILE` (or `request` on the client `work.ask` action) adds a typed question
+to the ask. A `decision` proposes one action and names exactly one `accept` answer, one
+`decline` answer and at most one `request_changes` answer. A `choice` names two to five options;
+`custom: true` also accepts the person's own words. `feedback` asks for text. Every request has a
+`question` and `why_person`, and may carry a `summary`, up to eight `reasons`, a
+`recommendation` naming one of its answers, and `subjects` (pull requests, issues, documents,
+missions, runs, steps, agents, hosts, commits or links) whose `revision` pins what was reviewed.
+Each named answer has a stable `id`, a `label`, the `consequence` that follows, and optional
+`conditions`. Without `--reason`, the person reads the request's question. `st work ask --help`
+shows a complete example.
+
+```sh
+st work done step-run/release/ask-ID --as person/operator --answer land
+st work done step-run/release/ask-ID --as person/operator --answer revise --text "Split the migration"
+```
+
+The person answers with a named `--answer ID`, adding `--text` where the answer needs words:
+requesting changes, a custom choice, or feedback. A reply in words alone does not answer a
+decision or a choice; `answer-required` lists the answer IDs. Feedback also accepts a plain
+`--summary`, so older clients can still send it. The `work.person-done` claim records the typed
+answer as `{type, outcome, id, label, text}`, where `outcome` is `accept`, `decline`,
+`request_changes`, `selected`, `custom` or `feedback`. The resumed origin step lists it in
+`person_answers` with the ask, respondent, time and summary; a person ask's own step does too,
+which is where a `--new-run` asker reads it. `st work show STEP --json` and the client `work`
+resource both carry the field. The summary stays as the `Person response:` constraint for
+history. A free-text ask works as before: it keeps no `request` field and takes no named answer.
+
 A person message leaves on read or archive, without an age expiry. A launch needs its current
 valid preview. Faults describe source recovery and inspection; they have no independent dismiss
 state. Legacy `attention request`, `resolve` and `withdraw` return `attention-migrated`.

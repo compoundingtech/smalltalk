@@ -10415,6 +10415,7 @@ impl Store {
                         "inspect subscription",
                         &["st", "subject", &failure.subject],
                     )],
+                    request: None,
                 });
             }
         }
@@ -17813,6 +17814,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 ],
             ),
         ],
+        request: None,
     }
 }
 
@@ -17872,6 +17874,7 @@ fn attention_item_from_planning(
                 ],
             ),
         ],
+        request: None,
     }
 }
 
@@ -17927,6 +17930,7 @@ fn attention_item_from_revision(
                 ],
             ),
         ],
+        request: None,
     }
 }
 
@@ -17962,6 +17966,7 @@ fn attention_item_from_failure(request: AttentionRequestView) -> AttentionItemVi
             "inspect source",
             &["st", "subject", &request.subject],
         )],
+        request: None,
     }
 }
 
@@ -23497,6 +23502,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         not_before_unix_ms: not_before.and_then(|value| value.parse().ok()),
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
+        person_answers: Vec::new(),
     })
 }
 
@@ -23524,28 +23530,7 @@ fn enrich_step_queue_at(
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
-    let mut query = connection.prepare(&canonical_sql(
-        "SELECT resolution.body FROM claims resolution JOIN claims request
-        ON request.subject=resolution.subject AND request.kind='work.person-asked'
-        WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
-          AND json_extract(request.body,'$.fields.origin_step')=?1
-          AND json_extract(request.body,'$.fields.origin_attempt')=?2
-        ORDER BY CANONICAL_ASC(resolution)",
-    ))?;
-    // Aliases other than the fixed marker aliases use the same helper directly.
-    let responses = query
-        .query_map(params![view.subject, view.attempt], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for response in responses {
-        if let Ok(response) = serde_json::from_str::<Value>(&response) {
-            if let Some(summary) = response["fields"]["summary"].as_str() {
-                view.constraints.push(format!("Person response: {summary}"));
-            }
-        }
-    }
-    Ok(())
+    person_work::enrich_responses(connection, view)
 }
 
 /// Copies the worker's latest progress summary and its completion summary for the
@@ -23607,28 +23592,7 @@ fn enrich_step_queue_for_reconcile_at(
 ) -> rusqlite::Result<()> {
     apply_effective_step_state(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
-    let mut query = connection.prepare(&canonical_sql(
-        "SELECT resolution.body FROM claims resolution JOIN claims request
-        ON request.subject=resolution.subject AND request.kind='work.person-asked'
-        WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
-          AND json_extract(request.body,'$.fields.origin_step')=?1
-          AND json_extract(request.body,'$.fields.origin_attempt')=?2
-        ORDER BY CANONICAL_ASC(resolution)",
-    ))?;
-    // Aliases other than the fixed marker aliases use the same helper directly.
-    let responses = query
-        .query_map(params![view.subject, view.attempt], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for response in responses {
-        if let Ok(response) = serde_json::from_str::<Value>(&response) {
-            if let Some(summary) = response["fields"]["summary"].as_str() {
-                view.constraints.push(format!("Person response: {summary}"));
-            }
-        }
-    }
-    Ok(())
+    person_work::enrich_responses(connection, view)
 }
 
 fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
