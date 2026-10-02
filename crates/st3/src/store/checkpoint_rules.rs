@@ -16,12 +16,19 @@ use smallclaims::store::checkpoint_agreement::*;
 
 /// The rule engine's version. It is part of the rules digest, so nodes agree on a checkpoint only
 /// when they run the same rules.
-pub const RULES_VERSION: u32 = 1;
+pub const RULES_VERSION: u32 = 2;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
 /// observation log's default retention.
 pub(crate) const LOCAL_KIND_MIN_AGE_MS: u128 = 5 * DAY_MS;
+
+/// Usage rollups keep their hourly history for this long before the cut, so a usage period that
+/// ends within it is exact to the hour. Before it, each rollup series keeps only its newest
+/// snapshot: the series' total, and the baseline for a period that starts at the window's edge.
+/// Every response is also exported to OpenTelemetry for history beyond the window.
+pub(crate) const USAGE_WINDOW_MS: u128 = 7 * DAY_MS;
+const HOUR_MS: u128 = 60 * 60 * 1000;
 
 /// The optional fields `current_harness_at` folds newest first from a harness's observations.
 pub(crate) const HARNESS_OPTIONAL_FIELDS: [&str; 7] = [
@@ -55,6 +62,9 @@ runtime.action.requested actor=null slot=subject,action,incarnation_id,operation
 runtime.action.succeeded actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
 runtime.action.failed actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
 runtime.action.deadline-reached actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
+harness.usage semantics=response_rollup slot=subject,incarnation_id,model,account,owner_run,owner_step,host keep=newest,last-of-each-utc-hour-by-observed_at-within-7d-before-cut,newest-before-that
+harness.usage semantics=session_cumulative slot=subject,incarnation_id keep=newest,largest-total_tokens
+harness.usage semantics=context_occupancy slot=subject,incarnation_id keep=newest
 render.applied slot=subject keep=newest min-age-before-cut=5d
 runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,shared-operation,writer-newest-envelope,whole-envelope
@@ -77,6 +87,8 @@ pub(crate) enum Rule {
     HarnessObserved,
     LoopState,
     Deferral,
+    UsageSeries,
+    UsageCumulative,
 }
 
 pub(crate) fn fields(claim: &ClaimRecord) -> Option<&serde_json::Map<String, Value>> {
@@ -137,6 +149,26 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         "render.applied" | "runtime.readiness-deadline-reached" => {
             Some((Rule::NewestAged, slot(&[])))
         }
+        // A legacy per-response claim is summed by every usage read, so it stays.
+        "harness.usage" => match field_str(claim, "semantics")? {
+            "response_rollup" => Some((
+                Rule::UsageSeries,
+                slot(&[
+                    "incarnation_id",
+                    "model",
+                    "account",
+                    "owner_run",
+                    "owner_step",
+                    "host",
+                ]),
+            )),
+            "session_cumulative" => Some((
+                Rule::UsageCumulative,
+                slot(&["semantics", "incarnation_id"]),
+            )),
+            "context_occupancy" => Some((Rule::Newest, slot(&["semantics", "incarnation_id"]))),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -219,6 +251,59 @@ pub(crate) fn harness_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> {
             keep.insert(position);
         }
     }
+    keep
+}
+
+/// When a usage snapshot was measured, as its writer recorded it, so every member buckets it the
+/// same way.
+fn usage_observed_at(claim: &ClaimRecord) -> u128 {
+    fields(claim)
+        .and_then(|fields| fields.get("observed_at_unix_ms"))
+        .and_then(Value::as_u64)
+        .map_or(claim.accepted_at_unix_ms, u128::from)
+}
+
+/// A rollup series is cumulative, so the snapshots kept are the ones a period read uses as its
+/// ends: the last of each UTC hour within [`USAGE_WINDOW_MS`] before the cut, the newest before
+/// that window as its baseline, and the newest of all as the series' total.
+pub(crate) fn usage_series_keep(claims: &[&ClaimRecord], cut: u128) -> BTreeSet<usize> {
+    let window = cut.saturating_sub(USAGE_WINDOW_MS);
+    let mut last_of_hour = BTreeMap::<u128, usize>::new();
+    let mut newest_before_window = None;
+    for (position, claim) in claims.iter().enumerate() {
+        let at = usage_observed_at(claim);
+        if at < window {
+            newest_before_window = Some(position);
+        } else {
+            last_of_hour.insert(at / HOUR_MS, position);
+        }
+    }
+    let mut keep = last_of_hour.into_values().collect::<BTreeSet<_>>();
+    keep.extend(newest_before_window);
+    keep.extend(claims.len().checked_sub(1));
+    keep
+}
+
+/// A session's cumulative usage is read as its largest reading, which is normally its newest.
+pub(crate) fn usage_cumulative_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> {
+    let total = |claim: &ClaimRecord| {
+        fields(claim)
+            .and_then(|fields| fields.get("total_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let mut keep = BTreeSet::from_iter(claims.len().checked_sub(1));
+    // The fold replaces its reading with any later one at least as large, so it answers with
+    // the last claim of the largest total.
+    let largest = claims.iter().map(|claim| total(claim)).max().unwrap_or(0);
+    keep.extend(
+        claims
+            .iter()
+            .enumerate()
+            .filter(|(_, claim)| total(claim) == largest)
+            .map(|(position, _)| position)
+            .last(),
+    );
     keep
 }
 
@@ -314,6 +399,8 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
         let keep = match rule {
             Rule::Newest | Rule::NewestAged => newest,
             Rule::HarnessObserved => harness_keep(&slot_claims),
+            Rule::UsageSeries => usage_series_keep(&slot_claims, cut),
+            Rule::UsageCumulative => usage_cumulative_keep(&slot_claims),
             Rule::LoopState => loop_keep(&slot_claims),
             Rule::Deferral => {
                 let request = slot.last().cloned().unwrap_or_default();
@@ -623,6 +710,23 @@ pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128)
                     );
                 }
                 answers.insert("incarnations".into(), Value::Object(harness));
+            }
+            // A rollup trim keeps every series' total, so lifetime usage must not change.
+            "harness.usage" => {
+                let rows = claims
+                    .iter()
+                    .map(|claim| {
+                        Ok((
+                            claim.store_index,
+                            serde_json::to_string(&claim.body).unwrap_or_default(),
+                            claim.accepted_at_unix_ms.to_string(),
+                        ))
+                    })
+                    .collect::<Vec<rusqlite::Result<_>>>();
+                answers.insert(
+                    "usage".into(),
+                    json!(Store::usage_summary_from_rows(rows, None)?),
+                );
             }
             "loop.state" => {
                 answers.insert(

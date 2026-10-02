@@ -55,7 +55,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_observations` | Local | Local-retention observations and their local frontier/id; never replicated. |
 | `local_subscription_mission_deferrals` | Local | Local reconciler capacity backoff/retry scheduling. |
 | `local_usage_spend` | Local | Local provider usage and cost accumulation before publication. |
-| `local_usage_seen` | Local | Local usage-input deduplication. |
+| `local_usage_responses` | Local | Local usage-input deduplication, trimmed after 30 days. |
 | `local_latest_slots` | Local | Local latest-retention publication slots and pending local observation pointers. |
 | `revision_proposals` | Shared projection | Shared candidate/source generation, reviewers/approvals, cutover/compatibility, status/preview/successor and durable timestamps. |
 | `planning_sessions` | Shared projection | Shared launch/planner/request/config, status, selected revision, ownership and durable timestamps. |
