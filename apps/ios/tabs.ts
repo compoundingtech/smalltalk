@@ -1,5 +1,5 @@
 // The tabs everyone sees, named and ordered as stui names them (crates/stui/src/ui/screens.rs).
-export const TABS = ['Home', 'Agents', 'Missions', 'Fleet'] as const;
+export const TABS = ['Home', 'Agents', 'Missions', 'Fleet', 'Usage'] as const;
 export type Tab = typeof TABS[number];
 
 // Names earlier builds used, still accepted in links and stored preferences.
