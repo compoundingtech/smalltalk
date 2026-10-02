@@ -868,6 +868,9 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 status.fleet_id.as_deref().unwrap_or("none"),
                 status.node
             );
+            if let Some(removed) = &status.removed {
+                println!("REMOVED  {}", removed.describe(status.fleet_id.as_deref()));
+            }
             println!("MEMBER  MODE  STATE  ROUTE-ENDPOINTS");
             for member in &status.view.members {
                 let transports = member
@@ -7772,6 +7775,10 @@ async fn wait_for_first_sync(
             .get::<ReplicationStatus>("/v1/replication/status")
             .await
         {
+            // A removed node never finishes syncing; say why instead of waiting out the timeout.
+            if let Some(removed) = &status.removed {
+                anyhow::bail!("{}", removed.describe(status.fleet_id.as_deref()));
+            }
             let first = status.first_sync.clone().context(
                 "this node has no first sync to wait for: it did not join with st fleet join",
             )?;
@@ -7880,6 +7887,9 @@ async fn wait_for_caught_up(
             .get::<ReplicationStatus>("/v1/replication/status")
             .await
         {
+            if let Some(removed) = &status.removed {
+                anyhow::bail!("{}", removed.describe(status.fleet_id.as_deref()));
+            }
             match caught_up_since(&status, since) {
                 Ok(caught_up) => return Ok(Ok(caught_up)),
                 Err(waiting) => missing = waiting,
@@ -8224,6 +8234,9 @@ async fn run_replication(
                 "fleet\t{}",
                 status.fleet_id.as_deref().unwrap_or("local-only")
             );
+            if let Some(removed) = &status.removed {
+                println!("removed\t{}", removed.describe(status.fleet_id.as_deref()));
+            }
             println!("authority-digest\t{}", status.authority_digest);
             println!("graph-digest\t{}", status.graph_digest);
             for (table, digest) in &status.projection_digests {

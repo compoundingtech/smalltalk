@@ -545,6 +545,8 @@ fn the_dial_set_comes_from_membership_and_skips_dial_out_members() {
             start: 1,
             end: None,
             ended: None,
+            removed_by: None,
+            removal_reason: None,
         };
     let loopback = |port: u16| {
         vec![serde_json::json!({"transport": "loopback", "address": format!("127.0.0.1:{port}")})]
@@ -1575,6 +1577,8 @@ mod retry_tests {
             start: 0,
             end: None,
             ended: None,
+            removed_by: None,
+            removal_reason: None,
             endpoints: vec![
                 serde_json::json!({"transport":"fabric", "node":"invented-node-id", "protocol":"sync"}),
             ],

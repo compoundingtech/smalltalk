@@ -624,11 +624,13 @@ Old builds ignore these headers. After the HMAC check passes, the receiver decid
 The dialer applies the same rules to the response and its signature, so it knows it reached the
 member it meant to reach.
 
-The `member-removed` refusal is a signed response whose body names the removal claim, the key it
-ended, and the person who removed it. A node treats it as about itself only when that key is its
-own current key. It then records `removed` in `fleet.toml`, stops dialing, and `st doctor` fails
-with the next command to run: `st uninstall`, or `st fleet leave --offline` to keep the local
-store. A refusal that names an older key reaches a machine that joined again under the same name
+The `member-removed` refusal is a signed response whose body names the key it ended, and whose
+message names the person who removed it and the reason when the refusing member knows them. A
+node treats it as about itself only when that key is its own current key. It then records
+`removed` in `fleet.toml`, keeps the reporter, message and time in `removal.json` beside it, logs
+the refusal and stops dialing. `st fleet status` and `st replication status` show the removal,
+and `st doctor` fails with the next command to run: `st uninstall`, or `st fleet leave --offline`
+to keep the local store. A refusal that names an older key reaches a machine that joined again under the same name
 from a member that has not yet received the new admission; the node treats it as transient, like
 `not-a-member`.
 

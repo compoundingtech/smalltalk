@@ -1290,6 +1290,58 @@ async fn a_removed_member_is_refused() {
         }),
         "{members}"
     );
+
+    // b itself says it was removed, by whom and why, everywhere a person looks (#1021).
+    let fleet = b.st_json(&["fleet", "status"]);
+    let removed = &fleet["removed"];
+    assert_eq!(removed["code"], "member-removed", "{fleet}");
+    assert_eq!(removed["reported_by"], "a", "{fleet}");
+    assert!(
+        removed["message"].as_str().is_some_and(
+            |message| message.contains(&format!("removed from this fleet by {PERSON}: test"))
+        ),
+        "{fleet}"
+    );
+    assert!(
+        removed["learned_at_unix_ms"]
+            .as_u64()
+            .is_some_and(|at| at > 0),
+        "{fleet}"
+    );
+    let text = b.st_ok(&["fleet", "status"]);
+    assert!(
+        text.contains("REMOVED  this node was removed from fleet"),
+        "{text}"
+    );
+    let status = b.st_json(&["replication", "status"]);
+    assert_eq!(status["removed"]["code"], "member-removed", "{status}");
+    let doctor = b.st(&["--json", "doctor"]);
+    let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "replication")
+        .cloned()
+        .unwrap();
+    assert_eq!(check["status"], "fail", "{check}");
+    let message = check["message"].as_str().unwrap();
+    assert!(
+        message.contains("this node was removed from fleet"),
+        "{check}"
+    );
+    assert!(message.contains("st fleet leave --offline"), "{check}");
+    let waited = b.st(&["fleet", "wait", "--timeout", "30s"]);
+    assert!(!waited.status.success());
+    assert!(
+        String::from_utf8_lossy(&waited.stderr).contains("this node was removed from fleet"),
+        "{waited:?}"
+    );
+    let log = fs::read_to_string(b.root.join("worker.stderr.log")).unwrap();
+    assert!(
+        log.contains("a refused this node (member-removed)"),
+        "{log}"
+    );
 }
 
 fn peer_status(node: &Node, peer: &str) -> Value {
