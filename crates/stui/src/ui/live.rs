@@ -141,6 +141,8 @@ enum Fetched {
     Machines(Collection),
     /// Token spend over a period of this many hours, or why st could not say.
     Usage(u64, Result<st3_client::UsagePeriod, String>),
+    /// st's conversation search for the palette's query, or why st could not say.
+    Said(String, Result<st3_client::ConversationSearch, String>),
     Devices(Collection),
     /// A send finished: the pending token and st's message id, or why it failed and whether st's
     /// answer is unknown.
@@ -286,6 +288,9 @@ pub fn run(context: Context) -> Result<()> {
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     let mut usage_reading = false;
+    // The palette's conversation search: what st was last asked, and what is typed since when.
+    let mut said_asked: Option<String> = None;
+    let mut said_typed: Option<(String, Instant)> = None;
     let mut last_cache_save = Instant::now();
     // A closed terminal ends the loop: without this check a detached stui spins and keeps
     // polling the daemon forever.
@@ -485,6 +490,10 @@ pub fn run(context: Context) -> Result<()> {
                     model.sessions = native;
                 }
                 Fetched::Machines(machines) => model.machines = machines,
+                Fetched::Said(query, outcome) => {
+                    ui.said = Some((query, outcome));
+                    changed = true;
+                }
                 Fetched::Usage(hours, outcome) => {
                     usage_reading = false;
                     if hours == ui.usage_hours {
@@ -614,6 +623,33 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
+        }
+        // Ctrl+K asks st's conversation search once what is typed has been still for a moment;
+        // an answer to an earlier query is dropped where it lands (Ui::said_choices).
+        match ui.said_wanted() {
+            Some(query) if said_asked.as_deref() != Some(query.as_str()) => match &said_typed {
+                Some((typed, at)) if *typed == query => {
+                    if at.elapsed() >= Duration::from_millis(250) && extras.live {
+                        said_asked = Some(query.clone());
+                        let client = client.clone();
+                        let tx = fetched_tx.clone();
+                        runtime.spawn(async move {
+                            let outcome = client
+                                .conversation_search(&query, None, None, None, Some(20))
+                                .await
+                                .map(|envelope| envelope.value)
+                                .map_err(|error| error.plain());
+                            let _ = tx.send(Fetched::Said(query, outcome));
+                        });
+                    }
+                }
+                _ => said_typed = Some((query, Instant::now())),
+            },
+            None => {
+                said_asked = None;
+                said_typed = None;
+            }
+            _ => {}
         }
         // Usage has no stream: it is read while something shows it, again each minute, and at
         // once over a new period.
