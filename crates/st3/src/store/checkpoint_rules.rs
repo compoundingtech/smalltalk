@@ -906,6 +906,7 @@ impl Store {
             detail: "Bring the waiting machines back, upgrade them, or excuse a machine that stays away.".into(),
             mission: None, mission_run: None, step: None, targets: vec![checkpoint.clone()], requested_at_unix_ms: since,
             actions: vec![attention_action("inspect checkpoint", &["st", "replication", "checkpoint", "status"])],
+            request: None,
         }])
     }
 }

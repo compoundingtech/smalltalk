@@ -1265,6 +1265,9 @@ struct DiscoveredItem {
     /// The data types the change belongs to: the item's collection, `comments`, `reactions` or
     /// `mentions`.
     data_types: BTreeSet<String>,
+    /// The item is new: neither a resource nor an older listing knew it, it was not known before
+    /// the observer's watermark, and this is not the baseline.
+    new_item: bool,
     deliver: bool,
 }
 
@@ -1513,12 +1516,13 @@ fn discovered_collection_items(
             if resource.as_ref() == Some(&facts) {
                 return None;
             }
+            let new_item =
+                prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
             let deliver = match (field, prior) {
                 ("pull_requests", Some(prior)) => pull_request_needs_review(Some(prior), &facts),
                 (_, Some(_)) => false,
-                _ if baseline || item.get("new") == Some(&Value::Bool(false)) => false,
-                ("pull_requests", None) => pull_request_needs_review(None, &facts),
-                _ => true,
+                ("pull_requests", None) => new_item && pull_request_needs_review(None, &facts),
+                _ => new_item,
             };
             let changed_fields = facts
                 .as_object()
@@ -1544,6 +1548,7 @@ fn discovered_collection_items(
                 subject,
                 kind,
                 data_types: item_data_types(field, prior, &facts, &changed_fields),
+                new_item,
                 changed_fields,
                 facts,
                 deliver,
@@ -1648,6 +1653,176 @@ fn listed_head_tx(
         .and_then(|item| item.get("head"))
         .and_then(Value::as_str)
         .map(str::to_owned))
+}
+
+/// The live agent that owns a repository item, and why: the agent named as its opener while its
+/// declaration is live, else the agent of a live mission run that opened it or published its pull
+/// request resource. A run's agent is the one working on one of its steps, else its first agent.
+fn item_owner_tx(connection: &Connection, facts: &Value) -> Result<Option<(String, String)>> {
+    if let Some(agent) = facts.get("opened_by").and_then(Value::as_str)
+        && person_work::declaration_live(connection, agent)?
+    {
+        return Ok(Some((agent.to_owned(), "it opened the item".to_owned())));
+    }
+    let runs = facts
+        .get("opened_by_run")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .into_iter()
+        .chain(authoring_pull_request_runs_tx(connection, facts)?)
+        .collect::<Vec<_>>();
+    for run in runs {
+        let run = run.trim_start_matches("mission-run/").to_owned();
+        if !person_work::run_live(connection, &run, None, false)? {
+            continue;
+        }
+        let qualified = format!("mission-run/{run}");
+        let agents = connection
+            .prepare_cached(
+                "SELECT subject FROM desired WHERE kind='agent' AND owner_run IN (?1, ?2)
+                 ORDER BY subject",
+            )?
+            .query_map(params![run, qualified], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let working = connection
+            .prepare_cached(
+                "SELECT lease_owner FROM step_runs WHERE run_id IN (?1, ?2)
+                 AND status IN ('claimed', 'working') AND lease_owner IS NOT NULL",
+            )?
+            .query_map(params![run, qualified], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let mut live = Vec::new();
+        for agent in agents {
+            if person_work::declaration_live(connection, &agent)? {
+                live.push(agent);
+            }
+        }
+        if let Some(agent) = live
+            .iter()
+            .find(|agent| working.contains(*agent))
+            .or(live.first())
+        {
+            return Ok(Some((
+                agent.clone(),
+                format!("its mission run {qualified} owns the item"),
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Send one message about an item to the agent that owns it. The message's subject comes from
+/// the delivery key, so a replacement watch or a repeated observation sends nothing more.
+#[allow(clippy::too_many_arguments)]
+fn route_item_to_owner_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    origin: &str,
+    batch_id: &str,
+    subscription: &str,
+    resource: &str,
+    owner: &str,
+    why: &str,
+    title: &str,
+    detail: &str,
+    delivery_key: &str,
+    evidence: &[String],
+) -> Result<Option<String>, St3Error> {
+    if routed_to_owner_tx(transaction, delivery_key)? {
+        return Ok(None);
+    }
+    let subject = format!("message/route-{}", &delivery_key[..20]);
+    append_claim_tx(
+        transaction,
+        origin,
+        &subject,
+        "message.sent",
+        None,
+        &json!({"fields": {
+            "from": format!("daemon/{origin}"),
+            "to": owner,
+            "title": title,
+            "content": format!("{detail}\n\nst sent this to you because {why}; no review or person request was made."),
+            "status": "sent",
+            "tags": ["resource-route", subscription, resource],
+        }, "evidence": evidence}),
+        &[],
+        Some(batch_id),
+    )
+    .map_err(claim_append_error)?;
+    Ok(Some(subject))
+}
+
+/// Whether an earlier observation sent the item under this delivery key to its owner.
+fn routed_to_owner_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    delivery_key: &str,
+) -> Result<bool, St3Error> {
+    Ok(transaction
+        .query_row(
+            "SELECT 1 FROM claims WHERE subject=?1 AND kind='message.sent' LIMIT 1",
+            [format!("message/route-{}", &delivery_key[..20])],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(internal)?
+        .is_some())
+}
+
+/// A routed item's message title and its detail: the item, its link and, for a pull request,
+/// the head it is at.
+fn item_route_text(facts: &Value) -> (String, String) {
+    let text = |name: &str| facts.get(name).and_then(Value::as_str).unwrap_or_default();
+    let number = facts
+        .get("number")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    match facts.get("head_sha").and_then(Value::as_str) {
+        Some(head) => (
+            format!("Pull request #{number} is at a new head: {}", text("title")),
+            format!("{}\nhead {head} on {}", text("url"), text("branch")),
+        ),
+        None => (
+            format!("New issue #{number}: {}", text("title")),
+            text("url").to_owned(),
+        ),
+    }
+}
+
+/// The mentions of an item that are new with this observation. A new item's mentions are all
+/// new. A recorded item's mention is new when the item did not know it and it was made no earlier
+/// than five minutes before the item's last observation, so turning mentions on, an edit to an
+/// old comment, or a body read again never reports an old mention.
+fn new_mentions(prior: Option<&(Value, u128)>, new_item: bool, facts: &Value) -> Vec<Value> {
+    let mentions = facts
+        .get("mentions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if new_item {
+        return mentions;
+    }
+    let Some((prior, observed_at)) = prior else {
+        return Vec::new();
+    };
+    let known = prior
+        .get("mentions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    mentions
+        .into_iter()
+        .filter(|mention| !known.contains(mention))
+        .filter(|mention| {
+            mention
+                .get("at")
+                .and_then(Value::as_str)
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .is_some_and(|at| {
+                    (at.timestamp_millis().max(0) as u128).saturating_add(5 * 60_000)
+                        >= *observed_at
+                })
+        })
+        .collect()
 }
 
 /// The mission runs that published a `resource/mission-run/RUN/pull-request` naming this pull
@@ -10428,6 +10603,7 @@ impl Store {
                         "inspect subscription",
                         &["st", "subject", &failure.subject],
                     )],
+                    request: None,
                 });
             }
         }
@@ -10700,7 +10876,21 @@ impl Store {
                         let recorded = latest_actual(transaction, &subject)
                             .map_err(internal)?
                             .and_then(|actual| actual.get("facts").cloned());
-                        recorded_items.insert(subject, recorded);
+                        let observed_at = transaction
+                            .query_row(
+                                &canonical_sql(
+                                    "SELECT accepted_at_unix_ms FROM claims
+                                     WHERE subject=?1 AND kind='resource.observed'
+                                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                                ),
+                                [&subject],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()
+                            .map_err(internal)?
+                            .and_then(|at| at.parse::<u128>().ok())
+                            .unwrap_or_default();
+                        recorded_items.insert(subject, recorded.map(|facts| (facts, observed_at)));
                     }
                 }
                 let mut discovered = Vec::new();
@@ -10710,7 +10900,13 @@ impl Store {
                         field,
                         previous.as_ref(),
                         &facts,
-                        &mut |subject| recorded_items.get(subject).cloned().flatten(),
+                        &mut |subject| {
+                            recorded_items
+                                .get(subject)
+                                .cloned()
+                                .flatten()
+                                .map(|(facts, _)| facts)
+                        },
                     );
                     changed_fields.extend(items.iter().flat_map(|item| item.data_types.iter().cloned()));
                     discovered.extend(items.into_iter().map(|item| (field, item)));
@@ -10873,6 +11069,7 @@ impl Store {
                 };
                 let mut collection_discoveries = BTreeMap::<String, Vec<(String, String)>>::new();
                 let mut item_claims = Vec::new();
+                let mut item_mentions = Vec::new();
                 for (field, item) in discovered {
                     let DiscoveredItem {
                         subject,
@@ -10880,6 +11077,7 @@ impl Store {
                         facts: mut item_facts,
                         changed_fields: item_changed_fields,
                         data_types,
+                        new_item,
                         deliver,
                     } = item;
                     // An agent's checkout names the opener first. An authoring run's own pull
@@ -10921,6 +11119,13 @@ impl Store {
                     )
                     .map_err(internal)?;
                     if !data_types.is_empty() {
+                        let prior = recorded_items.get(&subject).cloned().flatten();
+                        let mentions = if data_types.contains("mentions") {
+                            new_mentions(prior.as_ref(), new_item, &item_facts)
+                        } else {
+                            Vec::new()
+                        };
+                        item_mentions.push((subject.clone(), claim.id.clone(), item_facts.clone(), mentions));
                         item_claims.push((data_types, subject.clone(), claim.id.clone(), item_facts));
                     }
                     if deliver {
@@ -11008,6 +11213,94 @@ impl Store {
                             ))
                         }
                         .map_err(internal)?;
+                        if subscription.delivery == "person" {
+                            let repository_identity = current_object
+                                .get("repository_id")
+                                .filter(|value| !value.is_null())
+                                .cloned()
+                                .unwrap_or_else(|| Value::String(resource.into()));
+                            let delivery_scope = subscription_subject
+                                .rsplit('/')
+                                .next()
+                                .expect("a subscription subject has a local name");
+                            for (item_subject, claim, item_facts, mentions) in &item_mentions {
+                                for mention in mentions {
+                                    let text = |name: &str| {
+                                        mention.get(name).and_then(Value::as_str).unwrap_or_default()
+                                    };
+                                    let login = text("login");
+                                    // A login that mentions itself tells its person nothing.
+                                    if text("by").eq_ignore_ascii_case(login) {
+                                        continue;
+                                    }
+                                    let Some((_, person)) = subscription
+                                        .mentions
+                                        .iter()
+                                        .find(|(known, _)| known.eq_ignore_ascii_case(login))
+                                    else {
+                                        continue;
+                                    };
+                                    let number = item_facts.get("number").and_then(Value::as_u64);
+                                    let delivery_key = canonical_hash(&(
+                                        "mention",
+                                        delivery_scope,
+                                        &repository_identity,
+                                        number,
+                                        login.to_ascii_lowercase(),
+                                        text("url"),
+                                        text("at"),
+                                    ))
+                                    .map_err(internal)?;
+                                    if routed_to_owner_tx(transaction, &delivery_key)? {
+                                        continue;
+                                    }
+                                    let item_title = item_facts
+                                        .get("title")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
+                                    let by = Some(text("by")).filter(|by| !by.is_empty()).unwrap_or("someone");
+                                    let title = format!(
+                                        "{by} mentioned @{login} on #{}: {item_title}",
+                                        number.unwrap_or_default()
+                                    );
+                                    let detail = format!(
+                                        "{}\n\n{item_title}: {}",
+                                        text("url"),
+                                        item_facts.get("url").and_then(Value::as_str).unwrap_or_default()
+                                    );
+                                    if subscription.owner_message
+                                        && let Some((owner, why)) =
+                                            item_owner_tx(transaction, item_facts).map_err(internal)?
+                                    {
+                                        message_subjects.extend(route_item_to_owner_tx(
+                                            transaction,
+                                            &self.origin,
+                                            &batch_id,
+                                            subscription_subject,
+                                            item_subject,
+                                            &owner,
+                                            &why,
+                                            &title,
+                                            &detail,
+                                            &delivery_key,
+                                            std::slice::from_ref(claim),
+                                        )?);
+                                        continue;
+                                    }
+                                    person_work::ask_as_daemon_tx(
+                                        transaction,
+                                        &self.origin,
+                                        &format!("daemon/{}", self.origin),
+                                        person,
+                                        &title,
+                                        &detail,
+                                        "subscription-mention",
+                                        &delivery_key,
+                                    )?;
+                                }
+                            }
+                            continue;
+                        }
                         if subscription.delivery == "mission" {
                             let Some(mission) = subscription.mission.as_deref() else {
                                 continue;
@@ -11078,7 +11371,7 @@ impl Store {
                                 }
                                 .map_err(internal)?;
                                 if uses_collection
-                                    && collection_delivery_was_requested_tx(
+                                    && (collection_delivery_was_requested_tx(
                                         transaction,
                                         mission,
                                         delivery_scope,
@@ -11087,7 +11380,32 @@ impl Store {
                                         &delivery_key,
                                     )
                                     .map_err(internal)?
+                                        || routed_to_owner_tx(transaction, &delivery_key)?)
                                 {
+                                    continue;
+                                }
+                                // An item that a live agent owns goes to that agent, and no
+                                // review, triage, or person sees it.
+                                let item_facts = &discovery_body["fields"]["facts"];
+                                if uses_collection
+                                    && subscription.owner_message
+                                    && let Some((owner, why)) =
+                                        item_owner_tx(transaction, item_facts).map_err(internal)?
+                                {
+                                    let (title, detail) = item_route_text(item_facts);
+                                    message_subjects.extend(route_item_to_owner_tx(
+                                        transaction,
+                                        &self.origin,
+                                        &batch_id,
+                                        subscription_subject,
+                                        &delivery_resource,
+                                        &owner,
+                                        &why,
+                                        &title,
+                                        &detail,
+                                        &delivery_key,
+                                        std::slice::from_ref(&discovery),
+                                    )?);
                                     continue;
                                 }
                                 let mut request_fields = json!({
@@ -17830,6 +18148,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 ],
             ),
         ],
+        request: None,
     }
 }
 
@@ -17889,6 +18208,7 @@ fn attention_item_from_planning(
                 ],
             ),
         ],
+        request: None,
     }
 }
 
@@ -17944,6 +18264,7 @@ fn attention_item_from_revision(
                 ],
             ),
         ],
+        request: None,
     }
 }
 
@@ -17979,6 +18300,7 @@ fn attention_item_from_failure(request: AttentionRequestView) -> AttentionItemVi
             "inspect source",
             &["st", "subject", &request.subject],
         )],
+        request: None,
     }
 }
 
@@ -23514,6 +23836,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         not_before_unix_ms: not_before.and_then(|value| value.parse().ok()),
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
+        person_answers: Vec::new(),
     })
 }
 
@@ -23541,28 +23864,7 @@ fn enrich_step_queue_at(
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
-    let mut query = connection.prepare(&canonical_sql(
-        "SELECT resolution.body FROM claims resolution JOIN claims request
-        ON request.subject=resolution.subject AND request.kind='work.person-asked'
-        WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
-          AND json_extract(request.body,'$.fields.origin_step')=?1
-          AND json_extract(request.body,'$.fields.origin_attempt')=?2
-        ORDER BY CANONICAL_ASC(resolution)",
-    ))?;
-    // Aliases other than the fixed marker aliases use the same helper directly.
-    let responses = query
-        .query_map(params![view.subject, view.attempt], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for response in responses {
-        if let Ok(response) = serde_json::from_str::<Value>(&response) {
-            if let Some(summary) = response["fields"]["summary"].as_str() {
-                view.constraints.push(format!("Person response: {summary}"));
-            }
-        }
-    }
-    Ok(())
+    person_work::enrich_responses(connection, view)
 }
 
 /// Copies the worker's latest progress summary and its completion summary for the
@@ -23624,28 +23926,7 @@ fn enrich_step_queue_for_reconcile_at(
 ) -> rusqlite::Result<()> {
     apply_effective_step_state(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
-    let mut query = connection.prepare(&canonical_sql(
-        "SELECT resolution.body FROM claims resolution JOIN claims request
-        ON request.subject=resolution.subject AND request.kind='work.person-asked'
-        WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
-          AND json_extract(request.body,'$.fields.origin_step')=?1
-          AND json_extract(request.body,'$.fields.origin_attempt')=?2
-        ORDER BY CANONICAL_ASC(resolution)",
-    ))?;
-    // Aliases other than the fixed marker aliases use the same helper directly.
-    let responses = query
-        .query_map(params![view.subject, view.attempt], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for response in responses {
-        if let Ok(response) = serde_json::from_str::<Value>(&response) {
-            if let Some(summary) = response["fields"]["summary"].as_str() {
-                view.constraints.push(format!("Person response: {summary}"));
-            }
-        }
-    }
-    Ok(())
+    person_work::enrich_responses(connection, view)
 }
 
 fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {

@@ -7322,6 +7322,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         not_before_unix_ms: None,
                         created_at_unix_ms: run.created_at_unix_ms,
                         updated_at_unix_ms: run.updated_at_unix_ms,
+                        person_answers: Vec::new(),
                     };
                     if !matches!(
                         self.evaluate_mission_gate(run, step, &fake, gate)?,
@@ -10844,9 +10845,10 @@ pub(crate) fn append_work_wake_message(
         format!("{source} attempt {wake_attempt} ({reason})")
     };
     let content = format!(
-        "A mission step is ready: {0}. Run `st work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
+        "A mission step is ready: {0}. Run `st work claim {0} --as {2}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
+        agent,
     );
     let tag_value = format!(
         "{}@{}@{}@{}",
@@ -23253,6 +23255,218 @@ subscription "mentions" { observer "observer/repo"; on "mentions"; to "agent/exa
         );
     }
 
+    /// The intake pipeline: a new pull request head that a live agent owns reaches that agent as
+    /// one message and requests no review; one nobody owns requests one review. A mention of a
+    /// person becomes one request on their home, or one message to the item's owner. Nothing is
+    /// delivered twice, at the baseline, or for an old mention.
+    #[test]
+    fn the_intake_pipeline_routes_each_item_once_to_its_owner_or_a_person() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-mission");
+        let review = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+agent "builder" {{ workspace "/tmp"; command "true" }}
+observer "repo" {{
+  resource "resource/repo"; provider "github.repository"; locator "acme/garden"
+  field "pull_requests"; field "mentions"
+}}
+subscription "reviews" {{
+  observer "observer/repo"; on "pull_requests"
+  delivery "mission" {{ mission "review@{review}"; resource "source"; workspace "/tmp/st3-reviews"; owner "message" }}
+}}
+subscription "mentions" {{
+  observer "observer/repo"; on "mentions"
+  mention "orchid" "person/robin"
+  mention "fern" "person/lichen"
+  delivery "person" {{ owner "message" }}
+}}"#
+            ),
+            "watch",
+        );
+        let desired = store.desired_subjects().unwrap();
+        let subscriptions = ["subscription/reviews", "subscription/mentions"]
+            .into_iter()
+            .map(|subject| {
+                let item = desired.iter().find(|item| item.subject == subject).unwrap();
+                (
+                    item.subject.clone(),
+                    crate::graph::subscription_spec(&item.desired).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let observe = |pulls: Value| {
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    &revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &serde_json::json!({"repository_id": 7, "pull_requests": pulls}),
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap()
+        };
+        let requests = || {
+            store
+                .claims_for(
+                    "subscription/reviews",
+                    Some("subscription.mission-requested"),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|claim| {
+                    claim.body["fields"]["resource"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let asks = || {
+            store
+                .claims_for_kind_at("work.person-asked", None, false, 100)
+                .unwrap()
+                .claims
+                .into_iter()
+                .map(|claim| {
+                    (
+                        claim.body["fields"]["person"].as_str().unwrap().to_owned(),
+                        claim.body["fields"]["title"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let routed = |outcome: &crate::model::ResourceObservationOutcome| {
+            outcome
+                .message_subjects
+                .iter()
+                .map(|subject| {
+                    let message = store
+                        .latest_claim(subject, Some("message.sent"))
+                        .unwrap()
+                        .unwrap();
+                    (
+                        message.body["fields"]["to"].as_str().unwrap().to_owned(),
+                        message.body["fields"]["title"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let pull = |number: u64, head: char, opened_by: Option<&str>| {
+            let mut pull = serde_json::json!({
+                "number": number, "title": format!("Pull {number}"), "head": head.to_string().repeat(40),
+                "state": "open", "draft": false,
+                "url": format!("https://github.com/acme/garden/pull/{number}"),
+            });
+            if let Some(agent) = opened_by {
+                pull["opened_by"] = Value::String(agent.into());
+            }
+            pull
+        };
+        let mention = |login: &str, at: &str| {
+            serde_json::json!({"login": login, "by": "fern", "at": at,
+                "url": "https://github.com/acme/garden/pull/2#issuecomment-1"})
+        };
+        // The baseline delivers nothing, even a mention.
+        let mut baseline = pull(1, 'a', None);
+        baseline["mentions"] = serde_json::json!([mention("orchid", "2026-01-01T00:00:00Z")]);
+        assert!(
+            observe(serde_json::json!([baseline]))
+                .message_subjects
+                .is_empty()
+        );
+        assert!(requests().is_empty() && asks().is_empty());
+
+        // A new pull request the builder opened reaches the builder; one nobody owns, or whose
+        // opener is not a live agent, requests a review.
+        let opened = observe(serde_json::json!([
+            pull(2, 'b', Some("agent/node.builder")),
+            pull(3, 'c', None),
+            pull(4, 'd', Some("agent/departed")),
+        ]));
+        assert_eq!(
+            routed(&opened),
+            [(
+                "agent/node.builder".to_owned(),
+                "Pull request #2 is at a new head: Pull 2".to_owned()
+            )]
+        );
+        assert_eq!(
+            requests(),
+            [
+                "resource/repo/pull-request/3",
+                "resource/repo/pull-request/4"
+            ]
+        );
+
+        // A new head of the builder's pull request reaches it again, once.
+        let pushed = observe(serde_json::json!([pull(2, 'e', None)]));
+        assert_eq!(
+            routed(&pushed).len(),
+            1,
+            "the opener stays with its pull request"
+        );
+        assert!(
+            observe(serde_json::json!([pull(2, 'e', None)]))
+                .message_subjects
+                .is_empty()
+        );
+        assert_eq!(requests().len(), 2);
+
+        // A new comment that mentions orchid on a pull request nobody owns becomes one request on
+        // orchid's home; a mention of someone the subscription does not name reaches nobody.
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut mentioned = pull(3, 'c', None);
+        let mut own = mention("fern", &now);
+        own["by"] = Value::String("FERN".into());
+        mentioned["mentions"] =
+            serde_json::json!([mention("orchid", &now), mention("moss", &now), own]);
+        observe(serde_json::json!([mentioned.clone()]));
+        assert_eq!(
+            asks(),
+            [(
+                "person/robin".to_owned(),
+                "fern mentioned @orchid on #3: Pull 3".to_owned()
+            )]
+        );
+        // On the builder's pull request it reaches the builder instead.
+        let mut owned = pull(2, 'e', None);
+        owned["mentions"] = serde_json::json!([mention("orchid", &now)]);
+        let to_owner = observe(serde_json::json!([owned]));
+        assert_eq!(
+            routed(&to_owner),
+            [(
+                "agent/node.builder".to_owned(),
+                "fern mentioned @orchid on #2: Pull 2".to_owned()
+            )]
+        );
+        assert_eq!(asks().len(), 1);
+
+        // An old mention that turns up later, such as one in a body read again, reaches nobody.
+        let mut old = pull(4, 'd', None);
+        old["mentions"] = serde_json::json!([mention("orchid", "2026-01-02T00:00:00Z")]);
+        assert!(
+            observe(serde_json::json!([old]))
+                .message_subjects
+                .is_empty()
+        );
+        assert_eq!(asks().len(), 1);
+    }
+
     #[test]
     fn a_renamed_locator_and_a_first_complete_listing_deliver_nothing() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -25810,6 +26024,13 @@ mission "work-alert" state="ready" {
             "A mission step is ready: {}",
             run.steps[0].subject
         )));
+        // The command runs as written: a work action needs `--as`, and a model that has to guess
+        // the rest guesses an incarnation that does not exist.
+        assert!(messages[0].content.contains(&format!(
+            "`st work claim {} --as agent/node.worker`",
+            run.steps[0].subject
+        )));
+        assert!(!messages[0].content.contains("--incarnation"));
         assert!(messages[0].content.contains("Title: Build the change"));
         assert!(messages[0].content.contains("Wake: automatic attempt 1"));
         assert!(!messages[0].content.contains("detailed instruction"));
@@ -26042,6 +26263,7 @@ mission "ios-proof-blocked" state="ready" {
                 new_run: None,
                 incarnation: Some("ios-owner-one".into()),
                 idempotency_key: "repair-simulator".into(),
+                request: None,
             })
             .unwrap();
         store
@@ -26087,6 +26309,7 @@ mission "ios-proof-blocked" state="ready" {
                     episode: None,
                     evidence: Vec::new(),
                     idempotency_key: "simulator-repaired".into(),
+                    answer: None,
                 },
                 false,
             )
@@ -26142,6 +26365,7 @@ mission "ios-proof-blocked" state="ready" {
             not_before_unix_ms: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
+            person_answers: Vec::new(),
         };
         let parent = step("step-run/run-1/build", "build", "agent/builder");
         let inherited = step(
@@ -26299,6 +26523,7 @@ mission "ios-proof-blocked" state="ready" {
             not_before_unix_ms: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10,
+            person_answers: Vec::new(),
         };
         let mut second = first.clone();
         second.subject = "step-run/newer/work".into();
@@ -26684,6 +26909,7 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             not_before_unix_ms: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
+            person_answers: Vec::new(),
         };
         let work = [step];
 
