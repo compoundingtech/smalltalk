@@ -608,7 +608,7 @@ fn terminal_failed(
         return;
     };
     current.attachment_id = None;
-    let plain = st3_client::plain_message(code.as_ref(), &message);
+    let plain = terminal_reason(code.as_ref(), &message);
     let update = match code {
         // A daemon from before terminal-unavailable also says stale-fence when the owner is
         // briefly out of reach or the viewer idled: follow again, and the attach itself refuses a
@@ -664,6 +664,13 @@ async fn follow(
                 restarted: true,
                 reason: "Terminal restarted".into(),
             }));
+            return Ok(());
+        }
+        Err(Refusal::Unavailable(reason)) => {
+            current.retry_at =
+                Some(Instant::now() + RETRY_DELAYS[current.failures.min(RETRY_DELAYS.len() - 1)]);
+            current.failures += 1;
+            let _ = updates.send(Update::Terminal(TerminalUpdate::Reconnecting(reason)));
             return Ok(());
         }
         Err(Refusal::Failed(reason)) => {
@@ -743,7 +750,31 @@ async fn stop_following(
 enum Refusal {
     /// The runtime now runs another incarnation, or none.
     Restarted,
+    /// Out of reach for now (its host, or which host runs it): try again in a while.
+    Unavailable(String),
     Failed(String),
+}
+
+/// Why a terminal request failed, in words. st says stale-fence for an owner out of reach too, and
+/// then its own words say so better than the generic sentence.
+fn terminal_reason(code: Option<&ErrorCode>, message: &str) -> String {
+    match code {
+        Some(ErrorCode::StaleFence) if !message.is_empty() => message.to_owned(),
+        _ => st3_client::plain_message(code, message),
+    }
+}
+
+/// A failed terminal request as a refusal: one that may pass on its own is tried again later.
+fn refusal(error: ClientError) -> Refusal {
+    let reason = match &error {
+        ClientError::Api(code, message, _) => terminal_reason(Some(code), message),
+        other => other.plain(),
+    };
+    if error.is_transient() {
+        Refusal::Unavailable(reason)
+    } else {
+        Refusal::Failed(reason)
+    }
 }
 
 /// The first of these runtimes that has a terminal.
@@ -771,10 +802,7 @@ async fn attach(
     expected: Option<&str>,
 ) -> Result<st3_client::TerminalAttachment, Refusal> {
     for attempt in 0..FENCE_TRIES {
-        let current = client
-            .runtimes_get(runtime_id)
-            .await
-            .map_err(|error| Refusal::Failed(error.to_string()))?;
+        let current = client.runtimes_get(runtime_id).await.map_err(refusal)?;
         let Resource::Runtime(runtime) = current.value else {
             return Err(Refusal::Failed("the runtime is no longer available".into()));
         };
@@ -815,10 +843,10 @@ async fn attach(
                 tokio::time::sleep(Duration::from_millis(25 << attempt)).await;
                 continue;
             }
-            Err(error) => return Err(Refusal::Failed(error.to_string())),
+            Err(error) => return Err(refusal(error)),
         }
     }
-    Err(Refusal::Failed(
+    Err(Refusal::Unavailable(
         "the terminal kept changing while attaching".into(),
     ))
 }
@@ -904,6 +932,48 @@ mod tests {
             retries.failed(Window::Agents, start),
             "after loading, a failure is said again"
         );
+    }
+
+    fn api_error(code: ErrorCode, message: &str) -> ClientError {
+        ClientError::Api(
+            code.clone(),
+            message.into(),
+            Box::new(st3_client::ErrorEnvelope {
+                api_version: "v0".into(),
+                error_version: "1".into(),
+                request_id: "request".into(),
+                code,
+                message: message.into(),
+                retryable: false,
+                retry_after_ms: None,
+                details: Default::default(),
+            }),
+        )
+    }
+
+    #[test]
+    fn an_attach_its_owner_cannot_answer_is_tried_again_in_words() {
+        // Nathan, 2026-10-02: attaching to a terminal on another member ended at once with
+        // "st client API error StaleFence: …". It is out of reach for now, not over.
+        let refused = refusal(api_error(
+            ErrorCode::StaleFence,
+            "the terminal owner is not reachable",
+        ));
+        assert!(
+            matches!(&refused, Refusal::Unavailable(reason) if reason == "the terminal owner is not reachable")
+        );
+        let refused = refusal(api_error(
+            ErrorCode::RuntimeAuthorityIndeterminate,
+            "subject `agent/x` has indeterminate runtime authority",
+        ));
+        assert!(
+            matches!(&refused, Refusal::Unavailable(reason) if reason == "st cannot tell yet which host runs this")
+        );
+        let refused = refusal(api_error(
+            ErrorCode::Forbidden,
+            "only the person may attach",
+        ));
+        assert!(matches!(refused, Refusal::Failed(reason) if reason.starts_with("not allowed")));
     }
 
     #[test]

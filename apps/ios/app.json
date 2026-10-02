@@ -1,9 +1,10 @@
 {
   "expo": {
-    "name": "Smalltalk Starter",
+    "name": "smalltalk",
     "slug": "smalltalk-starter",
     "version": "0.1.0",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "plugins": [
       [

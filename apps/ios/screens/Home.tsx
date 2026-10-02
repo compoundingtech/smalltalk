@@ -1,4 +1,4 @@
-import { useMemo, useRef } from 'react';
+import { useLayoutEffect, useMemo, useRef } from 'react';
 import { Alert, ScrollView, SectionList, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -10,6 +10,7 @@ import { agentName } from '../agentsView';
 import { attentionActionLabel, attentionKindLabel } from '../presentation';
 import { missionTitle } from '../missionsView';
 import { useStore } from '../store';
+import { randomName } from '../launcher';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
 import { cleanMessageText } from '../conversationView';
@@ -25,6 +26,19 @@ export function HomeScreen() {
   const refresh = useRefresh();
   const agentOf = (row: HomeRow) => [row.item.requester_id, row.item.source_id].find(id => id?.startsWith('agent/'));
   const rows = useMemo(() => homeRows(data.attention, caps?.session_actor), [data.attention, caps?.session_actor]);
+  // Start something, as stui's launcher does: an agent with its first message, or a shell.
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      unstable_headerRightItems: () => [{
+        type: 'menu', label: 'New', icon: { type: 'sfSymbol', name: 'plus' },
+        menu: { items: [
+          { type: 'action', label: 'New agent', icon: { type: 'sfSymbol', name: 'person.badge.plus' }, onPress: () => navigation.navigate('NewAgent') },
+          { type: 'action', label: 'New terminal', icon: { type: 'sfSymbol', name: 'terminal' }, onPress: () => void actions.createTerminal(randomName()).then(terminalId => { if (terminalId) navigation.navigate('Terminal', { terminalId, title: 'shell' }); }) },
+          { type: 'action', label: 'New mission', icon: { type: 'sfSymbol', name: 'point.3.connected.trianglepath.dotted' }, onPress: () => navigation.navigate('NewMission') },
+        ] },
+      }],
+    });
+  }, [navigation, actions]);
   const sections = useMemo(() => homeSections(rows).map(section => ({ ...section, data: section.rows })), [rows]);
   return <Screen>
     <Banners />
@@ -75,7 +89,8 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
     const from = agent ? agentName(agent) : item.requester_id?.replace(/^agent\//, '') ?? 'An agent';
     return <Screen>
       <Banners />
-      <ScrollView contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
+      {/* Automatic insets keep the end of a long request clear of the floating tab bar. */}
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
         <T><T bold color={row.color}>{row.glyph} request</T><T dim>  {item.priority} · waited {row.age}</T></T>
         <T bold selectable>{row.title}</T>
         <T><T dim>asks  </T><T bold color={theme.person}>{from}</T></T>
@@ -91,7 +106,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
   }
   return <Screen>
     <Banners />
-    <View style={{ padding: 12, gap: 6 }}>
+    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 6, paddingBottom: 32 }}>
       <T><T bold color={row.color}>{row.glyph} {row.kind}</T><T dim>  {attentionKindLabel(item.attention_kind)} · {item.priority} · waited {row.age}</T></T>
       <T bold selectable>{row.title}</T>
       {item.detail ? <Markdown text={item.detail} color={theme.subtext0} /> : null}
@@ -102,7 +117,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
       <T dim selectable>{item.id}{item.source_id !== item.id ? ` · from ${item.source_id}` : ''}</T>
       {item.actions.includes('work.done') ? <Button label={attentionActionLabel('work.done').toLowerCase()} disabled={busy || status !== 'online'} onPress={() => Alert.prompt('Complete step', item.title, summary => { if (summary.trim()) void actions.done(item, summary).then(done => { if (done) navigation.goBack(); }); })} /> : null}
       {other.length ? <Note>in the CLI: {other.map(attentionActionLabel).join(', ')}</Note> : null}
-    </View>
+    </ScrollView>
   </Screen>;
 }
 
