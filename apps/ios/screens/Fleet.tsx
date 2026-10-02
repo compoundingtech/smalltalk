@@ -9,6 +9,7 @@ import { useStore } from '../store';
 import { TABS } from '../tabs';
 import { theme } from '../theme';
 import { Button, Field, ListRow, Note, Screen, SectionHeader, T } from '../ui';
+import { UsageCard } from './Usage';
 
 function machineGlyph(state: string): { glyph: string; color: string } {
   if (state === 'local' || state === 'reachable' || state === 'dial-out') return { glyph: '●', color: theme.idle };
@@ -36,6 +37,7 @@ export function FleetScreen() {
     <Banners />
     <ScrollView ref={scroll} contentInsetAdjustmentBehavior="automatic" refreshControl={refresh} contentContainerStyle={{ paddingBottom: 32 }}>
       <StatusLine />
+      <UsageCard />
       <SectionHeader title="machines" count={data.machines.length} />
       {data.machines.map(machine => <View key={machine.id}>
         <ListRow
