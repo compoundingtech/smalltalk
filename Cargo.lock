@@ -3957,15 +3957,19 @@ name = "smallclaims"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "chrono",
  "ciborium",
  "data-encoding",
+ "flate2",
+ "futures-util",
  "getrandom 0.3.4",
  "hex",
  "hmac",
  "libc",
  "proptest",
+ "reqwest",
  "ring",
  "rusqlite",
  "serde",
@@ -3973,6 +3977,8 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tower",
  "uuid",
 ]
 

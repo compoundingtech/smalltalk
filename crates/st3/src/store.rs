@@ -1001,6 +1001,12 @@ pub struct Store {
     smalltalk: Arc<SmalltalkRuntime>,
 }
 
+impl std::borrow::Borrow<GraphStore> for Store {
+    fn borrow(&self) -> &GraphStore {
+        &self.graph
+    }
+}
+
 impl Deref for Store {
     type Target = GraphStore;
 
@@ -1537,6 +1543,11 @@ fn backfill_message_index(connection: &Connection) -> Result<()> {
          COMMIT;",
     )?;
     Ok(())
+}
+
+/// The runtime smalltalk opens the graph with, for code that opens the graph store itself.
+pub fn runtime() -> Arc<dyn smallclaims::Runtime> {
+    Arc::new(SmalltalkRuntime::default())
 }
 
 impl Store {
