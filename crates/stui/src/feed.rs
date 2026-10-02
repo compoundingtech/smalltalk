@@ -316,14 +316,27 @@ async fn connected(
     // Glasses are followed only where st grants them in the shape this stui reads (splits of
     // tab groups, version 1); elsewhere stui keeps them on the device. A member still on the
     // earlier shape would send glasses this stui cannot decode, and that drops the connection.
-    let granted = glasses
-        && client.capabilities().await.is_ok_and(|capabilities| {
-            capabilities.value.capabilities.iter().any(|capability| {
-                capability.id == "glasses"
-                    && capability.version >= GLASSES_VERSION
-                    && capability.state == CapabilityState::Granted
-            })
-        });
+    let version = if glasses {
+        client.capabilities().await.ok().and_then(|capabilities| {
+            capabilities
+                .value
+                .capabilities
+                .iter()
+                .find(|capability| {
+                    capability.id == "glasses"
+                        && capability.version >= GLASSES_VERSION
+                        && capability.state == CapabilityState::Granted
+                })
+                .map(|capability| capability.version)
+        })
+    } else {
+        None
+    };
+    // From version 2 a glass's splits keep their sizes in st.
+    if let Some(version) = version {
+        crate::ui::set_glasses_version(version);
+    }
+    let granted = version.is_some();
     for window in Window::ALL
         .into_iter()
         .chain(granted.then_some(Window::Glasses))

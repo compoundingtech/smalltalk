@@ -3125,7 +3125,20 @@ fn pane_subject(pane: &Pane) -> Option<(usize, Option<String>)> {
     })
 }
 
-/// A layout as st's client types spell it. stui splits two at a time; a longer split nests.
+/// The glasses capability version st grants this stui. From version 2 (#958) a split carries its
+/// ratio; an older st is never sent one.
+static GLASSES_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+pub fn set_glasses_version(version: u32) {
+    GLASSES_VERSION.store(version, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ratios_on_the_wire() -> bool {
+    GLASSES_VERSION.load(std::sync::atomic::Ordering::Relaxed) >= 2
+}
+
+/// A layout as st's client types spell it. stui splits two at a time; a longer split nests, and
+/// only a two-way split's own ratio travels.
 fn to_wire(layout: &Layout) -> GlassLayout {
     match layout {
         Layout::Group(group) => GlassLayout::Group {
@@ -3139,7 +3152,9 @@ fn to_wire(layout: &Layout) -> GlassLayout {
                 .collect(),
         },
         Layout::Split {
-            split, children, ..
+            split,
+            children,
+            ratio,
         } => match children.as_slice() {
             [] => GlassLayout::Group { tabs: Vec::new() },
             [only] => to_wire(only),
@@ -3148,7 +3163,9 @@ fn to_wire(layout: &Layout) -> GlassLayout {
                     Side::Right => GlassSplit::Right,
                     Side::Below => GlassSplit::Below,
                 },
-                ratio: None,
+                ratio: ratio
+                    .filter(|_| rest.len() == 1 && ratios_on_the_wire())
+                    .map(f64::from),
                 children: [
                     Box::new(to_wire(first)),
                     Box::new(to_wire(&Layout::Split {
@@ -3175,7 +3192,9 @@ fn from_wire(layout: GlassLayout) -> Layout {
             current: 0,
         }),
         GlassLayout::Split {
-            split, children, ..
+            split,
+            children,
+            ratio,
         } => {
             let [first, second] = children;
             Layout::Split {
@@ -3184,7 +3203,7 @@ fn from_wire(layout: GlassLayout) -> Layout {
                     GlassSplit::Below => Side::Below,
                 },
                 children: vec![from_wire(*first), from_wire(*second)],
-                ratio: None,
+                ratio: ratio.map(|ratio| (ratio as f32).clamp(0.1, 0.9)),
             }
         }
     }
@@ -4725,6 +4744,26 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_splits_size_crosses_the_wire_only_where_st_keeps_it() {
+        let mut layout = Layout::Group(Group::of(Tab::pane("agent:a")));
+        layout.split(0, Side::Right, Group::of(Tab::pane("mission:m")));
+        layout.set_ratio(0, Some(0.3));
+        // st from #958 (glasses version 2) keeps it.
+        set_glasses_version(2);
+        let wire = to_wire(&layout);
+        set_glasses_version(1);
+        assert!(
+            matches!(&wire, GlassLayout::Split { ratio: Some(ratio), .. } if (ratio - 0.3).abs() < 1e-6)
+        );
+        assert_eq!(from_wire(wire), layout);
+        // An older st is never sent one.
+        assert!(matches!(
+            to_wire(&layout),
+            GlassLayout::Split { ratio: None, .. }
+        ));
     }
 
     #[test]

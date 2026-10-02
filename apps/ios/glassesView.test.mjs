@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { glassChoices, glassGroups, groups, paneTarget } from './glassesView.ts';
+import { glassChoices, glassGroups, groupBoxes, groups, paneTarget } from './glassesView.ts';
 
 const agent = (id, name) => ({ id, kind: 'agent', name, state: 'running' });
 const mission = (id, title) => ({ id, kind: 'mission', title, state: 'running' });
@@ -58,4 +58,12 @@ assert.deepEqual(glassGroups(glass('1', 'main', group()), lists), [{ index: 0, t
   const glass = { id: 'glass/person/robin/1', revision: 'r', body: { name: 'main', layout: { split: 'right', children: [{ tabs: [{ pane: 'agent:agent/a' }, { pane: 'mission:mission/m' }] }, { tabs: [{ pane: 'usage:' }] }] } } };
   assert.equal(spaceSummary(glass), '3 tabs in 2 panes');
   assert.equal(spaceSummary({ ...glass, body: { name: 'one', layout: { tabs: [{ pane: 'agent:agent/a' }] } } }), '1 tab');
+}
+
+// A split's ratio sizes its groups, as stui drew them; without one they share evenly.
+{
+  const sized = { split: 'right', ratio: 0.3, children: [group('a'), { split: 'below', children: [group('b'), group('c')] }] };
+  const boxes = groupBoxes(sized).map(box => Object.values(box).map(value => Math.round(value * 100) / 100));
+  assert.deepEqual(boxes, [[0, 0, 0.3, 1], [0.3, 0, 0.7, 0.5], [0.3, 0.5, 0.7, 0.5]]);
+  assert.deepEqual(groupBoxes(group('a')), [{ x: 0, y: 0, width: 1, height: 1 }]);
 }
