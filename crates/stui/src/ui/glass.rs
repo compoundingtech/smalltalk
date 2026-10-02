@@ -1608,6 +1608,13 @@ impl Ui {
             }
             // A usage tab names its group whatever the list groups by, so it draws from its key.
             Some(pane @ Pane::Usage(_)) => self.draw_pane(buf, content, &pane),
+            // A terminal tab that is not the attached one says so, rather than drawing whatever
+            // stui's own tab has selected.
+            Some(Pane::Terminal(id))
+                if self.terminal.as_ref().is_none_or(|view| view.agent != id) =>
+            {
+                self.draw_pane(buf, content, &Pane::Terminal(id))
+            }
             Some(_) if focused => self.draw_main(buf, content),
             Some(pane) => self.draw_pane(buf, content, &pane),
         }
@@ -4535,6 +4542,19 @@ mod tests {
         // A focus with nothing in it (a group showing Home) moves focus and nothing else.
         ui.show_focused();
         assert!(ui.terminal.is_some());
+    }
+
+    #[test]
+    fn a_shell_tab_that_is_not_attached_says_so_instead_of_showing_an_agent() {
+        let mut ui = glass();
+        ui.open_in_glass(Pane::Terminal("terminal/example-shell".into()), Open::Tab);
+        assert!(ui.terminal.is_none());
+        let shown = screen(&ui);
+        assert!(shown.contains("Not attached. Ctrl+] attaches"), "{shown}");
+        assert!(
+            !shown.contains("Message "),
+            "no agent's message box: {shown}"
+        );
     }
 
     #[test]
