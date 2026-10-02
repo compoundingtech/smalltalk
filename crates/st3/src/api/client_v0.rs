@@ -1093,7 +1093,10 @@ pub(super) async fn subject_definition(
         let store = state.store.clone();
         store.read_snapshot(|index| {
             let status = store.status_at(Some(&subject), None, Some(index))?;
-            let Some(status) = status.subjects.into_iter().find(|item| item.subject == subject)
+            let Some(status) = status
+                .subjects
+                .into_iter()
+                .find(|item| item.subject == subject)
             else {
                 return Ok(None);
             };
@@ -1104,9 +1107,11 @@ pub(super) async fn subject_definition(
                 crate::graph::redact_agent_env_values(&mut desired);
             }
             let kdl = crate::graph::render_agent_desired_kdl(&desired)?;
-            let revision = status.desired_revision
+            let revision = status
+                .desired_revision
                 .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired revision"))?;
-            let token = status.desired_token
+            let token = status
+                .desired_token
                 .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired token"))?;
             let value = json!({
                 "kind": "subject-definition",
@@ -1119,12 +1124,18 @@ pub(super) async fn subject_definition(
             });
             Ok(Some((client_snapshot_at(&state, index), value)))
         })
-    }).await?;
-    let (snapshot, value) = result.ok_or_else(|| ApiError::not_found(
-        format!("subject `{}` has no applied definition", query.subject),
-    ))?;
+    })
+    .await?;
+    let (snapshot, value) = result.ok_or_else(|| {
+        ApiError::not_found(format!(
+            "subject `{}` has no applied definition",
+            query.subject
+        ))
+    })?;
     // Reserve space for the snapshot and response envelope. Definitions are never truncated.
-    if serde_json::to_vec(&value).map_err(ApiError::internal)?.len()
+    if serde_json::to_vec(&value)
+        .map_err(ApiError::internal)?
+        .len()
         > CLIENT_MAX_RESPONSE_BYTES - 4096
     {
         return Err(ApiError::bad(St3Error::new(
@@ -5687,7 +5698,6 @@ pub(super) fn device_signing_key(public_key: &str) -> Option<&str> {
 
 pub(super) async fn pairing_complete(
     State(state): State<AppState>,
-    Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
     Json(request): Json<PairingComplete>,
 ) -> Result<Response, ApiError> {
@@ -6804,9 +6814,9 @@ fn consume_terminal_attachment_mode(
         .ok_or_else(|| forbidden("the terminal stream capability is unknown"))?;
     drop(lookup_span);
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
-    let raw_live = raw_mode.map(|_| {
-        remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation)
-    }).transpose()?;
+    let raw_live = raw_mode
+        .map(|_| remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation))
+        .transpose()?;
     let valid = is_current
         && attached.origin == state.store.origin()
         && field("session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
@@ -9305,7 +9315,11 @@ mod tests {
                             state,
                             ClientSession::local(None).unwrap(),
                             None,
-                            (None, None, super::super::ClientSubscriptionLimit::default().0),
+                            (
+                                None,
+                                None,
+                                super::super::ClientSubscriptionLimit::default().0,
+                            ),
                             move |state, session, request| {
                                 let reads = reads.clone();
                                 async move {
@@ -9434,19 +9448,30 @@ mod tests {
         assert_eq!(document.nodes()[1].name().value(), "agent");
         let node = &document.nodes()[1].children().unwrap().nodes()[0];
         assert_eq!(node.name().value(), "name with spaces");
-        let values = node.entries().iter().filter(|entry| entry.name().is_none())
-            .map(|entry| entry.value().clone()).collect::<Vec<_>>();
-        assert_eq!(values, vec![
-            kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
-            kdl::KdlValue::Integer(i128::from(i64::MIN)),
-            kdl::KdlValue::Integer(i128::from(i64::MAX)),
-            kdl::KdlValue::Float(1.0),
-            kdl::KdlValue::Float(1.25),
-            kdl::KdlValue::Bool(true),
-            kdl::KdlValue::Bool(false),
-            kdl::KdlValue::Null,
-        ]);
-        let property = node.entries().iter().find(|entry| entry.name().is_some()).unwrap();
+        let values = node
+            .entries()
+            .iter()
+            .filter(|entry| entry.name().is_none())
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
+                kdl::KdlValue::Integer(i128::from(i64::MIN)),
+                kdl::KdlValue::Integer(i128::from(i64::MAX)),
+                kdl::KdlValue::Float(1.0),
+                kdl::KdlValue::Float(1.25),
+                kdl::KdlValue::Bool(true),
+                kdl::KdlValue::Bool(false),
+                kdl::KdlValue::Null,
+            ]
+        );
+        let property = node
+            .entries()
+            .iter()
+            .find(|entry| entry.name().is_some())
+            .unwrap();
         assert_eq!(property.name().unwrap().value(), "property with spaces");
         assert_eq!(property.value(), &kdl::KdlValue::String("\"\\\nλ".into()));
         let child = &node.children().unwrap().nodes()[0];
@@ -14308,8 +14333,8 @@ mission "example/zero-run" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let mut state = test_state(root.path());
         state.pty_binary = pty.clone();
-        let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
-            .with_binary(pty.to_string_lossy());
+        let runtime =
+            st_runtime::PtyRuntime::new(state.pty_root.clone()).with_binary(pty.to_string_lossy());
         struct Cleanup(st_runtime::PtyRuntime);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -15034,7 +15059,10 @@ async fn glass_write(
     .map_err(|error| {
         let is_idempotency = matches!(error.code, "idempotency-mismatch" | "idempotency-conflict");
         let mut error = ApiError::bad(error);
-        if is_idempotency { error.code = "idempotency-conflict".into(); error.status = StatusCode::CONFLICT; }
+        if is_idempotency {
+            error.code = "idempotency-conflict".into();
+            error.status = StatusCode::CONFLICT;
+        }
         error
     })?;
     signal_changed(&state);
