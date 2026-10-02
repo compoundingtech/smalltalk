@@ -4317,7 +4317,7 @@ pub fn redact_agent_env_values(tree: &mut Value) {
     }
 }
 
-fn render_desired_node(tree: &Value) -> Result<KdlNode, St3Error> {
+pub fn render_desired_node(tree: &Value) -> Result<KdlNode, St3Error> {
     let invalid = || St3Error::new("invalid-declaration", "malformed desired KDL node tree");
     let object = tree.as_object().ok_or_else(invalid)?;
     let name = object
