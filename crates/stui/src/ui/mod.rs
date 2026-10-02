@@ -83,6 +83,8 @@ struct FrameInfo {
     glass_sidebar: Rect,
     /// Glasses: where each group's content was drawn, in group order.
     glass_leaves: Vec<Rect>,
+    /// The borders between a glass's splits, as drawn, to drag.
+    glass_dividers: Vec<layout::Divider>,
     /// Glasses: where Home was drawn over the glass, while it is open.
     home: Option<Rect>,
     read_messages: HashSet<String>,
@@ -3573,6 +3575,10 @@ impl Ui {
             )
         {
             native.write(bytes);
+            return;
+        }
+        // A tab dragged to another place or a split's edge.
+        if self.drag_mouse(mouse) {
             return;
         }
         match mouse.kind {
