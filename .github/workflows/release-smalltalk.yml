@@ -5,6 +5,7 @@ name: Smalltalk tag release
 
 on:
   push:
+    branches: [main]
     tags: ["**"]
   workflow_dispatch: null
   pull_request:
@@ -20,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: "smalltalk-release-${{ github.ref }}"
+  group: "smalltalk-release-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -78,6 +79,7 @@ jobs:
           name: "release-${{ matrix.target }}"
           path: dist/*
           if-no-files-found: error
+          retention-days: 7
   assemble:
     name: release-assemble
     needs: [build, installer]
@@ -108,6 +110,7 @@ jobs:
           name: smalltalk-release
           path: dist/*
           if-no-files-found: error
+          retention-days: 7
   publish:
     name: release-publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.event.deleted == false

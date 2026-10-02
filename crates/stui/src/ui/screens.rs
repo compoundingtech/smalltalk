@@ -308,6 +308,49 @@ fn text_box(doc: &mut Doc, title: &str, drafts: &Drafts<'_>, placeholder: &str, 
 
 /// A request whose text is (or ends in) a JSON report: the words before it, then the fields that
 /// say what happened, then the rest folded to a few. `None` when there is no JSON object.
+/// A question as agents write one, "Recommend: …⏎Why: …⏎Answer …", given room to read: a blank
+/// line between consecutive lines of prose, and a short leading label ("Why:") in bold. Lists,
+/// quotes, tables, headings and code keep their lines together (Nathan, 2026-10-02).
+pub fn spaced(question: &str) -> String {
+    let block = |line: &str| {
+        let line = line.trim_start();
+        line.starts_with(['-', '*', '>', '|', '#'])
+            || line.starts_with("```")
+            || line.split_once(". ").is_some_and(|(digits, _)| {
+                !digits.is_empty() && digits.len() < 4 && digits.chars().all(|c| c.is_ascii_digit())
+            })
+    };
+    let label = |line: &str| -> String {
+        match line.split_once(": ") {
+            Some((head, rest))
+                if !head.is_empty()
+                    && head.len() <= 24
+                    && head.split_whitespace().count() <= 3
+                    && head.starts_with(|c: char| c.is_uppercase())
+                    && !head.contains(['*', '`', '[']) =>
+            {
+                format!("**{head}:** {rest}")
+            }
+            _ => line.to_owned(),
+        }
+    };
+    let mut out = Vec::new();
+    let mut fenced = false;
+    let mut previous_prose = false;
+    for line in question.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        }
+        let prose = !fenced && !line.trim().is_empty() && !block(line);
+        if prose && previous_prose {
+            out.push(String::new());
+        }
+        out.push(if prose { label(line) } else { line.to_owned() });
+        previous_prose = prose;
+    }
+    out.join("\n")
+}
+
 fn report(text: &str, width: usize) -> Option<Vec<Line<'static>>> {
     const TELLING: [&str; 14] = [
         "status", "state", "outcome", "result", "error", "reason", "message", "summary", "commit",
@@ -806,7 +849,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             // A report pasted in as JSON shows its telling fields, not a wall of braces.
             match report(question, inner) {
                 Some(lines) => card.lines(lines),
-                None => card.lines(text::markdown(question, inner, theme::text())),
+                None => card.lines(text::markdown(&spaced(question), inner, theme::text())),
             }
             card.blank();
             // The answer goes back to the agent that asked, and its waiting step continues.

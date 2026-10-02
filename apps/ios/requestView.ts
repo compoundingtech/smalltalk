@@ -37,3 +37,30 @@ export function report(text: string): Report | null {
   for (const key of rest.slice(0, OTHERS)) rows.push({ key, value: shown(record[key]), tone: 'soft' });
   return { before: text.slice(0, start).trim(), rows, more: Math.max(0, rest.length - OTHERS) };
 }
+
+/** A question as agents write one, "Recommend: …⏎Why: …⏎Answer …", given room to read, as stui's
+ * `spaced`: a blank line between consecutive lines of prose, and a short leading label ("Why:")
+ * in bold. Lists, quotes, tables, headings and code keep their lines together. */
+export function spaced(question: string): string {
+  const block = (line: string) => {
+    const trimmed = line.trimStart();
+    return /^[-*>|#]/.test(trimmed) || trimmed.startsWith('```') || /^\d{1,3}\. /.test(trimmed);
+  };
+  const label = (line: string) => {
+    const at = line.indexOf(': ');
+    if (at <= 0) return line;
+    const head = line.slice(0, at);
+    const ok = head.length <= 24 && head.split(/\s+/).filter(Boolean).length <= 3 && /^[A-Z]/.test(head) && !/[*`[]/.test(head);
+    return ok ? `**${head}:** ${line.slice(at + 2)}` : line;
+  };
+  const out: string[] = [];
+  let fenced = false, previousProse = false;
+  for (const line of question.replace(/\r\n/g, '\n').split('\n')) {
+    if (line.trimStart().startsWith('```')) fenced = !fenced;
+    const prose = !fenced && line.trim() !== '' && !block(line);
+    if (prose && previousProse) out.push('');
+    out.push(prose ? label(line) : line);
+    previousProse = prose;
+  }
+  return out.join('\n');
+}
