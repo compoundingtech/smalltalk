@@ -134,6 +134,12 @@ impl Cache {
             if run == 0 {
                 let entry = &entries[index];
                 doc.entries.push((entry.id.clone(), doc.lines.len()));
+                // Mail between others is two lines until opened (Nathan, 2026-10-02).
+                if folds(&entry.body) && !expanded.contains(&entry.id) {
+                    doc.append(mail_lines(entry, width, theme), 0);
+                    index += 1;
+                    continue;
+                }
                 let one = self.render_as(
                     std::slice::from_ref(entry),
                     width,
@@ -203,6 +209,70 @@ fn call_line(entry: &Entry, width: usize, spinner: &str, theme: &Theme) -> Doc {
         Span::styled(format!("{glyph} "), theme::fg(color)),
         Span::styled(title, fg(RULES.tool.quiet.title, theme)),
     ]));
+    doc
+}
+
+/// Mail between others in two lines, "planner → builder  notes  10:02" and its first line,
+/// never wrapped. It opens like a call.
+fn mail_lines(entry: &Entry, width: usize, theme: &Theme) -> Doc {
+    let mut doc = Doc::new();
+    let Body::Mail {
+        from,
+        to,
+        subject,
+        body,
+        dictated,
+        ..
+    } = &entry.body
+    else {
+        return doc;
+    };
+    let look = RULES.mail.between_others;
+    let bar = || Span::styled("▎ ", fg(look.edge, theme));
+    let mut from_style = fg(look.from, theme);
+    if look.from_bold {
+        from_style = from_style.add_modifier(Modifier::BOLD);
+    }
+    let head = if to.is_empty() {
+        from.clone()
+    } else {
+        format!("{from} → {to}")
+    };
+    let head = text::truncate(&head, width.saturating_sub(2));
+    let at = format!("  {}", entry.at);
+    // The subject gets what the names and the time leave.
+    let room = width.saturating_sub(2 + text::width(&head) + text::width(&at) + 4);
+    let mut spans = vec![bar(), Span::styled(head, from_style)];
+    if !subject.is_empty() && room > 1 {
+        spans.push(Span::styled(
+            format!("  {}", text::truncate(&text::sanitize(subject), room)),
+            fg(look.text, theme),
+        ));
+    }
+    spans.push(Span::styled(at, theme.dim()));
+    if *dictated {
+        spans.push(Span::styled("  🎤", theme.dim()));
+    }
+    let head = Line::from(spans);
+    let mut lines = body.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or_default();
+    let more = lines.next().is_some();
+    let first = text::truncate(
+        &format!("{}{}", text::sanitize(first), if more { " …" } else { "" }),
+        width.saturating_sub(2),
+    );
+    for (line, spans) in [
+        (0, head.spans),
+        (1, vec![bar(), Span::styled(first, fg(look.text, theme))]),
+    ] {
+        doc.targets.push(Target {
+            line,
+            column: 0,
+            width: width as u16,
+            hit: PaneIntent::Expand(entry.id.clone()),
+        });
+        doc.line(Line::from(spans));
+    }
     doc
 }
 
@@ -673,6 +743,56 @@ mod tests {
         entries.push(entry("3", Body::Event("step ready".into())));
         let grown = cache.render(&entries, 40, &HashSet::new(), "⠋", &crate::tests::theme());
         assert_eq!(&grown.lines[..first.lines.len()], &first.lines[..]);
+    }
+
+    #[test]
+    fn simplified_mail_between_others_is_two_lines_and_yours_stays_whole() {
+        let mail = |id: &str, from: &str, to: &str| {
+            entry(
+                id,
+                Body::Mail {
+                    from: from.into(),
+                    to: to.into(),
+                    subject: "harbor audit".into(),
+                    body: "The keys rotated.\n\nThree hosts still read the old ones.".into(),
+                    delivered: false,
+                    dictated: false,
+                },
+            )
+        };
+        let entries = vec![
+            mail("message/others", "planner", "builder"),
+            mail("message/yours", "planner", "you"),
+        ];
+        let theme = crate::tests::theme();
+        let text = |expanded: &HashSet<String>| {
+            Cache::default()
+                .render_as(&entries, 60, expanded, "⠋", &theme, Density::Simple)
+                .lines
+                .iter()
+                .map(text::plain)
+                .collect::<Vec<_>>()
+        };
+        let folded = text(&HashSet::new());
+        let others = folded
+            .iter()
+            .position(|line| line.contains("planner → builder"))
+            .unwrap();
+        assert!(folded[others].contains("harbor audit"), "{folded:#?}");
+        assert!(
+            folded[others + 1].contains("The keys rotated. …"),
+            "{folded:#?}"
+        );
+        assert!(folded[others + 2].is_empty(), "two lines, then the gap");
+        let joined = folded.join("\n");
+        assert_eq!(
+            joined.matches("Three hosts").count(),
+            1,
+            "only yours whole: {joined}"
+        );
+        // Opened, it reads in full.
+        let opened = text(&HashSet::from(["message/others".to_owned()])).join("\n");
+        assert_eq!(opened.matches("Three hosts").count(), 2, "{opened}");
     }
 
     #[test]
