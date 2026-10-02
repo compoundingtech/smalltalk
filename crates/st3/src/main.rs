@@ -7944,10 +7944,36 @@ fn render_replication_peers(
         } else {
             let _ = writeln!(output, "  no exchange yet");
         }
+        if let Some(at) = peer.last_failure_at_unix_ms {
+            let _ = writeln!(
+                output,
+                "  last attempt failed {}{}",
+                relative_time(at, now),
+                peer.last_error
+                    .as_deref()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            );
+        }
         let Some(sync) = &peer.sync else {
             let _ = writeln!(output, "  difference not measured yet");
             continue;
         };
+        if sync.stale {
+            let _ = writeln!(
+                output,
+                "  stale: no exchange since the measurement below ({}), so it says what both held then, not now{}",
+                relative_time(sync.measured_at_unix_ms, now),
+                if sync.added_since_measured_envelopes == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; this node has gained {} since",
+                        envelope_count(sync.added_since_measured_envelopes)
+                    )
+                }
+            );
+        }
         if let Some(report) = &sync.heal {
             let _ = writeln!(output, "  {}", render_heal(&peer.peer, report, now));
         }
@@ -16656,6 +16682,7 @@ mod tests {
             status: "up".into(),
             last_success_at_unix_ms: None,
             last_error: None,
+            last_failure_at_unix_ms: None,
             refusal_reason: None,
             schema_digest: None,
             authority_digest: digest.map(str::to_owned),
@@ -18049,6 +18076,7 @@ mod tests {
                     status: "up".into(),
                     last_success_at_unix_ms: Some(now - 2_000),
                     last_error: None,
+                    last_failure_at_unix_ms: None,
                     refusal_reason: None,
                     schema_digest: None,
                     authority_digest: None,

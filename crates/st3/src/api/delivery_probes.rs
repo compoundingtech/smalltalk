@@ -8,7 +8,6 @@ use crate::store::Store;
 
 const PREFIX: &str = "doc/delivery-probes/";
 const FORMAT: &str = "st3.delivery-probes.v1";
-const STALE_MS: u128 = 90_000;
 /// A probe republishes an unchanged report every five minutes (each one is a replicated write),
 /// so a report is stale after three missed heartbeats.
 const HEARTBEAT_STALE_MS: u128 = 15 * 60_000;
@@ -53,9 +52,7 @@ pub(super) fn check(
         Ok(member == store.origin()
             || !peers.iter().any(|peer| peer == member)
             || store.replication_peer_refusal(member)?.is_some()
-            || store
-                .replication_peer_last_success(member)?
-                .is_some_and(|at| now.saturating_sub(at) < STALE_MS))
+            || store.replication_peer_up(member)?.0)
     };
     let documents = store.list_documents_page(None, Some(PREFIX), false, None, 201)?;
     if documents.is_empty() {
