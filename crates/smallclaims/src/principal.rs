@@ -89,7 +89,9 @@ impl Family {
     pub fn signs_with(self, role: Role) -> bool {
         matches!(
             (self, role),
-            (Self::Person, Role::Device) | (Self::Agent, Role::Agent) | (Self::Plugin, Role::Plugin)
+            (Self::Person, Role::Device)
+                | (Self::Agent, Role::Agent)
+                | (Self::Plugin, Role::Plugin)
         )
     }
 }
@@ -304,7 +306,9 @@ pub fn judge(claim: &Judged<'_>, signature: Option<&ClaimSignature>, facts: &dyn
     // A grant claim speaks for its issuer.
     if claim.kind == KEY_GRANTED {
         match KeyGrant::from_fields(claim.fields) {
-            Some(grant) if grant.issuer == signature.signer && grant.issuer_key == signature.key => {
+            Some(grant)
+                if grant.issuer == signature.signer && grant.issuer_key == signature.key =>
+            {
                 let Some(subject_family) = Family::of(claim.subject) else {
                     return Verdict::Invalid(format!("`{}` cannot hold keys", claim.subject));
                 };
@@ -422,8 +426,10 @@ pub struct Keyring {
 
 impl Keyring {
     pub fn set_directory(&self, directory: &Path) {
-        *self.directory.write().unwrap_or_else(PoisonError::into_inner) =
-            Some(directory.to_path_buf());
+        *self
+            .directory
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(directory.to_path_buf());
     }
 
     pub fn directory(&self) -> Option<PathBuf> {
@@ -479,8 +485,8 @@ impl Keyring {
     }
 
     fn key_path(directory: &Path, public: &str) -> PathBuf {
-        let digest = canonical_hash(&("smallclaims.held-key.v1", public))
-            .expect("a public key encodes");
+        let digest =
+            canonical_hash(&("smallclaims.held-key.v1", public)).expect("a public key encodes");
         directory.join(format!("{}.key", &digest[..32]))
     }
 
@@ -551,25 +557,48 @@ mod tests {
         let fields = serde_json::json!({"fields": {"text": "hello"}});
         let judged = claim(&fields);
         let facts = NoFacts(node.public().into());
-        let signature = ClaimSignature::sign(&node, &judged.content, "host/studio", Some("person/ada"), vec![], 1);
+        let signature = ClaimSignature::sign(
+            &node,
+            &judged.content,
+            "host/studio",
+            Some("person/ada"),
+            vec![],
+            1,
+        );
         assert_eq!(judge(&judged, Some(&signature), &facts), Verdict::Verified);
         assert_eq!(judge(&judged, None, &facts), Verdict::Unsigned);
 
         let other = serde_json::json!({"fields": {"text": "goodbye"}});
-        assert!(matches!(judge(&claim(&other), Some(&signature), &facts), Verdict::Invalid(_)));
+        assert!(matches!(
+            judge(&claim(&other), Some(&signature), &facts),
+            Verdict::Invalid(_)
+        ));
 
         let mut swapped = signature.clone();
         swapped.on_behalf = Some("person/grace".into());
-        assert!(matches!(judge(&judged, Some(&swapped), &facts), Verdict::Invalid(_)));
+        assert!(matches!(
+            judge(&judged, Some(&swapped), &facts),
+            Verdict::Invalid(_)
+        ));
         let mut chained = signature.clone();
         chained.chain = vec!["claim/other".into()];
-        assert!(matches!(judge(&judged, Some(&chained), &facts), Verdict::Invalid(_)));
+        assert!(matches!(
+            judge(&judged, Some(&chained), &facts),
+            Verdict::Invalid(_)
+        ));
         let mut stranger = signature;
         stranger.signer = "host/elsewhere".into();
-        assert!(matches!(judge(&judged, Some(&stranger), &facts), Verdict::Invalid(_)));
+        assert!(matches!(
+            judge(&judged, Some(&stranger), &facts),
+            Verdict::Invalid(_)
+        ));
         let (unknown, _) = MemberKey::generate().unwrap();
-        let unadmitted = ClaimSignature::sign(&unknown, &judged.content, "host/studio", None, vec![], 1);
-        assert!(matches!(judge(&judged, Some(&unadmitted), &facts), Verdict::Held(_)));
+        let unadmitted =
+            ClaimSignature::sign(&unknown, &judged.content, "host/studio", None, vec![], 1);
+        assert!(matches!(
+            judge(&judged, Some(&unadmitted), &facts),
+            Verdict::Held(_)
+        ));
     }
 
     #[test]

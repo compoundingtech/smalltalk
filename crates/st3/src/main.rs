@@ -1106,6 +1106,12 @@ async fn fleet_leave(
         .as_bytes(),
     )?;
     fs::remove_dir_all(config.state_dir.join("fleet"))?;
+    // The member key signed for this node and the people and agents it held keys for; a node
+    // that joins again starts with new keys.
+    let keys = st3::fleet::join::key_directory(&config.state_dir);
+    if keys.exists() {
+        fs::remove_dir_all(keys)?;
+    }
     // Local writes resume; the store stays bound to the fleet ID.
     let _: Result<Value> = client
         .post("/v1/internal/fleet/leave/cancel", &json!({}))
@@ -3870,6 +3876,15 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // A member pins its anchor, applies its writer floor, and signs with its key before it
     // writes anything, so every local batch after this point is signed.
     st3::fleet::activate(&store, &config)?;
+    // Every claim this node writes is signed; keys are made here the first time, silently.
+    let keys = st3::fleet::join::key_directory(&config.state_dir);
+    if config.fleet.is_none() {
+        store.set_node_key(Arc::new(st3::fleet::join::standalone_node_key(
+            &config.state_dir,
+        )?))?;
+    }
+    store.use_key_directory(&keys)?;
+    st3::profile::task("startup judge-claims", || store.judge_claims(true))?;
     let admission = st3::profile::task("startup validate-replication-backlog", || {
         store.validate_replication_backlog()
     })?;

@@ -30,6 +30,30 @@ pub fn store_path(state_dir: &Path) -> PathBuf {
     state_dir.join("claims.sqlite3")
 }
 
+/// Where a node keeps the keys it signs claims with: its own node key while it is in no fleet,
+/// and the keys it holds for people and agents.
+pub fn key_directory(state_dir: &Path) -> PathBuf {
+    state_dir.join("keys")
+}
+
+/// This machine's member key. A node that already signed claims on its own adopts that key, so
+/// its earlier claims still verify on every member once membership admits it.
+fn member_key(state_dir: &Path) -> Result<MemberKey> {
+    let path = fleet_dir(state_dir).join("node.key");
+    let standalone = key_directory(state_dir).join("node.key");
+    if !path.exists() && standalone.exists() {
+        let key = MemberKey::load(&standalone)?;
+        write_private(&path, &fs::read(&standalone)?)?;
+        return Ok(key);
+    }
+    MemberKey::load_or_create(&path)
+}
+
+/// This machine's node key while it is in no fleet.
+pub fn standalone_node_key(state_dir: &Path) -> Result<MemberKey> {
+    MemberKey::load_or_create(&key_directory(state_dir).join("node.key"))
+}
+
 fn fleet_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("fleet")
 }
@@ -135,7 +159,7 @@ pub fn found(state_dir: &Path, node: &str, settings: &MemberSettings) -> Result<
     getrandom::fill(&mut secret)?;
     let directory = fleet_dir(state_dir);
     write_private(&directory.join("secret"), hex::encode(secret).as_bytes())?;
-    let key = MemberKey::load_or_create(&directory.join("node.key"))?;
+    let key = member_key(state_dir)?;
     let port = settings.port()?;
     let transports = settings.transports();
     FleetFile {
@@ -429,7 +453,7 @@ pub async fn join(options: &JoinOptions) -> Result<Joined> {
         anyhow::ensure!(*pinned == name, "this code is for `{pinned}`, not `{name}`");
     }
     let directory = fleet_dir(state_dir);
-    let key = MemberKey::load_or_create(&directory.join("node.key"))?;
+    let key = member_key(state_dir)?;
     let writer_head = {
         fs::create_dir_all(state_dir)?;
         let store = Store::open(&store_path(state_dir), &name, options.runtime.clone())?;
@@ -563,7 +587,7 @@ pub fn migrate_anchor(
             None => anyhow::bail!("this store is not bound to a fleet yet; start st3 once first"),
         }
     }
-    let key = MemberKey::load_or_create(&fleet_dir(state_dir).join("node.key"))?;
+    let key = member_key(state_dir)?;
     let port = settings.port()?;
     let transports = settings.transports();
     FleetFile {

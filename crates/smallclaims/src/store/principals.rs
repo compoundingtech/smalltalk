@@ -10,6 +10,8 @@
 //! - `claim_verdict_links`: what each verdict relied on (delegations, keys, its nonce, the trust
 //!   roots). A claim that changes one of those queues every verdict linked to it.
 //! - `claim_verdict_queue`: claims to judge again.
+//! - `claim_verdict_fresh`: claims whose signature was just stored, at sealing or admission; a
+//!   pass judges them and queues whatever they change. Nothing scans the claims.
 //!
 //! An unsigned claim has no row: its verdict is `unsigned`. [`Store::recheck_claim_verdicts`]
 //! recomputes every verdict from the claims and reports any cached one that differed.
@@ -53,6 +55,9 @@ CREATE INDEX IF NOT EXISTS claim_verdict_links_claim_index ON claim_verdict_link
 CREATE TABLE IF NOT EXISTS claim_verdict_queue (
     claim_id TEXT PRIMARY KEY
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS claim_verdict_fresh (
+    claim_id TEXT PRIMARY KEY
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS held_keys (
     public_key TEXT PRIMARY KEY,
     principal TEXT NOT NULL,
@@ -61,11 +66,10 @@ CREATE TABLE IF NOT EXISTS held_keys (
 );
 "#;
 
-/// Claims judged per writer loan, so queued writes run between chunks.
+/// Queued claims judged per writer loan, so queued writes run between chunks.
 const JUDGE_CHUNK: usize = 256;
 /// The longest chain admission follows: a device, its person's root, and the node that vouched.
 const MAX_CHAIN_DEPTH: usize = 8;
-const VERDICT_INDEX: &str = "claim_verdict_index";
 const VERDICT_ROOTS: &str = "claim_verdict_roots";
 const OWN_NODE_KEY: &str = "principal_node_key";
 
@@ -117,14 +121,14 @@ fn stored_signature(connection: &Connection, claim_id: &str) -> Result<Option<Cl
     Ok(text.and_then(|text| serde_json::from_str(&text).ok()))
 }
 
-/// Keep `signature` for `claim_id`. A signature is never replaced: the first one stored is the
-/// one the claim's envelope carried.
+/// Keep `signature` for `claim_id`, and mark the claim for the next verdict pass. A signature is
+/// never replaced: the first one stored is the one the claim's envelope carried.
 pub fn store_claim_signature_tx(
     connection: &Connection,
     claim_id: &str,
     signature: &ClaimSignature,
 ) -> Result<()> {
-    connection
+    let stored = connection
         .prepare_cached(
             "INSERT OR IGNORE INTO claim_signatures(claim_id, signer, key, nonce, signature)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -136,6 +140,11 @@ pub fn store_claim_signature_tx(
             signature.nonce,
             serde_json::to_string(signature)?
         ])?;
+    if stored != 0 {
+        connection
+            .prepare_cached("INSERT OR IGNORE INTO claim_verdict_fresh(claim_id) VALUES (?1)")?
+            .execute([claim_id])?;
+    }
     Ok(())
 }
 
@@ -211,9 +220,15 @@ impl StoreFacts<'_> {
         if self.depth >= MAX_CHAIN_DEPTH {
             return Verdict::Invalid("the chain is too deep or loops".into());
         }
-        let verdict = judge_claim(self.connection, self.roots, claim_id, self.depth + 1, self.memo)
-            .map(|(verdict, _)| verdict)
-            .unwrap_or_else(|error| Verdict::Invalid(format!("could not judge: {error:#}")));
+        let verdict = judge_claim(
+            self.connection,
+            self.roots,
+            claim_id,
+            self.depth + 1,
+            self.memo,
+        )
+        .map(|(verdict, _)| verdict)
+        .unwrap_or_else(|error| Verdict::Invalid(format!("could not judge: {error:#}")));
         self.memo
             .borrow_mut()
             .insert(claim_id.to_owned(), verdict.clone());
@@ -223,7 +238,9 @@ impl StoreFacts<'_> {
 
 impl Facts for StoreFacts<'_> {
     fn delegation(&self, claim_id: &str) -> Option<Delegation> {
-        self.links.borrow_mut().insert(format!("delegation:{claim_id}"));
+        self.links
+            .borrow_mut()
+            .insert(format!("delegation:{claim_id}"));
         let row = claim_row(self.connection, claim_id).ok().flatten()?;
         if row.kind != KEY_GRANTED {
             return None;
@@ -245,7 +262,9 @@ impl Facts for StoreFacts<'_> {
     }
 
     fn revoked_before(&self, principal: &str, key: &str) -> bool {
-        self.links.borrow_mut().insert(format!("key:{principal}|{key}"));
+        self.links
+            .borrow_mut()
+            .insert(format!("key:{principal}|{key}"));
         let revocations = self
             .connection
             .prepare_cached(
@@ -276,7 +295,9 @@ impl Facts for StoreFacts<'_> {
     }
 
     fn nonce_used_before(&self, key: &str, nonce: &str) -> bool {
-        self.links.borrow_mut().insert(format!("nonce:{key}|{nonce}"));
+        self.links
+            .borrow_mut()
+            .insert(format!("nonce:{key}|{nonce}"));
         let others = self
             .connection
             .prepare_cached(
@@ -322,11 +343,17 @@ fn judge_claim(
     memo: &RefCell<BTreeMap<String, Verdict>>,
 ) -> Result<(Verdict, BTreeSet<String>)> {
     let Some(row) = claim_row(connection, claim_id)? else {
-        return Ok((Verdict::Held(format!("claim {claim_id} is not here")), BTreeSet::new()));
+        return Ok((
+            Verdict::Held(format!("claim {claim_id} is not here")),
+            BTreeSet::new(),
+        ));
     };
     let signature = stored_signature(connection, claim_id)?;
     let Some(position) = position(connection, claim_id)? else {
-        return Ok((Verdict::Held(format!("claim {claim_id} is not here")), BTreeSet::new()));
+        return Ok((
+            Verdict::Held(format!("claim {claim_id} is not here")),
+            BTreeSet::new(),
+        ));
     };
     let facts = StoreFacts {
         connection,
@@ -362,7 +389,9 @@ fn write_verdict_tx(
         .execute([claim_id])?;
     for link in links {
         connection
-            .prepare_cached("INSERT OR IGNORE INTO claim_verdict_links(link, claim_id) VALUES (?1, ?2)")?
+            .prepare_cached(
+                "INSERT OR IGNORE INTO claim_verdict_links(link, claim_id) VALUES (?1, ?2)",
+            )?
             .execute(params![link, claim_id])?;
     }
     connection
@@ -400,7 +429,10 @@ fn queue_affected_by_tx(connection: &Connection, claim_id: &str) -> Result<()> {
     let Some(signature) = stored_signature(connection, claim_id)? else {
         return Ok(());
     };
-    queue_linked_tx(connection, &format!("nonce:{}|{}", signature.key, signature.nonce))?;
+    queue_linked_tx(
+        connection,
+        &format!("nonce:{}|{}", signature.key, signature.nonce),
+    )?;
     let field_key = row
         .body
         .pointer("/fields/key")
@@ -517,32 +549,40 @@ impl Store {
                      issuer_key: &str,
                      label: Option<String>|
          -> Result<ClaimRecord, St3Error> {
-            self.runtime.append_claim(
-                self,
-                &ClaimInput {
-                    subject: subject.into(),
-                    kind: KEY_GRANTED.into(),
-                    actor: Some(issuer.into()),
-                    fields: KeyGrant {
-                        key: key.public().into(),
-                        role,
-                        issuer: issuer.into(),
-                        issuer_key: issuer_key.into(),
-                        label,
-                    }
-                    .fields(),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: None,
-                },
-            )
-            .map(|(claim, _)| claim)
+            self.runtime
+                .append_claim(
+                    self,
+                    &ClaimInput {
+                        subject: subject.into(),
+                        kind: KEY_GRANTED.into(),
+                        actor: Some(issuer.into()),
+                        fields: KeyGrant {
+                            key: key.public().into(),
+                            role,
+                            issuer: issuer.into(),
+                            issuer_key: issuer_key.into(),
+                            label,
+                        }
+                        .fields(),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    },
+                )
+                .map(|(claim, _)| claim)
         };
         let label = Some(format!("{} on {}", actor, self.origin));
         match family {
             Family::Agent => {
                 let key = self.keyring.create().map_err(internal)?;
-                let granted = grant(actor, &key, Role::Agent, &node_subject, node.public(), label)?;
+                let granted = grant(
+                    actor,
+                    &key,
+                    Role::Agent,
+                    &node_subject,
+                    node.public(),
+                    label,
+                )?;
                 self.hold_key(actor, Role::Agent, key, vec![granted.id])?;
             }
             Family::Person => {
@@ -556,7 +596,14 @@ impl Store {
                     }
                 };
                 let device = self.keyring.create().map_err(internal)?;
-                let granted = grant(actor, &device, Role::Device, actor, root.key.public(), label)?;
+                let granted = grant(
+                    actor,
+                    &device,
+                    Role::Device,
+                    actor,
+                    root.key.public(),
+                    label,
+                )?;
                 let mut chain = vec![granted.id];
                 chain.extend(root.chain.iter().cloned());
                 self.hold_key(actor, Role::Device, device, chain)?;
@@ -623,10 +670,7 @@ impl Store {
         let signed_at = u64::try_from(claim.accepted_at_unix_ms).unwrap_or(u64::MAX);
         let node_subject = self.node_subject();
         if claim.kind == KEY_GRANTED
-            && let Some(grant) = claim
-                .body
-                .get("fields")
-                .and_then(KeyGrant::from_fields)
+            && let Some(grant) = claim.body.get("fields").and_then(KeyGrant::from_fields)
         {
             if grant.issuer == node_subject && grant.issuer_key == node.public() {
                 return Some(ClaimSignature::sign(
@@ -669,20 +713,16 @@ impl Store {
         ))
     }
 
-    /// Whether a pass has anything to judge: a signed claim past the watermark, or a queued one.
-    /// One indexed probe on a reader.
+    /// Whether a pass has anything to judge: a newly signed claim, or a queued one. Two probes
+    /// of tiny tables on a reader.
     fn verdicts_pending(&self) -> Result<bool> {
         let connection = self.readers.get();
-        let watermark: i64 = fleet_meta(&connection, VERDICT_INDEX)?
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
         Ok(connection
             .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM claims JOIN claim_signatures ON claim_signatures.claim_id=claims.id
-                               WHERE claims.store_index>?1)
+                "SELECT EXISTS(SELECT 1 FROM claim_verdict_fresh)
                      OR EXISTS(SELECT 1 FROM claim_verdict_queue)",
             )?
-            .query_row([watermark], |row| row.get(0))?)
+            .query_row([], |row| row.get(0))?)
     }
 
     /// Judge every signed claim admitted since the last pass and every queued one. With
@@ -709,37 +749,21 @@ impl Store {
             let mut connection = self.connection.write();
             let transaction = connection.transaction()?;
             let roots = roots(&transaction, &self.origin)?;
-            let watermark: i64 = fleet_meta(&transaction, VERDICT_INDEX)?
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0);
             let fresh = transaction
-                .prepare_cached(
-                    "SELECT claims.id, claims.store_index FROM claim_signatures
-                     JOIN claims ON claims.id=claim_signatures.claim_id
-                     WHERE claims.store_index>?1 ORDER BY claims.store_index LIMIT ?2",
-                )?
-                .query_map(params![watermark, JUDGE_CHUNK as i64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })?
+                .prepare_cached("SELECT claim_id FROM claim_verdict_fresh LIMIT ?1")?
+                .query_map([JUDGE_CHUNK as i64], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            for (claim_id, _) in &fresh {
+            for claim_id in &fresh {
+                transaction
+                    .prepare_cached("DELETE FROM claim_verdict_fresh WHERE claim_id=?1")?
+                    .execute([claim_id])?;
+                // A new delegation, revocation or reused nonce changes what relied on it.
                 queue_affected_by_tx(&transaction, claim_id)?;
                 transaction
-                    .prepare_cached("INSERT OR IGNORE INTO claim_verdict_queue(claim_id) VALUES (?1)")?
+                    .prepare_cached(
+                        "INSERT OR IGNORE INTO claim_verdict_queue(claim_id) VALUES (?1)",
+                    )?
                     .execute([claim_id])?;
-            }
-            if let Some((_, index)) = fresh.last() {
-                set_meta_tx(&transaction, VERDICT_INDEX, &index.to_string())?;
-            } else {
-                // No new signed claim: move the watermark past unsigned ones too.
-                let top: i64 = transaction.query_row(
-                    "SELECT COALESCE(MAX(store_index), 0) FROM claims",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if top > watermark {
-                    set_meta_tx(&transaction, VERDICT_INDEX, &top.to_string())?;
-                }
             }
             let queued = transaction
                 .prepare_cached("SELECT claim_id FROM claim_verdict_queue LIMIT ?1")?
@@ -753,6 +777,10 @@ impl Store {
                 let Some(signature) = stored_signature(&transaction, claim_id)? else {
                     continue;
                 };
+                // A signature can arrive for a claim a checkpoint has since dropped.
+                if claim_row(&transaction, claim_id)?.is_none() {
+                    continue;
+                }
                 let (verdict, links) = judge_claim(&transaction, &roots, claim_id, 0, &memo)?;
                 if write_verdict_tx(&transaction, claim_id, &signature, &verdict, &links)? {
                     // A changed delegation or revocation changes what relied on it.
@@ -778,14 +806,19 @@ impl Store {
         stored_signature(&self.readers.get(), claim_id)
     }
 
-    /// How many claims have each verdict. Every claim without a cached verdict is `unsigned`.
+    /// How many claims have each verdict. This node's own claims are signed as their batches
+    /// are sealed, so it seals first. Every claim without a cached verdict is `unsigned`.
     pub fn claim_verdict_counts(&self) -> Result<BTreeMap<String, u64>> {
+        self.seal_local_batches()?;
         let connection = self.readers.get();
         let mut counts = connection
             .prepare("SELECT verdict, COUNT(*) FROM claim_verdicts GROUP BY verdict")?
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })?
             .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
-        let total: u64 = connection.query_row("SELECT COUNT(*) FROM claims", [], |row| row.get(0))?;
+        let total: u64 =
+            connection.query_row("SELECT COUNT(*) FROM claims", [], |row| row.get(0))?;
         let judged = counts.values().sum::<u64>();
         *counts.entry("unsigned".into()).or_default() += total.saturating_sub(judged);
         Ok(counts)
@@ -799,7 +832,9 @@ impl Store {
             let connection = self.readers.get();
             connection
                 .prepare("SELECT claim_id, verdict FROM claim_verdicts")?
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
         };
         {
@@ -807,22 +842,26 @@ impl Store {
             let transaction = connection.transaction()?;
             transaction.execute_batch(
                 "DELETE FROM claim_verdicts; DELETE FROM claim_verdict_links;
-                 DELETE FROM claim_verdict_queue;",
+                 DELETE FROM claim_verdict_queue;
+                 INSERT OR IGNORE INTO claim_verdict_fresh(claim_id) SELECT claim_id FROM claim_signatures;",
             )?;
-            transaction.execute(
-                "DELETE FROM meta WHERE key IN (?1, ?2)",
-                params![VERDICT_INDEX, VERDICT_ROOTS],
-            )?;
+            transaction.execute("DELETE FROM meta WHERE key=?1", params![VERDICT_ROOTS])?;
             transaction.commit()?;
         }
         self.judge_claims(true)?;
         let connection = self.readers.get();
         let recomputed = connection
             .prepare("SELECT claim_id, verdict FROM claim_verdicts")?
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
         let mut mismatches = Vec::new();
-        for claim_id in cached.keys().chain(recomputed.keys()).collect::<BTreeSet<_>>() {
+        for claim_id in cached
+            .keys()
+            .chain(recomputed.keys())
+            .collect::<BTreeSet<_>>()
+        {
             let before = cached.get(claim_id);
             let after = recomputed
                 .get(claim_id)

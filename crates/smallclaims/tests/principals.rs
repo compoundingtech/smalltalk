@@ -31,7 +31,13 @@ fn node(name: &str, member: Option<&Arc<MemberKey>>, anchor: Option<&Arc<MemberK
     store
 }
 
-fn append(store: &Store, kind: &str, subject: &str, actor: Option<&str>, fields: Value) -> ClaimRecord {
+fn append(
+    store: &Store,
+    kind: &str,
+    subject: &str,
+    actor: Option<&str>,
+    fields: Value,
+) -> ClaimRecord {
     store
         .append_claim(&ClaimInput {
             subject: subject.into(),
@@ -46,15 +52,28 @@ fn append(store: &Store, kind: &str, subject: &str, actor: Option<&str>, fields:
 }
 
 fn note(store: &Store, actor: Option<&str>, text: &str) -> ClaimRecord {
-    append(store, "example.note", "note/plans", actor, json!({"text": text}))
+    append(
+        store,
+        "example.note",
+        "note/plans",
+        actor,
+        json!({"text": text}),
+    )
 }
 
 fn admit(by: &Store, name: &str, member: &MemberKey, via: &str) {
-    let mut fields = json!({"fleet_id": FLEET, "member_key": member.public(), "via": via, "mode": "listening"});
+    let mut fields =
+        json!({"fleet_id": FLEET, "member_key": member.public(), "via": via, "mode": "listening"});
     if via != "anchor" {
         fields["sponsor"] = json!(format!("host/{}", by.origin));
     }
-    append(by, "fleet.member-admitted", &format!("host/{name}"), None, fields);
+    append(
+        by,
+        "fleet.member-admitted",
+        &format!("host/{name}"),
+        None,
+        fields,
+    );
 }
 
 /// The anchor `a` founds the fleet and admits each named member.
@@ -118,7 +137,11 @@ fn attach(store: &Store, claim: &ClaimRecord, signature: &ClaimSignature) {
 #[test]
 fn free_mode_signs_and_verifies_every_claim_with_no_fleet_and_no_prompt() {
     let store = Store::open_memory("studio", Arc::new(Plain)).unwrap();
-    let before = note(&store, Some("person/ada"), "written before the node had a key");
+    let before = note(
+        &store,
+        Some("person/ada"),
+        "written before the node had a key",
+    );
     seal(&store);
     store.set_node_key(key()).unwrap();
 
@@ -135,7 +158,11 @@ fn free_mode_signs_and_verifies_every_claim_with_no_fleet_and_no_prompt() {
     }
     let person_signature = store.claim_signature(&person.id).unwrap().unwrap();
     assert_eq!(person_signature.signer, "person/ada");
-    assert_eq!(person_signature.chain.len(), 2, "device grant, then root grant");
+    assert_eq!(
+        person_signature.chain.len(),
+        2,
+        "device grant, then root grant"
+    );
     assert_eq!(
         store.claim_signature(&again.id).unwrap().unwrap().key,
         person_signature.key,
@@ -149,12 +176,19 @@ fn free_mode_signs_and_verifies_every_claim_with_no_fleet_and_no_prompt() {
     assert_eq!(daemon_signature.on_behalf, None);
     let behalf_signature = store.claim_signature(&behalf.id).unwrap().unwrap();
     assert_eq!(behalf_signature.signer, "host/studio");
-    assert_eq!(behalf_signature.on_behalf.as_deref(), Some("daemon/runtime"));
+    assert_eq!(
+        behalf_signature.on_behalf.as_deref(),
+        Some("daemon/runtime")
+    );
 
     // Two grants for the person (root, device) and one for the agent, all verified.
     let grants = store.claims_for("person/ada", Some(KEY_GRANTED)).unwrap();
     assert_eq!(grants.len(), 2);
-    assert!(grants.iter().all(|grant| verdict(&store, grant) == Verdict::Verified));
+    assert!(
+        grants
+            .iter()
+            .all(|grant| verdict(&store, grant) == Verdict::Verified)
+    );
     let counts = store.claim_verdict_counts().unwrap();
     assert_eq!(counts.get("invalid"), None);
     assert_eq!(counts.get("held"), None);
@@ -170,8 +204,18 @@ fn members_verify_each_others_claims_through_membership() {
     sync(b, a);
     sync(a, c);
     for store in [a, c] {
-        assert_eq!(verdict(store, &from_b), Verdict::Verified, "on {}", store.origin);
-        assert_eq!(verdict(store, &agent_b), Verdict::Verified, "on {}", store.origin);
+        assert_eq!(
+            verdict(store, &from_b),
+            Verdict::Verified,
+            "on {}",
+            store.origin
+        );
+        assert_eq!(
+            verdict(store, &agent_b),
+            Verdict::Verified,
+            "on {}",
+            store.origin
+        );
     }
     // A store that does not know b's key holds b's claims until membership admits it.
     let stranger = node("stranger", Some(&key()), None);
@@ -235,12 +279,20 @@ fn revoking_a_key_invalidates_what_it_signs_afterwards_and_everything_below_a_re
     seal(b);
     let signature = b.claim_signature(&before.id).unwrap().unwrap();
     // The node revokes ada's device key.
-    append(b, KEY_REVOKED, "person/ada", None, json!({"key": signature.key, "reason": "lost laptop"}));
+    append(
+        b,
+        KEY_REVOKED,
+        "person/ada",
+        None,
+        json!({"key": signature.key, "reason": "lost laptop"}),
+    );
     let after = note(b, Some("person/ada"), "after");
     sync(b, a);
     for store in [a, b] {
         assert_eq!(verdict(store, &before), Verdict::Verified);
-        assert!(matches!(verdict(store, &after), Verdict::Invalid(reason) if reason.contains("revoked")));
+        assert!(
+            matches!(verdict(store, &after), Verdict::Invalid(reason) if reason.contains("revoked"))
+        );
     }
 
     // Revoking a root cuts its devices: grace's device signs, then her root is revoked.
@@ -248,13 +300,24 @@ fn revoking_a_key_invalidates_what_it_signs_afterwards_and_everything_below_a_re
     seal(b);
     let grace = b.claim_signature(&first.id).unwrap().unwrap();
     let root_grant = b.claim_by_id(grace.chain.last().unwrap()).unwrap().unwrap();
-    let root_key = root_grant.body["fields"]["key"].as_str().unwrap().to_owned();
-    append(b, KEY_REVOKED, "person/grace", None, json!({"key": root_key}));
+    let root_key = root_grant.body["fields"]["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    append(
+        b,
+        KEY_REVOKED,
+        "person/grace",
+        None,
+        json!({"key": root_key}),
+    );
     let later = note(b, Some("person/grace"), "later");
     sync(b, a);
     for store in [a, b] {
         assert_eq!(verdict(store, &first), Verdict::Verified);
-        assert!(matches!(verdict(store, &later), Verdict::Invalid(reason) if reason.contains("revoked")));
+        assert!(
+            matches!(verdict(store, &later), Verdict::Invalid(reason) if reason.contains("revoked"))
+        );
         assert!(store.recheck_claim_verdicts().unwrap().is_empty());
     }
 }
@@ -269,9 +332,21 @@ fn a_device_key_cannot_grant_keys_or_sign_for_another_person() {
 
     // ada's device signs a claim as grace, under ada's chain.
     let posing = note(&store, Some("person/grace"), "posing");
-    let content = content_digest(&posing.subject, &posing.kind, posing.actor.as_deref(), &posing.body);
+    let content = content_digest(
+        &posing.subject,
+        &posing.kind,
+        posing.actor.as_deref(),
+        &posing.body,
+    );
     let held = store.keyring.by_public(&device.key).unwrap();
-    let as_grace = ClaimSignature::sign(&held.key, &content, "person/grace", None, device.chain.clone(), 2);
+    let as_grace = ClaimSignature::sign(
+        &held.key,
+        &content,
+        "person/grace",
+        None,
+        device.chain.clone(),
+        2,
+    );
     attach(&store, &posing, &as_grace);
     seal(&store);
     assert!(matches!(verdict(&store, &posing), Verdict::Invalid(_)));
@@ -284,14 +359,21 @@ fn a_tampered_cache_is_caught_and_never_widens_a_verdict() {
     let good = note(&store, Some("person/ada"), "good");
     let bad = note(&store, Some("person/ada"), "bad");
     let content = content_digest(&bad.subject, &bad.kind, bad.actor.as_deref(), &bad.body);
-    attach(&store, &bad, &ClaimSignature::sign(&key(), &content, "person/ada", None, vec![], 3));
+    attach(
+        &store,
+        &bad,
+        &ClaimSignature::sign(&key(), &content, "person/ada", None, vec![], 3),
+    );
     seal(&store);
     assert!(matches!(verdict(&store, &bad), Verdict::Invalid(_)));
     let expected = verdicts(&store);
     {
         let connection = store.connection.write();
         connection
-            .execute("UPDATE claim_verdicts SET verdict='verified', reason=NULL WHERE claim_id=?1", [&bad.id])
+            .execute(
+                "UPDATE claim_verdicts SET verdict='verified', reason=NULL WHERE claim_id=?1",
+                [&bad.id],
+            )
             .unwrap();
         connection
             .execute("DELETE FROM claim_verdicts WHERE claim_id=?1", [&good.id])
@@ -304,7 +386,10 @@ fn a_tampered_cache_is_caught_and_never_widens_a_verdict() {
             .unwrap();
     }
     let mismatches = store.recheck_claim_verdicts().unwrap();
-    let mut found = mismatches.iter().map(|mismatch| mismatch.claim_id.as_str()).collect::<Vec<_>>();
+    let mut found = mismatches
+        .iter()
+        .map(|mismatch| mismatch.claim_id.as_str())
+        .collect::<Vec<_>>();
     found.sort_unstable();
     let mut wanted = vec![bad.id.as_str(), good.id.as_str(), "claim/injected"];
     wanted.sort_unstable();
@@ -337,18 +422,30 @@ fn a_restart_keeps_the_keys_and_rebuilds_the_same_verdicts() {
         store.claim_signature(&second.id).unwrap().unwrap().key,
         "the device key survives the restart"
     );
-    assert_eq!(store.claims_for("person/ada", Some(KEY_GRANTED)).unwrap().len(), 2);
+    assert_eq!(
+        store
+            .claims_for("person/ada", Some(KEY_GRANTED))
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(verdict(&store, &second), Verdict::Verified);
     assert!(store.recheck_claim_verdicts().unwrap().is_empty());
     let after = verdicts(&store);
-    assert!(before.iter().all(|(claim, verdict)| after.get(claim) == Some(verdict)));
+    assert!(
+        before
+            .iter()
+            .all(|(claim, verdict)| after.get(claim) == Some(verdict))
+    );
 }
 
 /// Deterministic shuffles without a dependency.
 fn shuffled<T: Clone>(items: &[T], mut seed: u64) -> Vec<T> {
     let mut items = items.to_vec();
     for index in (1..items.len()).rev() {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         items.swap(index, (seed >> 33) as usize % (index + 1));
     }
     items
@@ -362,14 +459,28 @@ fn verdicts_are_the_same_in_any_arrival_order_and_match_a_recompute() {
     for round in 0..4 {
         for (index, store) in writers.iter().enumerate() {
             let actor = people[(round + index) % people.len()];
-            let claim = note(store, Some(actor), &format!("round {round} from {}", store.origin));
+            let claim = note(
+                store,
+                Some(actor),
+                &format!("round {round} from {}", store.origin),
+            );
             if round == 2 && index == 0 {
                 // b replays one of its own signatures and revokes ada's key on b.
                 seal(store);
                 let signature = store.claim_signature(&claim.id).unwrap().unwrap();
-                let copy = note(store, Some(actor), &format!("round {round} from {}", store.origin));
+                let copy = note(
+                    store,
+                    Some(actor),
+                    &format!("round {round} from {}", store.origin),
+                );
                 attach(store, &copy, &signature);
-                append(store, KEY_REVOKED, actor, None, json!({"key": signature.key}));
+                append(
+                    store,
+                    KEY_REVOKED,
+                    actor,
+                    None,
+                    json!({"key": signature.key}),
+                );
             }
         }
     }
@@ -390,7 +501,10 @@ fn verdicts_are_the_same_in_any_arrival_order_and_match_a_recompute() {
             sync(&writers[index], &receiver);
         }
         let cached = verdicts(&receiver);
-        assert!(receiver.recheck_claim_verdicts().unwrap().is_empty(), "seed {seed}");
+        assert!(
+            receiver.recheck_claim_verdicts().unwrap().is_empty(),
+            "seed {seed}"
+        );
         assert!(cached.values().any(|verdict| verdict == "invalid"));
         assert!(cached.values().any(|verdict| verdict == "verified"));
         results.push(cached);

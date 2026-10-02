@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `ad0ba25729b58e1587de2f60fcebc3b9e00d804770ce700a127bc9bb705bb439`
+Digest: `20d452f37c160034c7ff12b1acba688b8214635d66e56bb56607b49b6ba78fcb`
 
 ## Subject families
 
@@ -126,6 +126,8 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `planning-session.question-requested` | `planning-session` | `authorized-participant` | `append` | `durable` | `decision_id:string`, `decision_type!:string`, `options:array`, `planner:subject-reference`, `question:string`, `requester:subject-reference`, `revision:integer` |  |
 | `planning-session.revision-requested` | `planning-session` | `authorized-requester` | `append` | `durable` | `candidate_revision:integer`, `feedback:subject-reference`, `requester:subject-reference`, `variant:string` | `feedback` |
 | `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `durable` | `mission:subject-reference`, `planner:subject-reference`, `planner_config:object`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` | `planning-session` |
+| `principal.key-granted` | `person`, `agent` | `system-only` | `append` | `durable` | `issuer!:string`, `issuer_key!:string`, `key!:string`, `label:string`, `role!:string` |  |
+| `principal.key-revoked` | `person`, `agent` | `system-only` | `append` | `durable` | `key!:string`, `reason:string` |  |
 | `publication.operation` | `*` | `system-only` | `append` | `durable` | `action:string`, `operation:string`, `status!:string` | `revision`, `reset`, `cancellation`, `refresh`, `feedback` |
 | `reconcile.fault` | `daemon`, `mission-run`, `observer`, `schedule`, `step-run`, `subscription` | `system-only` | `append` | `durable` | `reason:string`, `scope!:string`, `status!:string` |  |
 | `record.repaired` | `repair` | `ordinary-client` | `once` | `durable` | `reason!:string`, `record!:string`, `replacement!:string` | `repair` |
