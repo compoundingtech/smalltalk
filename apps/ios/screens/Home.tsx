@@ -75,7 +75,8 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
     const from = agent ? agentName(agent) : item.requester_id?.replace(/^agent\//, '') ?? 'An agent';
     return <Screen>
       <Banners />
-      <ScrollView contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
+      {/* Automatic insets keep the end of a long request clear of the floating tab bar. */}
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
         <T><T bold color={row.color}>{row.glyph} request</T><T dim>  {item.priority} · waited {row.age}</T></T>
         <T bold selectable>{row.title}</T>
         <T><T dim>asks  </T><T bold color={theme.person}>{from}</T></T>
@@ -91,7 +92,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
   }
   return <Screen>
     <Banners />
-    <View style={{ padding: 12, gap: 6 }}>
+    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 6, paddingBottom: 32 }}>
       <T><T bold color={row.color}>{row.glyph} {row.kind}</T><T dim>  {attentionKindLabel(item.attention_kind)} · {item.priority} · waited {row.age}</T></T>
       <T bold selectable>{row.title}</T>
       {item.detail ? <Markdown text={item.detail} color={theme.subtext0} /> : null}
@@ -102,7 +103,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
       <T dim selectable>{item.id}{item.source_id !== item.id ? ` · from ${item.source_id}` : ''}</T>
       {item.actions.includes('work.done') ? <Button label={attentionActionLabel('work.done').toLowerCase()} disabled={busy || status !== 'online'} onPress={() => Alert.prompt('Complete step', item.title, summary => { if (summary.trim()) void actions.done(item, summary).then(done => { if (done) navigation.goBack(); }); })} /> : null}
       {other.length ? <Note>in the CLI: {other.map(attentionActionLabel).join(', ')}</Note> : null}
-    </View>
+    </ScrollView>
   </Screen>;
 }
 
