@@ -38,7 +38,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case attentionMigrated
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
-    case terminalUnavailable, terminalEnded
+    case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
@@ -49,6 +49,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "idempotency-conflict": .idempotencyConflict; case "stale-fence": .staleFence
         case "cursor-gap": .cursorGap; case "page-cursor-expired": .pageCursorExpired
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
+        case "timeline-history-incomplete": .timelineHistoryIncomplete
         case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
         default: .unknown(raw)
@@ -61,6 +62,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .idempotencyConflict: "idempotency-conflict"; case .staleFence: "stale-fence"
         case .cursorGap: "cursor-gap"; case .pageCursorExpired: "page-cursor-expired"
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
+        case .timelineHistoryIncomplete: "timeline-history-incomplete"
         case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
         case .unknown(let value): value

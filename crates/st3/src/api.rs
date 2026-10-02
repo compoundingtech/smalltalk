@@ -1046,6 +1046,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "validation-failed"
         | "idempotency-conflict"
         | "stale-fence"
+        | "timeline-history-incomplete"
         | "cursor-gap"
         | "page-cursor-expired"
         | "rate-limited"
@@ -3609,6 +3610,7 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
     if !matches!(
         rejected.code.as_str(),
         "page-cursor-expired"
+            | "timeline-history-incomplete"
             | "cursor-gap"
             | "not-found"
             | "stale-fence"
