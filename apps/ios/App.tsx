@@ -18,6 +18,7 @@ import { theme } from './theme';
 import { AgentsScreen, HistoryScreen } from './screens/Agents';
 import { ConversationScreen } from './screens/Conversation';
 import { FleetScreen, PairScreen } from './screens/Fleet';
+import { UsageDetailScreen, UsageScreen } from './screens/Usage';
 import { AttentionScreen, HomeScreen } from './screens/Home';
 import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from './screens/Missions';
 import { SelectTextScreen } from './screens/SelectText';
@@ -37,8 +38,8 @@ const navigationTheme = {
   colors: { ...DarkTheme.colors, primary: theme.accent, background: theme.base, card: theme.mantle, text: theme.text, border: theme.surface0, notification: theme.person },
 };
 
-const ICONS: Record<Tab, string> = { Home: 'house', Agents: 'person.2', Missions: 'point.3.connected.trianglepath.dotted', Fleet: 'server.rack' };
-const ROOT_SCREENS = { HomeRoot: HomeScreen, AgentsRoot: AgentsScreen, MissionsRoot: MissionsScreen, FleetRoot: FleetScreen } as const;
+const ICONS: Record<Tab, string> = { Home: 'house', Agents: 'person.2', Missions: 'point.3.connected.trianglepath.dotted', Fleet: 'server.rack', Usage: 'chart.bar' };
+const ROOT_SCREENS = { HomeRoot: HomeScreen, AgentsRoot: AgentsScreen, MissionsRoot: MissionsScreen, FleetRoot: FleetScreen, UsageRoot: UsageScreen } as const;
 
 // Native header options only: the system font and look, tinted with the accent.
 const stackOptions: NativeStackNavigationOptions = {
@@ -63,6 +64,7 @@ function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
     <Stack.Screen name="Launch" component={LaunchScreen} options={{ title: 'Launch' }} />
     <Stack.Screen name="History" component={HistoryScreen} options={{ title: 'Past sessions' }} />
     <Stack.Screen name="NewMission" component={NewMissionScreen} options={{ title: 'New mission', presentation: 'modal' }} />
+    <Stack.Screen name="UsageDetail" component={UsageDetailScreen} options={{ title: 'Usage' }} />
   </Stack.Navigator>;
 }
 const TAB_COMPONENTS: Record<Tab, () => React.JSX.Element> = {
@@ -70,6 +72,7 @@ const TAB_COMPONENTS: Record<Tab, () => React.JSX.Element> = {
   Agents: () => <TabStack tab="Agents" />,
   Missions: () => <TabStack tab="Missions" />,
   Fleet: () => <TabStack tab="Fleet" />,
+  Usage: () => <TabStack tab="Usage" />,
 };
 const GlassesTab = () => <TabStack tab="Glasses" />;
 
