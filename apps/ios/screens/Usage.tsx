@@ -20,7 +20,7 @@ const tone: Record<Tone, string> = { ok: theme.idle, warning: theme.waiting, fau
 // The last read, so a detail screen shows what the list showed.
 let last: { hours: number; period: UsagePeriod } | null = null;
 
-function useUsage(hours: number) {
+export function useUsage(hours: number) {
   const { client } = useStore();
   const [period, setPeriod] = useState<UsagePeriod | null>(last?.hours === hours ? last.period : null);
   const [issue, setIssue] = useState('');
@@ -49,7 +49,7 @@ function useUsage(hours: number) {
   return { period, issue, reading, read };
 }
 
-function useNames(): Names {
+export function useNames(): Names {
   const { data } = useStore();
   return useMemo(() => ({
     agents: new Map(data.agents.map(agent => [agent.id, agentName(agent)])),
@@ -150,4 +150,26 @@ export function UsageDetailScreen() {
       })}
     </ScrollView>
   </Screen>;
+}
+
+/** Fleet's usage card: each account's spend today and its weekly share; it opens Usage. */
+export function UsageCard() {
+  const navigation = useNavigation<NativeStackNavigationProp<StackParams>>();
+  const { period, issue } = useUsage(PERIODS[0]);
+  const names = useNames();
+  const now = Date.now();
+  const rows = period?.rows ?? [];
+  const found = accounts(rows, period?.limits ?? []);
+  return <View>
+    <SectionHeader title="usage · today" />
+    {issue ? <Note tone="warning">{issue}</Note> : null}
+    {!period && !issue ? <Note>Loading usage…</Note> : null}
+    {found.map(({ id, total: spent, limit }) => {
+      const weekly = limit ? limitLine(limit, now).weekly : null;
+      return <ListRow key={id} title={label(id, names, rows)} onPress={() => navigation.navigate('Usage')}
+        right={<T color={theme.accent}>{cost(spent)}</T>}
+        second={weekly ? <T dim>weekly <T bold color={tone[weekly.tone]}>{weekly.text}</T></T> : `${tokens(spent.tokens)} tokens`} />;
+    })}
+    {period ? <ListRow title={<T color={theme.accent}>All usage ›</T>} onPress={() => navigation.navigate('Usage')} /> : null}
+  </View>;
 }
