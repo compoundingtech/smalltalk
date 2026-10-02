@@ -203,7 +203,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   useEffect(() => {
     const text = __DEV__ ? process.env.EXPO_PUBLIC_ST3_TEST_SEND : undefined;
     if (!text || !loaded || !agent) return;
-    const typed = setTimeout(() => setDraft(`${text} ${new Date().toISOString().slice(11, 19)}`), 3_000);
+    // `\n` in the variable is a new line, so a recording can show a tall box after a send.
+    const typed = setTimeout(() => setDraft(`${text.replaceAll('\\n', '\n')} ${new Date().toISOString().slice(11, 19)}`), 3_000);
     const sent = setTimeout(() => setDevSend(count => count + 1), 4_500);
     return () => { clearTimeout(typed); clearTimeout(sent); };
   }, [loaded, agent?.id]);
