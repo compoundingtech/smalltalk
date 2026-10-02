@@ -176,7 +176,7 @@ impl Runtime for Plain {
                     None,
                 )
                 .map(|claim| (claim, true))
-                .map_err(|error| Error::new("internal", error.to_string()))
+                .map_err(crate::error::typed)
             })
             .map_err(|error| Error::new("internal", error))?
     }

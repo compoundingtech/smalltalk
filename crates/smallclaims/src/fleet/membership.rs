@@ -61,6 +61,9 @@ pub struct Incarnation {
     pub end: Option<u64>,
     /// `removed` or `left` once the incarnation has ended.
     pub ended: Option<String>,
+    /// Who removed it and why, from the removal claim.
+    pub removed_by: Option<String>,
+    pub removal_reason: Option<String>,
     pub endpoints: Vec<Value>,
     endpoints_sequence: Option<u64>,
 }
@@ -162,6 +165,8 @@ impl Membership {
                 start: claim.number("writer_floor").unwrap_or(0).saturating_add(1),
                 end: None,
                 ended: None,
+                removed_by: None,
+                removal_reason: None,
                 endpoints: Vec::new(),
                 endpoints_sequence: None,
             });
@@ -194,6 +199,12 @@ impl Membership {
                                 );
                                 if incarnation.ended.as_deref() != Some("removed") {
                                     incarnation.ended = Some(ended.to_owned());
+                                    if ended == "removed" {
+                                        incarnation.removed_by =
+                                            claim.text("removed_by").map(str::to_owned);
+                                        incarnation.removal_reason =
+                                            claim.text("reason").map(str::to_owned);
+                                    }
                                 }
                             }
                         }
