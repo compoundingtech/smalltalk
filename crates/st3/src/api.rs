@@ -18782,7 +18782,10 @@ agent "seat" { workspace "/tmp"; command "true" }
         assert_eq!(again["status"], "completed");
         let (_, empty) = get_request(app, "/v1/client/now?person=person%2Favery").await;
         assert_eq!(empty["items"], json!([]));
-        assert!(state.store.messages(Some(&actor), true).unwrap().is_empty());
+        // No step waits on a new-run ask; its requester hears the answer once, by message.
+        let told = state.store.messages(Some(&actor), true).unwrap();
+        assert_eq!(told.len(), 1);
+        assert!(told[0].content.contains("Friday"));
     }
 
     #[tokio::test]

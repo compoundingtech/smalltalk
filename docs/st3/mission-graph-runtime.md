@@ -764,7 +764,9 @@ st work done step-run/release/ask-ID --as person/operator --summary "Friday"
 
 An ask creates a person-assigned runtime step in the live owning generation. Its origin waits in
 `waiting-person`, without a lease or time/retry consumption. Only the assigned person can
-complete it. The response resumes the same origin attempt with a new readiness epoch. A requester
+complete it. The response resumes the same origin attempt with a new readiness epoch, and the
+seat's ready-work wake tells the requester. No step waits on a `--new-run` ask, so the response
+also sends the requester one message from `daemon/runtime` with the answer. A requester
 can use `st work cancel-ask STEP --as AGENT --summary TEXT`. An unclaimed live requester can
 use `--new-run NAME`; claimed work must name `--step`. Repeated keys return the same source.
 
