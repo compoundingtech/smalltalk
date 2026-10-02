@@ -53,7 +53,7 @@ function errorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return code ? `${code}: ${message}` : message;
 }
-const transient = (code: string | undefined) => code === 'internal' || code === 'remote-unavailable' || code === 'rate-limited';
+const transient = (code: string | undefined) => code === 'internal' || code === 'remote-unavailable' || code === 'rate-limited' || code === 'terminal-unavailable';
 
 // One collections socket per paired gateway and credential. It holds the app's windows, at most one
 // followed terminal, and at most one followed conversation. A dropped socket reconnects after

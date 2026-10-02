@@ -456,6 +456,7 @@ impl ClientError {
                             | ErrorCode::RemoteUnavailable
                             | ErrorCode::RateLimited
                             | ErrorCode::RuntimeAuthorityIndeterminate
+                            | ErrorCode::TerminalUnavailable
                             | ErrorCode::Internal
                     )
             }
@@ -498,6 +499,8 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::NotFound => format!("it is gone: {message}"),
         ErrorCode::Forbidden => format!("not allowed: {message}"),
         ErrorCode::Internal => format!("st hit a problem: {message}"),
+        ErrorCode::TerminalEnded => "the terminal ended: its process exited".into(),
+        ErrorCode::TerminalUnavailable => "the terminal cannot be reached right now".into(),
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
@@ -1909,6 +1912,12 @@ mod tests {
         assert_eq!(gone.plain(), "it is gone: agent `agent/x` does not exist");
         assert!(!gone.is_transient());
         assert!(!api(ErrorCode::Forbidden, "no").is_transient());
+        // A terminal out of reach comes back; one whose process exited does not.
+        let away = api(ErrorCode::TerminalUnavailable, "the terminal owner is unavailable");
+        assert!(away.is_transient());
+        let ended = api(ErrorCode::TerminalEnded, "the terminal process exited");
+        assert_eq!(ended.plain(), "the terminal ended: its process exited");
+        assert!(!ended.is_transient());
         let slow = ClientError::Transport("client-v0 request deadline exceeded".into());
         assert!(slow.plain().contains("took too long"));
         assert!(slow.is_transient());
