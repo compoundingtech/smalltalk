@@ -319,7 +319,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Build the loopback-only client gateway. Unlike the local Unix boundary, every ordinary
-/// client request on this router requires a paired bearer or cookie credential.
+/// client request on this router requires a paired bearer credential.
 pub fn fabric_router(state: AppState) -> Router {
     router_for_transport(state, ClientTransportBoundary::FabricLoopback)
 }

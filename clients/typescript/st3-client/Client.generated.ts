@@ -83,9 +83,17 @@ export function applyWindow(window: CollectionWindow | undefined, frame: Collect
     return { items, hasMore: frame.has_more, snapshot: frame.snapshot };
 }
 
-function defaultTerminalSocket(url: string, protocols: string[], headers: Record<string, string>): TerminalSocket {
-    const Socket = WebSocket as unknown as new (url: string, protocols: string[], options: { headers: Record<string, string> }) => TerminalSocket;
-    return new Socket(url, protocols, { headers });
+function defaultTerminalSocket(url: string, protocols: string[], headers: Record<string, string>): CollectionSocket {
+    const Socket = WebSocket as unknown as new (url: string, protocols: string[], options?: { headers: Record<string, string> }) => CollectionSocket;
+    if (typeof navigator !== 'undefined' && navigator.product === 'ReactNative') {
+        return new Socket(url, protocols, { headers });
+    }
+    return new Socket(url, protocols);
+}
+
+function authenticatedProtocols(protocols: string[], credential: string | undefined): string[] {
+    if (credential) protocols.push(`st3.bearer.${credential}`);
+    return protocols;
 }
 
 export class ClientError extends Error {
@@ -143,7 +151,8 @@ export class St3Client {
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
-        const response = await this.fetchImpl(this.baseUrl + path, {
+        const fetchImpl = this.fetchImpl;
+        const response = await fetchImpl(this.baseUrl + path, {
             method, headers, body: body === undefined ? undefined : raw ? (body as BodyInit) : JSON.stringify(body),
         });
         const payload: unknown = await response.json();
@@ -240,7 +249,7 @@ export class St3Client {
         if (options.incarnation) url.searchParams.set('incarnation', options.incarnation);
         const headers: Record<string, string> = {};
         if (credential) headers.Authorization = `Bearer ${credential}`;
-        const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [TERMINAL_SUBPROTOCOL, `st3.cap.${options.streamCapability}`], headers);
+        const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), authenticatedProtocols([TERMINAL_SUBPROTOCOL, `st3.cap.${options.streamCapability}`], credential), headers);
         let ended = false;
         const stop = () => { ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
         const end = (error?: Error) => { if (ended) return; stop(); options.onEnd?.(error); };
@@ -266,7 +275,7 @@ export class St3Client {
         if (options.after) url.searchParams.set('after', options.after);
         const headers: Record<string, string> = {};
         if (credential) headers.Authorization = `Bearer ${credential}`;
-        const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [CONVERSATION_SUBPROTOCOL], headers);
+        const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), authenticatedProtocols([CONVERSATION_SUBPROTOCOL], credential), headers);
         let ended = false;
         const end = (error?: Error) => { if (ended) return; ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; options.onEnd?.(error); };
         socket.onmessage = event => {
@@ -290,7 +299,7 @@ export class St3Client {
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         const headers: Record<string, string> = {};
         if (credential) headers.Authorization = `Bearer ${credential}`;
-        const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);
+        const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), authenticatedProtocols([COLLECTIONS_SUBPROTOCOL], credential), headers);
         let ended = false, open = false;
         const waiting: string[] = [];
         const stop = () => { ended = true; socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };

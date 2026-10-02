@@ -36,97 +36,37 @@ mod gateway_tests {
     }
 
     #[test]
-    fn cookie_authentication_preserves_bearer_precedence_and_unix_authority() {
+    fn cookies_cannot_authenticate_and_native_bearers_keep_unix_authority() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
-        paired_device(&state, "cookie-secret", "cookie");
         paired_device(&state, "bearer-secret", "bearer");
-        let request = |bearer: Option<&str>, path: &str| {
+        let request = |bearer: Option<&str>| {
             let mut request = Request::builder()
-                .uri(path)
-                .header(axum::http::header::COOKIE, "st3_device=cookie-secret");
+                .uri("/v1/client/agents")
+                .header(axum::http::header::COOKIE, "st3_device=bearer-secret");
             if let Some(bearer) = bearer {
                 request = request.header(AUTHORIZATION, bearer);
             }
             request.body(Body::empty()).unwrap()
         };
+        assert!(authenticate(&state, &request(None), "fabric-loopback").is_err());
         assert_eq!(
-            authenticate(
-                &state,
-                &request(None, "/v1/client/agents"),
-                "fabric-loopback"
-            )
-            .unwrap()
-            .actor,
-            "person/alex/session/cookie"
-        );
-        assert_eq!(
-            authenticate(
-                &state,
-                &request(Some("Bearer bearer-secret"), "/v1/client/agents"),
-                "fabric-loopback"
-            )
-            .unwrap()
-            .actor,
-            "person/alex/session/bearer"
-        );
-        for bearer in ["Bearer unknown", "Basic cookie-secret", "Bearer "] {
-            assert!(
-                authenticate(
-                    &state,
-                    &request(Some(bearer), "/v1/client/agents"),
-                    "fabric-loopback"
-                )
-                .is_err()
-            );
-        }
-        assert_eq!(
-            authenticate(&state, &request(None, "/v1/client/agents"), "unix")
+            authenticate(&state, &request(Some("Bearer bearer-secret")), "fabric-loopback")
                 .unwrap()
                 .actor,
-            "client/local/read-only"
-        );
-        state
-            .store
-            .append_claim(&ClaimInput {
-                subject: "custom/client/pairing-cookie".into(),
-                kind: "custom.client.pairing-revoked".into(),
-                actor: Some("person/alex".into()),
-                fields: BTreeMap::new(),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .unwrap();
-        assert!(
-            authenticate(
-                &state,
-                &request(None, "/v1/client/agents"),
-                "fabric-loopback"
-            )
-            .is_err()
-        );
-        assert_eq!(
-            authenticate(
-                &state,
-                &request(Some("Bearer bearer-secret"), "/v1/client/agents"),
-                "fabric-loopback"
-            )
-            .unwrap()
-            .actor,
             "person/alex/session/bearer"
         );
-        let repair = Request::builder()
-            .method("POST")
-            .uri("/v1/client/pairings/new/complete")
-            .header(axum::http::header::COOKIE, "st3_device=cookie-secret")
-            .body(Body::empty())
-            .unwrap();
-        assert!(authenticate(&state, &repair, "fabric-loopback").is_ok());
+        for bearer in ["Bearer unknown", "Basic bearer-secret", "Bearer "] {
+            assert!(authenticate(&state, &request(Some(bearer)), "fabric-loopback").is_err());
+        }
+        assert_eq!(
+            authenticate(&state, &request(None), "unix").unwrap().actor,
+            "client/local/read-only"
+        );
     }
 
     #[tokio::test]
-    async fn pairing_cookie_delivery_is_secure_secret_free_and_success_only() {
+    async fn pairing_returns_native_bearer_without_cookie_and_rejects_reuse() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
         let Json(challenge) = pairing_begin(
@@ -149,22 +89,18 @@ mod gateway_tests {
                 .trim_start_matches("pairing/")
         );
         let app = crate::api::fabric_router(state.clone());
-        let complete = |code: &str, delivery: Option<&str>| {
-            let mut body = json!({"api_version": CLIENT_API_VERSION, "code": code, "device_public_key": "browser-public-key-01234567890123456789"});
-            if let Some(delivery) = delivery {
-                body["credential_delivery"] = json!(delivery);
-            }
+        let complete = |code: &str| {
+            let body = json!({"api_version": CLIENT_API_VERSION, "code": code, "device_public_key": "browser-public-key-01234567890123456789"});
             Request::builder()
                 .method("POST")
                 .uri(&uri)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header(axum::http::header::COOKIE, "st3_device=expired")
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
         let refused = app
             .clone()
-            .oneshot(complete("wrong", Some("cookie")))
+            .oneshot(complete("wrong"))
             .await
             .unwrap();
         assert_eq!(refused.status(), StatusCode::FORBIDDEN);
@@ -175,44 +111,24 @@ mod gateway_tests {
         );
         let response = app
             .clone()
-            .oneshot(complete(
-                challenge["code"].as_str().unwrap(),
-                Some("cookie"),
-            ))
+            .oneshot(complete(challenge["code"].as_str().unwrap()))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let cookie = response.headers()[axum::http::header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .to_owned();
-        assert!(cookie.starts_with("st3_device="));
-        for flag in [
-            "Path=/v1/client",
-            "HttpOnly",
-            "Secure",
-            "SameSite=Strict",
-            "Max-Age=",
-        ] {
-            assert!(cookie.contains(flag));
-        }
+        assert!(!response.headers().contains_key(axum::http::header::SET_COOKIE));
         let body: Value = serde_json::from_slice(
             &to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
                 .await
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(body["value"]["credential_delivery"], "cookie");
-        assert!(body["value"].get("credential").is_none());
+        let credential = body["value"]["credential"].as_str().unwrap();
         let authenticated = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/client/capabilities")
-                    .header(
-                        axum::http::header::COOKIE,
-                        cookie.split(';').next().unwrap(),
-                    )
+                    .header(AUTHORIZATION, format!("Bearer {credential}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -220,10 +136,7 @@ mod gateway_tests {
             .unwrap();
         assert_eq!(authenticated.status(), StatusCode::OK);
         let reused = app
-            .oneshot(complete(
-                challenge["code"].as_str().unwrap(),
-                Some("cookie"),
-            ))
+            .oneshot(complete(challenge["code"].as_str().unwrap()))
             .await
             .unwrap();
         assert_eq!(reused.status(), StatusCode::FORBIDDEN);
@@ -232,6 +145,72 @@ mod gateway_tests {
                 .headers()
                 .contains_key(axum::http::header::SET_COOKIE)
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_bearer_authenticates_before_upgrade_and_is_never_echoed() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        paired_device(&state, "browser-secret", "browser");
+        let (address, server) = serve(crate::api::fabric_router(state.clone())).await;
+        let request = |protocols: &str, authorization: Option<&str>| {
+            let mut request = format!("ws://{address}/v1/client/collections/stream")
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocols.parse().unwrap());
+            if let Some(value) = authorization {
+                request.headers_mut().insert(AUTHORIZATION, value.parse().unwrap());
+            }
+            request
+        };
+        let protocols = format!("{COLLECTION_SUBPROTOCOL}, {BEARER_PROTOCOL_PREFIX}browser-secret");
+        let (mut socket, response) = tokio_tungstenite::connect_async(request(&protocols, None))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[SEC_WEBSOCKET_PROTOCOL], COLLECTION_SUBPROTOCOL);
+        socket.send(Message::Text(json!({
+            "kind": "subscribe", "id": "browser-agents", "collection": "agents"
+        }).to_string().into())).await.unwrap();
+        let snapshot = next_json(&mut socket).await;
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert_eq!(snapshot["id"], "browser-agents");
+        socket.close(None).await.unwrap();
+
+        for (offered, authorization) in [
+            (COLLECTION_SUBPROTOCOL.to_owned(), None),
+            (format!("{COLLECTION_SUBPROTOCOL}, {BEARER_PROTOCOL_PREFIX}unknown"), None),
+            (format!("{protocols}, {BEARER_PROTOCOL_PREFIX}browser-secret"), None),
+            (format!("{COLLECTION_SUBPROTOCOL}, {BEARER_PROTOCOL_PREFIX}"), None),
+            (protocols.clone(), Some("Bearer unknown")),
+        ] {
+            let error = tokio_tungstenite::connect_async(request(&offered, authorization))
+                .await
+                .unwrap_err();
+            match error {
+                tokio_tungstenite::tungstenite::Error::Http(response) => {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                    assert!(!response.headers().contains_key(SEC_WEBSOCKET_PROTOCOL));
+                }
+                other => panic!("expected refused handshake, got {other}"),
+            }
+        }
+
+        // The bearer carrier is accepted only at a WebSocket upgrade, never on HTTP reads.
+        let read = Request::builder().uri("/v1/client/agents")
+            .header(SEC_WEBSOCKET_PROTOCOL, &protocols)
+            .body(Body::empty()).unwrap();
+        assert!(authenticate(&state, &read, "fabric-loopback").is_err());
+        state.store.append_claim(&ClaimInput {
+            subject: "custom/client/pairing-browser".into(),
+            kind: "custom.client.pairing-revoked".into(),
+            actor: Some("person/alex".into()),
+            fields: BTreeMap::new(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let error = tokio_tungstenite::connect_async(request(&protocols, None)).await.unwrap_err();
+        assert!(matches!(error, tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status() == StatusCode::FORBIDDEN));
+        server.abort();
     }
 
     async fn serve(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -251,13 +230,10 @@ mod gateway_tests {
         let mut request = format!("ws://{address}{path}")
             .into_client_request()
             .unwrap();
-        request.headers_mut().insert(
-            axum::http::header::COOKIE,
-            "st3_device=viewer-secret".parse().unwrap(),
-        );
+        // Model browser WebSocket: no Authorization header, only offered protocols.
         request
             .headers_mut()
-            .insert(SEC_WEBSOCKET_PROTOCOL, protocols.parse().unwrap());
+            .insert(SEC_WEBSOCKET_PROTOCOL, format!("{protocols}, {BEARER_PROTOCOL_PREFIX}viewer-secret").parse().unwrap());
         tokio_tungstenite::connect_async(request).await.unwrap().0
     }
 
@@ -296,7 +272,7 @@ mod gateway_tests {
         paired_device(state, "viewer-secret", "viewer");
         let auth = Request::builder()
             .uri("/v1/client/agents")
-            .header(axum::http::header::COOKIE, "st3_device=viewer-secret")
+            .header(AUTHORIZATION, "Bearer viewer-secret")
             .body(Body::empty())
             .unwrap();
         let session = authenticate(state, &auth, "fabric-loopback").unwrap();
@@ -374,7 +350,7 @@ mod gateway_tests {
                     attachment["attachment_id"].as_str().unwrap()
                 )
                 .unwrap()["state"],
-                "consumed"
+                "available"
             );
             if mode == "unsubscribe" {
                 socket
