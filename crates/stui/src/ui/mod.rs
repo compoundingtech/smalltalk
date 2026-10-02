@@ -4050,11 +4050,19 @@ impl Ui {
                 };
                 let (in_sidebar, pane) = {
                     let info = self.frame.borrow();
+                    // Home floats over the glass: under it, only Home scrolls (Nathan,
+                    // 2026-10-02). The pane drawn last is the one on top, as for clicks.
+                    let behind_home = self.home_open()
+                        && info
+                            .home
+                            .is_some_and(|rect| !contains(rect, mouse.column, mouse.row));
                     (
                         contains(info.sidebar, mouse.column, mouse.row),
                         info.panes
                             .iter()
+                            .rev()
                             .find(|pane| contains(pane.rect, mouse.column, mouse.row))
+                            .filter(|_| !behind_home)
                             .map(|pane| pane.key.clone()),
                     )
                 };

@@ -4439,6 +4439,48 @@ mod tests {
     }
 
     #[test]
+    fn the_wheel_over_home_scrolls_home_not_the_conversation_behind_it() {
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].id.clone();
+        ui.open_in_glass(Pane::Agent(Some(agent.clone())), Open::Tab);
+        ui.open_home();
+        let _ = screen(&ui);
+        let behind = format!("chat:{agent}");
+        let state = |ui: &Ui, key: &str| {
+            ui.conversation_state
+                .panes
+                .borrow()
+                .get(key)
+                .map(|state| (state.top, state.follow))
+        };
+        let before = state(&ui, &behind);
+        let home = ui.frame.borrow().home.unwrap();
+        // Up: a conversation that follows its newest message would leave it to read back.
+        let at = |column: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Over Home's card where the conversation lies beneath it, and over the dimmed glass.
+        let over = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key.starts_with("home:"))
+            .map(|pane| pane.rect)
+            .unwrap();
+        ui.mouse(at(over.x + 2, over.y + over.height / 2));
+        ui.mouse(at(home.x.saturating_sub(1), home.y + home.height / 2));
+        assert_eq!(
+            state(&ui, &behind),
+            before,
+            "the conversation behind stays put"
+        );
+    }
+
+    #[test]
     fn the_wheel_moves_the_palette_and_nothing_behind_it() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
