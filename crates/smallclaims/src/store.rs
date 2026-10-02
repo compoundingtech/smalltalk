@@ -351,6 +351,8 @@ pub struct Store {
     pub keyring: crate::principal::Keyring,
     /// Held while this node mints a key for a person or an agent.
     pub principal_minting: Mutex<()>,
+    /// Admission took in claims whose verdicts the next projection pass judges.
+    pub verdicts_due: AtomicBool,
     pub origin: String,
     /// The database file, or the shared-memory URI of an in-memory store. A checkpoint proof
     /// opens its own connection here to copy the store.
@@ -472,6 +474,7 @@ impl Store {
             member_key: std::sync::RwLock::new(None),
             keyring: crate::principal::Keyring::default(),
             principal_minting: Mutex::new(()),
+            verdicts_due: AtomicBool::new(false),
             origin,
             path,
             shared_memory,
@@ -518,6 +521,10 @@ pub struct ReplicationSnapshot {
     pub graph_digest: String,
     pub legacy_graph_digest: String,
     pub projection_digests: BTreeMap<String, String>,
+    /// Whether a local batch had no envelope yet when this snapshot was read. Its projection
+    /// digests then count claims its inventory does not, so `replication_snapshot` seals and
+    /// reads again rather than offer it.
+    pub unsealed: bool,
 }
 
 /// Cumulative replication time by stage, in nanoseconds.
@@ -4333,8 +4340,23 @@ impl Store {
     /// The replication snapshot with every local batch sealed into a signed envelope first. The
     /// exchange paths use it; they must offer peers everything this node wrote.
     pub fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
-        self.seal_local_batches()?;
-        self.sealed_replication_snapshot()
+        // A write that lands between sealing and reading would be counted by the projection
+        // digests but not by the inventory, and a peer comparing graphs at equal inventories
+        // would heal for nothing. Seal again until the snapshot holds no unsealed batch.
+        let mut snapshot;
+        let mut attempts = 0;
+        loop {
+            self.seal_local_batches()?;
+            snapshot = self.sealed_replication_snapshot()?;
+            attempts += 1;
+            if !snapshot.unsealed || attempts == 8 {
+                break;
+            }
+        }
+        // Judge the claims just sealed only after the snapshot is taken: a verdict pass takes the
+        // writer, and writes queued behind it must not land between sealing and the snapshot.
+        self.judge_claims(false)?;
+        Ok(snapshot)
     }
 
     /// Seal this node's batches that have no envelope yet, and sign them. Only this takes the
@@ -4345,7 +4367,6 @@ impl Store {
         // chunks. Capture the target once; concurrent writes belong to the next pass.
         const SEAL_CHUNK_BATCHES: usize = 64;
         let target = max_batch_rowid(&self.readers.get())?;
-        let mut sealed = false;
         while target > self.seeded_batch_rowid.load(Ordering::Acquire) {
             let mut connection = self.connection.write();
             let _timing = time_stage(&self.replication_timers.snapshot);
@@ -4371,13 +4392,7 @@ impl Store {
             self.sign_own_envelopes_range_tx(&transaction, Some(seeded_through), Some(through))?;
             transaction.commit()?;
             self.seeded_batch_rowid.store(through, Ordering::Release);
-            sealed = true;
             // The FIFO writer services any already queued request before the next loan.
-        }
-        // The claims just sealed carry new signatures. A call that sealed nothing writes nothing,
-        // as before.
-        if sealed {
-            self.judge_claims(false)?;
         }
         Ok(())
     }
@@ -4562,6 +4577,14 @@ impl Store {
             graph_digest,
             legacy_graph_digest,
             projection_digests,
+            unsealed: connection
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>?1 AND NOT EXISTS(
+                         SELECT 1 FROM replica_envelopes WHERE replica_envelopes.batch_id=batches.id))",
+                )?
+                .query_row([self.seeded_batch_rowid.load(Ordering::Acquire)], |row| {
+                    row.get(0)
+                })?,
         });
         *self
             .replication_snapshot
@@ -5129,9 +5152,12 @@ impl Store {
             )?;
         }
         drop(connection);
-        // Admitted claims, and any change to membership's trust roots, get their verdicts.
+        // Admitted claims, and any change to membership's trust roots, get their verdicts once
+        // they are projected: judging here would hold the writer between admission and
+        // projection, and a snapshot taken in between would offer an inventory its projections
+        // do not yet show.
         if outcome.changed {
-            self.judge_claims(true)?;
+            self.verdicts_due.store(true, Ordering::Release);
         }
         Ok(outcome)
     }
@@ -5240,6 +5266,9 @@ impl Store {
                 drop(connection);
                 if replayed {
                     self.runtime.forget_views();
+                }
+                if self.verdicts_due.swap(false, Ordering::AcqRel) {
+                    self.judge_claims(true)?;
                 }
                 Ok(true)
             }
