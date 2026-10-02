@@ -845,6 +845,7 @@ pub fn run(context: Context) -> Result<()> {
                 Effect::Send {
                     ref agent,
                     ref text,
+                    ..
                 }
                 | Effect::Discuss {
                     to: ref agent,
@@ -926,6 +927,7 @@ pub fn run(context: Context) -> Result<()> {
                 last_cache_save = Instant::now();
             }
         }
+        ui.step_voice();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
         execute!(io::stdout(), EndSynchronizedUpdate)?;
@@ -989,12 +991,13 @@ pub fn run(context: Context) -> Result<()> {
         {
             reattach_tries = 0;
         }
-        // While an attached terminal's output flows, draw it as it comes.
-        let flowing = ui
-            .terminal
-            .as_ref()
-            .and_then(|view| view.native.as_ref())
-            .is_some_and(|native| native.flowing());
+        // While an attached terminal's output flows, or voice listens, draw it as it comes.
+        let flowing = ui.voice.is_some()
+            || ui
+                .terminal
+                .as_ref()
+                .and_then(|view| view.native.as_ref())
+                .is_some_and(|native| native.flowing());
         if event::poll(Duration::from_millis(if flowing { 16 } else { 80 }))? {
             // crossterm's read never returns on a closed terminal, so check for one before each.
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
@@ -1343,6 +1346,7 @@ async fn perform(
                 None,
                 Some(attention.source_id.clone()),
                 None,
+                Vec::new(),
                 None,
             )
             .await?;
@@ -1356,7 +1360,17 @@ async fn perform(
                     .find(|candidate| candidate.header.id == to)
                     .and_then(|agent| agent.current_session_id.clone()),
             );
-            let id = send_message(client, &to, text, Some(title), None, session, sent).await?;
+            let id = send_message(
+                client,
+                &to,
+                text,
+                Some(title),
+                None,
+                session,
+                Vec::new(),
+                sent,
+            )
+            .await?;
             Ok((
                 "Sent; the reply will show here and in their conversation".into(),
                 id,
@@ -1450,12 +1464,12 @@ async fn perform(
         Effect::OpenTerminal { .. } | Effect::TerminalKey(_) | Effect::CloseTerminal => {
             Ok((String::new(), None))
         }
-        Effect::Send { agent, text } => {
+        Effect::Send { agent, text, tags } => {
             let session = model
                 .agents()
                 .find(|candidate| candidate.header.id == agent)
                 .and_then(|agent| agent.current_session_id.clone());
-            let id = send_message(client, &agent, text, None, None, session, sent).await?;
+            let id = send_message(client, &agent, text, None, None, session, tags, sent).await?;
             Ok(("Message sent".into(), id))
         }
     }
@@ -1471,6 +1485,7 @@ async fn send_message(
     title: Option<String>,
     in_reply_to: Option<String>,
     session_id: Option<String>,
+    tags: Vec<String>,
     sent: Option<&Mutex<Option<Sent>>>,
 ) -> Result<Option<String>> {
     let parameters = MessageSendParameters {
@@ -1479,7 +1494,7 @@ async fn send_message(
         title,
         in_reply_to,
         session_id,
-        tags: vec![],
+        tags,
     };
     let message_id = |result: st3_client::Envelope<st3_client::ActionResult>| {
         // The new message's id, so the pending copy can give way to the real one.

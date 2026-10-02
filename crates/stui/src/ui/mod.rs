@@ -24,6 +24,7 @@ pub mod screens;
 pub mod text;
 pub mod theme;
 mod usage;
+mod voice;
 // The live client fills the variants and fields the demo does not use.
 #[allow(dead_code)]
 pub mod view;
@@ -127,6 +128,8 @@ pub enum Effect {
     Send {
         agent: String,
         text: String,
+        /// st's message tags, such as `dictated`.
+        tags: Vec<String>,
     },
     /// Cancel a mission's latest run.
     CancelRun {
@@ -254,6 +257,10 @@ pub struct Ui {
     effects: Vec<Effect>,
     popover: Option<String>,
     chat: Option<ChatState>,
+    /// Voice mode: the speech helper listening for one input.
+    pub(crate) voice: Option<voice::VoiceState>,
+    /// Inputs whose text came from voice; their next message is tagged `dictated`.
+    dictated: HashSet<String>,
     /// The agent details pane beside the conversation.
     details: bool,
     /// The Missions tab shows the selected mission's whole declaration.
@@ -349,6 +356,8 @@ impl Ui {
             effects: Vec::new(),
             popover: None,
             chat: None,
+            voice: None,
+            dictated: HashSet::new(),
             details: true,
             kdl: false,
             tree: false,
@@ -1907,6 +1916,35 @@ impl Ui {
                 },
                 Hit::Composer,
             );
+            // Where this stui can listen, the box offers it: a click or Ctrl+R.
+            if crate::voice::available()
+                && self.composing(&agent.id)
+                && self.voice_for(&agent.id).is_none()
+            {
+                let label = " ◉ ctrl+r speak ";
+                let width = text::width(label) as u16;
+                // Only beside the text, never over it.
+                let typed = composer.first().map_or(0, |line| line.width()) as u16;
+                if area.width > width + 24 && typed + width + 2 <= area.width {
+                    let at = (area.x + area.width - width - 1, y + 1 + strip);
+                    buf.set_stringn(
+                        at.0,
+                        at.1,
+                        label,
+                        width as usize,
+                        theme::fg(theme::OVERLAY1),
+                    );
+                    self.hit(
+                        Rect {
+                            x: at.0,
+                            y: at.1,
+                            width,
+                            height: 1,
+                        },
+                        Hit::Voice,
+                    );
+                }
+            }
         }
     }
 
@@ -2284,6 +2322,9 @@ impl Ui {
         editing: bool,
         draft: &str,
     ) -> Vec<Line<'static>> {
+        if let Some(state) = self.voice_for(&agent.id) {
+            return self.voice_lines(state, width);
+        }
         if draft.is_empty() && !editing {
             let hint = if self.composing(&agent.id) {
                 format!("Message {} · c or click", agent.name)
@@ -2377,6 +2418,10 @@ impl Ui {
             ("drag", "select text in one pane; release copies it"),
             ("o", "expand or collapse tool output"),
             ("c", "write: a message, feedback, a reply"),
+            (
+                "ctrl+r",
+                "in a message box: speak instead (a Mac with SmallTalk.app's speech helper)",
+            ),
             ("s", "hide the sidebar"),
             (
                 "b p",
@@ -2491,6 +2536,10 @@ impl Ui {
 
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+        // Listening takes every key until the words are sent, kept or dropped.
+        if self.voice_key(key) {
             return;
         }
         if self.glass_key(key) {
@@ -2686,6 +2735,8 @@ impl Ui {
             match key.code {
                 KeyCode::Esc => self.editing = false,
                 KeyCode::Enter => self.submit(),
+                // Ctrl+R speaks into the input instead of typing.
+                KeyCode::Char('r') if control => self.start_voice(),
                 // Ctrl+V while writing to an agent attaches the clipboard's image.
                 KeyCode::Char('v') if control && self.tab == 1 => self.attach_clipboard(),
                 // Backspace in an empty box takes back the last image.
@@ -3431,6 +3482,11 @@ impl Ui {
             let effect = match self.tab {
                 1 => Some(Effect::Send {
                     agent: id.clone(),
+                    tags: if self.dictated.remove(&id) {
+                        vec!["dictated".into()]
+                    } else {
+                        Vec::new()
+                    },
                     text: draft,
                 }),
                 _ => match self
@@ -3941,6 +3997,10 @@ impl Ui {
                 }
             }
             Hit::Help => self.help = !self.help,
+            Hit::Voice => {
+                self.editing = true;
+                self.start_voice();
+            }
             Hit::Open(id) => self.open(&id),
             Hit::Field(index) if self.agent_form => {
                 if let Some(form) = self.new_agent.as_mut() {
@@ -4345,6 +4405,7 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     {
         ui.tick = (started.elapsed().as_millis() / 100) as u64;
         ui.step_demo();
+        ui.step_voice();
         for effect in std::mem::take(&mut ui.effects) {
             match effect {
                 Effect::CloseTerminal => ui.terminal = None,
@@ -4586,6 +4647,77 @@ mod tests {
         );
         ui.key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
         assert!(!ui.simple);
+    }
+
+    #[test]
+    fn spoken_words_are_sent_tagged_dictated() {
+        let mut ui = Ui::new(demo::world());
+        ui.live = true;
+        ui.tab = 1;
+        let agent = ui.selected_id().unwrap();
+        ui.editing = true;
+        ui.conversation_state
+            .drafts
+            .insert(agent.clone(), "Also:".into());
+        ui.voice = Some(voice::VoiceState::stand_in(&agent));
+        ui.voice_event(crate::voice::Event::Ready {
+            device: "Desk Microphone".into(),
+        });
+        ui.voice_event(crate::voice::Event::Level(0.6));
+        ui.voice_event(crate::voice::Event::Text {
+            text: "ship the".into(),
+            settled: false,
+        });
+        let screen = frame(&ui, 120, 30).join("\n");
+        assert!(screen.contains("listening · Desk Microphone"), "{screen}");
+        assert!(screen.contains("ship the"), "{screen}");
+        // Typing waits while listening; Enter sends once the words are all in.
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.effects.is_empty(), "nothing goes before the last words");
+        ui.voice_event(crate::voice::Event::Done {
+            text: "ship the harbor fix".into(),
+        });
+        assert!(ui.voice.is_none());
+        let sent: Vec<_> = ui.effects.iter().filter(|e| voice::dictated(e)).collect();
+        assert!(
+            matches!(&sent[..], [Effect::Send { text, .. }] if text == "Also: ship the harbor fix"),
+            "{:?}",
+            ui.effects
+        );
+    }
+
+    #[test]
+    fn spoken_words_kept_to_edit_are_tagged_when_sent_and_esc_drops_them() {
+        let mut ui = Ui::new(demo::world());
+        ui.live = true;
+        ui.tab = 1;
+        let agent = ui.selected_id().unwrap();
+        ui.editing = true;
+        ui.voice = Some(voice::VoiceState::stand_in(&agent));
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        ui.voice_event(crate::voice::Event::Done {
+            text: "check the logs".into(),
+        });
+        assert!(ui.effects.is_empty(), "Tab keeps the words to edit");
+        assert_eq!(
+            ui.conversation_state.drafts.get(&agent).map(String::as_str),
+            Some("check the logs")
+        );
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.effects.iter().any(voice::dictated), "{:?}", ui.effects);
+
+        ui.effects.clear();
+        ui.voice = Some(voice::VoiceState::stand_in(&agent));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.voice.is_none());
+        assert!(ui.effects.is_empty());
+        // A later typed message is not tagged.
+        ui.conversation_state
+            .drafts
+            .insert(agent.clone(), "typed".into());
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!ui.effects.iter().any(voice::dictated), "{:?}", ui.effects);
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod model;
 mod tree;
 mod ui;
 mod version;
+mod voice;
 
 use anyhow::{Context, Result};
 use crossterm::{
