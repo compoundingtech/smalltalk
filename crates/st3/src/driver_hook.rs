@@ -155,9 +155,21 @@ fn live_claude_label(env: &dyn HookEnv, identity: &str) -> Result<String> {
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let status: crate::model::StatusResponse = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            crate::client::Client::new(endpoint).get(&format!(
+        let client = crate::client::Client::new(endpoint);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        // The seat's own desired record, read on every render so renames show at once.
+        if let Ok(Ok(seat)) = tokio::time::timeout_at(
+            deadline,
+            client.get::<crate::model::DesiredSubject>(&format!("/v1/desired/{subject}")),
+        )
+        .await
+        {
+            return Ok(crate::mailbox::seat_label(&seat, persona_short.as_deref()));
+        }
+        // A daemon older than `/v1/desired` answers from its status reduction.
+        let status: crate::model::StatusResponse = tokio::time::timeout_at(
+            deadline,
+            client.get(&format!(
                 "/v1/status?subject={}",
                 urlencoding::encode(&subject)
             )),

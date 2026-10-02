@@ -16209,6 +16209,35 @@ fn latest_actual_at(
 /// accepted in the same millisecond, so a fold that stops early reads only what it uses. Left to
 /// itself it reads the kind by store index and sorts every claim of the kind the subject ever
 /// had, every observation a seat ever made, before it returns the first.
+/// Subject `?1`'s `harness.observed` claims that name incarnation `?3`, at or before store index
+/// `?2`, newest first in canonical order.
+fn harness_observations_of_incarnation_query() -> String {
+    format!(
+        "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
+         FROM claims INDEXED BY claims_incarnation_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND {INCARNATION_OF_CLAIM}=?3
+           AND claims.kind='harness.observed' AND +claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER_DESC}"
+    )
+}
+
+/// Subject `?1`'s `harness.observed` claims that name no incarnation as text, at or before store
+/// index `?2`, accepted no earlier than `?3` (the runtime observation's accepted time).
+fn harness_observations_without_incarnation_query() -> String {
+    format!(
+        "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
+         FROM claims INDEXED BY claims_subject_kind_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.observed' AND +claims.store_index<=?2
+           AND (length(claims.accepted_at_unix_ms)>length(?3)
+                OR (length(claims.accepted_at_unix_ms)=length(?3)
+                    AND claims.accepted_at_unix_ms>=?3))
+           AND ({INCARNATION_OF_CLAIM} IS NULL OR typeof({INCARNATION_OF_CLAIM})!='text')
+         ORDER BY {CANONICAL_ORDER_DESC}"
+    )
+}
+
 fn newest_claims_of_kind_query(columns: &str, kind: &str) -> String {
     format!(
         "SELECT {columns}
@@ -16478,36 +16507,62 @@ fn current_harness_at(
         }));
     }
 
-    // Newest first in canonical order, so every node that holds the same claims shows the same
-    // harness state.
-    let mut statement = connection.prepare_cached(&newest_claims_of_kind_query(
-        "claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms",
-        "harness.observed",
-    ))?;
-    let rows = statement.query_map(params![subject, at_index], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, u64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
+    // The observations of this runtime epoch, newest first in canonical order, so every node that
+    // holds the same claims shows the same harness state: those that name this incarnation, and
+    // those that name none and follow the runtime observation. Only those are read. Reading every
+    // observation the seat ever made, with a canonical key lookup for each, cost a seat whose
+    // current incarnation had reported nothing yet thousands of reads on every status and pass.
+    let row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, String, String)> {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    };
+    let mut unnamed = connection
+        .prepare_cached(&harness_observations_without_incarnation_query())?
+        .query_map(params![subject, at_index, runtime_key.0.to_string()], row)?
+        .map(|row| {
+            let (claim, body, observed_at_unix_ms) = row?;
+            let key = canonical::claim_key(connection, &claim)?;
+            Ok::<_, anyhow::Error>((key, claim, body, observed_at_unix_ms))
+        })
+        .filter(|row| row.as_ref().map_or(true, |(key, ..)| *key > runtime_key))
+        .collect::<Result<Vec<_>>>()?;
+    unnamed.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut unnamed = unnamed.into_iter().peekable();
+    let mut statement = connection.prepare_cached(&harness_observations_of_incarnation_query())?;
+    let mut named = statement.query_map(params![subject, at_index, incarnation_id], row)?;
+    let mut next_named = None;
     let mut current = None;
     let mut optional = BTreeMap::<&'static str, Option<String>>::new();
-    for row in rows {
-        let (claim, _store_index, body, observed_at_unix_ms) = row?;
-        let key = canonical::claim_key(connection, &claim)?;
+    loop {
+        if next_named.is_none() {
+            next_named = match named.next() {
+                Some(row) => {
+                    let (claim, body, observed_at_unix_ms) = row?;
+                    Some((
+                        canonical::claim_key(connection, &claim)?,
+                        claim,
+                        body,
+                        observed_at_unix_ms,
+                    ))
+                }
+                None => None,
+            };
+        }
+        let take_unnamed = match (next_named.as_ref(), unnamed.peek()) {
+            (Some((named_key, ..)), Some((unnamed_key, ..))) => unnamed_key > named_key,
+            (None, Some(_)) => true,
+            (_, None) => false,
+        };
+        let next = if take_unnamed {
+            unnamed.next()
+        } else {
+            next_named.take()
+        };
+        let Some((key, claim, body, observed_at_unix_ms)) = next else {
+            break;
+        };
         let observed_at_unix_ms = observed_at_unix_ms.parse::<u128>()?;
         let body: Value = serde_json::from_str(&body)?;
         let fields = body.get("fields").unwrap_or(&body);
-        let observed_incarnation = fields.get("incarnation_id").and_then(Value::as_str);
-        let belongs_to_epoch = match observed_incarnation {
-            Some(value) => value == incarnation_id,
-            None => key > runtime_key,
-        };
-        if !belongs_to_epoch {
-            continue;
-        }
         if current.is_none()
             && let Some(state) = fields.get("state").and_then(Value::as_str)
         {

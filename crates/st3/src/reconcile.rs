@@ -39,6 +39,9 @@ const WORK_WAKE_RETRY_MS: u128 = 15_000;
 // pass, including PTY snapshots. Ten seconds bounds result recognition without keeping a
 // busy host in near-continuous reconciliation while gates are still running.
 const GATE_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// While every polled gate runner still runs, a pass runs at most this often for them, so a gate's
+/// time limit is still enforced.
+const GATE_POLL_PASS_INTERVAL: Duration = Duration::from_secs(60);
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
 // A new harness can spend longer than the retry sequence reading its boot
 // contract before it claims work. Keep the quick delivery retries, but do not
@@ -494,6 +497,8 @@ pub struct Reconciler<R = NativeRuntime> {
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
     armed_observers: Arc<Mutex<std::collections::HashSet<String>>>,
     gate_poll_armed: Arc<AtomicBool>,
+    /// The gate runners the gate poll watches.
+    gate_poll_runtimes: Arc<Mutex<BTreeSet<String>>>,
     observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_cursors: Arc<Mutex<HashMap<String, Option<String>>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
@@ -596,6 +601,7 @@ impl Reconciler<NativeRuntime> {
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
+            gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
@@ -640,6 +646,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
+            gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
@@ -5721,7 +5728,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             match self.runtime.observe_exec(&runtime_id)? {
                 Some(observation) if observation.status == "running" => {
-                    self.arm_gate_poll();
+                    self.arm_gate_poll(&runtime_id);
                     return Ok(None);
                 }
                 Some(observation) if observation.status == "exited" => {
@@ -5749,7 +5756,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     return Ok(Some(value));
                 }
                 _ => {
-                    self.arm_gate_poll();
+                    self.arm_gate_poll(&runtime_id);
                     return Ok(None);
                 }
             }
@@ -5794,7 +5801,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             &member,
             "the loop metric was requested",
         )?;
-        self.arm_gate_poll();
+        self.arm_gate_poll(&member.runtime_id);
         Ok(None)
     }
 
@@ -9566,7 +9573,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             match self.runtime.observe_exec(&runtime_id)? {
                 Some(observation) if observation.status == "running" => {
-                    self.arm_gate_poll();
+                    self.arm_gate_poll(&runtime_id);
                     return Ok(GateOutcome::Pending);
                 }
                 Some(observation) if observation.status == "exited" => {
@@ -9593,7 +9600,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     });
                 }
                 _ => {
-                    self.arm_gate_poll();
+                    self.arm_gate_poll(&runtime_id);
                     return Ok(GateOutcome::Pending);
                 }
             }
@@ -9636,7 +9643,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             owner_step: None,
         };
         self.perform_start(&desired, &member, "the mechanical gate was requested")?;
-        self.arm_gate_poll();
+        self.arm_gate_poll(&member.runtime_id);
         Ok(GateOutcome::Pending)
     }
 
@@ -9666,15 +9673,48 @@ impl<R: RuntimeControl> Reconciler<R> {
             }))
     }
 
-    fn arm_gate_poll(&self) {
+    /// Watch gate runner `runtime_id` until it stops running. The poll reads only the runners'
+    /// exec state and runs a full pass when one is no longer running: a pass every ten seconds for
+    /// as long as a long gate ran was most of an idle member's reconcile work.
+    fn arm_gate_poll(&self, runtime_id: &str) {
+        self.gate_poll_runtimes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(runtime_id.to_owned());
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             if self.gate_poll_armed.swap(true, Ordering::AcqRel) {
                 return;
             }
             let notify = self.notify.clone();
             let armed = self.gate_poll_armed.clone();
+            let runtimes = self.gate_poll_runtimes.clone();
+            let runtime = self.runtime.clone();
             handle.spawn(async move {
-                tokio::time::sleep(GATE_POLL_INTERVAL).await;
+                let armed_at = tokio::time::Instant::now();
+                loop {
+                    tokio::time::sleep(GATE_POLL_INTERVAL).await;
+                    let watched = runtimes
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
+                    let runtime = runtime.clone();
+                    let all_running = tokio::task::spawn_blocking(move || {
+                        watched.iter().all(|runtime_id| {
+                            runtime.observe_exec(runtime_id).is_ok_and(|observation| {
+                                observation.is_some_and(|item| item.status == "running")
+                            })
+                        })
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if !all_running || armed_at.elapsed() >= GATE_POLL_PASS_INTERVAL {
+                        break;
+                    }
+                }
+                runtimes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clear();
                 armed.store(false, Ordering::Release);
                 crate::performance::record_wake("timer gate-poll", None);
                 notify.notify_one();
@@ -11581,8 +11621,8 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         );
 
         // Several pending gates must not restart a full host pass every two seconds.
-        for _ in 0..10 {
-            reconciler.arm_gate_poll();
+        for index in 0..10 {
+            reconciler.arm_gate_poll(&format!("gate-{index}"));
         }
         assert!(
             tokio::time::timeout(Duration::from_secs(4), notify.notified())
@@ -11597,6 +11637,60 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_running_gate_runner_is_watched_without_a_pass_until_it_exits() {
+        let notify = Arc::new(Notify::new());
+        let runtime = Arc::new(FakeRuntime::default());
+        let running = |status: &str| RuntimeObservation {
+            runtime_id: "gate-runner".into(),
+            terminal: false,
+            status: status.into(),
+            exit_code: None,
+            incarnation_id: None,
+        };
+        runtime
+            .execs
+            .lock()
+            .unwrap()
+            .insert("gate-runner".into(), running("running"));
+        let reconciler = Reconciler::new(
+            Arc::new(Store::open_memory("node").unwrap()),
+            runtime.clone(),
+            "node".into(),
+            notify.clone(),
+        );
+        reconciler.arm_gate_poll("gate-runner");
+        // Polls at 10, 20 and 30 seconds find the runner still running and wake no pass.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(35), notify.notified())
+                .await
+                .is_err()
+        );
+        runtime
+            .execs
+            .lock()
+            .unwrap()
+            .insert("gate-runner".into(), running("exited"));
+        tokio::time::timeout(Duration::from_secs(11), notify.notified())
+            .await
+            .expect("the poll after the runner exited should wake reconciliation");
+        // A runner that keeps running still gets a pass every minute, for its time limit.
+        runtime
+            .execs
+            .lock()
+            .unwrap()
+            .insert("gate-runner".into(), running("running"));
+        reconciler.arm_gate_poll("gate-runner");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(55), notify.notified())
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(10), notify.notified())
+            .await
+            .expect("a long gate still gets a pass every minute");
     }
 
     #[test]

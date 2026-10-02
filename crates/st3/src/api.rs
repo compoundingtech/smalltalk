@@ -503,6 +503,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/messages/delivery/{*subject}", get(message_delivery))
         .route("/v1/status", get(status))
+        .route("/v1/desired/{*subject}", get(get_desired))
         .route("/v1/events", get(events))
         .route("/v1/doctor", get(doctor))
         .route("/v1/repair", get(operational_repair_plan))
@@ -9198,6 +9199,22 @@ struct StatusQuery {
     history: bool,
 }
 
+/// One subject's desired record. Each Claude seat's status line reads it on every render (every
+/// five seconds), which a full status reduction of the seat made a tenth of a core on a member.
+async fn get_desired(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<crate::model::DesiredSubject>, ApiError> {
+    let store = state.store.clone();
+    let named = subject.clone();
+    blocking_store(move || store.desired_subjects_named(&[named]))
+        .await?
+        .into_iter()
+        .next()
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("`{subject}` has no desired record")))
+}
+
 async fn status(
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
@@ -11606,6 +11623,35 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn a_seat_reads_its_own_desired_record_for_its_status_line() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        state
+            .store
+            .apply_internal(
+                &parse_intent(
+                    r#"version 2
+agent "eval/named" { name "Quartz"; workspace "/tmp"; harness "claude" {} }
+"#,
+                    "node",
+                )
+                .unwrap(),
+                "desired-fixture",
+            )
+            .unwrap();
+        let app = router(state);
+        let (status, seat) = get_request(app.clone(), "/v1/desired/agent/eval/named").await;
+        assert_eq!(status, StatusCode::OK, "{seat}");
+        let seat: crate::model::DesiredSubject = serde_json::from_value(seat).unwrap();
+        assert_eq!(
+            crate::mailbox::seat_label(&seat, Some("gen")),
+            "Quartz[gen]"
+        );
+        let (status, missing) = get_request(app, "/v1/desired/agent/eval/absent").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    }
 
     #[tokio::test]
     async fn delivery_hold_api_enforces_authority_and_keeps_presence_separate() {
