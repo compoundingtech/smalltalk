@@ -727,6 +727,8 @@ fn codex_context_recomputes_the_captured_reading_and_pins_its_verified_version()
         harness_context::RateLimits {
             five_hour: None,
             seven_day: Some(44.0),
+            seven_day_resets_at_ms: Some(1_788_452_803_000),
+            ..Default::default()
         }
     );
     assert_eq!(observed.compactions, 0);

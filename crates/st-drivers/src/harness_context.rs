@@ -160,6 +160,29 @@ pub struct RateLimits {
     pub five_hour: Option<f64>,
     #[serde(default)]
     pub seven_day: Option<f64>,
+    /// When each window resets, in Unix milliseconds, as the harness reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_resets_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_resets_at_ms: Option<u64>,
+}
+
+impl RateLimits {
+    /// What a limit reader alarms on: each window's whole percent and its reset. A change in any
+    /// of them is worth a write.
+    fn bucket(&self) -> [Option<i64>; 4] {
+        let percent = |value: Option<f64>| {
+            value
+                .filter(|value| value.is_finite())
+                .map(|value| value.floor() as i64)
+        };
+        [
+            percent(self.five_hour),
+            percent(self.seven_day),
+            self.five_hour_resets_at_ms.map(|at| at as i64),
+            self.seven_day_resets_at_ms.map(|at| at as i64),
+        ]
+    }
 }
 
 impl RateLimits {
@@ -215,6 +238,12 @@ struct Record {
     /// record, not two (HC-R16). A record predating the field decodes through `default`.
     #[serde(default)]
     rate_limits: RateLimits,
+    /// The paying account the limits belong to (see `crate::account`) and the plan the harness
+    /// named for it, when it names them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<String>,
     #[serde(default)]
     compactions: u64,
     #[serde(default)]
@@ -250,6 +279,8 @@ pub struct Reading {
     pub cost_usd: Option<f64>,
     pub session_total_tokens: Option<u64>,
     pub rate_limits: RateLimits,
+    pub account: Option<String>,
+    pub plan: Option<String>,
 }
 
 /// One compaction edge as a producer observed it (HC-R12). `count` is `None` where st2 does the
@@ -521,6 +552,11 @@ impl Writer {
                 ),
                 (None, None) => (None, None, None, None, None, None, RateLimits::default()),
             };
+        let (account, plan) = match (&reading, current.as_ref()) {
+            (Some(reading), _) => (reading.account.clone(), reading.plan.clone()),
+            (None, Some(current)) => (current.account.clone(), current.plan.clone()),
+            (None, None) => (None, None),
+        };
         let observed_at_ms = match (&reading, current.as_ref()) {
             // A compaction edge with no reading behind it does not re-stamp the reading: the
             // numbers are as old as they were, and saying otherwise would hide that.
@@ -550,6 +586,8 @@ impl Writer {
             cost_usd,
             session_total_tokens: session_total,
             rate_limits: limits,
+            account,
+            plan,
             compactions: match (compaction, current.as_ref()) {
                 (Some(edge), current) => edge
                     .count
@@ -594,6 +632,14 @@ impl Writer {
         {
             return true;
         }
+        // Account limits are read across the fleet to decide when to stop an account's seats,
+        // so each whole percent, reset or account change lands at once.
+        if current.rate_limits.bucket() != reading.rate_limits.bucket()
+            || current.account != reading.account
+            || current.plan != reading.plan
+        {
+            return true;
+        }
         // Age is measured from the WRITE, not from the reading: the clause asks how long it has
         // been since anything reached the transport.
         let age = now_ms.saturating_sub(current.written_at_ms);
@@ -632,6 +678,8 @@ pub struct Observed {
     pub cost_usd: Option<f64>,
     pub session_total_tokens: Option<u64>,
     pub rate_limits: RateLimits,
+    pub account: Option<String>,
+    pub plan: Option<String>,
     pub compactions: u64,
     pub last_compaction_ms: Option<u64>,
     pub last_compaction_trigger: Option<CompactionTrigger>,
@@ -715,6 +763,8 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
         cost_usd: record.cost_usd,
         session_total_tokens: record.session_total_tokens,
         rate_limits: record.rate_limits,
+        account: record.account,
+        plan: record.plan,
         compactions: record.compactions,
         last_compaction_ms: record.last_compaction_ms,
         last_compaction_trigger: record.last_compaction_trigger,
@@ -799,7 +849,9 @@ mod tests {
                 rate_limits: RateLimits {
                     five_hour: Some(31.0),
                     seven_day: Some(55.0),
+                    ..Default::default()
                 },
+                ..Default::default()
             })
             .unwrap();
         writer
@@ -950,6 +1002,36 @@ mod tests {
     }
 
     #[test]
+    fn each_whole_limit_percent_reset_and_account_lands_with_the_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = catalog(tmp.path());
+        let mut writer = Writer::new(&agent_dir, "example-linux.worker", Harness::Codex).unwrap();
+        let weekly = |percent: f64, resets_at_ms, account: &str| Reading {
+            rate_limits: RateLimits {
+                seven_day: Some(percent),
+                seven_day_resets_at_ms: Some(resets_at_ms),
+                ..Default::default()
+            },
+            account: Some(account.into()),
+            plan: Some("pro".into()),
+            ..reading(85_000, 33.0)
+        };
+        assert!(writer.observe(weekly(94.2, 7_000, "codex/aaaa")).unwrap());
+        assert!(
+            !writer.observe(weekly(94.8, 7_000, "codex/aaaa")).unwrap(),
+            "the same whole percent waits for the heartbeat"
+        );
+        assert!(writer.observe(weekly(95.0, 7_000, "codex/aaaa")).unwrap());
+        assert!(writer.observe(weekly(95.0, 9_000, "codex/aaaa")).unwrap());
+        assert!(writer.observe(weekly(95.0, 9_000, "codex/bbbb")).unwrap());
+        let observed = read(&harness_context_path(&agent_dir)).unwrap();
+        assert_eq!(observed.rate_limits.seven_day, Some(95.0));
+        assert_eq!(observed.rate_limits.seven_day_resets_at_ms, Some(9_000));
+        assert_eq!(observed.account.as_deref(), Some("codex/bbbb"));
+        assert_eq!(observed.plan.as_deref(), Some("pro"));
+    }
+
+    #[test]
     fn claude_rate_limit_exhaustion_and_reset_crossings_land_inside_one_usage_bucket() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
@@ -958,6 +1040,7 @@ mod tests {
             rate_limits: RateLimits {
                 five_hour: Some(five_hour),
                 seven_day: Some(55.0),
+                ..Default::default()
             },
             ..reading(used_tokens, used_percent)
         };
@@ -996,6 +1079,7 @@ mod tests {
                     rate_limits: RateLimits {
                         five_hour: None,
                         seven_day: Some(100.0),
+                        ..Default::default()
                     },
                     ..reading(85_000, 33.0)
                 })
@@ -1006,19 +1090,22 @@ mod tests {
             !read(&path).unwrap().is_rate_limited(),
             "included allowance exhaustion is not Codex availability evidence"
         );
+        // The reset lands because the fleet reads account limits, yet it changes no availability
+        // classification either way.
         assert!(
-            !writer
+            writer
                 .observe(Reading {
                     rate_limits: RateLimits {
                         five_hour: None,
                         seven_day: Some(0.0),
+                        ..Default::default()
                     },
                     ..reading(85_400, 33.4)
                 })
-                .unwrap(),
-            "a Codex allowance reset is not a classification edge"
+                .unwrap()
         );
-        assert_eq!(fs::read(path).unwrap(), exhausted, "no write landed");
+        assert_ne!(fs::read(&path).unwrap(), exhausted);
+        assert!(!read(&path).unwrap().is_rate_limited());
     }
 
     /// The withheld case has its own bucket behaviour: `null` has no bucket, so withheld↔known is

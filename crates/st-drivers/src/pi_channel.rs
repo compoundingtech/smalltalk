@@ -702,6 +702,8 @@ fn context_frame(frame: &Value) -> Option<ContextFrame> {
             session_total_tokens: None,
             // Neither harness reports account-scoped rate limits.
             rate_limits: harness_context::RateLimits::default(),
+            account: None,
+            plan: None,
         }
     });
     let compaction = frame

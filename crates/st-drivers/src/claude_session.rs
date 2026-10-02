@@ -1571,7 +1571,18 @@ pub fn statusline_reading(payload: &serde_json::Value) -> Reading {
             seven_day: payload
                 .pointer("/rate_limits/seven_day/used_percentage")
                 .and_then(serde_json::Value::as_f64),
+            // Claude reports each reset in Unix seconds.
+            five_hour_resets_at_ms: payload
+                .pointer("/rate_limits/five_hour/resets_at")
+                .and_then(serde_json::Value::as_u64)
+                .map(|at| at.saturating_mul(1000)),
+            seven_day_resets_at_ms: payload
+                .pointer("/rate_limits/seven_day/resets_at")
+                .and_then(serde_json::Value::as_u64)
+                .map(|at| at.saturating_mul(1000)),
         },
+        account: None,
+        plan: None,
     }
 }
 
@@ -1613,8 +1624,11 @@ fn record_statusline(catalog_root: &Path, identity: &str, raw: &[u8]) -> Result<
     // call that provably cannot record is worse than none: it reads as instrumentation.
     // `06-observability`'s spec already scopes `hook_invocations_total` to `claude-observe` and
     // says other hook surfaces are not instrumented yet, which is exactly this.
+    let mut reading = statusline_reading(&payload);
+    // The limits belong to the account this Claude config is signed in to.
+    reading.account = crate::account::claude_account_cached(&agent_dir);
     context_writer(&agent_dir, identity, &payload)?
-        .observe(statusline_reading(&payload))
+        .observe(reading)
         .map(|_landed| ())
 }
 

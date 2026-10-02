@@ -182,6 +182,9 @@ pub struct Config {
     /// default, so a config this build writes still loads in a build without checkpoints.
     #[serde(skip_serializing_if = "CheckpointConfig::is_default")]
     pub checkpoint: CheckpointConfig,
+    /// What this node does when an account nears its weekly limit. Off unless enabled.
+    #[serde(skip_serializing_if = "LimitsConfig::is_default")]
+    pub limits: LimitsConfig,
     /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
     #[serde(skip)]
     pub fleet: Option<FleetFile>,
@@ -205,6 +208,45 @@ impl Default for CheckpointConfig {
 impl CheckpointConfig {
     pub fn is_default(&self) -> bool {
         self == &Self::default()
+    }
+}
+
+/// `[limits]`: when an account's freshest weekly reading reaches `stop_at_weekly_percent`, this
+/// node stops the seats it hosts that use that account, except those in `keep`, once per weekly
+/// window, and asks `ask` (else `person`) on their home. A seat a person starts again stays up
+/// until the next window. Every node that hosts seats needs the same settings.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    pub enabled: bool,
+    pub stop_at_weekly_percent: u32,
+    /// Seats never stopped, such as the seat that coordinates the fleet.
+    pub keep: Vec<String>,
+    /// The person asked; the node's `person` when absent.
+    pub ask: Option<String>,
+    /// A reading older than this is not acted on, as a number followed by `s`, `m`, `h` or `d`.
+    pub fresh: String,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stop_at_weekly_percent: 95,
+            keep: Vec::new(),
+            ask: None,
+            fresh: "1h".into(),
+        }
+    }
+}
+
+impl LimitsConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn fresh_ms(&self) -> Result<u64> {
+        parse_duration_ms(&self.fresh, "limits.fresh")
     }
 }
 
@@ -235,25 +277,30 @@ impl ObservationsConfig {
     pub const MINIMUM_RETENTION_MS: u64 = 60 * 60 * 1000;
 
     pub fn retention_ms(&self) -> Result<u64> {
-        let value = self.retention.trim();
-        let split = value
-            .find(|character: char| !character.is_ascii_digit())
-            .unwrap_or(value.len());
-        let (amount, unit) = value.split_at(split);
-        let amount: u64 = amount
-            .parse()
-            .with_context(|| format!("observations.retention `{value}` needs a number"))?;
-        let unit_ms: u64 = match unit {
-            "s" => 1_000,
-            "m" => 60_000,
-            "h" => 3_600_000,
-            "d" => 86_400_000,
-            _ => anyhow::bail!("observations.retention `{value}` needs a unit of s, m, h or d"),
-        };
-        amount
-            .checked_mul(unit_ms)
-            .with_context(|| format!("observations.retention `{value}` is too long"))
+        parse_duration_ms(&self.retention, "observations.retention")
     }
+}
+
+/// A duration such as `90s`, `30m`, `1h` or `7d`, in milliseconds.
+fn parse_duration_ms(value: &str, name: &str) -> Result<u64> {
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (amount, unit) = value.split_at(split);
+    let amount: u64 = amount
+        .parse()
+        .with_context(|| format!("{name} `{value}` needs a number"))?;
+    let unit_ms: u64 = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => anyhow::bail!("{name} `{value}` needs a unit of s, m, h or d"),
+    };
+    amount
+        .checked_mul(unit_ms)
+        .with_context(|| format!("{name} `{value}` is too long"))
 }
 
 impl Default for Config {
@@ -279,6 +326,7 @@ impl Default for Config {
             planner: PlannerSpec::default(),
             observations: ObservationsConfig::default(),
             checkpoint: CheckpointConfig::default(),
+            limits: LimitsConfig::default(),
             fleet: None,
         }
     }
@@ -420,6 +468,27 @@ impl Config {
         );
         if let Some(otlp) = &self.observations.otlp {
             otlp.validate()?;
+        }
+        if self.limits.enabled {
+            self.limits.fresh_ms()?;
+            anyhow::ensure!(
+                (1..=100).contains(&self.limits.stop_at_weekly_percent),
+                "limits.stop_at_weekly_percent must be between 1 and 100"
+            );
+            anyhow::ensure!(
+                self.limits
+                    .keep
+                    .iter()
+                    .all(|seat| seat.starts_with("agent/")),
+                "limits.keep lists agent/... subjects"
+            );
+            let ask = self.limits.ask.as_deref().or(self.person.as_deref());
+            anyhow::ensure!(
+                ask.is_some_and(|person| person.starts_with("person/")
+                    && person.matches('/').count() == 1
+                    && person.len() > "person/".len()),
+                "limits needs a person to ask: set limits.ask or person"
+            );
         }
         anyhow::ensure!(
             self.person.as_deref().is_none_or(|person| {
@@ -594,6 +663,32 @@ mod tests {
         );
         assert!(error.contains("--client-gateway-socket"), "{error}");
         assert!(error.contains("XDG_RUNTIME_DIR"), "{error}");
+    }
+
+    #[test]
+    fn the_limits_policy_is_off_until_enabled_and_needs_a_person_to_ask() {
+        let config = Config::default();
+        assert!(!config.limits.enabled);
+        assert_eq!(config.limits.stop_at_weekly_percent, 95);
+        assert!(!toml::to_string(&config).unwrap().contains("[limits]"));
+
+        let parsed: Config = toml::from_str(
+            "[limits]\nenabled = true\nkeep = [\"agent/example/coordinator\"]\nfresh = \"30m\"\n",
+        )
+        .unwrap();
+        let error = parsed.validate().unwrap_err().to_string();
+        assert!(error.contains("a person to ask"), "{error}");
+        let mut config = parsed.clone();
+        config.person = Some("person/avery".into());
+        config.validate().unwrap();
+        assert_eq!(config.limits.fresh_ms().unwrap(), 30 * 60_000);
+        for (field, value) in [("stop_at_weekly_percent", "0"), ("keep", "[\"seat\"]")] {
+            let parsed: Config = toml::from_str(&format!(
+                "person = \"person/avery\"\n[limits]\nenabled = true\n{field} = {value}\n"
+            ))
+            .unwrap();
+            assert!(parsed.validate().is_err(), "{field}");
+        }
     }
 
     #[test]

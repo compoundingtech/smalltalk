@@ -124,6 +124,9 @@ pub(super) struct CodexContextProducer {
     /// rolling update* whose absent fields do not clear a previously observed value, so the last
     /// known windows ride along with the next reading instead of blanking it.
     rate_limits: harness_context::RateLimits,
+    /// The paying account (from `account/read`) and the plan Codex names with its limits.
+    account: Option<String>,
+    plan: Option<String>,
     counted_compactions: VecDeque<CodexCompactionKey>,
     /// Highest rollout ordinal examined by the bounded transcript fallback. The first snapshot
     /// establishes a baseline; only later ordinals belong to this live observer incarnation.
@@ -136,6 +139,8 @@ impl CodexContextProducer {
         Self {
             writer,
             rate_limits: harness_context::RateLimits::default(),
+            account: None,
+            plan: None,
             counted_compactions: VecDeque::new(),
             transcript_ordinal: None,
             transcript_started_at_ms: SystemTime::now()
@@ -303,7 +308,13 @@ impl CodexContextProducer {
                 .and_then(Value::as_i64)
                 .and_then(|total| u64::try_from(total).ok()),
             rate_limits: self.rate_limits,
+            account: self.account.clone(),
+            plan: self.plan.clone(),
         })
+    }
+
+    pub(super) fn set_account(&mut self, account: Option<String>) {
+        self.account = account;
     }
 
     /// Merge a sparse rate-limit update into the last-known windows.
@@ -326,7 +337,17 @@ impl CodexContextProducer {
                 && let Some(used) = snapshot.get("usedPercent").and_then(Value::as_f64)
             {
                 self.rate_limits.seven_day = Some(used);
+                // Codex reports the reset in Unix seconds.
+                if let Some(resets_at) = snapshot.get("resetsAt").and_then(Value::as_u64) {
+                    self.rate_limits.seven_day_resets_at_ms = Some(resets_at.saturating_mul(1000));
+                }
             }
+        }
+        if let Some(plan) = message
+            .pointer("/params/rateLimits/planType")
+            .and_then(Value::as_str)
+        {
+            self.plan = Some(plan.to_owned());
         }
     }
 

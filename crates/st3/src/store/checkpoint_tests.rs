@@ -261,7 +261,7 @@ fn usage_rollups_keep_hourly_ends_in_the_window_and_one_baseline_before_it() {
     const HOUR: u128 = 60 * 60 * 1000;
     let window = CUT - 7 * DAY_MS;
     let mut sealed = Sealed::default();
-    let mut usage = |sealed: &mut Sealed, at: u128, fields: Value| {
+    let usage = |sealed: &mut Sealed, at: u128, fields: Value| {
         sealed.add("alder", at, draft("harness.usage", AGENT, fields))
     };
     let mut total = 0;
@@ -314,6 +314,27 @@ fn usage_rollups_keep_hourly_ends_in_the_window_and_one_baseline_before_it() {
         ])
     );
     let _ = (legacy, first_hour[2].clone(), second_hour[1].clone());
+}
+
+#[test]
+fn limits_keep_each_seats_newest_reading() {
+    let mut sealed = Sealed::default();
+    let reading = |sealed: &mut Sealed, subject, at: u128| {
+        sealed.add(
+            "alder",
+            at,
+            draft(
+                "harness.limits",
+                subject,
+                json!({"driver": "claude", "account": "claude/aaaa", "weekly_percent": 50, "measured_at_unix_ms": at as u64}),
+            ),
+        )
+    };
+    let first = [1, 2, 3].map(|offset| reading(&mut sealed, AGENT, T + offset));
+    let other = reading(&mut sealed, "agent/alder.other", T + 4);
+    let plan = plan_drops(&sealed.build());
+    assert_eq!(dropped(&plan), ids([&first[0], &first[1]]));
+    let _ = other;
 }
 
 #[test]

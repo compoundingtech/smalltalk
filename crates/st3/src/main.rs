@@ -3951,6 +3951,25 @@ async fn run_up(args: UpArgs) -> Result<()> {
         }
     });
     tokio::spawn(st3::profile::watch_runtime_lag());
+    if config.limits.enabled {
+        tokio::spawn(enforce_account_limits(
+            store.clone(),
+            st3::store::LimitsPolicy {
+                stop_at_weekly_percent: config.limits.stop_at_weekly_percent,
+                keep: config.limits.keep.iter().cloned().collect(),
+                person: config
+                    .limits
+                    .ask
+                    .clone()
+                    .or_else(|| config.person.clone())
+                    .expect("the daemon validated its limits person"),
+                fresh_ms: config
+                    .limits
+                    .fresh_ms()
+                    .expect("the daemon validated its limits freshness"),
+            },
+        ));
+    }
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
@@ -6703,6 +6722,44 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
             "UNPRICED  {} tokens on models without a price",
             total[6]
         );
+    }
+    let limits = report["limits"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !limits.is_empty() && only.is_none() {
+        let percent = |value: &Value| {
+            value
+                .as_f64()
+                .map_or_else(|| "?".to_owned(), |value| format!("{value:.0}%"))
+        };
+        let time = |value: &Value| {
+            value
+                .as_u64()
+                .and_then(|at| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at as i64))
+                .map_or_else(
+                    || "?".to_owned(),
+                    |at| at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                )
+        };
+        output.push('\n');
+        let _ = writeln!(
+            output,
+            "LIMITS  {} · the freshest reading of each account",
+            limits.len()
+        );
+        let _ = writeln!(output, "WEEKLY  5-HOUR  WEEKLY RESET  MEASURED  account");
+        for limit in limits {
+            let _ = writeln!(
+                output,
+                "{}  {}  {}  {}  {}",
+                percent(&limit["weekly_percent"]),
+                percent(&limit["five_hour_percent"]),
+                time(&limit["weekly_resets_at_unix_ms"]),
+                time(&limit["measured_at_unix_ms"]),
+                limit["account"].as_str().unwrap_or("unknown"),
+            );
+        }
     }
     let groups = only
         .map(|by| vec![by])
@@ -12778,6 +12835,7 @@ async fn drive_st2_native(
     let mut renewed_minute = None;
     let mut last_activity_fingerprint = None;
     let mut last_usage_fingerprint = None;
+    let mut last_limits_fingerprint = None;
     let mut last_control_warning = None;
     let mut last_capacity_fingerprint = None;
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
@@ -13010,6 +13068,15 @@ async fn drive_st2_native(
                                 &incarnation,
                                 &agent_dir,
                                 &mut last_usage_fingerprint,
+                            )
+                            .await?;
+                            publish_harness_limits(
+                                client,
+                                subject,
+                                driver,
+                                &incarnation,
+                                &agent_dir,
+                                &mut last_limits_fingerprint,
                             )
                             .await?;
                         }
@@ -13275,6 +13342,77 @@ async fn publish_harness_activity(
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: Some(format!("native-activity:{subject}:{fingerprint}")),
+            },
+        )
+        .await?;
+    *last_fingerprint = Some(fingerprint);
+    Ok(())
+}
+
+/// Publish the harness's latest reading of its paying account's limits when any of it changed.
+/// Readers take the freshest reading per account across the fleet, so the reading keeps the time
+/// the harness measured it, not when st published it.
+async fn publish_harness_limits(
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    incarnation: &str,
+    agent_dir: &Path,
+    last_fingerprint: &mut Option<String>,
+) -> Result<()> {
+    let Some(observed) = st_drivers::harness_context::read(
+        &st_drivers::harness_context::harness_context_path(agent_dir),
+    ) else {
+        return Ok(());
+    };
+    let limits = observed.rate_limits;
+    if limits.five_hour.is_none() && limits.seven_day.is_none() {
+        return Ok(());
+    }
+    let mut fields = BTreeMap::from([
+        ("driver".into(), Value::String(driver.into())),
+        ("incarnation_id".into(), Value::String(incarnation.into())),
+        (
+            "measured_at_unix_ms".into(),
+            Value::from(observed.observed_at_ms),
+        ),
+    ]);
+    for (name, value) in [("account", &observed.account), ("plan", &observed.plan)] {
+        if let Some(value) = value {
+            fields.insert(name.into(), Value::String(value.clone()));
+        }
+    }
+    for (name, value) in [
+        ("five_hour_percent", limits.five_hour),
+        ("weekly_percent", limits.seven_day),
+    ] {
+        if let Some(value) = value.filter(|value| value.is_finite()) {
+            fields.insert(name.into(), Value::from(value));
+        }
+    }
+    for (name, value) in [
+        ("five_hour_resets_at_unix_ms", limits.five_hour_resets_at_ms),
+        ("weekly_resets_at_unix_ms", limits.seven_day_resets_at_ms),
+    ] {
+        if let Some(value) = value {
+            fields.insert(name.into(), Value::from(value));
+        }
+    }
+    let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
+    if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(());
+    }
+    let _: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: subject.into(),
+                kind: "harness.limits".into(),
+                actor: Some(subject.into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("harness-limits:{subject}:{fingerprint}")),
             },
         )
         .await?;
@@ -14437,6 +14575,7 @@ async fn drive_codex_native(
     let mut renewed_minute = None;
     let mut last_activity_fingerprint = None;
     let mut last_usage_fingerprint = None;
+    let mut last_limits_fingerprint = None;
     let mut last_control_warning = None;
     let mut last_capacity_fingerprint = None;
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
@@ -14575,6 +14714,15 @@ async fn drive_codex_native(
                         &incarnation,
                         &agent_dir,
                         &mut last_usage_fingerprint,
+                    )
+                    .await?;
+                    publish_harness_limits(
+                        client,
+                        subject,
+                        "codex",
+                        &incarnation,
+                        &agent_dir,
+                        &mut last_limits_fingerprint,
                     )
                     .await?;
                     // The Codex runtime stamps its timeline with its own incarnation, which
@@ -15812,6 +15960,32 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
 
 /// Trim the local observation log at startup and then once an hour. Local observations
 /// never replicate, so this never changes what any peer holds.
+/// Apply this node's `[limits]` policy every two minutes: stop the seats it hosts on an account
+/// past its weekly limit, and ask the policy's person once per weekly window.
+async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPolicy) {
+    const LIMITS_INTERVAL: Duration = Duration::from_secs(2 * 60);
+    loop {
+        let pass = store.clone();
+        let policy = policy.clone();
+        match tokio::task::spawn_blocking(move || {
+            st3::profile::task("task enforce-account-limits", || {
+                pass.enforce_account_limits(&policy, now_ms())
+            })
+        })
+        .await
+        {
+            Ok(Ok(outcome)) => {
+                for seat in outcome.stopped {
+                    eprintln!("st3: limits policy stopped {seat}");
+                }
+            }
+            Ok(Err(error)) => eprintln!("st3: limits policy failed: {error}"),
+            Err(error) => eprintln!("st3: limits policy stopped: {error}"),
+        }
+        tokio::time::sleep(LIMITS_INTERVAL).await;
+    }
+}
+
 async fn trim_local_observations(store: Arc<Store>, observations: st3::config::ObservationsConfig) {
     const LOCAL_OBSERVATION_TRIM_INTERVAL: Duration = Duration::from_secs(60 * 60);
     const LOCAL_OBSERVATION_TRIM_CHUNK: usize = 5_000;
@@ -16122,6 +16296,16 @@ mod tests {
         assert!(output.contains("$4.00  40  7  3  4  26  step-run/two/review"));
         assert!(output.contains("$4.00  40  7  3  4  26  claude/bbbb"));
         assert!(output.contains("$0.00+  50  50  0  0  0  unknown"));
+        let with_limits = json!({"rows": [], "limits": [
+            {"account": "claude/aaaa", "weekly_percent": 96.4, "five_hour_percent": null,
+             "weekly_resets_at_unix_ms": 1_800_000_000_000_u64, "measured_at_unix_ms": 1_799_000_000_000_u64},
+        ]});
+        let output_with_limits = render_usage_report(&with_limits, 24, None);
+        assert!(
+            output_with_limits
+                .contains("96%  ?  2027-01-15 08:00 UTC  2027-01-03 18:13 UTC  claude/aaaa"),
+            "{output_with_limits}"
+        );
         let by_step = render_usage_report(&report, 24, Some(UsageBy::Step));
         assert_eq!(by_step.matches("USAGE  ").count(), 1);
         assert!(by_step.contains("by step"));

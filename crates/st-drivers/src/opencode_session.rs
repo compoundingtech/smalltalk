@@ -1440,6 +1440,8 @@ impl ContextProducer {
             cost_usd: self.cost_usd,
             session_total_tokens: self.session_total_tokens,
             rate_limits: harness_context::RateLimits::default(),
+            account: None,
+            plan: None,
         }
     }
 

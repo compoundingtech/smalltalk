@@ -50,6 +50,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_subscription_mission_deferrals",
         "local_usage_spend",
         "local_usage_responses",
+        "local_limit_stops",
         "local_latest_slots",
         "graph_generation",
         "projection_digest_state",
