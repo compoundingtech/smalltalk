@@ -295,12 +295,12 @@ mod tests {
 
     #[test]
     fn claude_resumes_only_its_workspace_transcript() {
-        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
         let workspace = Path::new("/work/seat.one");
-        let home = Some(home.path());
+        let home = Some(root.path());
         let missing = claude_argv(argv(&["claude", "--model", "x"]), "abc", workspace, home);
         assert_eq!(missing.unwrap_err().code, "transcript-missing");
-        let transcript = claude_transcript(home.unwrap(), workspace, "abc");
+        let transcript = claude_transcript(root.path(), workspace, "abc");
         assert!(transcript.ends_with("projects/-work-seat-one/abc.jsonl"));
         fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         fs::write(&transcript, "{}\n").unwrap();

@@ -14906,22 +14906,6 @@ impl PiFamilyReports {
                 .await?;
             self.state = None;
         }
-        if let Some((native, path)) = self.native_session.clone() {
-            let _: ClaimRecord = client
-                .post(
-                    "/v1/agents/native-session",
-                    &json!({
-                        "subject": subject,
-                        "actor": subject,
-                        "incarnation_id": incarnation,
-                        "harness": driver,
-                        "session_id": native,
-                        "path": path,
-                    }),
-                )
-                .await?;
-            self.native_session = None;
-        }
         while let Some(message) = self.acknowledgements.first().cloned() {
             match &self.fence {
                 Some(fence) => mailbox_receipt(client, fence, &message, "delivered").await?,
@@ -14938,6 +14922,33 @@ impl PiFamilyReports {
                 stdout.flush().await?;
             }
             self.reads.remove(&message);
+        }
+        // Last, and never fatal: a report the daemon does not take must not hold back delivery.
+        // It stays pending and goes again with the next report.
+        if let Some((native, path)) = self.native_session.clone() {
+            let reported: Result<ClaimRecord> = client
+                .post(
+                    "/v1/agents/native-session",
+                    &json!({
+                        "subject": subject,
+                        "actor": subject,
+                        "incarnation_id": incarnation,
+                        "harness": driver,
+                        "session_id": native,
+                        "path": path,
+                    }),
+                )
+                .await;
+            match reported {
+                Ok(_) => self.native_session = None,
+                Err(error) => {
+                    let _ = write_driver_log(
+                        subject,
+                        &json!({"type":"native_session_report_failed","error":format!("{error:#}")})
+                            .to_string(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -15347,8 +15358,8 @@ async fn drive_codex_native(
                         }).await?;
                         loop_state.ready = true;
                     }
-                    if let Some(thread) = codex_bound_thread(&state_dir, prior_binding.as_ref()) {
-                        report_native_session(
+                    if let Some(thread) = codex_bound_thread(&state_dir, prior_binding.as_ref())
+                        && let Err(error) = report_native_session(
                             client,
                             subject,
                             &incarnation,
@@ -15357,7 +15368,9 @@ async fn drive_codex_native(
                             None,
                             &mut reported_session,
                         )
-                        .await?;
+                        .await
+                    {
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
                     }
                     let current_record = fs::read(&harness_state_path).ok();
                     loop_state.harness_record_started = harness_record_belongs_to_current_session(
