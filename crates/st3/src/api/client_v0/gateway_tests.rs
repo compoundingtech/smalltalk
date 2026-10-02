@@ -51,9 +51,13 @@ mod gateway_tests {
         };
         assert!(authenticate(&state, &request(None), "fabric-loopback").is_err());
         assert_eq!(
-            authenticate(&state, &request(Some("Bearer bearer-secret")), "fabric-loopback")
-                .unwrap()
-                .actor,
+            authenticate(
+                &state,
+                &request(Some("Bearer bearer-secret")),
+                "fabric-loopback"
+            )
+            .unwrap()
+            .actor,
             "person/alex/session/bearer"
         );
         for bearer in ["Bearer unknown", "Basic bearer-secret", "Bearer "] {
@@ -98,11 +102,7 @@ mod gateway_tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        let refused = app
-            .clone()
-            .oneshot(complete("wrong"))
-            .await
-            .unwrap();
+        let refused = app.clone().oneshot(complete("wrong")).await.unwrap();
         assert_eq!(refused.status(), StatusCode::FORBIDDEN);
         assert!(
             !refused
@@ -115,7 +115,11 @@ mod gateway_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(!response.headers().contains_key(axum::http::header::SET_COOKIE));
+        assert!(
+            !response
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE)
+        );
         let body: Value = serde_json::from_slice(
             &to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
                 .await
@@ -157,9 +161,13 @@ mod gateway_tests {
             let mut request = format!("ws://{address}/v1/client/collections/stream")
                 .into_client_request()
                 .unwrap();
-            request.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocols.parse().unwrap());
+            request
+                .headers_mut()
+                .insert(SEC_WEBSOCKET_PROTOCOL, protocols.parse().unwrap());
             if let Some(value) = authorization {
-                request.headers_mut().insert(AUTHORIZATION, value.parse().unwrap());
+                request
+                    .headers_mut()
+                    .insert(AUTHORIZATION, value.parse().unwrap());
             }
             request
         };
@@ -167,10 +175,20 @@ mod gateway_tests {
         let (mut socket, response) = tokio_tungstenite::connect_async(request(&protocols, None))
             .await
             .unwrap();
-        assert_eq!(response.headers()[SEC_WEBSOCKET_PROTOCOL], COLLECTION_SUBPROTOCOL);
-        socket.send(Message::Text(json!({
-            "kind": "subscribe", "id": "browser-agents", "collection": "agents"
-        }).to_string().into())).await.unwrap();
+        assert_eq!(
+            response.headers()[SEC_WEBSOCKET_PROTOCOL],
+            COLLECTION_SUBPROTOCOL
+        );
+        socket
+            .send(Message::Text(
+                json!({
+                    "kind": "subscribe", "id": "browser-agents", "collection": "agents"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
         let snapshot = next_json(&mut socket).await;
         assert_eq!(snapshot["kind"], "snapshot");
         assert_eq!(snapshot["id"], "browser-agents");
@@ -178,9 +196,18 @@ mod gateway_tests {
 
         for (offered, authorization) in [
             (COLLECTION_SUBPROTOCOL.to_owned(), None),
-            (format!("{COLLECTION_SUBPROTOCOL}, {BEARER_PROTOCOL_PREFIX}unknown"), None),
-            (format!("{protocols}, {BEARER_PROTOCOL_PREFIX}browser-secret"), None),
-            (format!("{COLLECTION_SUBPROTOCOL}, {BEARER_PROTOCOL_PREFIX}"), None),
+            (
+                format!("{COLLECTION_SUBPROTOCOL}, {BEARER_PROTOCOL_PREFIX}unknown"),
+                None,
+            ),
+            (
+                format!("{protocols}, {BEARER_PROTOCOL_PREFIX}browser-secret"),
+                None,
+            ),
+            (
+                format!("{COLLECTION_SUBPROTOCOL}, {BEARER_PROTOCOL_PREFIX}"),
+                None,
+            ),
             (protocols.clone(), Some("Bearer unknown")),
         ] {
             let error = tokio_tungstenite::connect_async(request(&offered, authorization))
@@ -196,20 +223,31 @@ mod gateway_tests {
         }
 
         // The bearer carrier is accepted only at a WebSocket upgrade, never on HTTP reads.
-        let read = Request::builder().uri("/v1/client/agents")
+        let read = Request::builder()
+            .uri("/v1/client/agents")
             .header(SEC_WEBSOCKET_PROTOCOL, &protocols)
-            .body(Body::empty()).unwrap();
+            .body(Body::empty())
+            .unwrap();
         assert!(authenticate(&state, &read, "fabric-loopback").is_err());
-        state.store.append_claim(&ClaimInput {
-            subject: "custom/client/pairing-browser".into(),
-            kind: "custom.client.pairing-revoked".into(),
-            actor: Some("person/alex".into()),
-            fields: BTreeMap::new(), evidence: Vec::new(),
-            expected_subject: None, idempotency_key: None,
-        }).unwrap();
-        let error = tokio_tungstenite::connect_async(request(&protocols, None)).await.unwrap_err();
-        assert!(matches!(error, tokio_tungstenite::tungstenite::Error::Http(response)
-            if response.status() == StatusCode::FORBIDDEN));
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/client/pairing-browser".into(),
+                kind: "custom.client.pairing-revoked".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let error = tokio_tungstenite::connect_async(request(&protocols, None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status() == StatusCode::FORBIDDEN)
+        );
         server.abort();
     }
 
@@ -231,9 +269,12 @@ mod gateway_tests {
             .into_client_request()
             .unwrap();
         // Model browser WebSocket: no Authorization header, only offered protocols.
-        request
-            .headers_mut()
-            .insert(SEC_WEBSOCKET_PROTOCOL, format!("{protocols}, {BEARER_PROTOCOL_PREFIX}viewer-secret").parse().unwrap());
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            format!("{protocols}, {BEARER_PROTOCOL_PREFIX}viewer-secret")
+                .parse()
+                .unwrap(),
+        );
         tokio_tungstenite::connect_async(request).await.unwrap().0
     }
 
