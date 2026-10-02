@@ -15,7 +15,7 @@
       },
       {
         "id": "timeline-entry/release-agent/9/2", "sequence": 2, "revision": 1, "timestamp": "2026-09-20T11:06:32Z",
-        "role": "user", "type": "message", "final": true, "body": { "message_id": "turn/1" }
+        "role": "user", "type": "message", "final": true, "body": { "message_id": "turn/1", "tags": ["dictated"] }
       },
       {
         "id": "timeline-entry/release-agent/9/3", "sequence": 3, "revision": 1, "timestamp": "2026-09-20T11:06:32Z",

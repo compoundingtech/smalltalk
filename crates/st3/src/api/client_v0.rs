@@ -3370,6 +3370,11 @@ fn session_message_body(claim: &ClaimRecord) -> Value {
     if let Some(title) = fields.get("title").and_then(Value::as_str) {
         body["title"] = Value::String(title.to_owned());
     }
+    if let Some(tags) = fields.get("tags").and_then(Value::as_array)
+        && !tags.is_empty()
+    {
+        body["tags"] = Value::Array(tags.clone());
+    }
     body
 }
 
@@ -11929,6 +11934,7 @@ mission "example/zero-run" state="ready" {
                     ("from".into(), Value::String("person/alex".into())),
                     ("to".into(), Value::String(subject.into())),
                     ("content".into(), Value::String("do the work".into())),
+                    ("tags".into(), json!(["dictated", "test-label"])),
                     ("status".into(), Value::String("sent".into())),
                     (
                         "session_id".into(),
@@ -12183,6 +12189,25 @@ mission "example/zero-run" state="ready" {
                 break;
             }
         }
+        let user_message = entries
+            .iter()
+            .find(|entry| {
+                entry["type"] == "message" && entry["body"]["message_id"] == message.subject
+            })
+            .unwrap();
+        assert_eq!(
+            user_message["body"]["tags"],
+            json!(["dictated", "test-label"])
+        );
+        assert_eq!(
+            state
+                .store
+                .message(&message.subject)
+                .unwrap()
+                .unwrap()
+                .content,
+            "do the work"
+        );
         let types = entries
             .iter()
             .filter_map(|entry| entry["type"].as_str())

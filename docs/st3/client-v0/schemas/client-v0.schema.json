@@ -1121,7 +1121,7 @@
     },
     "TimelineMessageBody": {
       "type": "object", "additionalProperties": false, "required": ["message_id"],
-      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": "string" }, "from": { "$ref": "#/$defs/Id" }, "to": { "$ref": "#/$defs/Id" }, "title": { "type": "string" } }
+      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": "string" }, "from": { "$ref": "#/$defs/Id" }, "to": { "$ref": "#/$defs/Id" }, "title": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } } }
     },
     "TimelineContentBody": {
       "type": "object", "additionalProperties": false, "required": ["media_type"],
