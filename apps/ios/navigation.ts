@@ -26,6 +26,7 @@ export type StackParams = {
   Attention: { id: string };
   Launch: { id: string };
   NewMission: undefined;
+  NewAgent: undefined;
   History: undefined;
 };
 /** The tabs, and Glasses while that experiment is on. */
