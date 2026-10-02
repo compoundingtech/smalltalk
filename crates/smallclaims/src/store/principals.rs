@@ -898,3 +898,107 @@ fn set_meta_tx(connection: &Connection, key: &str, value: &str) -> Result<()> {
         .execute(params![key, value])?;
     Ok(())
 }
+
+/// The rules as the graph holds them: for each `rule/NAME`, its latest [`crate::rules::RULE_SET`]
+/// claim in canonical order.
+pub fn current_rules_tx(connection: &Connection) -> Result<Vec<crate::rules::NamedRule>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT claims.subject, claims.id, claims.body FROM claims
+         WHERE claims.kind=?1 ORDER BY {CANONICAL_ORDER}"
+    ))?;
+    let mut latest = BTreeMap::new();
+    for row in statement.query_map([crate::rules::RULE_SET], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (subject, id, body) = row?;
+        latest.insert(subject, (id, body));
+    }
+    Ok(latest
+        .into_iter()
+        .filter_map(|(subject, (claim_id, body))| {
+            let body: Value = serde_json::from_str(&body).ok()?;
+            Some(crate::rules::NamedRule {
+                name: subject.strip_prefix("rule/")?.to_owned(),
+                claim_id,
+                rule: crate::rules::Rule::from_fields(body.get("fields")?)?,
+            })
+        })
+        .collect())
+}
+
+impl Store {
+    /// The rules, from memory; read again after any rule changes.
+    pub fn current_rules(&self) -> Result<Arc<Vec<crate::rules::NamedRule>>> {
+        if !self.rules_stale.load(Ordering::Acquire)
+            && let Some(rules) = self
+                .rules
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        {
+            return Ok(rules);
+        }
+        self.rules_stale.store(false, Ordering::Release);
+        let rules = Arc::new(current_rules_tx(&self.readers.get())?);
+        *self.rules.write().unwrap_or_else(PoisonError::into_inner) = Some(rules.clone());
+        Ok(rules)
+    }
+
+    /// Check a local write against the rules: refuse it under a rule in enforce mode, and record
+    /// each rule in audit mode that would have refused it. Writes without an actor, and the
+    /// audit records themselves, are the node's own and pass, and a person may always set a rule.
+    pub(crate) fn apply_rules(&self, input: &ClaimInput) -> Result<(), St3Error> {
+        let Some(actor) = input.actor.as_deref() else {
+            return Ok(());
+        };
+        if input.kind == crate::rules::RULE_AUDITED {
+            return Ok(());
+        }
+        // A person can always change the rules, so no rule can lock its owner out.
+        if input.kind == crate::rules::RULE_SET && Family::of(actor) == Some(Family::Person) {
+            return Ok(());
+        }
+        let rules = self.current_rules().map_err(internal)?;
+        if rules.is_empty() {
+            return Ok(());
+        }
+        let decision = crate::rules::decide(&rules, actor, &input.kind, &input.subject);
+        if let Some(denied) = decision.denied {
+            return Err(St3Error::new(
+                "rule-denied",
+                format!(
+                    "rule `{}` refuses {actor} writing {} on {}{}",
+                    denied.name,
+                    input.kind,
+                    input.subject,
+                    if denied.rule.description.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", denied.rule.description)
+                    }
+                ),
+            ));
+        }
+        for rule in decision.audited {
+            self.append_claim(&ClaimInput {
+                subject: format!("rule/{}", rule.name),
+                kind: crate::rules::RULE_AUDITED.into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("rule".into(), Value::String(rule.claim_id)),
+                    ("actor".into(), Value::String(actor.into())),
+                    ("action".into(), Value::String(input.kind.clone())),
+                    ("target".into(), Value::String(input.subject.clone())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })?;
+        }
+        Ok(())
+    }
+}

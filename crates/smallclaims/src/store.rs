@@ -351,6 +351,9 @@ pub struct Store {
     pub keyring: crate::principal::Keyring,
     /// Held while this node mints a key for a person or an agent.
     pub principal_minting: Mutex<()>,
+    /// The rules, read from the graph when `rules_stale` says they may have changed.
+    pub rules: std::sync::RwLock<Option<Arc<Vec<crate::rules::NamedRule>>>>,
+    pub rules_stale: AtomicBool,
     pub origin: String,
     /// The database file, or the shared-memory URI of an in-memory store. A checkpoint proof
     /// opens its own connection here to copy the store.
@@ -472,6 +475,8 @@ impl Store {
             member_key: std::sync::RwLock::new(None),
             keyring: crate::principal::Keyring::default(),
             principal_minting: Mutex::new(()),
+            rules: std::sync::RwLock::new(None),
+            rules_stale: AtomicBool::new(true),
             origin,
             path,
             shared_memory,
@@ -3969,7 +3974,12 @@ impl Store {
         if let Some(actor) = &input.actor {
             self.ensure_principal_key(actor)?;
         }
-        self.runtime.append_claim(self, input)
+        self.apply_rules(input)?;
+        let appended = self.runtime.append_claim(self, input);
+        if input.kind == crate::rules::RULE_SET {
+            self.rules_stale.store(true, Ordering::Release);
+        }
+        appended
     }
 
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
@@ -5129,8 +5139,10 @@ impl Store {
             )?;
         }
         drop(connection);
-        // Admitted claims, and any change to membership's trust roots, get their verdicts.
+        // Admitted claims, and any change to membership's trust roots, get their verdicts; a
+        // replicated rule takes effect here.
         if outcome.changed {
+            self.rules_stale.store(true, Ordering::Release);
             self.judge_claims(true)?;
         }
         Ok(outcome)
