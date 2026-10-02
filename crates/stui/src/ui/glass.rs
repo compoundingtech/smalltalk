@@ -2538,8 +2538,11 @@ impl Ui {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
         };
-        if matches!(pane, Pane::Home(_)) {
-            self.show_in(0, 0);
+        // Home floats over the glass: an item opened "here" opens Home with it selected. Asked
+        // for in a tab or a split, the item's card opens there like any pane (Nathan,
+        // 2026-10-02: Ctrl+T on a "needs you" item made no tab).
+        if matches!(pane, Pane::Home(_)) && how == Open::Here {
+            self.open_home();
             self.focus_pane(&pane);
             return;
         }
@@ -4570,6 +4573,26 @@ mod tests {
             (small.x, small.y, small.width, small.height),
             (6, 3, 68, 20)
         );
+    }
+
+    #[test]
+    fn a_needs_you_item_opens_in_a_new_tab_or_in_home() {
+        let mut ui = glass();
+        let item = ui.world.attention.items()[0].id.clone();
+        ui.open_in_glass(Pane::Home(Some(item.clone())), Open::Tab);
+        let key = Pane::Home(Some(item.clone())).key();
+        assert!(
+            tabs(&ui).2.iter().flatten().any(|pane| *pane == key),
+            "a tab for the item: {:?}",
+            tabs(&ui)
+        );
+        assert!(!ui.home_open());
+        assert!(screen(&ui).contains(&ui.world.attention.items()[0].title));
+        // Here, it opens Home with the item selected.
+        let other = ui.world.attention.items()[1].id.clone();
+        ui.open_in_glass(Pane::Home(Some(other.clone())), Open::Here);
+        assert!(ui.home_open());
+        assert_eq!(ui.attention_focus().as_deref(), Some(other.as_str()));
     }
 
     #[test]
