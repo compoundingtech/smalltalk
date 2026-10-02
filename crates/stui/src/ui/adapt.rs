@@ -235,7 +235,12 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                             })
                             .unwrap_or_else(|| "An agent".into()),
                         from_id: item.requester_id.clone().unwrap_or_default(),
-                        question: clean_message_text(&item.detail),
+                        question: clean_message_text(
+                            item.request
+                                .as_ref()
+                                .map_or(&item.detail, |request| &request.question),
+                        ),
+                        structured: item.request.clone().map(Box::new),
                     },
                 ),
                 // Home holds only requests and reviews. Messages stay in conversations, and st

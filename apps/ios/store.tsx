@@ -226,9 +226,10 @@ function useAppStore() {
       await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await clearCachedProjection();
       setCredential(null); setCaps(null); setPairingIssue(''); setHistoricalSessions([]); setStatus('setup');
     },
-    async done(item: Attention, summary: string) {
+    /** Complete a person step; `answer` is a structured request's named answer, by id. */
+    async done(item: Attention, summary: string, answer?: string) {
       if (!client) return false;
-      return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary } }); });
+      return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(answer ? { answer: { id: answer } } : {}) } }); });
     },
     /** Send Small Talk to an agent, as stui does: fenced to a fresh snapshot, once more if it moved. */
     async send(to: string, content: string, sessionId?: string, tags?: string[]): Promise<string | null> {
