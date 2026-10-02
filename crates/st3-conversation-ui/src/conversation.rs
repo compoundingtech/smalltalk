@@ -419,6 +419,7 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             subject,
             body,
             delivered,
+            dictated,
         } => {
             // Mail the person is part of leads; mail between others stays in the background
             // and folds like a tool call until opened.
@@ -482,6 +483,8 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     ),
                     run(format!("  {}", text::sanitize(subject)), on(subject_style)),
                     run(format!("  {}", entry.at), on(theme.dim())),
+                    // Spoken, then transcribed: a reader allows for transcription mistakes.
+                    run(if *dictated { "  🎤" } else { "" }, on(theme.dim())),
                     run(progress.text, on(progress.style)),
                 ],
                 inner,
@@ -778,6 +781,35 @@ mod tests {
     }
 
     #[test]
+    fn dictated_mail_carries_a_microphone_mark() {
+        let mail = |dictated: bool| {
+            entry(
+                "message/spoken",
+                Body::Mail {
+                    from: "you".into(),
+                    to: "planner".into(),
+                    subject: String::new(),
+                    body: "ship the harbor fix".into(),
+                    delivered: true,
+                    dictated,
+                },
+            )
+        };
+        let head = |dictated: bool| {
+            let doc = Cache::default().render(
+                &[mail(dictated)],
+                60,
+                &HashSet::new(),
+                "⠋",
+                &crate::tests::theme(),
+            );
+            text::plain(&doc.lines[0])
+        };
+        assert!(head(true).contains("🎤"), "{}", head(true));
+        assert!(!head(false).contains("🎤"));
+    }
+
+    #[test]
     fn mail_between_others_folds_like_a_tool_call_and_mail_to_you_never_does() {
         let cache = Cache::default();
         let body = (0..20)
@@ -793,6 +825,7 @@ mod tests {
                     subject: "notes".into(),
                     body: body.clone(),
                     delivered: false,
+                    dictated: false,
                 },
             )
         };

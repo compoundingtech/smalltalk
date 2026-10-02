@@ -95,6 +95,17 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.deepEqual(delivered.map(entry => [entry.body.kind, entry.body.delivered]), [['mail', true]]);
 }
 
+// A message spoken and transcribed carries st's `dictated` tag; the app marks it.
+{
+  const spoken = (tags) => conversationEntries([
+    { id: 'm', sequence: 1, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'message', final: true, body: { message_id: 'message/one', from: 'person/avery', to: 'agent/example/harbor/keeper', ...(tags ? { tags } : {}) } },
+    { id: 'c', sequence: 2, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text: 'ship the harbor fix' } },
+  ], new Map([['person/avery', 'you']]))[0].body;
+  assert.equal(spoken(['dictated']).dictated, true);
+  assert.equal(spoken(undefined).dictated, undefined);
+  assert.equal(spoken(['urgent']).dictated, undefined);
+}
+
 // Finding: an entry matches by what a person reads in it, case aside.
 {
   const mail = { id: 'm', at: '', timestamp: '', body: { kind: 'mail', from: 'Keeper', to: 'you', subject: 'Audit', text: 'The Harbor keys rotated.' } };

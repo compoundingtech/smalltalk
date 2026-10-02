@@ -1609,6 +1609,7 @@ mod tests {
                 subject: "Reply".into(),
                 body: "Here is the reply.".into(),
                 delivered: false,
+                dictated: false,
             },
         }];
         let cache = super::super::conversation::Cache::default();
@@ -1703,6 +1704,7 @@ mod tests {
                 subject: "Reply".into(),
                 body: "Here is the reply.".into(),
                 delivered: false,
+                dictated: false,
             },
         };
         let mut world = super::super::demo::world();

@@ -33,6 +33,8 @@ pub enum Body {
         body: String,
         /// The recipient's harness has it: st delivered it into the agent's session.
         delivered: bool,
+        /// Spoken and transcribed (st's `dictated` tag): it may hold transcription mistakes.
+        dictated: bool,
     },
     /// A graph event worth a line: a step became ready, a run started.
     Event(String),
