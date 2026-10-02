@@ -338,6 +338,43 @@ fn a_late_envelope_before_the_cut_reseals_until_someone_verified() {
 }
 
 #[test]
+fn a_seal_that_returns_to_earlier_terms_is_a_new_seal() {
+    let scratch = tempfile::tempdir().unwrap();
+    let context = context(scratch.path(), 0);
+    let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+    observe(&alder, 2);
+    observe(&birch, 1);
+    sync(&[&alder, &birch]);
+    assert_eq!(kinds(&step(&alder, &context)), ["sealed"]);
+
+    // Birch is excused, so alder seals without it; then birch seals, which ends its
+    // excusal, and alder's terms are the first ones again.
+    alder
+        .excuse_checkpoint_writer(&CheckpointExcuseRequest {
+            writer: "birch".into(),
+            reason: "away".into(),
+            actor: "person/operator".into(),
+        })
+        .unwrap();
+    assert_eq!(kinds(&step(&alder, &context)), ["sealed"]);
+    sync(&[&alder, &birch]);
+    assert_eq!(kinds(&step(&birch, &context)), ["sealed"]);
+    sync(&[&alder, &birch]);
+    let actions = step(&alder, &context);
+    let CheckpointAction::Sealed { participants, .. } = &actions[0] else {
+        panic!("{actions:?}");
+    };
+    assert_eq!(participants, &names(&["alder", "birch"]));
+    // The seal took effect, so alder moves on rather than sealing again forever.
+    let checkpoint = checkpoint_name(newest_due_cut(context.now_unix_ms));
+    assert_eq!(
+        newest_seals(&alder.checkpoint_claims().unwrap(), &checkpoint)["alder"].participants,
+        names(&["alder", "birch"])
+    );
+    assert!(!kinds(&step(&alder, &context)).contains(&"sealed"));
+}
+
+#[test]
 fn a_silent_participant_holds_everything_up_until_a_person_excuses_it() {
     let scratch = tempfile::tempdir().unwrap();
     let first = context(scratch.path(), 0);
