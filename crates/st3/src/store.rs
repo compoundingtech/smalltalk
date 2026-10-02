@@ -16171,26 +16171,45 @@ fn known_replicated_claim_kind(kind: &str) -> bool {
     ) || registered_client_claim_kind(kind)
 }
 
+/// Claim families that decide where a subject runs and whether it can be reached: its
+/// declaration (`intent.*`), its runtime observations and actions (`runtime.*`), and a host's
+/// transport (`transport.*`). A replicated claim of a kind this build does not know, in one of
+/// these families, could change the answer.
+const RUNTIME_AUTHORITY_FAMILIES: &[&str] = &["intent.", "runtime.", "transport."];
+
+/// Whether a replica record this build cannot project could bear on a subject's runtime
+/// authority. An invalid record, or an unknown one without a kind, always could. An unknown kind
+/// outside the authority families (a newer member's `harness.limits`, say) is kept and waits for
+/// an upgrade, but it never makes the subject's reachability indeterminate.
+fn replica_record_bears_authority(state: &str, kind: Option<&str>) -> bool {
+    state != "unknown"
+        || kind.is_none_or(|kind| {
+            RUNTIME_AUTHORITY_FAMILIES
+                .iter()
+                .any(|family| kind.starts_with(family))
+        })
+}
+
 fn has_unknown_claim_at(
     connection: &Connection,
     subject: &str,
     at_index: Option<u64>,
 ) -> Result<Option<String>> {
     if at_index.is_none() {
-        let unresolved = connection
-            .query_row(
-                "SELECT state, kind_hint FROM replica_records
-                 WHERE subject_hint=?1 AND state IN ('unknown','invalid')
-                 ORDER BY record_ref LIMIT 1",
-                [subject],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .optional()?;
-        if let Some((state, kind)) = unresolved {
-            return Ok(Some(format!(
-                "replica-{state}:{}",
-                kind.unwrap_or_else(|| "unknown-kind".into())
-            )));
+        let mut statement = connection.prepare_cached(
+            "SELECT state, kind_hint FROM replica_records
+             WHERE subject_hint=?1 AND state IN ('unknown','invalid')
+             ORDER BY record_ref",
+        )?;
+        let mut rows = statement.query([subject])?;
+        while let Some(row) = rows.next()? {
+            let (state, kind) = (row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?);
+            if replica_record_bears_authority(&state, kind.as_deref()) {
+                return Ok(Some(format!(
+                    "replica-{state}:{}",
+                    kind.unwrap_or_else(|| "unknown-kind".into())
+                )));
+            }
         }
     }
     let through = at_index.unwrap_or(i64::MAX as u64);
@@ -19330,6 +19349,81 @@ mod fleet_admission_tests {
 
     fn admitted(store: &Store, claim: &ClaimRecord) -> bool {
         store.claim_by_id(&claim.id).unwrap().is_some()
+    }
+
+    /// A member one build behind keeps a newer member's unknown claims, and only an unknown claim
+    /// that could bear on runtime authority makes a subject indeterminate. Seen live: a newer
+    /// member's `harness.limits` made every seat on it unreachable for terminal attach from an
+    /// older member, though its runtime observations were valid.
+    #[test]
+    fn an_unknown_non_authority_claim_leaves_runtime_routing_alone() {
+        let anchor_key = key();
+        let older_key = key();
+        let current = node("current", Some(&anchor_key), Some(&anchor_key));
+        admit(&current, "current", &anchor_key, "anchor", None);
+        admit(&current, "older", &older_key, "invite", None);
+        let older = node("older", Some(&older_key), Some(&anchor_key));
+        let mut registry = st3_schema::registry().clone();
+        for kind in ["harness.limits", "runtime.restart-window-reset"] {
+            registry.claims.remove(kind).unwrap();
+        }
+        older.set_claim_registry(registry);
+        sync(&current, &older);
+
+        let subject = "agent/example/worker";
+        append(
+            &current,
+            "runtime.observed",
+            subject,
+            json!({"status": "running", "runtime_id": "agent.example.worker",
+                   "incarnation_id": "worker-one"}),
+        );
+        append(
+            &current,
+            "harness.limits",
+            subject,
+            json!({"driver": "claude", "incarnation_id": "worker-one",
+                   "five_hour_percent": 12.5, "measured_at_unix_ms": 1_790_000_000_000_u64}),
+        );
+        let admission = sync(&current, &older);
+        assert_eq!(admission.unknown, 1, "the newer kind is kept, not dropped");
+        let status = older.status(Some(subject)).unwrap();
+        let worker = &status.subjects[0];
+        assert_eq!(worker.reachability, "reachable", "{:?}", worker.reason);
+        assert_eq!(worker.actual_origin.as_deref(), Some("current"));
+        assert_eq!(worker.reason, None);
+
+        // An unknown kind in the runtime family could change the answer: stay conservative.
+        append(
+            &current,
+            "runtime.restart-window-reset",
+            subject,
+            json!({"incarnation_id": "worker-one", "reason": "test"}),
+        );
+        sync(&current, &older);
+        let status = older.status(Some(subject)).unwrap();
+        assert_eq!(status.subjects[0].reachability, "indeterminate");
+        assert!(
+            status.subjects[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("runtime.restart-window-reset"))
+        );
+    }
+
+    #[test]
+    fn replica_records_bear_authority_only_in_the_authority_families() {
+        for (state, kind, bears) in [
+            ("unknown", Some("harness.limits"), false),
+            ("unknown", Some("message.tagged"), false),
+            ("unknown", Some("runtime.lease"), true),
+            ("unknown", Some("intent.paused"), true),
+            ("unknown", Some("transport.future-observed"), true),
+            ("unknown", None, true),
+            ("invalid", Some("harness.limits"), true),
+        ] {
+            assert_eq!(replica_record_bears_authority(state, kind), bears, "{state} {kind:?}");
+        }
     }
 
     #[test]
@@ -31580,7 +31674,8 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             let candidate = rewrite_envelope(&exchange.envelopes[0], |payload| {
                 let mut invalid = payload.batch.claims[0].clone();
                 if unknown_kind {
-                    invalid.kind = "future.transport-observed".into();
+                    // A newer transport kind could decide the host's reachability.
+                    invalid.kind = "transport.future-observed".into();
                 } else {
                     invalid.body["fields"]["status"] = Value::Bool(true);
                 }
