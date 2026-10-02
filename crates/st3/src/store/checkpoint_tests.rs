@@ -1474,3 +1474,40 @@ fn an_observed_item_keeps_its_latest_state_and_every_version_still_read_by_id() 
     assert_eq!(dropped(&plan), ids([&replaced]));
     let _ = (requested, latest, authored);
 }
+
+#[test]
+fn checkpoint_reads_of_sealed_batches_do_not_wait_for_the_writer() {
+    let store = Arc::new(Store::open_memory("checkpoint-writer-test").unwrap());
+    store
+        .append_claim(&input(
+            "agent/checkpoint-reader",
+            "harness.observed",
+            Some("agent/checkpoint-reader"),
+            json!({"state":"idle", "incarnation_id":"checkpoint-i1"}),
+            "checkpoint-reader",
+        ))
+        .unwrap();
+    store.seal_local_batches().unwrap();
+    let cut = now_ms() + 1;
+    // Holding the writer models an unrelated request without writing uncommitted state.
+    let writer = store.connection.write();
+    let (sent, received) = std::sync::mpsc::channel();
+    let reader = store.clone();
+    let task = std::thread::spawn(move || {
+        let result = reader
+            .checkpoint_sealed_identities(cut, None)
+            .and_then(|identities| {
+                reader
+                    .checkpoint_sealed_set_through(cut, None)
+                    .map(|sealed| (identities.digest, sealed_digest(&sealed)))
+            });
+        sent.send(result).unwrap();
+    });
+    let result = received.recv_timeout(std::time::Duration::from_secs(2));
+    drop(writer);
+    task.join().unwrap();
+    let (identities, sealed) = result
+        .expect("an already sealed checkpoint must not take the writer")
+        .unwrap();
+    assert_eq!(identities, sealed);
+}

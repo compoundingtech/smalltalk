@@ -586,13 +586,9 @@ impl Store {
         cut_unix_ms: u128,
         through_rowid: Option<i64>,
     ) -> Result<SealedSet> {
-        {
-            // Every local batch has an envelope before the planner reads them.
-            let mut connection = self.connection.write();
-            let transaction = connection.transaction()?;
-            seed_replica_envelopes_tx(&transaction, &self.origin, None)?;
-            transaction.commit()?;
-        }
+        // Seal only new batches. A full history scan under the writer stalls live requests
+        // every time a checkpoint is reconsidered, even when no new envelope is needed.
+        self.seal_local_batches()?;
         let connection = self.readers.get();
         // One read transaction, so the envelopes, the claims and the high water agree.
         let connection = connection.unchecked_transaction()?;
@@ -757,12 +753,7 @@ impl Store {
         cut_unix_ms: u128,
         through_rowid: Option<i64>,
     ) -> Result<SealedIdentities> {
-        {
-            let mut connection = self.connection.write();
-            let transaction = connection.transaction()?;
-            seed_replica_envelopes_tx(&transaction, &self.origin, None)?;
-            transaction.commit()?;
-        }
+        self.seal_local_batches()?;
         let connection = self.readers.get();
         let connection = connection.unchecked_transaction()?;
         let seal_rowid: i64 = connection.query_row(

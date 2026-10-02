@@ -29,6 +29,16 @@ a complete snapshot, including explicit null clearing for absent blocking metada
 and exit, so legacy optional-field backfill cannot resurrect an answered ask. A delayed observation
 from a previous runtime incarnation never changes the current agent.
 
+### Subagents
+
+An agent's `subagents` lists the subagents its harness runs now, oldest first: each was recorded
+on the seat, has not ended, and has a lease that runs past the read. Each one has the harness's
+own `id`, its `subagent_type`, a one-line `description`, its `driver` and `session_id`, the
+`work_id` of the step the seat held when it appeared, `started_at`, and `lease_expires_at`. A
+subagent is part of its agent, not a resource of its own, and has no actions. The list is read
+per request, so a lease that runs out leaves it at the next read without a new claim. A daemon
+older than the field omits it; clients read a missing list as empty.
+
 ## Boundary and transport
 
 The client API is a projection and command gateway, not a graph replica. Its version is

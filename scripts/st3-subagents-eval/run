@@ -240,6 +240,20 @@ def expect(condition, message):
         fail(message)
 
 
+def shown(node, seat, subagent, description):
+    """A running subagent shows on its agent: in the client API, `st agents show` and the tree."""
+    def listed():
+        agent = node.api("/v1/client/agents/" + seat.subject) or {}
+        return [row for row in agent.get("subagents", []) if row.get("id") == subagent]
+    row = until(listed, 30, f"{subagent} never showed on {seat.subject}")[0]
+    expect(row.get("description") == description and row.get("lease_expires_at"), f"{subagent}: {row}")
+    card = node.cli("agents", "show", seat.subject)
+    expect(f"SUBAGENT     {description}" in card, f"st agents show:\n{card}")
+    tree = node.cli("agents", "tree")
+    expect(f"─ {description}" in tree, f"st agents tree:\n{tree}")
+    return row
+
+
 def worker_scenarios(node, worker, run, checks):
     worker.control("claim-ready")
     worker.applied()
@@ -318,10 +332,13 @@ def worker_scenarios(node, worker, run, checks):
     worker.appeared("w6")
     time.sleep(3)
     expect(not worker.of("subagent.ended", "w4"), "w4 ended across a daemon restart")
+    checks["shown"] = shown(node, worker, "w4", "runs across the restart")
     worker.control("finish", id="w4", responses=[{"output": 1}])
     worker.control("finish", id="w6", responses=[{"output": 1}])
     for subagent in ("w4", "w6"):
         expect(worker.ended(subagent).get("outcome") == "completed", f"{subagent} did not complete")
+    until(lambda: "runs across the restart" not in node.cli("agents", "show", worker.subject),
+          30, "an ended subagent still shows on its agent")
     checks["daemon_restart"] = True
 
     # A removed seat: its mission run is cancelled.

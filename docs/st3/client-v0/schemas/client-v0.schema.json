@@ -695,7 +695,8 @@
             "upcoming_work": { "type": "array", "items": { "$ref": "#/$defs/WorkLabel" } },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
-            "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present only for a local native seat whose harness can take work; a stale path makes the agent `waiting`." }
+            "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present only for a local native seat whose harness can take work; a stale path makes the agent `waiting`." },
+            "subagents": { "type": "array", "items": { "$ref": "#/$defs/AgentSubagent" }, "description": "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." }
           }
         }
       ]
@@ -709,6 +710,21 @@
         "reason": { "type": ["string", "null"] },
         "polled_seconds_ago": { "type": ["integer", "null"], "minimum": 0 },
         "transport": { "type": ["string", "null"] }
+      }
+    },
+    "AgentSubagent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "driver", "lease_expires_at"],
+      "properties": {
+        "id": { "type": "string", "description": "The harness's own subagent ID, unique within its seat." },
+        "subagent_type": { "type": ["string", "null"] },
+        "description": { "type": ["string", "null"], "description": "One line." },
+        "driver": { "type": "string" },
+        "session_id": { "type": ["string", "null"], "description": "The harness session the subagent runs in." },
+        "work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }], "description": "The step the seat held when the subagent appeared." },
+        "started_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "lease_expires_at": { "$ref": "#/$defs/Timestamp" }
       }
     },
     "AgentRelationship": {

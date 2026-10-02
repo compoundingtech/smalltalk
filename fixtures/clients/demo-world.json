@@ -25,6 +25,20 @@
         "parent": null,
         "state": "needs_you",
         "step": "cut-over",
+        "subagents": [
+          {
+            "age": "4m",
+            "description": "map the parser's error paths",
+            "id": "a3f9e1",
+            "kind": "Explore"
+          },
+          {
+            "age": "1m",
+            "description": "run the slow tests",
+            "id": "b72c04",
+            "kind": "general-purpose"
+          }
+        ],
         "terminal": true,
         "unmanaged": false,
         "worktree": "~/src/atlas--store-move"

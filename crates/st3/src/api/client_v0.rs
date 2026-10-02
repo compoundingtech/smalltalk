@@ -13009,6 +13009,72 @@ mission "example/zero-run" state="ready" {
         assert!(!stored.contains("stream_capability"));
     }
 
+    /// A member one build behind still routes to a terminal on a newer member whose seat reports
+    /// a claim kind it does not know yet (`harness.limits`): the valid runtime observation
+    /// decides, and the unknown claim waits for an upgrade.
+    #[test]
+    fn an_older_member_routes_to_a_terminal_despite_an_unknown_harness_claim() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let follower_root = tempfile::tempdir().unwrap();
+        let owner = test_state_named(owner_root.path(), "owner-node");
+        let mut follower = test_state_named(follower_root.path(), "follower-node");
+        let secret = follower_root.path().join("fleet-secret");
+        std::fs::write(&secret, [7_u8; 32]).unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        follower.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
+            node: "follower-node".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![crate::config::PeerConfig {
+                name: "owner-node".into(),
+                url: "http://127.0.0.1:9".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut registry = st3_schema::registry().clone();
+        registry.claims.remove("harness.limits").unwrap();
+        follower.store.set_claim_registry(registry);
+        let subject = "agent/fleet-terminal";
+        let claim = |kind: &str, fields: Value, key: &str| ClaimInput {
+            subject: subject.into(),
+            kind: kind.into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(fields).unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(key.into()),
+        };
+        owner
+            .store
+            .append_claim(&claim(
+                "runtime.observed",
+                json!({"runtime_id": "same-runtime-id", "incarnation_id": "same-runtime-id:i1",
+                       "status": "running", "terminal": true}),
+                "owner-running",
+            ))
+            .unwrap();
+        owner
+            .store
+            .append_claim(&claim(
+                "harness.limits",
+                json!({"driver": "claude", "incarnation_id": "same-runtime-id:i1",
+                       "weekly_percent": 40.0, "measured_at_unix_ms": 1_790_000_000_000_u64}),
+                "owner-limits",
+            ))
+            .unwrap();
+        follower
+            .store
+            .import_replication("owner-node", &owner.store.export_replication(0).unwrap())
+            .unwrap();
+        let status = follower.store.status(Some(subject)).unwrap();
+        assert_eq!(status.subjects[0].reachability, "reachable");
+        let live = remote_terminal_live_session(&follower, subject, "same-runtime-id:i1")
+            .unwrap_or_else(|error| panic!("{}: {}", error.code, error.message));
+        assert_eq!(live.owner_host_id, "host/owner-node");
+        assert_eq!(live.incarnation_id, "same-runtime-id:i1");
+    }
+
     #[test]
     fn terminal_capabilities_and_pty_reads_are_bound_to_the_selected_owner_host() {
         let owner_root = tempfile::tempdir().unwrap();
