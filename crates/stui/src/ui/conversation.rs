@@ -15,10 +15,16 @@ impl Cache {
         width: usize,
         expanded: &HashSet<String>,
         spinner: &str,
+        density: st3_conversation_ui::Density,
     ) -> Doc {
-        let rendered = self
-            .0
-            .render(entries, width, expanded, spinner, &theme::conversation());
+        let rendered = self.0.render_as(
+            entries,
+            width,
+            expanded,
+            spinner,
+            &theme::conversation(),
+            density,
+        );
         Doc {
             lines: rendered.lines,
             messages: rendered.messages,

@@ -246,6 +246,7 @@ pub fn run(context: Context) -> Result<()> {
     // Messages sent from here, shown at once until st reports them back.
     let mut pending: Vec<Pending> = Vec::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
+    ui.load_prefs();
     ui.build = true;
     ui.live = true;
     ui.glasses = glass.map(|name| {
@@ -1589,7 +1590,13 @@ mod tests {
             },
         }];
         let cache = super::super::conversation::Cache::default();
-        let doc = cache.render(&entries, 90, &HashSet::new(), "*");
+        let doc = cache.render(
+            &entries,
+            90,
+            &HashSet::new(),
+            "*",
+            st3_conversation_ui::Density::Full,
+        );
         let body_start = doc.messages[0].1.start as u16;
         let ui = Ui::new(super::super::demo::world());
         let mut terminal =

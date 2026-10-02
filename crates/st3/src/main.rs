@@ -3045,6 +3045,9 @@ enum MessageCommand {
         /// Every normalized entry as it is stored, instead of the conversation as it reads.
         #[arg(long)]
         raw: bool,
+        /// Simplified: a tool call to a line, and a run of calls to one line.
+        #[arg(long, conflicts_with = "raw")]
+        simple: bool,
     },
     /// Follow the visible normalized conversation; JSON output is one entry per line.
     Follow {
@@ -6922,7 +6925,10 @@ fn print_timeline_page(
 
 /// A conversation page as stui draws it, through the shared renderer: in colour on a terminal
 /// (unless `NO_COLOR` is set), plain text otherwise.
-fn print_conversation_page(response: &ClientEnvelope<ClientTimelinePage>) -> Result<()> {
+fn print_conversation_page(
+    response: &ClientEnvelope<ClientTimelinePage>,
+    simple: bool,
+) -> Result<()> {
     use std::io::IsTerminal as _;
     let stdout = std::io::stdout();
     let color = stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none();
@@ -6932,6 +6938,11 @@ fn print_conversation_page(response: &ClientEnvelope<ClientTimelinePage>) -> Res
         &response.value.items,
         width,
         color,
+        if simple {
+            st3_conversation_ui::Density::Simple
+        } else {
+            st3_conversation_ui::Density::Full
+        },
     );
     if response.value.page.has_more
         && let Some(cursor) = &response.value.page.next_cursor
@@ -6951,6 +6962,7 @@ fn conversation_text(
     items: &[ClientTimelineEntry],
     width: usize,
     color: bool,
+    density: st3_conversation_ui::Density,
 ) -> String {
     let mut output = format!("CONVERSATION  {session_id}\n\n");
     if let Some(reason) = st3_conversation_ui::adapt::unreadable_transcript(items) {
@@ -6961,12 +6973,13 @@ fn conversation_text(
         output.push_str("Nothing in this conversation yet.\n");
         return output;
     }
-    let rendered = st3_conversation_ui::Cache::default().render(
+    let rendered = st3_conversation_ui::Cache::default().render_as(
         &entries,
         width,
         &Default::default(),
         "",
         &st3_conversation_ui::Theme::default(),
+        density,
     );
     for line in &rendered.lines {
         output.push_str(&st3_conversation_ui::ansi::line(line, color));
@@ -11891,6 +11904,7 @@ async fn run_message(
             limit,
             cursor,
             raw,
+            simple,
         } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -11902,7 +11916,7 @@ async fn run_message(
             if raw || json_output {
                 print_timeline_page(&response, json_output)
             } else {
-                print_conversation_page(&response)
+                print_conversation_page(&response, simple)
             }
         }
         MessageCommand::Follow {
@@ -16353,7 +16367,13 @@ mod tests {
             "../../../fixtures/clients/transcripts/claude.json"
         ))
         .unwrap();
-        let pretty = conversation_text("session/example", &items, 80, false);
+        let pretty = conversation_text(
+            "session/example",
+            &items,
+            80,
+            false,
+            st3_conversation_ui::Density::Full,
+        );
         assert!(pretty.starts_with("CONVERSATION  session/example"), "{pretty}");
         assert!(pretty.contains("Please check why the n"), "{pretty}");
         // The harness's own wrappers are cleaned away, as in stui; no escapes without colour.

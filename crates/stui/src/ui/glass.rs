@@ -495,6 +495,8 @@ enum Action {
     NewTerminal,
     /// The new mission form, in a new tab.
     NewMission,
+    /// Every conversation simplified, or in full again (Shift+O).
+    ToggleSimple,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
 }
@@ -672,6 +674,16 @@ impl Ui {
             "a shell in a new tab",
             "new terminal shell".into(),
             Action::NewTerminal,
+        ));
+        choices.push(start(
+            if self.simple {
+                "Full conversations".into()
+            } else {
+                "Simplified conversations".into()
+            },
+            "shift+o · tool calls to a line each, runs of them to one",
+            "simplified simple full conversations tools compact".into(),
+            Action::ToggleSimple,
         ));
         if !name.is_empty() {
             choices.push(start(
@@ -2440,6 +2452,7 @@ impl Ui {
             Action::NewAgent(task) => self.open_new_agent(task),
             Action::NewTerminal => self.open_new_terminal(),
             Action::NewMission => self.open_new_mission(),
+            Action::ToggleSimple => self.toggle_simple(),
             Action::Home => self.open_home(),
             Action::Name(naming) => {
                 let query = match naming {
