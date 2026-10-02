@@ -1,9 +1,11 @@
-// The tabs everyone sees, named and ordered as stui names them (crates/stui/src/ui/screens.rs).
-export const TABS = ['Home', 'Agents', 'Missions', 'Fleet', 'Usage'] as const;
+// The tabs everyone sees, as stui names them (crates/stui/src/ui/screens.rs). iOS shows five tabs
+// before folding the rest into a More screen, and Spaces takes the fifth, so stui's Usage tab
+// is a screen in Fleet here.
+export const TABS = ['Home', 'Agents', 'Missions', 'Fleet'] as const;
 export type Tab = typeof TABS[number];
 
 // Names earlier builds used, still accepted in links and stored preferences.
-const ALIASES: Record<string, Tab> = { now: 'Home', chat: 'Agents', control: 'Missions' };
+const ALIASES: Record<string, Tab> = { now: 'Home', chat: 'Agents', control: 'Missions', usage: 'Fleet' };
 
 /** The tab a name means, in any case and under any earlier name, or null. */
 export function tabNamed(name: string | null | undefined): Tab | null {
