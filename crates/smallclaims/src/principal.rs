@@ -575,7 +575,7 @@ mod tests {
         ));
 
         let mut swapped = signature.clone();
-        swapped.on_behalf = Some("person/grace".into());
+        swapped.on_behalf = Some("person/robin".into());
         assert!(matches!(
             judge(&judged, Some(&swapped), &facts),
             Verdict::Invalid(_)

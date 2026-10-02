@@ -806,11 +806,17 @@ impl Store {
         stored_signature(&self.readers.get(), claim_id)
     }
 
-    /// How many claims have each verdict. This node's own claims are signed as their batches
-    /// are sealed, so it seals first. Every claim without a cached verdict is `unsigned`.
+    /// How many claims have each verdict, read only. This node's own claims are signed as their
+    /// batches are sealed: claims in batches not sealed yet count as `unsealed`, and every other
+    /// claim without a cached verdict is `unsigned`.
     pub fn claim_verdict_counts(&self) -> Result<BTreeMap<String, u64>> {
-        self.seal_local_batches()?;
         let connection = self.readers.get();
+        let unsealed: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM batches JOIN claims ON claims.batch_id=batches.id
+             WHERE batches.rowid>?1",
+            [self.seeded_batch_rowid.load(Ordering::Acquire)],
+            |row| row.get(0),
+        )?;
         let mut counts = connection
             .prepare("SELECT verdict, COUNT(*) FROM claim_verdicts GROUP BY verdict")?
             .query_map([], |row| {
@@ -820,7 +826,11 @@ impl Store {
         let total: u64 =
             connection.query_row("SELECT COUNT(*) FROM claims", [], |row| row.get(0))?;
         let judged = counts.values().sum::<u64>();
-        *counts.entry("unsigned".into()).or_default() += total.saturating_sub(judged);
+        *counts.entry("unsigned".into()).or_default() +=
+            total.saturating_sub(judged).saturating_sub(unsealed);
+        if unsealed != 0 {
+            counts.insert("unsealed".into(), unsealed);
+        }
         Ok(counts)
     }
 

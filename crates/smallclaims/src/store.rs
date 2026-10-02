@@ -4345,6 +4345,7 @@ impl Store {
         // chunks. Capture the target once; concurrent writes belong to the next pass.
         const SEAL_CHUNK_BATCHES: usize = 64;
         let target = max_batch_rowid(&self.readers.get())?;
+        let mut sealed = false;
         while target > self.seeded_batch_rowid.load(Ordering::Acquire) {
             let mut connection = self.connection.write();
             let _timing = time_stage(&self.replication_timers.snapshot);
@@ -4370,9 +4371,14 @@ impl Store {
             self.sign_own_envelopes_range_tx(&transaction, Some(seeded_through), Some(through))?;
             transaction.commit()?;
             self.seeded_batch_rowid.store(through, Ordering::Release);
+            sealed = true;
             // The FIFO writer services any already queued request before the next loan.
         }
-        self.judge_claims(false)?;
+        // The claims just sealed carry new signatures. A call that sealed nothing writes nothing,
+        // as before.
+        if sealed {
+            self.judge_claims(false)?;
+        }
         Ok(())
     }
 

@@ -147,7 +147,7 @@ fn free_mode_signs_and_verifies_every_claim_with_no_fleet_and_no_prompt() {
 
     let person = note(&store, Some("person/ada"), "from the CLI");
     let again = note(&store, Some("person/ada"), "again");
-    let agent = note(&store, Some("agent/fleet/web/reviewer"), "from a seat");
+    let agent = note(&store, Some("agent/example/reviewer"), "from a seat");
     let daemon = note(&store, None, "from the daemon");
     let behalf = note(&store, Some("daemon/runtime"), "for a step");
     seal(&store);
@@ -169,7 +169,7 @@ fn free_mode_signs_and_verifies_every_claim_with_no_fleet_and_no_prompt() {
         "one device key per person per machine"
     );
     let agent_signature = store.claim_signature(&agent.id).unwrap().unwrap();
-    assert_eq!(agent_signature.signer, "agent/fleet/web/reviewer");
+    assert_eq!(agent_signature.signer, "agent/example/reviewer");
     assert_eq!(agent_signature.chain.len(), 1);
     let daemon_signature = store.claim_signature(&daemon.id).unwrap().unwrap();
     assert_eq!(daemon_signature.signer, "host/studio");
@@ -200,7 +200,7 @@ fn members_verify_each_others_claims_through_membership() {
     let stores = fleet(&["b", "c"]);
     let (a, b, c) = (&stores[0], &stores[1], &stores[2]);
     let from_b = note(b, Some("person/ada"), "on b");
-    let agent_b = note(b, Some("agent/fleet/web/reviewer"), "a seat on b");
+    let agent_b = note(b, Some("agent/example/reviewer"), "a seat on b");
     sync(b, a);
     sync(a, c);
     for store in [a, c] {
@@ -295,11 +295,11 @@ fn revoking_a_key_invalidates_what_it_signs_afterwards_and_everything_below_a_re
         );
     }
 
-    // Revoking a root cuts its devices: grace's device signs, then her root is revoked.
-    let first = note(b, Some("person/grace"), "first");
+    // Revoking a root cuts its devices: robin's device signs, then their root is revoked.
+    let first = note(b, Some("person/robin"), "first");
     seal(b);
-    let grace = b.claim_signature(&first.id).unwrap().unwrap();
-    let root_grant = b.claim_by_id(grace.chain.last().unwrap()).unwrap().unwrap();
+    let robin = b.claim_signature(&first.id).unwrap().unwrap();
+    let root_grant = b.claim_by_id(robin.chain.last().unwrap()).unwrap().unwrap();
     let root_key = root_grant.body["fields"]["key"]
         .as_str()
         .unwrap()
@@ -307,11 +307,11 @@ fn revoking_a_key_invalidates_what_it_signs_afterwards_and_everything_below_a_re
     append(
         b,
         KEY_REVOKED,
-        "person/grace",
+        "person/robin",
         None,
         json!({"key": root_key}),
     );
-    let later = note(b, Some("person/grace"), "later");
+    let later = note(b, Some("person/robin"), "later");
     sync(b, a);
     for store in [a, b] {
         assert_eq!(verdict(store, &first), Verdict::Verified);
@@ -330,8 +330,8 @@ fn a_device_key_cannot_grant_keys_or_sign_for_another_person() {
     seal(&store);
     let device = store.claim_signature(&ada.id).unwrap().unwrap();
 
-    // ada's device signs a claim as grace, under ada's chain.
-    let posing = note(&store, Some("person/grace"), "posing");
+    // ada's device signs a claim as robin, under ada's chain.
+    let posing = note(&store, Some("person/robin"), "posing");
     let content = content_digest(
         &posing.subject,
         &posing.kind,
@@ -339,15 +339,15 @@ fn a_device_key_cannot_grant_keys_or_sign_for_another_person() {
         &posing.body,
     );
     let held = store.keyring.by_public(&device.key).unwrap();
-    let as_grace = ClaimSignature::sign(
+    let as_robin = ClaimSignature::sign(
         &held.key,
         &content,
-        "person/grace",
+        "person/robin",
         None,
         device.chain.clone(),
         2,
     );
-    attach(&store, &posing, &as_grace);
+    attach(&store, &posing, &as_robin);
     seal(&store);
     assert!(matches!(verdict(&store, &posing), Verdict::Invalid(_)));
 }
@@ -455,7 +455,7 @@ fn shuffled<T: Clone>(items: &[T], mut seed: u64) -> Vec<T> {
 fn verdicts_are_the_same_in_any_arrival_order_and_match_a_recompute() {
     let stores = fleet(&["b", "c", "d"]);
     let writers = &stores[1..];
-    let people = ["person/ada", "person/grace", "agent/fleet/web/reviewer"];
+    let people = ["person/ada", "person/robin", "agent/example/reviewer"];
     for round in 0..4 {
         for (index, store) in writers.iter().enumerate() {
             let actor = people[(round + index) % people.len()];

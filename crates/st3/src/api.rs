@@ -4515,7 +4515,12 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         st_runtime::priority_report(&observations)
     });
     let token = crate::resource::github_token().await;
-    let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
+    let mut report = tokio::task::spawn_blocking(move || {
+        // This node's claims are signed as their batches are sealed; seal them so the
+        // signature counts cover everything written so far.
+        state.store.seal_local_batches().map_err(ApiError::internal)?;
+        doctor_report(&state)
+    })
         .await
         .map_err(ApiError::internal)??
         .0;
@@ -4862,9 +4867,10 @@ fn claim_signatures_check(counts: &std::collections::BTreeMap<String, u64>) -> D
         name: "claim-signatures".into(),
         status: if held + invalid == 0 { "pass" } else { "warn" }.into(),
         message: format!(
-            "{} verified, {} unsigned, {held} waiting for a delegation, {invalid} invalid",
+            "{} verified, {} unsigned, {} not yet sealed, {held} waiting for a delegation, {invalid} invalid",
             count("verified"),
             count("unsigned"),
+            count("unsealed"),
         ),
     }
 }
