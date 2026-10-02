@@ -400,7 +400,9 @@ const styles = StyleSheet.create({
   call: { marginHorizontal: 8, marginVertical: 2, paddingHorizontal: 8, paddingVertical: 3, borderLeftWidth: 2 },
   composer: { flexDirection: 'row', alignItems: 'flex-end', gap: 6, paddingHorizontal: 10, paddingTop: 6, borderTopColor: theme.surface0, borderTopWidth: StyleSheet.hairlineWidth * 2, backgroundColor: theme.mantle },
   prompt: { paddingBottom: 9, fontFamily: fonts.bold },
-  input: { flex: 1, minHeight: 36, maxHeight: 140, marginTop: 0 },
+  // The box grows with its text up to maxHeight. No flex here: inside the column that holds the
+  // microphone, flex would set the height from the column (36) instead of the text.
+  input: { minHeight: 36, maxHeight: 140, marginTop: 0 },
   mic: { position: 'absolute', right: 6, bottom: 6, zIndex: 1, padding: 2 },
   send: { marginTop: 0, marginBottom: 2 },
   latest: { position: 'absolute', right: 12, bottom: 84, backgroundColor: theme.surface0, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 4 },
