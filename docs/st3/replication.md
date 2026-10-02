@@ -634,7 +634,8 @@ them, and every node deletes the same ones:
 2. **Verify.** Once every participant has sealed the same envelopes and rules, each node plans
    the drops from the claims of those envelopes, less repaired originals: whether a node holds a
    repaired original depends on whether it admitted it before the repair arrived. It proves on a
-   copy of its store that deleting them changes neither the graph nor any reader's answer, then
+   copy of its store, cut down to those claims and the blobs they reference, that deleting them
+   changes neither the graph nor any reader's answer, then
    publishes `checkpoint.verified` with the digests of the drops, the kept claims, the graph and
    the answers. A node verifies a checkpoint once.
 3. **Trim.** When every participant verified the same digests, the checkpoint is stable. Each node

@@ -766,6 +766,41 @@ fn a_repaired_original_held_by_one_node_does_not_split_the_verifications() {
 }
 
 #[test]
+fn a_blob_that_arrived_after_the_cut_does_not_split_the_verifications() {
+    let scratch = tempfile::tempdir().unwrap();
+    let context = context(scratch.path(), 0);
+    let cut = newest_due_cut(context.now_unix_ms);
+    let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+    observe(&alder, 4);
+    observe(&birch, 3);
+    alder
+        .put_document("doc/before-the-cut", b"sealed notes", &None, "before")
+        .unwrap();
+    sync(&[&alder, &birch]);
+    for node in [&alder, &birch] {
+        assert_eq!(kinds(&step(node, &context)), ["sealed"]);
+    }
+    sync(&[&alder, &birch]);
+    // Written after alder sealed, so dated after the cut, and birch has not received it when
+    // both verify.
+    alder
+        .put_document("doc/after-the-cut", b"later notes", &None, "after")
+        .unwrap();
+    for node in [&alder, &birch] {
+        assert_eq!(kinds(&step(node, &context)), ["verified"]);
+    }
+    sync(&[&alder, &birch]);
+    let pending = alder
+        .checkpoint_status(context.now_unix_ms, &[])
+        .unwrap()
+        .pending;
+    assert!(pending.is_none(), "{pending:#?}");
+    for node in [&alder, &birch] {
+        assert_eq!(stable_cuts(node), [cut]);
+    }
+}
+
+#[test]
 fn status_names_what_differs_between_verifications() {
     let scratch = tempfile::tempdir().unwrap();
     let context = context(scratch.path(), 0);

@@ -479,14 +479,20 @@ pub fn prove_on_copy(
     // Keep only the sealed set.
     transaction.execute_batch(
         "CREATE TEMP TABLE sealed_claims(id TEXT PRIMARY KEY);
+         CREATE TEMP TABLE sealed_blobs(hash TEXT PRIMARY KEY);
          CREATE TEMP TABLE sealed_envelopes(writer TEXT, sequence INTEGER, envelope_hash TEXT,
              PRIMARY KEY(writer, sequence, envelope_hash));",
     )?;
+    let mut blobs = BTreeSet::new();
     for sealed_claim in &sealed.claims {
         transaction.execute(
             "INSERT OR IGNORE INTO temp.sealed_claims(id) VALUES (?1)",
             [&sealed_claim.claim.id],
         )?;
+        collect_hash_fields(&sealed_claim.claim.body, &mut blobs);
+    }
+    for hash in &blobs {
+        transaction.execute("INSERT INTO temp.sealed_blobs(hash) VALUES (?1)", [hash])?;
     }
     for envelope in &sealed.envelopes {
         transaction.execute(
@@ -499,8 +505,12 @@ pub fn prove_on_copy(
         )?;
     }
     runtime.clear_checkpoint_projections(&transaction)?;
+    // Blobs go with the claims that reference them. Admission needs a claim's blobs, so every
+    // node that holds the sealed claims holds these, while the blobs of later claims depend on
+    // what has arrived since the cut. A trim deletes no blob.
     transaction.execute_batch(
         "DELETE FROM claims WHERE id NOT IN (SELECT id FROM temp.sealed_claims);
+         DELETE FROM blobs WHERE hash NOT IN (SELECT hash FROM temp.sealed_blobs);
          DELETE FROM replica_records WHERE NOT EXISTS (
              SELECT 1 FROM temp.sealed_envelopes s WHERE s.writer=replica_records.writer
                AND s.sequence=replica_records.sequence AND s.envelope_hash=replica_records.envelope_hash);",
