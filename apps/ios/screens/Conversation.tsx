@@ -10,6 +10,7 @@ import rules from '../../../fixtures/clients/conversation-style.json';
 import { tokenColor, type ConversationRules } from '../conversationStyle';
 import { COLLAPSED_TOOL_LINES, conversationEntries, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
 import { rememberBounded } from '../boundedCache';
+import { simplify, type SimpleRow } from '../conversationSimple';
 import { sessionPerson } from '../homeView';
 import type { RootScreen } from '../navigation';
 import { applyConversation, isUnresolved, type Conversation } from '../sessionView';
@@ -23,7 +24,7 @@ const c = tokenColor;
 
 const empty: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1 };
 type Pending = { id: string; text: string; at: string; failed?: string };
-type Row = { kind: 'entry'; entry: ConversationEntry } | { kind: 'pending'; pending: Pending } | { kind: 'older' };
+type Row = { kind: 'entry'; entry: ConversationEntry } | Exclude<SimpleRow, { kind: 'entry' }> | { kind: 'pending'; pending: Pending } | { kind: 'older' };
 
 function nowClock() {
   const at = new Date();
@@ -34,7 +35,7 @@ function nowClock() {
 // above the composer, unless the person has scrolled back to read.
 export function ConversationScreen({ route, navigation }: RootScreen<'Conversation'>) {
   const { target, sessionId } = route.params;
-  const { data, feed, caps, status, historicalSessions, conversationCache, draftCache, actions } = useStore();
+  const { data, feed, caps, status, historicalSessions, conversationCache, draftCache, actions, simpleOn } = useStore();
   const session = [...data.sessions, ...historicalSessions].find(candidate => candidate.id === (sessionId ?? target));
   // A running session st manages belongs to its agent: name it, and send to it, as the agent.
   const agent = data.agents.find(candidate => candidate.id === target)
@@ -51,6 +52,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const [findOpen, setFinding] = useState(false);
   const [draft, setDraft] = useState(() => draftCache.current.get(target) ?? '');
   const [away, setAway] = useState(false);
+  // How far from the newest entry the list is scrolled (it is inverted: 0 is the newest).
+  const offset = useRef(0);
   const list = useRef<FlatList<Row>>(null);
   const headerHeight = useHeaderHeight();
   const insets = useSafeAreaInsets();
@@ -106,7 +109,22 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   }, [data.agents, caps?.session_actor]);
   // Half a conversation is worse than none: when st could not read the transcript, say why.
   const unreadable = useMemo(() => unreadableTranscript(timeline.entries), [timeline.entries]);
-  const entries = useMemo(() => unreadable ? [] : conversationEntries(timeline.entries, names), [unreadable, timeline.entries, names]);
+  // An entry that did not change keeps its object, so its row is not drawn and measured again:
+  // redrawing every row on each frame made the list jump.
+  const stable = useRef(new Map<string, { key: string; entry: ConversationEntry }>());
+  const entries = useMemo(() => {
+    const fresh = unreadable ? [] : conversationEntries(timeline.entries, names);
+    const kept = new Map<string, { key: string; entry: ConversationEntry }>();
+    const result = fresh.map(entry => {
+      const key = JSON.stringify(entry);
+      const previous = stable.current.get(entry.id);
+      const same = previous && previous.key === key ? previous.entry : entry;
+      kept.set(entry.id, { key, entry: same });
+      return same;
+    });
+    stable.current = kept;
+    return result;
+  }, [unreadable, timeline.entries, names]);
   // A message st has taken shows up in the conversation; the pending copy then gives way.
   useEffect(() => {
     setPending(previous => previous.filter(item => item.failed || !entries.some(entry => entry.body.kind === 'mail' && entry.body.from === 'you' && entry.body.text.trim() === item.text.trim())));
@@ -115,9 +133,12 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const found = useMemo(() => finding ? entries.filter(entry => entryMatches(entry, find)) : entries, [entries, find, finding]);
   const rows: Row[] = useMemo(() => [
     ...(finding ? [] : [...pending].reverse().map(item => ({ kind: 'pending' as const, pending: item }))),
-    ...[...found].reverse().map(entry => ({ kind: 'entry' as const, entry })),
+    // Simplified (this phone's choice, on by default): a tool call to a line, a run to one line.
+    ...(simpleOn && !finding
+      ? simplify(found, open).reverse().map((row): Row => row)
+      : [...found].reverse().map(entry => ({ kind: 'entry' as const, entry }))),
     ...(timeline.hasOlder && !finding ? [{ kind: 'older' as const }] : []),
-  ], [found, pending, timeline.hasOlder, finding]);
+  ], [found, pending, timeline.hasOlder, finding, simpleOn, open]);
 
   const canSend = !!agent && status === 'online';
   async function send() {
@@ -126,7 +147,9 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     const item: Pending = { id: `pending-${Date.now()}`, text, at: nowClock() };
     setPending(previous => [...previous, item]);
     setDraft(''); draftCache.current.delete(target);
-    list.current?.scrollToOffset({ offset: 0, animated: true });
+    // To the newest, where the message appears: animated from nearby, a jump from far up, since an
+    // animation across the whole conversation reads as the list scrolling everything again.
+    list.current?.scrollToOffset({ offset: 0, animated: offset.current < 1200 });
     const failed = await actions.send(agent.id, text, agent.current_session_id ?? undefined);
     if (failed) setPending(previous => previous.map(candidate => candidate.id === item.id ? { ...candidate, failed } : candidate));
     else setTimeout(() => setPending(previous => previous.filter(candidate => candidate.id !== item.id)), 60_000);
@@ -146,17 +169,19 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       ref={list}
       inverted
       data={rows}
-      keyExtractor={row => row.kind === 'entry' ? row.entry.id : row.kind === 'pending' ? row.pending.id : 'older'}
+      keyExtractor={row => row.kind === 'entry' ? row.entry.id : row.kind === 'call' ? `call:${row.entry.id}` : row.kind === 'bundle' ? row.id : row.kind === 'pending' ? row.pending.id : 'older'}
       renderItem={({ item: row }) => row.kind === 'older'
         ? <View style={styles.entry}><T dim>older history is not shown here · `st conversations timeline` has all of it</T></View>
         : row.kind === 'pending' ? <PendingView pending={row.pending} />
+        : row.kind === 'bundle' ? <BundleView row={row} onToggle={toggle} />
+        : row.kind === 'call' && !open.has(row.entry.id) ? <CallView entry={row.entry} tool={row.tool} onToggle={toggle} />
         // A long press opens the entry's text to select any part of it; iOS text selects only whole.
         : <Pressable onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} /></Pressable>}
       ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 60 }}
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
-      onScroll={event => setAway(event.nativeEvent.contentOffset.y > 240)}
+      onScroll={event => { offset.current = event.nativeEvent.contentOffset.y; setAway(offset.current > 240); }}
       scrollEventThrottle={100}
       contentContainerStyle={{ paddingVertical: 8 }}
     />
@@ -238,6 +263,33 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
   }
 });
 
+type Tool = Extract<ConversationEntry['body'], { kind: 'tool' }>;
+
+const toolGlyph = (state: Tool['state']): [string, string] => state === 'running' ? ['⠿', c(RULES.tool.running)] : state === 'ok' ? [RULES.tool.ok.text, c(RULES.tool.ok.color)] : [RULES.tool.failed.text, c(RULES.tool.failed.color)];
+
+// Simplified: one tool call on one line, never wrapped; a tap opens it in full.
+const CallView = memo(function CallView({ entry, tool, onToggle }: { entry: ConversationEntry; tool: Tool; onToggle: (id: string) => void }) {
+  const [glyph, color] = toolGlyph(tool.state);
+  return <Pressable accessibilityRole="button" accessibilityState={{ expanded: false }} onPress={() => onToggle(entry.id)} style={[styles.call, { borderLeftColor: color }]}>
+    <T numberOfLines={1}><T bold color={color}>{glyph} </T><T color={c(RULES.tool.quiet.title)}>{tool.title}</T></T>
+  </Pressable>;
+});
+
+// Simplified: a run of calls on one line, "▸ 7 tool calls · ✓6 · ✕1 · last: …"; a tap lists them.
+const BundleView = memo(function BundleView({ row, onToggle }: { row: Extract<SimpleRow, { kind: 'bundle' }>; onToggle: (id: string) => void }) {
+  const rule = RULES.bundle;
+  const edge = row.running ? c(RULES.tool.running) : row.failed ? c(RULES.tool.failed.color) : c(RULES.tool.ok.color);
+  return <Pressable accessibilityRole="button" accessibilityState={{ expanded: row.open }} onPress={() => onToggle(row.id)} style={[styles.call, { borderLeftColor: edge }]}>
+    <T numberOfLines={1}>
+      <T color={c(rule.label)}>{row.open ? rule.opened : rule.folded} {row.calls.length} tool calls</T>
+      {row.running ? <T color={c(RULES.tool.running)}> · ⠿{row.running}</T> : null}
+      {row.ok ? <T color={c(RULES.tool.ok.color)}> · {RULES.tool.ok.text}{row.ok}</T> : null}
+      {row.failed ? <T color={c(RULES.tool.failed.color)}> · {RULES.tool.failed.text}{row.failed}</T> : null}
+      <T color={c(rule.last)}> · last: {row.last}</T>
+    </T>
+  </Pressable>;
+});
+
 type Mail = Extract<ConversationEntry['body'], { kind: 'mail' }>;
 
 // Mail the person is part of leads; mail between others stays back and folds to a few rows,
@@ -271,6 +323,7 @@ const styles = StyleSheet.create({
   barred: { borderLeftWidth: 2, marginLeft: 10, paddingLeft: 8 },
   tool: { marginHorizontal: 8, marginVertical: 4, paddingHorizontal: 8, paddingVertical: 4, borderLeftWidth: 2 },
   toolLine: { fontSize: 12, lineHeight: 17, paddingLeft: 18 },
+  call: { marginHorizontal: 8, marginVertical: 2, paddingHorizontal: 8, paddingVertical: 3, borderLeftWidth: 2 },
   composer: { flexDirection: 'row', alignItems: 'flex-end', gap: 6, paddingHorizontal: 10, paddingTop: 6, borderTopColor: theme.surface0, borderTopWidth: StyleSheet.hairlineWidth * 2, backgroundColor: theme.mantle },
   prompt: { paddingBottom: 9, fontFamily: fonts.bold },
   input: { flex: 1, minHeight: 36, maxHeight: 140, marginTop: 0 },
