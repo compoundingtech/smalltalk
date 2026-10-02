@@ -5451,7 +5451,10 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                     .peers
                     .iter()
                     .any(|peer| peer.status != "refused");
-            let status = if replication.unhealthy_projections != 0
+            // A removed node is never told by status alone: its peers merely stop answering.
+            let removed = crate::fleet::file::RemovalNotice::load(&state.state_dir);
+            let status = if removed.is_some()
+                || replication.unhealthy_projections != 0
                 || !diverged.is_empty()
                 || first_sync_failed.is_some()
             {
@@ -5470,7 +5473,13 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{}{}{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    "{}{}{}{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    removed
+                        .map(|notice| format!(
+                            "{}; ",
+                            notice.describe(replication.fleet_id.as_deref())
+                        ))
+                        .unwrap_or_default(),
                     if !catching_up.is_empty() {
                         format!("catching up: {}; ", catching_up.join(", "))
                     } else if unmeasured {
@@ -5705,9 +5714,14 @@ async fn replication_status(
     let configured = state.fleet_id.is_some();
     let fleet = state.fleet_id.clone();
     let peers = replication_peer_names(&state);
-    blocking_store(move || store.replication_status_sealed(configured, fleet.as_deref(), &peers))
-        .await
-        .map(Json)
+    let state_dir = state.state_dir.clone();
+    blocking_store(move || {
+        let mut status = store.replication_status_sealed(configured, fleet.as_deref(), &peers)?;
+        status.removed = crate::fleet::file::RemovalNotice::load(&state_dir);
+        Ok(status)
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -6127,6 +6141,9 @@ pub struct FleetStatus {
     pub view: crate::fleet::FleetView,
     pub peers: Vec<crate::model::ReplicationPeerStatus>,
     pub invites: Vec<crate::store::FleetInviteView>,
+    /// A member refused this node as removed or left, so it no longer syncs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<crate::fleet::file::RemovalNotice>,
 }
 
 fn concrete_person(person: &str) -> Result<(), ApiError> {
@@ -6145,6 +6162,7 @@ async fn fleet_status(State(state): State<AppState>) -> Result<Json<FleetStatus>
     let store = state.store.clone();
     let node = state.node.clone();
     let fleet_id = state.fleet_id.clone();
+    let state_dir = state.state_dir.clone();
     blocking_store(move || {
         let replication =
             store.replication_status_sealed(fleet_id.is_some(), fleet_id.as_deref(), &peers)?;
@@ -6155,6 +6173,7 @@ async fn fleet_status(State(state): State<AppState>) -> Result<Json<FleetStatus>
             view: store.fleet_view_sealed()?,
             peers: replication.peers,
             invites: store.fleet_invites(false)?,
+            removed: crate::fleet::file::RemovalNotice::load(&state_dir),
         })
     })
     .await
