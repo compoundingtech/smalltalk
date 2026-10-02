@@ -506,6 +506,7 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::NotFound => format!("it is gone: {message}"),
         ErrorCode::Forbidden => format!("not allowed: {message}"),
         ErrorCode::Internal => format!("st hit a problem: {message}"),
+        ErrorCode::TimelineHistoryIncomplete => message.to_owned(),
         ErrorCode::TerminalEnded => "the terminal ended: its process exited".into(),
         ErrorCode::TerminalUnavailable => "the terminal cannot be reached right now".into(),
         ErrorCode::ValidationFailed
@@ -2842,6 +2843,12 @@ mod tests {
             "the terminal owner is unavailable",
         );
         assert!(away.is_transient());
+        let incomplete = api(
+            ErrorCode::TimelineHistoryIncomplete,
+            "the retained transcript start is incomplete: an entry's append operation is missing",
+        );
+        assert!(!incomplete.is_transient());
+        assert!(incomplete.plain().contains("append operation is missing"));
         let ended = api(ErrorCode::TerminalEnded, "the terminal process exited");
         assert_eq!(ended.plain(), "the terminal ended: its process exited");
         assert!(!ended.is_transient());

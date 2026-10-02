@@ -197,8 +197,7 @@ async fn deliver_collection(
     let (snapshot, items, has_more) = match read {
         Ok(read) => read,
         Err(error) => {
-            let retryable =
-                client_error_retryable(error.status, Some(&error.code), Some(&error.details));
+            let retryable = client_error_retryable(error.status, Some(&error.code));
             let kind = if retryable { "resync" } else { "error" };
             let sent = send_collection(
                 socket,
@@ -425,7 +424,7 @@ async fn conversation_changes_value(
 /// the socket stops listening. A change the server can no longer replay sends the page again.
 fn conversation_stream_error(id: &str, error: &ApiError) -> Value {
     json!({"kind":"error", "id":id, "collection":"conversation", "code":client_error_code(Some(&error.code)), "message":error.message,
-        "retryable":client_error_retryable(error.status, Some(&error.code), Some(&error.details))})
+        "retryable":client_error_retryable(error.status, Some(&error.code))})
 }
 
 async fn follow_conversation(
@@ -445,7 +444,7 @@ async fn follow_conversation(
         {
             Ok(start) => start,
             Err(error) => {
-                if client_error_retryable(error.status, Some(&error.code), Some(&error.details)) {
+                if client_error_retryable(error.status, Some(&error.code)) {
                     if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true}))).is_err() { return; }
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     continue;
@@ -457,7 +456,7 @@ async fn follow_conversation(
         let page = match conversation_page(&state, &session, &session_id, remote).await {
             Ok(page) => page,
             Err(error) => {
-                if client_error_retryable(error.status, Some(&error.code), Some(&error.details)) {
+                if client_error_retryable(error.status, Some(&error.code)) {
                     if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true}))).is_err() { return; }
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     continue;
@@ -515,13 +514,7 @@ async fn follow_conversation(
                 {
                     break;
                 }
-                Err(error)
-                    if client_error_retryable(
-                        error.status,
-                        Some(&error.code),
-                        Some(&error.details),
-                    ) =>
-                {
+                Err(error) if client_error_retryable(error.status, Some(&error.code)) => {
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     break;
                 }
@@ -3851,7 +3844,7 @@ pub(super) fn timeline_value(
     if !timeline_retention_is_explicit(&timeline_claims, has_older_timeline) {
         return Err(ApiError {
             status: StatusCode::GONE,
-            code: "cursor-gap".into(),
+            code: "timeline-history-incomplete".into(),
             message: "the retained transcript start is incomplete: older history has no truncation interval"
                 .into(),
             details: Box::new(serde_json::Map::from_iter([
@@ -3870,7 +3863,7 @@ pub(super) fn timeline_value(
         if !retained_entries.contains(entry_id) && operation != Some("append") {
             return Err(ApiError {
                 status: StatusCode::GONE,
-                code: "cursor-gap".into(),
+                code: "timeline-history-incomplete".into(),
                 message: "the retained transcript start is incomplete: an entry's append operation is missing".into(),
                 details: Box::new(serde_json::Map::from_iter([
                     ("full_resync".into(), Value::Bool(false)),
@@ -6295,7 +6288,7 @@ fn terminal_stream_error(error: &ApiError) -> Value {
         "request_id": format!("request/{}", new_request_id()),
         "code": client_error_code(Some(&error.code)),
         "message": error.message,
-        "retryable": client_error_retryable(error.status, Some(&error.code), Some(&error.details)),
+        "retryable": client_error_retryable(error.status, Some(&error.code)),
         "details": error.details,
     })
 }
@@ -12308,7 +12301,7 @@ mission "example/zero-run" state="ready" {
                 &ClientListQuery::default(),
             )
             .unwrap_err();
-            assert_eq!(gap.code, "cursor-gap");
+            assert_eq!(gap.code, "timeline-history-incomplete");
             assert!(gap.message.contains("append operation is missing"));
             assert_eq!(gap.details["full_resync"], false);
             let raw = json!({"code":gap.code,"message":gap.message,"details":gap.details});
@@ -12322,11 +12315,7 @@ mission "example/zero-run" state="ready" {
             );
         }
         // An actual cursor/window race still admits a fresh read.
-        assert!(client_error_retryable(
-            StatusCode::GONE,
-            Some("cursor-gap"),
-            None
-        ));
+        assert!(client_error_retryable(StatusCode::GONE, Some("cursor-gap")));
     }
 
     #[test]
@@ -12420,13 +12409,9 @@ mission "example/zero-run" state="ready" {
         )
         .unwrap_err();
         assert_eq!(gap.status, StatusCode::GONE);
-        assert_eq!(gap.code, "cursor-gap");
+        assert_eq!(gap.code, "timeline-history-incomplete");
         assert_eq!(gap.details.get("full_resync"), Some(&Value::Bool(false)));
-        assert!(!client_error_retryable(
-            gap.status,
-            Some(&gap.code),
-            Some(&gap.details)
-        ));
+        assert!(!client_error_retryable(gap.status, Some(&gap.code)));
 
         append_entry(
             4_098,
@@ -12446,7 +12431,7 @@ mission "example/zero-run" state="ready" {
             &ClientListQuery::default(),
         )
         .unwrap_err();
-        assert_eq!(insufficient.code, "cursor-gap");
+        assert_eq!(insufficient.code, "timeline-history-incomplete");
 
         append_entry(
             4_099,

@@ -492,7 +492,7 @@ snapshot pages, and resumes from the capabilities response's `event_cursor`. It 
 missing mutations or request graph replication.
 
 A timeline whose retained claims omit an entry's append, or omit older history without a typed
-truncation interval, reports `cursor-gap` with `retryable: false`, `full_resync: false` and
+truncation interval, reports `timeline-history-incomplete` with `retryable: false`, `full_resync: false` and
 `retained_history_incomplete: true`. Its message explains that the retained transcript start is
 incomplete. Retrying a fresh snapshot cannot restore those missing claims; clients show the
 reason and stop automatic retries. Ordinary expired stream cursors remain retryable.

@@ -59,6 +59,7 @@ pub enum ErrorCode {
     RemoteUnavailable,
     TerminalUnavailable,
     TerminalEnded,
+    TimelineHistoryIncomplete,
     Internal,
     #[serde(other)]
     Unknown,
