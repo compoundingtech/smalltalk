@@ -1059,9 +1059,17 @@ mod retry_tests {
                 .unwrap();
             wakes[index].send_modify(|generation| *generation += 1);
         };
-        async fn converge(stores: &[Arc<Store>]) {
+        // The hub cannot dial an isolated leaf, so a leaf that finished its exchanges before the
+        // other leaf pushed learns of it at its next contact. Stand in for that contact while
+        // waiting: an inbound change wakes the hub dialers, never a refused route.
+        async fn converge(stores: &[Arc<Store>], contexts: &[FleetContext]) {
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
+                    for context in contexts {
+                        context
+                            .inbound_changed
+                            .send_modify(|generation| *generation += 1);
+                    }
                     let snapshots = stores
                         .iter()
                         .map(|store| store.replication_status(true, None, &[]).unwrap())
@@ -1072,7 +1080,7 @@ mod retry_tests {
                     }) {
                         return;
                     }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
             .await
@@ -1081,7 +1089,7 @@ mod retry_tests {
         for index in 0..3 {
             write(index, &format!("initial-{}", names[index]));
         }
-        converge(&stores).await;
+        converge(&stores, &contexts).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             while std::fs::read_to_string(&log)
                 .unwrap_or_default()
@@ -1124,7 +1132,7 @@ mod retry_tests {
                     .inbound_changed
                     .send_modify(|generation| *generation += 1);
             }
-            converge(&stores).await;
+            converge(&stores, &contexts).await;
         }
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
         // Advance an hour on the real dialers. Let shell I/O finish in real time between
