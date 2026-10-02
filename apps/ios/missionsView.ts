@@ -104,8 +104,20 @@ export function missionRows(missions: Mission[], attention: Attention[], agents:
       system: isSystemMission(mission.id),
     };
   });
-  const rows = all.filter(row => showSystem || !row.system).sort((a, b) => WORDS.indexOf(a.word) - WORDS.indexOf(b.word) || a.title.toLowerCase().localeCompare(b.title.toLowerCase()));
-  return { rows, hidden: all.filter(row => row.system && !showSystem).length };
+  // A failure ages out of the list after its day, as in stui (Nathan, 2026-10-02); showing the
+  // hidden missions brings it back.
+  const hide = (row: MissionRow) => row.system || failedBeforeToday(row, now);
+  const rows = all.filter(row => showSystem || !hide(row)).sort((a, b) => WORDS.indexOf(a.word) - WORDS.indexOf(b.word) || a.title.toLowerCase().localeCompare(b.title.toLowerCase()));
+  return { rows, hidden: showSystem ? 0 : all.filter(hide).length };
+}
+
+/** A failed mission whose last change was before today, on this device's clock. */
+export function failedBeforeToday(row: Pick<MissionRow, 'word' | 'mission'>, now = Date.now()): boolean {
+  if (row.word !== 'failed') return false;
+  const at = Date.parse(row.mission.updated_at);
+  if (Number.isNaN(at)) return false;
+  const today = new Date(now); today.setHours(0, 0, 0, 0);
+  return at < today.getTime();
 }
 
 export type MissionSection = { word: Word; title: string; count: number; rows: MissionRow[] };

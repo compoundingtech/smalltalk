@@ -4868,6 +4868,41 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_mission_ages_out_of_the_list_after_its_day() {
+        let mut world = demo::world();
+        let now = chrono::Local::now();
+        if let Load::Ready(missions) = &mut world.missions {
+            let mut failed = missions[0].clone();
+            failed.word = Word::Failed;
+            failed.system = false;
+            let mut today = failed.clone();
+            today.id = "mission/example/failed-today".into();
+            today.title = "Failed today".into();
+            today.updated_at = now.to_rfc3339();
+            failed.id = "mission/example/failed-yesterday".into();
+            failed.title = "Failed yesterday".into();
+            failed.updated_at = (now - chrono::Duration::days(1)).to_rfc3339();
+            missions.push(today);
+            missions.push(failed);
+        }
+        let shown = screens::missions_list(&world, "⠋", false);
+        assert!(shown.ids.iter().any(|id| id == "mission/example/failed-today"));
+        assert!(!shown.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
+        let note = shown
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Note(line) => Some(text::plain(line)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(note.contains("1 failed before today"), "{note}");
+        // x shows it again.
+        let all = screens::missions_list(&world, "⠋", true);
+        assert!(all.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
+    }
+
+    #[test]
     fn a_structured_request_shows_its_fields_and_sends_a_named_answer() {
         let mut world = demo::world();
         let request = st3_client::StructuredRequest {
