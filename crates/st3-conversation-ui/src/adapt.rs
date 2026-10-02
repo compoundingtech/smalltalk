@@ -101,6 +101,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                         body
                     },
                     delivered: false,
+                    dictated: message.tags.iter().any(|tag| tag == "dictated"),
                 }
             };
             stamped.push((
@@ -427,6 +428,7 @@ fn harness_bodies(
             subject,
             body: clean_message_text(&unescape(&block)),
             delivered: false,
+            dictated: false,
         });
     }
     // A `<channel>` delivery announces mail that is already in the stream, so it becomes one line.

@@ -381,7 +381,7 @@ const MailView = memo(function MailView({ entry, body, open, onToggle }: { entry
   const mark = body.from !== 'you' ? null : body.delivered ? rule.delivered : rule.sent;
   return <Pressable disabled={!long} accessibilityRole={long ? 'button' : undefined} accessibilityState={long ? { expanded: open } : undefined} onPress={() => onToggle(entry.id)}
     style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }, toYou ? { backgroundColor: c(rule.to_you_fill) } : null]}>
-    <T><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
+    <T><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
     <View style={long && !open ? { maxHeight: limit, overflow: 'hidden' } : null}>
       {/* Measured at its full height and never shrunk by the fold: a measurement the fold could
           change would fold and unfold the mail in a loop. */}

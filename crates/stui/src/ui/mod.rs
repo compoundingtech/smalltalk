@@ -3393,6 +3393,7 @@ impl Ui {
                     subject: title.clone(),
                     body: text,
                     delivered: false,
+                    dictated: false,
                 },
             });
             entries.push(Entry {
@@ -3404,6 +3405,7 @@ impl Ui {
                     subject: title,
                     body: "Good question. Here is what I know, and what I would need from you to go on. (demo reply)".into(),
                     delivered: false,
+                    dictated: false,
                 },
             });
         }
@@ -3519,6 +3521,7 @@ impl Ui {
                             subject: String::new(),
                             body: draft,
                             delivered: false,
+                            dictated: false,
                         },
                     });
                 }
