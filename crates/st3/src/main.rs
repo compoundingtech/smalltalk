@@ -2416,6 +2416,14 @@ enum AgentsCommand {
     Stop(AgentStopArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
     Restart(AgentRestartArgs),
+    /// Stop a quiet seat at a clean boundary, keeping its native session to resume.
+    ///
+    /// The seat must be idle, with no pending ask or unsent input, no claimed step and no
+    /// running subagent. A suspended seat stays declared, takes no restarts, and keeps its mail
+    /// until it is resumed.
+    Suspend(AgentSuspendArgs),
+    /// Resume a suspended seat on the same native session; wait until its harness proves it.
+    Resume(AgentResumeArgs),
     /// Change only a seat's human label, without restarting its harness.
     Rename(AgentRenameArgs),
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
@@ -2683,6 +2691,33 @@ struct AgentStopArgs {
     /// Print the exact stop KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+}
+
+#[derive(Args)]
+struct AgentSuspendArgs {
+    /// Exact seat subject or its identity without the `agent/` prefix.
+    #[arg(value_parser = parse_agent_start_identity)]
+    subject: String,
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+    /// Why the seat is suspended, recorded with the request.
+    #[arg(long)]
+    reason: Option<String>,
+    /// How long to wait for the seat to suspend.
+    #[arg(long, default_value = "5m")]
+    timeout: String,
+}
+
+#[derive(Args)]
+struct AgentResumeArgs {
+    /// Exact seat subject or its identity without the `agent/` prefix.
+    #[arg(value_parser = parse_agent_start_identity)]
+    subject: String,
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+    /// How long to wait for the seat to resume its native session.
+    #[arg(long, default_value = "10m")]
+    timeout: String,
 }
 
 #[derive(Args)]
@@ -3614,6 +3649,8 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Start(args) => Some(args.actor.as_str()),
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
             AgentsCommand::Restart(args) => Some(args.actor.as_str()),
+            AgentsCommand::Suspend(args) => Some(args.actor.as_str()),
+            AgentsCommand::Resume(args) => Some(args.actor.as_str()),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness delivery hold needs explicit --as {own}")
             })?),
@@ -9009,6 +9046,59 @@ async fn run_agents(
             }
             Ok(())
         }
+        AgentsCommand::Suspend(args) => {
+            let subject = format!("agent/{}", args.subject);
+            let agent = request_suspension(
+                endpoint,
+                "/v1/agents/suspend",
+                &subject,
+                &args.actor,
+                args.reason.as_deref(),
+                &args.timeout,
+            )
+            .await?;
+            if json_output {
+                print_value(&agent, true)
+            } else {
+                let suspension = agent.suspension.as_ref();
+                println!(
+                    "Suspended {subject}: {} session {}; resume it with `st agents resume {subject}`",
+                    suspension
+                        .and_then(|item| item.harness.as_deref())
+                        .unwrap_or("native"),
+                    suspension
+                        .and_then(|item| item.native_session_id.as_deref())
+                        .unwrap_or("unknown"),
+                );
+                Ok(())
+            }
+        }
+        AgentsCommand::Resume(args) => {
+            let subject = format!("agent/{}", args.subject);
+            let agent = request_suspension(
+                endpoint,
+                "/v1/agents/resume",
+                &subject,
+                &args.actor,
+                None,
+                &args.timeout,
+            )
+            .await?;
+            if json_output {
+                print_value(&agent, true)
+            } else {
+                println!(
+                    "Resumed {subject} on its native session {}: running on incarnation {}",
+                    agent
+                        .suspension
+                        .as_ref()
+                        .and_then(|item| item.native_session_id.as_deref())
+                        .unwrap_or("unknown"),
+                    agent.incarnation_id.as_deref().unwrap_or("")
+                );
+                Ok(())
+            }
+        }
         AgentsCommand::Restart(args) => {
             let timeout = st3::graph::parse_duration(&args.timeout, false)?;
             let subject = format!("agent/{}", args.subject);
@@ -9699,6 +9789,8 @@ async fn run_agent_inspection(
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
         | AgentsCommand::Restart(_)
+        | AgentsCommand::Suspend(_)
+        | AgentsCommand::Resume(_)
         | AgentsCommand::Rename(_)
         | AgentsCommand::Queue(_)
         | AgentsCommand::Hold(_) => {
@@ -10442,6 +10534,23 @@ fn render_client_agent(
     );
     if let Some(fault) = &agent.fault {
         let _ = writeln!(output, "FAULT        {fault}");
+    }
+    if let Some(suspension) = &agent.suspension {
+        let session = match (&suspension.harness, &suspension.native_session_id) {
+            (Some(harness), Some(session)) => format!(" · {harness} session {session}"),
+            (None, Some(session)) => format!(" · session {session}"),
+            _ => String::new(),
+        };
+        let failure = match (&suspension.code, &suspension.reason) {
+            (Some(code), Some(reason)) => format!(" · {code}: {reason}"),
+            (Some(code), None) => format!(" · {code}"),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            output,
+            "SUSPENSION   {} {}{session}{failure}",
+            suspension.action, suspension.phase
+        );
     }
     if let Some(delivery) = &agent.delivery {
         match delivery.reason.as_deref() {
@@ -12783,6 +12892,50 @@ async fn run_st2_native_driver(
         )
     })
     .await?;
+    // A resumed seat relaunches its harness on the session it suspended on, or not at all.
+    let argv = match st3::native_resume::requested() {
+        None => argv,
+        Some(session) => {
+            let selected = match driver {
+                "claude" => st3::native_resume::claude_argv(
+                    argv,
+                    &session,
+                    &std::env::current_dir()?,
+                    st3::native_resume::claude_home().as_deref(),
+                ),
+                "pi" | "omp" => {
+                    st3::native_resume::pi_family_argv(driver, argv, &paths.agent_dir, &session)
+                }
+                "opencode" => st3::native_resume::opencode_argv(
+                    argv,
+                    &session,
+                    st3::native_resume::opencode_data_dir().as_deref(),
+                ),
+                _ => unreachable!("the native driver was checked"),
+            };
+            match selected {
+                Ok(argv) => argv,
+                Err(refusal) => {
+                    return Err(refuse_native_resume(
+                        client,
+                        subject,
+                        &incarnation,
+                        driver,
+                        refusal,
+                    )
+                    .await);
+                }
+            }
+        }
+    };
+    if driver == "opencode" {
+        // The predecessor's bound session is not this launch's, and the driver reports this file.
+        let _ = fs::remove_file(
+            paths
+                .agent_dir
+                .join(st_drivers::opencode_session::NATIVE_SESSION_FILE),
+        );
+    }
     let harness_state_path = st_drivers::harness_state::harness_state_path(&paths.agent_dir);
     let loop_state = NativeLoopState {
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
@@ -13145,6 +13298,7 @@ async fn drive_st2_native(
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
     let mut replacement = DriverReplacement::new();
     let mut binding_watch = ClaudeBindingWatch::default();
+    let mut reported_session = None;
     // Claude's hooks keep the subagent ledger; this driver records it on the seat.
     let mut subagents = (driver == "claude").then(|| {
         st3::subagents::Publisher::start(
@@ -13231,6 +13385,27 @@ async fn drive_st2_native(
                 } else {
                     None
                 };
+                let bound = match driver {
+                    "claude" => provider_incarnation
+                        .as_deref()
+                        .and_then(|token| st3::hooks::claude_binding(&agent_dir, token)),
+                    "opencode" => st3::native_resume::opencode_bound_session(&agent_dir),
+                    _ => None,
+                };
+                if let Some(session) = bound
+                    && let Err(error) = report_native_session(
+                        client,
+                        subject,
+                        &incarnation,
+                        driver,
+                        &session,
+                        None,
+                        &mut reported_session,
+                    )
+                    .await
+                {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
                 if driver == "claude"
                     && let Some(reason) = binding_watch.overdue(
                         &agent_dir,
@@ -13331,7 +13506,7 @@ async fn drive_st2_native(
                                     subject: subject.into(),
                                     kind: "harness.observed".into(),
                                     actor: Some(subject.into()),
-                                    fields: BTreeMap::from([
+                                    fields: with_quiescence(BTreeMap::from([
                                         ("state".into(), Value::String("ready".into())),
                                         ("driver".into(), Value::String(driver.into())),
                                         (
@@ -13343,7 +13518,7 @@ async fn drive_st2_native(
                                             }),
                                         ),
                                         ("incarnation_id".into(), Value::String(incarnation.clone())),
-                                    ]),
+                                    ])),
                                     evidence: Vec::new(),
                                     expected_subject: None,
                                     idempotency_key: Some(format!("native-ready:{subject}:{driver}:{incarnation}")),
@@ -13652,6 +13827,7 @@ async fn publish_harness_activity(
     if let Some(incarnation) = incarnation {
         fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
     }
+    st3::suspension::annotate_quiescence(&mut fields);
     let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
         observed.since_ms,
         &fields,
@@ -14004,6 +14180,101 @@ fn timeline_claim_fields(
     fields
 }
 
+/// The driver cannot relaunch the native session its suspended seat names. Record the typed
+/// reason where the daemon's resume reads it, and end this launch: a harness must never start on
+/// another session in its place.
+async fn refuse_native_resume(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    driver: &str,
+    refusal: st3::native_resume::Refusal,
+) -> anyhow::Error {
+    let _ = write_driver_log(
+        subject,
+        &json!({"type":"native_resume_refused","driver":driver,"code":refusal.code,"reason":refusal.reason}).to_string(),
+    );
+    let diagnostic = ClaimInput {
+        subject: subject.into(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(subject.into()),
+        fields: BTreeMap::from([
+            ("severity".into(), Value::String("error".into())),
+            ("status".into(), Value::String(refusal.code.into())),
+            (
+                "code".into(),
+                Value::String(st3::suspension::RESUME_UNAVAILABLE_CODE.into()),
+            ),
+            ("reason".into(), Value::String(refusal.reason.clone())),
+            ("incarnation_id".into(), Value::String(incarnation.into())),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(format!(
+            "{}:{subject}:{incarnation}",
+            st3::suspension::RESUME_UNAVAILABLE_CODE
+        )),
+    };
+    let _ = retry_while_daemon_unreachable(subject, || {
+        client.post::<_, ClaimRecord>("/v1/claims", &diagnostic)
+    })
+    .await;
+    anyhow::anyhow!(
+        "{driver} cannot resume its native session ({}): {}",
+        refusal.code,
+        refusal.reason
+    )
+}
+
+/// Report the native session the harness bound for this incarnation, once per session.
+async fn report_native_session(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    harness: &str,
+    session: &str,
+    path: Option<&Path>,
+    reported: &mut Option<String>,
+) -> Result<()> {
+    if reported.as_deref() == Some(session) {
+        return Ok(());
+    }
+    let _: ClaimRecord = client
+        .post(
+            "/v1/agents/native-session",
+            &json!({
+                "subject": subject,
+                "actor": subject,
+                "incarnation_id": incarnation,
+                "harness": harness,
+                "session_id": session,
+                "path": path.map(|path| path.to_string_lossy().into_owned()),
+            }),
+        )
+        .await?;
+    *reported = Some(session.to_owned());
+    Ok(())
+}
+
+/// The thread a Codex wrapper bound in `binding.json` since `prior` was read at launch.
+fn codex_bound_thread(state_dir: &Path, prior: Option<&Vec<u8>>) -> Option<String> {
+    let bytes = fs::read(state_dir.join("binding.json")).ok()?;
+    if Some(&bytes) == prior {
+        return None;
+    }
+    let binding: Value = serde_json::from_slice(&bytes).ok()?;
+    binding["threadId"]
+        .as_str()
+        .filter(|thread| !thread.is_empty())
+        .map(str::to_owned)
+}
+
+/// A `harness.observed` claim's fields with the driver's quiescence report added.
+fn with_quiescence(mut fields: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    st3::suspension::annotate_quiescence(&mut fields);
+    fields
+}
+
 async fn publish_harness_state(
     client: &Client,
     subject: &str,
@@ -14022,6 +14293,7 @@ async fn publish_harness_state(
     if let Some(reason) = reason {
         fields.insert("reason".into(), Value::String(reason.into()));
     }
+    st3::suspension::annotate_quiescence(&mut fields);
     let incarnation_key = work_incarnation_key(incarnation);
     let _: ClaimRecord = client
         .post(
@@ -14476,6 +14748,22 @@ impl PiChannelResume {
                     .map(|reason| reason.chars().take(2_000).collect());
                 true
             }
+            // The extension names the native session it runs, before and after its hello.
+            Some("session" | "ready") => {
+                let Some(native) = frame
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                else {
+                    return false;
+                };
+                let path = frame
+                    .get("sessionFile")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.pending.native_session = Some((native.to_owned(), path));
+                true
+            }
             Some("delivered") => {
                 let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else {
                     return false;
@@ -14557,6 +14845,9 @@ struct PiFamilyReports {
     reads: BTreeSet<String>,
     #[serde(default)]
     fence: Option<st3::mailbox::Fence>,
+    /// The native session the harness reported, with its transcript, until the daemon has it.
+    #[serde(default)]
+    native_session: Option<(String, Option<String>)>,
 }
 
 impl PiFamilyReports {
@@ -14576,7 +14867,7 @@ impl PiFamilyReports {
                         subject: subject.into(),
                         kind: "harness.observed".into(),
                         actor: Some(subject.into()),
-                        fields: BTreeMap::from([
+                        fields: with_quiescence(BTreeMap::from([
                             ("state".into(), Value::String(status)),
                             ("driver".into(), Value::String(driver.into())),
                             (
@@ -14604,7 +14895,7 @@ impl PiFamilyReports {
                             ),
                             ("input_buffer".into(), Value::Null),
                             ("exit".into(), Value::Null),
-                        ]),
+                        ])),
                         evidence: Vec::new(),
                         expected_subject: None,
                         idempotency_key: Some(format!(
@@ -14614,6 +14905,22 @@ impl PiFamilyReports {
                 )
                 .await?;
             self.state = None;
+        }
+        if let Some((native, path)) = self.native_session.clone() {
+            let _: ClaimRecord = client
+                .post(
+                    "/v1/agents/native-session",
+                    &json!({
+                        "subject": subject,
+                        "actor": subject,
+                        "incarnation_id": incarnation,
+                        "harness": driver,
+                        "session_id": native,
+                        "path": path,
+                    }),
+                )
+                .await?;
+            self.native_session = None;
         }
         while let Some(message) = self.acknowledgements.first().cloned() {
             match &self.fence {
@@ -14812,6 +15119,11 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
         )
     })
     .await?;
+    if let Some(thread) = st3::native_resume::requested()
+        && let Err(refusal) = st3::native_resume::codex_check(&argv, &thread)
+    {
+        return Err(refuse_native_resume(client, subject, &incarnation, "codex", refusal).await);
+    }
     drive_codex_native(
         client,
         subject,
@@ -14833,6 +15145,7 @@ fn spawn_codex_provider(
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
     tokio::task::spawn_blocking(move || match start {
+        // A resumed seat's launch environment names the thread it suspended on.
         ProviderStart::Launch(_) => st_drivers::codex_app_server::run_controlled_paths(
             &paths.catalog,
             &state_dir,
@@ -14841,6 +15154,7 @@ fn spawn_codex_provider(
             paths.runtime_id,
             argv,
             paths.delivery_gate,
+            st3::native_resume::requested(),
         ),
         ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
             tui_pid,
@@ -14907,6 +15221,7 @@ async fn drive_codex_native(
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
+    let mut reported_session = None;
     // The Codex control pump keeps the subagent ledger; this driver records it on the seat.
     let mut subagents = st3::subagents::Publisher::start(
         subject,
@@ -14970,6 +15285,15 @@ async fn drive_codex_native(
                         expected_subject: None,
                         idempotency_key: Some(format!("codex-driver-failed:{subject}:{incarnation}")),
                     }).await;
+                    // A resume that ended before its thread bound was refused by Codex itself,
+                    // such as a thread with no rollout.
+                    if reported_session.is_none() && st3::native_resume::requested().is_some() {
+                        let refusal = st3::native_resume::Refusal {
+                            code: "harness-refused",
+                            reason: format!("{error:#}").chars().take(2_000).collect(),
+                        };
+                        let _ = refuse_native_resume(client, subject, &incarnation, "codex", refusal).await;
+                    }
                 }
                 return outcome;
             },
@@ -15011,17 +15335,29 @@ async fn drive_codex_native(
                             subject: subject.into(),
                             kind: "harness.observed".into(),
                             actor: Some(subject.into()),
-                            fields: BTreeMap::from([
+                            fields: with_quiescence(BTreeMap::from([
                                 ("state".into(), Value::String("ready".into())),
                                 ("driver".into(), Value::String("codex".into())),
                                 ("transport".into(), Value::String("app-server".into())),
                                 ("incarnation_id".into(), Value::String(incarnation.clone())),
-                            ]),
+                            ])),
                             evidence: Vec::new(),
                             expected_subject: None,
                             idempotency_key: Some(format!("codex-ready:{subject}:{incarnation}")),
                         }).await?;
                         loop_state.ready = true;
+                    }
+                    if let Some(thread) = codex_bound_thread(&state_dir, prior_binding.as_ref()) {
+                        report_native_session(
+                            client,
+                            subject,
+                            &incarnation,
+                            "codex",
+                            &thread,
+                            None,
+                            &mut reported_session,
+                        )
+                        .await?;
                     }
                     let current_record = fs::read(&harness_state_path).ok();
                     loop_state.harness_record_started = harness_record_belongs_to_current_session(
@@ -15414,6 +15750,72 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
         }
     }
     failure.map_or(Ok(()), Err)
+}
+
+/// Ask the daemon to suspend or resume `subject`, then wait for the request to finish: the seat
+/// suspended, or resumed with its harness bound to the suspended native session.
+async fn request_suspension(
+    endpoint: &Endpoint,
+    route: &str,
+    subject: &str,
+    actor: &str,
+    reason: Option<&str>,
+    timeout_text: &str,
+) -> Result<st3_client::Agent> {
+    let timeout = st3::graph::parse_duration(timeout_text, false)?;
+    let client = cli_client(endpoint);
+    let request: ClaimRecord = client
+        .post(
+            route,
+            &json!({
+                "subject": subject,
+                "actor": actor,
+                "reason": reason,
+                "idempotency_key": uuid::Uuid::now_v7().to_string(),
+            }),
+        )
+        .await?;
+    let resume = route.ends_with("/resume");
+    let gateway = generated_client(endpoint, None)?;
+    let wait = async {
+        loop {
+            if let ClientResource::Agent(agent) = gateway.agents_get(subject).await?.value
+                && let Some(suspension) = agent.suspension.clone()
+                && suspension.operation_id == request.id
+            {
+                let failure = || {
+                    let blocking = if suspension.blocking.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", suspension.blocking.join(", "))
+                    };
+                    anyhow::anyhow!(
+                        "`{subject}` could not {}: {}{blocking}: {}; inspect it with `st agents show {subject}`",
+                        if resume { "resume" } else { "suspend" },
+                        suspension.code.as_deref().unwrap_or("failed"),
+                        suspension.reason.as_deref().unwrap_or("no reason recorded"),
+                    )
+                };
+                match (resume, suspension.phase.as_str()) {
+                    (false, "suspended") | (true, "resumed") => {
+                        return Ok::<_, anyhow::Error>(agent);
+                    }
+                    (false, "failed") => return Err(failure()),
+                    (true, "suspended") if suspension.code.is_some() => return Err(failure()),
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_millis(timeout), wait)
+        .await
+        .with_context(|| {
+            format!(
+                "`{subject}` did not {} within {timeout_text}; inspect it with `st agents show {subject}`",
+                if resume { "resume" } else { "suspend" }
+            )
+        })?
 }
 
 /// Whether a renewal failed only because the step's claim ended or moved to another incarnation.

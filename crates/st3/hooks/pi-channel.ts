@@ -317,6 +317,21 @@ export default function (pi: ExtensionAPI) {
             send({ type: "delivered", meta: accepted.meta });
             if (accepted.read) send({ type: "read", meta: accepted.meta });
           }
+          // The native session this channel serves: st resumes a suspended seat on it and checks
+          // the resumed seat reports the same one.
+          const sessions = ctx.sessionManager as {
+            getSessionId?: () => unknown;
+            getSessionFile?: () => unknown;
+          };
+          const nativeSessionId = sessions?.getSessionId?.();
+          if (typeof nativeSessionId === "string" && nativeSessionId.trim() !== "") {
+            const sessionFile = sessions.getSessionFile?.();
+            send({
+              type: "ready",
+              sessionId: nativeSessionId,
+              ...(typeof sessionFile === "string" ? { sessionFile } : {}),
+            });
+          }
           settleAfterStart(ctx, child);
           clearTimeout(timer);
           settle(typeof frame.sessionContext === "string" ? frame.sessionContext : "");

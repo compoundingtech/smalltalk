@@ -3,7 +3,9 @@
 // at each boundary: starts the session, hands the extension idle state, takes native user messages
 // and raises the `context` event for them, and acts on a message as a model would.
 import childProcess from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const harness = process.env.STUB_HARNESS;
@@ -35,11 +37,44 @@ const act = (content) => {
 };
 
 record('started', { argv: process.argv.slice(2), harness });
+
+// The session, kept as pi and omp keep it: `<time>_<id>.jsonl` in `--session-dir`, whose first line
+// names the session. pi resumes `--session PATH` (and starts a new session at a path that does not
+// exist); omp resumes `--resume ID` and refuses an ID it has no transcript for.
+const option = (name) => {
+  const index = process.argv.indexOf(name);
+  return index > 0 ? process.argv[index + 1] : undefined;
+};
+const sessionDir = option('--session-dir') ?? process.cwd();
+const headerId = (file) => JSON.parse(fs.readFileSync(file, 'utf8').split('\n')[0]).id;
+let sessionFile;
+let sessionId;
+if (harness === 'omp' && option('--resume')) {
+  sessionId = option('--resume');
+  const name = fs.readdirSync(sessionDir).find((entry) => entry.endsWith(`_${sessionId}.jsonl`));
+  if (!name) {
+    console.error(`Session ${sessionId} not found`);
+    record('session-missing', { sessionId });
+    process.exit(1);
+  }
+  sessionFile = path.join(sessionDir, name);
+} else if (harness === 'pi' && option('--session') && fs.existsSync(option('--session'))) {
+  sessionFile = option('--session');
+  sessionId = headerId(sessionFile);
+} else {
+  sessionId = crypto.randomUUID();
+  sessionFile = option('--session') ?? path.join(sessionDir, `${Date.now()}_${sessionId}.jsonl`);
+  fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+  fs.writeFileSync(sessionFile, JSON.stringify({ type: 'session', id: sessionId, cwd: process.cwd() }) + '\n');
+}
+const resumed = fs.readFileSync(sessionFile, 'utf8').split('\n').length > 2;
+fs.appendFileSync(sessionFile, JSON.stringify({ type: 'launch', at: Date.now() }) + '\n');
+record('session', { sessionId, sessionFile, resumed });
 const events = new Map();
 let title = '';
 const ctx = {
   isIdle: () => true,
-  sessionManager: { getSessionId: () => `stub-${process.pid}`, getEntries: () => [] },
+  sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile, getEntries: () => [] },
   ui: { notify: (message, level) => record('notification', { message, level }) },
 };
 const api = {

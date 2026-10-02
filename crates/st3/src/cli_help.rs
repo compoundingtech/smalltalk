@@ -123,6 +123,9 @@ pub(super) fn agent_state(
             fault.unwrap_or("the agent process failed")
         ),
         "stopped" => "Stopped — the agent is no longer running.".into(),
+        "suspended" => {
+            "Suspended — the agent stopped at a quiet moment; `st agents resume` brings back its session.".into()
+        }
         "waiting" if reachability != "reachable" => {
             "Still starting — the agent process cannot currently be reached.".into()
         }

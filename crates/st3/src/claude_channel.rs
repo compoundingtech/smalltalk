@@ -101,8 +101,9 @@ pub async fn run(
                         // MCP initialization is positive native readiness, independent of hooks.
                         let _: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
                             subject: subject.into(), kind:"harness.observed".into(), actor:Some(subject.into()),
-                            fields:BTreeMap::from([("state".into(),json!("ready")),("driver".into(),json!("claude")),
-                                ("transport".into(),json!("claude-channel")),("incarnation_id".into(),json!(incarnation))]),
+                            fields:{let mut fields=BTreeMap::from([("state".into(),json!("ready")),("driver".into(),json!("claude")),
+                                ("transport".into(),json!("claude-channel")),("incarnation_id".into(),json!(incarnation))]);
+                                crate::suspension::annotate_quiescence(&mut fields); fields},
                             evidence:Vec::new(),expected_subject:None,idempotency_key:Some(format!("channel-ready:{subject}:{incarnation}:{}",state.fence.epoch)),
                         }).await;
                     }

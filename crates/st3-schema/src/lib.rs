@@ -2584,6 +2584,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("incarnation_id", string()),
             ("deadline_unix_ms", string()),
             ("signal", string()),
+            ("reason", string()),
         ],
         "runtime.action.succeeded"
         | "runtime.action.failed"
@@ -2598,6 +2599,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("reason", string()),
             ("signal", string()),
             ("operation_status", string()),
+            ("code", string()),
+            ("blocking", array()),
+            ("harness", string()),
+            ("native_session_id", string()),
         ],
         "runtime.observed" => &[
             ("status", string()),
@@ -2667,6 +2672,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("ownership_sequence", integer()),
             ("transition_sequence", integer()),
             ("evidence_incarnation", string()),
+            ("quiescent", boolean()),
+            ("blocking", array()),
         ],
         "harness.session-file" => &[
             ("harness", required_string()),

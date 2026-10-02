@@ -840,6 +840,38 @@ pub struct Agent {
     /// The subagents this seat's harness runs now, oldest first. An older daemon omits them.
     #[serde(default)]
     pub subagents: Vec<AgentSubagent>,
+    /// The seat's latest suspend or resume and its phase. An older daemon omits it.
+    #[serde(default)]
+    pub suspension: Option<AgentSuspension>,
+}
+/// Where a seat's latest suspend or resume stands.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentSuspension {
+    /// `suspend` or `resume`.
+    pub action: String,
+    /// suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running).
+    /// resume: restoring, verifying, resumed; a failed resume returns to suspended.
+    pub phase: String,
+    /// The request claim; each phase change is a change of the agent.
+    pub operation_id: String,
+    #[serde(default)]
+    pub harness: Option<String>,
+    /// The harness's own session the seat suspended on and resumes.
+    #[serde(default)]
+    pub native_session_id: Option<String>,
+    #[serde(default)]
+    pub incarnation_id: Option<String>,
+    #[serde(default)]
+    pub suspended_at: Option<String>,
+    pub updated_at: String,
+    /// Stable reason the last suspend or resume failed.
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Why a refused suspend did not find the seat quiet.
+    #[serde(default)]
+    pub blocking: Vec<String>,
 }
 /// A subagent a seat's harness runs inside its own session: open, with a lease that runs on.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1641,6 +1673,10 @@ pub enum ActionType {
     AgentStop,
     #[serde(rename = "agent.start")]
     AgentStart,
+    #[serde(rename = "agent.suspend")]
+    AgentSuspend,
+    #[serde(rename = "agent.resume")]
+    AgentResume,
     #[serde(rename = "terminal.create")]
     TerminalCreate,
     #[serde(rename = "terminal.end")]
@@ -1739,6 +1775,20 @@ impl ActionRequest {
             &parameters,
         )
     }
+    pub fn agent_resume(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentResumeParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::AgentResume,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
     pub fn agent_start(
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
@@ -1762,6 +1812,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::AgentStop,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn agent_suspend(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentSuspendParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::AgentSuspend,
             idempotency_key,
             fence,
             &parameters,
@@ -2527,6 +2591,20 @@ pub struct AgentStopParameters {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentStartParameters {
+    pub agent: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSuspendParameters {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResumeParameters {
     pub agent: String,
 }
 

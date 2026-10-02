@@ -1559,6 +1559,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                 } else {
                     self.runtime.observe_exec(&member.runtime_id)?
                 };
+                if subject.kind == "agent"
+                    && let Some(suspension) =
+                        crate::suspension::current(&self.store, &subject.subject)?
+                    && suspension.holds_seat()
+                {
+                    return self.reconcile_suspension(
+                        subject,
+                        member,
+                        observed.as_ref(),
+                        blocked,
+                        &suspension,
+                    );
+                }
                 if self.reconcile_requested_restart(
                     subject,
                     member,
@@ -3501,6 +3514,372 @@ impl<R: RuntimeControl> Reconciler<R> {
         )?;
         self.signal_changed();
         Ok(())
+    }
+
+    /// Record one phase of a suspend or resume as its requester, so it replicates.
+    fn record_suspension_phase(
+        &self,
+        subject: &str,
+        suspension: &crate::suspension::Suspension,
+        kind: &str,
+        key: String,
+        mut fields: BTreeMap<String, Value>,
+    ) -> Result<()> {
+        fields.insert("action".into(), Value::String(suspension.action.clone()));
+        self.store.append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: kind.into(),
+            actor: suspension.requested_by.clone(),
+            fields,
+            evidence: vec![suspension.operation_id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(key),
+        })?;
+        self.signal_changed();
+        Ok(())
+    }
+
+    fn fail_suspension(
+        &self,
+        subject: &str,
+        suspension: &crate::suspension::Suspension,
+        code: &str,
+        reason: String,
+        blocking: Vec<String>,
+    ) -> Result<()> {
+        let key = if suspension.action == "suspend" {
+            crate::suspension::suspend_failed_key(&suspension.operation_id)
+        } else {
+            crate::suspension::resume_failed_key(&suspension.operation_id)
+        };
+        self.record_suspension_phase(
+            subject,
+            suspension,
+            "runtime.action.failed",
+            key,
+            BTreeMap::from([
+                ("code".into(), Value::String(code.into())),
+                ("reason".into(), Value::String(reason)),
+                (
+                    "blocking".into(),
+                    Value::Array(blocking.into_iter().map(Value::String).collect()),
+                ),
+            ]),
+        )
+    }
+
+    /// Drive a seat's suspend or resume one step. A suspended seat has no process, and nothing
+    /// but its resume starts one: not its restart policy, not a restart request.
+    fn reconcile_suspension(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: Option<&RuntimeObservation>,
+        blocked: Option<anyhow::Error>,
+        suspension: &crate::suspension::Suspension,
+    ) -> Result<()> {
+        use crate::suspension as suspended;
+        let agent = subject.subject.as_str();
+        let status = observation.map(|item| item.status.as_str());
+        let running = observation.filter(|item| item.status == "running");
+        let ended = matches!(status, None | Some("exited" | "vanished" | "stopped"));
+        let stop = |observation: &RuntimeObservation| {
+            self.reconcile_runtime_stop(
+                agent,
+                &member.runtime_id,
+                member.terminal,
+                observation.incarnation_id.as_deref(),
+                member.shutdown_timeout_ms,
+                Some(observation),
+            )
+        };
+        match suspension.phase.as_str() {
+            "quiescing" => {
+                let Some(observation) = running.filter(|item| {
+                    item.incarnation_id.is_some()
+                        && item.incarnation_id == suspension.incarnation_id
+                }) else {
+                    if ended || running.is_some() {
+                        return self.fail_suspension(
+                            agent,
+                            suspension,
+                            "not-running",
+                            "the seat is not running the incarnation the suspend named".into(),
+                            Vec::new(),
+                        );
+                    }
+                    return Ok(());
+                };
+                self.record_member(subject, observation, true)?;
+                let incarnation = observation.incarnation_id.as_deref().unwrap_or_default();
+                let blocking = suspended::blockers(&self.store, agent, incarnation)?;
+                if !blocking.is_empty() {
+                    return self.fail_suspension(
+                        agent,
+                        suspension,
+                        "not-quiescent",
+                        format!("the seat is not quiet: {}", blocking.join(", ")),
+                        blocking,
+                    );
+                }
+                let Some((harness, session)) =
+                    suspended::bound_session(&self.store, agent, incarnation)?
+                else {
+                    unreachable!("blockers require a bound native session");
+                };
+                self.record_suspension_phase(
+                    agent,
+                    suspension,
+                    "runtime.action.succeeded",
+                    suspended::suspend_snapshot_key(&suspension.operation_id),
+                    BTreeMap::from([
+                        (
+                            "operation_status".into(),
+                            Value::String("snapshotting".into()),
+                        ),
+                        ("harness".into(), Value::String(harness)),
+                        ("native_session_id".into(), Value::String(session)),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                        (
+                            "runtime_id".into(),
+                            Value::String(member.runtime_id.clone()),
+                        ),
+                    ]),
+                )?;
+                stop(observation)?;
+                Ok(())
+            }
+            "snapshotting" => {
+                if let Some(observation) = running {
+                    self.record_member(subject, observation, true)?;
+                    stop(observation)?;
+                    return Ok(());
+                }
+                if !ended {
+                    return Ok(());
+                }
+                if let Some(observation) = observation {
+                    self.record_member(subject, observation, false)?;
+                }
+                self.reconcile_runtime_stop(
+                    agent,
+                    &member.runtime_id,
+                    member.terminal,
+                    None,
+                    member.shutdown_timeout_ms,
+                    None,
+                )?;
+                self.record_suspension_phase(
+                    agent,
+                    suspension,
+                    "runtime.action.succeeded",
+                    suspended::suspend_completed_key(&suspension.operation_id),
+                    BTreeMap::from([
+                        ("operation_status".into(), Value::String("suspended".into())),
+                        (
+                            "harness".into(),
+                            suspension
+                                .harness
+                                .clone()
+                                .map_or(Value::Null, Value::String),
+                        ),
+                        (
+                            "native_session_id".into(),
+                            suspension
+                                .native_session_id
+                                .clone()
+                                .map_or(Value::Null, Value::String),
+                        ),
+                    ]),
+                )
+            }
+            "suspended" => {
+                // A resume that failed after its launch leaves a process to end.
+                if let Some(observation) = running {
+                    self.record_member(subject, observation, true)?;
+                    stop(observation)?;
+                } else if ended {
+                    self.reconcile_runtime_stop(
+                        agent,
+                        &member.runtime_id,
+                        member.terminal,
+                        None,
+                        member.shutdown_timeout_ms,
+                        None,
+                    )?;
+                }
+                Ok(())
+            }
+            "restoring" => {
+                if running.is_some() || !ended {
+                    // A launch from an earlier pass is already under way; verify it.
+                    return self.record_suspension_phase(
+                        agent,
+                        suspension,
+                        "runtime.action.succeeded",
+                        suspended::resume_started_key(&suspension.operation_id),
+                        BTreeMap::from([(
+                            "operation_status".into(),
+                            Value::String("verifying".into()),
+                        )]),
+                    );
+                }
+                if let Some(error) = blocked {
+                    return self.fail_suspension(
+                        agent,
+                        suspension,
+                        "start-blocked",
+                        format!("{error:#}"),
+                        Vec::new(),
+                    );
+                }
+                let Some(session) = suspension.native_session_id.clone() else {
+                    return self.fail_suspension(
+                        agent,
+                        suspension,
+                        "snapshot-incomplete",
+                        "the suspension recorded no native session".into(),
+                        Vec::new(),
+                    );
+                };
+                let mut resumed = member.clone();
+                resumed
+                    .environment
+                    .insert(suspended::RESUME_ENV.into(), session);
+                let before = self
+                    .store
+                    .latest_observation(agent, "runtime.action.succeeded")?
+                    .map(|claim| claim.id);
+                if let Err(error) =
+                    self.perform_start(subject, &resumed, "a suspended seat was resumed")
+                {
+                    return self.fail_suspension(
+                        agent,
+                        suspension,
+                        "start-failed",
+                        format!("{error:#}"),
+                        Vec::new(),
+                    );
+                }
+                let after = self
+                    .store
+                    .latest_observation(agent, "runtime.action.succeeded")?
+                    .map(|claim| claim.id);
+                if after == before {
+                    return Ok(());
+                }
+                self.record_suspension_phase(
+                    agent,
+                    suspension,
+                    "runtime.action.succeeded",
+                    suspended::resume_started_key(&suspension.operation_id),
+                    BTreeMap::from([(
+                        "operation_status".into(),
+                        Value::String("verifying".into()),
+                    )]),
+                )
+            }
+            "verifying" => {
+                let overdue = now_ms().saturating_sub(suspension.updated_at_unix_ms)
+                    > suspended::VERIFY_TIMEOUT_MS;
+                if let Some(observation) = running {
+                    self.record_member(subject, observation, true)?;
+                    let incarnation = observation.incarnation_id.as_deref().unwrap_or_default();
+                    match suspended::bound_session(&self.store, agent, incarnation)? {
+                        Some((_, live)) if Some(&live) == suspension.native_session_id.as_ref() => {
+                            self.record_suspension_phase(
+                                agent,
+                                suspension,
+                                "runtime.action.succeeded",
+                                suspended::resume_completed_key(&suspension.operation_id),
+                                BTreeMap::from([
+                                    ("operation_status".into(), Value::String("resumed".into())),
+                                    ("native_session_id".into(), Value::String(live)),
+                                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                                ]),
+                            )
+                        }
+                        Some((_, live)) => self.fail_suspension(
+                            agent,
+                            suspension,
+                            "native-session-mismatch",
+                            format!(
+                                "the harness bound native session {live}, not the suspended {}",
+                                suspension.native_session_id.as_deref().unwrap_or("session")
+                            ),
+                            Vec::new(),
+                        ),
+                        None if overdue => self.fail_suspension(
+                            agent,
+                            suspension,
+                            "native-session-unbound",
+                            format!(
+                                "the resumed harness bound no native session within {} s",
+                                suspended::VERIFY_TIMEOUT_MS / 1000
+                            ),
+                            Vec::new(),
+                        ),
+                        None => Ok(()),
+                    }
+                } else if ended {
+                    if let Some(observation) = observation {
+                        self.record_member(subject, observation, false)?;
+                    }
+                    let diagnostic = self
+                        .store
+                        .claims_for(agent, Some("harness.diagnostic"))?
+                        .into_iter()
+                        .rev()
+                        .find(|claim| {
+                            // The driver can refuse before this owner records the launch.
+                            let incarnation =
+                                observation.and_then(|item| item.incarnation_id.as_deref());
+                            claim.body.pointer("/fields/code").and_then(Value::as_str)
+                                == Some(suspended::RESUME_UNAVAILABLE_CODE)
+                                && match incarnation {
+                                    Some(incarnation) => {
+                                        claim_incarnation(claim) == Some(incarnation)
+                                    }
+                                    None => {
+                                        claim.accepted_at_unix_ms >= suspension.requested_at_unix_ms
+                                    }
+                                }
+                        });
+                    let (code, reason) = match diagnostic {
+                        Some(claim) => (
+                            claim
+                                .body
+                                .pointer("/fields/status")
+                                .and_then(Value::as_str)
+                                .unwrap_or(suspended::RESUME_UNAVAILABLE_CODE)
+                                .to_owned(),
+                            claim
+                                .body
+                                .pointer("/fields/reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("the driver could not resume the native session")
+                                .to_owned(),
+                        ),
+                        None => (
+                            "resume-exited".into(),
+                            "the resumed seat exited before it bound its native session".into(),
+                        ),
+                    };
+                    self.fail_suspension(agent, suspension, &code, reason, Vec::new())
+                } else if overdue {
+                    self.fail_suspension(
+                        agent,
+                        suspension,
+                        "native-session-unbound",
+                        "the resumed seat did not start running".into(),
+                        Vec::new(),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
     }
 
     /// A requester-authored action replicates to the runtime owner. The declaration and old
