@@ -62,6 +62,8 @@ pub const CLIENT_READ_MAX_HOPS: u8 = 4;
 const CLIENT_READ_HOP_MARGIN: Duration = Duration::from_secs(10);
 /// How long a relay reuses the fleet's observed links before it reads them again.
 const CLIENT_READ_LINKS_TTL: Duration = Duration::from_secs(5);
+/// How long an owner's stale-fence refusal counts as a recent fence conflict.
+const CLIENT_READ_FENCE_WINDOW: Duration = Duration::from_secs(60);
 /// The daemon route a replication worker hands a read to when it must forward it.
 pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
 
@@ -80,12 +82,17 @@ pub enum ClientReadOperation {
     },
     TerminalScreen {
         terminal_id: String,
+        /// Ask the owner for its best-effort session facts too.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        facts: bool,
     },
     /// Wait on the owner until the screen's revision differs from `after_revision`.
     TerminalScreenChange {
         terminal_id: String,
         after_revision: String,
         wait_ms: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        facts: bool,
     },
     TerminalControl {
         action_id: String,
@@ -144,6 +151,36 @@ pub struct ClientReadRejected {
     pub code: String,
     pub status: u16,
     pub message: String,
+    /// Why and where the read failed, such as `reason`, `owner_host_id`, `attempts`.
+    pub details: serde_json::Map<String, Value>,
+}
+
+impl ClientReadRejected {
+    pub fn new(code: impl Into<String>, status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            status: status.as_u16(),
+            message: message.into(),
+            details: serde_json::Map::new(),
+        }
+    }
+
+    /// A read that could not reach its owner for `reason`: `no-route`, `dial-failed`,
+    /// `timed-out`, `refused`, `hop-limit`, `transport-error` or `owner-error`.
+    pub fn unreachable(reason: &str, message: impl Into<String>) -> Self {
+        let mut rejected = Self::new(
+            "remote-unavailable",
+            StatusCode::SERVICE_UNAVAILABLE,
+            message,
+        );
+        rejected.details.insert("reason".into(), reason.into());
+        rejected
+    }
+
+    /// The reason a read could not reach its owner, if this says.
+    pub fn reason(&self) -> Option<&str> {
+        self.details.get("reason").and_then(Value::as_str)
+    }
 }
 
 impl std::fmt::Display for ClientReadRejected {
@@ -180,6 +217,24 @@ pub struct ClientRelay {
     observed: Arc<std::sync::Mutex<Option<ObservedLinks>>>,
     fabric: Option<Fabric>,
     legacy: bool,
+    /// When each owner last refused this node's reads as stale, for provenance.
+    fence_conflicts:
+        Arc<std::sync::Mutex<BTreeMap<String, std::collections::VecDeque<std::time::Instant>>>>,
+}
+
+/// How a relayed read got its answer, so a client can tell a slow gateway from a down owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ClientReadProvenance {
+    pub owner_host_id: String,
+    /// The first node the read went to; the owner itself when `direct`.
+    pub via: String,
+    pub direct: bool,
+    /// How that first hop was dialed: `fabric` or `http`.
+    pub transport: &'static str,
+    /// Milliseconds from sending the read to receiving the owner's answer.
+    pub rtt_ms: u64,
+    /// How many of this node's reads the owner refused as stale in the last minute.
+    pub fence_conflicts: u32,
 }
 
 impl ClientRelay {
@@ -288,6 +343,7 @@ impl ClientRelay {
             links: None,
             legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
             observed: Arc::default(),
+            fence_conflicts: Arc::default(),
             fabric: resolve_tool(
                 config
                     .fleet
@@ -305,16 +361,99 @@ impl ClientRelay {
         host_id: &str,
         request: &ClientReadRequest,
     ) -> Result<serde_json::Value> {
+        self.read_traced(host_id, request)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// [`Self::read`], with how the answer arrived. A failure carries the same facts in the
+    /// details of its [`ClientReadRejected`], so a slow gateway reads differently from a down
+    /// owner.
+    pub async fn read_traced(
+        &self,
+        host_id: &str,
+        request: &ClientReadRequest,
+    ) -> Result<(serde_json::Value, ClientReadProvenance)> {
         let target = host_id
             .strip_prefix("host/")
             .context("the owner host ID is invalid")?;
-        self.send_toward(
-            target,
-            request,
-            vec![self.node.clone()],
-            CLIENT_READ_MAX_HOPS,
-        )
-        .await
+        let started = std::time::Instant::now();
+        match self
+            .send_toward(
+                target,
+                request,
+                vec![self.node.clone()],
+                CLIENT_READ_MAX_HOPS,
+            )
+            .await
+        {
+            Ok((value, peer)) => Ok((
+                value,
+                ClientReadProvenance {
+                    owner_host_id: host_id.to_owned(),
+                    via: format!("host/{}", peer.name),
+                    direct: peer.name == target,
+                    transport: if peer.url.starts_with("fabric://") {
+                        "fabric"
+                    } else {
+                        "http"
+                    },
+                    rtt_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    fence_conflicts: self.recent_fence_conflicts(target),
+                },
+            )),
+            Err(error) => {
+                let mut rejected = match error.downcast::<ClientReadRejected>() {
+                    Ok(rejected) => rejected,
+                    Err(error) => ClientReadRejected::unreachable(
+                        "transport-error",
+                        format!("the read to {host_id} failed: {error:#}"),
+                    ),
+                };
+                if rejected.code == "stale-fence" {
+                    self.note_fence_conflict(target);
+                }
+                rejected
+                    .details
+                    .insert("owner_host_id".into(), host_id.into());
+                rejected.details.insert(
+                    "elapsed_ms".into(),
+                    u64::try_from(started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX)
+                        .into(),
+                );
+                rejected.details.insert(
+                    "fence_conflicts".into(),
+                    self.recent_fence_conflicts(target).into(),
+                );
+                Err(rejected.into())
+            }
+        }
+    }
+
+    fn note_fence_conflict(&self, target: &str) {
+        let mut conflicts = self
+            .fence_conflicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        let recent = conflicts.entry(target.to_owned()).or_default();
+        recent.retain(|at| now.duration_since(*at) < CLIENT_READ_FENCE_WINDOW);
+        recent.push_back(now);
+    }
+
+    /// How many of this node's reads the owner refused as stale lately.
+    fn recent_fence_conflicts(&self, target: &str) -> u32 {
+        let mut conflicts = self
+            .fence_conflicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        let Some(recent) = conflicts.get_mut(target) else {
+            return 0;
+        };
+        recent.retain(|at| now.duration_since(*at) < CLIENT_READ_FENCE_WINDOW);
+        u32::try_from(recent.len()).unwrap_or(u32::MAX)
     }
 
     /// Carry on a read a peer relayed here because this node is on its way to the owner.
@@ -328,29 +467,32 @@ impl ClientRelay {
             .strip_prefix("host/")
             .context("the relayed owner host ID is invalid")?;
         if route.hops_left == 0 || route.path.contains(&self.node) {
-            return Err(ClientReadRejected {
-                code: "remote-unavailable".into(),
-                status: StatusCode::LOOP_DETECTED.as_u16(),
-                message: format!("{} cannot carry this read any further", self.node),
-            }
-            .into());
+            let mut rejected = ClientReadRejected::unreachable(
+                "hop-limit",
+                format!("{} cannot carry this read any further", self.node),
+            );
+            rejected.status = StatusCode::LOOP_DETECTED.as_u16();
+            return Err(rejected.into());
         }
         let mut path = route.path.clone();
         path.push(self.node.clone());
         self.send_toward(target, request, path, route.hops_left - 1)
             .await
+            .map(|(value, _)| value)
     }
 
     /// Try each next hop in turn. An owner's own answer, including a refusal such as a stale
     /// fence, ends the attempt; a hop that cannot be reached, or cannot reach further, does not.
+    /// When none can, the failure says which hops were tried and why each failed.
     async fn send_toward(
         &self,
         target: &str,
         request: &ClientReadRequest,
         path: Vec<String>,
         hops_left: u8,
-    ) -> Result<serde_json::Value> {
-        let mut last = None;
+    ) -> Result<(serde_json::Value, PeerConfig)> {
+        let mut attempts = Vec::new();
+        let mut last_reason = None;
         for peer in self.next_hops(target, &path) {
             let relay = (peer.name != target).then(|| ClientReadRoute {
                 target: format!("host/{target}"),
@@ -366,20 +508,51 @@ impl ClientRelay {
                 relay,
             };
             match self.send(&peer, &outgoing).await {
-                Ok(value) => return Ok(value),
-                Err(error)
-                    if error
-                        .downcast_ref::<ClientReadRejected>()
-                        .is_some_and(|rejected| rejected.code != "remote-unavailable") =>
-                {
-                    return Err(error);
+                Ok(value) => return Ok((value, peer)),
+                Err(error) => {
+                    let rejected = match error.downcast::<ClientReadRejected>() {
+                        Ok(rejected) => rejected,
+                        Err(error) => {
+                            ClientReadRejected::unreachable("transport-error", format!("{error:#}"))
+                        }
+                    };
+                    if rejected.code != "remote-unavailable" {
+                        return Err(rejected.into());
+                    }
+                    let reason = rejected.reason().unwrap_or("transport-error").to_owned();
+                    let mut attempt = serde_json::json!({
+                        "via": format!("host/{}", peer.name),
+                        "reason": reason,
+                    });
+                    if let Some(next) = rejected.details.get("attempts") {
+                        attempt["next"] = next.clone();
+                    }
+                    attempts.push(attempt);
+                    last_reason = Some(reason);
                 }
-                Err(error) => last = Some(error),
             }
         }
-        Err(last.unwrap_or_else(|| {
-            anyhow::anyhow!("no peer of {} can reach owner host/{target}", self.node)
-        }))
+        let (reason, message) = match &last_reason {
+            None => (
+                "no-route".to_owned(),
+                format!(
+                    "no route from {} to owner host/{target}: it is not a peer and no peer reaches it",
+                    self.node
+                ),
+            ),
+            Some(reason) => (
+                reason.clone(),
+                format!(
+                    "owner host/{target} did not answer from {} ({reason} after {} attempt(s))",
+                    self.node,
+                    attempts.len()
+                ),
+            ),
+        };
+        let mut rejected = ClientReadRejected::unreachable(&reason, message);
+        rejected.details.insert("path".into(), path.into());
+        rejected.details.insert("attempts".into(), attempts.into());
+        Err(rejected.into())
     }
 
     async fn send(
@@ -391,12 +564,16 @@ impl ClientRelay {
         let url = match parse_route(&peer.url).context("invalid peer client route")? {
             Route::Http(url) => url,
             Route::Fabric { node, protocol } => {
-                let address = self
-                    .fabric
-                    .as_ref()
-                    .context("Fabric is unavailable")?
-                    .dial(&node, &protocol)
-                    .await?;
+                let address = match self.fabric.as_ref() {
+                    Some(fabric) => fabric.dial(&node, &protocol).await,
+                    None => Err(anyhow::anyhow!("Fabric is unavailable")),
+                }
+                .map_err(|error| {
+                    ClientReadRejected::unreachable(
+                        "dial-failed",
+                        format!("dial {node} over Fabric: {error:#}"),
+                    )
+                })?;
                 format!("http://{address}")
             }
         };
@@ -423,8 +600,25 @@ impl ClientRelay {
             .timeout(timeout)
             .body(body)
             .send()
-            .await?;
+            .await
+            .map_err(|error| {
+                let reason = if error.is_timeout() {
+                    "timed-out"
+                } else if error.is_connect() {
+                    "dial-failed"
+                } else {
+                    "transport-error"
+                };
+                ClientReadRejected::unreachable(reason, format!("peer {name}: {error}"))
+            })?;
         let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(ClientReadRejected::unreachable(
+                "refused",
+                format!("peer {name} does not accept this node's client reads"),
+            )
+            .into());
+        }
         let response_headers = response.headers().clone();
         anyhow::ensure!(
             response
@@ -433,7 +627,16 @@ impl ClientRelay {
             "the peer client read response exceeds its bound"
         );
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            ClientReadRejected::unreachable(
+                if error.is_timeout() {
+                    "timed-out"
+                } else {
+                    "transport-error"
+                },
+                format!("peer {name}: {error}"),
+            )
+        })? {
             anyhow::ensure!(
                 bytes.len().saturating_add(chunk.len()) <= MAX_CLIENT_READ_BYTES,
                 "the peer client read response exceeds its bound"
@@ -464,6 +667,10 @@ impl ClientRelay {
                     .as_str()
                     .unwrap_or("owner read failed")
                     .into(),
+                details: envelope.value["details"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
             }
             .into());
         }
@@ -682,10 +889,11 @@ async fn forward_client_read(
         .post::<_, serde_json::Value>(CLIENT_READ_FORWARD_PATH, request)
         .await
         .map_err(|error| match crate::client::api_error_parts(&error) {
-            Some((status, code, message)) => ClientReadRejected {
+            Some((status, code, message, details)) => ClientReadRejected {
                 code: code.to_owned(),
                 status,
                 message: message.to_owned(),
+                details: details.clone(),
             }
             .into(),
             None => error,
@@ -761,23 +969,35 @@ async fn receive_client_read(
                     .value;
                 Ok(serde_json::to_value(value)?)
             }
-            ClientReadOperation::TerminalScreen { terminal_id } => {
-                let value = client.terminal_screen(&terminal_id).await?.value;
+            ClientReadOperation::TerminalScreen { terminal_id, facts } => {
+                let value = if facts {
+                    client.terminal_screen_with_facts(&terminal_id).await?.value
+                } else {
+                    client.terminal_screen(&terminal_id).await?.value
+                };
                 Ok(serde_json::to_value(value)?)
             }
             ClientReadOperation::TerminalScreenChange {
                 terminal_id,
                 after_revision,
                 wait_ms,
+                facts,
             } => {
                 anyhow::ensure!(
                     wait_ms <= CLIENT_READ_MAX_WAIT_MS,
                     "the terminal screen wait exceeds its bound"
                 );
-                let value = client
-                    .terminal_screen_change(&terminal_id, &after_revision, wait_ms)
-                    .await?
-                    .value;
+                let value = if facts {
+                    client
+                        .terminal_screen_change_with_facts(&terminal_id, &after_revision, wait_ms)
+                        .await?
+                        .value
+                } else {
+                    client
+                        .terminal_screen_change(&terminal_id, &after_revision, wait_ms)
+                        .await?
+                        .value
+                };
                 Ok(serde_json::to_value(value)?)
             }
             ClientReadOperation::TerminalControl {
@@ -839,11 +1059,11 @@ async fn receive_client_read(
             ClientReadOperation::AgentWorkspace { identity } => {
                 let workspace =
                     crate::config::default_agent_workspace(&identity).map_err(|error| {
-                        ClientReadRejected {
-                            code: "validation-failed".into(),
-                            status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
-                            message: error.to_string(),
-                        }
+                        ClientReadRejected::new(
+                            "validation-failed",
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            error.to_string(),
+                        )
                     })?;
                 Ok(serde_json::json!({ "workspace": workspace }))
             }
@@ -868,16 +1088,17 @@ async fn receive_client_read(
         )
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         Err(error) => {
-            let (status, code, message) =
+            let (status, code, message, details) =
                 if let Some(rejected) = error.downcast_ref::<ClientReadRejected>() {
                     (
                         StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::CONFLICT),
                         rejected.code.clone(),
                         rejected.message.clone(),
+                        rejected.details.clone(),
                     )
                 } else {
                     match error.downcast_ref::<st3_client::ClientError>() {
-                        Some(st3_client::ClientError::Api(code, message, _)) => {
+                        Some(st3_client::ClientError::Api(code, message, details)) => {
                             let status = match code {
                                 st3_client::ErrorCode::PageCursorExpired
                                 | st3_client::ErrorCode::CursorGap => StatusCode::GONE,
@@ -892,16 +1113,28 @@ async fn receive_client_read(
                                     .and_then(|value| value.as_str().map(str::to_owned))
                                     .unwrap_or_else(|| "remote-unavailable".into()),
                                 message.clone(),
+                                details
+                                    .details
+                                    .iter()
+                                    .map(|(key, value)| (key.clone(), value.clone()))
+                                    .collect(),
                             )
                         }
-                        _ => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "remote-unavailable".into(),
-                            format!("fleet client read from {sender} failed"),
-                        ),
+                        _ => {
+                            let failed = ClientReadRejected::unreachable(
+                                "owner-error",
+                                format!("fleet client read from {sender} failed: {error:#}"),
+                            );
+                            (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                failed.code,
+                                failed.message,
+                                failed.details,
+                            )
+                        }
                     }
                 };
-            signed_client_read_failure(&state, &request_digest, status, &code, &message)
+            signed_client_read_failure(&state, &request_digest, status, &code, &message, details)
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -913,13 +1146,14 @@ fn signed_client_read_failure(
     status: StatusCode,
     code: &str,
     message: &str,
+    details: serde_json::Map<String, Value>,
 ) -> Result<Response> {
     let envelope = ApiResponse {
         api_version: "st3.v1".into(),
         request_id: uuid::Uuid::now_v7().to_string(),
         snapshot_host: state.node().to_owned(),
         store_index: 0,
-        value: serde_json::json!({"code":code,"message":message}),
+        value: serde_json::json!({"code":code,"message":message,"details":details}),
     };
     let body = serde_json::to_vec(&envelope)?;
     let headers =
@@ -1679,6 +1913,12 @@ mod tests {
         let (status, body) = ask("elsewhere", Some("person/avery"), "site").await;
         assert!(!status.is_success());
         assert_eq!(body["code"], "remote-unavailable", "{body}");
+        assert_eq!(body["details"]["reason"], "no-route", "{body}");
+        assert_eq!(body["details"]["owner_host_id"], "host/elsewhere", "{body}");
+        assert!(
+            !body["message"].as_str().unwrap().contains("temporarily"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -1912,6 +2152,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(changed.value.lines[1].text, "$ echo far");
+
+        // The gateway says how it got a screen: through the relay, not straight from the owner.
+        // This stand-in session never answers a stats query, so the owner has no facts to give
+        // and the screen still arrives.
+        let screen = client
+            .terminal_screen_with_facts(&attachment.terminal_id)
+            .await
+            .unwrap()
+            .value;
+        let provenance = screen
+            .relay
+            .expect("a relayed screen carries its provenance");
+        assert_eq!(provenance.owner_host_id, "host/chain-owner");
+        assert_eq!(provenance.via, "host/chain-relay");
+        assert!(!provenance.direct);
+        assert_eq!(provenance.transport, "http");
+        assert_eq!(provenance.capability_ttl_s, 60);
+        assert_eq!(provenance.fence_conflicts, 0);
+        assert!(screen.facts.is_none());
     }
 
     #[tokio::test]
@@ -1965,6 +2224,7 @@ mod tests {
                 authority_actor: "person/test".into(),
                 request: ClientReadOperation::TerminalScreen {
                     terminal_id: "terminal/agent/far".into(),
+                    facts: false,
                 },
                 relay: Some(route),
             })

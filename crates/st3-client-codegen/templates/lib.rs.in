@@ -990,10 +990,49 @@ impl Client {
         after_revision: &str,
         wait_ms: u64,
     ) -> Result<Envelope<TerminalScreen>, ClientError> {
+        self.terminal_screen_at(terminal_id, Some((after_revision, wait_ms)), false)
+            .await
+    }
+    /// The terminal's screen with the owner's best-effort `facts` (geometry, clients, uptime,
+    /// tags). They never decide admission; a client renders them when present.
+    pub async fn terminal_screen_with_facts(
+        &self,
+        terminal_id: &str,
+    ) -> Result<Envelope<TerminalScreen>, ClientError> {
+        self.terminal_screen_at(terminal_id, None, true).await
+    }
+    /// [`Self::terminal_screen_change`] with the owner's best-effort `facts`.
+    pub async fn terminal_screen_change_with_facts(
+        &self,
+        terminal_id: &str,
+        after_revision: &str,
+        wait_ms: u64,
+    ) -> Result<Envelope<TerminalScreen>, ClientError> {
+        self.terminal_screen_at(terminal_id, Some((after_revision, wait_ms)), true)
+            .await
+    }
+    async fn terminal_screen_at(
+        &self,
+        terminal_id: &str,
+        after: Option<(&str, u64)>,
+        facts: bool,
+    ) -> Result<Envelope<TerminalScreen>, ClientError> {
+        let mut query = Vec::new();
+        if let Some((after_revision, wait_ms)) = after {
+            query.push(format!("after={}", percent_encode(after_revision)));
+            query.push(format!("wait_ms={wait_ms}"));
+        }
+        if facts {
+            query.push("facts=true".to_owned());
+        }
+        let query = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
         self.get(&format!(
-            "/v1/client/terminals/{}/screen?after={}&wait_ms={wait_ms}",
-            percent_encode_segment(terminal_id.trim_start_matches("terminal/")),
-            percent_encode(after_revision)
+            "/v1/client/terminals/{}/screen{query}",
+            percent_encode_segment(terminal_id.trim_start_matches("terminal/"))
         ))
         .await
     }

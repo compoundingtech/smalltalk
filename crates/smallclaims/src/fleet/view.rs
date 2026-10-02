@@ -30,6 +30,11 @@ pub struct MemberView {
     /// `removed` or `left` once ended.
     #[serde(default)]
     pub ended: Option<String>,
+    /// Who removed this member, and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_reason: Option<String>,
 }
 
 impl FleetView {
@@ -66,6 +71,8 @@ impl FleetView {
                     start: incarnation.start,
                     end: incarnation.end,
                     ended: incarnation.ended.clone(),
+                    removed_by: incarnation.removed_by.clone(),
+                    removal_reason: incarnation.removal_reason.clone(),
                 });
             }
         }
@@ -176,7 +183,14 @@ pub fn accept(
             } else {
                 "member-removed"
             },
-            message: format!("`{}` is no longer a member of this fleet", sender.name),
+            // The removed node keeps this message to say who removed it and why.
+            message: match (&member.removed_by, &member.removal_reason) {
+                (Some(by), Some(reason)) if !left => format!(
+                    "`{}` was removed from this fleet by {by}: {reason}",
+                    sender.name
+                ),
+                _ => format!("`{}` is no longer a member of this fleet", sender.name),
+            },
             member_key: Some(member.member_key.clone()),
         });
     }
@@ -213,6 +227,8 @@ mod tests {
             start: 1,
             end: ended.map(|_| 10),
             ended: ended.map(str::to_owned),
+            removed_by: None,
+            removal_reason: None,
         }
     }
 

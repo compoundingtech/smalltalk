@@ -2621,8 +2621,11 @@ impl Ui {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
         };
-        if matches!(pane, Pane::Home(_)) {
-            self.show_in(0, 0);
+        // Home floats over the glass: an item opened "here" opens Home with it selected. Asked
+        // for in a tab or a split, the item's card opens there like any pane (Nathan,
+        // 2026-10-02: Ctrl+T on a "needs you" item made no tab).
+        if matches!(pane, Pane::Home(_)) && how == Open::Here {
+            self.open_home();
             self.focus_pane(&pane);
             return;
         }
@@ -4780,6 +4783,26 @@ mod tests {
     }
 
     #[test]
+    fn a_needs_you_item_opens_in_a_new_tab_or_in_home() {
+        let mut ui = glass();
+        let item = ui.world.attention.items()[0].id.clone();
+        ui.open_in_glass(Pane::Home(Some(item.clone())), Open::Tab);
+        let key = Pane::Home(Some(item.clone())).key();
+        assert!(
+            tabs(&ui).2.iter().flatten().any(|pane| *pane == key),
+            "a tab for the item: {:?}",
+            tabs(&ui)
+        );
+        assert!(!ui.home_open());
+        assert!(screen(&ui).contains(&ui.world.attention.items()[0].title));
+        // Here, it opens Home with the item selected.
+        let other = ui.world.attention.items()[1].id.clone();
+        ui.open_in_glass(Pane::Home(Some(other.clone())), Open::Here);
+        assert!(ui.home_open());
+        assert_eq!(ui.attention_focus().as_deref(), Some(other.as_str()));
+    }
+
+    #[test]
     fn ctrl_h_opens_home_and_closes_it_again() {
         let mut ui = glass();
         ctrl(&mut ui, 'h');
@@ -4805,6 +4828,35 @@ mod tests {
         ui.open_home();
         assert!(ui.home_open());
         assert_eq!(edge(&ui), before, "the conversation, not Home's selection");
+    }
+
+    #[test]
+    fn an_attached_shell_stays_in_its_own_tab() {
+        let mut ui = glass();
+        ui.live = true;
+        let shell = "terminal/example-shell".to_owned();
+        ui.open_in_glass(Pane::Terminal(shell.clone()), Open::Tab);
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: shell.clone(),
+            title: "shell".into(),
+            name: "shell".into(),
+            lines: vec![ratatui::text::Line::from("$ echo in the shell")],
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: None,
+        });
+        assert!(screen(&ui).contains("echo in the shell"));
+        // Another tab shows its own conversation; the shell stays attached behind it.
+        let agent = ui.world.agents.items()[0].clone();
+        ui.open_in_glass(Pane::Agent(Some(agent.id.clone())), Open::Tab);
+        let shown = screen(&ui);
+        assert!(!shown.contains("echo in the shell"), "{shown}");
+        assert!(shown.contains(&agent.name), "{shown}");
+        assert!(ui.terminal.is_some(), "still attached");
+        // Back on its tab, the shell shows again.
+        ui.open_in_glass(Pane::Terminal(shell), Open::Here);
+        assert!(screen(&ui).contains("echo in the shell"));
     }
 
     #[test]

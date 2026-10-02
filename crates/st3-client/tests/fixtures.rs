@@ -133,6 +133,13 @@ fn generated_models_decode_every_stream_fixture() {
         screen.value.lines[1].runs[0].fg,
         Some(TerminalColor::Rgb("#5fd75f".into()))
     );
+    let facts = screen.value.facts.as_ref().expect("the fixture carries facts");
+    assert_eq!(facts.clients.as_ref().unwrap().read_only, 1);
+    assert_eq!(facts.uptime_s, Some(3120));
+    let relay = screen.value.relay.as_ref().expect("the fixture carries provenance");
+    assert_eq!(relay.owner_host_id, "host/host-b");
+    assert!(!relay.direct);
+    assert_eq!(relay.capability_ttl_s, 60);
     let changed: Envelope<TerminalScreen> = decode("terminal-screen-changed.json");
     assert_eq!(changed.value.terminal_id, screen.value.terminal_id);
     assert_ne!(changed.value.revision, screen.value.revision);
