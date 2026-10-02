@@ -15819,11 +15819,11 @@ async fn trim_local_observations(store: Arc<Store>, observations: st3::config::O
         .retention_ms()
         .expect("the daemon validated its observation retention");
     loop {
-        let store = store.clone();
+        let observation_store = store.clone();
         let max_per_subject_kind = observations.max_per_subject_kind;
         let trimmed = tokio::task::spawn_blocking(move || {
             st3::profile::task("task trim-local-observations", || {
-                store.trim_local_observations(
+                observation_store.trim_local_observations(
                     now_ms().saturating_sub(u128::from(retention_ms)),
                     max_per_subject_kind,
                     LOCAL_OBSERVATION_TRIM_CHUNK,
@@ -15831,6 +15831,17 @@ async fn trim_local_observations(store: Arc<Store>, observations: st3::config::O
             })
         })
         .await;
+        let usage_store = store.clone();
+        if let Ok(Err(error)) = tokio::task::spawn_blocking(move || {
+            usage_store.trim_usage_responses(
+                now_ms().saturating_sub(st3::store::USAGE_RESPONSE_HORIZON_MS),
+                LOCAL_OBSERVATION_TRIM_CHUNK,
+            )
+        })
+        .await
+        {
+            eprintln!("st3: usage response trim failed: {error:#}");
+        }
         match trimmed {
             Ok(Ok(0)) => {}
             Ok(Ok(count)) => eprintln!("st3: trimmed {count} local observations"),

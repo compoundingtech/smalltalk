@@ -102,7 +102,7 @@ async fn personal_shell_creation_retry_and_end_use_person_ownership() {
     assert_eq!(member.display_name.as_deref(), Some("A shell"));
     assert_eq!(member.restart, st3::model::RestartType::Never);
     assert_eq!(member.cwd, "/tmp");
-    // Same request (including original fence) returns its durable action receipt.
+    // A retry with a refreshed fence returns its durable action receipt.
     let (_, caps) = request(
         app.clone(),
         "GET",
@@ -113,20 +113,38 @@ async fn personal_shell_creation_retry_and_end_use_person_ownership() {
     )
     .await;
     let retry = json!({"api_version":"st3.client.v0", "id":"action/shell-create-00001", "type":"terminal.create", "idempotency_key":"shell-create-00001", "fence":{"snapshot_id":caps["snapshot"]["id"]}, "parameters":{"name":"A shell", "cwd":"/tmp"}});
-    // A different fence under the same key is a different request, as for all client actions.
+    // Refreshing the snapshot does not turn an accepted create into another mutation.
+    let (status, replay) = request(
+        app.clone(),
+        "POST",
+        "/v1/client/actions",
+        Some("person/ada"),
+        None,
+        retry.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
     assert_eq!(
-        request(
-            app.clone(),
-            "POST",
-            "/v1/client/actions",
-            Some("person/ada"),
-            None,
-            retry
-        )
-        .await
-        .0,
-        StatusCode::CONFLICT
+        replay["value"]["affected_ids"],
+        result["value"]["affected_ids"]
     );
+    assert_eq!(
+        replay["value"]["operation_id"],
+        result["value"]["operation_id"]
+    );
+    let mut different = retry;
+    different["parameters"]["name"] = json!("A different shell");
+    let (status, conflict) = request(
+        app.clone(),
+        "POST",
+        "/v1/client/actions",
+        Some("person/ada"),
+        None,
+        different,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["code"], "idempotency-conflict");
     assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
     let (denied, _) = action(
         app.clone(),

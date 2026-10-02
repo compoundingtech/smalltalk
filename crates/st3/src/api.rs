@@ -162,6 +162,8 @@ struct ClientPageCursor {
     items_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     before_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    after_key: Option<(u128, String)>,
     expires_at_unix_ms: u128,
 }
 
@@ -251,7 +253,20 @@ impl ApiError {
         }
     }
 
-    fn internal(error: impl std::fmt::Display) -> Self {
+    fn internal(error: impl std::fmt::Display + 'static) -> Self {
+        let typed = &error as &dyn std::any::Any;
+        let store_error = typed.downcast_ref::<St3Error>().or_else(|| {
+            typed
+                .downcast_ref::<anyhow::Error>()
+                .and_then(|error| error.downcast_ref::<St3Error>())
+        });
+        if let Some(error) = store_error {
+            return Self::bad(St3Error {
+                code: error.code,
+                message: error.message.clone(),
+                details: error.details.clone(),
+            });
+        }
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal".into(),
@@ -994,11 +1009,30 @@ fn client_error_envelope(status: StatusCode, raw: &Value, request_id: &str) -> V
         "request_id": request_id,
         "code": client_error_code(raw.get("code").and_then(Value::as_str)),
         "message": raw.get("message").and_then(Value::as_str).unwrap_or("the request failed"),
-        "retryable": matches!(status, StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE)
-            || (status == StatusCode::GONE
-                && raw.get("code").and_then(Value::as_str) == Some("page-cursor-expired")),
+        "retryable": client_error_retryable(status, raw.get("code").and_then(Value::as_str)),
         "details": raw.get("details").cloned().unwrap_or_else(|| json!({})),
     })
+}
+
+fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "remote-unavailable"
+                | "terminal-unavailable"
+                | "cursor-gap"
+                | "page-cursor-expired"
+                | "rate-limited"
+                | "runtime-authority-indeterminate"
+        )
+    ) || matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 fn client_error_code(code: Option<&str>) -> String {
@@ -1016,6 +1050,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-not-local"
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
+        | "terminal-unavailable"
+        | "terminal-ended"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "launch-review-not-authorized"
         | "wrong-message-recipient"
@@ -1027,7 +1063,14 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-person-response"
         | "missing-ask-owner"
         | "ambiguous-ask-owner" => "validation-failed".into(),
-        "stale-work-ask" => "stale-fence".into(),
+        "stale-work-ask"
+        | "stale-subject"
+        | "missing-subject-token"
+        | "stale-document-token"
+        | "stale-incarnation"
+        | "stale-launch-preview"
+        | "wrong-work-incarnation" => "stale-fence".into(),
+        "idempotency-mismatch" => "idempotency-conflict".into(),
         "run-not-queued"
         | "missing-queue-anchor"
         | "unexpected-queue-anchor"
@@ -1110,7 +1153,7 @@ fn client_page_read(
     collection: &str,
     items: Vec<Value>,
     query: &ClientListQuery,
-    pinned: bool,
+    _pinned: bool,
 ) -> Result<ClientResourcePage, ApiError> {
     let requested_limit = query
         .limit
@@ -1162,11 +1205,6 @@ fn client_page_read(
             cursor.expires_at_unix_ms,
         )
     } else {
-        if !pinned && state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
-            return Err(client_page_expired(
-                "the snapshot changed; restart pagination from the first page",
-            ));
-        }
         let items_digest = hex::encode(Sha256::digest(
             serde_json::to_vec(&items).map_err(ApiError::internal)?,
         ));
@@ -1229,6 +1267,7 @@ fn client_page_read(
             native_only: query.native_only,
             items_digest,
             before_index: None,
+            after_key: None,
             expires_at_unix_ms,
         })?)
     } else {
@@ -1480,6 +1519,7 @@ fn client_work_resources(
 /// One page of the work history, newest update first, and whether more follow. Rendering the
 /// whole history to show a page of it enriched every step the store had ever run: seconds on
 /// a busy host's store.
+#[cfg(test)]
 fn client_work_history_page(
     store: &Store,
     actor: Option<&str>,
@@ -1488,8 +1528,28 @@ fn client_work_history_page(
     offset: usize,
     limit: usize,
 ) -> anyhow::Result<(Vec<Value>, bool)> {
+    client_work_history_page_after(
+        store,
+        actor,
+        snapshot_unix_ms,
+        snapshot_index,
+        offset,
+        limit,
+        None,
+    )
+}
+
+fn client_work_history_page_after(
+    store: &Store,
+    actor: Option<&str>,
+    snapshot_unix_ms: u128,
+    snapshot_index: u64,
+    offset: usize,
+    limit: usize,
+    after: Option<&(u128, String)>,
+) -> anyhow::Result<(Vec<Value>, bool)> {
     let (work, has_more) =
-        store.client_work_history_page_at_snapshot(actor, snapshot_unix_ms, offset, limit)?;
+        store.client_work_history_page_after(actor, snapshot_unix_ms, offset, limit, after)?;
     let desired = store.desired_subjects_for_owner_steps(
         &work
             .iter()
@@ -3190,14 +3250,14 @@ async fn client_work(
 }
 
 /// The work history, read a page at a time in the order it shows, each page inside one SQLite
-/// snapshot. Like the mission list, a later page reads its steps again, so it holds only while
-/// that is still its first page's snapshot.
+/// snapshot. Continuation seeks after the last update time and subject, so unrelated writes
+/// do not invalidate it or shift its offset.
 async fn client_work_history(
     state: &AppState,
     snapshot: ClientSnapshot,
     query: &ClientListQuery,
 ) -> Result<ClientPageResponse, ApiError> {
-    let (offset, limit, expires_at_unix_ms) = if let Some(encoded) = &query.cursor {
+    let (offset, limit, expires_at_unix_ms, after_key) = if let Some(encoded) = &query.cursor {
         let cursor = decode_client_cursor(encoded)?;
         if cursor.collection != "work"
             || cursor.snapshot.id != snapshot.id
@@ -3220,7 +3280,16 @@ async fn client_work_history(
         if client_now_ms() > cursor.expires_at_unix_ms {
             return Err(client_page_expired("the page cursor expired"));
         }
-        (cursor.offset, cursor.limit, cursor.expires_at_unix_ms)
+        (
+            if cursor.after_key.is_some() {
+                0
+            } else {
+                cursor.offset
+            },
+            cursor.limit,
+            cursor.expires_at_unix_ms,
+            cursor.after_key,
+        )
     } else {
         (
             0,
@@ -3229,28 +3298,22 @@ async fn client_work_history(
                 .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
                 .clamp(1, CLIENT_MAX_PAGE_ITEMS),
             client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+            None,
         )
     };
     let reader = state.clone();
     let actor = query.actor.clone();
-    let later_page = query.cursor.is_some();
     let read = blocking_store(move || {
         reader.store.clone().read_snapshot(|index| {
-            if later_page && index != snapshot.store_index {
-                return Ok(None);
-            }
-            let snapshot = if later_page {
-                snapshot
-            } else {
-                client_snapshot_at(&reader, index)
-            };
-            let (items, has_more) = client_work_history_page(
+            let snapshot = client_snapshot_at(&reader, index);
+            let (items, has_more) = client_work_history_page_after(
                 &reader.store,
                 actor.as_deref(),
                 client_snapshot_time(&snapshot),
                 index,
                 offset,
                 limit,
+                after_key.as_ref(),
             )?;
             Ok(Some((snapshot, items, has_more)))
         })
@@ -3276,6 +3339,7 @@ async fn client_work_history(
                 native_only: query.native_only,
                 items_digest: "sql-page".into(),
                 before_index: None,
+                after_key: None,
                 expires_at_unix_ms,
             })
         })
@@ -3763,11 +3827,6 @@ async fn client_history(
             cursor.expires_at_unix_ms,
         )
     } else {
-        if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
-            return Err(client_page_expired(
-                "the snapshot changed; restart pagination from the first page",
-            ));
-        }
         (
             snapshot.store_index.saturating_add(1),
             requested_limit,
@@ -3801,6 +3860,7 @@ async fn client_history(
                 native_only: query.native_only,
                 items_digest: String::new(),
                 before_index: Some(next),
+                after_key: None,
                 expires_at_unix_ms,
             })
         })
@@ -15296,6 +15356,102 @@ mission "many-runs" state="ready" {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn steady_mission_and_work_pages_resume_after_unrelated_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        for number in 0..7 {
+            let name = format!("paged-{number}");
+            let kdl = format!(
+                r#"version 2
+mission "{name}" state="ready" {{
+  goal "Run a bounded page."
+  step "build" {{ assigned-to "agent/builder" }}
+}}"#
+            );
+            let intent = parse_intent(&kdl, "node").unwrap();
+            let preview = state
+                .store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .apply(&intent, &preview.subject_tokens, &name)
+                .unwrap();
+            state
+                .store
+                .create_mission_run(&MissionRunRequest {
+                    mission: name.clone(),
+                    revision: None,
+                    workspace: workspace.display().to_string(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("run-{name}"),
+                })
+                .unwrap();
+        }
+        for collection in ["missions", "work"] {
+            let expected = if collection == "missions" {
+                state.store.mission_collection_ids(true, 0, 100).unwrap()
+            } else {
+                client_work_resources(
+                    &state.store,
+                    None,
+                    true,
+                    client_now_ms(),
+                    state.store.index().unwrap(),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|item| item["id"].as_str().unwrap().to_owned())
+                .collect()
+            };
+            let app = router(state.clone());
+            let mut cursor: Option<String> = None;
+            let mut received = Vec::new();
+            loop {
+                state
+                    .store
+                    .append_claim(&probe_claim(
+                        &format!("churn-{collection}-{}", received.len()),
+                        "idle",
+                    ))
+                    .unwrap();
+                let path = format!(
+                    "/v1/client/{collection}?limit=2&history=true{}",
+                    cursor
+                        .as_deref()
+                        .map(|cursor| format!("&cursor={}", urlencoding::encode(cursor)))
+                        .unwrap_or_default()
+                );
+                let (status, response) = get_request(app.clone(), &path).await;
+                assert_eq!(status, StatusCode::OK, "{response}");
+                let page = &response;
+                received.extend(
+                    page["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| item["id"].as_str().unwrap().to_owned()),
+                );
+                cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(received, expected, "{collection}");
+        }
     }
 
     /// Each page of the work history is that page of the whole history, for every reader, and

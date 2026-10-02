@@ -610,7 +610,17 @@ it keeps sets every field a reader takes from the dropped one:
 - `harness.observed`, `harness.timeline`, `loop.state`, `observer.observed`,
   `transport.observed`, `daemon.diagnostic` and `subscription.mission-deferred`;
 - `render.applied`, `runtime.readiness-deadline-reached`, and the runtime's own
-  `runtime.action.*` claims.
+  `runtime.action.*` claims;
+- `harness.usage` snapshots. A response rollup series keeps the last snapshot of each UTC hour,
+  by the time its writer measured it, for seven days before the cut, and only its newest snapshot
+  before that. `st usage` stays exact to the hour for a period inside that window, a longer period
+  counts each series from its start, and a series' total never changes. A session's cumulative reading keeps its newest and its largest; a context
+  reading keeps its newest. Per-response claims from older builds stay.
+
+Every model response also goes to OpenTelemetry when `[observations.otlp]` is set: an
+`st.usage.response` log with its agent, mission run, step, model, account, tokens and cost, and
+the counters `st_usage_tokens_total` and `st_usage_cost_microusd_total`, labelled only by
+driver, model, account and cost basis. That export is the history beyond the window.
 
 It never drops a claim a person wrote or a claim another claim cites as evidence. Mission run,
 step, membership and message claims are never dropped. Each node proves the drops before it agrees to

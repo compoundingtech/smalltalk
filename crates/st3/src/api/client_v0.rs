@@ -178,7 +178,9 @@ async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
 enum Refreshed {
     /// Up to date, whether or not anything was sent.
     Current,
-    /// The subscription failed before its first snapshot and is gone.
+    /// A retryable read failed; keep the subscription and schedule another read.
+    Retry,
+    /// A permanent refusal ended the subscription.
     Dropped,
     /// The socket closed.
     Closed,
@@ -194,20 +196,22 @@ async fn deliver_collection(
     let request = &subscription.request;
     let (snapshot, items, has_more) = match read {
         Ok(read) => read,
-        Err(error) if !subscription.delivered => {
-            let sent = send_collection(socket, json!({"kind":"error", "id":request.id, "code":error.code, "message":error.message})).await;
-            return if sent {
+        Err(error) => {
+            let retryable = client_error_retryable(error.status, Some(&error.code));
+            let kind = if retryable { "resync" } else { "error" };
+            let sent = send_collection(
+                socket,
+                json!({"kind":kind, "id":request.id,
+                "code":client_error_code(Some(&error.code)), "message":error.message,
+                "retryable":retryable}),
+            )
+            .await;
+            return if !sent {
+                Refreshed::Closed
+            } else if retryable {
+                Refreshed::Retry
+            } else {
                 Refreshed::Dropped
-            } else {
-                Refreshed::Closed
-            };
-        }
-        Err(_) => {
-            let sent = send_collection(socket, json!({"kind":"resync", "id":request.id})).await;
-            return if sent {
-                Refreshed::Current
-            } else {
-                Refreshed::Closed
             };
         }
     };
@@ -427,7 +431,10 @@ async fn follow_conversation(
     outbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
 ) {
     let remote = remote.as_deref();
-    let failed = |error: ApiError| json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
+    let failed = |error: &ApiError| {
+        json!({"kind":"error", "id":id, "collection":"conversation", "code":client_error_code(Some(&error.code)), "message":error.message,
+        "retryable":client_error_retryable(error.status, Some(&error.code))})
+    };
     loop {
         // The cursor first, so nothing that lands while the page is read is lost.
         let start = match conversation_changes_value(&state, &session, &session_id, remote, None, 0)
@@ -435,14 +442,24 @@ async fn follow_conversation(
         {
             Ok(start) => start,
             Err(error) => {
-                let _ = outbox.send((id.clone(), failed(error)));
+                if client_error_retryable(error.status, Some(&error.code)) {
+                    if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true}))).is_err() { return; }
+                    tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
+                    continue;
+                }
+                let _ = outbox.send((id.clone(), failed(&error)));
                 return;
             }
         };
         let page = match conversation_page(&state, &session, &session_id, remote).await {
             Ok(page) => page,
             Err(error) => {
-                let _ = outbox.send((id.clone(), failed(error)));
+                if client_error_retryable(error.status, Some(&error.code)) {
+                    if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true}))).is_err() { return; }
+                    tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
+                    continue;
+                }
+                let _ = outbox.send((id.clone(), failed(&error)));
                 return;
             }
         };
@@ -490,9 +507,17 @@ async fn follow_conversation(
                     }
                     after = changes["next_cursor"].as_str().map(str::to_owned);
                 }
-                Err(error) if error.code == "cursor-gap" => break,
+                Err(error)
+                    if matches!(error.code.as_str(), "cursor-gap" | "page-cursor-expired") =>
+                {
+                    break;
+                }
+                Err(error) if client_error_retryable(error.status, Some(&error.code)) => {
+                    tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
+                    break;
+                }
                 Err(error) => {
-                    let _ = outbox.send((id.clone(), failed(error)));
+                    let _ = outbox.send((id.clone(), failed(&error)));
                     return;
                 }
             }
@@ -527,7 +552,25 @@ impl Drop for ConversationFollowers {
     }
 }
 
-async fn collection_stream_socket(mut socket: WebSocket, state: AppState, session: ClientSession) {
+async fn collection_stream_socket(socket: WebSocket, state: AppState, session: ClientSession) {
+    collection_stream_socket_with_reader(
+        socket,
+        state,
+        session,
+        |state, session, request| async move { collection_items(&state, &session, &request).await },
+    )
+    .await;
+}
+
+async fn collection_stream_socket_with_reader<F, Fut>(
+    mut socket: WebSocket,
+    state: AppState,
+    session: ClientSession,
+    read: F,
+) where
+    F: Fn(AppState, ClientSession, CollectionSubscribe) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+{
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
@@ -651,7 +694,7 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
                     Some(TerminalFrame::Screen(envelope)) => json!({"kind":"screen", "id":id, "collection":"terminal", "snapshot":envelope["snapshot"], "value":envelope["value"]}),
                     Some(TerminalFrame::Ended(error)) => {
                         terminals.remove(&id);
-                        json!({"kind":"error", "id":id, "collection":"terminal", "code":error["code"], "message":error["message"]})
+                        json!({"kind":"error", "id":id, "collection":"terminal", "code":error["code"], "message":error["message"], "retryable":error["retryable"]})
                     }
                     None => {
                         terminals.remove(&id);
@@ -673,8 +716,8 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
         // one slow window never holds back the others' reads.
         let reads = futures_util::future::join_all(refresh.into_iter().filter_map(|id| {
             let request = subscriptions.get(&id)?.request.clone();
-            let (state, session) = (&state, &session);
-            Some(async move { (id, collection_items(state, session, &request).await) })
+            let (state, session, read) = (state.clone(), session.clone(), read.clone());
+            Some(async move { (id, read(state, session, request).await) })
         }))
         .await;
         for (id, read) in reads {
@@ -683,6 +726,9 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
             };
             match deliver_collection(&mut socket, subscription, read).await {
                 Refreshed::Current => {}
+                Refreshed::Retry => {
+                    reread_due = true;
+                }
                 Refreshed::Dropped => {
                     subscriptions.remove(&id);
                 }
@@ -2506,7 +2552,7 @@ pub(super) async fn missions(
         .limit
         .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
         .clamp(1, CLIENT_MAX_PAGE_ITEMS);
-    let (offset, limit, expires_at_unix_ms) = if let Some(encoded) = &query.cursor {
+    let (offset, limit, expires_at_unix_ms, after_key) = if let Some(encoded) = &query.cursor {
         let cursor = decode_client_cursor(encoded)?;
         if cursor.collection != "missions"
             || cursor.snapshot.id != snapshot.id
@@ -2529,42 +2575,55 @@ pub(super) async fn missions(
         if client_now_ms() > cursor.expires_at_unix_ms {
             return Err(client_page_expired("the mission page cursor expired"));
         }
-        (cursor.offset, cursor.limit, cursor.expires_at_unix_ms)
+        (
+            if cursor.after_key.is_some() {
+                0
+            } else {
+                cursor.offset
+            },
+            cursor.limit,
+            cursor.expires_at_unix_ms,
+            cursor.after_key,
+        )
     } else {
         (
             0,
             requested_limit,
             client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+            None,
         )
     };
-    // Each page reads its missions inside one SQLite snapshot. A first page names that snapshot;
-    // a later page reads the missions again, so it holds only while that is still its first
-    // page's snapshot.
+    // Each page reads one consistent SQLite view; continuation seeks after the last
+    // update time and mission ID instead of rejecting unrelated store writes.
     let reader = state.clone();
     let history = query.history;
-    let later_page = query.cursor.is_some();
-    let requested = snapshot;
     let read = super::blocking_store(move || {
         let store = reader.store.clone();
         store.read_snapshot(|index| {
-            if later_page && index != requested.store_index {
-                return Ok(None);
-            }
-            let snapshot = if later_page {
-                requested
-            } else {
-                client_snapshot_at(&reader, index)
-            };
-            let mut ids = store.mission_collection_ids(history, offset, limit.saturating_add(1))?;
+            let snapshot = client_snapshot_at(&reader, index);
+            let mut ids = store.mission_collection_page(
+                history,
+                offset,
+                limit.saturating_add(1),
+                after_key.as_ref(),
+            )?;
             let mut has_more = ids.len() > limit;
             ids.truncate(limit);
-            let mut items = mission_list_cards(&store, &ids)?;
+            let mut items = mission_list_cards(
+                &store,
+                &ids.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            )?;
             has_more |= bound_mission_cards(&mut items)?;
-            Ok(Some((snapshot, items, has_more)))
+            let after_key = items.last().and_then(|item| {
+                ids.iter()
+                    .find(|(id, _)| Some(id.as_str()) == item["id"].as_str())
+                    .map(|(id, time)| (*time, id.clone()))
+            });
+            Ok(Some((snapshot, items, has_more, after_key)))
         })
     })
     .await?;
-    let Some((snapshot, items, has_more)) = read else {
+    let Some((snapshot, items, has_more, after_key)) = read else {
         return Err(client_page_expired(
             "the mission collection changed; restart pagination",
         ));
@@ -2584,6 +2643,7 @@ pub(super) async fn missions(
                 native_only: query.native_only,
                 items_digest: "sql-page".into(),
                 before_index: None,
+                after_key: after_key.clone(),
                 expires_at_unix_ms,
             })
         })
@@ -4163,9 +4223,6 @@ fn conversation_read_now(
         if store_index > snapshot.store_index
             || local_position > local_latest
             || native_sequence > native_latest
-            || (all.len() == 200
-                && (snapshot.store_index.saturating_sub(store_index) > 200
-                    || local_latest.saturating_sub(local_position) > 200))
         {
             return Err(ApiError {
                 status: StatusCode::GONE,
@@ -5214,12 +5271,12 @@ fn remote_terminal_live_session(
         .first()
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
     if !matches!(selected.reachability.as_str(), "reachable" | "local") {
-        return Err(stale("the terminal owner is not reachable"));
+        return Err(terminal_unavailable("the terminal owner is not reachable"));
     }
     let origin = selected
         .actual_origin
         .as_deref()
-        .ok_or_else(|| stale("the terminal owner is unknown"))?;
+        .ok_or_else(|| terminal_unavailable("the terminal owner is unknown"))?;
     if origin == state.store.origin() {
         return terminal_live_session(state, subject, Some(expected_incarnation));
     }
@@ -5269,12 +5326,25 @@ const TERMINAL_RELAY_WAIT_MS: u64 = 10_000;
 /// The most often an open terminal stream rechecks its runtime incarnation fence.
 const TERMINAL_FENCE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
+fn terminal_unavailable(message: impl Into<String>) -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "terminal-unavailable".into(),
+        message: message.into(),
+        details: Box::default(),
+    }
+}
+
 fn terminal_view_error(end: terminal_view::ViewEnd) -> ApiError {
     match end {
-        terminal_view::ViewEnd::Unavailable(message) => ApiError::internal(message),
-        terminal_view::ViewEnd::Exited | terminal_view::ViewEnd::Idle => {
-            stale("the terminal session ended")
-        }
+        terminal_view::ViewEnd::Unavailable(message) => terminal_unavailable(message),
+        terminal_view::ViewEnd::Idle => terminal_unavailable("the terminal viewer became idle"),
+        terminal_view::ViewEnd::Exited => ApiError {
+            status: StatusCode::GONE,
+            code: "terminal-ended".into(),
+            message: "the terminal session ended".into(),
+            details: Box::default(),
+        },
     }
 }
 
@@ -5557,7 +5627,7 @@ impl TerminalSink {
             Self::Socket(socket) => close_terminal_stream(socket, code, reason).await,
             Self::Subscription(sender) => {
                 sender.send_replace(TerminalFrame::Ended(terminal_stream_error(
-                    &ApiError::internal(reason),
+                    &ApiError::internal(reason.to_owned()),
                 )));
             }
         }
@@ -5601,7 +5671,7 @@ async fn remote_terminal_stream_socket(
     incarnation: String,
 ) {
     let Some(relay) = state.client_relay.as_ref() else {
-        sink.close(1012, "terminal owner unavailable").await;
+        sink.fail(&remote_unavailable(&owner)).await;
         return;
     };
     let terminal_id = client_detail_id("terminal", &id);
@@ -5698,12 +5768,14 @@ fn existing_terminal_attachment(
     else {
         return Ok(None);
     };
-    if attached
+    let old_digest = attached
         .body
         .pointer("/fields/request_digest")
-        .and_then(Value::as_str)
-        != Some(request_digest)
-    {
+        .and_then(Value::as_str);
+    let legacy_digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(request).map_err(ApiError::internal)?,
+    ));
+    if old_digest != Some(request_digest) && old_digest != Some(legacy_digest.as_str()) {
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             code: "idempotency-conflict".into(),
@@ -6153,7 +6225,7 @@ fn terminal_stream_error(error: &ApiError) -> Value {
         "request_id": format!("request/{}", new_request_id()),
         "code": client_error_code(Some(&error.code)),
         "message": error.message,
-        "retryable": false,
+        "retryable": client_error_retryable(error.status, Some(&error.code)),
         "details": error.details,
     })
 }
@@ -6214,7 +6286,7 @@ async fn terminal_stream_socket(
     let mut screen = match terminal_view::next_screen(&mut screens, None, first).await {
         Ok(Some(screen)) => Some(screen),
         Ok(None) => {
-            sink.fail(&ApiError::internal("the terminal screen did not arrive"))
+            sink.fail(&terminal_unavailable("the terminal screen did not arrive"))
                 .await;
             return;
         }
@@ -6631,12 +6703,7 @@ fn validate_launch_fence(state: &AppState, target: &str, fence: &Fence) -> Resul
     Ok(())
 }
 
-fn validate_fence(
-    state: &AppState,
-    _snapshot: &ClientSnapshot,
-    fence: &Fence,
-    terminal_view_action: bool,
-) -> Result<(), ApiError> {
+fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
     let parsed = fence
         .snapshot_id
         .strip_prefix("snapshot/")
@@ -6646,16 +6713,13 @@ fn validate_fence(
     let expected_host = state.node.replace(char::is_whitespace, "-");
     if !parsed.is_some_and(|(host, index)| {
         host == expected_host
-            && index.parse::<u64>().ok().is_some_and(|index| {
-                if terminal_view_action {
-                    index <= current_index
-                } else {
-                    index == current_index
-                }
-            })
+            && index
+                .parse::<u64>()
+                .ok()
+                .is_some_and(|index| index <= current_index)
     }) {
         return Err(stale(
-            "the client snapshot changed before the action was submitted",
+            "the client snapshot belongs to another host or a future store position",
         ));
     }
     for (subject, revision) in &fence.subject_revisions {
@@ -7708,6 +7772,40 @@ async fn dispatch_action(
     }
 }
 
+// Concurrent retries must wait for the first dispatch to persist its receipt. Weak entries
+// keep the gate table bounded by requests currently executing or waiting.
+fn action_gate(
+    state: &AppState,
+    session: &ClientSession,
+    key: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    static GATES: OnceLock<Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("action gates poisoned");
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    let key = format!("{}:{}:{key}", state.store.origin(), session.actor);
+    if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
+fn action_request_digest(request: &ActionRequest) -> Result<String, ApiError> {
+    let mut content = serde_json::to_value(request).map_err(ApiError::internal)?;
+    content
+        .as_object_mut()
+        .expect("an action is an object")
+        .remove("fence");
+    Ok(hex::encode(Sha256::digest(
+        serde_json::to_vec(&content).map_err(ApiError::internal)?,
+    )))
+}
+
 pub(super) async fn action(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -7736,12 +7834,8 @@ pub(super) async fn action(
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
     require_scope(&session, scope)?;
-    // Terminal views/control are fenced by their own screen and incarnation, not unrelated
-    // graph writes. Keep declaration mutations on the strict whole-snapshot fence.
-    let terminal_view_action = matches!(
-        request.action_type.as_str(),
-        "terminal.attach" | "terminal.detach" | "terminal.input" | "terminal.resize"
-    );
+    // Snapshot provenance is checked, while freshness belongs to the action's own
+    // revision, generation, incarnation, or screen checks.
     let read_only_terminal_lifecycle = matches!(
         request.action_type.as_str(),
         "terminal.attach" | "terminal.detach"
@@ -7751,8 +7845,13 @@ pub(super) async fn action(
             "client mutations require a concrete person or a local agent",
         ));
     }
-    let encoded = serde_json::to_vec(&request).map_err(ApiError::internal)?;
-    let request_digest = hex::encode(Sha256::digest(&encoded));
+    let gate = action_gate(&state, &session, &request.idempotency_key);
+    let _guard = gate.lock().await;
+    let request_digest = action_request_digest(&request)?;
+    // Receipts written before action-content.v1 still accept the exact original request.
+    let legacy_digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&request).map_err(ApiError::internal)?,
+    ));
     let receipt_digest = hex::encode(Sha256::digest(
         format!("{}:{}", session.actor, request.idempotency_key).as_bytes(),
     ));
@@ -7767,7 +7866,8 @@ pub(super) async fn action(
             .body
             .pointer("/fields/request_digest")
             .and_then(Value::as_str);
-        if old_digest != Some(request_digest.as_str()) {
+        if old_digest != Some(request_digest.as_str()) && old_digest != Some(legacy_digest.as_str())
+        {
             return Err(ApiError {
                 status: StatusCode::CONFLICT,
                 code: "idempotency-conflict".into(),
@@ -7805,7 +7905,7 @@ pub(super) async fn action(
         let live =
             remote_terminal_live_session(&state, &terminal_subject(&terminal_id), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) {
-            validate_fence(&state, &snapshot, &request.fence, terminal_view_action)?;
+            validate_fence(&state, &request.fence)?;
             let expected_sequence = request
                 .fence
                 .terminal_sequence
@@ -7864,7 +7964,7 @@ pub(super) async fn action(
         }
     }
     let mut reconciled_attachment = None;
-    let fence_result = validate_fence(&state, &snapshot, &request.fence, terminal_view_action);
+    let fence_result = validate_fence(&state, &request.fence);
     if let Err(error) = fence_result {
         if request.action_type == "terminal.attach" {
             reconciled_attachment =
@@ -8012,6 +8112,72 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
+
+    #[tokio::test]
+    async fn steady_collection_retries_a_failed_first_read_without_another_command_or_write() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, reads) = (state.clone(), counted.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            move |state, session, request| {
+                                let reads = reads.clone();
+                                async move {
+                                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                                        Err(ApiError::internal("injected first read failure"))
+                                    } else {
+                                        collection_items(&state, &session, &request).await
+                                    }
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"agents","collection":"agents","limit":10})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let first: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(first["kind"], "resync");
+        assert_eq!(first["retryable"], true);
+        let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let recovered: Value = serde_json::from_str(next.to_text().unwrap()).unwrap();
+        assert_eq!(recovered["kind"], "snapshot");
+        assert_eq!(recovered["id"], "agents");
+        assert!(reads.load(Ordering::SeqCst) >= 2);
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
 
     #[test]
     fn listed_unresolved_process_opens_into_explanatory_no_conversation_state() {
@@ -9096,6 +9262,111 @@ subscription "watch/source" {
         let resources =
             device_resources(&state, &new_client_snapshot(&state), "person/alex").unwrap();
         assert_eq!(resources[0]["name"], "Alex's iPhone");
+    }
+
+    #[test]
+    fn steady_errors_preserve_store_conflicts_and_distinguish_terminal_lifetime() {
+        let conflict = ApiError::internal(anyhow::Error::new(St3Error::new(
+            "stale-subject",
+            "the resource changed",
+        )));
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+        let envelope = client_error_envelope(
+            conflict.status,
+            &json!({"code":conflict.code,"message":conflict.message}),
+            "request/test",
+        );
+        assert_eq!(envelope["code"], "stale-fence");
+        assert_eq!(envelope["retryable"], false);
+        for (code, status, retryable) in [
+            ("terminal-ended", StatusCode::GONE, false),
+            (
+                "terminal-unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+            ),
+            ("remote-unavailable", StatusCode::SERVICE_UNAVAILABLE, true),
+            ("page-cursor-expired", StatusCode::GONE, true),
+            ("validation-failed", StatusCode::UNPROCESSABLE_ENTITY, false),
+        ] {
+            let envelope = client_error_envelope(
+                status,
+                &json!({"code":code,"message":"test"}),
+                "request/test",
+            );
+            assert_eq!(envelope["code"], code);
+            assert_eq!(envelope["retryable"], retryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn steady_actions_survive_churn_and_replay_with_fresh_fences_without_duplicates() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/steady-send".into(),
+            action_type: "message.send".into(),
+            idempotency_key: "steady-send-idempotency-key".into(),
+            fence: Fence {
+                snapshot_id: snapshot.id.clone(),
+                ..Default::default()
+            },
+            parameters: json!({"to":"person/blair","content":"Send once despite unrelated activity."}),
+        };
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/unrelated".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), json!("vanished"))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let submit = |request: ActionRequest| {
+            action(
+                State(state.clone()),
+                Extension(new_client_snapshot(&state)),
+                Extension(session.clone()),
+                Json(request),
+            )
+        };
+        let (first, concurrent) = tokio::join!(submit(request.clone()), submit(request.clone()));
+        let first = first.unwrap().0;
+        assert_eq!(concurrent.unwrap().0["affected_ids"], first["affected_ids"]);
+        let mut fresh = request.clone();
+        fresh.fence.snapshot_id = new_client_snapshot(&state).id;
+        // A completed retry is answered before testing even an obsolete resource fence.
+        fresh
+            .fence
+            .subject_revisions
+            .insert("agent/unrelated".into(), "obsolete".into());
+        let replay = submit(fresh.clone()).await.unwrap().0;
+        assert_eq!(replay["operation_id"], first["operation_id"]);
+        assert_eq!(replay["affected_ids"], first["affected_ids"]);
+        assert_eq!(
+            state
+                .store
+                .claims_for_kind_at("message.sent", None, true, 100)
+                .unwrap()
+                .claims
+                .len(),
+            1
+        );
+        fresh.parameters["content"] = json!("Different mutation");
+        assert_eq!(
+            submit(fresh).await.unwrap_err().code,
+            "idempotency-conflict"
+        );
+        let mut other = request.clone();
+        other.idempotency_key = "steady-send-foreign-snapshot".into();
+        other.fence.snapshot_id = snapshot.id.replace("snapshot/", "snapshot/foreign-");
+        assert_eq!(submit(other).await.unwrap_err().code, "stale-fence");
     }
 
     #[test]
@@ -10858,6 +11129,59 @@ mission "example/zero-run" state="ready" {
                 .iter()
                 .any(|item| item["body"]["text"] == "Native reply")
         );
+        // A full replay page still resumes after hundreds of unrelated graph commits.
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        for number in 0..230 {
+            writeln!(writer, "{}", json!({"type":"response_item","timestamp":"2026-09-24T12:00:03Z","payload":{"type":"message","role":"assistant","id":format!("steady-{number}"),"content":[{"type":"output_text","text":format!("Turn {number}")} ]}})).unwrap();
+        }
+        drop(writer);
+        let full = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let page = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery {
+                limit: Some(200),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0;
+        assert_eq!(page["items"].as_array().unwrap().len(), 200);
+        let before_churn = new_client_snapshot(&state);
+        for _ in 0..301 {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/unrelated".into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), json!("vanished"))]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let unchanged =
+            conversation_read_now(&state, &session, &session_id, full["next_cursor"].as_str())
+                .unwrap();
+        assert!(unchanged["items"].as_array().unwrap().is_empty());
+        let _ = timeline_value(
+            &state,
+            &before_churn,
+            &session,
+            &session_id,
+            &ClientListQuery {
+                limit: Some(200),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         // A transcript st3 binds but cannot read is named, so the failure can be reported.
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -12044,8 +12368,8 @@ mission "example/zero-run" state="ready" {
             })
             .unwrap();
         assert!(
-            validate_fence(&state, &snapshot, &fence, false).is_err(),
-            "declaration mutations remain strict"
+            validate_fence(&state, &fence).is_ok(),
+            "unrelated writes do not invalidate declaration mutations"
         );
         let mut attach_fence = fence.clone();
         attach_fence.terminal_sequence = None;
@@ -12104,19 +12428,19 @@ mission "example/zero-run" state="ready" {
         }
         let mut foreign = fence.clone();
         foreign.snapshot_id = foreign.snapshot_id.replacen(&state.node, "another-host", 1);
-        assert!(validate_fence(&state, &snapshot, &foreign, true).is_err());
+        assert!(validate_fence(&state, &foreign).is_err());
         let mut future = fence.clone();
         future.snapshot_id = format!(
             "snapshot/{}/{}/digest",
             state.node,
             state.store.index().unwrap() + 1
         );
-        assert!(validate_fence(&state, &snapshot, &future, true).is_err());
+        assert!(validate_fence(&state, &future).is_err());
         let mut revision = fence.clone();
         revision
             .subject_revisions
             .insert("agent/unrelated".into(), "old-revision".into());
-        assert!(validate_fence(&state, &snapshot, &revision, true).is_err());
+        assert!(validate_fence(&state, &revision).is_err());
         observe("replacement-incarnation");
         let error = action(
             State(state.clone()),
