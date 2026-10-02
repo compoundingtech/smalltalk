@@ -28,6 +28,12 @@ assert.deepEqual([keeper.kind, keeper.title, keeper.needsYou, keeper.gone], ['ag
 const audit = paneTarget('mission:mission/example/harbor/audit', lists);
 assert.deepEqual([audit.kind, audit.title, audit.needsYou], ['mission', 'Audit', true]);
 assert.equal(paneTarget('agent:agent/example/retired', lists).gone, true);
+// Agents and missions carry their state as their own lists mark it (Nathan, 2026-10-02).
+assert.equal(keeper.status?.word, 'idle');
+const busy = paneTarget('agent:agent/example/harbor/keeper', { ...lists, agents: [{ ...lists.agents[0], harness_state: 'working' }] });
+assert.equal(busy.status?.word, 'working');
+assert.ok(audit.status?.glyph);
+assert.equal(paneTarget('agent:agent/example/retired', lists).status, undefined);
 assert.equal(paneTarget('machine:machine/lighthouse', lists).title, 'lighthouse');
 assert.equal(paneTarget('machine:machine/elsewhere', { ...lists, machines: [] }).gone, false, 'machines not loaded yet are not gone');
 assert.deepEqual([paneTarget('later-kind:thing', lists).kind, paneTarget('later-kind:thing', lists).title], ['other', 'later-kind:thing']);
