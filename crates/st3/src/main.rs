@@ -13523,9 +13523,17 @@ async fn drive_st2_native(
                     None
                 };
                 let bound = match driver {
+                    // Claude writes the transcript a resume needs only with its first turn.
                     "claude" => provider_incarnation
                         .as_deref()
-                        .and_then(|token| st3::hooks::claude_binding(&agent_dir, token)),
+                        .and_then(|token| st3::hooks::claude_binding(&agent_dir, token))
+                        .filter(|session| {
+                            let workspace = std::env::current_dir().unwrap_or_default();
+                            st3::native_resume::claude_home().is_some_and(|home| {
+                                st3::native_resume::claude_transcript(&home, &workspace, session)
+                                    .is_file()
+                            })
+                        }),
                     "opencode" => st3::native_resume::opencode_bound_session(&agent_dir),
                     _ => None,
                 };
@@ -15049,8 +15057,21 @@ impl PiFamilyReports {
             self.reads.remove(&message);
         }
         // Last, and never fatal: a report the daemon does not take must not hold back delivery.
-        // It stays pending and goes again with the next report.
-        if let Some((native, path)) = self.native_session.clone() {
+        // It stays pending and goes again with the next report. A session is reported only once
+        // its transcript exists, because only then can a resume find it: pi writes nothing until
+        // its first turn.
+        let resumable = |native: &str| {
+            std::env::var_os(st_drivers::driver_paths::SESSION_DIR_ENV).is_none_or(|dir| {
+                st3::native_resume::pi_family_transcript(
+                    &PathBuf::from(dir).join("provider-sessions"),
+                    native,
+                )
+                .is_some()
+            })
+        };
+        if let Some((native, path)) = self.native_session.clone()
+            && resumable(&native)
+        {
             let reported: Result<ClaimRecord> = client
                 .post(
                     "/v1/agents/native-session",

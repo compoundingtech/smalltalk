@@ -31,7 +31,7 @@ reasons:
 | `starting`, `harness-indeterminate`, `harness-unobserved` | the driver cannot yet show the harness is idle |
 | `claimed-work` | the seat holds a claimed step, whose lease would lapse |
 | `subagent-running` | st still records a subagent for the seat |
-| `native-session-unbound` | the driver has reported no native session to resume |
+| `native-session-unbound` | the driver has reported no native session it can resume; Claude and pi write a transcript only with their first turn |
 
 The owner checks the same reasons again before it stops anything. A refused suspend leaves the
 seat running, and `st agents show` prints the refusal.
@@ -39,8 +39,8 @@ seat running, and `st agents show` prints the refusal.
 ## What suspend and resume do
 
 The seat's driver reports the native session its harness is running as a `harness.session-file`
-claim for that incarnation, through `POST /v1/agents/native-session`. That session is the
-snapshot. Suspend records it, stops the runtime, and leaves the seat `suspended`. A suspended seat
+claim for that incarnation, through `POST /v1/agents/native-session`, once the harness has
+written what a resume reads. That session is the snapshot. Suspend records it, stops the runtime, and leaves the seat `suspended`. A suspended seat
 stays declared. Its restart policy does not restart it, `st agents restart` refuses it, and mail
 sent to it waits until it resumes.
 
