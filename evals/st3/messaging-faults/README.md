@@ -63,6 +63,11 @@ current, so the case isolates compatibility with an old channel. It does not pro
 an old driver's recovery or compatibility between arbitrary historical releases:
 failure of that case's warmup is a fixture error, not a fault verdict.
 
+The pinned graph channel requires an obsolete `--catalog` argument but does not read it.
+The provider stand-in supplies the resolved native root as that argument when launching the
+historical channel. Current drivers and extensions use explicit paths, and the oracle rejects
+any `catalog.kdl` or `agent.kdl` created in the native driver state, including this case.
+
 The provider matches consumed text to immutable IDs from real channel-frame
 metadata, which also works with old channels that lack message envelopes. Observed
 wire frames alone never count as consumption. It writes every native handoff before posting its recipient `delivered`,

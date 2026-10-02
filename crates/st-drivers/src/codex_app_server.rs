@@ -805,11 +805,23 @@ impl CodexInboxDelivery {
         // sequence: HC-T04 leaves the numbers unfenced on purpose, because the worst a straggler
         // can publish here is a reading older than the reader thinks — which `observedAtMs`
         // already says — rather than a live state that is not live.
-        let context = match harness_context::Writer::new(
-            &config.agent_dir,
-            config.identity.clone(),
-            harness_context::Harness::Codex,
+        let context_writer = if matches!(
+            config.control,
+            crate::session_control::SessionControl::Graph(_)
         ) {
+            harness_context::Writer::new_paths(
+                &config.agent_dir,
+                config.identity.clone(),
+                harness_context::Harness::Codex,
+            )
+        } else {
+            harness_context::Writer::new(
+                &config.agent_dir,
+                config.identity.clone(),
+                harness_context::Harness::Codex,
+            )
+        };
+        let context = match context_writer {
             Ok(writer) => Some(CodexContextProducer::new(
                 writer.with_session(runtime.incarnation()),
             )),

@@ -208,6 +208,11 @@ enum Command {
         #[command(subcommand)]
         command: DocCommand,
     },
+    /// Restrict what agents may write, and read what each rule would have refused.
+    Rules {
+        #[command(subcommand)]
+        command: RuleCommand,
+    },
     /// Discover native harness sessions and move one under durable st ownership.
     Import {
         #[command(subcommand)]
@@ -751,6 +756,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
         }
         FleetCommand::Wait { timeout } => {
             let timeout = Duration::from_secs(parse_fleet_duration(&timeout)?);
+            let started = std::time::Instant::now();
+            let since = now_ms();
             let first = wait_for_first_sync(&client, timeout, !json_output)
                 .await?
                 .with_context(|| {
@@ -760,7 +767,36 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                         timeout.as_secs()
                     )
                 })?;
-            report_first_sync(&first, json_output)
+            if first.state != "verified" {
+                return report_first_sync(&first, json_output);
+            }
+            // A first sync is verified once, long ago after a restart. A wait is a gate for now:
+            // it also needs an exchange since it began at which this node held everything.
+            let caught_up = wait_for_caught_up(
+                &client,
+                since,
+                timeout.saturating_sub(started.elapsed()),
+                !json_output,
+            )
+            .await?;
+            let caught_up = match caught_up {
+                Ok(caught_up) => caught_up,
+                Err(waiting) => anyhow::bail!(
+                    "{}\nbut this node has not caught up since this wait began {} s ago: {}; st \
+                     replication status shows how far it got",
+                    render_first_sync(&first, now_ms()),
+                    started.elapsed().as_secs(),
+                    waiting
+                ),
+            };
+            if json_output {
+                let mut value = serde_json::to_value(&first)?;
+                value["caught_up"] = serde_json::to_value(&caught_up)?;
+                return print_value(&value, true);
+            }
+            println!("{}", render_first_sync(&first, now_ms()));
+            println!("{}", render_caught_up(&caught_up, now_ms()));
+            Ok(())
         }
         FleetCommand::Remove(args) => run_fleet_remove(&client, &config, args).await,
         FleetCommand::Migrate(args) => run_fleet_migrate(&client, &config, args).await,
@@ -2349,6 +2385,35 @@ enum DocCommand {
 }
 
 #[derive(Subcommand)]
+enum RuleCommand {
+    /// List the rules, each with its mode: off, audit or enforce.
+    Ls,
+    /// List the writes the rules in audit mode would have refused, newest first.
+    Audit {
+        /// Only this rule's records.
+        rule: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Set the lockdown rules, each in audit mode until you enforce it.
+    Lockdown {
+        #[arg(long = "as")]
+        actor: Option<String>,
+        /// An agent that may still start agents, such as agent/example/planner. Repeatable.
+        #[arg(long = "starter")]
+        starters: Vec<String>,
+    },
+    /// Turn one rule off, to audit, or to enforce.
+    Mode {
+        name: String,
+        #[arg(value_parser = ["off", "audit", "enforce"])]
+        mode: String,
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ImportCommand {
     /// List running native sessions; use --all for resumable saved history.
     Ls {
@@ -2846,6 +2911,8 @@ struct AttentionWithdrawArgs {
 enum WorkCommand {
     /// Ask a person through a runtime step owned by live work.
     Ask(WorkAskArgs),
+    /// Bring a person information they asked for. Nothing waits on it; it clears once read.
+    Update(WorkUpdateArgs),
     /// Complete a person-assigned step with a response.
     Done(WorkDoneArgs),
     /// Cancel your own ask and resume its live origin.
@@ -2926,6 +2993,25 @@ struct WorkAskArgs {
     actor: String,
     #[arg(long, env = "ST3_INCARNATION")]
     incarnation: Option<String>,
+    #[arg(long)]
+    idempotency_key: String,
+}
+
+#[derive(Args)]
+struct WorkUpdateArgs {
+    #[arg(long = "for")]
+    person: String,
+    /// Where the person asked for this: their own mission run or step run, or their message to
+    /// you. An update about anything else is refused.
+    #[arg(long, value_name = "RUN|STEP|MESSAGE")]
+    about: String,
+    #[arg(long)]
+    title: String,
+    /// The information itself.
+    #[arg(long)]
+    body: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
     #[arg(long)]
     idempotency_key: String,
 }
@@ -3562,6 +3648,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Trace { command } => run_trace_command(&client, command, cli.json).await,
         Command::Schema { command } => run_schema(&client, command, cli.json).await,
         Command::Documents { command } => run_doc(&client, command, cli.json).await,
+        Command::Rules { command } => run_rules(&client, &config, command, cli.json).await,
         Command::Import { command } => run_import(&endpoint, command, cli.json).await,
         Command::Completions(args) => {
             let shell = match args.shell {
@@ -3961,7 +4048,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .pty_root
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
-    let login_environment = st3::environment::snapshot()?;
+    let login_environment = st3::environment::snapshot_at_startup()?;
     st_runtime::initialize_isolation(&login_environment);
     let pty_binary = match args.pty_binary.clone() {
         Some(pty_binary) => pty_binary,
@@ -7782,6 +7869,108 @@ async fn wait_for_first_sync(
     }
 }
 
+/// The peers this node caught up with at exchanges since a wait began, and those it could not
+/// check because they are not up.
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+struct CaughtUp {
+    /// Each peer and when this node last measured that it held every envelope the peer held.
+    peers: Vec<(String, u128)>,
+    not_checked: Vec<String>,
+}
+
+/// Whether this node has caught up since `since`: every peer that is up has exchanged since
+/// then, and at the latest exchange this node held every envelope that peer held. Peers that are
+/// not up cannot be checked, but at least one peer must be. `Err` says what is still missing.
+fn caught_up_since(status: &ReplicationStatus, since: u128) -> Result<CaughtUp, String> {
+    let mut caught_up = CaughtUp::default();
+    let mut waiting = Vec::new();
+    for peer in &status.peers {
+        let fresh = peer
+            .sync
+            .as_ref()
+            .filter(|sync| sync.measured_at_unix_ms >= since);
+        match fresh {
+            Some(sync) if sync.peer_only_envelopes == 0 => caught_up
+                .peers
+                .push((peer.peer.clone(), sync.measured_at_unix_ms)),
+            Some(sync) => waiting.push(format!(
+                "{} has {} this node lacks",
+                peer.peer,
+                envelope_count(sync.peer_only_envelopes)
+            )),
+            None if peer.status == "up" => {
+                waiting.push(format!("no exchange with {} yet", peer.peer));
+            }
+            None => caught_up
+                .not_checked
+                .push(format!("{} ({})", peer.peer, peer.status)),
+        }
+    }
+    if caught_up.peers.is_empty() && waiting.is_empty() {
+        waiting.push(if status.peers.is_empty() {
+            "this node has no peers".into()
+        } else {
+            "no peer has exchanged with this node".into()
+        });
+    }
+    if waiting.is_empty() {
+        Ok(caught_up)
+    } else {
+        Err(waiting.join("; "))
+    }
+}
+
+/// Wait until [`caught_up_since`] holds, printing progress when `progress` is set. Returns what
+/// is still missing at the deadline.
+async fn wait_for_caught_up(
+    client: &Client,
+    since: u128,
+    timeout: Duration,
+    progress: bool,
+) -> Result<Result<CaughtUp, String>> {
+    let started = std::time::Instant::now();
+    let mut reported = None::<std::time::Instant>;
+    let mut missing = "replication status did not answer".to_owned();
+    loop {
+        if let Ok(status) = client
+            .get::<ReplicationStatus>("/v1/replication/status")
+            .await
+        {
+            match caught_up_since(&status, since) {
+                Ok(caught_up) => return Ok(Ok(caught_up)),
+                Err(waiting) => missing = waiting,
+            }
+            if progress && reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(10)) {
+                reported = Some(std::time::Instant::now());
+                println!("catching up: {missing}");
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Ok(Err(missing));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn render_caught_up(caught_up: &CaughtUp, now: u128) -> String {
+    let peers = caught_up
+        .peers
+        .iter()
+        .map(|(peer, at)| format!("{peer} ({})", relative_time(*at, now)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut line = format!(
+        "caught up now: at its latest exchange with {peers}, this node held every envelope the peer held"
+    );
+    if !caught_up.not_checked.is_empty() {
+        line.push_str(&format!(
+            "; not checked, since they are not up: {}",
+            caught_up.not_checked.join(", ")
+        ));
+    }
+    line
+}
+
 /// Print how a first sync ended, and fail when its graphs still differ.
 fn report_first_sync(first: &st3::model::ReplicationFirstSync, json_output: bool) -> Result<()> {
     if json_output {
@@ -7813,12 +8002,12 @@ fn render_first_sync(first: &st3::model::ReplicationFirstSync, now: u128) -> Str
     );
     match first.state.as_str() {
         "verified" if first.authority_digest.is_some() => format!(
-            "first sync verified {when}: this node holds the same {} as {peer}; log digest {}; projection comparison waits for matching builds",
+            "first sync verified {when}: this node then held the same {} as {peer}; log digest {}; projection comparison waits for matching builds",
             envelope_count(first.envelopes.unwrap_or(0)),
             short_digest(first.authority_digest.as_deref().unwrap_or("unknown")),
         ),
         "verified" => format!(
-            "first sync verified {when}: this node holds the same {} as {peer} and projects the same graph ({}){}",
+            "first sync verified {when}: this node then held the same {} as {peer} and projected the same graph ({}){}",
             envelope_count(first.envelopes.unwrap_or(0)),
             short_digest(first.graph_digest.as_deref().unwrap_or("unknown")),
             if first.healed { ", after a heal" } else { "" }
@@ -7944,10 +8133,36 @@ fn render_replication_peers(
         } else {
             let _ = writeln!(output, "  no exchange yet");
         }
+        if let Some(at) = peer.last_failure_at_unix_ms {
+            let _ = writeln!(
+                output,
+                "  last attempt failed {}{}",
+                relative_time(at, now),
+                peer.last_error
+                    .as_deref()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            );
+        }
         let Some(sync) = &peer.sync else {
             let _ = writeln!(output, "  difference not measured yet");
             continue;
         };
+        if sync.stale {
+            let _ = writeln!(
+                output,
+                "  stale: no exchange since the measurement below ({}), so it says what both held then, not now{}",
+                relative_time(sync.measured_at_unix_ms, now),
+                if sync.added_since_measured_envelopes == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; this node has gained {} since",
+                        envelope_count(sync.added_since_measured_envelopes)
+                    )
+                }
+            );
+        }
         if let Some(report) = &sync.heal {
             let _ = writeln!(output, "  {}", render_heal(&peer.peer, report, now));
         }
@@ -8536,6 +8751,114 @@ fn normalize_member_subject(subject: &str, namespace: &str) -> String {
         subject.into()
     } else {
         format!("{namespace}/{subject}")
+    }
+}
+
+async fn run_rules(
+    client: &Client,
+    config: &Config,
+    command: RuleCommand,
+    json_output: bool,
+) -> Result<()> {
+    use smallclaims::rules::{Mode, NamedRule};
+    let person = |actor: Option<String>| -> Result<String> {
+        actor
+            .or_else(|| config.person.clone())
+            .context("rules are set by a person: set person in config.toml or pass --as person/NAME")
+    };
+    let set = |actor: &str, name: &str, rule: smallclaims::rules::Rule| {
+        let request = st3::api::RuleSetRequest {
+            actor: actor.to_owned(),
+            name: name.to_owned(),
+            rule,
+        };
+        async move {
+            let _: Value = client.post("/v1/rules/set", &request).await?;
+            anyhow::Ok(())
+        }
+    };
+    match command {
+        RuleCommand::Ls => {
+            let rules: Vec<NamedRule> = client.get("/v1/rules").await?;
+            if json_output {
+                return print_value(&rules, true);
+            }
+            if rules.is_empty() {
+                println!("no rules: every principal may write what its person may (st rules lockdown sets the presets)");
+            }
+            for rule in rules {
+                println!(
+                    "{}\t{}\t{}",
+                    rule.name,
+                    rule.rule.mode.as_str(),
+                    rule.rule.description
+                );
+            }
+            Ok(())
+        }
+        RuleCommand::Audit { rule, limit } => {
+            let mut path = format!("/v1/rules/audit?limit={limit}");
+            if let Some(rule) = &rule {
+                path.push_str(&format!("&rule={}", urlencoding::encode(rule)));
+            }
+            let audits: Vec<st3::api::RuleAudit> = client.get(&path).await?;
+            if json_output {
+                return print_value(&audits, true);
+            }
+            if audits.is_empty() {
+                println!("no write has been refused or audited");
+            }
+            for audit in audits {
+                println!(
+                    "{}\t{}\t{} {} on {}",
+                    audit.at_unix_ms, audit.rule, audit.actor, audit.action, audit.target
+                );
+            }
+            Ok(())
+        }
+        RuleCommand::Lockdown { actor, starters } => {
+            let actor = person(actor)?;
+            let rules = st3::rules::lockdown(&starters);
+            for (name, rule) in &rules {
+                set(&actor, name, rule.clone()).await?;
+            }
+            if json_output {
+                return print_value(
+                    &rules
+                        .iter()
+                        .map(|(name, rule)| json!({"name": name, "rule": rule}))
+                        .collect::<Vec<_>>(),
+                    true,
+                );
+            }
+            for (name, rule) in &rules {
+                println!("{name}\taudit\t{}", rule.description);
+            }
+            println!(
+                "Each rule logs what it would refuse; read the log with st rules audit, then st rules mode NAME enforce."
+            );
+            Ok(())
+        }
+        RuleCommand::Mode { name, mode, actor } => {
+            let actor = person(actor)?;
+            let rules: Vec<NamedRule> = client.get("/v1/rules").await?;
+            let mut rule = rules
+                .into_iter()
+                .find(|rule| rule.name == name)
+                .with_context(|| format!("no rule is named `{name}`; st rules ls lists them"))?
+                .rule;
+            rule.mode = match mode.as_str() {
+                "off" => Mode::Off,
+                "enforce" => Mode::Enforce,
+                _ => Mode::Audit,
+            };
+            set(&actor, &name, rule).await?;
+            if json_output {
+                return print_value(&json!({"name": name, "mode": mode}), true);
+            }
+            println!("{name}\t{mode}");
+            Ok(())
+        }
     }
 }
 
@@ -10989,14 +11312,38 @@ async fn run_attention(
                     format!("attention item `{normalized}` is not currently actionable")
                 })?;
             if json_output {
-                print_value(&item, true)
+                print_value(&item, true)?;
             } else {
                 print!(
                     "{}",
                     render_attention_show(&item, OutputStyle::stdout(), now_ms())
                 );
-                Ok(())
             }
+            // The person opening an update reads it, which clears it from their home. An agent
+            // seat looking at the person's home reads nothing for them.
+            if item.request.as_ref().is_some_and(|r| r["type"] == "update")
+                && item.person == actor
+                && std::env::var_os("ST_AGENT").is_none()
+            {
+                let _: StepRunView = client
+                    .post(
+                        "/v1/work/done",
+                        &PersonStepResponse {
+                            subject: item.subject.clone(),
+                            actor: actor.clone(),
+                            summary: String::new(),
+                            evidence: Vec::new(),
+                            episode: Some(item.episode.clone()),
+                            idempotency_key: format!("update-read:{}", item.episode),
+                            answer: None,
+                        },
+                    )
+                    .await?;
+                if !json_output {
+                    println!("\nRead: this update has left your home.");
+                }
+            }
+            Ok(())
         }
         AttentionCommand::Request(args) => {
             let actor = args
@@ -11109,7 +11456,8 @@ A `decision` proposes one action: exactly one `accept` answer, one `decline` ans
 one `request_changes` answer, each naming what happens next. A `choice` names 2 to 5 options,
 and `"custom": true` also takes the person's own words. `feedback` asks for text and has no
 answers. `why_person` says why no runtime fact or standing instruction settles it. Omit
-`recommendation` to make none. Subject kinds: pull_request, issue, document, mission, run,
+`recommendation` to make none. An `update` asks nothing: it names `about`, the person's own
+run or step or their message to you, and clears once read (`st work update` builds one). Subject kinds: pull_request, issue, document, mission, run,
 step, agent, host, commit, link; `revision` pins what was reviewed.
 
   {"version": 1, "type": "decision",
@@ -11163,7 +11511,7 @@ async fn run_work(
                 (Some(reason), _) => reason,
                 (None, Some(request)) => request["question"]
                     .as_str()
-                    .context("the request needs a question")?
+                    .context("the request needs a question; an update's text goes in --reason")?
                     .to_owned(),
                 (None, None) => unreachable!("clap requires --reason or --request"),
             };
@@ -11181,6 +11529,29 @@ async fn run_work(
                         incarnation: args.incarnation,
                         idempotency_key: args.idempotency_key,
                         request,
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+        WorkCommand::Update(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: StepRunView = client
+                .post(
+                    "/v1/work/ask",
+                    &PersonAskRequest {
+                        legacy_request: None,
+                        person: args.person,
+                        title: args.title,
+                        reason: args.body,
+                        actor: args.actor,
+                        step: None,
+                        new_run: None,
+                        incarnation: None,
+                        idempotency_key: args.idempotency_key,
+                        request: Some(
+                            serde_json::json!({"version": 1, "type": "update", "about": args.about}),
+                        ),
                     },
                 )
                 .await?;
@@ -12631,21 +13002,26 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             .subject
             .as_deref()
             .context("the Claude channel has no subject")?;
-        let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+        let identity = subject.strip_prefix("agent/").unwrap_or(subject);
+        let paths = match st_drivers::driver_paths::Paths::from_environment(identity, &|name| {
+            std::env::var(name).ok()
+        })? {
+            Some(paths) => NativePaths::from_resolved(subject, paths),
+            None => NativePaths::legacy(subject, "claude")?,
+        };
         if push_mailbox_enabled() {
             let incarnation = wait_for_agent_incarnation(client, subject).await?;
             return st3::claude_channel::run(
                 client,
                 subject,
                 &incarnation,
-                &catalog,
-                &agent_dir,
-                &identity,
-                &runtime_id,
+                &paths.resolved(),
+                &paths.identity,
+                &paths.runtime_id,
             )
             .await;
         }
-        return st_drivers::claude_mcp::run_st3(&catalog, &identity);
+        return st_drivers::claude_mcp::run_st3(&paths.driver_root, &paths.identity);
     }
     if matches!(args.driver.as_str(), "pi-channel" | "omp-channel") {
         let identity = args
@@ -12661,8 +13037,17 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         } else {
             "pi"
         };
-        let catalog = catalog.context("the pi-family channel has no native driver catalog")?;
-        return run_pi_channel(client, &normalize_agent_subject(identity), driver, catalog).await;
+        let subject = normalize_agent_subject(identity);
+        let paths = st_drivers::driver_paths::Paths::from_environment(
+            subject.strip_prefix("agent/").unwrap_or(&subject),
+            &|name| std::env::var(name).ok(),
+        )?;
+        let root = paths
+            .as_ref()
+            .map(|paths| paths.root.as_path())
+            .or(catalog)
+            .context("the pi-family channel has no driver root")?;
+        return run_pi_channel(client, &normalize_agent_subject(identity), driver, root).await;
     }
     let subject = args
         .subject
@@ -12769,7 +13154,7 @@ async fn run_st2_native_driver(
     if driver == "claude" {
         reject_noninteractive_claude_argv(&argv)?;
     }
-    let paths = NativePaths::prepare(subject)?;
+    let paths = NativePaths::prepare(subject, driver)?;
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
     // A driver launched while the daemon restarts waits for it; exiting here would end the seat.
     retry_while_daemon_unreachable(subject, || {
@@ -12785,6 +13170,7 @@ async fn run_st2_native_driver(
     .await?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&paths.agent_dir);
     let loop_state = NativeLoopState {
+        paths: Some(paths.resolved()),
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
         ..NativeLoopState::default()
     };
@@ -12801,36 +13187,109 @@ async fn run_st2_native_driver(
     .await
 }
 
-/// The private catalog paths a native driver derives from its subject.
+/// Resolved observation and session paths for one native driver.
 #[derive(Clone)]
 struct NativePaths {
     delivery_gate: st_drivers::session_control::DeliveryGate,
     pending_hold_adoption: Option<st3::delivery_hold::HoldRequest>,
-    catalog: PathBuf,
+    driver_root: PathBuf,
+    session_dir: PathBuf,
     agent_dir: PathBuf,
     identity: String,
     runtime_id: String,
 }
 
 impl NativePaths {
-    fn prepare(subject: &str) -> Result<Self> {
-        let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+    fn prepare(subject: &str, driver: &str) -> Result<Self> {
+        let (driver_root, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+        let session_dir = driver_root.join("sessions").join(driver);
+        fs::create_dir_all(&session_dir)?;
         Ok(Self {
             delivery_gate: st_drivers::session_control::DeliveryGate::default(),
             pending_hold_adoption: None,
-            catalog,
+            driver_root,
+            session_dir,
             agent_dir,
             identity,
             runtime_id,
         })
     }
 
-    /// The driver's own state root, where it leaves its resume state for its next image.
+    fn resolved(&self) -> st_drivers::driver_paths::Paths {
+        st_drivers::driver_paths::Paths {
+            root: self.driver_root.clone(),
+            agent_dir: self.agent_dir.clone(),
+            session_dir: self.session_dir.clone(),
+        }
+    }
+
+    fn from_resolved(subject: &str, paths: st_drivers::driver_paths::Paths) -> Self {
+        let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
+        Self {
+            delivery_gate: st_drivers::session_control::DeliveryGate::default(),
+            pending_hold_adoption: None,
+            driver_root: paths.root,
+            agent_dir: paths.agent_dir,
+            session_dir: paths.session_dir,
+            runtime_id: identity.clone(),
+            identity,
+        }
+    }
+
+    /// A pre-change resume record adopts existing files without fabricating declarations.
+    fn legacy(subject: &str, driver: &str) -> Result<Self> {
+        let drivers = PathBuf::from(
+            std::env::var_os("ST3_DRIVER_STATE_DIR")
+                .context("the native driver has no ST3_DRIVER_STATE_DIR")?,
+        );
+        Self::legacy_in(subject, driver, &drivers)
+    }
+
+    fn legacy_in(subject: &str, driver: &str, drivers: &Path) -> Result<Self> {
+        let driver_root = drivers
+            .join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24])
+            .join("catalog");
+        let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
+        let agent_dir =
+            st3::hooks::legacy_claude_agent_dir(&drivers, subject, &st_drivers::run::detect_host());
+        let session_dir = match driver {
+            "claude" => st_drivers::claude_session::state_dir(&driver_root, &identity),
+            "opencode" => st_drivers::opencode_session::state_dir(&driver_root, &identity),
+            "codex" => driver_root.parent().unwrap().join("state"),
+            _ => driver_root.parent().unwrap().join("sessions").join(driver),
+        };
+        Ok(Self::from_resolved(
+            subject,
+            st_drivers::driver_paths::Paths {
+                root: driver_root,
+                agent_dir,
+                session_dir,
+            },
+        ))
+    }
+
+    fn resumed(
+        subject: &str,
+        driver: &str,
+        paths: Option<st_drivers::driver_paths::Paths>,
+    ) -> Result<Self> {
+        match paths {
+            Some(paths) => Ok(Self::from_resolved(subject, paths)),
+            None => Self::legacy(subject, driver),
+        }
+    }
+
+    /// Predecessor drivers wrote resume state beside their private catalog.
     fn state_root(&self) -> PathBuf {
-        self.catalog
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.catalog.clone())
+        if self
+            .driver_root
+            .file_name()
+            .is_some_and(|name| name == "catalog")
+        {
+            self.driver_root.parent().unwrap().to_path_buf()
+        } else {
+            self.driver_root.clone()
+        }
     }
 }
 
@@ -12853,17 +13312,30 @@ fn spawn_st2_provider(
     tokio::task::spawn_blocking(move || match start {
         ProviderStart::Launch(argv) => match driver.as_str() {
             "claude" => st_drivers::claude_session::run_controlled_paths(
-                &paths.catalog,
-                &paths.agent_dir,
+                &paths.resolved(),
                 paths.identity,
                 paths.runtime_id,
                 argv,
             ),
-            "pi" => st_drivers::pi_session::run_native(&paths.catalog, paths.identity, paths.runtime_id, argv),
-            "omp" => st_drivers::omp_session::run_native(&paths.catalog, paths.identity, paths.runtime_id, argv),
-            "opencode" => {
-                st_drivers::opencode_session::run_with_control(&paths.catalog, paths.identity, paths.runtime_id, argv, st_drivers::session_control::SessionControl::Graph(paths.delivery_gate))
-            }
+            "pi" => st_drivers::pi_session::run_native(
+                &paths.resolved(),
+                paths.identity,
+                paths.runtime_id,
+                argv,
+            ),
+            "omp" => st_drivers::omp_session::run_native(
+                &paths.resolved(),
+                paths.identity,
+                paths.runtime_id,
+                argv,
+            ),
+            "opencode" => st_drivers::opencode_session::run_with_paths(
+                &paths.resolved(),
+                paths.identity,
+                paths.runtime_id,
+                argv,
+                st_drivers::session_control::SessionControl::Graph(paths.delivery_gate),
+            ),
             _ => unreachable!("the native driver was checked"),
         },
         ProviderStart::Adopt(session) => match (driver.as_str(), session) {
@@ -12877,22 +13349,26 @@ fn spawn_st2_provider(
                     seq,
                 )
             }
-            ("pi", DetachedSession::Provider { pid, session, seq }) => st_drivers::pi_session::adopt_native(
-                &paths.catalog,
-                paths.identity,
-                paths.runtime_id,
-                pid,
-                session,
-                seq,
-            ),
-            ("omp", DetachedSession::Provider { pid, session, seq }) => st_drivers::omp_session::adopt_native(
-                &paths.catalog,
-                paths.identity,
-                paths.runtime_id,
-                pid,
-                session,
-                seq,
-            ),
+            ("pi", DetachedSession::Provider { pid, session, seq }) => {
+                st_drivers::pi_session::adopt_native(
+                    &paths.resolved(),
+                    paths.identity,
+                    paths.runtime_id,
+                    pid,
+                    session,
+                    seq,
+                )
+            }
+            ("omp", DetachedSession::Provider { pid, session, seq }) => {
+                st_drivers::omp_session::adopt_native(
+                    &paths.resolved(),
+                    paths.identity,
+                    paths.runtime_id,
+                    pid,
+                    session,
+                    seq,
+                )
+            }
             (
                 "opencode",
                 DetachedSession::OpenCode {
@@ -12904,8 +13380,8 @@ fn spawn_st2_provider(
                     version_ok,
                     producer_version,
                 },
-            ) => st_drivers::opencode_session::adopt_with_control(
-                &paths.catalog,
+            ) => st_drivers::opencode_session::adopt_with_paths(
+                &paths.resolved(),
                 paths.identity,
                 paths.runtime_id,
                 pid,
@@ -12928,6 +13404,8 @@ fn spawn_st2_provider(
 /// image already published nor forgets that the harness already reported ready.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct NativeLoopState {
+    #[serde(default)]
+    paths: Option<st_drivers::driver_paths::Paths>,
     ready: bool,
     /// Whether the harness-state file already belongs to this session. A resumed driver adopts a
     /// running session, so its record is always current.
@@ -12986,10 +13464,11 @@ async fn resume_native_driver(
         )
         .await;
     }
-    let mut paths = NativePaths::prepare(subject)?;
+    let mut paths = NativePaths::resumed(subject, driver, resume.loop_state.paths.clone())?;
     if driver == "opencode" {
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
+    resume.loop_state.paths = Some(paths.resolved());
     let task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(resume.session));
     drive_st2_native(
         client,
@@ -13120,7 +13599,7 @@ async fn drive_st2_native(
     mut task: tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
     let NativePaths {
-        catalog,
+        session_dir,
         agent_dir,
         identity,
         runtime_id,
@@ -13267,7 +13746,7 @@ async fn drive_st2_native(
                 if mailbox.subscription.is_some() {
                     if driver == "opencode" {
                         if let Err(error) = mailbox.pump(client, &agent_dir,
-                            NativeDeliveryReceipts::OpenCode { catalog_root: &catalog, identity: &identity, runtime_id: &runtime_id }).await {
+                            NativeDeliveryReceipts::OpenCode { session_dir: &session_dir, identity: &identity, runtime_id: &runtime_id }).await {
                             note_driver_tick_failure(subject, error, &mut last_control_warning);
                         }
                     }
@@ -13297,7 +13776,7 @@ async fn drive_st2_native(
                         &archive,
                         "opencode-server",
                         NativeDeliveryReceipts::OpenCode {
-                            catalog_root: &catalog,
+                            session_dir: &session_dir,
                             identity: &identity,
                             runtime_id: &runtime_id,
                         },
@@ -13542,28 +14021,16 @@ fn prepare_native_driver_in(
     subject: &str,
     state_root: &Path,
 ) -> Result<(PathBuf, PathBuf, String, String)> {
-    let state_root = state_root.join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24]);
-    let catalog = state_root.join("catalog");
-    fs::create_dir_all(&catalog)?;
-    // This private catalog exists for st2 hook resolution, not for PTY ownership.
-    // Its deeply nested state path would otherwise fail st2's portable socket-path
-    // validation for slash-qualified st identities, silently disabling hooks.
-    fs::write(
-        catalog.join("catalog.kdl"),
-        "catalog { pty-root \"/tmp/st3-native\" }\n",
-    )?;
-    let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
-    let host = st_drivers::run::detect_host();
-    let leaf = &hex::encode(Sha256::digest(identity.as_bytes()))[..16];
-    let agent_dir = catalog.join("agents").join(&host).join(leaf);
+    let state_root = fs::canonicalize(state_root)
+        .or_else(|_| {
+            fs::create_dir_all(state_root)?;
+            fs::canonicalize(state_root)
+        })?
+        .join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24]);
+    let agent_dir = state_root.join("observations");
     fs::create_dir_all(&agent_dir)?;
-    let workspace = std::env::current_dir()?;
-    let declaration = format!(
-        "agent {identity:?} {{\n  identity {identity:?}\n  host {host:?}\n  workspace {:?}\n  command \"true\"\n}}\n",
-        workspace.to_string_lossy()
-    );
-    fs::write(agent_dir.join("agent.kdl"), declaration)?;
-    Ok((catalog, agent_dir, identity.clone(), identity))
+    let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
+    Ok((state_root, agent_dir, identity.clone(), identity))
 }
 
 fn harness_activity_state(activity: st_drivers::harness_state::Activity) -> &'static str {
@@ -14303,7 +14770,9 @@ async fn run_pi_channel(
                     if !state.first_idle_seen {
                         break;
                     }
-                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
+                    // A prior incarnation's handoff is not proof that the model consumed mail.
+                    // The incarnation-local set survives channel reexec and prevents repeats here.
+                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
                     if state.retry_after_ms.get(&message.subject).is_some_and(|after|
                         current_unix_ms().unwrap_or_default() < u128::from(*after)) {
                         continue;
@@ -14374,7 +14843,7 @@ async fn run_pi_channel(
                             .await;
                     }
                     stdout.flush().await?;
-                    let state_root = catalog.parent().unwrap_or(catalog);
+                    let state_root = if std::env::var_os(st_drivers::driver_paths::ROOT_ENV).is_some() { catalog } else { catalog.parent().unwrap_or(catalog) };
                     let _ = write_driver_log(
                         subject,
                         &format!(
@@ -14832,7 +15301,7 @@ fn spawn_codex_provider(
     let argv = argv.to_vec();
     tokio::task::spawn_blocking(move || match start {
         ProviderStart::Launch(_) => st_drivers::codex_app_server::run_controlled_paths(
-            &paths.catalog,
+            &paths.driver_root,
             &state_dir,
             &paths.agent_dir,
             paths.identity,
@@ -14848,7 +15317,7 @@ fn spawn_codex_provider(
             socket_path,
             safe_fallback,
         }) => st_drivers::codex_app_server::adopt_controlled_paths(
-            &paths.catalog,
+            &paths.driver_root,
             &state_dir,
             &paths.agent_dir,
             paths.identity,
@@ -14876,7 +15345,12 @@ async fn drive_codex_native(
     start: ProviderStart,
     mut loop_state: NativeLoopState,
 ) -> Result<()> {
-    let mut paths = NativePaths::prepare(subject)?;
+    let mut paths = if matches!(start, ProviderStart::Launch(_)) {
+        NativePaths::prepare(subject, "codex")?
+    } else {
+        NativePaths::resumed(subject, "codex", loop_state.paths.clone())?
+    };
+    loop_state.paths = Some(paths.resolved());
     let NativePaths {
         agent_dir,
         identity,
@@ -14884,7 +15358,7 @@ async fn drive_codex_native(
         ..
     } = paths.clone();
     let root = paths.state_root();
-    let state_dir = root.join("state");
+    let state_dir = paths.session_dir.clone();
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     if matches!(start, ProviderStart::Launch(_)) {
         // The path can still hold the predecessor's terminal record. It is the predecessor's, never
@@ -15701,11 +16175,11 @@ impl NativeMailbox {
                 state_dir, identity, runtime_id,
             )?,
             NativeDeliveryReceipts::OpenCode {
-                catalog_root,
+                session_dir,
                 identity,
                 runtime_id,
-            } => st_drivers::opencode_session::consumed_delivery_filenames(
-                catalog_root,
+            } => st_drivers::opencode_session::consumed_delivery_paths(
+                session_dir,
                 identity,
                 runtime_id,
             )?,
@@ -15731,12 +16205,8 @@ impl NativeMailbox {
                     mailbox_receipt(client, &self.fence, &view.subject, "read").await?;
                     return Ok(());
                 }
-                // Delivery is durable handoff evidence, including mail handed to the legacy
-                // provider turn before the push ledger used graph subjects as its keys.
-                if view.status == "delivered" {
-                    self.queued.remove(&view.subject);
-                    return Ok(());
-                }
+                // Reoffer delivered-unread mail under its stable key. The provider ledger
+                // reconciles native consumption and uncertain handoffs before any reinjection.
                 if view.status == "sent" {
                     let staged =
                         mailbox_receipt_claim(client, &self.fence, &view.subject, "staged").await?;
@@ -15998,10 +16468,12 @@ async fn forward_projected_messages_reporting(
             incarnation,
         } => claude_channel_consumed_delivery_filenames(agent_dir, incarnation),
         NativeDeliveryReceipts::OpenCode {
-            catalog_root,
+            session_dir,
             identity,
             runtime_id,
-        } => st_drivers::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
+        } => {
+            st_drivers::opencode_session::consumed_delivery_paths(session_dir, identity, runtime_id)
+        }
     }?;
     let mut cursor = None;
     let mut failures = Vec::new();
@@ -16020,7 +16492,7 @@ async fn forward_projected_messages_reporting(
                 consumed_by_recipient.insert(message.subject);
                 continue;
             }
-            if !matches!(message.status.as_str(), "sent" | "staged") {
+            if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") {
                 continue;
             }
             // One message that cannot be forwarded, such as a document missing on this host, is
@@ -16140,7 +16612,7 @@ enum NativeDeliveryReceipts<'a> {
         incarnation: &'a str,
     },
     OpenCode {
-        catalog_root: &'a Path,
+        session_dir: &'a Path,
         identity: &'a str,
         runtime_id: &'a str,
     },
@@ -16555,12 +17027,60 @@ mod tests {
             status: "up".into(),
             last_success_at_unix_ms: None,
             last_error: None,
+            last_failure_at_unix_ms: None,
             refusal_reason: None,
             schema_digest: None,
             authority_digest: digest.map(str::to_owned),
             graph_digest: None,
             sync: None,
         }
+    }
+
+    #[test]
+    fn a_wait_counts_only_exchanges_since_it_began() {
+        let since = 10_000;
+        let with = |name: &str, status: &str, measured: Option<(u128, u64)>| {
+            let mut peer = peer_status(name, None);
+            peer.status = status.into();
+            peer.sync = measured.map(|(at, peer_only)| st3::model::ReplicationPeerSync {
+                peer_only_envelopes: peer_only,
+                measured_at_unix_ms: at,
+                ..Default::default()
+            });
+            peer
+        };
+        let status = |peers| ReplicationStatus {
+            peers,
+            ..Default::default()
+        };
+        // An in-sync measurement from before the wait, as after a restart, proves nothing.
+        let error = caught_up_since(&status(vec![with("alder", "up", Some((9_000, 0)))]), since)
+            .unwrap_err();
+        assert_eq!(error, "no exchange with alder yet");
+        let error = caught_up_since(
+            &status(vec![with("alder", "up", Some((11_000, 300)))]),
+            since,
+        )
+        .unwrap_err();
+        assert_eq!(error, "alder has 300 envelopes this node lacks");
+        // A member that is not up cannot be checked, but some member must be.
+        let caught_up = caught_up_since(
+            &status(vec![
+                with("alder", "up", Some((11_000, 0))),
+                with("birch", "last-seen", Some((9_000, 0))),
+            ]),
+            since,
+        )
+        .unwrap();
+        assert_eq!(caught_up.peers, vec![("alder".to_owned(), 11_000)]);
+        assert_eq!(caught_up.not_checked, vec!["birch (last-seen)".to_owned()]);
+        assert!(
+            render_caught_up(&caught_up, 12_000)
+                .contains("not checked, since they are not up: birch")
+        );
+        let error =
+            caught_up_since(&status(vec![with("birch", "last-seen", None)]), since).unwrap_err();
+        assert_eq!(error, "no peer has exchanged with this node");
     }
 
     #[test]
@@ -16903,7 +17423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_mailbox_upgrade_does_not_queue_legacy_delivered_mail_or_acknowledge_it_as_read()
+    async fn native_mailbox_replays_delivered_unread_but_never_queues_read_or_closed_mail()
     {
         // The two providers share this pump but load their own native receipt ledgers.
         for driver in ["codex", "opencode"] {
@@ -16916,7 +17436,7 @@ mod tests {
                 subject: "message/legacy".into(),
                 from: "person/eval".into(),
                 to: "agent/eval.worker".into(),
-                content: "doc/unavailable@hash".into(),
+                content: "Recovered signal".into(),
                 status: "delivered".into(),
                 title: None,
                 in_reply_to: None,
@@ -16930,15 +17450,16 @@ mod tests {
                 queued: BTreeMap::new(),
                 replayed: true,
             };
-            // Even a previously cached body must leave the fresh-handoff queue when delivery lands.
-            mailbox.queued.insert(
-                view.subject.clone(),
-                native_queued_message(&view, "Cached signal".into()),
-            );
             view.subject = "message/pending".into();
             view.status = "staged".into();
             view.content = "Fresh signal".into();
             mailbox.messages.push(view.clone());
+            for status in ["read", "closed"] {
+                let mut settled = view.clone();
+                settled.subject = format!("message/{status}");
+                settled.status = status.into();
+                mailbox.messages.push(settled);
+            }
             for _ in 0..3 {
                 let receipts = if driver == "codex" {
                     NativeDeliveryReceipts::Codex {
@@ -16948,25 +17469,21 @@ mod tests {
                     }
                 } else {
                     NativeDeliveryReceipts::OpenCode {
-                        catalog_root: root.path(),
+                        session_dir: root.path(),
                         identity: "eval.worker",
                         runtime_id: "worker",
                     }
                 };
-                // An absent daemon makes any accidental body fetch, staging or fabricated read fail.
+                // Replay requires no backward staging or invented consumption receipt.
                 mailbox.pump(&client, &agent_dir, receipts).await.unwrap();
                 let queued = st_drivers::push_mailbox::messages(
                     &agent_dir,
                     &agent_dir.join("resources/inbox"),
                 )
                 .unwrap();
-                assert_eq!(queued.len(), 1, "{driver}");
-                assert_eq!(queued[0].filename, "message/pending");
-                assert!(st_drivers::push_mailbox::is_unread(
-                    &agent_dir,
-                    "message/legacy",
-                    &queued
-                ));
+                let mut ids = queued.iter().map(|message| message.filename.as_str()).collect::<Vec<_>>();
+                ids.sort_unstable();
+                assert_eq!(ids, ["message/legacy", "message/pending"], "{driver}");
             }
             assert!(!agent_dir.join("resources").exists());
         }
@@ -17146,6 +17663,7 @@ mod tests {
                 seq: 3,
             },
             loop_state: NativeLoopState {
+                paths: None,
                 mailbox_fence: None,
                 ready: true,
                 harness_record_started: true,
@@ -17951,6 +18469,7 @@ mod tests {
                     status: "up".into(),
                     last_success_at_unix_ms: Some(now - 2_000),
                     last_error: None,
+                    last_failure_at_unix_ms: None,
                     refusal_reason: None,
                     schema_digest: None,
                     authority_digest: None,
@@ -20062,24 +20581,63 @@ mission "review" state="ready" {
     }
 
     #[test]
-    fn a_native_driver_gets_one_graph_message_projection() {
+    fn a_native_driver_has_explicit_paths_without_catalogs() {
         let root = tempfile::tempdir().unwrap();
-        let (catalog, agent_dir, identity, runtime_id) =
-            prepare_native_driver_in("agent/node.worker", root.path()).unwrap();
-        let discovery = agent_spec::discovery::discover_strict(&catalog);
-        assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
-        assert_eq!(discovery.specs.len(), 1);
-        assert_eq!(discovery.specs[0].identity, "node.worker");
+        for subject in [
+            "agent/node.worker",
+            "agent/example/app-web/standing/app-web",
+        ] {
+            let (driver_root, agent_dir, identity, runtime_id) =
+                prepare_native_driver_in(subject, root.path()).unwrap();
+            assert_eq!(agent_dir, driver_root.join("observations"));
+            assert!(agent_dir.is_dir());
+            assert!(!driver_root.join("catalog").exists());
+            assert!(!driver_root.join("catalog.kdl").exists());
+            assert!(!agent_dir.join("agent.kdl").exists());
+            assert_eq!(identity, subject.strip_prefix("agent/").unwrap());
+            assert_eq!(runtime_id, identity);
+            assert_eq!(
+                prepare_native_driver_in(subject, root.path()).unwrap().1,
+                agent_dir
+            );
+        }
+    }
+
+    #[test]
+    fn predecessor_layout_survives_resume_without_rewriting_catalogs() {
+        let drivers = tempfile::tempdir().unwrap();
+        let subject = "agent/example/worker";
+        let old = NativePaths::legacy_in(subject, "codex", drivers.path()).unwrap();
+        fs::create_dir_all(&old.agent_dir).unwrap();
+        fs::write(old.driver_root.join("catalog.kdl"), "predecessor bytes").unwrap();
+        fs::write(old.agent_dir.join("agent.kdl"), "predecessor declaration").unwrap();
+        fs::create_dir_all(&old.session_dir).unwrap();
+        fs::write(old.session_dir.join("binding.json"), "provider binding").unwrap();
+        let state = NativeLoopState {
+            paths: Some(old.resolved()),
+            ..NativeLoopState::default()
+        };
+        let encoded = serde_json::to_value(&state).unwrap();
+        let back: NativeLoopState = serde_json::from_value(encoded.clone()).unwrap();
+        let adopted = NativePaths::resumed(subject, "codex", back.paths).unwrap();
+        assert_eq!(adopted.resolved(), old.resolved());
         assert_eq!(
-            discovery.specs[0].path.parent().unwrap(),
-            agent_dir.as_path()
+            fs::read(adopted.session_dir.join("binding.json")).unwrap(),
+            b"provider binding"
         );
-        assert_eq!(identity, "node.worker");
-        assert_eq!(runtime_id, "node.worker");
-        let (long_catalog, _, _, _) =
-            prepare_native_driver_in("agent/example/app-web/standing/app-web", root.path()).unwrap();
-        let report = st_drivers::validate::validate_for_host(&long_catalog, &st_drivers::run::detect_host());
-        assert!(report.issues.is_empty(), "{report:?}");
+        assert_eq!(
+            fs::read(old.driver_root.join("catalog.kdl")).unwrap(),
+            b"predecessor bytes"
+        );
+        assert!(!old.state_root().join("observations").exists());
+        let mut predecessor = encoded;
+        predecessor.as_object_mut().unwrap().remove("paths");
+        assert!(
+            serde_json::from_value::<NativeLoopState>(predecessor)
+                .unwrap()
+                .paths
+                .is_none()
+        );
     }
 
     #[test]
@@ -20255,7 +20813,8 @@ mission "review" state="ready" {
         };
         let deadline = request.until_unix_ms;
         let mut paths = NativePaths {
-            catalog: root.path().into(),
+            driver_root: root.path().into(),
+            session_dir: root.path().join("sessions"),
             agent_dir: root.path().into(),
             identity: "h.gated".into(),
             runtime_id: "gated".into(),
@@ -20379,6 +20938,85 @@ mission "review" state="ready" {
         .unwrap();
         assert!(!inbox.join(&filename).exists());
         assert!(archive.join(filename).is_file());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_native_mailbox_replays_delivered_unread_once_and_keeps_read_closed_final() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_memory("replay").unwrap());
+        let seat = "agent/eval.worker";
+        for final_status in ["delivered", "read", "closed"] {
+            let subject = format!("message/{final_status}");
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/eval".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!("person/eval")),
+                        ("to".into(), json!(seat)),
+                        ("content".into(), json!("Recovered brief")),
+                        ("status".into(), json!("sent")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            for status in ["delivered", "read", "closed"] {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: subject.clone(),
+                        kind: format!("message.{status}"),
+                        actor: Some(seat.into()),
+                        fields: BTreeMap::from([("status".into(), json!(status))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                if status == final_status {
+                    break;
+                }
+            }
+        }
+        let (client, server) = serve_test_store(store.clone(), root.path(), "replay").await;
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+        let mut first_filename = None;
+        for _ in 0..3 {
+            forward_projected_messages(
+                &client,
+                seat,
+                &inbox,
+                &archive,
+                "app-server",
+                NativeDeliveryReceipts::Codex {
+                    state_dir: root.path(),
+                    identity: "eval.worker",
+                    runtime_id: "worker",
+                },
+            )
+            .await
+            .unwrap();
+            let messages = st_drivers::message::list_dir(&inbox).unwrap();
+            let subjects = messages
+                .iter()
+                .flat_map(|message| &message.tags)
+                .filter_map(|tag| tag.strip_prefix("st3-message:"))
+                .collect::<Vec<_>>();
+            assert_eq!(subjects, ["message/delivered"]);
+            let filename = &messages[0].filename;
+            if let Some(first) = &first_filename {
+                assert_eq!(filename, first, "replay must retain the native handoff identity");
+            } else {
+                first_filename = Some(filename.clone());
+            }
+        }
+        assert_eq!(store.message("message/delivered").unwrap().unwrap().status, "delivered");
+        assert_eq!(store.message("message/read").unwrap().unwrap().status, "read");
+        assert_eq!(store.message("message/closed").unwrap().unwrap().status, "closed");
         server.abort();
     }
 

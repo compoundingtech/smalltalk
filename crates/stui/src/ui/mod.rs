@@ -14,6 +14,7 @@ pub mod demo;
 pub mod doc;
 mod edit;
 mod glass;
+pub use glass::set_glasses_version;
 mod glass_store;
 pub mod layout;
 pub mod live;
@@ -115,6 +116,8 @@ pub enum Effect {
         id: String,
         action: String,
         reason: Option<String>,
+        /// A structured request's named answer, by id.
+        answer: Option<String>,
     },
     LaunchRevise {
         id: String,
@@ -257,6 +260,8 @@ pub struct Ui {
     effects: Vec<Effect>,
     popover: Option<String>,
     chat: Option<ChatState>,
+    /// The named answer chosen on the focused structured request, before Enter sends it.
+    answering: Option<usize>,
     /// Voice mode: the speech helper listening for one input.
     pub(crate) voice: Option<voice::VoiceState>,
     /// Inputs whose text came from voice; their next message is tagged `dictated`.
@@ -357,6 +362,7 @@ impl Ui {
             popover: None,
             chat: None,
             voice: None,
+            answering: None,
             dictated: HashSet::new(),
             details: true,
             kdl: false,
@@ -1059,7 +1065,7 @@ impl Ui {
             ]
         } else if self.terminal_focused() {
             vec![
-                ("ctrl+\\", "return"),
+                ("ctrl+\\", "back to stui"),
                 ("keys", "go to the terminal"),
                 ("ctrl-c twice", "interrupt"),
             ]
@@ -1480,6 +1486,7 @@ impl Ui {
             cursor: self.cursor.at(key, text.unwrap_or("")),
             editing: self.editing,
             confirm: self.confirm,
+            answering: self.answering,
             chat,
         }
     }
@@ -1490,9 +1497,16 @@ impl Ui {
         match self.tab {
             0 => Pane::Home(id),
             1 if self.agent_form => Pane::NewAgent,
+            // In spaces an attached terminal is its own tab's: another tab shows what it holds,
+            // and the terminal stays attached behind it (Nathan, 2026-10-02).
             1 => match &self.terminal {
-                Some(view) => Pane::Terminal(view.agent.clone()),
-                None => Pane::Agent(id),
+                Some(view)
+                    if self.glasses.is_none()
+                        || self.focused_pane() == Some(Pane::Terminal(view.agent.clone())) =>
+                {
+                    Pane::Terminal(view.agent.clone())
+                }
+                _ => Pane::Agent(id),
             },
             2 if self.new_mission.is_some() => Pane::NewMission,
             2 if self.kdl => Pane::Declaration(id),
@@ -2381,10 +2395,29 @@ impl Ui {
     }
 
     fn draw_help(&self, buf: &mut Buffer, area: Rect) {
-        let width = 64.min(area.width.saturating_sub(4));
-        let mut inner = Doc::new();
-        let w = width as usize - 4;
-        inner.section("what the marks mean", None, w);
+        // Two columns where they fit, so the whole list shows at once.
+        let width = 124.min(area.width.saturating_sub(4));
+        let columns = if width >= 100 { 2 } else { 1 };
+        let column = (width as usize - 4 - 3 * (columns - 1)) / columns;
+        let keys = |doc: &mut Doc, title: &str, entries: &[(&str, &str)]| {
+            doc.section(title, None, column);
+            for (key, meaning) in entries {
+                doc.lines(text::wrap(
+                    &[text::run(*meaning, theme::soft())],
+                    column,
+                    &[text::run(
+                        format!(" {key:<19} "),
+                        theme::strong(theme::ACCENT),
+                    )],
+                    &[text::run(" ".repeat(21), theme::dim())],
+                    None,
+                ));
+            }
+            doc.blank();
+        };
+        // The marks also show in the footer's legend, so a single column puts the keys first.
+        let mut marks = Doc::new();
+        marks.section("what the marks mean", None, column);
         for (glyph, color, meaning) in [
             (
                 "◆",
@@ -2408,44 +2441,135 @@ impl Ui {
             ),
             ("✉", theme::SAPPHIRE, "a Small Talk message"),
         ] {
-            inner.lines(text::wrap(
+            marks.lines(text::wrap(
                 &[text::run(meaning, theme::soft())],
-                w,
+                column,
                 &[text::run(format!(" {glyph}  "), theme::strong(color))],
                 &[text::run("    ", theme::dim())],
                 None,
             ));
         }
-        inner.blank();
-        inner.section("keys", None, w);
-        for (key, meaning) in [
-            ("1-5 or click", "switch tabs"),
-            ("ctrl+h", "Home (in a text box it is backspace)"),
-            ("↑↓ j k or click", "select in the list"),
-            ("wheel pgup pgdn", "scroll the pane under the pointer"),
-            ("end", "jump to the newest message and follow it"),
-            ("drag", "select text in one pane; release copies it"),
-            ("o", "expand or collapse tool output"),
-            ("c", "write: a message, feedback, a reply"),
-            (
-                "ctrl+r",
-                "in a message box: speak instead (a Mac with SmallTalk.app's speech helper)",
-            ),
-            ("s", "hide the sidebar"),
-            (
-                "b p",
-                "Usage: group by agent, mission, step...; change the period",
-            ),
-            ("q", "quit"),
-        ] {
-            inner.line(Line::from(vec![
-                Span::styled(format!(" {key:<18}"), theme::strong(theme::ACCENT)),
-                Span::styled(meaning, theme::soft()),
-            ]));
+        marks.blank();
+        let mut left = Doc::new();
+        keys(
+            &mut left,
+            "everywhere",
+            &[
+                ("?", "this help; any key closes it"),
+                (
+                    "ctrl+k",
+                    "open anything: an agent, a mission, a space, an action",
+                ),
+                (
+                    "ctrl+h",
+                    "Home, and again to close it (in a text box it is backspace)",
+                ),
+                ("q", "quit"),
+            ],
+        );
+        if self.glasses.is_some() {
+            keys(
+                &mut left,
+                "spaces",
+                &[
+                    ("ctrl+t", "open something in a new tab"),
+                    ("ctrl+v  ctrl+x", "split right; split below"),
+                    ("ctrl+w", "close the tab"),
+                    ("[ ]  ctrl+pgup pgdn", "previous, next tab in the split"),
+                    ("alt+1-9", "a tab by its number"),
+                    (
+                        "alt+arrows",
+                        "move between splits; left of the first is the sidebar",
+                    ),
+                    ("ctrl+o", "zoom the split, and back"),
+                    ("ctrl+s", "show or hide the sidebar"),
+                    ("ctrl+g", "another space, or a new one"),
+                    ("ctrl+n", "start a new agent"),
+                    ("1-5", "open the palette at a section"),
+                ],
+            );
+        } else {
+            keys(
+                &mut left,
+                "classic",
+                &[("1-5  tab", "switch tabs"), ("s", "hide or show the list")],
+            );
+        }
+        let mut right = Doc::new();
+        keys(
+            &mut right,
+            "lists and cards",
+            &[
+                ("↑↓ j k or click", "select"),
+                ("t", "Agents, Missions: the path tree or the groups"),
+                ("x", "Missions: show st's own missions"),
+                ("n", "Agents: a new agent; Missions: a new mission"),
+                ("y", "confirm what a card asks; Enter never does"),
+                (
+                    "b p",
+                    "Usage: group by agent, mission, step...; change the period",
+                ),
+            ],
+        );
+        keys(
+            &mut right,
+            "a conversation",
+            &[
+                ("c or click", "write: a message, feedback, a reply"),
+                ("wheel pgup pgdn", "scroll the pane under the pointer"),
+                ("end", "jump to the newest message and follow it"),
+                ("/", "find in this conversation"),
+                ("o", "expand or collapse tool output"),
+                (
+                    "shift+o",
+                    "simplified view: tool calls fold to a line (this device)",
+                ),
+                ("i", "the agent's details beside it"),
+                ("drag", "select text in one pane; release copies it"),
+                ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
+                ("r  x", "resend or clear a message that was not sent"),
+            ],
+        );
+        keys(
+            &mut right,
+            "in a message box",
+            &[
+                ("enter", "send"),
+                ("shift+enter ctrl+j", "a new line"),
+                ("ctrl+w  ctrl+u", "delete a word; clear the box"),
+                ("ctrl+v", "attach the clipboard's image"),
+                (
+                    "ctrl+r",
+                    "speak instead of typing (a Mac with SmallTalk.app's speech helper)",
+                ),
+                ("esc", "stop writing; the keys above work again"),
+            ],
+        );
+        let mut inner = Doc::new();
+        if columns == 2 {
+            marks.lines.extend(left.lines);
+            let left = marks;
+            for row in 0..left.lines.len().max(right.lines.len()) {
+                let mut spans = left
+                    .lines
+                    .get(row)
+                    .map(|line| line.spans.clone())
+                    .unwrap_or_default();
+                let used: usize = spans.iter().map(|span| text::width(&span.content)).sum();
+                spans.push(Span::raw(" ".repeat(column.saturating_sub(used) + 3)));
+                if let Some(line) = right.lines.get(row) {
+                    spans.extend(line.spans.clone());
+                }
+                inner.line(Line::from(spans));
+            }
+        } else {
+            inner.lines(left.lines);
+            inner.lines(right.lines);
+            inner.lines(marks.lines);
         }
         let mut doc = Doc::new();
         doc.card(
-            "help · ? or esc closes",
+            "help · any key closes",
             theme::ACCENT,
             false,
             inner,
@@ -2467,7 +2591,64 @@ impl Ui {
 
     // ------------------------------------------------------------------- input
 
+    /// The focused Home item's structured request (#1010), with the item's id.
+    fn structured_request(&self) -> Option<(String, Box<st3_client::StructuredRequest>)> {
+        let id = self.attention_focus()?;
+        let item = self
+            .world
+            .attention
+            .items()
+            .iter()
+            .find(|item| item.id == id)?;
+        match &item.kind {
+            AttentionKind::Request {
+                structured: Some(request),
+                ..
+            } => Some((id, request.clone())),
+            _ => None,
+        }
+    }
+
+    fn answer_key(&mut self, key: KeyEvent) -> bool {
+        let Some(index) = self.answering else {
+            return false;
+        };
+        let Some((id, request)) = self.structured_request() else {
+            self.answering = None;
+            return false;
+        };
+        let last = request.answers.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.answering = Some(index.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.answering = Some((index + 1).min(last)),
+            KeyCode::Esc => self.answering = None,
+            KeyCode::Enter => {
+                self.answering = None;
+                let Some(answer) = request.answers.get(index) else {
+                    return true;
+                };
+                if self.live {
+                    self.effects.push(Effect::Attention {
+                        id,
+                        action: "work.done".into(),
+                        reason: Some(answer.label.clone()),
+                        answer: Some(answer.id.clone()),
+                    });
+                    self.flash(format!("Answering “{}”…", answer.label));
+                } else {
+                    self.flash(format!(
+                        "Answered “{}” · demo: nothing was sent",
+                        answer.label
+                    ));
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn select(&mut self, index: usize) {
+        self.answering = None;
         let count = self.ids().len();
         if count == 0 {
             return;
@@ -2480,6 +2661,7 @@ impl Ui {
     }
 
     fn switch_tab(&mut self, tab: usize) {
+        self.answering = None;
         self.tab = tab.min(TABS.len() - 1);
         self.editing = false;
         self.chat = None;
@@ -2549,6 +2731,10 @@ impl Ui {
         }
         // Listening takes every key until the words are sent, kept or dropped.
         if self.voice_key(key) {
+            return;
+        }
+        // Choosing a structured request's answer: ↑↓ another, Enter sends, Esc puts it away.
+        if self.answer_key(key) {
             return;
         }
         if self.glass_key(key) {
@@ -2983,6 +3169,19 @@ impl Ui {
                     }
                     ("launch", 'd') | ("revision", 'j') | ("fault" | "request", 'r') => {
                         self.confirm = Some(key)
+                    }
+                    ("request", 'a') => {
+                        if let Some((_, request)) = self.structured_request() {
+                            let recommended = request.recommendation.as_ref().and_then(|wanted| {
+                                request
+                                    .answers
+                                    .iter()
+                                    .position(|answer| answer.id == wanted.answer)
+                            });
+                            if !request.answers.is_empty() {
+                                self.answering = Some(recommended.unwrap_or(0));
+                            }
+                        }
                     }
                     ("request", 'y' | 'n') => self.confirm = Some(key),
                     ("message", 'm') => self.act('m'),
@@ -3512,6 +3711,7 @@ impl Ui {
                         id: id.clone(),
                         action: "review.reject".into(),
                         reason: Some(draft),
+                        answer: None,
                     }),
                     Some(AttentionKind::Launch { .. }) => Some(Effect::LaunchRevise {
                         id: id.clone(),
@@ -3521,6 +3721,7 @@ impl Ui {
                         id: id.clone(),
                         action: "work.done".into(),
                         reason: Some(draft),
+                        answer: None,
                     }),
                     Some(AttentionKind::Message { from, .. }) => Some(Effect::Reply {
                         id: id.clone(),
@@ -3661,6 +3862,7 @@ impl Ui {
                     id,
                     action: "work.done".into(),
                     reason: Some(answer.into()),
+                    answer: None,
                 });
                 self.flash(format!("Answering “{answer}”…"));
             } else {
@@ -3697,6 +3899,7 @@ impl Ui {
                     id,
                     action: name.into(),
                     reason,
+                    answer: None,
                 });
                 self.flash("Sending…");
             } else {
@@ -3855,11 +4058,19 @@ impl Ui {
                 };
                 let (in_sidebar, pane) = {
                     let info = self.frame.borrow();
+                    // Home floats over the glass: under it, only Home scrolls (Nathan,
+                    // 2026-10-02). The pane drawn last is the one on top, as for clicks.
+                    let behind_home = self.home_open()
+                        && info
+                            .home
+                            .is_some_and(|rect| !contains(rect, mouse.column, mouse.row));
                     (
                         contains(info.sidebar, mouse.column, mouse.row),
                         info.panes
                             .iter()
+                            .rev()
                             .find(|pane| contains(pane.rect, mouse.column, mouse.row))
+                            .filter(|_| !behind_home)
                             .map(|pane| pane.key.clone()),
                     )
                 };
@@ -4009,6 +4220,7 @@ impl Ui {
                 }
             }
             Hit::Help => self.help = !self.help,
+            Hit::Answer(index) => self.answering = Some(index),
             Hit::Voice => {
                 self.editing = true;
                 self.start_voice();
@@ -4612,6 +4824,7 @@ mod tests {
                 from: "Planner".into(),
                 from_id: "agent/example/planner".into(),
                 question: "Answer yes and I land them.".into(),
+                structured: None,
             },
             actions: vec!["work.done".into()],
             related: Vec::new(),
@@ -4659,6 +4872,150 @@ mod tests {
         );
         ui.key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
         assert!(!ui.simple);
+    }
+
+    #[test]
+    fn a_failed_mission_ages_out_of_the_list_after_its_day() {
+        let mut world = demo::world();
+        let now = chrono::Local::now();
+        if let Load::Ready(missions) = &mut world.missions {
+            let mut failed = missions[0].clone();
+            failed.word = Word::Failed;
+            failed.system = false;
+            let mut today = failed.clone();
+            today.id = "mission/example/failed-today".into();
+            today.title = "Failed today".into();
+            today.updated_at = now.to_rfc3339();
+            failed.id = "mission/example/failed-yesterday".into();
+            failed.title = "Failed yesterday".into();
+            failed.updated_at = (now - chrono::Duration::days(1)).to_rfc3339();
+            missions.push(today);
+            missions.push(failed);
+        }
+        let shown = screens::missions_list(&world, "⠋", false);
+        assert!(shown.ids.iter().any(|id| id == "mission/example/failed-today"));
+        assert!(!shown.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
+        let note = shown
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Note(line) => Some(text::plain(line)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(note.contains("1 failed before today"), "{note}");
+        // x shows it again.
+        let all = screens::missions_list(&world, "⠋", true);
+        assert!(all.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
+    }
+
+    #[test]
+    fn a_structured_request_shows_its_fields_and_sends_a_named_answer() {
+        let mut world = demo::world();
+        let request = st3_client::StructuredRequest {
+            version: 1,
+            entry_type: "choice".into(),
+            question: "Shipped today: 62 pull requests.".into(),
+            why_person: "You asked for a summary.".into(),
+            summary: Some("All three machines run main.".into()),
+            reasons: vec![
+                "Seats start reliably (#1008).".into(),
+                "Search is in (#1065).".into(),
+            ],
+            recommendation: Some(st3_client::RequestRecommendation {
+                answer: "more".into(),
+                reason: "two items need your eyes".into(),
+            }),
+            subjects: vec![st3_client::RequestSubject {
+                kind: "link".into(),
+                label: "pull requests merged today".into(),
+                url: Some("https://example.com/merged".into()),
+                ..Default::default()
+            }],
+            answers: vec![
+                st3_client::RequestAnswerOption {
+                    id: "read".into(),
+                    label: "Read it".into(),
+                    consequence: "Clears this item.".into(),
+                    ..Default::default()
+                },
+                st3_client::RequestAnswerOption {
+                    id: "more".into(),
+                    label: "Tell me more".into(),
+                    consequence: "The asker replies with detail.".into(),
+                    ..Default::default()
+                },
+            ],
+            custom: true,
+        };
+        let item = Attention {
+            id: "attention/shipped".into(),
+            tier: Tier::Stopped,
+            title: "Shipped today".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: request.question.clone(),
+                structured: Some(Box::new(request)),
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/shipped")
+            .unwrap();
+        ui.select(at);
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in [
+            "recommends  Tell me more",
+            "All three machines run main.",
+            "Seats start reliably (#1008).",
+            "pull requests merged today",
+            "Read it",
+            "Clears this item.",
+            "Why you: You asked for a summary.",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        // a chooses the recommended answer; ↑ another; Enter sends it by its id.
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(ui.answering, Some(1));
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, answer: Some(answer), reason: Some(reason), .. }]
+                if id == "attention/shipped" && answer == "read" && reason == "Read it"),
+            "{:?}",
+            ui.effects
+        );
+    }
+
+    #[test]
+    fn an_agents_question_gets_room_to_read() {
+        let question = "Recommend: yes, in three parts.\nWhy: the release run failed.\nMy proposal:\n1. Land #1049.\n2. Build on main.\n```\ncargo build\nnext\n```\nAnswer yes and I queue it.";
+        assert_eq!(
+            screens::spaced(question),
+            "**Recommend:** yes, in three parts.\n\n**Why:** the release run failed.\n\nMy proposal:\n1. Land #1049.\n2. Build on main.\n```\ncargo build\nnext\n```\nAnswer yes and I queue it."
+        );
+        // A long lead before a colon is a sentence, not a label.
+        assert_eq!(
+            screens::spaced("The release run on the Linux runner failed: mold is missing"),
+            "The release run on the Linux runner failed: mold is missing"
+        );
     }
 
     #[test]

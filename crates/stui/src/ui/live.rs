@@ -1306,8 +1306,13 @@ async fn perform(
                 .find(|id| id.starts_with("agent/"));
             Ok((format!("Starting {name}"), agent))
         }
-        Effect::Attention { id, action, reason } => {
-            crate::attention_action(client, person, &id, &action, reason)
+        Effect::Attention {
+            id,
+            action,
+            reason,
+            answer,
+        } => {
+            crate::attention_action(client, person, &id, &action, reason, answer)
                 .await
                 .map(|notice| (notice, None))
         }
@@ -1502,6 +1507,7 @@ async fn send_message(
         in_reply_to,
         session_id,
         tags,
+        signature: None,
     };
     let message_id = |result: st3_client::Envelope<st3_client::ActionResult>| {
         // The new message's id, so the pending copy can give way to the real one.

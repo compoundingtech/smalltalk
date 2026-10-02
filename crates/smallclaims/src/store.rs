@@ -351,6 +351,11 @@ pub struct Store {
     pub keyring: crate::principal::Keyring,
     /// Held while this node mints a key for a person or an agent.
     pub principal_minting: Mutex<()>,
+    /// The rules, read from the graph when `rules_stale` says they may have changed.
+    pub rules: std::sync::RwLock<Option<Arc<Vec<crate::rules::NamedRule>>>>,
+    pub rules_stale: AtomicBool,
+    /// Admission took in claims whose verdicts the next projection pass judges.
+    pub verdicts_due: AtomicBool,
     pub origin: String,
     /// The database file, or the shared-memory URI of an in-memory store. A checkpoint proof
     /// opens its own connection here to copy the store.
@@ -472,6 +477,9 @@ impl Store {
             member_key: std::sync::RwLock::new(None),
             keyring: crate::principal::Keyring::default(),
             principal_minting: Mutex::new(()),
+            rules: std::sync::RwLock::new(None),
+            rules_stale: AtomicBool::new(true),
+            verdicts_due: AtomicBool::new(false),
             origin,
             path,
             shared_memory,
@@ -518,6 +526,10 @@ pub struct ReplicationSnapshot {
     pub graph_digest: String,
     pub legacy_graph_digest: String,
     pub projection_digests: BTreeMap<String, String>,
+    /// Whether a local batch had no envelope yet when this snapshot was read. Its projection
+    /// digests then count claims its inventory does not, so `replication_snapshot` seals and
+    /// reads again rather than offer it.
+    pub unsealed: bool,
 }
 
 /// Cumulative replication time by stage, in nanoseconds.
@@ -570,6 +582,8 @@ pub struct PeerSyncProgress {
     pub heal_started_at_unix_ms: Option<u128>,
     pub heal_backoff_ms: u128,
     pub heal: Option<ReplicationHealReport>,
+    /// How many envelopes this node held when it took the last measurement.
+    pub measured_inventory_envelopes: u64,
 }
 
 impl PeerSyncProgress {
@@ -633,6 +647,7 @@ impl PeerSyncProgress {
     /// than one exchange of envelopes this node lacks.
     pub fn view(&self, now: u128) -> Option<ReplicationPeerSync> {
         let mut sync = self.measured.clone()?;
+        sync.stale = now.saturating_sub(sync.measured_at_unix_ms) >= PEER_QUIET_EXCHANGE_MS;
         sync.catching_up = sync.peer_only_envelopes > REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64
             && now.saturating_sub(sync.measured_at_unix_ms) <= REPLICATION_SYNC_STALE_MS;
         sync.graph_compared_at_unix_ms = self.graph_compared_at_unix_ms;
@@ -1005,6 +1020,10 @@ pub fn insert_claim(
     predecessors: &[String],
     now: u128,
 ) -> Result<u64> {
+    // Every local write comes through here; rules see each one that names its writer.
+    if let Some(actor) = actor {
+        principals::rules_gate_tx(transaction, origin, actor, kind, subject)?;
+    }
     promote_claim_blobs(transaction, body)?;
     transaction.execute(
         "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
@@ -2783,6 +2802,23 @@ pub const REPLICATION_SYNC_WINDOW_MS: u128 = 10_000;
 /// between measurements gives no rate sample.
 pub const REPLICATION_SYNC_STALE_MS: u128 = 300_000;
 
+/// A peer counts as up for this long after its last exchange in either direction.
+pub const PEER_UP_MS: u128 = 90_000;
+
+/// Healthy peers exchange at least once per 30-second quiet interval. Once this long has passed
+/// since the last exchange and an attempt since then failed, the peer is not up: it missed an
+/// exchange, and the one this node tried did not happen. A failure sooner than this can be a
+/// one-way route while the peer still reaches this node.
+pub const PEER_QUIET_EXCHANGE_MS: u128 = 35_000;
+
+/// Whether a peer counts as up `now`, from its last exchange and whether an attempt failed since.
+pub fn peer_up(last_success_at: Option<u128>, failed_since: bool, now: u128) -> bool {
+    last_success_at.is_some_and(|at| {
+        let age = now.saturating_sub(at);
+        age < PEER_UP_MS && !(failed_since && age >= PEER_QUIET_EXCHANGE_MS)
+    })
+}
+
 /// How long comparisons must keep finding the same envelopes projecting different graphs before
 /// the two nodes count as diverged. A peer can export between storing envelopes and projecting
 /// them, and a catching-up peer defers projection for up to `CATCH_UP_PROJECTION_INTERVAL_MS`,
@@ -3969,7 +4005,11 @@ impl Store {
         if let Some(actor) = &input.actor {
             self.ensure_principal_key(actor)?;
         }
-        self.runtime.append_claim(self, input)
+        let appended = self.runtime.append_claim(self, input);
+        if input.kind == crate::rules::RULE_SET {
+            self.rules_stale.store(true, Ordering::Release);
+        }
+        appended
     }
 
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
@@ -4008,6 +4048,19 @@ impl Store {
         bytes: &[u8],
         expected_document: &Option<String>,
         idempotency_key: &str,
+    ) -> Result<DocumentVersion, St3Error> {
+        self.put_document_as(name, bytes, expected_document, idempotency_key, None)
+    }
+
+    /// Store a document for `writer`, whom the rules judge as the publisher. The binding claim
+    /// itself is the node's, as every document binding is.
+    pub fn put_document_as(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        expected_document: &Option<String>,
+        idempotency_key: &str,
+        writer: Option<&str>,
     ) -> Result<DocumentVersion, St3Error> {
         validate_document_name(name)?;
         if bytes.len() > 1024 * 1024 {
@@ -4059,6 +4112,10 @@ impl Store {
                         params![hash, bytes, bytes.len() as u64],
                     )
                     .map_err(internal)?;
+                if let Some(writer) = writer {
+                    principals::rules_gate_tx(transaction, &self.origin, writer, "doc.bound", name)
+                        .map_err(crate::error::typed)?;
+                }
                 let body = json!({ "name": name, "hash": hash, "size": bytes.len() });
                 let record = self.runtime.append_claim_tx(
                     transaction,
@@ -4333,8 +4390,23 @@ impl Store {
     /// The replication snapshot with every local batch sealed into a signed envelope first. The
     /// exchange paths use it; they must offer peers everything this node wrote.
     pub fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
-        self.seal_local_batches()?;
-        self.sealed_replication_snapshot()
+        // A write that lands between sealing and reading would be counted by the projection
+        // digests but not by the inventory, and a peer comparing graphs at equal inventories
+        // would heal for nothing. Seal again until the snapshot holds no unsealed batch.
+        let mut snapshot;
+        let mut attempts = 0;
+        loop {
+            self.seal_local_batches()?;
+            snapshot = self.sealed_replication_snapshot()?;
+            attempts += 1;
+            if !snapshot.unsealed || attempts == 8 {
+                break;
+            }
+        }
+        // Judge the claims just sealed only after the snapshot is taken: a verdict pass takes the
+        // writer, and writes queued behind it must not land between sealing and the snapshot.
+        self.judge_claims(false)?;
+        Ok(snapshot)
     }
 
     /// Seal this node's batches that have no envelope yet, and sign them. Only this takes the
@@ -4345,7 +4417,6 @@ impl Store {
         // chunks. Capture the target once; concurrent writes belong to the next pass.
         const SEAL_CHUNK_BATCHES: usize = 64;
         let target = max_batch_rowid(&self.readers.get())?;
-        let mut sealed = false;
         while target > self.seeded_batch_rowid.load(Ordering::Acquire) {
             let mut connection = self.connection.write();
             let _timing = time_stage(&self.replication_timers.snapshot);
@@ -4371,13 +4442,7 @@ impl Store {
             self.sign_own_envelopes_range_tx(&transaction, Some(seeded_through), Some(through))?;
             transaction.commit()?;
             self.seeded_batch_rowid.store(through, Ordering::Release);
-            sealed = true;
             // The FIFO writer services any already queued request before the next loan.
-        }
-        // The claims just sealed carry new signatures. A call that sealed nothing writes nothing,
-        // as before.
-        if sealed {
-            self.judge_claims(false)?;
         }
         Ok(())
     }
@@ -4562,6 +4627,14 @@ impl Store {
             graph_digest,
             legacy_graph_digest,
             projection_digests,
+            unsealed: connection
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>?1 AND NOT EXISTS(
+                         SELECT 1 FROM replica_envelopes WHERE replica_envelopes.batch_id=batches.id))",
+                )?
+                .query_row([self.seeded_batch_rowid.load(Ordering::Acquire)], |row| {
+                    row.get(0)
+                })?,
         });
         *self
             .replication_snapshot
@@ -4989,6 +5062,9 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner);
         let progress = sync.entry(relay.to_owned()).or_default();
         progress.observe(received, difference, now);
+        if difference.is_some() {
+            progress.measured_inventory_envelopes = snapshot.inventory.envelopes.len() as u64;
+        }
         if !same_registry || waiting {
             // Retire a comparison from before a rolling upgrade or a newly waiting claim.
             progress.graph_compared_at_unix_ms = None;
@@ -5129,9 +5205,13 @@ impl Store {
             )?;
         }
         drop(connection);
-        // Admitted claims, and any change to membership's trust roots, get their verdicts.
+        // Admitted claims, and any change to membership's trust roots, get their verdicts once
+        // they are projected: judging here would hold the writer between admission and
+        // projection, and a snapshot taken in between would offer an inventory its projections
+        // do not yet show. A replicated rule takes effect here.
         if outcome.changed {
-            self.judge_claims(true)?;
+            self.rules_stale.store(true, Ordering::Release);
+            self.verdicts_due.store(true, Ordering::Release);
         }
         Ok(outcome)
     }
@@ -5240,6 +5320,9 @@ impl Store {
                 drop(connection);
                 if replayed {
                     self.runtime.forget_views();
+                }
+                if self.verdicts_due.swap(false, Ordering::AcqRel) {
+                    self.judge_claims(true)?;
                 }
                 Ok(true)
             }
@@ -5443,13 +5526,25 @@ impl Store {
         // Keep the existing storage and claim vocabulary for mixed-version fleets.
         // Unknown reachability projects as last-seen in current product views.
         let status = if status == "down" { "unknown" } else { status };
-        let error = if status == "unknown" { "" } else { error };
+        // Every failure is evidence a person needs: it stays as the peer's last error until the
+        // next exchange in either direction clears it, and its time is the row's update time.
+        self.connection
+            .batched(|transaction| {
+                transaction.execute(
+                    "INSERT INTO replication_peers(peer, status, last_error, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(peer) DO UPDATE SET last_error=excluded.last_error,
+                        updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![peer, status, error, now_ms().to_string()],
+                )
+            })
+            .map_err(anyhow::Error::msg)??;
         // An inbound exchange is just as good evidence of reachability as an outbound one.
         // Keep the last success during a short missed-exchange window, so a failed dial on
         // one side cannot flap a peer that is still exchanging in the other direction.
         let last_success = self.replication_peer_last_success(peer)?;
         let recent_exchange =
-            last_success.is_some_and(|last| now_ms().saturating_sub(last) < 90_000);
+            last_success.is_some_and(|last| now_ms().saturating_sub(last) < PEER_UP_MS);
         if recent_exchange {
             return Ok(false);
         }
@@ -5465,7 +5560,7 @@ impl Store {
                     claim.origin == self.origin && claim.body["fields"]["status"] == "up"
                 })
                 .and_then(|claim| claim.body["fields"]["last_success_at"].as_u64())
-                .is_some_and(|last| now_ms().saturating_sub(u128::from(last)) < 90_000);
+                .is_some_and(|last| now_ms().saturating_sub(u128::from(last)) < PEER_UP_MS);
         if recent_observation {
             return Ok(false);
         }
@@ -5486,11 +5581,8 @@ impl Store {
         self.connection
             .batched(|transaction| {
                 transaction.execute(
-                    "INSERT INTO replication_peers(peer, status, last_error, updated_at_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(peer) DO UPDATE SET status=excluded.status, last_error=excluded.last_error,
-                        updated_at_unix_ms=excluded.updated_at_unix_ms",
-                    params![peer, status, error, now_ms().to_string()],
+                    "UPDATE replication_peers SET status=?2 WHERE peer=?1",
+                    params![peer, status],
                 )
             })
             .map_err(anyhow::Error::msg)??;
@@ -5611,6 +5703,22 @@ impl Store {
             .and_then(|value| value.parse().ok()))
     }
 
+    /// Whether `peer` counts as up now (see [`peer_up`]), and when it last exchanged.
+    pub fn replication_peer_up(&self, peer: &str) -> Result<(bool, Option<u128>)> {
+        let connection = self.readers.get();
+        let (last_success, failed_since) = connection
+            .query_row(
+                "SELECT last_success_at_unix_ms, last_error IS NOT NULL
+                 FROM replication_peers WHERE peer=?1",
+                [peer],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let last_success = last_success.and_then(|value| value.parse().ok());
+        Ok((peer_up(last_success, failed_since, now_ms()), last_success))
+    }
+
     /// Whether any peer's latest measurement says this node is catching up with it.
     pub fn replication_catching_up(&self) -> bool {
         let now = now_ms();
@@ -5636,6 +5744,16 @@ impl Store {
         &self,
         configured_peers: &[String],
     ) -> BTreeMap<String, ReplicationPeerSync> {
+        self.replication_peer_sync_held(configured_peers, None)
+    }
+
+    /// The latest sync measurements, each with the envelopes this node gained since it when
+    /// `held` gives how many this node holds now.
+    pub fn replication_peer_sync_held(
+        &self,
+        configured_peers: &[String],
+        held: Option<u64>,
+    ) -> BTreeMap<String, ReplicationPeerSync> {
         let now = now_ms();
         let progress = self
             .replication_sync
@@ -5643,7 +5761,15 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner);
         configured_peers
             .iter()
-            .filter_map(|peer| Some((peer.clone(), progress.get(peer)?.view(now)?)))
+            .filter_map(|peer| {
+                let progress = progress.get(peer)?;
+                let mut sync = progress.view(now)?;
+                if let Some(held) = held {
+                    sync.added_since_measured_envelopes =
+                        held.saturating_sub(progress.measured_inventory_envelopes);
+                }
+                Some((peer.clone(), sync))
+            })
             .collect()
     }
 
@@ -5724,63 +5850,77 @@ impl Store {
         };
         let waiting_claims = count("unknown")?;
         let registry_digest = self.runtime.schema_digest();
-        let sync = self.replication_peer_sync(configured_peers);
+        let now = now_ms();
+        let sync = self.replication_peer_sync_held(
+            configured_peers,
+            Some(snapshot.inventory.envelopes.len() as u64),
+        );
         let mut peers = Vec::new();
         for peer in configured_peers {
-            let mut status = connection
+            let (mut status, updated_at) = connection
                 .query_row(
                     "SELECT status, last_success_at_unix_ms, last_error, schema_digest,
-                                authority_digest, graph_digest
+                                authority_digest, graph_digest, updated_at_unix_ms
                          FROM replication_peers WHERE peer=?1",
                     [peer],
                     |row| {
-                        Ok(ReplicationPeerStatus {
-                            peer: peer.clone(),
-                            status: row.get(0)?,
-                            last_success_at_unix_ms: row
-                                .get::<_, Option<String>>(1)?
-                                .and_then(|value| value.parse().ok()),
-                            last_error: row.get(2)?,
-                            refusal_reason: None,
-                            schema_digest: row.get(3)?,
-                            authority_digest: row.get(4)?,
-                            graph_digest: row.get(5)?,
-                            projection_digests: BTreeMap::new(),
-                            differing_tables: Vec::new(),
-                            projection_comparison_waiting: false,
-                            sync: None,
-                        })
+                        let updated_at = row.get::<_, String>(6)?.parse::<u128>().ok();
+                        Ok((
+                            ReplicationPeerStatus {
+                                peer: peer.clone(),
+                                status: row.get(0)?,
+                                last_success_at_unix_ms: row
+                                    .get::<_, Option<String>>(1)?
+                                    .and_then(|value| value.parse().ok()),
+                                last_error: row.get(2)?,
+                                refusal_reason: None,
+                                schema_digest: row.get(3)?,
+                                authority_digest: row.get(4)?,
+                                graph_digest: row.get(5)?,
+                                projection_digests: BTreeMap::new(),
+                                differing_tables: Vec::new(),
+                                projection_comparison_waiting: false,
+                                sync: None,
+                                last_failure_at_unix_ms: None,
+                            },
+                            updated_at,
+                        ))
                     },
                 )
                 .optional()?
-                .unwrap_or(ReplicationPeerStatus {
-                    peer: peer.clone(),
-                    status: "unknown".into(),
-                    last_success_at_unix_ms: None,
-                    last_error: None,
-                    refusal_reason: None,
-                    schema_digest: None,
-                    authority_digest: None,
-                    graph_digest: None,
-                    projection_digests: BTreeMap::new(),
-                    differing_tables: Vec::new(),
-                    projection_comparison_waiting: false,
-                    sync: None,
-                });
+                .unwrap_or((
+                    ReplicationPeerStatus {
+                        peer: peer.clone(),
+                        status: "unknown".into(),
+                        last_success_at_unix_ms: None,
+                        last_error: None,
+                        refusal_reason: None,
+                        schema_digest: None,
+                        authority_digest: None,
+                        graph_digest: None,
+                        projection_digests: BTreeMap::new(),
+                        differing_tables: Vec::new(),
+                        projection_comparison_waiting: false,
+                        sync: None,
+                        last_failure_at_unix_ms: None,
+                    },
+                    None,
+                ));
             if matches!(
                 status.status.as_str(),
                 "up" | "unknown" | "down" | "last-seen"
             ) {
-                status.status = if status
-                    .last_success_at_unix_ms
-                    .is_some_and(|at| now_ms().saturating_sub(at) < 90_000)
-                {
+                // A failure stays recorded until the next exchange, so a frozen or vanished
+                // peer shows its error and stops counting as up once it misses an exchange.
+                let failed_since = status.last_error.is_some();
+                status.status = if peer_up(status.last_success_at_unix_ms, failed_since, now) {
                     "up"
                 } else {
                     "last-seen"
                 }
                 .into();
-                status.last_error = None;
+                status.last_failure_at_unix_ms = updated_at.filter(|_| failed_since);
+                status.last_error = status.last_error.filter(|error| !error.is_empty());
             }
             let refusal = connection
                 .query_row(
@@ -6572,6 +6712,8 @@ pub fn append_claim_record_tx(
         predecessors,
         now,
     )?;
+    // A device signed this claim before the node wrote it: keep the signature with it.
+    principals::attach_expected_signature_tx(transaction, &id, subject, kind, actor)?;
     Ok(ClaimRecord {
         id,
         store_index,

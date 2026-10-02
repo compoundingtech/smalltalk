@@ -405,6 +405,7 @@ async fn raw_terminal_bytes_capability_replay_and_close_over_paired_gateways() {
             api_version: st3_client::API_VERSION.into(),
             code: challenge.value.code,
             device_public_key: "raw-terminal-public-key-000000000000000000000".into(),
+            key_storage: None,
         },
     ).await.unwrap();
     let gateway_socket = state.state_dir.join("raw-client-gateway.sock");
@@ -1478,6 +1479,7 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
                 api_version: st3_client::API_VERSION.into(),
                 code: challenge.value.code,
                 device_public_key: "conformance-public-key-000000000000000000000000".into(),
+                key_storage: None,
             },
         )
         .await

@@ -1,11 +1,16 @@
 import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
-// Preserve release triggers, source verification and publishing permissions.
+// Preserve release triggers, source verification and publishing permissions. Every commit on main
+// also builds and verifies both archives and keeps them as short-lived artifacts, so release
+// breakage fails on main instead of at tag time (the daily release publishes those artifacts).
 export default githubWorkflow({
   actionlint: defaultActionlintConfig,
   "name": "Smalltalk tag release",
   "on": {
     "push": {
+      "branches": [
+        "main"
+      ],
       "tags": [
         "**"
       ]
@@ -26,7 +31,7 @@ export default githubWorkflow({
     "contents": "read"
   },
   "concurrency": {
-    "group": "smalltalk-release-${{ github.ref }}",
+    "group": "smalltalk-release-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}",
     "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"
   },
   "jobs": {
@@ -115,7 +120,8 @@ export default githubWorkflow({
           "with": {
             "name": "release-${{ matrix.target }}",
             "path": "dist/*",
-            "if-no-files-found": "error"
+            "if-no-files-found": "error",
+            "retention-days": 7
           }
         }
       ]
@@ -154,7 +160,8 @@ export default githubWorkflow({
           "with": {
             "name": "smalltalk-release",
             "path": "dist/*",
-            "if-no-files-found": "error"
+            "if-no-files-found": "error",
+            "retention-days": 7
           }
         }
       ]

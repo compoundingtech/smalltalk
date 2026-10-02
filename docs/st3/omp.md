@@ -26,3 +26,8 @@ available.
 Messages delivered during a running turn are held until the current tool batch returns. A tool call
 that runs longer than the hold limit can still be backgrounded. Read the exact graph message with
 `st conversations read` before acting on it, and archive it after the related action completes.
+
+The channel reports idle only after `ctx.isIdle()` proves that the native turn has settled.
+It keeps sampling through slow final unwind rather than abandoning the idle edge after a
+timeout. New activity, session replacement, or channel replacement retires the old sampler;
+an outstanding human ask or approval keeps its blocking observation, including on reconnect.

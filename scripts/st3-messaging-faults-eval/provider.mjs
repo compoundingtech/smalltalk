@@ -31,6 +31,13 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const pendingFrames = [];
 const spawn = childProcess.spawn;
 childProcess.spawn = (...args) => {
+  if (args[0] === process.env.FAULT_OLD_CHANNEL_BIN && process.env.ST_DRIVER_ROOT
+      && !args[1].includes('--catalog')) {
+    // This pinned graph channel only checks that the obsolete flag is present; it never
+    // reads a catalog. Adapt its CLI in the fixture, using the real native root without
+    // fabricating declarations or restoring catalog arguments in the current extension.
+    args[1] = ['--catalog', process.env.ST_DRIVER_ROOT, ...args[1]];
+  }
   const child = spawn(...args);
   let partial = '';
   child.stdout.setEncoding('utf8');

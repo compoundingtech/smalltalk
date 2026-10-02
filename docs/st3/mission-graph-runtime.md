@@ -801,6 +801,24 @@ which is where a `--new-run` asker reads it. `st work show STEP --json` and the 
 resource both carry the field. The summary stays as the `Person response:` constraint for
 history. A free-text ask works as before: it keeps no `request` field and takes no named answer.
 
+#### Updates
+
+An `update` asks nothing: it brings a person information they asked for, such as a report or a
+status. Post one with `st work update --for PERSON --about REF --title TEXT --body TEXT
+--idempotency-key KEY --as AGENT`, or a `{"version": 1, "type": "update", "about": REF}` request
+on `work ask` (optional `summary` and `subjects`; no question, answers or recommendation).
+`about` is the proof that the person asked: their own mission run or step run (the run, or its
+root run, names them as requester), or a message they sent to the posting agent. Anything else
+returns `update-not-asked`.
+
+The update is a person step in a run of its own, so no step waits on it and the poster keeps
+working. It stays on the person's home until they read it, even after the poster stops; the
+poster can withdraw it with `cancel-ask`. Opening it with `st attention show` as the person (not
+from an agent seat) reads it, as does `st work done STEP --as PERSON --answer read`. Reading
+records `{type: "update", outcome: "read"}` and tells nobody. The client attention card carries
+the update under `update`, not `request`, so a client that predates updates shows a plain card
+whose response reads it.
+
 A person message leaves on read or archive, without an age expiry. A launch needs its current
 valid preview. Faults describe source recovery and inspection; they have no independent dismiss
 state. Legacy `attention request`, `resolve` and `withdraw` return `attention-migrated`.

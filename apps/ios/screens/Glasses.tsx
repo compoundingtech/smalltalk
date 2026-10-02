@@ -3,7 +3,7 @@ import { ScrollView, StyleSheet, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Banners, Empty, StatusLine, useListsOnFocus } from '../chrome';
-import { glassChoices, glassGroups, spaceSummary, type GlassLists, type PaneTarget } from '../glassesView';
+import { glassChoices, glassGroups, groupBoxes, spaceSummary, type GlassLists, type PaneTarget } from '../glassesView';
 import { navigationRef, type RootParams, type RootScreen } from '../navigation';
 import { useStore } from '../store';
 import { theme } from '../theme';
@@ -87,6 +87,7 @@ export function SpaceScreen({ route, navigation }: RootScreen<'Space'>) {
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingVertical: 8, paddingBottom: 32 }}>
       <Notes />
       {!glass ? <Empty text="This space is gone." /> : null}
+      {glass?.body && panes.length > 1 ? <SpaceMap layout={glass.body.layout} titles={panes.map(pane => pane.tabs[0]?.title ?? '')} /> : null}
       {panes.map(pane => <View key={pane.index} style={styles.pane}>
         {pane.tabs.map(tab => {
           const glyph = paneGlyph(tab.pane);
@@ -99,7 +100,19 @@ export function SpaceScreen({ route, navigation }: RootScreen<'Space'>) {
   </Screen>;
 }
 
+/** The space's splits at the sizes stui gives them (st keeps them from glasses version 2), each
+ * labelled with its first tab, so the cards below map to where they sit on the computer. */
+function SpaceMap({ layout, titles }: { layout: Parameters<typeof groupBoxes>[0]; titles: string[] }) {
+  return <View style={styles.map}>
+    {groupBoxes(layout).map((box, index) => <View key={index} style={[styles.mapBox, { left: `${box.x * 100}%`, top: `${box.y * 100}%`, width: `${box.width * 100}%`, height: `${box.height * 100}%` }]}>
+      <T dim numberOfLines={2} style={{ fontSize: 11, lineHeight: 14 }}>{titles[index] || 'empty'}</T>
+    </View>)}
+  </View>;
+}
+
 // A pane's tabs share a card, with space between cards: grouped without headings.
 const styles = StyleSheet.create({
+  map: { marginHorizontal: 8, marginVertical: 6, aspectRatio: 16 / 9, position: 'relative' },
+  mapBox: { position: 'absolute', borderWidth: StyleSheet.hairlineWidth * 2, borderColor: theme.surface1, backgroundColor: theme.mantle, padding: 4, overflow: 'hidden' },
   pane: { marginHorizontal: 8, marginVertical: 6, borderRadius: 10, backgroundColor: theme.mantle, borderLeftWidth: 2, borderLeftColor: theme.surface1, overflow: 'hidden' },
 });

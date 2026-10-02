@@ -38,6 +38,10 @@ impl Daemon {
     }
 
     async fn start(&mut self) {
+        self.start_with_binding(false).await;
+    }
+
+    async fn start_with_binding(&mut self, native: bool) {
         let state = AppState {
             store: self.store.clone(),
             notify: Arc::new(Notify::new()),
@@ -54,7 +58,12 @@ impl Daemon {
         };
         let socket = self.socket.clone();
         self.server = Some(tokio::spawn(async move {
-            let _ = st3::api::serve_unix(&socket, st3::api::router(state)).await;
+            let app = st3::api::router(state);
+            if native {
+                let _ = st3::api::serve_unix_bound(&socket, &socket, app).await;
+            } else {
+                let _ = st3::api::serve_unix(&socket, app).await;
+            }
         }));
         wait_until(
             "the daemon accepts connections",
@@ -587,4 +596,100 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
         "{stderr}"
     );
     let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_settled_mail() {
+    for driver in ["omp", "pi"] {
+        for transport in ["push", "poll"] {
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path();
+            let seat = "agent/replay-worker";
+            let mut daemon = Daemon::new(root);
+            daemon.store = Arc::new(Store::open(&root.join("graph.db"), "restart-node").unwrap());
+            daemon.observe_running(seat, "previous");
+            for (id, lifecycle) in [
+                ("unread-one", "delivered"),
+                ("unread-two", "delivered"),
+                ("read", "read"),
+                ("closed", "closed"),
+            ] {
+                let subject = format!("message/{id}");
+                daemon.send(&subject, seat, &format!("BRIEF {id}"));
+                for status in ["delivered", "read", "closed"] {
+                    daemon.store.append_claim(&ClaimInput {
+                        subject: subject.clone(),
+                        kind: format!("message.{status}"),
+                        actor: Some(seat.into()),
+                        fields: BTreeMap::from([("status".into(), json!(status))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    }).unwrap();
+                    if status == lifecycle { break; }
+                }
+            }
+            // Keep the native parent session, replacing only the seat incarnation.
+            daemon.append(seat, "runtime.observed", json!({
+                "runtime_id": "replay-worker", "incarnation_id": "previous", "status": "exited",
+            }));
+            daemon.observe_running(seat, "replacement");
+            daemon.start_with_binding(true).await;
+            let mut channel = seat_command(root, &daemon.socket)
+                .env("ST_AGENT", seat)
+                .env("ST3_MAILBOX_TRANSPORT", transport)
+                .env(st_drivers::omp_session::CHANNEL_SESSION, "same-native-parent")
+                .env(st_drivers::pi_session::CHANNEL_SESSION, "same-native-parent")
+                .arg("--catalog").arg(root.join("catalog"))
+                .args(["driver", &format!("{driver}-channel"), "--identity", "replay-worker"])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                .spawn().unwrap();
+            let mut input = channel.stdin.take().unwrap();
+            let (frames, received) = std::sync::mpsc::channel::<Value>();
+            let output = channel.stdout.take().unwrap();
+            std::thread::spawn(move || {
+                for line in BufReader::new(output).lines() {
+                    let Ok(line) = line else { break };
+                    if let Ok(frame) = serde_json::from_str(&line) {
+                        let _ = frames.send(frame);
+                    }
+                }
+            });
+            assert_eq!(received.recv_timeout(Duration::from_secs(10)).unwrap()["type"], "hello");
+            writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
+            input.flush().unwrap();
+            let mut replayed = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while replayed.len() < 2 {
+                match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(frame) if frame["type"] == "message" => {
+                        replayed.push(frame["meta"]["messageId"].as_str().unwrap().to_owned());
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let stderr = stop(channel);
+                        panic!("{driver}/{transport}: delivered-unread mail did not replay: {error}; {stderr}");
+                    }
+                }
+            }
+            replayed.sort();
+            assert_eq!(replayed, ["message/unread-one", "message/unread-two"], "{driver}/{transport}");
+            // Several mailbox ticks and a delivered receipt must not reinject into this channel.
+            writeln!(input, "{}", json!({
+                "type":"delivered", "meta":{"messageId":"message/unread-one"},
+            })).unwrap();
+            input.flush().unwrap();
+            let deadline = Instant::now() + Duration::from_millis(2_200);
+            while let Ok(frame) = received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                assert_ne!(frame["type"], "message", "{driver}/{transport}: duplicate or settled mail: {frame}");
+            }
+            assert_eq!(daemon.store.message("message/unread-one").unwrap().unwrap().status, "delivered");
+            assert_eq!(daemon.store.message("message/read").unwrap().unwrap().status, "read");
+            assert_eq!(daemon.store.message("message/closed").unwrap().unwrap().status, "closed");
+            assert_eq!(daemon.store.claims_for("message/unread-one", Some("message.delivered")).unwrap().len(), 1);
+            let stderr = stop(channel);
+            assert!(stderr.is_empty(), "{driver}/{transport}: {stderr}");
+            daemon.stop().await;
+        }
+    }
 }

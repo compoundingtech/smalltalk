@@ -1,5 +1,5 @@
 import { useLayoutEffect, useMemo, useRef } from 'react';
-import { Alert, ScrollView, SectionList, View } from 'react-native';
+import { Alert, Linking, Pressable, ScrollView, SectionList, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Banners, Empty, StatusLine, useDebugScroll, useRefresh } from '../chrome';
@@ -14,7 +14,7 @@ import { randomName } from '../launcher';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
 import { cleanMessageText } from '../conversationView';
-import { ANSWERS, isRequest, report, yesNo } from '../requestView';
+import { ANSWERS, isRequest, report, spaced, yesNo } from '../requestView';
 import type { RootScreen } from '../navigation';
 
 // Home: what needs the person, as stui's Home lists it.
@@ -94,9 +94,11 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
         <T><T bold color={row.color}>{row.glyph} request</T><T dim>  {item.priority} · waited {row.age}</T></T>
         <T bold selectable>{row.title}</T>
         <T><T dim>asks  </T><T bold color={theme.person}>{from}</T></T>
-        <RequestQuestion text={cleanMessageText(item.detail ?? '')} />
-        <T bold color={theme.person}>{from} is waiting on you.</T>
-        <RequestAnswers item={item} from={from} onAnswered={() => navigation.goBack()} />
+        {item.request ? <StructuredRequestView item={item} request={item.request} from={from} onAnswered={() => navigation.goBack()} /> : <>
+          <RequestQuestion text={cleanMessageText(item.detail ?? '')} />
+          <T bold color={theme.person}>{from} is waiting on you.</T>
+          <RequestAnswers item={item} from={from} onAnswered={() => navigation.goBack()} />
+        </>}
         <T dim>Answer it, or Nothing to do if there is nothing for you to do. Either way the step it waits on continues.</T>
         {mission ? <Button label={`mission ${missionTitle(mission)}`} onPress={() => navigation.navigate('Mission', { id: mission.id })} /> : null}
         {agentId ? <Button label={`chat with ${from}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: from })} /> : null}
@@ -121,10 +123,42 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
   </Screen>;
 }
 
+// A structured request (#1010) as stui shows it: the recommendation first, then the question, its
+// summary, reasons and links, and each named answer with what it does. A tap on an answer asks
+// to confirm, then sends it by its id.
+type Structured = NonNullable<Parameters<ReturnType<typeof useStore>['actions']['done']>[0]['request']>;
+function StructuredRequestView({ item, request, from, onAnswered }: { item: Parameters<ReturnType<typeof useStore>['actions']['done']>[0]; request: Structured; from: string; onAnswered: () => void }) {
+  const { busy, status, actions } = useStore();
+  const disabled = busy || status !== 'online';
+  const label = (id: string) => request.answers?.find(answer => answer.id === id)?.label ?? id;
+  const send = (answer: { id: string; label: string }) => Alert.alert(`Answer ${from} “${answer.label}”`, undefined, [
+    { text: 'Cancel', style: 'cancel' },
+    { text: 'Send', onPress: () => void actions.done(item, answer.label, answer.id).then(done => { if (done) onAnswered(); }) },
+  ]);
+  const words = () => Alert.prompt(`Answer ${from}`, item.title, text => { if (text.trim()) void actions.done(item, text.trim()).then(done => { if (done) onAnswered(); }); });
+  return <View style={{ gap: 8 }}>
+    {request.recommendation ? <T><T dim>recommends  </T><T bold color={theme.green}>{label(request.recommendation.answer)}</T><T soft>  {request.recommendation.reason}</T></T> : null}
+    <RequestQuestion text={request.question} />
+    {request.summary ? <Markdown text={spaced(request.summary)} color={theme.subtext0} /> : null}
+    {request.reasons?.length ? <View style={{ gap: 2 }}>{request.reasons.map((reason, index) => <T key={index}><T color={theme.lavender}>•  </T>{reason}</T>)}</View> : null}
+    {request.subjects?.map((subject, index) => subject.url
+      ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
+      : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
+    <T bold color={theme.person}>{from} is waiting on you.</T>
+    {request.answers?.map(answer => <Pressable key={answer.id} disabled={disabled} onPress={() => send(answer)}
+      style={{ borderLeftWidth: 2, borderLeftColor: request.recommendation?.answer === answer.id ? theme.green : theme.surface1, paddingLeft: 8, paddingVertical: 4, opacity: disabled ? 0.5 : 1 }}>
+      <T bold color={theme.accent}>{answer.label}{request.recommendation?.answer === answer.id ? <T color={theme.green}>  recommended</T> : null}</T>
+      <T dim>{answer.consequence}</T>
+    </Pressable>)}
+    {request.custom ? <Button label="Answer in words" disabled={disabled} onPress={words} /> : null}
+    {request.why_person ? <T dim>Why you: {request.why_person}</T> : null}
+  </View>;
+}
+
 // A request's question: a JSON report as its telling fields, anything else as Markdown.
 function RequestQuestion({ text }: { text: string }) {
   const shown = report(text);
-  if (!shown) return <Markdown text={text} color={theme.text} />;
+  if (!shown) return <Markdown text={spaced(text)} color={theme.text} />;
   const tone = { fault: theme.red, text: theme.text, soft: theme.subtext0 } as const;
   return <View style={{ gap: 2 }}>
     {shown.before ? <Markdown text={shown.before} color={theme.text} /> : null}

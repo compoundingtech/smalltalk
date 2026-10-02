@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS claim_verdict_queue (
 CREATE TABLE IF NOT EXISTS claim_verdict_fresh (
     claim_id TEXT PRIMARY KEY
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS expected_claim_signatures (
+    subject TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    PRIMARY KEY(subject, kind, actor)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS held_keys (
     public_key TEXT PRIMARY KEY,
     principal TEXT NOT NULL,
@@ -144,6 +151,38 @@ pub fn store_claim_signature_tx(
         connection
             .prepare_cached("INSERT OR IGNORE INTO claim_verdict_fresh(claim_id) VALUES (?1)")?
             .execute([claim_id])?;
+    }
+    Ok(())
+}
+
+/// Keep a signature a device made for the claim this node is about to write on `subject`, so the
+/// write stores it in its own transaction.
+pub fn attach_expected_signature_tx(
+    transaction: &Transaction<'_>,
+    claim_id: &str,
+    subject: &str,
+    kind: &str,
+    actor: Option<&str>,
+) -> Result<()> {
+    let Some(actor) = actor else {
+        return Ok(());
+    };
+    let expected = transaction
+        .prepare_cached(
+            "SELECT signature FROM expected_claim_signatures
+             WHERE subject=?1 AND kind=?2 AND actor=?3",
+        )?
+        .query_row(params![subject, kind, actor], |row| row.get::<_, String>(0))
+        .optional()?;
+    if let Some(text) = expected {
+        transaction
+            .prepare_cached(
+                "DELETE FROM expected_claim_signatures WHERE subject=?1 AND kind=?2 AND actor=?3",
+            )?
+            .execute(params![subject, kind, actor])?;
+        if let Ok(signature) = serde_json::from_str::<ClaimSignature>(&text) {
+            store_claim_signature_tx(transaction, claim_id, &signature)?;
+        }
     }
     Ok(())
 }
@@ -369,6 +408,7 @@ fn judge_claim(
         id: &row.id,
         subject: &row.subject,
         kind: &row.kind,
+        actor: row.actor.as_deref(),
         content: content_digest(&row.subject, &row.kind, row.actor.as_deref(), &row.body),
         fields: &fields,
     };
@@ -466,6 +506,114 @@ pub struct VerdictMismatch {
 }
 
 impl Store {
+    /// Write `input` with a signature a device made for it, in the same transaction. The
+    /// signature must already verify for `input`; an idempotent repeat keeps the first claim and
+    /// its signature.
+    pub fn append_signed_claim(
+        &self,
+        input: &ClaimInput,
+        signature: &ClaimSignature,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        let actor = input
+            .actor
+            .clone()
+            .ok_or_else(|| St3Error::new("invalid-signature", "a signed claim names its actor"))?;
+        let key = (input.subject.clone(), input.kind.clone(), actor);
+        let text = serde_json::to_string(signature).map_err(internal)?;
+        {
+            let connection = self.connection.write();
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO expected_claim_signatures(subject, kind, actor, signature)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![key.0, key.1, key.2, text],
+                )
+                .map_err(internal)?;
+        }
+        let appended = self.append_claim_outcome(input);
+        // Nothing waits for a signature once the write has happened or failed.
+        let connection = self.connection.write();
+        connection
+            .execute(
+                "DELETE FROM expected_claim_signatures WHERE subject=?1 AND kind=?2 AND actor=?3",
+                params![key.0, key.1, key.2],
+            )
+            .map_err(internal)?;
+        appended
+    }
+
+    /// Whether another claim already carries this key and nonce.
+    pub fn signature_nonce_used(&self, key: &str, nonce: &str) -> Result<bool> {
+        let connection = self.readers.get();
+        Ok(connection
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM claim_signatures WHERE key=?1 AND nonce=?2)",
+            )?
+            .query_row(params![key, nonce], |row| row.get(0))?)
+    }
+
+    /// Enrol a device of `person`: the person's root key, which this node holds, grants `key` as
+    /// a device key. Returns the chain the device signs with: its grant, then the root's.
+    pub fn enroll_device_key(
+        &self,
+        person: &str,
+        key: &str,
+        label: &str,
+    ) -> Result<Vec<String>, St3Error> {
+        if Family::of(person) != Some(Family::Person) {
+            return Err(St3Error::new(
+                "invalid-person",
+                "only a person enrols devices",
+            ));
+        }
+        self.ensure_principal_key(person)?;
+        let root = self.held_root(person).ok_or_else(|| {
+            St3Error::new(
+                "no-person-key",
+                "this node holds no root key for the person, so it cannot enrol a device",
+            )
+        })?;
+        let (granted, _) = self.runtime.append_claim(
+            self,
+            &ClaimInput {
+                subject: person.into(),
+                kind: KEY_GRANTED.into(),
+                actor: Some(person.into()),
+                fields: KeyGrant {
+                    key: key.into(),
+                    role: Role::Device,
+                    issuer: person.into(),
+                    issuer_key: root.key.public().into(),
+                    label: Some(label.into()),
+                }
+                .fields(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("device-key:{person}:{key}")),
+            },
+        )?;
+        let mut chain = vec![granted.id];
+        chain.extend(root.chain.iter().cloned());
+        Ok(chain)
+    }
+
+    /// Withdraw a device key of `person`, as the node.
+    pub fn revoke_device_key(&self, person: &str, key: &str, reason: &str) -> Result<(), St3Error> {
+        self.append_claim(&ClaimInput {
+            subject: person.into(),
+            kind: KEY_REVOKED.into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("key".into(), Value::String(key.into())),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("device-key-revoked:{person}:{key}")),
+        })
+        .map(|_| ())
+    }
+
     /// Use `directory` for the private keys this node mints for people and agents, and load the
     /// keys it already holds.
     pub fn use_key_directory(&self, directory: &Path) -> Result<()> {
@@ -897,4 +1045,164 @@ fn set_meta_tx(connection: &Connection, key: &str, value: &str) -> Result<()> {
         )?
         .execute(params![key, value])?;
     Ok(())
+}
+
+/// The rules as the graph holds them: for each `rule/NAME`, its latest [`crate::rules::RULE_SET`]
+/// claim in canonical order.
+pub fn current_rules_tx(connection: &Connection) -> Result<Vec<crate::rules::NamedRule>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT claims.subject, claims.id, claims.body FROM claims
+         WHERE claims.kind=?1 ORDER BY {CANONICAL_ORDER}"
+    ))?;
+    let mut latest = BTreeMap::new();
+    for row in statement.query_map([crate::rules::RULE_SET], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (subject, id, body) = row?;
+        latest.insert(subject, (id, body));
+    }
+    Ok(latest
+        .into_iter()
+        .filter_map(|(subject, (claim_id, body))| {
+            let body: Value = serde_json::from_str(&body).ok()?;
+            Some(crate::rules::NamedRule {
+                name: subject.strip_prefix("rule/")?.to_owned(),
+                claim_id,
+                rule: crate::rules::Rule::from_fields(body.get("fields")?)?,
+            })
+        })
+        .collect())
+}
+
+/// Check one local write against the rules, inside the write's own transaction: refuse it with
+/// `rule-denied` under a rule in enforce mode, and record each rule in audit mode that would have
+/// refused it beside the write. Writes without an actor, and the audit records themselves, are
+/// the node's own and pass; a person may always set a rule, so no rule can lock its owner out.
+/// With no rules, one indexed probe.
+pub fn rules_gate_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    actor: &str,
+    kind: &str,
+    subject: &str,
+) -> Result<()> {
+    if kind == crate::rules::RULE_SET {
+        if Family::of(actor) == Some(Family::Person) {
+            return Ok(());
+        }
+        return Err(anyhow::Error::new(St3Error::new(
+            "rule-denied",
+            format!("only a person sets rules, not {actor}"),
+        )));
+    }
+    if kind == crate::rules::RULE_AUDITED {
+        return Ok(());
+    }
+    let any: bool = transaction
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM claims WHERE kind=?1)")?
+        .query_row([crate::rules::RULE_SET], |row| row.get(0))?;
+    if !any {
+        return Ok(());
+    }
+    let rules = current_rules_tx(transaction)?;
+    let decision = crate::rules::decide(&rules, actor, kind, subject);
+    if let Some(denied) = decision.denied {
+        return Err(anyhow::Error::new(St3Error::new(
+            "rule-denied",
+            format!(
+                "rule `{}` refuses {actor} writing {kind} on {subject}{}",
+                denied.name,
+                if denied.rule.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", denied.rule.description)
+                }
+            ),
+        )));
+    }
+    for rule in decision.audited {
+        append_claim_record_tx(
+            transaction,
+            origin,
+            &format!("rule/{}", rule.name),
+            crate::rules::RULE_AUDITED,
+            None,
+            &serde_json::json!({
+                "fields": {
+                    "rule": rule.claim_id,
+                    "actor": actor,
+                    "action": kind,
+                    "target": subject,
+                },
+                "evidence": [],
+            }),
+            &[],
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+impl Store {
+    /// Set `rule/NAME` as `person` sets it.
+    pub fn set_rule(
+        &self,
+        name: &str,
+        rule: &crate::rules::Rule,
+        person: &str,
+    ) -> Result<ClaimRecord, St3Error> {
+        if name.is_empty() || name.contains('/') {
+            return Err(St3Error::new(
+                "invalid-rule-name",
+                "a rule name is one path segment",
+            ));
+        }
+        self.append_claim(&ClaimInput {
+            subject: format!("rule/{name}"),
+            kind: crate::rules::RULE_SET.into(),
+            actor: Some(person.into()),
+            fields: rule.fields(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+    }
+
+    /// The newest audit records, of one rule or of all, newest first.
+    pub fn rule_audits(&self, rule: Option<&str>, limit: usize) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.kind=?1 AND (?2 IS NULL OR claims.subject=?2)
+             ORDER BY claims.store_index DESC LIMIT ?3"
+        ))?;
+        let subject = rule.map(|name| format!("rule/{name}"));
+        Ok(statement
+            .query_map(
+                params![crate::rules::RULE_AUDITED, subject, limit as i64],
+                claim_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The rules, from memory; read again after any rule changes.
+    pub fn current_rules(&self) -> Result<Arc<Vec<crate::rules::NamedRule>>> {
+        if !self.rules_stale.load(Ordering::Acquire)
+            && let Some(rules) = self
+                .rules
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        {
+            return Ok(rules);
+        }
+        self.rules_stale.store(false, Ordering::Release);
+        let rules = Arc::new(current_rules_tx(&self.readers.get())?);
+        *self.rules.write().unwrap_or_else(PoisonError::into_inner) = Some(rules.clone());
+        Ok(rules)
+    }
 }

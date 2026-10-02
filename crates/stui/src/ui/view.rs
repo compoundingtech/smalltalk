@@ -3,6 +3,7 @@
 //! The live client and the demo fixtures both produce a `World`. Anything the graph cannot
 //! answer yet is an `Option` or a `Load`, so a screen can say "unknown" instead of guessing.
 
+pub use st3_ui_model::missions::{Mission, Step, StepState, Word};
 use std::collections::BTreeMap;
 
 /// Something that arrives later. `Loading` is never drawn as empty.
@@ -157,6 +158,9 @@ pub enum AttentionKind {
         from: String,
         from_id: String,
         question: String,
+        /// A structured ask's typed fields (#1010): summary, reasons, links, named answers and
+        /// a recommendation. Absent on a free-text ask.
+        structured: Option<Box<st3_client::StructuredRequest>>,
     },
 }
 
@@ -296,130 +300,6 @@ pub struct AgentDetails {
     pub runtime: Option<String>,
     pub fault: Option<String>,
     pub under: Option<String>,
-}
-
-// ------------------------------------------------------------------- missions
-
-/// One word naming who has to move, shared by every mission surface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Word {
-    Decision,
-    Stalled,
-    /// Ready, and the agent that would take it is stopped or broken: a person can fix that.
-    Unstaffed,
-    /// Ready, and st does not say who will take it.
-    Unclaimed,
-    /// Ready, waiting its turn behind other work on a busy agent. Nothing to do.
-    Queued,
-    Working,
-    /// Kept open by st so its observers can start other missions. Nothing is running.
-    Watching,
-    Held,
-    Idle,
-    Done,
-    Failed,
-    /// Someone or something stopped it before it finished.
-    Cancelled,
-    /// Published, and nobody has started a run of it.
-    NotStarted,
-}
-
-impl Word {
-    pub fn name(self) -> &'static str {
-        match self {
-            Word::Decision => "needs you",
-            Word::Stalled => "stalled",
-            Word::Unstaffed => "unstaffed",
-            Word::Unclaimed => "unclaimed",
-            Word::Queued => "queued",
-            Word::Working => "working",
-            Word::Watching => "watching",
-            Word::Held => "held",
-            Word::Idle => "idle",
-            Word::Done => "done",
-            Word::Failed => "failed",
-            Word::Cancelled => "cancelled",
-            Word::NotStarted => "not started",
-        }
-    }
-    pub fn explain(self) -> &'static str {
-        match self {
-            Word::Decision => "a step is waiting for your answer",
-            Word::Stalled => "a step has an owner who is not moving",
-            Word::Unstaffed => "a step is ready but its agent is stopped or broken",
-            Word::Unclaimed => "a step is ready; st has not said which agent takes it",
-            Word::Queued => "a step is waiting its turn on a busy agent; nothing to do",
-            Word::Working => "an agent is doing a step now",
-            Word::Watching => "st keeps this open and starts other missions when something happens",
-            Word::Held => "waiting on something outside the fleet",
-            Word::Idle => "running, with nothing ready",
-            Word::Done => "every step finished",
-            Word::Failed => "a step failed and nothing retried it",
-            Word::Cancelled => "it was stopped before it finished",
-            Word::NotStarted => "published, and never started",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StepState {
-    Done,
-    Cancelled,
-    Working,
-    Ready,
-    Waiting,
-    NeedsYou,
-    Failed,
-    Pending,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct Step {
-    pub name: String,
-    pub state: StepState,
-    pub owner: Option<String>,
-    pub note: Option<String>,
-    pub after: Vec<String>,
-    pub age: String,
-    pub goals: Vec<String>,
-    pub constraints: Vec<String>,
-    pub gates: Vec<String>,
-    pub attempt: u32,
-    pub blockers: Vec<String>,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct Mission {
-    pub id: String,
-    pub title: String,
-    pub word: Word,
-    pub age: String,
-    pub host: String,
-    pub goals: Vec<String>,
-    pub steps: Vec<Step>,
-    pub agents: Vec<String>,
-    pub decision: Option<String>,
-    pub worktree: Option<String>,
-    pub parent: Option<String>,
-    pub system: bool,
-    /// The mission's declaration as written, when st provides it.
-    pub kdl: Option<String>,
-    /// The outcome a person or an authorized agent set on its finished run, and why.
-    pub outcome: Option<String>,
-}
-
-impl Mission {
-    pub fn progress(&self) -> (usize, usize) {
-        (
-            self.steps
-                .iter()
-                .filter(|step| step.state == StepState::Done)
-                .count(),
-            self.steps.len(),
-        )
-    }
 }
 
 // ---------------------------------------------------------------- fleet, trees

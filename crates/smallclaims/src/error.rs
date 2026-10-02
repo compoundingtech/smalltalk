@@ -38,3 +38,12 @@ impl std::error::Error for Error {}
 pub fn internal(error: impl fmt::Display) -> Error {
     Error::new("internal", error.to_string())
 }
+
+/// The store error inside `error` when there is one, such as a rule's `rule-denied`, else an
+/// internal error with its message.
+pub fn typed(error: anyhow::Error) -> Error {
+    match error.downcast::<Error>() {
+        Ok(error) => error,
+        Err(error) => internal(format!("{error:#}")),
+    }
+}

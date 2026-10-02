@@ -283,7 +283,10 @@ ask key returns the same step. Retirement and generation replacement invalidate 
 `work.ask` may also carry a `request`: a `StructuredRequest` decision, choice or feedback with
 named answers (see [the runtime guide](../mission-graph-runtime.md#structured-requests)). The
 person-step attention card then includes the same `request`; a card without one is a free-text
-ask, and clients should not infer answers from its title.
+ask, and clients should not infer answers from its title. A card with `update` instead brings
+information the person asked for and asks nothing: show it, and send `work.done` with
+`answer: {"id": "read"}` (its `action_parameters` already carry it) when the person opens it
+or presses read. Agents post updates with `st work update`.
 
 `work.done` takes `target_id`, `episode`, nonempty `summary`, optional string `evidence`, and
 an optional `answer` (`id` and/or `text`). A structured decision or choice needs `answer.id`,

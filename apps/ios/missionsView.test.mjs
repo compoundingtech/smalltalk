@@ -37,3 +37,15 @@ assert.deepEqual(rows.map(row => [row.word, row.title, row.done, row.total]), [[
 assert.equal(hidden, 1);
 assert.deepEqual(missionSections(rows).map(section => section.title), ['working', 'idle']);
 assert.equal(missionRows(missions, [], [], true).rows.length, 3);
+
+// A failed mission ages out of the list after its day, and showing hidden ones brings it back.
+{
+  const now = new Date(2026, 9, 2, 22, 0).getTime();
+  const failedAt = (at) => ({ id: `mission/example/failed-${at}`, title: 'failed', state: 'failed', updated_at: new Date(at).toISOString(), run_details: null });
+  const yesterday = failedAt(new Date(2026, 9, 1, 23, 0).getTime());
+  const today = failedAt(new Date(2026, 9, 2, 9, 0).getTime());
+  const { rows, hidden } = missionRows([yesterday, today], [], [], false, now);
+  assert.deepEqual(rows.map(row => row.mission.id), [today.id]);
+  assert.equal(hidden, 1);
+  assert.equal(missionRows([yesterday, today], [], [], true, now).rows.length, 2);
+}

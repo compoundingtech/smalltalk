@@ -476,6 +476,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/launches/{id}/revise", post(revise_planning_session))
         .route("/v1/launches/{id}/cancel", post(cancel_planning_session))
         .route("/v1/documents", get(list_documents).post(put_document))
+        .route("/v1/rules", get(list_rules))
+        .route("/v1/rules/audit", get(list_rule_audits))
+        .route("/v1/rules/set", post(set_rule))
         .route("/v1/documents/content", get(get_document))
         .route("/v1/diagnostics/harness", post(post_harness_diagnostic))
         .route("/v1/delivery/hold", get(get_delivery_hold).post(post_delivery_hold))
@@ -1071,7 +1074,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "answer-required"
         | "unsupported-person-request"
         | "missing-ask-owner"
-        | "ambiguous-ask-owner" => "validation-failed".into(),
+        | "ambiguous-ask-owner"
+        | "update-not-asked" => "validation-failed".into(),
         "stale-work-ask"
         | "stale-subject"
         | "missing-subject-token"
@@ -1868,9 +1872,9 @@ fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Graph state says whether a harness took its ready turn; only this daemon can say whether the
-/// process that carries the seat's messages is still polling and runs its binary. A running local
-/// native seat with a stale delivery path is `waiting`, with the reason, rather than `running`.
+/// Delivery presence is independent of harness readiness: a local native seat waiting on a human
+/// still has a transport to assess. A running seat with a stale path becomes `waiting`; an
+/// already-waiting seat retains its harness block and ask details.
 fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     const NATIVE_DRIVERS: [&str; 5] = ["claude", "codex", "opencode", "pi", "omp"];
     let Some(driver) = item
@@ -1882,12 +1886,11 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
         return;
     };
     let local = item.get("host_id").and_then(Value::as_str) == Some(local_host);
-    let takes_work = item.get("state").and_then(Value::as_str) == Some("running")
-        && matches!(
-            item.get("harness_state").and_then(Value::as_str),
-            Some("ready" | "working" | "idle")
-        );
-    if !local || !takes_work {
+    let live = matches!(
+        item.get("state").and_then(Value::as_str),
+        Some("running" | "waiting")
+    );
+    if !local || !live {
         return;
     }
     let Some(recipient) = item.get("id").and_then(Value::as_str) else {
@@ -2532,8 +2535,16 @@ fn client_attention_resources(
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
-            if let Some(request) = item.request {
-                resource["request"] = request;
+            match item.request {
+                // An update asks nothing, so it is not a `request`: a client that predates
+                // updates shows a free-text card, and any response to it reads it.
+                Some(update) if update["type"] == "update" => {
+                    resource["action_parameters"]["work.done"]["summary"] = json!("Read");
+                    resource["action_parameters"]["work.done"]["answer"] = json!({"id": "read"});
+                    resource["update"] = update;
+                }
+                Some(request) => resource["request"] = request,
+                None => {}
             }
         }
         if item.kind == "fault" {
@@ -4274,6 +4285,9 @@ async fn serve_unix_with_ancestor(
                     if let Some(caller) = caller {
                         request.extensions_mut().insert(caller);
                     }
+                    if let Some(agent) = &bound_agent {
+                        request.extensions_mut().insert(BoundAgent(agent.clone()));
+                    }
                     let client_request = request.uri().path().starts_with("/v1/client/");
                     let request = match guard_bound_request(request, bound_agent.as_deref()).await {
                         Ok(request) => request,
@@ -4551,6 +4565,10 @@ fn record_legacy_poll(
     }
 }
 
+/// The agent whose harness a local request comes from, when it comes from one.
+#[derive(Clone, Debug)]
+pub struct BoundAgent(pub String);
+
 async fn guard_bound_request(
     request: Request<Body>,
     bound_agent: Option<&str>,
@@ -4599,6 +4617,7 @@ async fn guard_bound_request(
         "/v1/reviews/",
         "/v1/claims",
         "/v1/diagnostic",
+        "/v1/rules/",
     ]
     .iter()
     .any(|prefix| path.starts_with(prefix))
@@ -4671,9 +4690,9 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     });
     let token = crate::resource::github_token().await;
     let mut report = tokio::task::spawn_blocking(move || {
-        // This node's claims are signed as their batches are sealed; seal them so the
-        // signature counts cover everything written so far.
-        state.store.seal_local_batches().map_err(ApiError::internal)?;
+        // This node's claims are signed as their batches are sealed; seal and judge them so
+        // the signature counts cover everything written so far.
+        state.store.replication_snapshot().map_err(ApiError::internal)?;
         doctor_report(&state)
     })
         .await
@@ -5079,9 +5098,7 @@ fn unread_current_seat_counts(
             .and_then(|owner| owner.member.as_ref())
             .map(|member| member.host.as_str())
             && host != store.origin()
-            && !store
-                .replication_peer_last_success(host)?
-                .is_some_and(|at| now.saturating_sub(at) < 90_000)
+            && !store.replication_peer_up(host)?.0
         {
             continue;
         }
@@ -5443,6 +5460,58 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 })
                 .map(|peer| format!("{}={}", peer.peer, peer.status))
                 .collect::<Vec<_>>();
+            // A member that listens is meant to answer, so its absence warns. A dial-out
+            // member, or a config peer outside membership, can be away for hours, as a sleeping
+            // laptop is; its absence is reported without a warning.
+            let now = client_now_ms();
+            let listening = state
+                .store
+                .fleet_view_sealed()
+                .map(|view| {
+                    view.members
+                        .into_iter()
+                        .filter(|member| member.state == "current" && member.mode == "listening")
+                        .map(|member| member.name)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let (absent, away): (Vec<_>, Vec<_>) = replication
+                .peers
+                .iter()
+                .filter(|peer| peer.status == "last-seen")
+                .partition(|peer| listening.contains(&peer.peer));
+            let describe = |peers: Vec<&crate::model::ReplicationPeerStatus>| {
+                peers
+                    .into_iter()
+                    .map(|peer| {
+                        format!(
+                            "{} {}{}{}",
+                            peer.peer,
+                            peer.last_success_at_unix_ms
+                                .map(|at| format!(
+                                    "has not exchanged for {}",
+                                    elapsed_words(now.saturating_sub(at))
+                                ))
+                                .unwrap_or_else(|| "has never exchanged with this node".into()),
+                            peer.sync
+                                .as_ref()
+                                .map(|sync| sync.local_only_envelopes
+                                    + sync.added_since_measured_envelopes)
+                                .filter(|unsent| *unsent != 0)
+                                .map(|unsent| format!(
+                                    "; this node has not sent it {unsent} envelopes"
+                                ))
+                                .unwrap_or_default(),
+                            peer.last_error
+                                .as_deref()
+                                .map(|error| format!(" (last attempt: {error})"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let absent = describe(absent);
+            let away = describe(away);
             let unresolved = replication.invalid_records;
             let diverged = replication
                 .peers
@@ -5473,12 +5542,36 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .first_sync
                 .as_ref()
                 .filter(|first| first.state == "failed");
+            // A verified first sync is history. Whether this node is caught up now takes an
+            // exchange since this daemon started, and one that found nothing left to fetch.
+            let catching_up = replication
+                .peers
+                .iter()
+                .filter_map(|peer| {
+                    let sync = peer.sync.as_ref().filter(|sync| sync.catching_up)?;
+                    Some(format!(
+                        "{} has {} envelopes this node lacks",
+                        peer.peer, sync.peer_only_envelopes
+                    ))
+                })
+                .collect::<Vec<_>>();
+            // A peer whose grants refuse this node never exchanges with it directly.
+            let unmeasured = replication.timings.exchanges == 0
+                && replication
+                    .peers
+                    .iter()
+                    .any(|peer| peer.status != "refused");
             let status = if replication.unhealthy_projections != 0
                 || !diverged.is_empty()
                 || first_sync_failed.is_some()
             {
                 "fail"
-            } else if !unavailable.is_empty() || unresolved != 0 {
+            } else if !unavailable.is_empty()
+                || !absent.is_empty()
+                || unresolved != 0
+                || !catching_up.is_empty()
+                || unmeasured
+            {
                 "warn"
             } else {
                 "pass"
@@ -5487,7 +5580,21 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    "{}{}{}{}{} envelopes; {} unresolved records; {} claims waiting for a newer build; {} unhealthy projections{}; peers {}",
+                    if !catching_up.is_empty() {
+                        format!("catching up: {}; ", catching_up.join(", "))
+                    } else if unmeasured {
+                        "no exchange with a peer since this daemon started, so whether this \
+                         node is caught up is not known yet; "
+                            .to_owned()
+                    } else {
+                        String::new()
+                    },
+                    absent
+                        .iter()
+                        .chain(&away)
+                        .map(|peer| format!("{peer}; "))
+                        .collect::<String>(),
                     first_sync_failed
                         .map(|first| format!(
                             "the first sync with {} ended with a different graph, and a heal \
@@ -6007,6 +6114,17 @@ async fn replication_heal_next(
         signal_changed(&state);
     }
     Ok(Json(step))
+}
+
+/// A span such as `45s`, `12m` or `3h` for a doctor message.
+fn elapsed_words(ms: u128) -> String {
+    let seconds = ms / 1_000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
 }
 
 fn replication_receive_has_new_data(received: usize) -> bool {
@@ -8220,19 +8338,104 @@ async fn get_mission(
 
 async fn put_document(
     State(state): State<AppState>,
+    bound: Option<axum::Extension<BoundAgent>>,
     Json(request): Json<DocumentPutRequest>,
 ) -> Result<Json<DocumentVersion>, ApiError> {
     let response = state
         .store
-        .put_document(
+        .put_document_as(
             &request.name,
             &request.bytes,
             &request.expected_document,
             &request.idempotency_key,
+            bound.as_ref().map(|bound| bound.0.0.as_str()),
         )
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
+}
+
+async fn list_rules(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<smallclaims::rules::NamedRule>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.current_rules().map(|rules| rules.as_ref().clone()))
+        .await
+        .map(Json)
+}
+
+#[derive(Deserialize)]
+struct RuleAuditQuery {
+    rule: Option<String>,
+    limit: Option<usize>,
+}
+
+/// One write a rule in audit mode would have refused.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuleAudit {
+    pub rule: String,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub at_unix_ms: u128,
+    pub claim: String,
+}
+
+async fn list_rule_audits(
+    State(state): State<AppState>,
+    Query(query): Query<RuleAuditQuery>,
+) -> Result<Json<Vec<RuleAudit>>, ApiError> {
+    let store = state.store.clone();
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    blocking_store(move || {
+        Ok(store
+            .rule_audits(query.rule.as_deref(), limit)?
+            .into_iter()
+            .map(|claim| {
+                let field = |name: &str| {
+                    claim.body["fields"][name]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                RuleAudit {
+                    rule: claim
+                        .subject
+                        .strip_prefix("rule/")
+                        .unwrap_or(&claim.subject)
+                        .to_owned(),
+                    actor: field("actor"),
+                    action: field("action"),
+                    target: field("target"),
+                    at_unix_ms: claim.accepted_at_unix_ms,
+                    claim: claim.id,
+                }
+            })
+            .collect())
+    })
+    .await
+    .map(Json)
+}
+
+/// Set one rule as a person.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuleSetRequest {
+    pub actor: String,
+    pub name: String,
+    pub rule: smallclaims::rules::Rule,
+}
+
+async fn set_rule(
+    State(state): State<AppState>,
+    Json(request): Json<RuleSetRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    concrete_person(&request.actor)?;
+    let claim = state
+        .store
+        .set_rule(&request.name, &request.rule, &request.actor)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(claim))
 }
 
 #[derive(Deserialize)]
@@ -8965,13 +9168,126 @@ async fn send_message(
     State(state): State<AppState>,
     Json(request): Json<MessageSendRequest>,
 ) -> Result<Json<MessageView>, ApiError> {
-    blocking_api(move || accept_message(&state, request, None)).await
+    blocking_api(move || accept_message(&state, request, None, None)).await
+}
+
+/// The fields a device signs on a message it sends, in the `fields-v1` format.
+pub const SIGNED_MESSAGE_FIELDS: &[&str] = &[
+    "content",
+    "from",
+    "in_reply_to",
+    "session_id",
+    "tags",
+    "title",
+    "to",
+];
+
+/// How far a device's signing time may be from this daemon's clock when it first accepts the
+/// message. Members that receive it later check the signature, never the time.
+pub const DEVICE_SIGNATURE_WINDOW_MS: u128 = 15 * 60 * 1_000;
+
+fn device_signature_error(code: &'static str, message: impl Into<String>) -> ApiError {
+    ApiError::bad(St3Error::new(code, message.into()))
+}
+
+/// Check a device's signature on the message this daemon is about to write, before writing it.
+fn check_device_signature(
+    state: &AppState,
+    signature: &smallclaims::principal::ClaimSignature,
+    request: &MessageSendRequest,
+    subject: &str,
+    from: &str,
+    fields: &BTreeMap<String, Value>,
+) -> Result<(), ApiError> {
+    use smallclaims::principal::{FIELDS_FORMAT, Judged, KeyGrant};
+    let mut signed = signature.signed_fields.clone();
+    signed.sort();
+    if signature.format.as_deref() != Some(FIELDS_FORMAT) || signed != SIGNED_MESSAGE_FIELDS {
+        return Err(device_signature_error(
+            "device-signature-format",
+            format!(
+                "a device signs a message in {FIELDS_FORMAT} over {}",
+                SIGNED_MESSAGE_FIELDS.join(", ")
+            ),
+        ));
+    }
+    if signature.signer != from || signature.on_behalf.is_some() {
+        return Err(device_signature_error(
+            "device-signature-signer",
+            format!("a device signs as the paired person, {from}"),
+        ));
+    }
+    if normalize_message_party(&request.to) != request.to {
+        return Err(device_signature_error(
+            "device-signature-noncanonical",
+            format!(
+                "a signed message names its recipient canonically: `{}`",
+                normalize_message_party(&request.to)
+            ),
+        ));
+    }
+    let now = client_now_ms();
+    if u128::from(signature.signed_at_unix_ms).abs_diff(now) > DEVICE_SIGNATURE_WINDOW_MS {
+        return Err(device_signature_error(
+            "device-signature-stale",
+            "the device signed this message more than 15 minutes from this daemon's clock; check the device's time",
+        ));
+    }
+    // A retry of the same send gets its first answer; any other claim may not reuse the nonce.
+    let repeat = state
+        .store
+        .latest_claim(subject, Some("message.sent"))
+        .map_err(ApiError::internal)?
+        .is_some();
+    if !repeat
+        && state
+            .store
+            .signature_nonce_used(&signature.key, &signature.nonce)
+            .map_err(ApiError::internal)?
+    {
+        return Err(device_signature_error(
+            "device-signature-replayed",
+            "another claim already carries this signature's nonce",
+        ));
+    }
+    let enrolled = signature
+        .chain
+        .first()
+        .and_then(|grant| state.store.claim_by_id(grant).ok().flatten())
+        .and_then(|grant| {
+            let fields = grant.body.get("fields")?;
+            (grant.subject == from).then(|| KeyGrant::from_fields(fields))?
+        })
+        .is_some_and(|grant| grant.key == signature.key);
+    if !enrolled {
+        return Err(device_signature_error(
+            "device-key-not-enrolled",
+            "the signing key is not enrolled for this person; pair the device again",
+        ));
+    }
+    let fields = Value::Object(fields.clone().into_iter().collect());
+    let judged = Judged {
+        id: "",
+        subject,
+        kind: "message.sent",
+        actor: Some(from),
+        content: String::new(),
+        fields: &fields,
+    };
+    if !signature.verifies(&judged) {
+        return Err(device_signature_error(
+            "device-signature-invalid",
+            "the signature does not match this message",
+        ));
+    }
+    Ok(())
 }
 
 fn accept_message(
     state: &AppState,
     request: MessageSendRequest,
     session_id: Option<String>,
+    device_signature: Option<smallclaims::principal::ClaimSignature>,
 ) -> Result<Json<MessageView>, ApiError> {
     if request.content.trim().is_empty() {
         return Err(ApiError::bad(St3Error::new(
@@ -9043,18 +9359,23 @@ fn accept_message(
     if let Some(session_id) = session_id {
         fields.insert("session_id".into(), Value::String(session_id));
     }
-    let record = state
-        .store
-        .append_claim(&ClaimInput {
-            subject: subject.clone(),
-            kind: "message.sent".into(),
-            actor: Some(from.clone()),
-            fields,
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: Some(request.idempotency_key),
-        })
-        .map_err(ApiError::bad)?;
+    if let Some(signature) = &device_signature {
+        check_device_signature(state, signature, &request, &subject, &from, &fields)?;
+    }
+    let input = ClaimInput {
+        subject: subject.clone(),
+        kind: "message.sent".into(),
+        actor: Some(from.clone()),
+        fields,
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(request.idempotency_key),
+    };
+    let record = match &device_signature {
+        Some(signature) => state.store.append_signed_claim(&input, signature).map(|(claim, _)| claim),
+        None => state.store.append_claim(&input),
+    }
+    .map_err(ApiError::bad)?;
     let mut work_wake = is_work_wake(&request.tags);
     if let Some(parent) = request.in_reply_to.as_deref() {
         // Settling the parent writes its lifecycle claims too.
@@ -12329,6 +12650,46 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
     }
 
     #[test]
+    fn waiting_native_seats_retain_delivery_presence() {
+        let recipient = "agent/eval/waiting-delivery-presence";
+        delivery_presence::record_legacy(recipient, "omp-channel", std::process::id());
+        for harness in [
+            "ready",
+            "working",
+            "idle",
+            "blocked",
+            "indeterminate",
+            "unauthenticated",
+        ] {
+            let mut item = json!({
+                "id": recipient, "driver": "omp", "host_id": "local",
+                "state": "waiting", "harness_state": harness,
+                "blocked_on": "human", "ask": "approval",
+            });
+            overlay_delivery_presence(&mut item, "local");
+            assert_eq!(item["delivery"]["state"], "legacy", "{harness}: {item}");
+            assert_eq!(item["state"], "waiting");
+            assert_eq!(item["blocked_on"], "human");
+            assert_eq!(item["ask"], "approval");
+        }
+        for (state, host, driver) in [
+            ("stopped", "local", "omp"),
+            ("failed", "local", "omp"),
+            ("desired", "local", "omp"),
+            ("waiting", "remote", "omp"),
+            ("waiting", "local", "shell"),
+        ] {
+            let mut item = json!({
+                "id": recipient, "driver": driver, "host_id": host,
+                "state": state, "harness_state": "working",
+            });
+            overlay_delivery_presence(&mut item, "local");
+            assert!(item.get("delivery").is_none(), "{item}");
+            assert_eq!(item["state"], state);
+        }
+    }
+
+    #[test]
     fn mailbox_reads_do_not_renew_a_native_delivery_beat() {
         let recipient = "agent/eval/ordinary-mailbox-read";
         record_legacy_poll(None, Some(recipient), false);
@@ -12526,6 +12887,95 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(check.status, "pass");
         assert!(check.message.contains("intentionally local-only"));
         assert!(check.message.contains("after leaving its fleet"));
+    }
+
+    #[tokio::test]
+    async fn rules_audit_an_agents_write_then_refuse_it_once_enforced() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        for (name, rule) in crate::rules::lockdown(&[]) {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/rules/set",
+                json!({"actor": "person/ada", "name": name, "rule": rule}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (_, rules) = get_request(app.clone(), "/v1/rules").await;
+        assert_eq!(rules.as_array().unwrap().len(), 3, "{rules}");
+        assert!(
+            rules
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|rule| rule["mode"] == "audit"),
+            "{rules}"
+        );
+        let publish = |name: &str| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/documents")
+                .header("content-type", "application/json")
+                .extension(BoundAgent("agent/team/web/reviewer".into()))
+                .body(Body::from(
+                    serde_json::to_vec(&DocumentPutRequest {
+                        name: name.into(),
+                        bytes: b"notes".to_vec(),
+                        expected_document: None,
+                        idempotency_key: format!("put:{name}"),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+            }
+        };
+        // Inside its namespace nothing is logged; outside, the write proceeds and is logged.
+        assert_eq!(publish("doc/team/web/plan").await.0, StatusCode::OK);
+        assert_eq!(publish("doc/team/api/plan").await.0, StatusCode::OK);
+        let (_, audits) = get_request(app.clone(), "/v1/rules/audit").await;
+        let audits = audits.as_array().unwrap();
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0]["rule"], "agents-publish-in-namespace");
+        assert_eq!(audits[0]["actor"], "agent/team/web/reviewer");
+        assert_eq!(audits[0]["action"], "doc.bound");
+        assert_eq!(audits[0]["target"], "doc/team/api/plan");
+
+        // Enforced, the same write is refused with a typed reason and nothing is stored.
+        let mut rule = crate::rules::lockdown(&[])
+            .into_iter()
+            .find(|(name, _)| *name == "agents-publish-in-namespace")
+            .unwrap()
+            .1;
+        rule.mode = smallclaims::rules::Mode::Enforce;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/rules/set",
+            json!({"actor": "person/ada", "name": "agents-publish-in-namespace", "rule": rule}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, refused) = publish("doc/team/api/later").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(refused["code"], "rule-denied", "{refused}");
+        assert!(state.store.claims_for("doc/team/api/later", None).unwrap().is_empty());
+        assert_eq!(publish("doc/team/web/later").await.0, StatusCode::OK);
+
+        // Only a person sets rules.
+        let (status, refused) = json_request(
+            app.clone(),
+            "/v1/rules/set",
+            json!({"actor": "agent/team/web/reviewer", "name": "agents-publish-in-namespace", "rule": rule}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
     }
 
     #[tokio::test]

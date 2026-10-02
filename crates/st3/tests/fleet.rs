@@ -254,6 +254,17 @@ impl Node {
         let _ = fs::remove_file(self.socket());
     }
 
+    /// Send `signal` (such as `STOP` or `CONT`) to this node's daemon and worker.
+    fn signal(&self, signal: &str) {
+        for child in [&self.daemon, &self.worker].into_iter().flatten() {
+            let status = Command::new("kill")
+                .args([format!("-{signal}"), child.id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success(), "kill -{signal} {}", child.id());
+        }
+    }
+
     async fn restart(&mut self) {
         self.stop();
         self.start().await;
@@ -1259,6 +1270,45 @@ async fn the_secret_never_leaves_its_file() {
     let _ = json!({});
 }
 
+/// `st fleet wait` gates a restart (#1022). A first sync is verified once; after a restart
+/// far behind, the wait must also see an exchange since it began at which this node held
+/// everything its peer held, instead of returning at once with the old verdict.
+#[tokio::test(flavor = "multi_thread")]
+async fn fleet_wait_after_a_restart_waits_until_the_member_has_caught_up() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let mut b = joined(root.path(), &a, "b", &[]).await;
+    let waited = b.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    assert!(waited.contains("first sync verified"), "{waited}");
+
+    b.stop();
+    for index in 0..500 {
+        a.note(&format!("while-b-stopped-{index}")).await;
+    }
+    let held = a.st_json(&["replication", "status"])["received_envelopes"]
+        .as_u64()
+        .unwrap();
+    b.start().await;
+    let waited = b.st_ok(&["fleet", "wait", "--timeout", "120s"]);
+    let received = b.st_json(&["replication", "status"])["received_envelopes"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        received >= held,
+        "fleet wait returned while b held {received} of a's {held} envelopes:\n{waited}"
+    );
+    assert!(waited.contains("this node then held the same"), "{waited}");
+    assert!(
+        waited.contains("caught up now: at its latest exchange with a"),
+        "{waited}"
+    );
+
+    // The JSON says the same.
+    let waited = b.st_json(&["fleet", "wait", "--timeout", "60s"]);
+    assert_eq!(waited["state"], "verified", "{waited}");
+    assert_eq!(waited["caught_up"]["peers"][0][0], "a", "{waited}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_member_is_refused() {
     let root = tempfile::tempdir().unwrap();
@@ -1293,6 +1343,104 @@ async fn a_removed_member_is_refused() {
         }),
         "{members}"
     );
+}
+
+fn peer_status(node: &Node, peer: &str) -> Value {
+    node.st_json(&["replication", "status"])["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|status| status["peer"] == peer)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn doctor_check(node: &Node, name: &str) -> Value {
+    let doctor = node.st(&["--json", "doctor"]);
+    let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == name)
+        .cloned()
+        .unwrap()
+}
+
+/// A member that stops answering, here frozen with SIGSTOP, must not stay `up` behind an old
+/// measurement that hides what it has not received (#1020). Once it misses an exchange and an
+/// attempt to reach it fails, the other member says last-seen with that failure, marks the
+/// measurement stale with the envelopes written since it, and doctor warns.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frozen_member_is_not_reported_up() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let b = joined(root.path(), &a, "b", &[]).await;
+    b.note("before").await;
+    wait_for_notes(
+        &a,
+        &BTreeSet::from(["custom/fleet-test/before".to_owned()]),
+        60,
+        &[&a, &b],
+    )
+    .await;
+    wait_until("a measures b in sync", 60, || async {
+        let peer = peer_status(&a, "b");
+        peer["status"] == "up"
+            && peer["sync"]["peer_only_envelopes"] == 0
+            && peer["sync"]["local_only_envelopes"] == 0
+    })
+    .await;
+
+    b.signal("STOP");
+    for index in 0..20 {
+        a.note(&format!("unsent-{index}")).await;
+    }
+    wait_until("a stops counting the frozen b as up", 120, || async {
+        peer_status(&a, "b")["status"] == "last-seen"
+    })
+    .await;
+    let peer = peer_status(&a, "b");
+    assert!(
+        peer["last_error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "{peer}"
+    );
+    assert!(peer["last_failure_at_unix_ms"].is_u64(), "{peer}");
+    assert_eq!(peer["sync"]["stale"], true, "{peer}");
+    assert!(
+        peer["sync"]["added_since_measured_envelopes"]
+            .as_u64()
+            .is_some_and(|added| added >= 20),
+        "{peer}"
+    );
+    let text = a.st_ok(&["replication", "status"]);
+    assert!(text.contains("peer\tb\tlast-seen"), "{text}");
+    assert!(text.contains("last attempt failed"), "{text}");
+    assert!(text.contains("stale: no exchange since"), "{text}");
+    let check = doctor_check(&a, "replication");
+    assert_eq!(check["status"], "warn", "{check}");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("b has not exchanged for"),
+        "{check}"
+    );
+    let fleet = a.st_ok(&["fleet", "status"]);
+    assert!(fleet.contains("PEER  b  last-seen"), "{fleet}");
+
+    // Once b answers again, the next exchange clears the failure and measures afresh.
+    b.signal("CONT");
+    wait_until("a counts b as up again", 120, || async {
+        let peer = peer_status(&a, "b");
+        peer["status"] == "up"
+            && peer["last_error"].is_null()
+            && peer["sync"]["stale"] == false
+            && peer["sync"]["local_only_envelopes"] == 0
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2379,7 +2527,7 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
                 .unwrap();
             assert_eq!(peer["status"], "last-seen", "{status}");
             assert!(peer["last_success_at_unix_ms"].is_number());
-            assert!(peer["last_error"].is_null());
+            // Doctor says the traveller is away, without warning: it is not a listening member.
             let doctor = node.st_json(&["doctor"]);
             let check = doctor["checks"]
                 .as_array()
@@ -2388,6 +2536,13 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
                 .find(|check| check["name"] == "replication")
                 .unwrap();
             assert_eq!(check["status"], "pass", "{doctor}");
+            assert!(
+                check["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("traveller has not exchanged for"),
+                "{doctor}"
+            );
             let machines = node.st_json(&["machines"]);
             let machine = machines["value"]["items"]
                 .as_array()

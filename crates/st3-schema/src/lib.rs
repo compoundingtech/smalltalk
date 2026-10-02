@@ -694,6 +694,12 @@ fn build_registry() -> Registry {
             true,
         ),
         (
+            "rule",
+            "rule/NAME",
+            "A permission rule, its mode, and the writes it audited.",
+            false,
+        ),
+        (
             "revision-proposal",
             "revision-proposal/ID",
             "A mission revision proposal.",
@@ -1882,6 +1888,24 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["subscription"],
         ),
         (
+            "subscription.batched",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
+            "subscription.batch-sent",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
             "subscription.mission-deferred",
             &["subscription"],
             WritePolicy::SystemOnly,
@@ -1959,6 +1983,24 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             WritePolicy::SystemOnly,
             Cardinality::Append,
             Some("fleet"),
+            false,
+            &[],
+        ),
+        (
+            "rule.set",
+            &["rule"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("rules"),
+            false,
+            &[],
+        ),
+        (
+            "rule.audited",
+            &["rule"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("rules"),
             false,
             &[],
         ),
@@ -2526,6 +2568,21 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("reason", required_string()),
             ("removed_by", reference_to(&["person"])),
         ],
+        "rule.set" => &[
+            ("mode", required_enum(&["off", "audit", "enforce"])),
+            ("description", string()),
+            ("actors", array()),
+            ("except", array()),
+            ("kinds", array()),
+            ("subjects", array()),
+            ("unless_subjects", array()),
+        ],
+        "rule.audited" => &[
+            ("rule", required_string()),
+            ("actor", required_string()),
+            ("action", required_string()),
+            ("target", required_string()),
+        ],
         "principal.key-granted" => &[
             ("key", required_string()),
             ("role", required_enum(&["root", "device", "agent", "plugin"])),
@@ -3006,6 +3063,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("delivery_key", string()),
             ("requester", reference_to(&["agent", "person"])),
             ("held", boolean()),
+            ("text_input", string()),
+            ("text", string()),
         ],
         "subscription.mission-request-cancelled" | "subscription.mission-request-released" => {
             &[("request", required_string()), ("reason", string())]
@@ -3013,6 +3072,15 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         "subscription.mission-started" => &[
             ("request", required_string()),
             ("mission_run", required_reference_to(&["mission-run"])),
+        ],
+        "subscription.batched" => &[
+            ("entries", required_array()),
+            ("delivery_key", required_string()),
+        ],
+        "subscription.batch-sent" => &[
+            ("through", required_string()),
+            ("message", required_reference_to(&["message"])),
+            ("entries", required_integer()),
         ],
         "checkpoint.sealed" => &[
             ("cut_unix_ms", required_integer()),
@@ -3106,6 +3174,13 @@ fn required_integer() -> FieldSpec {
     FieldSpec {
         required: true,
         ..integer()
+    }
+}
+
+fn required_array() -> FieldSpec {
+    FieldSpec {
+        required: true,
+        ..array()
     }
 }
 
@@ -3256,6 +3331,7 @@ mod tests {
                 "repair",
                 "resource",
                 "revision-proposal",
+                "rule",
                 "run-generation",
                 "schedule",
                 "step-run",
@@ -3379,6 +3455,8 @@ mod tests {
                 "revision-proposal.approved",
                 "revision-proposal.cancelled",
                 "revision-proposal.created",
+                "rule.audited",
+                "rule.set",
                 "run-generation.created",
                 "run-generation.state",
                 "run-generation.superseded",
@@ -3402,6 +3480,8 @@ mod tests {
                 "subagent.appeared",
                 "subagent.ended",
                 "subagent.renewed",
+                "subscription.batch-sent",
+                "subscription.batched",
                 "subscription.mission-deferred",
                 "subscription.mission-failed",
                 "subscription.mission-request-cancelled",

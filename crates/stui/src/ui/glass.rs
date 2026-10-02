@@ -1629,7 +1629,9 @@ impl Ui {
             {
                 self.draw_pane(buf, content, &Pane::Terminal(id))
             }
-            Some(_) if focused => self.draw_main(buf, content),
+            // While Home floats over the glass, stui's own tab is Home: the focused group draws
+            // its pane like the others, not Home's selection (Nathan, 2026-10-02).
+            Some(_) if focused && !self.home_open() => self.draw_main(buf, content),
             Some(pane) => self.draw_pane(buf, content, &pane),
         }
     }
@@ -2536,8 +2538,11 @@ impl Ui {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
         };
-        if matches!(pane, Pane::Home(_)) {
-            self.show_in(0, 0);
+        // Home floats over the glass: an item opened "here" opens Home with it selected. Asked
+        // for in a tab or a split, the item's card opens there like any pane (Nathan,
+        // 2026-10-02: Ctrl+T on a "needs you" item made no tab).
+        if matches!(pane, Pane::Home(_)) && how == Open::Here {
+            self.open_home();
             self.focus_pane(&pane);
             return;
         }
@@ -3123,7 +3128,20 @@ fn pane_subject(pane: &Pane) -> Option<(usize, Option<String>)> {
     })
 }
 
-/// A layout as st's client types spell it. stui splits two at a time; a longer split nests.
+/// The glasses capability version st grants this stui. From version 2 (#958) a split carries its
+/// ratio; an older st is never sent one.
+static GLASSES_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+pub fn set_glasses_version(version: u32) {
+    GLASSES_VERSION.store(version, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ratios_on_the_wire() -> bool {
+    GLASSES_VERSION.load(std::sync::atomic::Ordering::Relaxed) >= 2
+}
+
+/// A layout as st's client types spell it. stui splits two at a time; a longer split nests, and
+/// only a two-way split's own ratio travels.
 fn to_wire(layout: &Layout) -> GlassLayout {
     match layout {
         Layout::Group(group) => GlassLayout::Group {
@@ -3137,7 +3155,9 @@ fn to_wire(layout: &Layout) -> GlassLayout {
                 .collect(),
         },
         Layout::Split {
-            split, children, ..
+            split,
+            children,
+            ratio,
         } => match children.as_slice() {
             [] => GlassLayout::Group { tabs: Vec::new() },
             [only] => to_wire(only),
@@ -3146,7 +3166,9 @@ fn to_wire(layout: &Layout) -> GlassLayout {
                     Side::Right => GlassSplit::Right,
                     Side::Below => GlassSplit::Below,
                 },
-                ratio: None,
+                ratio: ratio
+                    .filter(|_| rest.len() == 1 && ratios_on_the_wire())
+                    .map(f64::from),
                 children: [
                     Box::new(to_wire(first)),
                     Box::new(to_wire(&Layout::Split {
@@ -3173,7 +3195,9 @@ fn from_wire(layout: GlassLayout) -> Layout {
             current: 0,
         }),
         GlassLayout::Split {
-            split, children, ..
+            split,
+            children,
+            ratio,
         } => {
             let [first, second] = children;
             Layout::Split {
@@ -3182,7 +3206,7 @@ fn from_wire(layout: GlassLayout) -> Layout {
                     GlassSplit::Below => Side::Below,
                 },
                 children: vec![from_wire(*first), from_wire(*second)],
-                ratio: None,
+                ratio: ratio.map(|ratio| (ratio as f32).clamp(0.1, 0.9)),
             }
         }
     }
@@ -4437,6 +4461,48 @@ mod tests {
     }
 
     #[test]
+    fn the_wheel_over_home_scrolls_home_not_the_conversation_behind_it() {
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].id.clone();
+        ui.open_in_glass(Pane::Agent(Some(agent.clone())), Open::Tab);
+        ui.open_home();
+        let _ = screen(&ui);
+        let behind = format!("chat:{agent}");
+        let state = |ui: &Ui, key: &str| {
+            ui.conversation_state
+                .panes
+                .borrow()
+                .get(key)
+                .map(|state| (state.top, state.follow))
+        };
+        let before = state(&ui, &behind);
+        let home = ui.frame.borrow().home.unwrap();
+        // Up: a conversation that follows its newest message would leave it to read back.
+        let at = |column: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Over Home's card where the conversation lies beneath it, and over the dimmed glass.
+        let over = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key.starts_with("home:"))
+            .map(|pane| pane.rect)
+            .unwrap();
+        ui.mouse(at(over.x + 2, over.y + over.height / 2));
+        ui.mouse(at(home.x.saturating_sub(1), home.y + home.height / 2));
+        assert_eq!(
+            state(&ui, &behind),
+            before,
+            "the conversation behind stays put"
+        );
+    }
+
+    #[test]
     fn the_wheel_moves_the_palette_and_nothing_behind_it() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
@@ -4571,12 +4637,80 @@ mod tests {
     }
 
     #[test]
+    fn a_needs_you_item_opens_in_a_new_tab_or_in_home() {
+        let mut ui = glass();
+        let item = ui.world.attention.items()[0].id.clone();
+        ui.open_in_glass(Pane::Home(Some(item.clone())), Open::Tab);
+        let key = Pane::Home(Some(item.clone())).key();
+        assert!(
+            tabs(&ui).2.iter().flatten().any(|pane| *pane == key),
+            "a tab for the item: {:?}",
+            tabs(&ui)
+        );
+        assert!(!ui.home_open());
+        assert!(screen(&ui).contains(&ui.world.attention.items()[0].title));
+        // Here, it opens Home with the item selected.
+        let other = ui.world.attention.items()[1].id.clone();
+        ui.open_in_glass(Pane::Home(Some(other.clone())), Open::Here);
+        assert!(ui.home_open());
+        assert_eq!(ui.attention_focus().as_deref(), Some(other.as_str()));
+    }
+
+    #[test]
     fn ctrl_h_opens_home_and_closes_it_again() {
         let mut ui = glass();
         ctrl(&mut ui, 'h');
         assert!(ui.home_open());
         ctrl(&mut ui, 'h');
         assert!(!ui.home_open());
+    }
+
+    #[test]
+    fn the_pane_behind_home_keeps_showing_itself() {
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].id.clone();
+        ui.open_in_glass(Pane::Agent(Some(agent)), Open::Tab);
+        // What shows around Home's card: the glass's left edge, row by row.
+        let edge = |ui: &Ui| {
+            screen(ui)
+                .lines()
+                .skip(1)
+                .map(|line| line.chars().take(8).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let before = edge(&ui);
+        ui.open_home();
+        assert!(ui.home_open());
+        assert_eq!(edge(&ui), before, "the conversation, not Home's selection");
+    }
+
+    #[test]
+    fn an_attached_shell_stays_in_its_own_tab() {
+        let mut ui = glass();
+        ui.live = true;
+        let shell = "terminal/example-shell".to_owned();
+        ui.open_in_glass(Pane::Terminal(shell.clone()), Open::Tab);
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: shell.clone(),
+            title: "shell".into(),
+            name: "shell".into(),
+            lines: vec![ratatui::text::Line::from("$ echo in the shell")],
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: None,
+        });
+        assert!(screen(&ui).contains("echo in the shell"));
+        // Another tab shows its own conversation; the shell stays attached behind it.
+        let agent = ui.world.agents.items()[0].clone();
+        ui.open_in_glass(Pane::Agent(Some(agent.id.clone())), Open::Tab);
+        let shown = screen(&ui);
+        assert!(!shown.contains("echo in the shell"), "{shown}");
+        assert!(shown.contains(&agent.name), "{shown}");
+        assert!(ui.terminal.is_some(), "still attached");
+        // Back on its tab, the shell shows again.
+        ui.open_in_glass(Pane::Terminal(shell), Open::Here);
+        assert!(screen(&ui).contains("echo in the shell"));
     }
 
     #[test]
@@ -4704,6 +4838,26 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_splits_size_crosses_the_wire_only_where_st_keeps_it() {
+        let mut layout = Layout::Group(Group::of(Tab::pane("agent:a")));
+        layout.split(0, Side::Right, Group::of(Tab::pane("mission:m")));
+        layout.set_ratio(0, Some(0.3));
+        // st from #958 (glasses version 2) keeps it.
+        set_glasses_version(2);
+        let wire = to_wire(&layout);
+        set_glasses_version(1);
+        assert!(
+            matches!(&wire, GlassLayout::Split { ratio: Some(ratio), .. } if (ratio - 0.3).abs() < 1e-6)
+        );
+        assert_eq!(from_wire(wire), layout);
+        // An older st is never sent one.
+        assert!(matches!(
+            to_wire(&layout),
+            GlassLayout::Split { ratio: None, .. }
+        ));
     }
 
     #[test]
