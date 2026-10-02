@@ -15,8 +15,39 @@ const ENVIRONMENT_BEGIN: &[u8] = b"ST3_ENV_BEGIN";
 const ENVIRONMENT_END: &[u8] = b"ST3_ENV_END";
 
 pub fn login_environment() -> Result<BTreeMap<String, String>> {
+    login_environment_within(SHELL_STARTUP_TIMEOUT)
+}
+
+/// Like [`login_environment`], with the caller's allowance for the shell's startup files. A machine
+/// under heavy load can take far longer than the default to run them.
+pub fn login_environment_within(timeout: Duration) -> Result<BTreeMap<String, String>> {
     let shell = account_shell().context("the user account has no default shell")?;
-    login_environment_from(&shell, SHELL_STARTUP_TIMEOUT)
+    login_environment_from(&shell, timeout)
+}
+
+/// The login shell did not finish its startup files in time. Unlike a missing shell or a failing
+/// startup file, waiting longer can fix it.
+#[derive(Debug)]
+pub struct ShellStartupTimeout {
+    pub shell: PathBuf,
+    pub seconds: f64,
+}
+
+impl std::fmt::Display for ShellStartupTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the default shell {} did not finish startup within {} seconds",
+            self.shell.display(),
+            self.seconds
+        )
+    }
+}
+
+impl std::error::Error for ShellStartupTimeout {}
+
+pub fn is_shell_startup_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ShellStartupTimeout>())
 }
 
 fn login_environment_from(shell: &Path, timeout: Duration) -> Result<BTreeMap<String, String>> {
@@ -100,11 +131,11 @@ fn login_environment_with_args(
             let _ = child.wait();
             drop(pair.master);
             let _ = reader_thread.join();
-            anyhow::bail!(
-                "the default shell {} did not finish startup within {} seconds",
-                shell.display(),
-                timeout.as_secs_f64()
-            );
+            return Err(ShellStartupTimeout {
+                shell: shell.to_owned(),
+                seconds: timeout.as_secs_f64(),
+            }
+            .into());
         }
         std::thread::sleep(Duration::from_millis(10));
     };

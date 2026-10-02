@@ -158,6 +158,7 @@
             "episode": {"type": "string"},
             "action_parameters": {"type": "object"},
             "request": { "$ref": "#/$defs/StructuredRequest", "description": "A person-step ask's structured request; absent on a free-text ask." },
+            "update": { "$ref": "#/$defs/PersonUpdate", "description": "Information the person asked for. It asks nothing: reading it (work.done with answer id read) clears it." },
             "source_id": { "$ref": "#/$defs/Id" },
             "person_id": { "$ref": "#/$defs/Id" },
             "requester_id": { "$ref": "#/$defs/Id" },
@@ -1334,6 +1335,17 @@
         "custom": {"type": "boolean", "description": "A choice also takes an answer in the person's own words."}
       }
     },
+    "PersonUpdate": {
+      "type": "object", "additionalProperties": false, "required": ["version", "type", "about"],
+      "description": "Information an agent brings a person who asked for it. Nothing waits on it.",
+      "properties": {
+        "version": {"const": 1},
+        "type": {"const": "update"},
+        "about": {"$ref": "#/$defs/Id", "description": "Where the person asked: their mission run or step run, or their message to the agent."},
+        "summary": {"type": "string"},
+        "subjects": {"type": "array", "maxItems": 12, "items": {"$ref": "#/$defs/RequestSubject"}}
+      }
+    },
     "RequestSubject": {
       "type": "object", "additionalProperties": false, "required": ["kind", "label"],
       "properties": {
@@ -1362,8 +1374,8 @@
     "PersonAnswer": {
       "type": "object", "required": ["type", "outcome"],
       "properties": {
-        "type": {"enum": ["decision", "choice", "feedback"]},
-        "outcome": {"enum": ["accept", "decline", "request_changes", "selected", "custom", "feedback"]},
+        "type": {"enum": ["decision", "choice", "feedback", "update"]},
+        "outcome": {"enum": ["accept", "decline", "request_changes", "selected", "custom", "feedback", "read"]},
         "id": {"type": "string"},
         "label": {"type": "string"},
         "text": {"type": "string"}
@@ -1410,7 +1422,7 @@
             "type": { "const": "message.send" },
             "parameters": {
               "type": "object", "additionalProperties": false, "required": ["to", "content"],
-              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true } }
+              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "signature": { "$ref": "#/$defs/DeviceSignature" } }
             }
           }
         },
@@ -1662,7 +1674,8 @@
       "properties": {
         "api_version": { "const": "st3.client.v0" },
         "code": { "type": "string", "pattern": "^[A-Z2-9]{8}$" },
-        "device_public_key": { "type": "string", "minLength": 32 }
+        "device_public_key": { "type": "string", "minLength": 32 },
+        "key_storage": { "enum": ["secure-enclave", "software"] }
       }
     },
     "PairedSession": {
@@ -1676,7 +1689,23 @@
         "session_actor": { "$ref": "#/$defs/Id" },
         "credential": { "type": "string", "minLength": 32 },
         "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-        "expires_at": { "$ref": "#/$defs/Timestamp" }
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "device_key_chain": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "DeviceSignature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signer", "key", "chain", "nonce", "signed_at_unix_ms", "signature", "format", "signed_fields"],
+      "properties": {
+        "signer": { "type": "string", "pattern": "^person/[^/]+$" },
+        "key": { "type": "string" },
+        "chain": { "type": "array", "items": { "type": "string" } },
+        "nonce": { "type": "string", "minLength": 16 },
+        "signed_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "signature": { "type": "string" },
+        "format": { "const": "fields-v1" },
+        "signed_fields": { "type": "array", "items": { "type": "string" } }
       }
     },
     "TerminalLine": {

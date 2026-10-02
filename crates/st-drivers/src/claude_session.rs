@@ -136,12 +136,10 @@ fn run_with_required_resume(
 
 /// Run one interactive Claude provider for an st3-owned agent directory.
 ///
-/// ST3 keeps its native-driver catalog private, so it supplies the resolved paths instead of
-/// asking the legacy catalog resolver to find them. This path is deliberately interactive: it
+/// The host supplies resolved observation and session paths. This path is deliberately interactive: it
 /// preserves capabilities such as Claude Remote Control that are incompatible with `--print`.
 pub fn run_controlled_paths(
-    catalog_root: &Path,
-    agent_dir: &Path,
+    paths: &crate::driver_paths::Paths,
     identity: String,
     runtime_id: String,
     claude_argv: Vec<String>,
@@ -150,29 +148,31 @@ pub fn run_controlled_paths(
         !claude_argv.is_empty(),
         "Claude driver '{runtime_id}' has no provider argv"
     );
-    let claude_argv = prepare_st3_channel_argv(catalog_root, &identity, claude_argv)?;
+    let claude_argv = prepare_st3_channel_argv(&paths.root, &identity, claude_argv)?;
     let workspace = std::env::current_dir().context("reading the Claude driver workspace")?;
     crate::pretrust::pretrust_claude(std::slice::from_ref(&workspace))
         .with_context(|| format!("admitting Claude driver workspace {}", workspace.display()))?;
     install_signal_handler();
-    let observer = SessionObserver::new(agent_dir, &identity, "claude", &runtime_id)?;
-    let env = [
+    let observer = SessionObserver::new(&paths.agent_dir, &identity, "claude", &runtime_id)?;
+    let mut env = vec![
         (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
         (SESSION_ENV.to_string(), observer.session().to_string()),
         (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
         ("ST_CLAUDE_IDENTITY".to_string(), identity.clone()),
-        (
-            "CATALOG".to_string(),
-            catalog_root.to_string_lossy().into_owned(),
-        ),
     ];
+    env.extend(paths.environment(&identity));
     // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
     run_provider_with_env_removals(
         "Claude",
         None,
         &claude_argv,
         &env,
-        &[EXPECTED_NATIVE_SESSION_ENV, RESUME_GENERATION_ENV],
+        &[
+            EXPECTED_NATIVE_SESSION_ENV,
+            RESUME_GENERATION_ENV,
+            "CATALOG",
+            "ST_ROOT",
+        ],
         crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
@@ -876,11 +876,23 @@ pub fn channel_transcript(
     runtime_id: &str,
     incarnation: &str,
 ) -> Result<Option<PathBuf>> {
-    Ok(
-        load_binding(&state_dir(catalog_root, identity), identity, runtime_id)?
-            .filter(|binding| binding.runtime_incarnation == incarnation)
-            .map(|binding| binding.transcript_path),
+    channel_transcript_paths(
+        &state_dir(catalog_root, identity),
+        identity,
+        runtime_id,
+        incarnation,
     )
+}
+
+pub fn channel_transcript_paths(
+    session_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+    incarnation: &str,
+) -> Result<Option<PathBuf>> {
+    Ok(load_binding(session_dir, identity, runtime_id)?
+        .filter(|binding| binding.runtime_incarnation == incarnation)
+        .map(|binding| binding.transcript_path))
 }
 
 fn load_pending_binding(
@@ -892,7 +904,7 @@ fn load_pending_binding(
 }
 
 fn record_session_start_binding(
-    catalog_root: &Path,
+    state_dir: &Path,
     identity: &str,
     runtime_id: &str,
     runtime_incarnation: &str,
@@ -933,11 +945,10 @@ fn record_session_start_binding(
         )
     })?;
     validate_transcript(&transcript_path, native_session_id, &canonical_workspace)?;
-    let state_dir = state_dir(catalog_root, identity);
 
     let mut effective_generation = resume_generation;
     if let Some(generation) = resume_generation {
-        if let Some(current) = load_binding(&state_dir, identity, runtime_id)? {
+        if let Some(current) = load_binding(state_dir, identity, runtime_id)? {
             if current.resume_generation == Some(generation)
                 && current.runtime_incarnation == runtime_incarnation
             {
@@ -955,7 +966,7 @@ fn record_session_start_binding(
             );
         }
     }
-    let schema = load_binding(&state_dir, identity, runtime_id)?
+    let schema = load_binding(state_dir, identity, runtime_id)?
         .filter(|binding| binding.runtime_incarnation == runtime_incarnation)
         .map_or_else(|| BINDING_SCHEMA.to_owned(), |binding| binding.schema);
     let binding = ClaudeSessionBinding {
@@ -1155,8 +1166,9 @@ pub fn run_observe(
     let _ = std::io::stdin().read_to_string(&mut raw);
     let var = |name: &str| std::env::var(name).ok();
     observe_payload(
-        catalog_root,
+        &state_dir(catalog_root, identity),
         &agent_dir,
+        false,
         identity,
         runtime_id,
         event,
@@ -1182,8 +1194,9 @@ pub fn run_observe_payload(
         message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
             .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
     observe_payload(
-        catalog_root,
+        &state_dir(catalog_root, identity),
         &agent_dir,
+        false,
         identity,
         runtime_id,
         event,
@@ -1192,9 +1205,32 @@ pub fn run_observe_payload(
     )
 }
 
+/// Record a native hook without declaration discovery or a catalog-derived state path.
+pub fn run_observe_payload_paths(
+    paths: &crate::driver_paths::Paths,
+    identity: &str,
+    runtime_id: &str,
+    event: &str,
+    raw: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
+    let var = &|name: &str| crate::contracts::env_with(name, var);
+    observe_payload(
+        &paths.session_dir,
+        &paths.agent_dir,
+        true,
+        identity,
+        Some(runtime_id),
+        event,
+        raw,
+        var,
+    )
+}
+
 fn observe_payload(
-    catalog_root: &Path,
+    session_dir: &Path,
     agent_dir: &Path,
+    native: bool,
     identity: &str,
     runtime_id: Option<&str>,
     event: &str,
@@ -1222,7 +1258,7 @@ fn observe_payload(
     if event == "SessionStart" {
         let binding = match (runtime_id, exported_session.as_deref()) {
             (Some(runtime_id), Some(runtime_incarnation)) => Some(record_session_start_binding(
-                catalog_root,
+                session_dir,
                 identity,
                 runtime_id,
                 runtime_incarnation,
@@ -1292,7 +1328,7 @@ fn observe_payload(
     // events that carry a compaction edge say nothing about top-level harness state and would
     // otherwise return below. Fail-open: a context record that cannot be written must never stop
     // a hook the harness is waiting on, and the numbers authorize nothing (HC-A02).
-    if let Err(error) = observe_compaction(agent_dir, identity, event, &payload) {
+    if let Err(error) = observe_compaction(agent_dir, identity, event, &payload, native) {
         tracing::warn!("st claude-observe: harness-context compaction write failed: {error:#}");
     }
     // The credential axis is independent of both the numbers and the categorical state, and is
@@ -1423,8 +1459,13 @@ fn context_writer(
     agent_dir: &Path,
     identity: &str,
     payload: &serde_json::Value,
+    native: bool,
 ) -> Result<harness_context::Writer> {
-    let writer = harness_context::Writer::new(agent_dir, identity, Harness::Claude)?;
+    let writer = if native {
+        harness_context::Writer::new_paths(agent_dir, identity, Harness::Claude)?
+    } else {
+        harness_context::Writer::new(agent_dir, identity, Harness::Claude)?
+    };
     let exported = crate::contracts::env(SESSION_ENV);
     Ok(match exported.or_else(|| wrapperless_token(payload)) {
         Some(token) => writer.with_session(token),
@@ -1458,6 +1499,7 @@ fn observe_compaction(
     identity: &str,
     event: &str,
     payload: &serde_json::Value,
+    native: bool,
 ) -> Result<()> {
     // A subagent's compaction is not the top-level session's, and this record describes the
     // top-level window (the status-line payload carries no subagent window either — DQ-C9). The
@@ -1482,7 +1524,7 @@ fn observe_compaction(
         }
         _ => return Ok(()),
     };
-    context_writer(agent_dir, identity, payload)?
+    context_writer(agent_dir, identity, payload, native)?
         .compacted(edge)
         .map(|_landed| ())
 }
@@ -1619,10 +1661,28 @@ pub fn run_statusline(catalog_root: &Path, identity: &str) -> Result<()> {
 }
 
 fn record_statusline(catalog_root: &Path, identity: &str, raw: &[u8]) -> Result<()> {
-    let payload: serde_json::Value = serde_json::from_slice(raw).unwrap_or(serde_json::Value::Null);
     let agent_dir =
         message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
             .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    record_statusline_paths(&agent_dir, identity, raw, false)
+}
+
+pub fn run_statusline_paths(agent_dir: &Path, identity: &str) -> Result<()> {
+    let mut raw = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut raw);
+    if let Err(error) = record_statusline_paths(agent_dir, identity, &raw, true) {
+        tracing::warn!("st claude-statusline: recording failed; chaining anyway: {error:#}");
+    }
+    chain_statusline(&raw)
+}
+
+fn record_statusline_paths(
+    agent_dir: &Path,
+    identity: &str,
+    raw: &[u8],
+    native: bool,
+) -> Result<()> {
+    let payload: serde_json::Value = serde_json::from_slice(raw).unwrap_or(serde_json::Value::Null);
     // Deliberately uncounted. The tee builds no telemetry pipeline at all (`DQ-C13`, see
     // `main`), so a `record_hook_invocation` here could never reach a collector — and a metric
     // call that provably cannot record is worse than none: it reads as instrumentation.
@@ -1631,7 +1691,7 @@ fn record_statusline(catalog_root: &Path, identity: &str, raw: &[u8]) -> Result<
     let mut reading = statusline_reading(&payload);
     // The limits belong to the account this Claude config is signed in to.
     reading.account = crate::account::claude_account_cached(&agent_dir);
-    context_writer(&agent_dir, identity, &payload)?
+    context_writer(agent_dir, identity, &payload, native)?
         .observe(reading)
         .map(|_landed| ())
 }
@@ -2860,7 +2920,7 @@ mod tests {
         let dir = agent_dir(&tmp);
         let payload = fixture(PRE_TURN);
 
-        let mut writer = context_writer(&dir, "ExampleMac.fabric", &payload).unwrap();
+        let mut writer = context_writer(&dir, "ExampleMac.fabric", &payload, false).unwrap();
         assert!(writer.observe(statusline_reading(&payload)).unwrap());
         // A withheld percent has no bucket, so a second identical render is inside the written
         // one and, well inside the heartbeat, writes nothing. That is the write guard (HC-R09)
@@ -2882,7 +2942,7 @@ mod tests {
         let mut payload = session.clone();
         payload["trigger"] = "auto".into();
 
-        observe_compaction(&dir, "ExampleMac.fabric", "PreCompact", &payload).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "PreCompact", &payload, false).unwrap();
         let counted = context(&dir);
         assert_eq!(counted.compactions, 1);
         assert_eq!(
@@ -2891,7 +2951,7 @@ mod tests {
         );
 
         // The completion edge holds the count and only moves `lastCompactionMs` forward.
-        observe_compaction(&dir, "ExampleMac.fabric", "PostCompact", &payload).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "PostCompact", &payload, false).unwrap();
         let completed = context(&dir);
         assert_eq!(
             completed.compactions, 1,
@@ -2903,7 +2963,7 @@ mod tests {
         // and deliberately inert — counting it is exactly the double count HC-R12 forbids.
         let mut restart = session;
         restart["source"] = "compact".into();
-        observe_compaction(&dir, "ExampleMac.fabric", "SessionStart", &restart).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "SessionStart", &restart, false).unwrap();
         assert_eq!(context(&dir).compactions, 1);
     }
 
@@ -2915,7 +2975,7 @@ mod tests {
 
         // No record at all: the PreCompact write never landed, so PostCompact is the first
         // evidence st2 has that a compaction happened and it counts rather than losing it.
-        observe_compaction(&dir, "ExampleMac.fabric", "PostCompact", &payload).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "PostCompact", &payload, false).unwrap();
         let observed = context(&dir);
         assert_eq!(observed.compactions, 1);
         assert_eq!(
@@ -2932,7 +2992,7 @@ mod tests {
             "session_id": "s-1", "trigger": "auto", "agent_id": "sub-7"
         });
 
-        observe_compaction(&dir, "ExampleMac.fabric", "PreCompact", &payload).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "PreCompact", &payload, false).unwrap();
         assert!(harness_context::read(&harness_context::harness_context_path(&dir)).is_none());
     }
 
@@ -2971,7 +3031,7 @@ mod tests {
             wrapperless_token(&payload).as_deref(),
             Some("claude-session-abc")
         );
-        context_writer(&dir, "ExampleMac.fabric", &payload)
+        context_writer(&dir, "ExampleMac.fabric", &payload, false)
             .unwrap()
             .observe(statusline_reading(&payload))
             .unwrap();

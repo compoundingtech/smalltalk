@@ -157,7 +157,37 @@ pub(super) fn run_live(
         }
         if let Some(parent) = header.parent_step_run.as_deref() {
             let Some(parent) = step(connection, parent)? else {
-                return Ok(false);
+                // Subscription and schedule deliveries use their declaration as the parent,
+                // normalized with a step-run prefix. They do not create a synthetic work step.
+                let subject = parent.strip_prefix("step-run/").unwrap_or(parent);
+                let Some(owner) = current_desired_row(connection, subject)? else {
+                    return Ok(false);
+                };
+                let body: Value = serde_json::from_str(&owner.body)?;
+                if !matches!(owner.kind.as_str(), "subscription" | "schedule")
+                    || body
+                        .get("children")
+                        .and_then(Value::as_array)
+                        .is_some_and(|children| {
+                            children.len() == 1 && children[0]["name"] == "stop"
+                        })
+                {
+                    return Ok(false);
+                }
+                let Some(owner_run) = owner.owner_run else {
+                    return Ok(false);
+                };
+                let owner_header =
+                    mission_run_header_tx(connection, owner_run.trim_start_matches("mission-run/"))
+                        .optional()?;
+                if owner_header
+                    .is_none_or(|owner| owner.root_mission_run != header.root_mission_run)
+                {
+                    return Ok(false);
+                }
+                run = owner_run.trim_start_matches("mission-run/").into();
+                expected_generation = owner.owner_generation;
+                continue;
             };
             if matches!(parent.status.as_str(), "completed" | "cancelled")
                 || (parent.status == "failed" && !failure)
@@ -188,15 +218,16 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
         return Ok(false);
     };
     let requester = ask.actor.as_deref().unwrap_or_default();
-    // A daemon asks for its own policy, not for a seat, so no declaration fences it.
-    let daemon = requester.starts_with("daemon/");
+    // A daemon asks for its own policy, not for a seat, so no declaration fences it. An update
+    // waits for nobody, so it stays until the person reads it, even after its poster stops.
+    let unfenced = requester.starts_with("daemon/") || is_update(ask);
     if !matches!(view.status.as_str(), "pending" | "ready")
         || !run_live(connection, &view.run, Some(&view.generation), false)?
-        || (!daemon && !declaration_live(connection, requester)?)
+        || (!unfenced && !declaration_live(connection, requester)?)
     {
         return Ok(false);
     }
-    if daemon {
+    if unfenced {
         return Ok(true);
     }
     let mut declarations = connection.prepare(&canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='intent.desired' ORDER BY CANONICAL_ASC(claims)"))?;
@@ -244,6 +275,41 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
         }
     }
     Ok(true)
+}
+
+fn is_update(ask: &ClaimRecord) -> bool {
+    ask.body["fields"]["request"]["type"] == "update"
+}
+
+/// Whether `person` asked for `about`: a mission run or step run that the person requested, or
+/// whose root run they requested, or a message the person sent to `agent`.
+fn person_asked(connection: &Connection, person: &str, agent: &str, about: &str) -> Result<bool> {
+    if about.starts_with("message/") {
+        let mut query = connection
+            .prepare_cached("SELECT body FROM claims WHERE subject=?1 AND kind='message.sent'")?;
+        for body in query.query_map([about], |row| row.get::<_, String>(0))? {
+            let body: Value = serde_json::from_str(&body?)?;
+            if body["fields"]["from"] == person && body["fields"]["to"] == agent {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    let run = if about.starts_with("step-run/") {
+        match step(connection, about)? {
+            Some(view) => view.run,
+            None => return Ok(false),
+        }
+    } else {
+        about.to_owned()
+    };
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mission_runs run
+          LEFT JOIN mission_runs root ON root.id=run.root_run_id
+          WHERE run.id=?1 AND (run.requester=?2 OR root.requester=?2))",
+        params![run.trim_start_matches("mission-run/"), person],
+        |row| row.get(0),
+    )?)
 }
 
 /// Adds person responses to a step view: the responses to asks this attempt made, as
@@ -314,6 +380,13 @@ impl Store {
                 "invalid-person-ask",
                 "a person ask needs a person, title, reason and idempotency key",
             ));
+        }
+        if input
+            .request
+            .as_ref()
+            .is_some_and(|request| request["type"] == "update")
+        {
+            return self.post_update(input);
         }
         if input.step.is_none() || input.new_run.is_some() {
             return self.ask_person_in_new_run(input);
@@ -432,7 +505,7 @@ impl Store {
             }
             let claim = append_claim_tx(tx, &self.origin, &subject, kind, Some(&input.actor), &body, &evidence, None).map_err(claim_append_error)?;
             project(tx, &claim)?;
-            if let Some(ask) = ask.as_ref().filter(|a| !cancel && a.body["fields"]["origin_step"].is_null()) {
+            if let Some(ask) = ask.as_ref().filter(|a| !cancel && a.body["fields"]["origin_step"].is_null() && !is_update(a)) {
                 send_answer_tx(tx, &self.origin, ask, &claim, &summary, answer.as_ref())?;
             }
             if let Some(origin) = ask.as_ref().and_then(|a| a.body["fields"]["origin_step"].as_str()) {
@@ -561,6 +634,52 @@ impl Store {
                 ask_as_daemon_tx(tx, &self.origin, actor, person, title, reason, name, key)
             })
             .map_err(internal)?
+    }
+
+    /// Brings a person information they asked for. Nothing waits on an update: it stays on the
+    /// person's home until they open or read it, and it is refused unless `about` names the
+    /// person's own run or step, or their message to the poster.
+    fn post_update(&self, input: &PersonAskRequest) -> Result<StepRunView, St3Error> {
+        if input.step.is_some() || input.new_run.is_some() {
+            return Err(St3Error::new(
+                "ambiguous-ask-owner",
+                "an update names the work it is about in its request, not with a step or new run",
+            ));
+        }
+        let structured = canonical_request(input)?;
+        let about = structured["about"].as_str().unwrap_or_default().to_owned();
+        self.connection.batched(|tx| {
+            if !declaration_live(tx, &input.actor).map_err(internal)? {
+                return Err(St3Error::new("missing-ask-owner", "the agent posting an update must have a live declaration"));
+            }
+            if !person_asked(tx, &input.person, &input.actor, &about).map_err(internal)? {
+                return Err(St3Error::new("update-not-asked", format!(
+                    "{} did not ask for `{about}`: an update is about the person's own run or step, or their message to you",
+                    input.person)));
+            }
+            let identity = serde_json::to_string(&(&input.actor, &input.person, &about, &input.idempotency_key)).map_err(internal)?;
+            let hash = hex::encode(Sha256::digest(identity.as_bytes()));
+            let generation = format!("update-{}", &hash[..32]);
+            let subject = format!("step-run/{generation}/update");
+            if let Some(existing) = request(tx, &subject).map_err(internal)? {
+                if existing.body["fields"]["title"] != input.title || existing.body["fields"]["reason"] != input.reason
+                    || existing.body["fields"]["request"] != structured {
+                    return Err(St3Error::new("idempotency-conflict", "this update key already names another update"));
+                }
+                return step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the update is no longer retained"));
+            }
+            let mission_id = format!("person-update/{}", &hash[..32]);
+            let kdl = format!("version 2\nmission {mission_id:?} state=\"ready\" {{ goal {:?}; step \"update\" {{ assigned-to {:?}; goal {:?}; }} }}", input.title, input.person, input.reason);
+            let mut intent = crate::graph::parse_internal_intent(&kdl, &self.origin)?;
+            let mission = intent.missions.remove(&mission_id).ok_or_else(|| St3Error::new("internal", "the update mission could not be parsed"))?;
+            let claim = append_claim_tx(tx, &self.origin, &subject, "work.person-asked", Some(&input.actor),
+                &with_request(json!({"fields": {"run": format!("mission-run/person-update/{}", &hash[..32]),
+                    "generation": format!("run-generation/{generation}"), "person": input.person, "title": input.title,
+                    "reason": input.reason, "key": input.idempotency_key, "attempt": 1, "status": "ready", "mission_spec": mission}}), &structured),
+                &[], None).map_err(claim_append_error)?;
+            project(tx, &claim)?;
+            step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the update could not be projected"))
+        }).map_err(internal)?
     }
 
     fn ask_person_in_new_run(&self, input: &PersonAskRequest) -> Result<StepRunView, St3Error> {
@@ -802,6 +921,177 @@ mission "person-work" state="ready" {
             request: None,
         };
         (store, origin, input)
+    }
+
+    fn delivery_fixture(kind: &str) -> (Store, StepRunView, PersonAskRequest, MissionRunView) {
+        let (store, origin, mut input) = fixture();
+        let root = store.mission_run(&origin.run).unwrap().unwrap();
+        let source = r#"version 2
+mission "child-person-work" state="ready" {
+  goal "Gather one person decision."
+  step "prepare" { assigned-to "agent/alder.asker"; goal "Prepare the question." }
+}
+resource "issues" { kind "vcs.repository" }
+observer "issues" { resource "resource/issues"; provider "github.repository"; locator "example/repo"; field "issues" }
+subscription "intake" {
+  observer "observer/issues"; on "issues"
+  delivery "mission" { mission "child-person-work"; resource "source"; workspace "/tmp" }
+}
+schedule "intake" {
+  calendar { at "08:00"; timezone "UTC" }
+  work { mission "person-work@REVISION"; workspace "/tmp" }
+}"#.replace("REVISION", &root.revision);
+        let mut intent = crate::graph::parse_internal_intent(&source, "alder").unwrap();
+        let parent = format!("{kind}/intake");
+        let subscription = intent.subjects.get_mut(&parent).unwrap();
+        subscription.owner_run = Some(root.subject.clone());
+        subscription.owner_generation = Some(root.generation.clone());
+        store.apply_internal(&intent, "owned-subscription").unwrap();
+        let child = store
+            .create_child_mission_run(
+                &MissionRunRequest {
+                    mission: "child-person-work".into(),
+                    revision: None,
+                    workspace: "/tmp/child".into(),
+                    requester: Some(input.actor.clone()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: "subscription-child".into(),
+                },
+                &root,
+                &parent,
+                None,
+            )
+            .unwrap();
+        let origin = child
+            .steps
+            .iter()
+            .find(|step| step.step == "prepare")
+            .unwrap()
+            .clone();
+        store.connection.batched(|tx| -> Result<()> {
+            let claim = append_claim_tx(tx, "alder", &origin.subject, "work.claimed", Some(&input.actor),
+                &json!({"fields": {"attempt": 1, "status": "claimed", "claimant": input.actor,
+                    "claim_incarnation": "asker-one", "claim_expires_at_unix_ms": (now_ms()+600_000) as u64}}), &[], None)?;
+            project_mission_run_update(tx, &claim).unwrap();
+            Ok(())
+        }).unwrap().unwrap();
+        input.step = Some(origin.subject.clone());
+        (store, origin, input, root)
+    }
+
+    #[test]
+    fn delivery_child_person_ask_survives_reconciliation_and_replay() {
+        for kind in ["subscription", "schedule"] {
+            let (store, origin, input, _) = delivery_fixture(kind);
+            let ask = store.ask_person(&input).unwrap();
+            for replay in [false, true] {
+                if replay {
+                    store.replay_replication_graph().unwrap();
+                }
+                store.reconcile_person_asks().unwrap();
+                assert_eq!(
+                    store.step_run(&ask.subject).unwrap().unwrap().status,
+                    "ready"
+                );
+                assert!(
+                    store
+                        .attention_items(Some("person/avery"))
+                        .unwrap()
+                        .iter()
+                        .any(|item| item.subject == ask.subject)
+                );
+            }
+            let response = PersonStepResponse {
+                subject: ask.subject,
+                actor: "person/avery".into(),
+                summary: "Friday".into(),
+                evidence: vec![],
+                episode: None,
+                idempotency_key: "subscription-answer".into(),
+                answer: None,
+            };
+            store.finish_person_step(&response, false).unwrap();
+            assert_eq!(
+                store.step_run(&origin.subject).unwrap().unwrap().status,
+                "ready"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_child_person_asks_keep_owner_fences() {
+        for invalidation in [
+            "stop",
+            "root-ended",
+            "stale-generation",
+            "missing-parent",
+            "missing-step",
+        ] {
+            let (store, origin, input, root) = delivery_fixture("subscription");
+            let ask = store.ask_person(&input).unwrap();
+            match invalidation {
+                "stop" => {
+                    let mut intent = crate::graph::parse_internal_intent(
+                        "version 2\nsubscription \"intake\" { stop }",
+                        "alder",
+                    )
+                    .unwrap();
+                    let stopped = intent.subjects.get_mut("subscription/intake").unwrap();
+                    stopped.owner_run = Some(root.subject.clone());
+                    stopped.owner_generation = Some(root.generation.clone());
+                    store.apply_internal(&intent, "stop-subscription").unwrap();
+                }
+                "root-ended" => {
+                    store
+                        .set_mission_run_state(
+                            &root.subject,
+                            "cancelled",
+                            "terminal",
+                            Some("intake ended"),
+                        )
+                        .unwrap();
+                }
+                "stale-generation" => {
+                    store.connection.batched(|tx| -> Result<()> {
+                        tx.execute("UPDATE desired SET owner_generation='run-generation/old' WHERE subject='subscription/intake'", [])?;
+                        Ok(())
+                    }).unwrap().unwrap();
+                }
+                missing => {
+                    let parent = if missing == "missing-parent" {
+                        "step-run/subscription/missing"
+                    } else {
+                        "step-run/missing/prepare"
+                    };
+                    store
+                        .connection
+                        .batched(|tx| -> Result<()> {
+                            tx.execute(
+                                "UPDATE mission_runs SET parent_step_run=?1 WHERE id=?2",
+                                params![parent, origin.run.trim_start_matches("mission-run/")],
+                            )?;
+                            Ok(())
+                        })
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .iter()
+                    .all(|item| item.subject != ask.subject),
+                "{invalidation}"
+            );
+            store.reconcile_person_asks().unwrap();
+            assert_eq!(
+                store.step_run(&ask.subject).unwrap().unwrap().status,
+                "cancelled",
+                "{invalidation}"
+            );
+        }
     }
 
     #[test]
@@ -1119,6 +1409,132 @@ mission "person-work" state="ready" {
         assert!(messages[0].content.contains(
             "Answer: Revise auth and review (revise-auth)\nPair browsers like the native clients."
         ));
+    }
+
+    /// An update brings the person what they asked for: the poster keeps working, the update
+    /// stays on the person's home after the poster stops, and reading it clears it without
+    /// telling anyone. Work the person did not ask for takes no update.
+    #[test]
+    fn an_update_waits_for_nobody_stays_until_read_and_needs_the_persons_own_work() {
+        let (store, origin, mut input) = fixture();
+        input.step = None;
+        input.incarnation = None;
+        input.title = "Release notes are ready".into();
+        input.reason = "The notes cover all three fixes.".into();
+        input.request = Some(json!({"version": 1, "type": "update", "about": origin.run}));
+        let update = store.ask_person(&input).unwrap();
+        assert!(update.subject.ends_with("/update"));
+        assert_eq!(store.ask_person(&input).unwrap().subject, update.subject);
+        // Nothing waits on an update: the poster's step keeps its claim.
+        assert_eq!(
+            store.step_run(&origin.subject).unwrap().unwrap().status,
+            "claimed"
+        );
+
+        // Not the person's work, not the person's message: refused.
+        let mut stranger = input.clone();
+        stranger.person = "person/someone-else".into();
+        assert_eq!(
+            store.ask_person(&stranger).unwrap_err().code,
+            "update-not-asked"
+        );
+        let message = |subject: &str, from: &str, to: &str| {
+            store.connection.batched(|tx| -> Result<()> {
+                append_claim_tx(tx, "alder", subject, "message.sent", Some(from),
+                    &json!({"fields": {"from": from, "to": to, "content": "How did the release go?", "status": "sent"}}), &[], None)?;
+                Ok(())
+            }).unwrap().unwrap();
+        };
+        message(
+            "message/0000000000000001",
+            "person/avery",
+            "agent/alder.asker",
+        );
+        message(
+            "message/0000000000000002",
+            "person/avery",
+            "agent/alder.other",
+        );
+        let mut asked = input.clone();
+        asked.idempotency_key = "asked-in-message".into();
+        asked.request =
+            Some(json!({"version": 1, "type": "update", "about": "message/0000000000000001"}));
+        let answered = store.ask_person(&asked).unwrap();
+        asked.request =
+            Some(json!({"version": 1, "type": "update", "about": "message/0000000000000002"}));
+        assert_eq!(
+            store.ask_person(&asked).unwrap_err().code,
+            "update-not-asked"
+        );
+        asked.request = Some(json!({"version": 1, "type": "update", "about": origin.subject}));
+        asked.idempotency_key = "asked-in-step".into();
+        store.ask_person(&asked).unwrap();
+        let mut with_step = input.clone();
+        with_step.step = Some(origin.subject.clone());
+        assert_eq!(
+            store.ask_person(&with_step).unwrap_err().code,
+            "ambiguous-ask-owner"
+        );
+
+        let stop =
+            crate::graph::parse_internal_intent("version 2\nstop \"agent/alder.asker\"", "alder")
+                .unwrap();
+        store.apply_internal(&stop, "retire-poster").unwrap();
+        store.reconcile_person_asks().unwrap();
+        let items = store.attention_items(Some("person/avery")).unwrap();
+        let item = items
+            .iter()
+            .find(|item| item.subject == update.subject)
+            .expect("the update outlives its poster");
+        assert_eq!(item.request.as_ref().unwrap()["type"], "update");
+        assert_eq!(item.actions[0].label, "read");
+        assert_eq!(item.actions[0].argv[6..], ["--answer", "read"]);
+
+        let read = |subject: &str, answer: Option<&str>, text: Option<&str>| {
+            store.finish_person_step(
+                &PersonStepResponse {
+                    subject: subject.into(),
+                    actor: "person/avery".into(),
+                    summary: String::new(),
+                    evidence: vec![],
+                    episode: None,
+                    idempotency_key: format!("read:{subject}:{answer:?}:{text:?}"),
+                    answer: (answer.is_some() || text.is_some()).then(|| {
+                        crate::person_request::AnswerInput {
+                            id: answer.map(str::to_owned),
+                            text: text.map(str::to_owned),
+                        }
+                    }),
+                },
+                false,
+            )
+        };
+        assert_eq!(
+            read(&update.subject, None, Some("Thanks, now ship it"))
+                .unwrap_err()
+                .code,
+            "invalid-person-answer"
+        );
+        read(&update.subject, Some("read"), None).unwrap();
+        read(&answered.subject, None, None).unwrap();
+        let done = store.step_run(&update.subject).unwrap().unwrap();
+        assert_eq!(done.status, "completed");
+        assert_eq!(done.person_answers[0].summary, "Read");
+        assert_eq!(
+            done.person_answers[0].answer,
+            Some(json!({"type": "update", "outcome": "read"}))
+        );
+        assert!(
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != update.subject && item.subject != answered.subject)
+        );
+        // Reading tells nobody: an update is not a question. The one message is the person's.
+        let messages = store.messages(Some("agent/alder.asker"), true).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "How did the release go?");
     }
 
     /// A free-text ask keeps working, takes no named answer, and keeps its claim body unchanged

@@ -1048,7 +1048,8 @@ PEER  beacon  last-seen
 `current` is the member's admission state, not a claim that it is online. Use
 `st replication status` for each peer's last exchange time, envelope backlog and divergence;
 `st machines` and stui also show last contact. A member never seen has no successful exchange
-time yet. Normal absence does not produce a doctor fault or delivery-probe attention. Invalid
+time yet. An absent listening member, which is meant to answer, makes doctor warn; an absent
+dial-out member is only named, and neither produces delivery-probe attention. Invalid
 authentication, conflicting membership, rejected envelopes and projection faults remain
 visible. `st fleet status --json` includes the membership, endpoints and peer results for
 inspection.

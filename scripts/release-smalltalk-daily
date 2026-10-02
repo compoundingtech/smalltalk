@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Publish a release from the archives main already built, when main changed since the last one.
+
+Every main commit runs "Smalltalk tag release", which builds, tests and verifies both archives and
+uploads them as the `smalltalk-release` artifact. This takes the newest commit whose run succeeded,
+re-verifies its checksums and sources, tags that exact commit and publishes the same bytes. Nothing
+is rebuilt, so a release is always an archive a main run has already proven.
+
+Usage: scripts/release-smalltalk-daily [--dry-run] [--tag TAG]
+Environment: GH_TOKEN and GH_REPO (as for gh). Run from a full-history checkout with tags.
+Needs contents: write (the release creates the tag) and actions: read (the artifact download).
+"""
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+
+WORKFLOW = 'release-smalltalk.yml'
+SEMVER = re.compile(r'v(\d+)\.(\d+)\.(\d+)')
+
+
+def run(*cmd, cwd=None):
+    return subprocess.run(cmd, check=True, text=True, capture_output=True, cwd=cwd).stdout.strip()
+
+
+def say(message):
+    print(f'release-smalltalk-daily: {message}', flush=True)
+
+
+def newest_verified_main_run():
+    rows = json.loads(run('gh', 'run', 'list', '--workflow', WORKFLOW, '--branch', 'main', '--event', 'push',
+                          '--status', 'success', '--limit', '1', '--json', 'databaseId,headSha'))
+    return (rows[0]['databaseId'], rows[0]['headSha']) if rows else (None, None)
+
+
+def latest_release_tag():
+    return run('gh', 'release', 'view', '--json', 'tagName', '--jq', '.tagName')
+
+
+def next_tag():
+    versions = [tuple(map(int, m.groups())) for t in run('git', 'tag', '--list', 'v*').split()
+                if (m := SEMVER.fullmatch(t))]
+    major, minor, patch = max(versions)
+    return f'v{major}.{minor}.{patch + 1}'
+
+
+def merged_titles(since, sha):
+    """One line per first-parent commit: the pull request title, with its number when there is one."""
+    raw = run('git', 'log', '--first-parent', '--reverse', '--format=%s%x1f%b%x1e', f'{since}..{sha}')
+    lines = []
+    for record in filter(None, (r.strip('\n') for r in raw.split('\x1e'))):
+        subject, _, body = record.partition('\x1f')
+        merge = re.match(r'Merge pull request #(\d+) from ', subject)
+        if merge:
+            number = merge.group(1)
+            # The pull request's own title; a merge body can be anything the merger typed.
+            try:
+                title = run('gh', 'pr', 'view', number, '--json', 'title', '--jq', '.title')
+            except subprocess.CalledProcessError:
+                title = body.strip().splitlines()[0] if body.strip() else subject
+            lines.append(f'- {title} (#{number})')
+        else:
+            lines.append(f'- {subject}')
+    return lines
+
+
+def release_notes(tag, previous, since, sha, guide):
+    titles = merged_titles(since, sha)
+    return '\n'.join([
+        f'Daily release of main at `{sha}`, built and verified by the main workflow run for that commit.',
+        '',
+        f'## Changes since {previous}',
+        '',
+        *(titles or ['- No merged pull requests.']),
+        '',
+        '---',
+        '',
+        guide.rstrip('\n'),
+        '',
+        f'Exact source: `{sha}`. See RELEASE.json for the PTY revision and targets.',
+        '',
+    ])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    parser.add_argument('--dry-run', action='store_true', help='verify and print the notes; publish nothing')
+    parser.add_argument('--tag', help='release tag; default is the next patch after the highest v tag')
+    args = parser.parse_args()
+    repo = pathlib.Path(__file__).resolve().parent.parent
+
+    run_id, sha = newest_verified_main_run()
+    if sha is None:
+        say('no successful main run to release')
+        return 1
+    previous = latest_release_tag()
+    since = run('git', 'rev-parse', f'{previous}^{{commit}}', cwd=repo)
+    if since == sha or subprocess.run(['git', 'merge-base', '--is-ancestor', sha, since], cwd=repo).returncode == 0:
+        say(f'main has not changed since {previous} ({since}); nothing to release')
+        return 0
+    tag = args.tag or next_tag()
+    if subprocess.run(['git', 'rev-parse', '-q', '--verify', f'refs/tags/{tag}'], cwd=repo,
+                      capture_output=True).returncode == 0:
+        say(f'{tag} already exists; refusing to reuse a tag')
+        return 1
+    say(f'releasing {tag} from {sha} (run {run_id}), previous release {previous} at {since}')
+
+    dist = pathlib.Path(tempfile.mkdtemp(prefix='smalltalk-release-'))
+    run('gh', 'run', 'download', str(run_id), '--name', 'smalltalk-release', '--dir', str(dist))
+    # The same checks the tag workflow makes, so the bytes are proven before they are published.
+    run('sha256sum', '--check', 'SHA256SUMS', cwd=dist)
+    say(run('python3', str(repo / 'scripts/release-smalltalk-manifest.py'), sha, cwd=dist))
+
+    notes = dist / 'RELEASE-NOTES.md'
+    notes.write_text(release_notes(tag, previous, since, sha, (repo / 'docs/st3/binary-releases.md').read_text()))
+    assets = sorted(str(p) for pattern in ('*.tar.gz', '*.sha256') for p in dist.glob(pattern))
+    assets += [str(dist / 'SHA256SUMS'), str(dist / 'RELEASE.json')]
+    if args.dry_run:
+        print(notes.read_text())
+        say(f'dry run: would publish {tag} at {sha} with {len(assets)} assets')
+        return 0
+
+    # A draft has no tag yet. Publishing it creates the tag at exactly this commit, so a partial
+    # draft can be inspected and deleted without leaving a tag behind.
+    run('gh', 'release', 'create', tag, '--target', sha, '--draft', '--title', f'Smalltalk {tag}',
+        '--notes-file', str(notes), *assets)
+    run('gh', 'release', 'edit', tag, '--draft=false')
+    tagged = run('git', 'ls-remote', 'origin', f'refs/tags/{tag}^{{}}', f'refs/tags/{tag}', cwd=repo).split()
+    if sha not in tagged:
+        say(f'published {tag}, but the tag does not point at {sha}: {tagged}')
+        return 1
+    say(f'published {tag} at {sha}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

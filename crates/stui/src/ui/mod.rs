@@ -14,6 +14,7 @@ pub mod demo;
 pub mod doc;
 mod edit;
 mod glass;
+pub use glass::set_glasses_version;
 mod glass_store;
 pub mod layout;
 pub mod live;
@@ -115,6 +116,8 @@ pub enum Effect {
         id: String,
         action: String,
         reason: Option<String>,
+        /// A structured request's named answer, by id.
+        answer: Option<String>,
     },
     LaunchRevise {
         id: String,
@@ -257,6 +260,8 @@ pub struct Ui {
     effects: Vec<Effect>,
     popover: Option<String>,
     chat: Option<ChatState>,
+    /// The named answer chosen on the focused structured request, before Enter sends it.
+    answering: Option<usize>,
     /// Voice mode: the speech helper listening for one input.
     pub(crate) voice: Option<voice::VoiceState>,
     /// Inputs whose text came from voice; their next message is tagged `dictated`.
@@ -357,6 +362,7 @@ impl Ui {
             popover: None,
             chat: None,
             voice: None,
+            answering: None,
             dictated: HashSet::new(),
             details: true,
             kdl: false,
@@ -1480,6 +1486,7 @@ impl Ui {
             cursor: self.cursor.at(key, text.unwrap_or("")),
             editing: self.editing,
             confirm: self.confirm,
+            answering: self.answering,
             chat,
         }
     }
@@ -2577,7 +2584,64 @@ impl Ui {
 
     // ------------------------------------------------------------------- input
 
+    /// The focused Home item's structured request (#1010), with the item's id.
+    fn structured_request(&self) -> Option<(String, Box<st3_client::StructuredRequest>)> {
+        let id = self.attention_focus()?;
+        let item = self
+            .world
+            .attention
+            .items()
+            .iter()
+            .find(|item| item.id == id)?;
+        match &item.kind {
+            AttentionKind::Request {
+                structured: Some(request),
+                ..
+            } => Some((id, request.clone())),
+            _ => None,
+        }
+    }
+
+    fn answer_key(&mut self, key: KeyEvent) -> bool {
+        let Some(index) = self.answering else {
+            return false;
+        };
+        let Some((id, request)) = self.structured_request() else {
+            self.answering = None;
+            return false;
+        };
+        let last = request.answers.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.answering = Some(index.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.answering = Some((index + 1).min(last)),
+            KeyCode::Esc => self.answering = None,
+            KeyCode::Enter => {
+                self.answering = None;
+                let Some(answer) = request.answers.get(index) else {
+                    return true;
+                };
+                if self.live {
+                    self.effects.push(Effect::Attention {
+                        id,
+                        action: "work.done".into(),
+                        reason: Some(answer.label.clone()),
+                        answer: Some(answer.id.clone()),
+                    });
+                    self.flash(format!("Answering “{}”…", answer.label));
+                } else {
+                    self.flash(format!(
+                        "Answered “{}” · demo: nothing was sent",
+                        answer.label
+                    ));
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn select(&mut self, index: usize) {
+        self.answering = None;
         let count = self.ids().len();
         if count == 0 {
             return;
@@ -2590,6 +2654,7 @@ impl Ui {
     }
 
     fn switch_tab(&mut self, tab: usize) {
+        self.answering = None;
         self.tab = tab.min(TABS.len() - 1);
         self.editing = false;
         self.chat = None;
@@ -2659,6 +2724,10 @@ impl Ui {
         }
         // Listening takes every key until the words are sent, kept or dropped.
         if self.voice_key(key) {
+            return;
+        }
+        // Choosing a structured request's answer: ↑↓ another, Enter sends, Esc puts it away.
+        if self.answer_key(key) {
             return;
         }
         if self.glass_key(key) {
@@ -3093,6 +3162,19 @@ impl Ui {
                     }
                     ("launch", 'd') | ("revision", 'j') | ("fault" | "request", 'r') => {
                         self.confirm = Some(key)
+                    }
+                    ("request", 'a') => {
+                        if let Some((_, request)) = self.structured_request() {
+                            let recommended = request.recommendation.as_ref().and_then(|wanted| {
+                                request
+                                    .answers
+                                    .iter()
+                                    .position(|answer| answer.id == wanted.answer)
+                            });
+                            if !request.answers.is_empty() {
+                                self.answering = Some(recommended.unwrap_or(0));
+                            }
+                        }
                     }
                     ("request", 'y' | 'n') => self.confirm = Some(key),
                     ("message", 'm') => self.act('m'),
@@ -3622,6 +3704,7 @@ impl Ui {
                         id: id.clone(),
                         action: "review.reject".into(),
                         reason: Some(draft),
+                        answer: None,
                     }),
                     Some(AttentionKind::Launch { .. }) => Some(Effect::LaunchRevise {
                         id: id.clone(),
@@ -3631,6 +3714,7 @@ impl Ui {
                         id: id.clone(),
                         action: "work.done".into(),
                         reason: Some(draft),
+                        answer: None,
                     }),
                     Some(AttentionKind::Message { from, .. }) => Some(Effect::Reply {
                         id: id.clone(),
@@ -3771,6 +3855,7 @@ impl Ui {
                     id,
                     action: "work.done".into(),
                     reason: Some(answer.into()),
+                    answer: None,
                 });
                 self.flash(format!("Answering “{answer}”…"));
             } else {
@@ -3807,6 +3892,7 @@ impl Ui {
                     id,
                     action: name.into(),
                     reason,
+                    answer: None,
                 });
                 self.flash("Sending…");
             } else {
@@ -4119,6 +4205,7 @@ impl Ui {
                 }
             }
             Hit::Help => self.help = !self.help,
+            Hit::Answer(index) => self.answering = Some(index),
             Hit::Voice => {
                 self.editing = true;
                 self.start_voice();
@@ -4722,6 +4809,7 @@ mod tests {
                 from: "Planner".into(),
                 from_id: "agent/example/planner".into(),
                 question: "Answer yes and I land them.".into(),
+                structured: None,
             },
             actions: vec!["work.done".into()],
             related: Vec::new(),
@@ -4769,6 +4857,101 @@ mod tests {
         );
         ui.key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
         assert!(!ui.simple);
+    }
+
+    #[test]
+    fn a_structured_request_shows_its_fields_and_sends_a_named_answer() {
+        let mut world = demo::world();
+        let request = st3_client::StructuredRequest {
+            version: 1,
+            entry_type: "choice".into(),
+            question: "Shipped today: 62 pull requests.".into(),
+            why_person: "You asked for a summary.".into(),
+            summary: Some("All three machines run main.".into()),
+            reasons: vec![
+                "Seats start reliably (#1008).".into(),
+                "Search is in (#1065).".into(),
+            ],
+            recommendation: Some(st3_client::RequestRecommendation {
+                answer: "more".into(),
+                reason: "two items need your eyes".into(),
+            }),
+            subjects: vec![st3_client::RequestSubject {
+                kind: "link".into(),
+                label: "pull requests merged today".into(),
+                url: Some("https://example.com/merged".into()),
+                ..Default::default()
+            }],
+            answers: vec![
+                st3_client::RequestAnswerOption {
+                    id: "read".into(),
+                    label: "Read it".into(),
+                    consequence: "Clears this item.".into(),
+                    ..Default::default()
+                },
+                st3_client::RequestAnswerOption {
+                    id: "more".into(),
+                    label: "Tell me more".into(),
+                    consequence: "The asker replies with detail.".into(),
+                    ..Default::default()
+                },
+            ],
+            custom: true,
+        };
+        let item = Attention {
+            id: "attention/shipped".into(),
+            tier: Tier::Stopped,
+            title: "Shipped today".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: request.question.clone(),
+                structured: Some(Box::new(request)),
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/shipped")
+            .unwrap();
+        ui.select(at);
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in [
+            "recommends  Tell me more",
+            "All three machines run main.",
+            "Seats start reliably (#1008).",
+            "pull requests merged today",
+            "Read it",
+            "Clears this item.",
+            "Why you: You asked for a summary.",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        // a chooses the recommended answer; ↑ another; Enter sends it by its id.
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(ui.answering, Some(1));
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, answer: Some(answer), reason: Some(reason), .. }]
+                if id == "attention/shipped" && answer == "read" && reason == "Read it"),
+            "{:?}",
+            ui.effects
+        );
     }
 
     #[test]

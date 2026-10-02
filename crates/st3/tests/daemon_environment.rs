@@ -19,10 +19,10 @@ fn executable(path: &Path, source: &str) {
 }
 
 fn start_service(root: &Path, home: &Path, state_home: &Path) -> (Service, std::path::PathBuf) {
+    let shell = st_runtime::resolve_executable("bash", &std::env::vars().collect()).unwrap();
     let socket = root.join("daemon.sock");
     let log = std::fs::File::create(root.join("daemon.log")).unwrap();
     let binary = assert_cmd::cargo::cargo_bin!("st3");
-    let shell = st_runtime::resolve_executable("bash", &std::env::vars().collect()).unwrap();
     let mut service = Service(
         Command::new(binary)
             .env_clear()
@@ -43,7 +43,7 @@ fn start_service(root: &Path, home: &Path, state_home: &Path) -> (Service, std::
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while std::os::unix::net::UnixStream::connect(&socket).is_err() {
         assert!(
             service.0.try_wait().unwrap().is_none(),
@@ -222,4 +222,62 @@ fn doctor_reports_missing_build_tools_and_whether_a_small_crate_links() {
             && message.contains("linker `mold` not found"),
         "{message}"
     );
+}
+
+/// A deploy restarts the daemon while the machine is busy building, and a login shell that takes
+/// seconds when idle can take minutes then. The first capture here overruns its ten seconds; the
+/// daemon must retry with more patience and start, not exit.
+#[test]
+fn a_login_shell_too_slow_for_the_first_capture_still_lets_the_daemon_start() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let bin = home.join("orchid-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let profile = format!(
+        "export PATH='{}:{}'\nexport ORCHID_CONTROL=from-shell\n",
+        bin.display(),
+        std::env::var("PATH").unwrap()
+    );
+    for name in [".bash_profile", ".zprofile", ".zshrc"] {
+        std::fs::write(home.join(name), &profile).unwrap();
+    }
+    executable(&bin.join("pty"), "#!/bin/sh\nprintf '[]\\n'\n");
+    executable(&bin.join("gh"), "#!/bin/sh\nexit 1\n");
+    // The account's login shell reads these. Its first run is slow beyond the first capture's
+    // allowance, as on a loaded machine; later runs are not. (The account's shell, not $SHELL,
+    // is what st runs, so the slowness lives in the startup files.)
+    let marker = root.path().join("slow-shell-ran");
+    let slow = format!(
+        "[ -e '{marker}' ] || {{ : > '{marker}'; sleep 120; }}\n",
+        marker = marker.display()
+    );
+    for name in [".bash_profile", ".zprofile", ".zshrc"] {
+        let current = std::fs::read_to_string(home.join(name)).unwrap();
+        std::fs::write(home.join(name), format!("{slow}{current}")).unwrap();
+    }
+    std::fs::create_dir_all(root.path().join("config/fish")).unwrap();
+    std::fs::write(
+        root.path().join("config/fish/config.fish"),
+        format!(
+            "if not test -e '{marker}'\n  touch '{marker}'\n  sleep 120\nend\n",
+            marker = marker.display()
+        ),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let (_service, socket) = start_service(root.path(), &home, &root.path().join("state"));
+    assert!(
+        started.elapsed() >= Duration::from_secs(10),
+        "the first capture should have waited out its allowance"
+    );
+    let log = std::fs::read_to_string(root.path().join("daemon.log")).unwrap();
+    assert!(log.contains("the login shell is slow to start"), "{log}");
+    let report = doctor_report(&home, &socket);
+    let environment = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "daemon-environment")
+        .unwrap();
+    assert_eq!(environment["status"], "pass", "{environment}");
 }
