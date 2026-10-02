@@ -2357,6 +2357,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_followed_conversation_says_why_while_its_owner_cannot_be_reached() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let make_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let owner = make_state(owner_root.path(), "conversation-owner");
+        let mut gateway = make_state(gateway_root.path(), "conversation-gateway");
+        let agent = "agent/conversation-peer";
+        let incarnation = "conversation-runtime:i1";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    (
+                        "runtime_id".into(),
+                        serde_json::json!("conversation-runtime"),
+                    ),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("status".into(), serde_json::json!("running")),
+                    ("terminal".into(), serde_json::json!(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-runtime".into()),
+            })
+            .unwrap();
+        gateway
+            .store
+            .import_replication(
+                "conversation-owner",
+                &owner.store.export_replication(0).unwrap(),
+            )
+            .unwrap();
+        // The owner is a configured peer, but nothing answers at its address.
+        let address = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "conversation-gateway".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "conversation-owner".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_socket = gateway_root.path().join("st3.sock");
+        let served_gateway = gateway_socket.clone();
+        tokio::spawn(async move {
+            crate::api::serve_unix(&served_gateway, crate::api::router(gateway)).await
+        });
+        for _ in 0..200 {
+            if tokio::net::UnixStream::connect(&gateway_socket)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = st3_client::Client::unix_as(&gateway_socket, "person/example");
+        let mut stream = client.collection_stream().await.unwrap();
+        stream
+            .subscribe_conversation("conversation", agent)
+            .await
+            .unwrap();
+        // The subscription stays (st retries it) and says why, so a client showing its last
+        // copy can say that copy is stale.
+        let event = tokio::time::timeout(Duration::from_secs(20), stream.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let st3_client::CollectionEvent::Resync { id, code, message } = event else {
+            panic!("expected a resync, got {event:?}");
+        };
+        assert_eq!(id, "conversation");
+        assert_eq!(code, Some(st3_client::ErrorCode::RemoteUnavailable));
+        assert!(
+            message.is_some_and(|message| message.contains("conversation-owner")),
+            "the message names the owner"
+        );
+    }
+
+    #[tokio::test]
     async fn a_gateway_receives_remote_conversation_changes_without_idle_data() {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();

@@ -312,7 +312,13 @@ pub enum CollectionEvent {
         has_more: bool,
     },
     /// Subscribe again: the server could not bring this subscription up to date.
-    Resync { id: String },
+    /// `code` and `message` say why when a temporary failure caused it, such as a conversation
+    /// whose owner cannot be reached; the server keeps retrying.
+    Resync {
+        id: String,
+        code: Option<ErrorCode>,
+        message: Option<String>,
+    },
     /// The subscription failed or ended; the socket and other subscriptions continue.
     Error {
         id: String,
@@ -360,7 +366,17 @@ impl CollectionEvent {
                 has_more: field::<Option<bool>>(&frame, "has_more")?.unwrap_or(false),
                 id,
             }),
-            Some("resync") => Ok(Self::Resync { id }),
+            Some("resync") => Ok(Self::Resync {
+                code: frame
+                    .get("code")
+                    .cloned()
+                    .and_then(|code| serde_json::from_value(code).ok()),
+                message: frame
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                id,
+            }),
             Some("error") => Ok(Self::Error {
                 code: frame
                     .get("code")

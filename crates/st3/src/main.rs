@@ -7298,6 +7298,7 @@ async fn follow_conversation(
         .subscribe_conversation("conversation", target)
         .await?;
     let mut seen = BTreeMap::new();
+    let mut stalled: Option<String> = None;
     loop {
         match stream.next_event().await? {
             None => anyhow::bail!("st closed the conversation stream"),
@@ -7307,6 +7308,7 @@ async fn follow_conversation(
                 items,
                 ..
             }) => {
+                stalled = None;
                 // The first page shows its newest `limit` entries; later pages only what changed.
                 let items = if replace && seen.is_empty() {
                     items[items.len().saturating_sub(limit)..].to_vec()
@@ -7321,6 +7323,18 @@ async fn follow_conversation(
             }
             Some(st3_client::CollectionEvent::Error { message, .. }) => {
                 anyhow::bail!("st could not show this conversation: {message}")
+            }
+            // st retries on its own; say why once, so a quiet follow is not read as a quiet agent.
+            Some(st3_client::CollectionEvent::Resync {
+                code,
+                message: Some(message),
+                ..
+            }) => {
+                let message = st3_client::plain_message(code.as_ref(), &message);
+                if stalled.as_deref() != Some(message.as_str()) {
+                    eprintln!("st: {message} · trying again");
+                    stalled = Some(message);
+                }
             }
             Some(_) => {}
         }
