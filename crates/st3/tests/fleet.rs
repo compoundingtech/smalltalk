@@ -685,6 +685,59 @@ async fn invite_and_join_sync_full_history() {
     }
 }
 
+/// Members have no `[[peers]]`, so a client read to another host's owner state goes through the
+/// relay that dials by the fleet view. Each direction must answer, and a host nobody can reach
+/// must say it has no route rather than that it is temporarily unavailable.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_read_each_others_owner_state_and_unreachable_owners_say_why() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let b = joined(root.path(), &a, "b", &[]).await;
+    let waited = b.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    assert!(waited.contains("first sync verified"), "{waited}");
+    b.wait_listening().await;
+
+    for (from, owner) in [(&a, "b"), (&b, "a")] {
+        let client = Client::unix_as(from.socket(), PERSON).unwrap();
+        let path = format!("/v1/hosts/{owner}/agent-workspace?identity=agent/fleet-test/probe");
+        let mut last = String::new();
+        let mut answered = None;
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
+            match client.get::<Value>(&path).await {
+                Ok(value) => {
+                    answered = Some(value);
+                    break;
+                }
+                Err(error) => last = format!("{error:#}"),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let value = answered.unwrap_or_else(|| {
+            panic!(
+                "{} could not read {owner}'s workspace through the relay: {last}\n{}",
+                from.name,
+                from.logs()
+            )
+        });
+        assert_eq!(value["host_id"], format!("host/{owner}"), "{value}");
+        assert!(value["workspace"].is_string(), "{value}");
+    }
+
+    let client = Client::unix_as(a.socket(), PERSON).unwrap();
+    let error = client
+        .get::<Value>("/v1/hosts/ghost/agent-workspace?identity=agent/fleet-test/probe")
+        .await
+        .unwrap_err();
+    let (status, code, message, details) =
+        st3::client::api_error_parts(&error).unwrap_or_else(|| panic!("{error:#}"));
+    assert_eq!(status, 503, "{message}");
+    assert_eq!(code, "remote-unavailable", "{message}");
+    assert!(!message.contains("temporarily"), "{message}");
+    assert_eq!(details["reason"], "no-route", "{details:?}");
+    assert_eq!(details["owner_host_id"], "host/ghost", "{details:?}");
+}
+
 /// The `sync` object `st replication status` reports for `peer`, or null.
 fn peer_sync(node: &Node, peer: &str) -> Value {
     node.st_json(&["replication", "status"])["peers"]

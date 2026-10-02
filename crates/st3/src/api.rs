@@ -3596,26 +3596,71 @@ async fn forward_client_read(
                 status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::CONFLICT),
                 code: rejected.code.clone(),
                 message: rejected.message.clone(),
-                details: Box::default(),
+                details: Box::new(rejected.details.clone()),
             },
             None => remote_unavailable(&target),
         }
     })
 }
 
+/// A read with no owner to send it to: this node has no relay, or no peer reaches the owner.
 fn remote_unavailable(host: &str) -> ApiError {
+    let mut details = serde_json::Map::new();
+    details.insert("reason".into(), "no-route".into());
+    details.insert("owner_host_id".into(), host.into());
+    details.insert("hops".into(), 0.into());
     ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: "remote-unavailable".into(),
-        message: format!("owner {host} is temporarily unavailable; cached data remains usable"),
-        details: Box::default(),
+        message: format!(
+            "no route to owner {host}: this node cannot dial it and no peer reaches it; cached data remains usable"
+        ),
+        details: Box::new(details),
     }
 }
 
+/// How many nodes the furthest route a read tried handed it to, from the attempts it records.
+fn attempt_hops(attempts: Option<&Value>) -> u64 {
+    attempts.and_then(Value::as_array).map_or(0, |attempts| {
+        attempts
+            .iter()
+            .map(|attempt| 1 + attempt_hops(attempt.get("next")))
+            .max()
+            .unwrap_or(0)
+    })
+}
+
 fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
-    let Some(rejected) = error.downcast_ref::<crate::peer::ClientReadRejected>() else {
-        return remote_unavailable(host);
+    let rejected = match error.downcast::<crate::peer::ClientReadRejected>() {
+        Ok(rejected) => rejected,
+        Err(error) => crate::peer::ClientReadRejected::unreachable(
+            "transport-error",
+            format!("the read to owner {host} failed: {error:#}"),
+        ),
     };
+    let mut details = rejected.details.clone();
+    details
+        .entry("owner_host_id")
+        .or_insert_with(|| host.into());
+    if rejected.code == "remote-unavailable" {
+        let hops = attempt_hops(details.get("attempts"));
+        details.entry("hops").or_insert_with(|| hops.into());
+        let elapsed_ms = details.get("elapsed_ms").and_then(Value::as_u64);
+        tracing::warn!(
+            owner = host,
+            reason = rejected.reason().unwrap_or("unknown"),
+            hops,
+            elapsed_ms,
+            "a client read could not reach its owner: {}",
+            rejected.message
+        );
+        return ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "remote-unavailable".into(),
+            message: rejected.message,
+            details: Box::new(details),
+        };
+    }
     if !matches!(
         rejected.code.as_str(),
         "page-cursor-expired"
@@ -3631,9 +3676,9 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
     }
     ApiError {
         status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-        code: rejected.code.clone(),
-        message: rejected.message.clone(),
-        details: Box::default(),
+        code: rejected.code,
+        message: rejected.message,
+        details: Box::new(details),
     }
 }
 
@@ -12202,25 +12247,56 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
 
     #[test]
     fn owner_cursor_expiry_remains_a_typed_retryable_gateway_error() {
-        let rejected = crate::peer::ClientReadRejected {
-            code: "page-cursor-expired".into(),
-            status: 410,
-            message: "the owner page expired".into(),
-        };
+        let rejected = crate::peer::ClientReadRejected::new(
+            "page-cursor-expired",
+            StatusCode::GONE,
+            "the owner page expired",
+        );
         let error = remote_read_error("host/owner", rejected.into());
         assert_eq!(error.status, StatusCode::GONE);
         assert_eq!(error.code, "page-cursor-expired");
-        let rejected = crate::peer::ClientReadRejected {
-            code: "validation-failed".into(),
-            status: 422,
-            message: "remote terminal input is invalid".into(),
-        };
+        let rejected = crate::peer::ClientReadRejected::new(
+            "validation-failed",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "remote terminal input is invalid",
+        );
         let terminal_error = remote_read_error("host/owner", rejected.into());
         assert_eq!(terminal_error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(terminal_error.code, "validation-failed");
         let unavailable = remote_read_error("host/owner", anyhow::anyhow!("transport down"));
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.code, "remote-unavailable");
+        assert_eq!(unavailable.details["reason"], "transport-error");
+        assert_eq!(unavailable.details["owner_host_id"], "host/owner");
+    }
+
+    #[test]
+    fn an_unreachable_owner_says_why_and_how_far_the_read_got() {
+        let mut rejected = crate::peer::ClientReadRejected::unreachable(
+            "dial-failed",
+            "owner host/owner did not answer from gateway (dial-failed after 1 attempt(s))",
+        );
+        rejected.details.insert(
+            "attempts".into(),
+            json!([{"via": "host/relay", "reason": "dial-failed", "next": [
+                {"via": "host/owner", "reason": "dial-failed"}
+            ]}]),
+        );
+        rejected.details.insert("elapsed_ms".into(), 7.into());
+        let error = remote_read_error("host/owner", rejected.into());
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "remote-unavailable");
+        assert!(!error.message.contains("temporarily"), "{}", error.message);
+        assert_eq!(error.details["reason"], "dial-failed");
+        assert_eq!(error.details["hops"], 2);
+        assert_eq!(error.details["elapsed_ms"], 7);
+        assert_eq!(error.details["owner_host_id"], "host/owner");
+
+        let none = remote_unavailable("host/owner");
+        assert_eq!(none.code, "remote-unavailable");
+        assert_eq!(none.details["reason"], "no-route");
+        assert_eq!(none.details["hops"], 0);
+        assert!(none.message.starts_with("no route to owner host/owner"));
     }
 
     #[test]
