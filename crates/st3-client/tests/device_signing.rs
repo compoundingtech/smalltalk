@@ -260,22 +260,22 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
     // A signed message is written with the phone's signature, and every member verifies it.
     let signature = phone.sign_message(
         &chain,
-        "phone-message-0001",
+        "phone-message-send-1",
         "agent/alder",
         "on my way",
-        "nonce-phone-0001",
+        "nonce-phone-send-1",
         now_ms(),
     );
     send(
         &client,
-        "phone-message-0001",
+        "phone-message-send-1",
         "agent/alder",
         "on my way",
         signature.clone(),
     )
     .await
     .unwrap();
-    let subject = message_subject("phone-message-0001");
+    let subject = message_subject("phone-message-send-1");
     let claim = state
         .store
         .latest_claim(&subject, Some("message.sent"))
@@ -307,7 +307,7 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
     // A retry of the same send gets the first answer.
     send(
         &client,
-        "phone-message-0001",
+        "phone-message-send-1",
         "agent/alder",
         "on my way",
         signature.clone(),
@@ -326,16 +326,16 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
     // What the daemon refuses before writing anything.
     let tampered = phone.sign_message(
         &chain,
-        "phone-message-0002",
+        "phone-message-send-2",
         "agent/alder",
         "on my way",
-        "nonce-phone-0002",
+        "nonce-phone-send-2",
         now_ms(),
     );
     let message = refused(
         send(
             &client,
-            "phone-message-0002",
+            "phone-message-send-2",
             "agent/alder",
             "not what was signed",
             tampered,
@@ -345,16 +345,16 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
     assert!(message.contains("does not match"), "{message}");
     let replayed = phone.sign_message(
         &chain,
-        "phone-message-0003",
+        "phone-message-send-3",
         "agent/alder",
         "again",
-        "nonce-phone-0001",
+        "nonce-phone-send-1",
         now_ms(),
     );
     let message = refused(
         send(
             &client,
-            "phone-message-0003",
+            "phone-message-send-3",
             "agent/alder",
             "again",
             replayed,
@@ -364,41 +364,41 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
     assert!(message.contains("nonce"), "{message}");
     let stale = phone.sign_message(
         &chain,
-        "phone-message-0004",
+        "phone-message-send-4",
         "agent/alder",
         "late",
-        "nonce-phone-0004",
+        "nonce-phone-send-4",
         now_ms() - 60 * 60 * 1000,
     );
-    let message = refused(send(&client, "phone-message-0004", "agent/alder", "late", stale).await);
+    let message = refused(send(&client, "phone-message-send-4", "agent/alder", "late", stale).await);
     assert!(message.contains("15 minutes"), "{message}");
     let loose = phone.sign_message(
         &chain,
-        "phone-message-0005",
+        "phone-message-send-5",
         "alder",
         "hi",
-        "nonce-phone-0005",
+        "nonce-phone-send-5",
         now_ms(),
     );
-    let message = refused(send(&client, "phone-message-0005", "alder", "hi", loose).await);
+    let message = refused(send(&client, "phone-message-send-5", "alder", "hi", loose).await);
     assert!(message.contains("canonically"), "{message}");
     let stranger = Device::new();
     let forged = stranger.sign_message(
         &chain,
-        "phone-message-0006",
+        "phone-message-send-6",
         "agent/alder",
         "hi",
-        "nonce-phone-0006",
+        "nonce-phone-send-6",
         now_ms(),
     );
-    let message = refused(send(&client, "phone-message-0006", "agent/alder", "hi", forged).await);
+    let message = refused(send(&client, "phone-message-send-6", "agent/alder", "hi", forged).await);
     assert!(message.contains("not enrolled"), "{message}");
     for key in [
-        "phone-message-0002",
-        "phone-message-0003",
-        "phone-message-0004",
-        "phone-message-0005",
-        "phone-message-0006",
+        "phone-message-send-2",
+        "phone-message-send-3",
+        "phone-message-send-4",
+        "phone-message-send-5",
+        "phone-message-send-6",
     ] {
         assert!(
             state
@@ -441,10 +441,10 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
     // A message the phone signs after the revocation is written, but its verdict is invalid.
     let late = phone.sign_message(
         &chain,
-        "phone-message-0007",
+        "phone-message-send-7",
         "agent/alder",
         "after",
-        "nonce-phone-0007",
+        "nonce-phone-send-7",
         now_ms(),
     );
     let late: smallclaims::principal::ClaimSignature =
@@ -453,7 +453,7 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
         .store
         .append_signed_claim(
             &st3::model::ClaimInput {
-                subject: message_subject("phone-message-0007"),
+                subject: message_subject("phone-message-send-7"),
                 kind: "message.sent".into(),
                 actor: Some(PERSON.into()),
                 fields: serde_json::from_value(json!({
@@ -463,7 +463,7 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
                 .unwrap(),
                 evidence: Vec::new(),
                 expected_subject: None,
-                idempotency_key: Some("phone-message-0007".into()),
+                idempotency_key: Some("phone-message-send-7".into()),
             },
             &late,
         )
