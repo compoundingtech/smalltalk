@@ -16809,11 +16809,18 @@ fn selected_actual_source_at(
     let Some((selected_id, _, selected_origin, selected_body)) = selected else {
         return Ok((None, None, false));
     };
+    // An origin's newer runtime observation supersedes its older observations. In particular,
+    // its stop must retire its earlier running claim even when the new owner's intent follows
+    // the desired-state branch rather than descending from that runtime branch.
+    let mut observed_origins = BTreeSet::new();
     let rivals = rows
         .iter()
-        .filter(|(id, kind, origin, body)| {
-            kind == "runtime.observed"
-                && id != selected_id
+        .rev()
+        .filter(|(_, kind, origin, _)| {
+            kind == "runtime.observed" && observed_origins.insert(origin.as_str())
+        })
+        .filter(|(id, _, origin, body)| {
+            id != selected_id
                 && origin != selected_origin
                 && !nonowner_terminal_observation(
                     desired_host,
@@ -29431,6 +29438,52 @@ version 2
             status.subjects[0].reason.as_deref(),
             Some("concurrent runtime observations have indeterminate authority")
         );
+    }
+
+    #[test]
+    fn a_rival_origins_latest_observation_determines_runtime_authority() {
+        let subject = "agent/run/worker";
+        for terminal_status in ["stopped", "absent", "exited", "vanished"] {
+            let left = Store::open_memory("left").unwrap();
+            let right = Store::open_memory("right").unwrap();
+            left.set_write_clock_at(1_800_000_000_000).unwrap();
+            right.set_write_clock_at(1_800_000_000_001).unwrap();
+            let observe = |store: &Store, status: &str, host: &str| {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: "runtime.observed".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("status".into(), json!(status)),
+                            ("host".into(), json!(host)),
+                            ("incarnation_id".into(), json!(host)),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap()
+            };
+            observe(&left, "running", "left");
+            observe(&left, terminal_status, "left");
+            // The new owner has no causal path through the old owner's runtime branch.
+            let selected = observe(&right, "running", "right");
+            right.import_replication("left", &left.export_replication(0).unwrap())
+                .unwrap();
+            let view = right.status(Some(subject)).unwrap().subjects.remove(0);
+            assert_eq!(view.actual_claim.as_deref(), Some(selected.id.as_str()));
+            assert_eq!(view.reachability, "reachable", "{terminal_status}: {view:?}");
+            // A later live rival is not hidden by its previous terminal observation.
+            left.set_write_clock_at(1_800_000_000_002).unwrap();
+            observe(&left, "running", "left");
+            right.import_replication("left", &left.export_replication(0).unwrap())
+                .unwrap();
+            assert_eq!(
+                right.status(Some(subject)).unwrap().subjects[0].reachability,
+                "indeterminate"
+            );
+        }
     }
 
     /// A subject's harness reports neither change which observation its status selects nor hide
