@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { FlatList, Keyboard, KeyboardAvoidingView, Platform, Pressable, StyleSheet, View } from 'react-native';
+import { FlatList, Keyboard, KeyboardAvoidingView, Platform, Pressable, StyleSheet, TextInput, View } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -66,6 +66,10 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const [listening, setListening] = useState(false), [heard, setHeard] = useState(''), [levels, setLevels] = useState<number[]>([]);
   const [dictated, setDictated] = useState(false);
   const stopListening = useRef<(() => Promise<string>) | null>(null);
+  const box = useRef<TextInput>(null);
+  /** Empty the message box. Clearing it natively too lets it shrink back to one line; with the
+   * value alone it kept the height of what was sent (Nathan, 2026-10-02). */
+  const emptyBox = () => { setDraft(''); draftCache.current.delete(target); box.current?.clear(); };
   // Leaving the conversation while listening stops it, so the microphone and other audio are freed.
   useEffect(() => () => { const stop = stopListening.current; stopListening.current = null; void stop?.(); }, []);
   const canDictate = useMemo(() => dictationAvailable(), []);
@@ -165,7 +169,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     if (!agent || !text) return;
     const item: Pending = { id: `pending-${Date.now()}`, text, at: nowClock() };
     setPending(previous => [...previous, item]);
-    if (spoken === undefined) { setDraft(''); draftCache.current.delete(target); }
+    if (spoken === undefined) emptyBox();
     // To the newest, where the message appears: animated from nearby, a jump from far up, since an
     // animation across the whole conversation reads as the list scrolling everything again.
     list.current?.scrollToOffset({ offset: 0, animated: offset.current < 1200 });
@@ -192,7 +196,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     setListening(false);
     const words = stop ? (await stop()).trim() : '';
     if (then === 'cancel' || !words) return;
-    if (then === 'send') { await send(draft.trim() ? `${draft.trimEnd()} ${words}` : words); setDraft(''); draftCache.current.delete(target); return; }
+    if (then === 'send') { await send(draft.trim() ? `${draft.trimEnd()} ${words}` : words); emptyBox(); return; }
     const text = draft.trim() ? `${draft.trimEnd()} ${words}` : words;
     setDraft(text); rememberBounded(draftCache.current, target, text, 24);
     setDictated(true);
@@ -203,7 +207,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   useEffect(() => {
     const text = __DEV__ ? process.env.EXPO_PUBLIC_ST3_TEST_SEND : undefined;
     if (!text || !loaded || !agent) return;
-    const typed = setTimeout(() => setDraft(`${text} ${new Date().toISOString().slice(11, 19)}`), 3_000);
+    // `\n` in the variable is a new line, so a recording can show a tall box after a send.
+    const typed = setTimeout(() => setDraft(`${text.replaceAll('\\n', '\n')} ${new Date().toISOString().slice(11, 19)}`), 3_000);
     const sent = setTimeout(() => setDevSend(count => count + 1), 4_500);
     return () => { clearTimeout(typed); clearTimeout(sent); };
   }, [loaded, agent?.id]);
@@ -234,7 +239,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (issue ? `Not loaded yet: ${issue}. Trying again.` : status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 60 }}
       keyboardDismissMode="interactive"
-      keyboardShouldPersistTaps="handled"
+      // A tap on the conversation puts the keyboard away, as in Messages; the next tap acts.
+      keyboardShouldPersistTaps="never"
       onScroll={event => { offset.current = event.nativeEvent.contentOffset.y; setAway(offset.current > 240); }}
       scrollEventThrottle={100}
       contentContainerStyle={{ paddingVertical: 8 }}
@@ -253,6 +259,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       {/* The microphone sits inside the box, at its right edge, over the text's padding. */}
       <View style={{ flex: 1 }}>
         <Field
+          ref={box}
           value={draft}
           onChangeText={text => { setDraft(text); if (text) rememberBounded(draftCache.current, target, text, 24); else draftCache.current.delete(target); }}
           placeholder={`Message ${title}`}
