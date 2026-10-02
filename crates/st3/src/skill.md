@@ -29,9 +29,9 @@ Answer where you were asked: people read st replies in st, not in the agent's se
 `"$ST3_BIN" work ls --as "$ST_AGENT"` lists the steps available to this seat, and
 `work claim STEP --as "$ST_AGENT"` takes one and prints its goals, its constraints, and
 this machine's host facts. `work progress`, `work complete`, `work fail`, and `work release` record
-what happened to a claimed step, each with `--as "$ST_AGENT"`. The seat's driver renews the claim's
-lease while the seat runs. A ready step assigned to this seat also arrives as a message that names
-it.
+what happened to a claimed step, each with `--as "$ST_AGENT"`. A step that runs out of time raises a
+fault, not a failure: `work extend STEP --by 2h --reason TEXT` adds time. The seat's driver renews the claim's
+lease while the seat runs. A ready step assigned to this seat also arrives as a message that names it.
 
 ## Person work
 

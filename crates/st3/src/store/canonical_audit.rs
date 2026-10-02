@@ -117,6 +117,7 @@ fn shared_folds_never_order_by_local_arrival() {
         "claims_page_query",
         "agent_projection_index",
         "work_action",
+        "work_action_extending",
         "events_after_bounded",
         "events_tail_bounded",
         "projection_time_at",
