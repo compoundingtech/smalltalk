@@ -130,6 +130,8 @@ pub enum Effect {
         text: String,
         /// st's message tags, such as `dictated`.
         tags: Vec<String>,
+        /// Images to upload to st and attach (from a paste, a drop or the clipboard).
+        images: Vec<std::path::PathBuf>,
     },
     /// Cancel a mission's latest run.
     CancelRun {
@@ -3589,14 +3591,16 @@ impl Ui {
             self.flash("Write something first");
             return;
         };
-        // Until st carries images, the message names each file; an agent on this machine
-        // reads it there.
+        // Live, the images go to st with the message, so an agent on any machine can read them
+        // (#1078); the demo, which sends nothing, names them.
         if !images.is_empty() {
-            if !draft.is_empty() {
-                draft.push_str("\n\n");
-            }
-            draft.push_str(&attach::mention(&images));
             self.attachments.remove(&id);
+            if !self.live {
+                if !draft.is_empty() {
+                    draft.push_str("\n\n");
+                }
+                draft.push_str(&attach::mention(&images));
+            }
         }
         // The input stays focused after a send; Esc leaves it.
         if self.live {
@@ -3609,6 +3613,7 @@ impl Ui {
                         Vec::new()
                     },
                     text: draft,
+                    images: images.iter().map(|image| image.path.clone()).collect(),
                 }),
                 _ => match self
                     .world

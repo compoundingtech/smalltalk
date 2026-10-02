@@ -861,10 +861,26 @@ pub fn run(context: Context) -> Result<()> {
                 } => {
                     let token = uuid::Uuid::now_v7().to_string();
                     let sent = Arc::new(Mutex::new(None));
+                    let images = match &effect {
+                        Effect::Send { images, .. } => images.len(),
+                        _ => 0,
+                    };
+                    let shown = match (text.is_empty(), images) {
+                        (_, 0) => text.clone(),
+                        (true, count) => {
+                            format!("▣ {count} image{}", if count == 1 { "" } else { "s" })
+                        }
+                        (false, count) => {
+                            format!(
+                                "{text}\n▣ {count} image{}",
+                                if count == 1 { "" } else { "s" }
+                            )
+                        }
+                    };
                     pending.push(Pending {
                         token: token.clone(),
                         agent: agent.clone(),
-                        text: text.clone(),
+                        text: shown,
                         at: chrono::Local::now().format("%H:%M").to_string(),
                         message_id: None,
                         failed: None,
@@ -1354,6 +1370,7 @@ async fn perform(
                 Some(attention.source_id.clone()),
                 None,
                 Vec::new(),
+                Vec::new(),
                 None,
             )
             .await?;
@@ -1374,6 +1391,7 @@ async fn perform(
                 Some(title),
                 None,
                 session,
+                Vec::new(),
                 Vec::new(),
                 sent,
             )
@@ -1471,12 +1489,67 @@ async fn perform(
         Effect::OpenTerminal { .. } | Effect::TerminalKey(_) | Effect::CloseTerminal => {
             Ok((String::new(), None))
         }
-        Effect::Send { agent, text, tags } => {
+        Effect::Send {
+            agent,
+            mut text,
+            tags,
+            images,
+        } => {
             let session = model
                 .agents()
                 .find(|candidate| candidate.header.id == agent)
                 .and_then(|agent| agent.current_session_id.clone());
-            let id = send_message(client, &agent, text, None, None, session, tags, sent).await?;
+            // Each image goes to st first; the message then carries them by reference, and the
+            // bytes reach whichever machine reads them (#1078).
+            let mut attachments = Vec::new();
+            for (index, path) in images.iter().enumerate() {
+                let bytes = std::fs::read(path).map_err(|error| {
+                    anyhow::anyhow!("could not read {}: {error}", path.display())
+                })?;
+                match client
+                    .upload_blob(bytes, super::attach::media_type(path))
+                    .await
+                {
+                    Ok(upload) => attachments.push(st3_client::AttachmentInput {
+                        blob: upload.value.blob,
+                        media_type: upload.value.media_type,
+                        name: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned()),
+                    }),
+                    // An st from before attachments: name the files, as stui did then.
+                    Err(st3_client::ClientError::Api(
+                        st3_client::ErrorCode::NotFound
+                        | st3_client::ErrorCode::UnsupportedCapability,
+                        ..,
+                    )) => {
+                        let rest = images[index..]
+                            .iter()
+                            .filter_map(|path| {
+                                super::attach::from_path(&path.display().to_string())
+                            })
+                            .collect::<Vec<_>>();
+                        if !text.is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        text.push_str(&super::attach::mention(&rest));
+                        break;
+                    }
+                    Err(error) => anyhow::bail!("the image was not sent: {}", error.plain()),
+                }
+            }
+            let id = send_message(
+                client,
+                &agent,
+                text,
+                None,
+                None,
+                session,
+                tags,
+                attachments,
+                sent,
+            )
+            .await?;
             Ok(("Message sent".into(), id))
         }
     }
@@ -1493,6 +1566,7 @@ async fn send_message(
     in_reply_to: Option<String>,
     session_id: Option<String>,
     tags: Vec<String>,
+    attachments: Vec<st3_client::AttachmentInput>,
     sent: Option<&Mutex<Option<Sent>>>,
 ) -> Result<Option<String>> {
     let parameters = MessageSendParameters {
@@ -1502,7 +1576,7 @@ async fn send_message(
         in_reply_to,
         session_id,
         tags,
-        attachments: Vec::new(),
+        attachments,
         signature: None,
     };
     let message_id = |result: st3_client::Envelope<st3_client::ActionResult>| {

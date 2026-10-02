@@ -268,7 +268,23 @@ fn png_size(path: &Path) -> Option<(u32, u32)> {
     Some((number(16), number(20)))
 }
 
-/// The message text an agent reads for its attachments, until st carries them itself.
+/// An image file's media type, by its extension: one st accepts (png, jpeg, gif, webp).
+pub fn media_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "image/png",
+    }
+}
+
+/// The message text an agent reads for its attachments, where st cannot carry them (an st from
+/// before message attachments).
 pub fn mention(attachments: &[Attachment]) -> String {
     attachments
         .iter()
