@@ -12932,6 +12932,16 @@ async fn drive_st2_native(
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
     let mut replacement = DriverReplacement::new();
     let mut binding_watch = ClaudeBindingWatch::default();
+    // Claude's hooks keep the subagent ledger; this driver records it on the seat.
+    let mut subagents = (driver == "claude").then(|| {
+        st3::subagents::Publisher::start(
+            subject,
+            driver,
+            &incarnation,
+            &agent_dir,
+            st_drivers::subagents::now_ms(),
+        )
+    });
     loop {
         tokio::select! {
             frame = mailbox.recv() => {
@@ -12952,6 +12962,15 @@ async fn drive_st2_native(
                     loop_state = resume.loop_state;
                     task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
                     continue;
+                }
+                // The harness is gone, and its subagents with it. The reconciler ends any this
+                // cannot record once it sees the runtime exit.
+                if let Some(subagents) = subagents.as_mut() {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        subagents.end_all(client, "harness-exited", "its harness exited"),
+                    )
+                    .await;
                 }
                 loop {
                     let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
@@ -13185,6 +13204,11 @@ async fn drive_st2_native(
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+                if let Some(subagents) = subagents.as_mut()
+                    && let Err(error) = subagents.tick(client).await
+                {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 replacement.check();

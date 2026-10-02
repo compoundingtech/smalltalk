@@ -85,8 +85,12 @@ mod attention_snapshot;
 mod checkpoint_rules;
 mod limits;
 mod person_work;
+mod subagents;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
 pub use limits::{AccountLimit, LIMITS_ACTOR, LimitsOutcome, LimitsPolicy};
+pub use subagents::{
+    EndedSubagent, SUBAGENT_KINDS, SUBAGENT_LEASE_MS, SubagentSweep, SubagentView,
+};
 #[cfg(test)]
 mod checkpoint_agreement_tests;
 #[cfg(test)]
@@ -175,6 +179,12 @@ WHERE kind IN ('work.progress', 'work.submitted');
 CREATE INDEX IF NOT EXISTS claims_actor_work_activity_index
 ON claims(actor, json_extract(body, '$.fields.claim_incarnation'), store_index)
 WHERE kind IN ('work.claimed', 'work.progress');
+CREATE INDEX IF NOT EXISTS claims_subagent_index
+ON claims(subject, kind, json_extract(body, '$.fields.subagent_id'))
+WHERE kind IN ('subagent.appeared', 'subagent.renewed', 'subagent.ended');
+CREATE INDEX IF NOT EXISTS claims_subagent_origin_index
+ON claims(origin, store_index)
+WHERE kind='subagent.appeared';
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
@@ -12404,6 +12414,9 @@ impl Store {
                 | "work.submitted"
                 | "work.failed"
                 | "work.released"
+                | "subagent.appeared"
+                | "subagent.renewed"
+                | "subagent.ended"
         )
     }
 
@@ -12415,7 +12428,7 @@ impl Store {
         let connection = self.readers.get();
         let (total, other): (u64, u64) = connection.query_row(
             "SELECT COUNT(*), COUNT(*) FILTER (
-                 WHERE kind NOT IN ('harness.usage', 'work.renewed')
+                 WHERE kind NOT IN ('harness.usage', 'work.renewed', 'subagent.renewed')
                    AND NOT (
                      kind IN ('message.sent', 'message.staged', 'message.delivered',
                               'message.read', 'message.closed')
@@ -42197,6 +42210,9 @@ pub(crate) fn append_claim_fenced_outcome(
                 && input.fields.get("legacy_adoption") == Some(&Value::Bool(true))
                 && let Some(existing) = latest_claim_of_kind_tx(transaction, &input.subject, "delivery.hold")?
             {
+                return Ok((existing, false));
+            }
+            if let Some(existing) = subagents::check_subagent_claim_tx(transaction, input)? {
                 return Ok((existing, false));
             }
             for evidence in &input.evidence {

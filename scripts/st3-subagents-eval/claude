@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""A stand-in `claude` that runs subagents the way Claude reports them to its hooks, with no model.
+
+It runs every hook command from the `--settings` JSON st passes (through `bash -c`, with the hook
+payload on stdin), as Claude does, and writes Claude-format transcripts beneath
+~/.claude/projects. The eval drives it through control.jsonl in its workspace, one JSON operation
+per line, applied in order:
+
+- `spawn` {id, type, description, prompt_id?}: PreToolUse for the Agent tool, SubagentStart, and
+  the subagent's transcript and meta file beside the session transcript.
+- `finish` {id, responses}: one assistant response per entry ({output} tokens) in the subagent's
+  transcript, then SubagentStop.
+- `phantom`: the SubagentStop Claude sends after a turn for an agent that never ran.
+- `turn-end` {running}: Stop, listing the given subagents as running background tasks.
+- `session-start` / `session-end` {reason}: a new session, or the end of this one.
+- `claim-ready`: claim the first ready step offered to this seat.
+
+Every operation is appended to receipts.jsonl. The workspace's control.offset survives a restart,
+so a new incarnation never replays an operation.
+"""
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+WORKSPACE = Path.cwd()
+RECEIPTS = WORKSPACE / "receipts.jsonl"
+CONTROL = WORKSPACE / "control.jsonl"
+OFFSET = WORKSPACE / "control.offset"
+
+
+def receipt(event, **fields):
+    with RECEIPTS.open("a") as stream:
+        stream.write(json.dumps({"event": event, "at": time.time(), "pid": os.getpid(), **fields}) + "\n")
+
+
+def option(argv, name):
+    for index, argument in enumerate(argv):
+        if argument == name and index + 1 < len(argv):
+            return argv[index + 1]
+        if argument.startswith(name + "="):
+            return argument.split("=", 1)[1]
+    return None
+
+
+def stamp():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+argv = sys.argv[1:]
+if argv[:1] in (["plugin"], ["mcp"]) or "--version" in argv:
+    sys.exit(1)
+settings = json.loads(option(argv, "--settings") or "{}")
+receipt("started", argv=argv)
+
+cwd = str(WORKSPACE)
+projects = Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+projects.mkdir(parents=True, exist_ok=True)
+session_id = str(uuid.uuid4())
+running = {}
+
+
+def transcript():
+    return projects / f"{session_id}.jsonl"
+
+
+def subagent_transcript(agent_id):
+    return projects / session_id / "subagents" / f"agent-{agent_id}.jsonl"
+
+
+def append(path, row):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as stream:
+        stream.write(json.dumps(row) + "\n")
+
+
+def hooks(event, payload):
+    base = {"session_id": session_id, "transcript_path": str(transcript()), "cwd": cwd,
+            "hook_event_name": event}
+    for group in settings.get("hooks", {}).get(event, []):
+        for hook in group.get("hooks", []):
+            result = subprocess.run(["bash", "-c", hook["command"]], input=json.dumps({**base, **payload}),
+                                    capture_output=True, text=True, timeout=60)
+            receipt("hook", hook_event=event, exit=result.returncode, stderr=result.stderr[-2000:])
+
+
+def start_session(source):
+    global session_id
+    session_id = str(uuid.uuid4())
+    append(transcript(), {"type": "user", "uuid": str(uuid.uuid4()), "timestamp": stamp(),
+                          "sessionId": session_id, "cwd": cwd,
+                          "message": {"role": "user", "content": "subagents probe"}})
+    hooks("SessionStart", {"source": source, "model": "claude-stub-model"})
+
+
+def spawn(op):
+    agent_id, kind = op["id"], op.get("type", "general-purpose")
+    prompt_id = op.get("prompt_id", "prompt-1")
+    tool_use_id = "toolu_" + uuid.uuid4().hex[:20]
+    tool_input = {"description": op.get("description", "stand-in work"), "subagent_type": kind,
+                  "prompt": "a private prompt that stays on the host"}
+    hooks("PreToolUse", {"prompt_id": prompt_id, "tool_name": "Agent", "tool_input": tool_input,
+                         "tool_use_id": tool_use_id, "permission_mode": "default"})
+    hooks("SubagentStart", {"prompt_id": prompt_id, "agent_id": agent_id, "agent_type": kind})
+    path = subagent_transcript(agent_id)
+    append(path, {"type": "user", "isSidechain": True, "agentId": agent_id, "timestamp": stamp(),
+                  "message": {"role": "user", "content": tool_input["prompt"]}})
+    # Claude writes the meta file just after the start hook; the stand-in does the same.
+    (path.parent / f"agent-{agent_id}.meta.json").write_text(json.dumps({
+        "agentType": kind, "description": tool_input["description"], "toolUseId": tool_use_id}))
+    running[agent_id] = kind
+
+
+def finish(op):
+    agent_id = op["id"]
+    kind = running.pop(agent_id, op.get("type", "general-purpose"))
+    path = subagent_transcript(agent_id)
+    for index, response in enumerate(op.get("responses", [])):
+        message = {"id": f"msg_{agent_id}_{index}", "model": "claude-stub-model", "role": "assistant",
+                   "content": [{"type": "text", "text": "stand-in answer"}],
+                   "usage": {"input_tokens": response.get("input", 10),
+                             "output_tokens": response.get("output", 1),
+                             "cache_creation_input_tokens": response.get("cache_write", 0),
+                             "cache_read_input_tokens": response.get("cached", 0)}}
+        # Claude writes a response's usage on its partial line too; only the last one counts.
+        partial = {**message, "usage": {**message["usage"], "output_tokens": 1}}
+        for body in (partial, message):
+            append(path, {"type": "assistant", "isSidechain": True, "agentId": agent_id,
+                          "timestamp": stamp(), "message": body})
+    hooks("SubagentStop", {"prompt_id": "prompt-1", "agent_id": agent_id, "agent_type": kind,
+                           "stop_hook_active": False, "agent_transcript_path": str(path),
+                           "last_assistant_message": "stand-in answer",
+                           "background_tasks": [{"id": other, "type": "subagent", "status": "running",
+                                                 "agent_type": other_kind}
+                                                for other, other_kind in running.items()]})
+
+
+def apply(op):
+    name = op["op"]
+    if name == "spawn":
+        spawn(op)
+    elif name == "spawn-many":
+        for index in range(op["count"]):
+            spawn({**op, "id": f"{op['prefix']}{index}"})
+    elif name == "finish":
+        finish(op)
+    elif name == "finish-many":
+        for index in range(op["count"]):
+            finish({**op, "id": f"{op['prefix']}{index}"})
+    elif name == "phantom":
+        hooks("SubagentStop", {"agent_id": uuid.uuid4().hex[:17], "agent_type": "",
+                               "stop_hook_active": False})
+    elif name == "turn-end":
+        hooks("Stop", {"stop_hook_active": False, "last_assistant_message": "done",
+                       "background_tasks": [{"id": agent_id, "type": "subagent", "status": "running",
+                                             "agent_type": running.get(agent_id, "general-purpose")}
+                                            for agent_id in op.get("running", [])]})
+    elif name == "session-end":
+        hooks("SessionEnd", {"reason": op.get("reason", "other")})
+    elif name == "session-start":
+        start_session(op.get("source", "clear"))
+    elif name == "claim-ready":
+        listed = subprocess.run([os.environ["ST3_BIN"], "work", "ls", "--as", os.environ["ST_AGENT"], "--json"],
+                                capture_output=True, text=True, timeout=60)
+        items = json.loads(listed.stdout or "{}").get("value", {}).get("items", [])
+        ready = [item["id"] for item in items if item.get("state") == "ready"]
+        if not ready:
+            raise RuntimeError(f"no ready step: {listed.stdout[-1000:]} {listed.stderr[-1000:]}")
+        claimed = subprocess.run([os.environ["ST3_BIN"], "work", "claim", ready[0], "--as",
+                                  os.environ["ST_AGENT"]], capture_output=True, text=True, timeout=60)
+        if claimed.returncode:
+            raise RuntimeError(claimed.stderr[-1000:])
+        receipt("claimed", step=ready[0])
+    else:
+        raise RuntimeError(f"unknown operation {name}")
+
+
+stopping = False
+
+
+def stop(*_):
+    global stopping
+    stopping = True
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGHUP, stop)
+start_session("startup")
+receipt("ready", session=session_id)
+offset = int(OFFSET.read_text()) if OFFSET.exists() else 0
+while not stopping:
+    lines = CONTROL.read_text().splitlines() if CONTROL.exists() else []
+    while offset < len(lines) and not stopping:
+        op = json.loads(lines[offset])
+        try:
+            apply(op)
+            receipt("applied", op=op, session=session_id)
+        except Exception as error:  # noqa: BLE001 - every failure is evidence
+            receipt("failed", op=op, error=str(error))
+        offset += 1
+        OFFSET.write_text(str(offset))
+    time.sleep(0.2)
+receipt("ended")
