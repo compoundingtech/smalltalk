@@ -101,10 +101,12 @@ pub enum Update {
         has_more: bool,
         items: Vec<TimelineEntry>,
     },
-    /// st could not show the open conversation; the feed asks again after a backoff.
+    /// st could not show the open conversation; the feed asks again after a backoff, unless
+    /// st said it never can (`permanent`).
     ConversationFailed {
         target: String,
         message: String,
+        permanent: bool,
     },
 }
 
@@ -424,11 +426,14 @@ async fn connected(
                     CollectionEvent::Error { id, code, message } if id.starts_with(CONVERSATION) => {
                         let message = st3_client::plain_message(code.as_ref(), &message);
                         let Some(current) = conversing.iter_mut().find(|current| current.id == id) else { continue };
-                        // Anything may clear: the agent starts, its host comes back, its
+                        let permanent = !conversation_may_clear(code.as_ref());
+                        // Anything else may clear: the agent starts, its host comes back, its
                         // history arrives. Ask again after a backoff.
-                        current.retry_at = Some(Instant::now() + RETRY_DELAYS[current.failures.min(RETRY_DELAYS.len() - 1)]);
-                        current.failures += 1;
-                        if updates.send(Update::ConversationFailed { target: current.target.clone(), message }).is_err() {
+                        if !permanent {
+                            current.retry_at = Some(Instant::now() + RETRY_DELAYS[current.failures.min(RETRY_DELAYS.len() - 1)]);
+                            current.failures += 1;
+                        }
+                        if updates.send(Update::ConversationFailed { target: current.target.clone(), message, permanent }).is_err() {
                             return Ended::Closed;
                         }
                     }
@@ -790,6 +795,12 @@ async fn resolve(client: &Client, runtime_ids: &[String]) -> Result<(String, Str
     Err("that agent has no terminal right now".into())
 }
 
+/// Whether a refused conversation may load if asked again. Only st's word that it keeps no
+/// start for the transcript (`timeline-history-incomplete`) is final: asking again cannot help.
+fn conversation_may_clear(code: Option<&ErrorCode>) -> bool {
+    !matches!(code, Some(ErrorCode::TimelineHistoryIncomplete))
+}
+
 /// How many times a fenced terminal request is tried while it races a busy store.
 const FENCE_TRIES: u32 = 8;
 
@@ -949,6 +960,21 @@ mod tests {
                 details: Default::default(),
             }),
         )
+    }
+
+    #[test]
+    fn only_incomplete_history_stops_a_conversation_retrying() {
+        assert!(!conversation_may_clear(Some(
+            &ErrorCode::TimelineHistoryIncomplete
+        )));
+        for code in [
+            ErrorCode::CursorGap,
+            ErrorCode::StaleFence,
+            ErrorCode::NotFound,
+        ] {
+            assert!(conversation_may_clear(Some(&code)), "{code:?}");
+        }
+        assert!(conversation_may_clear(None));
     }
 
     #[test]
