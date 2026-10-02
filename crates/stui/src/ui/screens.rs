@@ -1236,9 +1236,19 @@ pub fn mission_order(world: &World, system: bool) -> Vec<&Mission> {
     missions
 }
 
-/// Missions a person rarely looks for: st's own, and ones nobody has started. `x` shows them.
+/// Missions a person rarely looks for: st's own, ones nobody has started, and failures from before
+/// today, which age out of the list (Nathan, 2026-10-02). `x` shows them.
 fn hidden_by_default(mission: &Mission) -> bool {
-    mission.system || mission.word == Word::NotStarted
+    mission.system || mission.word == Word::NotStarted || failed_before_today(mission)
+}
+
+/// A failed mission whose last change was before today, on this machine's clock. A failure with
+/// no known time stays in view.
+fn failed_before_today(mission: &Mission) -> bool {
+    mission.word == Word::Failed
+        && chrono::DateTime::parse_from_rfc3339(&mission.updated_at).is_ok_and(|at| {
+            at.with_timezone(&chrono::Local).date_naive() < chrono::Local::now().date_naive()
+        })
 }
 
 pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> Listing {
@@ -1307,6 +1317,10 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
             (
                 count(|mission| !mission.system && mission.word == Word::NotStarted),
                 "not started",
+            ),
+            (
+                count(|mission| !mission.system && failed_before_today(mission)),
+                "failed before today",
             ),
         ]
         .into_iter()
