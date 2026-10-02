@@ -2370,6 +2370,7 @@ impl Ui {
         inner.section("keys", None, w);
         for (key, meaning) in [
             ("1-5 or click", "switch tabs"),
+            ("ctrl+h", "Home (in a text box it is backspace)"),
             ("↑↓ j k or click", "select in the list"),
             ("wheel pgup pgdn", "scroll the pane under the pointer"),
             ("end", "jump to the newest message and follow it"),
@@ -2724,6 +2725,10 @@ impl Ui {
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
+            // Ctrl+H is Home; in a text box it stays backspace.
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.switch_tab(0)
+            }
             KeyCode::Char('?') => self.help = true,
             // Without Ctrl: Ctrl+5 is how terminals send Ctrl+], which attaches.
             KeyCode::Char(digit @ '1'..='5') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3474,6 +3479,11 @@ impl Ui {
                     self.effects.push(effect);
                     self.conversation_state.drafts.remove(&id);
                     self.follow_latest();
+                    // An answer on Home is done: the next item opens closed, so it does not
+                    // take the keys (Nathan, 2026-10-02). A conversation keeps its input.
+                    if self.tab != 1 {
+                        self.editing = false;
+                    }
                     self.flash("Sending…");
                 }
                 None => self.flash("This needs the st CLI for now"),
@@ -4512,6 +4522,49 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn answering_a_request_leaves_the_next_one_closed() {
+        let mut world = demo::world();
+        let asks = |id: &str| Attention {
+            id: id.into(),
+            tier: Tier::Stopped,
+            title: "Merge the three PRs?".into(),
+            waiting: Some("Planner on lark".into()),
+            age: "2m".into(),
+            mission: None,
+            agent: Some("agent/example/planner".into()),
+            kind: AttentionKind::Request {
+                from: "Planner".into(),
+                from_id: "agent/example/planner".into(),
+                question: "Answer yes and I land them.".into(),
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, asks("attention/request-one"));
+            items.insert(1, asks("attention/request-two"));
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let request = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/request-one")
+            .expect("the request is listed");
+        ui.selected[0] = request;
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(ui.editing, "c opens the answer box");
+        for letter in "fine".chars() {
+            ui.key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+        }
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!ui.editing, "the answer is sent and the box closes");
     }
 
     #[test]
