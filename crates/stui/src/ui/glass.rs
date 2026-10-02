@@ -1499,16 +1499,19 @@ impl Ui {
         true
     }
 
-    /// Home over the glass: its list and cards, as large as the glass allows, keys and all.
+    /// Home over the glass: its list and cards, keys and all, inset from the edges with the glass
+    /// dimmed behind it so it reads as floating (Nathan, 2026-10-02).
     fn draw_home_popover(&self, buf: &mut Buffer, body: Rect) {
-        let rect = Rect {
-            x: body.x + 2,
-            y: body.y + 1,
-            width: body.width.saturating_sub(4),
-            height: body.height.saturating_sub(2),
-        };
+        let rect = home_popover_rect(body);
         if rect.width < 30 || rect.height < 8 {
             return;
+        }
+        for y in body.y..body.y + body.height {
+            for x in body.x..body.x + body.width {
+                if !rect.contains((x, y).into()) {
+                    buf[(x, y)].set_fg(theme::SURFACE2).set_bg(theme::CRUST);
+                }
+            }
         }
         buf.set_style(rect, Style::default().bg(theme::BASE).fg(theme::TEXT));
         for y in rect.y..rect.y + rect.height {
@@ -2245,6 +2248,7 @@ impl Ui {
         {
             match key.code {
                 KeyCode::Esc => self.close_home(),
+                KeyCode::Char('h') if control => self.close_home(),
                 KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
                 _ => return false,
             }
@@ -2272,6 +2276,14 @@ impl Ui {
         match key.code {
             KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
             KeyCode::Char('s') if control => self.toggle_sidebar(),
+            // Home over the glass, and away again; in a text box Ctrl+H stays backspace.
+            KeyCode::Char('h') if control => {
+                if self.home_open() {
+                    self.close_home();
+                } else {
+                    self.open_home();
+                }
+            }
             KeyCode::Char('t') if control => self.open_palette(None, Open::Tab),
             KeyCode::Char('v') if control => self.split_group(Side::Right),
             KeyCode::Char('x') if control => self.split_group(Side::Below),
@@ -3194,6 +3206,19 @@ pub(crate) fn pane_for(id: &str) -> Option<Pane> {
         Some(Pane::Machine(Some(id)))
     } else {
         None
+    }
+}
+
+/// Where Home floats over a glass of this size: a margin that grows with the glass, from 2 columns
+/// and 1 row on a small one up to 8 columns and 3 rows.
+fn home_popover_rect(body: Rect) -> Rect {
+    let side = (body.width / 12).clamp(2, 8);
+    let top = (body.height / 12).clamp(1, 3);
+    Rect {
+        x: body.x + side,
+        y: body.y + top,
+        width: body.width.saturating_sub(side * 2),
+        height: body.height.saturating_sub(top * 2),
     }
 }
 
@@ -4532,6 +4557,26 @@ mod tests {
             "{:?}",
             ui.effects
         );
+    }
+
+    #[test]
+    fn home_floats_clear_of_the_edges() {
+        let wide = home_popover_rect(Rect::new(0, 1, 200, 50));
+        assert_eq!((wide.x, wide.y, wide.width, wide.height), (8, 4, 184, 44));
+        let small = home_popover_rect(Rect::new(0, 1, 80, 24));
+        assert_eq!(
+            (small.x, small.y, small.width, small.height),
+            (6, 3, 68, 20)
+        );
+    }
+
+    #[test]
+    fn ctrl_h_opens_home_and_closes_it_again() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'h');
+        assert!(ui.home_open());
+        ctrl(&mut ui, 'h');
+        assert!(!ui.home_open());
     }
 
     #[test]

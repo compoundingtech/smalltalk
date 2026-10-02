@@ -231,14 +231,14 @@ function useAppStore() {
       return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary } }); });
     },
     /** Send Small Talk to an agent, as stui does: fenced to a fresh snapshot, once more if it moved. */
-    async send(to: string, content: string, sessionId?: string): Promise<string | null> {
+    async send(to: string, content: string, sessionId?: string, tags?: string[]): Promise<string | null> {
       if (!client) return 'not connected';
       if (status !== 'online') return 'offline';
       try {
         // Each try is a new request on a fresh fence, made only after st said the last applied nothing.
         await retryTransient(8, async () => {
           const id = actionId();
-          await client.messageSend({ id, idempotency_key: id, fence: await fence(), parameters: { to, content, ...(sessionId ? { session_id: sessionId } : {}) } });
+          await client.messageSend({ id, idempotency_key: id, fence: await fence(), parameters: { to, content, ...(sessionId ? { session_id: sessionId } : {}), ...(tags?.length ? { tags } : {}) } });
         }, notApplied);
         return null;
       } catch (e) { return errorText(e); }

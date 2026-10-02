@@ -1,9 +1,10 @@
 {
   "expo": {
-    "name": "Smalltalk Starter",
+    "name": "smalltalk",
     "slug": "smalltalk-starter",
     "version": "0.1.0",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "plugins": [
       [
@@ -41,7 +42,9 @@
             }
           }
         },
-        "NSLocalNetworkUsageDescription": "Smalltalk connects to your paired st gateway on your local network when you enter a .local name or private LAN address."
+        "NSLocalNetworkUsageDescription": "Smalltalk connects to your paired st gateway on your local network when you enter a .local name or private LAN address.",
+        "NSMicrophoneUsageDescription": "Small Talk listens while you dictate a message, and transcribes it on this phone.",
+        "NSSpeechRecognitionUsageDescription": "Small Talk transcribes your dictated messages on this phone."
       }
     }
   }

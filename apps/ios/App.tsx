@@ -24,7 +24,7 @@ import { AttentionScreen, HomeScreen } from './screens/Home';
 import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from './screens/Missions';
 import { SelectTextScreen } from './screens/SelectText';
 import { TerminalScreen } from './screens/Terminal';
-import { GlassesScreen } from './screens/Glasses';
+import { GlassesScreen, SpaceScreen } from './screens/Glasses';
 
 // The chrome is native: one UITabBarController (react-native-screens' tabs, through
 // @react-navigation/bottom-tabs' native navigator) holding a UINavigationController per tab
@@ -57,6 +57,7 @@ function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
     {tab === 'Glasses'
       ? <Stack.Screen name="GlassesRoot" component={GlassesScreen} options={{ title: 'Spaces' }} />
       : <Stack.Screen name={ROOTS[tab] as keyof typeof ROOT_SCREENS} component={ROOT_SCREENS[ROOTS[tab] as keyof typeof ROOT_SCREENS]} options={{ title: tab }} />}
+    <Stack.Screen name="Space" component={SpaceScreen} options={{ title: 'Space' }} />
     <Stack.Screen name="Conversation" component={ConversationScreen} options={{ title: 'Conversation' }} />
     <Stack.Screen name="SelectText" component={SelectTextScreen} options={{ title: 'Select text', presentation: 'formSheet', sheetAllowedDetents: [0.6, 1], sheetGrabberVisible: true }} />
     <Stack.Screen name="Terminal" component={TerminalScreen} options={{ title: 'Terminal', contentStyle: { backgroundColor: theme.crust } }} />
@@ -129,10 +130,8 @@ function Main() {
     screenOptions={({ route }) => ({
       headerShown: false,
       tabBarActiveTintColor: theme.accent,
-      // Glasses: two rounded-rect panes and a two-line bridge, drawn as a template so it takes the tab's tint.
-      tabBarIcon: route.name === 'Glasses'
-        ? { type: 'image', source: require('./assets/icons/glasses.png'), tinted: true }
-        : { type: 'sfSymbol', name: ICONS[route.name as Tab] as never },
+      // Spaces: one rounded rect, as stui's ▢.
+      tabBarIcon: { type: 'sfSymbol', name: (route.name === 'Glasses' ? 'app' : ICONS[route.name as Tab]) as never },
       tabBarStyle: { display: tabBarHidden(route) ? 'none' : 'flex' },
     })}
   >
