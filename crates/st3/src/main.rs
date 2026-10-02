@@ -14288,7 +14288,9 @@ async fn run_pi_channel(
                     if !state.first_idle_seen {
                         break;
                     }
-                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
+                    // A prior incarnation's handoff is not proof that the model consumed mail.
+                    // The incarnation-local set survives channel reexec and prevents repeats here.
+                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
                     if state.retry_after_ms.get(&message.subject).is_some_and(|after|
                         current_unix_ms().unwrap_or_default() < u128::from(*after)) {
                         continue;
@@ -15716,12 +15718,8 @@ impl NativeMailbox {
                     mailbox_receipt(client, &self.fence, &view.subject, "read").await?;
                     return Ok(());
                 }
-                // Delivery is durable handoff evidence, including mail handed to the legacy
-                // provider turn before the push ledger used graph subjects as its keys.
-                if view.status == "delivered" {
-                    self.queued.remove(&view.subject);
-                    return Ok(());
-                }
+                // Reoffer delivered-unread mail under its stable key. The provider ledger
+                // reconciles native consumption and uncertain handoffs before any reinjection.
                 if view.status == "sent" {
                     let staged =
                         mailbox_receipt_claim(client, &self.fence, &view.subject, "staged").await?;
@@ -16005,7 +16003,7 @@ async fn forward_projected_messages_reporting(
                 consumed_by_recipient.insert(message.subject);
                 continue;
             }
-            if !matches!(message.status.as_str(), "sent" | "staged") {
+            if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") {
                 continue;
             }
             // One message that cannot be forwarded, such as a document missing on this host, is
@@ -16888,7 +16886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_mailbox_upgrade_does_not_queue_legacy_delivered_mail_or_acknowledge_it_as_read()
+    async fn native_mailbox_replays_delivered_unread_but_never_queues_read_or_closed_mail()
     {
         // The two providers share this pump but load their own native receipt ledgers.
         for driver in ["codex", "opencode"] {
@@ -16901,7 +16899,7 @@ mod tests {
                 subject: "message/legacy".into(),
                 from: "person/eval".into(),
                 to: "agent/eval.worker".into(),
-                content: "doc/unavailable@hash".into(),
+                content: "Recovered signal".into(),
                 status: "delivered".into(),
                 title: None,
                 in_reply_to: None,
@@ -16915,15 +16913,16 @@ mod tests {
                 queued: BTreeMap::new(),
                 replayed: true,
             };
-            // Even a previously cached body must leave the fresh-handoff queue when delivery lands.
-            mailbox.queued.insert(
-                view.subject.clone(),
-                native_queued_message(&view, "Cached signal".into()),
-            );
             view.subject = "message/pending".into();
             view.status = "staged".into();
             view.content = "Fresh signal".into();
             mailbox.messages.push(view.clone());
+            for status in ["read", "closed"] {
+                let mut settled = view.clone();
+                settled.subject = format!("message/{status}");
+                settled.status = status.into();
+                mailbox.messages.push(settled);
+            }
             for _ in 0..3 {
                 let receipts = if driver == "codex" {
                     NativeDeliveryReceipts::Codex {
@@ -16938,20 +16937,16 @@ mod tests {
                         runtime_id: "worker",
                     }
                 };
-                // An absent daemon makes any accidental body fetch, staging or fabricated read fail.
+                // Replay requires no backward staging or invented consumption receipt.
                 mailbox.pump(&client, &agent_dir, receipts).await.unwrap();
                 let queued = st_drivers::push_mailbox::messages(
                     &agent_dir,
                     &agent_dir.join("resources/inbox"),
                 )
                 .unwrap();
-                assert_eq!(queued.len(), 1, "{driver}");
-                assert_eq!(queued[0].filename, "message/pending");
-                assert!(st_drivers::push_mailbox::is_unread(
-                    &agent_dir,
-                    "message/legacy",
-                    &queued
-                ));
+                let mut ids = queued.iter().map(|message| message.filename.as_str()).collect::<Vec<_>>();
+                ids.sort_unstable();
+                assert_eq!(ids, ["message/legacy", "message/pending"], "{driver}");
             }
             assert!(!agent_dir.join("resources").exists());
         }
@@ -20363,6 +20358,85 @@ mission "review" state="ready" {
         .unwrap();
         assert!(!inbox.join(&filename).exists());
         assert!(archive.join(filename).is_file());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_native_mailbox_replays_delivered_unread_once_and_keeps_read_closed_final() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_memory("replay").unwrap());
+        let seat = "agent/eval.worker";
+        for final_status in ["delivered", "read", "closed"] {
+            let subject = format!("message/{final_status}");
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/eval".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!("person/eval")),
+                        ("to".into(), json!(seat)),
+                        ("content".into(), json!("Recovered brief")),
+                        ("status".into(), json!("sent")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            for status in ["delivered", "read", "closed"] {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: subject.clone(),
+                        kind: format!("message.{status}"),
+                        actor: Some(seat.into()),
+                        fields: BTreeMap::from([("status".into(), json!(status))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                if status == final_status {
+                    break;
+                }
+            }
+        }
+        let (client, server) = serve_test_store(store.clone(), root.path(), "replay").await;
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+        let mut first_filename = None;
+        for _ in 0..3 {
+            forward_projected_messages(
+                &client,
+                seat,
+                &inbox,
+                &archive,
+                "app-server",
+                NativeDeliveryReceipts::Codex {
+                    state_dir: root.path(),
+                    identity: "eval.worker",
+                    runtime_id: "worker",
+                },
+            )
+            .await
+            .unwrap();
+            let messages = st_drivers::message::list_dir(&inbox).unwrap();
+            let subjects = messages
+                .iter()
+                .flat_map(|message| &message.tags)
+                .filter_map(|tag| tag.strip_prefix("st3-message:"))
+                .collect::<Vec<_>>();
+            assert_eq!(subjects, ["message/delivered"]);
+            let filename = &messages[0].filename;
+            if let Some(first) = &first_filename {
+                assert_eq!(filename, first, "replay must retain the native handoff identity");
+            } else {
+                first_filename = Some(filename.clone());
+            }
+        }
+        assert_eq!(store.message("message/delivered").unwrap().unwrap().status, "delivered");
+        assert_eq!(store.message("message/read").unwrap().unwrap().status, "read");
+        assert_eq!(store.message("message/closed").unwrap().unwrap().status, "closed");
         server.abort();
     }
 

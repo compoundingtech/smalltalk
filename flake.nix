@@ -882,6 +882,7 @@
                 --outfile=hooks/typecheck/smoke-out/st-$harness-channel.mjs
               ${pkgs.nodejs}/bin/node hooks/typecheck/st-smoke.mjs $harness hooks/typecheck/smoke-out/st-$harness-channel.mjs
             done
+            ${pkgs.nodejs}/bin/node hooks/typecheck/omp-smoke.mjs ./smoke-out/st-omp-channel.mjs
             ${pkgs.nodejs}/bin/node hooks/typecheck/environment-smoke.mjs
             touch $out
           '';

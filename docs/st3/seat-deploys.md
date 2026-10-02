@@ -25,6 +25,13 @@ after a daemon restart. Socket loss creates no delivered or read receipt. Native
 uncertain handoffs, and successful handoffs retry lost receipt acknowledgements with stable IDs.
 No push component projects message bodies into `resources/inbox` or `resources/archive`.
 
+`delivered` records native transport acceptance, not model consumption. A replacement runtime
+reoffers delivered-but-unread messages with their original stable IDs, as well as sent and staged
+messages. The same live channel keeps its handoff deduplication, and provider ledgers reconcile
+uncertain handoffs across channel replacement. Read and closed messages are not reinjected.
+If a provider accepted mail without durable consumption evidence, recovery favors another offer
+over silently dropping it; recipients should record read evidence when they consume the message.
+
 Epochs are allocated by the daemon, independently of wall-clock time. An initial bind has a stable
 request token; a lost acknowledgement retries that same epoch, and retired tokens cannot allocate
 another epoch after replacement. Reexec carries the returned epoch and token. Only an explicit
@@ -109,8 +116,9 @@ channel's PID, image, and the age of its last presence write. The daemon keeps t
 each recipient in memory. It is not graph state; a restarted daemon learns every live path again
 within a second.
 
-`st agents ls` and `st agents show` add a `delivery` object to each local native seat whose harness
-can take work:
+`st agents ls` and `st agents show` add a `delivery` object to each local native seat that is running
+or waiting. Waiting on a human, login, or trust prompt does not hide its transport assessment;
+delivery presence is independent of whether the harness can start another turn:
 
 - `current`: a report arrived in the last 45 seconds from a process running the daemon's own image,
   and for Claude the channel reported in the last ten seconds from that image too. Pi-family
@@ -141,8 +149,8 @@ Pi and omp extensions reopen an unexpectedly exited channel with bounded backoff
 handshake samples the provider's idle proof, even when no turn runs. Negative handoff receipts
 retry indefinitely with a delay capped at five seconds; the third failure records a diagnostic
 without stopping retries. The channel reports the rejected handoff as stale until native
-acceptance or an authoritative delivery/read/close receipt settles it. This never authorizes
-repeating a handoff already accepted by the native transport.
+acceptance or an authoritative delivery/read/close receipt settles it. Within the same incarnation,
+this never authorizes repeating a handoff already accepted by the native transport.
 
 Rejected-attempt counts survive channel reexec in the same incarnation and appear in its presence
 and diagnostics. They are not durable `message.attempt` claims and reset on a new seat incarnation.
