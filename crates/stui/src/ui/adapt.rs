@@ -9,7 +9,9 @@ use serde_json::Value;
 #[cfg(test)]
 use st3_client::TimelineEntry;
 use st3_client::{MissionStep, WorkLabel};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 /// What the live loop has fetched beside the model: conversations and launch previews.
 #[derive(Default)]
