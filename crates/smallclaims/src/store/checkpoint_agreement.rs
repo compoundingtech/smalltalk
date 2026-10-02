@@ -536,6 +536,7 @@ impl Store {
         checkpoint: &str,
         terms: &SealTerms,
         sealed: &SealedIdentities,
+        replaces: Option<&str>,
     ) -> Result<()> {
         // The floor first: the seal itself, and everything after it, is dated at or after the
         // cut, even on a clock that runs days slow.
@@ -553,9 +554,10 @@ impl Store {
                 ("build".into(), json!(checkpoint_build())),
             ]),
             format!(
-                "checkpoint-sealed:{}:{checkpoint}:{}",
+                "checkpoint-sealed:{}:{checkpoint}:{}:{}",
                 self.origin,
-                terms_key(terms)
+                terms_key(terms),
+                replaces.unwrap_or("first")
             ),
         )
     }
@@ -636,7 +638,18 @@ impl Store {
                 rules_digest: self.runtime.checkpoint_rules_digest(),
             };
             if seals.get(&self.origin) != Some(&terms) {
-                self.publish_seal(&checkpoint, &terms, &sealed)?;
+                // The seal this one replaces. Terms can return to an earlier value, such as a
+                // participant leaving and coming back, and that must still be a new seal.
+                let replaces = claims
+                    .iter()
+                    .filter(|claim| {
+                        claim.subject == checkpoint
+                            && claim.writer == self.origin
+                            && claim.seal_terms().is_some()
+                    })
+                    .next_back()
+                    .map(|claim| claim.id.as_str());
+                self.publish_seal(&checkpoint, &terms, &sealed, replaces)?;
                 actions.push(CheckpointAction::Sealed {
                     checkpoint: checkpoint.clone(),
                     sealed_digest: terms.sealed_digest.clone(),

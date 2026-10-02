@@ -8336,12 +8336,16 @@ async fn get_usage(
             "usage start must be before its end",
         )));
     }
-    let rows = state
-        .store
-        .usage_period_rows(since_ms, until_ms)
-        .map_err(ApiError::internal)?;
+    let store = state.store.clone();
+    let (rows, limits) = blocking_store(move || {
+        Ok((
+            store.usage_period_rows(since_ms, until_ms)?,
+            store.account_limits()?,
+        ))
+    })
+    .await?;
     Ok(Json(
-        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows}),
+        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits}),
     ))
 }
 

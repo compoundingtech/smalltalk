@@ -83,8 +83,10 @@ pub use smallclaims::store::{
 
 mod attention_snapshot;
 mod checkpoint_rules;
+mod limits;
 mod person_work;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
+pub use limits::{AccountLimit, LIMITS_ACTOR, LimitsOutcome, LimitsPolicy};
 #[cfg(test)]
 mod checkpoint_agreement_tests;
 #[cfg(test)]
@@ -509,6 +511,15 @@ CREATE TABLE IF NOT EXISTS local_usage_spend (
     unpriced_tokens INTEGER NOT NULL DEFAULT 0,
     observed_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY(subject, incarnation_id, model, account, owner_run, owner_step, host)
+);
+-- The seats this node's limits policy stopped, once per account and weekly window, so a seat a
+-- person starts again stays up until the window resets.
+CREATE TABLE IF NOT EXISTS local_limit_stops (
+    account TEXT NOT NULL,
+    episode TEXT NOT NULL,
+    seat TEXT NOT NULL,
+    stopped_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY(account, episode, seat)
 );
 -- Each response already counted, with when the harness recorded it. A response is remembered
 -- for `USAGE_RESPONSE_HORIZON_MS`, longer than any harness keeps a response in the record st

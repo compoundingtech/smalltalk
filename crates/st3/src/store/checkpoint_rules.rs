@@ -16,7 +16,7 @@ use smallclaims::store::checkpoint_agreement::*;
 
 /// The rule engine's version. It is part of the rules digest, so nodes agree on a checkpoint only
 /// when they run the same rules.
-pub const RULES_VERSION: u32 = 2;
+pub const RULES_VERSION: u32 = 3;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -65,6 +65,7 @@ runtime.action.deadline-reached actor=null slot=subject,action,incarnation_id,op
 harness.usage semantics=response_rollup slot=subject,incarnation_id,model,account,owner_run,owner_step,host keep=newest,last-of-each-utc-hour-by-observed_at-within-7d-before-cut,newest-before-that
 harness.usage semantics=session_cumulative slot=subject,incarnation_id keep=newest,largest-total_tokens
 harness.usage semantics=context_occupancy slot=subject,incarnation_id keep=newest
+harness.limits slot=subject keep=newest
 render.applied slot=subject keep=newest min-age-before-cut=5d
 runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,shared-operation,writer-newest-envelope,whole-envelope
@@ -149,6 +150,8 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         "render.applied" | "runtime.readiness-deadline-reached" => {
             Some((Rule::NewestAged, slot(&[])))
         }
+        // Limits are read as each seat's newest reading.
+        "harness.limits" => Some((Rule::Newest, slot(&[]))),
         // A legacy per-response claim is summed by every usage read, so it stays.
         "harness.usage" => match field_str(claim, "semantics")? {
             "response_rollup" => Some((

@@ -105,13 +105,18 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
     let Some(view) = step(connection, &ask.subject)? else {
         return Ok(false);
     };
+    let requester = ask.actor.as_deref().unwrap_or_default();
+    // A daemon asks for its own policy, not for a seat, so no declaration fences it.
+    let daemon = requester.starts_with("daemon/");
     if !matches!(view.status.as_str(), "pending" | "ready")
         || !run_live(connection, &view.run, Some(&view.generation), false)?
-        || !declaration_live(connection, ask.actor.as_deref().unwrap_or_default())?
+        || (!daemon && !declaration_live(connection, requester)?)
     {
         return Ok(false);
     }
-    let requester = ask.actor.as_deref().unwrap_or_default();
+    if daemon {
+        return Ok(true);
+    }
     let mut declarations = connection.prepare(&canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='intent.desired' ORDER BY CANONICAL_ASC(claims)"))?;
     let ask_key = canonical::claim_key(connection, &ask.id)?;
     for declaration in declarations.query_map([requester], claim_from_row)? {
@@ -373,6 +378,52 @@ impl Store {
             }
             Ok(changed)
         }).map_err(anyhow::Error::msg)?
+    }
+
+    /// A request the daemon itself puts on a person's home, as `actor` (`daemon/NAME`), in a run
+    /// of its own. Every node that asks with the same name and key names the same step, so the
+    /// request appears once. Clients cannot reach this: `ask_person` accepts only agents.
+    pub(crate) fn ask_person_as_daemon(
+        &self,
+        actor: &str,
+        person: &str,
+        title: &str,
+        reason: &str,
+        name: &str,
+        key: &str,
+    ) -> Result<StepRunView, St3Error> {
+        if !actor.starts_with("daemon/")
+            || !person.starts_with("person/")
+            || person.matches('/').count() != 1
+            || title.trim().is_empty()
+            || reason.trim().is_empty()
+            || key.is_empty()
+        {
+            return Err(St3Error::new(
+                "invalid-person-ask",
+                "a daemon ask needs a daemon actor, a person, a title, a reason and a key",
+            ));
+        }
+        self.connection.batched(|tx| {
+            let identity = serde_json::to_string(&(actor, name, key)).map_err(internal)?;
+            let hash = hex::encode(Sha256::digest(identity.as_bytes()));
+            let generation = format!("ask-{}", &hash[..32]);
+            let subject = format!("step-run/{generation}/ask");
+            if request(tx, &subject).map_err(internal)?.is_some() {
+                return step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
+            }
+            let mission_id = format!("person-ask/{}", &hash[..32]);
+            let kdl = format!("version 2\nmission {mission_id:?} state=\"ready\" {{ goal {title:?}; step \"ask\" {{ assigned-to {person:?}; goal {reason:?}; }} }}");
+            let mut intent = crate::graph::parse_internal_intent(&kdl, &self.origin)?;
+            let mission = intent.missions.remove(&mission_id).ok_or_else(|| St3Error::new("internal", "the person mission could not be parsed"))?;
+            let claim = append_claim_tx(tx, &self.origin, &subject, "work.person-asked", Some(actor),
+                &json!({"fields": {"run": format!("mission-run/person-ask/{}", &hash[..32]),
+                    "generation": format!("run-generation/{generation}"),
+                    "person": person, "title": title, "reason": reason, "key": key,
+                    "attempt": 1, "status": "ready", "mission_spec": mission}}), &[], None).map_err(claim_append_error)?;
+            project(tx, &claim)?;
+            step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the ask could not be projected"))
+        }).map_err(internal)?
     }
 
     fn ask_person_in_new_run(&self, input: &PersonAskRequest) -> Result<StepRunView, St3Error> {

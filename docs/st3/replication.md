@@ -614,8 +614,10 @@ it keeps sets every field a reader takes from the dropped one:
 - `harness.usage` snapshots. A response rollup series keeps the last snapshot of each UTC hour,
   by the time its writer measured it, for seven days before the cut, and only its newest snapshot
   before that. `st usage` stays exact to the hour for a period inside that window, a longer period
-  counts each series from its start, and a series' total never changes. A session's cumulative reading keeps its newest and its largest; a context
-  reading keeps its newest. Per-response claims from older builds stay.
+  counts each series from its start, and a series' total never changes. A session's cumulative
+  reading keeps its newest and its largest; a context reading keeps its newest. Per-response
+  claims from older builds stay;
+- `harness.limits` readings, keeping each seat's newest.
 
 Every model response also goes to OpenTelemetry when `[observations.otlp]` is set: an
 `st.usage.response` log with its agent, mission run, step, model, account, tokens and cost, and

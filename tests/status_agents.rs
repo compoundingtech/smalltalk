@@ -579,6 +579,7 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
             rate_limits: st2::harness_context::RateLimits {
                 five_hour: Some(100.0),
                 seven_day: Some(55.0),
+                ..Default::default()
             },
             ..Reading::default()
         })

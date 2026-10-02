@@ -652,7 +652,10 @@ mod tests {
             rate_limits: harness_context::RateLimits {
                 five_hour: Some(31.0),
                 seven_day: Some(55.0),
+                ..Default::default()
             },
+            account: None,
+            plan: None,
             compactions: 3,
             last_compaction_ms: Some(1788000097290),
             last_compaction_trigger: Some(harness_context::CompactionTrigger::Unknown),
@@ -704,6 +707,8 @@ mod tests {
             cost_usd: Some(0.42),
             session_total_tokens: None,
             rate_limits: harness_context::RateLimits::default(),
+            account: None,
+            plan: None,
             compactions: 0,
             last_compaction_ms: None,
             last_compaction_trigger: None,
@@ -753,7 +758,10 @@ mod tests {
             rate_limits: harness_context::RateLimits {
                 five_hour: Some(100.0),
                 seven_day: Some(55.0),
+                ..Default::default()
             },
+            account: None,
+            plan: None,
             compactions: 0,
             last_compaction_ms: None,
             last_compaction_trigger: None,

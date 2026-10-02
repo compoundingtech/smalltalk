@@ -291,6 +291,28 @@ st usage --hours 24 --by step
 st usage --hours 24 --by account
 ```
 
+`st usage` also lists each account's 5-hour and weekly limits: the freshest reading any seat on
+that account reported, with when it was measured and when the weekly window resets.
+
+A node can stop an account's seats as the account nears its weekly limit. It is off until its
+config enables it:
+
+```toml
+person = "person/ada"
+
+[limits]
+enabled = true
+stop_at_weekly_percent = 95
+keep = ["agent/example/coordinator"]
+fresh = "1h"
+```
+
+When an account's freshest weekly reading, no older than `fresh`, reaches the percentage, each
+node stops the seats it hosts on that account, except those in `keep`, and the node that measured
+the reading puts one request on the person's home naming the stopped seats and the reset time.
+Each seat is stopped once per weekly window: start it again and it stays up until the reset. Give
+every node that hosts seats the same `[limits]`.
+
 The seat starts its harness in the workspace with no prompt. It stays idle, taking no turn, until
 a person types in its terminal or a message is posted to it. A seat you declare as
 `fleet/PROJECT/...` may also publish, start, and revise missions under `fleet/PROJECT/*`;

@@ -905,6 +905,9 @@ impl CodexInboxDelivery {
         if account.is_none() {
             tracing::debug!("st codex: account/read named no account; usage stays unattributed");
         }
+        if let Some(context) = self.context.as_mut() {
+            context.set_account(account.clone());
+        }
         self.timeline.set_account(account);
         true
     }
