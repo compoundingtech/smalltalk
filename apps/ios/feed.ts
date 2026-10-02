@@ -54,6 +54,9 @@ function errorMessage(error: unknown): string {
   return code ? plainMessage(code, error instanceof Error ? error.message : String(error)) : plainError(error);
 }
 const transient = (code: string | undefined) => code !== undefined && isTransientCode(code);
+/** Whether a refused conversation may load if asked again: all but st's word that it keeps no
+ * start for the transcript (`timeline-history-incomplete`). */
+export const conversationMayClear = (code: string | undefined) => code !== 'timeline-history-incomplete';
 
 // One collections socket per paired gateway and credential. It holds the app's windows, at most one
 // followed terminal, and at most one followed conversation. A dropped socket reconnects after
@@ -264,9 +267,16 @@ export class Feed {
     } else if (frame.kind === 'error') {
       if (id === TERMINAL) this.terminal?.failed(frame.code, frame.message);
       else if (id === CONVERSATION && this.conversation) {
+        const follow = this.conversation;
+        // st keeps no start for this transcript: asking again cannot help, so say st's reason
+        // once and stop, as stui does.
+        if (!conversationMayClear(frame.code)) {
+          clearTimeout(follow.timer);
+          follow.handlers.onIssue(plainMessage(frame.code, frame.message));
+          return;
+        }
         // The subscription ended. Whatever stopped it may clear (a busy store moved under the
         // page, the agent's host came back): ask again after a backoff, as stui does.
-        const follow = this.conversation;
         const delay = this.retryDelaysMs[Math.min(follow.failures, this.retryDelaysMs.length - 1)];
         follow.failures++;
         clearTimeout(follow.timer);
