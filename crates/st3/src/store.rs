@@ -33263,6 +33263,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 &ReplicaEnvelopePayload {
                     batch: batch.clone(),
                     blobs: BTreeMap::new(),
+                    claim_signatures: BTreeMap::new(),
                 },
                 &mut bytes,
             )

@@ -43,6 +43,7 @@ pub mod checkpoint_agreement;
 pub mod checkpoint_trim;
 pub mod document_index;
 pub mod heal;
+pub mod principals;
 pub mod projection_digest;
 pub mod runtime;
 
@@ -346,6 +347,10 @@ pub struct Store {
     pub heal: Mutex<heal::HealState>,
     /// This node's fleet member key. Set, it signs every envelope of this node's writer.
     pub member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
+    /// The keys this node signs claims with. See `principals`.
+    pub keyring: crate::principal::Keyring,
+    /// Held while this node mints a key for a person or an agent.
+    pub principal_minting: Mutex<()>,
     pub origin: String,
     /// The database file, or the shared-memory URI of an in-memory store. A checkpoint proof
     /// opens its own connection here to copy the store.
@@ -430,6 +435,7 @@ impl Store {
         reject_old_schema(connection)?;
         runtime.migrate_schema(connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(principals::PRINCIPAL_SCHEMA)?;
         runtime.create_schema(connection)?;
         connection.execute_batch(SCHEMA_VERSION)?;
         document_index::initialize(connection)?;
@@ -464,6 +470,8 @@ impl Store {
             last_replication_projection_unix_ms: AtomicU64::new(0),
             heal: Mutex::default(),
             member_key: std::sync::RwLock::new(None),
+            keyring: crate::principal::Keyring::default(),
+            principal_minting: Mutex::new(()),
             origin,
             path,
             shared_memory,
@@ -1157,6 +1165,9 @@ impl Store {
         }
         // Seed envelopes for any local batch first, so the full pass below sees all of them.
         self.replication_snapshot()?;
+        if let Some(key) = &key {
+            self.set_node_key(key.clone())?;
+        }
         *self
             .member_key
             .write()
@@ -2532,6 +2543,19 @@ fn seed_replica_envelopes_range_tx(
     after_rowid: Option<i64>,
     through_rowid: Option<i64>,
 ) -> Result<()> {
+    seed_replica_envelopes_signed_tx(transaction, relay, after_rowid, through_rowid, None)
+}
+
+/// Seal batches into envelopes. With `sign`, each claim without a stored signature is signed
+/// and its signature travels in the payload.
+#[allow(clippy::type_complexity)]
+fn seed_replica_envelopes_signed_tx(
+    transaction: &Transaction<'_>,
+    relay: &str,
+    after_rowid: Option<i64>,
+    through_rowid: Option<i64>,
+    sign: Option<&dyn Fn(&principals::Unsealed<'_>) -> Option<crate::principal::ClaimSignature>>,
+) -> Result<()> {
     let order = if after_rowid.is_some() {
         "batches.rowid"
     } else {
@@ -2576,6 +2600,29 @@ fn seed_replica_envelopes_range_tx(
         drop(claim_statement);
         let mut blobs = BTreeMap::new();
         collect_referenced_blobs(transaction, &claims, &mut blobs)?;
+        let mut claim_signatures = BTreeMap::new();
+        for claim in &claims {
+            let existing = transaction
+                .prepare_cached("SELECT signature FROM claim_signatures WHERE claim_id=?1")?
+                .query_row([&claim.id], |row| row.get::<_, String>(0))
+                .optional()?
+                .and_then(|text| serde_json::from_str(&text).ok());
+            let signature = match (existing, sign) {
+                (Some(signature), _) => Some(signature),
+                (None, Some(sign)) => sign(&principals::Unsealed {
+                    subject: &claim.subject,
+                    kind: &claim.kind,
+                    actor: claim.actor.as_deref(),
+                    body: &claim.body,
+                    accepted_at_unix_ms: claim.accepted_at_unix_ms,
+                }),
+                (None, None) => None,
+            };
+            if let Some(signature) = signature {
+                principals::store_claim_signature_tx(transaction, &claim.id, &signature)?;
+                claim_signatures.insert(claim.id.clone(), signature);
+            }
+        }
         let batch = ReplicaBatch {
             id: id.clone(),
             origin: writer.clone(),
@@ -2586,7 +2633,14 @@ fn seed_replica_envelopes_range_tx(
             claims: claims.clone(),
         };
         let mut payload = Vec::new();
-        ciborium::into_writer(&ReplicaEnvelopePayload { batch, blobs }, &mut payload)?;
+        ciborium::into_writer(
+            &ReplicaEnvelopePayload {
+                batch,
+                blobs,
+                claim_signatures,
+            },
+            &mut payload,
+        )?;
         let envelope_hash = replica_envelope_hash(
             &writer,
             sequence,
@@ -3782,6 +3836,10 @@ pub fn validate_and_admit_envelope_tx(
                     )
                     .map_err(internal)?
                 };
+                if let Some(signature) = payload.claim_signatures.get(&claim.id) {
+                    principals::store_claim_signature_tx(transaction, &claim.id, signature)
+                        .map_err(internal)?;
+                }
                 transaction
                     .execute(
                         "INSERT INTO replica_records(
@@ -3908,6 +3966,9 @@ impl Store {
         &self,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
+        if let Some(actor) = &input.actor {
+            self.ensure_principal_key(actor)?;
+        }
         self.runtime.append_claim(self, input)
     }
 
@@ -4299,17 +4360,19 @@ impl Store {
                 |row| row.get(0),
             )?;
             let transaction = connection.transaction()?;
-            seed_replica_envelopes_range_tx(
+            seed_replica_envelopes_signed_tx(
                 &transaction,
                 &self.origin,
                 Some(seeded_through),
                 Some(through),
+                Some(&|claim: &principals::Unsealed<'_>| self.sign_unsealed(claim)),
             )?;
             self.sign_own_envelopes_range_tx(&transaction, Some(seeded_through), Some(through))?;
             transaction.commit()?;
             self.seeded_batch_rowid.store(through, Ordering::Release);
             // The FIFO writer services any already queued request before the next loan.
         }
+        self.judge_claims(false)?;
         Ok(())
     }
 
@@ -5058,6 +5121,11 @@ impl Store {
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_claim_hash_retried', ?1)",
                 [now_ms().to_string()],
             )?;
+        }
+        drop(connection);
+        // Admitted claims, and any change to membership's trust roots, get their verdicts.
+        if outcome.changed {
+            self.judge_claims(true)?;
         }
         Ok(outcome)
     }
