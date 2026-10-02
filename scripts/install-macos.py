@@ -44,6 +44,15 @@ def binaries(app):
     return {name: Path(app) / 'Contents/MacOS' / name for name in ['st3', 'stui']}
 
 
+# stui's speech helper (apps/macos/listen), when built: its own app inside SmallTalk.app, so the
+# microphone prompt names Small Talk with the helper's usage strings.
+HELPER = 'StListen.app'
+
+
+def helper_executable(helper):
+    return Path(helper) / 'Contents/MacOS/st-listen'
+
+
 def write_atomic(path, data, mode=0o644):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,7 +119,9 @@ def verify(app, expected=None):
 
 def prepare(home, job, built):
     resolve_identity()
-    payload = {name: sha(path) for name, path in built.items()}
+    payload = {name: sha(path) for name, path in built.items() if name != HELPER}
+    if HELPER in built:
+        payload['st-listen'] = sha(helper_executable(built[HELPER]))
     desired = {'hashes': payload, 'certificate': CERTIFICATE, 'team': TEAM, 'identifier': IDENTIFIER}
     current = fixed(home)
     metadata = current / 'Contents/Resources/deploy-payload.json'
@@ -124,16 +135,29 @@ def prepare(home, job, built):
     paths['st3'].parent.mkdir(parents=True)
     resources = app / 'Contents/Resources'
     resources.mkdir()
-    for name, path in built.items():
-        shutil.copy2(path, paths[name]); os.chmod(paths[name], 0o755)
+    for name, path in paths.items():
+        shutil.copy2(built[name], path); os.chmod(path, 0o755)
     info = {'CFBundleIdentifier': IDENTIFIER, 'CFBundleExecutable': 'st3', 'CFBundleName': 'St3',
             'CFBundlePackageType': 'APPL', 'CFBundleVersion': '1', 'LSUIElement': True}
+    if HELPER in built:
+        # macOS asks on behalf of the outermost app, so its name and usage strings are the ones shown.
+        info['CFBundleDisplayName'] = 'Small Talk'
+        info['NSMicrophoneUsageDescription'] = (
+            'Small Talk listens while you dictate a message in stui, and transcribes it on this Mac.')
+        info['NSSpeechRecognitionUsageDescription'] = 'Small Talk transcribes your dictated messages on this Mac.'
+
     (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     metadata = resources / 'deploy-payload.json'
     metadata.write_text(json.dumps(desired, sort_keys=True) + '\n')
     for name, path in paths.items():
         command(['/usr/bin/codesign', '--force', '--sign', CERTIFICATE or '-', '--identifier',
                  IDENTIFIER if name == 'st3' else IDENTIFIER + '.stui', '--timestamp=none', path])
+    if HELPER in built:
+        # Nested code is signed before the app that seals it.
+        helper = app / 'Contents/Helpers' / HELPER
+        shutil.copytree(built[HELPER], helper, symlinks=True)
+        command(['/usr/bin/codesign', '--force', '--sign', CERTIFICATE or '-', '--identifier',
+                 IDENTIFIER + '.listen', '--timestamp=none', helper])
     command(['/usr/bin/codesign', '--force', '--sign', CERTIFICATE or '-', '--identifier', IDENTIFIER, '--timestamp=none', app])
     identity = verify(app)
     return app, dict(identity, payload_unchanged=False), payload
@@ -316,6 +340,8 @@ def main():
         for path in built.values():
             if not path.is_file() or not os.access(path, os.X_OK):
                 parser.error('missing executable: ' + str(path))
+        if helper_executable(args.source / HELPER).is_file():
+            built[HELPER] = args.source / HELPER
         app, identity, payload = prepare(home, args.job, built)
         if args.prepare_only:
             print(json.dumps({'app': str(app), 'identity': identity, 'payload_hashes': payload}, sort_keys=True))
