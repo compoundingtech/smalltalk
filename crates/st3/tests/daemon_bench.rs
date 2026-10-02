@@ -1308,6 +1308,7 @@ fn generate(store: &Store, prefix: &str, scale: f64) {
             new_run: Some(format!("question-{request}")),
             incarnation: None,
             idempotency_key: format!("bench-{prefix}-person-ask-{request}"),
+            request: None,
         });
         if let Ok(posted) = posted {
             if request % 50 != 0 {
@@ -1319,6 +1320,7 @@ fn generate(store: &Store, prefix: &str, scale: f64) {
                         evidence: Vec::new(),
                         episode: None,
                         idempotency_key: format!("bench-{prefix}-person-done-{request}"),
+                        answer: None,
                     },
                     false,
                 );

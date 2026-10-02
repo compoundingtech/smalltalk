@@ -19,6 +19,7 @@ import { AgentsScreen, HistoryScreen } from './screens/Agents';
 import { ConversationScreen } from './screens/Conversation';
 import { FleetScreen, PairScreen } from './screens/Fleet';
 import { UsageDetailScreen, UsageScreen } from './screens/Usage';
+import { NewAgentScreen } from './screens/NewAgent';
 import { AttentionScreen, HomeScreen } from './screens/Home';
 import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from './screens/Missions';
 import { SelectTextScreen } from './screens/SelectText';
@@ -65,6 +66,7 @@ function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
     <Stack.Screen name="Launch" component={LaunchScreen} options={{ title: 'Launch' }} />
     <Stack.Screen name="History" component={HistoryScreen} options={{ title: 'Past sessions' }} />
     <Stack.Screen name="NewMission" component={NewMissionScreen} options={{ title: 'New mission', presentation: 'modal' }} />
+    <Stack.Screen name="NewAgent" component={NewAgentScreen} options={{ title: 'New agent', presentation: 'modal' }} />
     <Stack.Screen name="Usage" component={UsageScreen} options={{ title: 'Usage' }} />
     <Stack.Screen name="UsageDetail" component={UsageDetailScreen} options={{ title: 'Usage' }} />
   </Stack.Navigator>;

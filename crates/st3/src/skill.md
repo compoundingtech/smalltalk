@@ -35,8 +35,8 @@ it.
 
 ## Person work
 
-`"$ST3_BIN" work ask --for PERSON --title TEXT --reason TEXT --step STEP --idempotency-key KEY --as "$ST_AGENT"` creates a person-assigned step in the same generation. The asking step waits without a worker lease; the person's response resumes it. `--new-run NAME` creates a minimal ask run when the seat has no claimed work. The ask ends with its requester, originating attempt or owner.
-`work done PERSON_STEP --as PERSON --summary TEXT` records the response; `work cancel-ask PERSON_STEP --as "$ST_AGENT" --reason TEXT` cancels the requester's ask.
+`"$ST3_BIN" work ask --for PERSON --title TEXT --reason TEXT --step STEP --idempotency-key KEY --as "$ST_AGENT"` creates a person-assigned step in the same generation. The asking step waits without a worker lease; the person's response resumes it. `--new-run NAME` creates a minimal ask run when the seat has no claimed work; its answer arrives as a message. The ask ends with its requester, originating attempt or owner. `--request FILE` asks a structured decision, choice or feedback with named answers (`work ask --help` shows the JSON); the answer returns as data in the resumed step's `person_answers` (`work show STEP --json`).
+`work done PERSON_STEP --as PERSON --summary TEXT` records the response, or `--answer ID` and `--text TEXT` for a structured request; `work cancel-ask PERSON_STEP --as "$ST_AGENT" --reason TEXT` cancels the requester's ask.
 `st now` and `attention ls/show` show a person's requests and reviews; attention has no separate close action.
 Messages stay in conversations and do not enter a person's attention.
 A fault arrives as a message to the agent that owns it, which retries, revises or cancels, and asks a person with `work ask` only for what only a person can give.

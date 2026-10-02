@@ -243,6 +243,33 @@ function useAppStore() {
         return null;
       } catch (e) { return errorText(e); }
     },
+    /** A plain shell, named as stui names one; its terminal id, or null with the reason shown. */
+    async createTerminal(name: string): Promise<string | null> {
+      if (!client) return null;
+      let created: string | null = null;
+      const done = await runAction(async () => {
+        const id = actionId();
+        const result = await client.terminalCreate({ id, idempotency_key: id, fence: await fence(), parameters: { name } });
+        created = result.value.affected_ids?.find(affected => affected.startsWith('terminal/')) ?? null;
+      });
+      if (!done || !created) return null;
+      // The shell starts a moment after st declares it: open it once st can show its screen.
+      for (let tries = 0; tries < 30; tries++) {
+        try { await client.terminalScreen(created); return created; } catch { await new Promise(resolve => setTimeout(resolve, 500)); }
+      }
+      return created;
+    },
+    /** A new agent with its first message; its id, or null with the reason shown. */
+    async createAgent(parameters: { name: string; harness: string; model?: string; effort?: string; host?: string; message?: string }): Promise<string | null> {
+      if (!client) return null;
+      let created: string | null = null;
+      const done = await runAction(async () => {
+        const id = actionId();
+        const result = await client.agentCreate({ id, idempotency_key: id, fence: await fence(), parameters: parameters as never });
+        created = result.value.affected_ids?.find(affected => affected.startsWith('agent/')) ?? null;
+      });
+      return done ? created : null;
+    },
     async createLaunch(parameters: { title: string; request: string; workspace: string; provider: Planner; model?: string; effort?: string }) {
       if (!client) return false;
       return runAction(async () => { const id = actionId(); await client.launchCreate({ id, idempotency_key: id, fence: await fence(), parameters: { title: parameters.title, request: parameters.request, target: { type: 'new-mission', mission_id: `mission/ios-${Crypto.randomUUID()}`, workspace: parameters.workspace }, provider: parameters.provider, ...(parameters.model ? { model: parameters.model } : {}), ...(parameters.effort ? { effort: parameters.effort } : {}) } }); }, ['launches']);

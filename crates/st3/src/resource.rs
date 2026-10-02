@@ -6,6 +6,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
+
+mod github_repository;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -393,67 +395,7 @@ async fn observe_github_repository_at(
     api_base: &str,
     token: Option<&str>,
 ) -> Result<ProviderObservation> {
-    let cache_for = github_cache_for(&request);
-    let token = token
-        .filter(|value| !value.trim().is_empty())
-        .context(GITHUB_AUTH_REMEDY)?;
-    let (owner, repository) = request
-        .locator
-        .split_once('/')
-        .context("a GitHub repository locator needs OWNER/REPO")?;
-    anyhow::ensure!(
-        !owner.is_empty() && !repository.is_empty() && !repository.contains('/'),
-        "a GitHub repository locator needs OWNER/REPO"
-    );
-    let client = github_client();
-    let base = format!("{api_base}/repos/{owner}/{repository}");
-    // A renamed repository answers through a redirect. Its numeric ID proves that the locator
-    // still names the repository whose items were observed before.
-    let repository_id = github_json(&client, base.clone(), token, cache_for)
-        .await?
-        .value
-        .get("id")
-        .and_then(Value::as_u64)
-        .context("the GitHub repository response has no numeric ID")?;
-    let pulls = if request.fields.contains("pull_requests") {
-        github_pages(
-            &client,
-            format!("{base}/pulls?state=open&per_page=100"),
-            token,
-            cache_for,
-        )
-        .await?
-    } else {
-        Vec::new()
-    };
-    let issues = if request.fields.contains("issues") {
-        github_pages(
-            &client,
-            format!("{base}/issues?state=open&per_page=100"),
-            token,
-            cache_for,
-        )
-        .await?
-    } else {
-        Vec::new()
-    };
-    let facts = normalize_github_repository(
-        request.previous_facts.as_ref(),
-        repository_id,
-        &pulls,
-        &issues,
-        &request.fields,
-    )?;
-    let cursor = Some(hex::encode(Sha256::digest(serde_json::to_vec(&facts)?)));
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    Ok(ProviderObservation {
-        facts,
-        cursor,
-        next_check_unix_ms: now.saturating_add(300_000),
-    })
+    github_repository::observe_at(request, api_base, token).await
 }
 
 /// The most pages one GitHub listing reads. A larger listing fails the observation instead of
@@ -535,8 +477,9 @@ struct GithubSpend {
     not_modified: u64,
     refused: u64,
     last_sent_at_unix_ms: u128,
-    /// When each request of the last hour that GitHub counted was sent.
-    counted: std::collections::VecDeque<u128>,
+    /// When each request of the last hour that GitHub counted was sent, and the budget it
+    /// spent.
+    counted: std::collections::VecDeque<(u128, String)>,
 }
 
 /// The token's budget for one GitHub rate limit resource, as GitHub last reported it.
@@ -598,7 +541,9 @@ impl GithubUsage {
         if status == reqwest::StatusCode::NOT_MODIFIED {
             spend.not_modified += 1;
         } else {
-            spend.counted.push_back(now);
+            spend
+                .counted
+                .push_back((now, github_budget_resource(headers)));
         }
         if matches!(
             status,
@@ -611,7 +556,7 @@ impl GithubUsage {
         while spend
             .counted
             .front()
-            .is_some_and(|sent_at| now.saturating_sub(*sent_at) > HOUR_MS)
+            .is_some_and(|(sent_at, _)| now.saturating_sub(*sent_at) > HOUR_MS)
         {
             spend.counted.pop_front();
         }
@@ -632,11 +577,13 @@ impl GithubUsage {
     }
 
     fn report(&self, now: u128) -> GithubUsageReport {
-        let counted_since = |since: u128| {
+        let counted_since = |resource: &str, since: u128| {
             self.spenders
                 .values()
                 .flat_map(|spend| spend.counted.iter())
-                .filter(|sent_at| **sent_at >= since && **sent_at <= now)
+                .filter(|(sent_at, spent)| {
+                    *sent_at >= since && *sent_at <= now && spent == resource
+                })
                 .count() as u64
         };
         let mut spenders = self
@@ -650,7 +597,7 @@ impl GithubUsage {
                 counted_last_hour: spend
                     .counted
                     .iter()
-                    .filter(|sent_at| now.saturating_sub(**sent_at) <= HOUR_MS)
+                    .filter(|(sent_at, _)| now.saturating_sub(*sent_at) <= HOUR_MS)
                     .count() as u64,
                 last_sent_at_unix_ms: spend.last_sent_at_unix_ms,
             })
@@ -662,21 +609,32 @@ impl GithubUsage {
                 .then(right.sent.cmp(&left.sent))
                 .then(left.spender.cmp(&right.spender))
         });
-        // Observers call the REST API, which spends the `core` budget.
+        // Observers call the REST API, which spends the `core` budget, and GraphQL, which
+        // spends its own.
         let budgets = self
             .budgets
             .values()
             .map(|budget| GithubBudgetReport {
                 budget: budget.clone(),
-                counted_here: if budget.resource == "core" {
-                    counted_since(budget.reset_at_unix_ms.saturating_sub(HOUR_MS))
-                } else {
-                    0
-                },
+                counted_here: counted_since(
+                    &budget.resource,
+                    budget.reset_at_unix_ms.saturating_sub(HOUR_MS),
+                ),
             })
             .collect();
         GithubUsageReport { spenders, budgets }
     }
+}
+
+/// The budget a response says its request spent. A response without the header spent `core`.
+fn github_budget_resource(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get("x-ratelimit-resource")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("core")
+        .to_owned()
 }
 
 fn github_budget(headers: &reqwest::header::HeaderMap, now: u128) -> Option<GithubBudget> {
@@ -691,10 +649,7 @@ fn github_budget(headers: &reqwest::header::HeaderMap, now: u128) -> Option<Gith
     let remaining = number("x-ratelimit-remaining")?;
     let reset_at_unix_ms = u128::from(number("x-ratelimit-reset")?).saturating_mul(1_000);
     Some(GithubBudget {
-        resource: header("x-ratelimit-resource")
-            .filter(|value| !value.is_empty())
-            .unwrap_or("core")
-            .to_owned(),
+        resource: github_budget_resource(headers),
         limit,
         remaining,
         used: number("x-ratelimit-used").unwrap_or_else(|| limit.saturating_sub(remaining)),
@@ -798,20 +753,108 @@ async fn github_pages(
     token: &str,
     cache_for: Duration,
 ) -> Result<Vec<Value>> {
+    Ok(
+        github_listing(client, url, token, cache_for, GITHUB_LIST_PAGES, false)
+            .await?
+            .values,
+    )
+}
+
+/// One read of a paged GitHub listing: its items, a version for each page (its ETag, or its
+/// content when GitHub named none), and whether more pages remained after the most this read
+/// takes.
+pub(crate) struct GithubListing {
+    pub(crate) values: Vec<Value>,
+    pub(crate) versions: Vec<String>,
+    pub(crate) truncated: bool,
+}
+
+/// Read up to `pages` pages of a listing. A listing that continues past them fails the read,
+/// unless `resumable` says the caller continues it later from where this read stopped.
+async fn github_listing(
+    client: &reqwest::Client,
+    url: String,
+    token: &str,
+    cache_for: Duration,
+    pages: usize,
+    resumable: bool,
+) -> Result<GithubListing> {
     let mut next = Some(url);
-    let mut pages = 0;
-    let mut values = Vec::new();
+    let mut listing = GithubListing {
+        values: Vec::new(),
+        versions: Vec::new(),
+        truncated: false,
+    };
     while let Some(url) = next {
-        anyhow::ensure!(
-            pages < GITHUB_LIST_PAGES,
-            "the GitHub listing has more than {GITHUB_LIST_PAGES} pages"
-        );
+        if listing.versions.len() == pages {
+            anyhow::ensure!(resumable, "the GitHub listing has more than {pages} pages");
+            listing.truncated = true;
+            break;
+        }
         let payload = github_json(client, url, token, cache_for).await?;
-        values.extend(serde_json::from_value::<Vec<Value>>(payload.value)?);
+        listing
+            .versions
+            .push(payload.etag.clone().unwrap_or_else(|| {
+                hex::encode(Sha256::digest(
+                    serde_json::to_vec(&payload.value).unwrap_or_default(),
+                ))
+            }));
+        listing
+            .values
+            .extend(serde_json::from_value::<Vec<Value>>(payload.value)?);
         next = payload.next;
-        pages += 1;
     }
-    Ok(values)
+    Ok(listing)
+}
+
+/// Ask GitHub's GraphQL API one query. GraphQL has its own hourly budget, reports a refusal in a
+/// successful response, and has no conditional request.
+async fn github_graphql(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    query: &str,
+    variables: Value,
+) -> Result<Value> {
+    let response = client
+        .post(format!("{api_base}/graphql"))
+        .header("Accept", "application/vnd.github+json")
+        .bearer_auth(token)
+        .json(&json!({"query": query, "variables": variables}))
+        .send()
+        .await?;
+    record_github_response(response.status(), response.headers());
+    let response = github_response(response).await?;
+    let headers = response.headers().clone();
+    let body = response.json::<Value>().await?;
+    if let Some(errors) = body
+        .get("errors")
+        .and_then(Value::as_array)
+        .filter(|errors| !errors.is_empty())
+    {
+        if errors
+            .iter()
+            .any(|error| error.get("type").and_then(Value::as_str) == Some("RATE_LIMITED"))
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            bail!(ProviderRateLimit {
+                retry_at_unix_ms: github_retry_at(&headers, now),
+                status: 200,
+            });
+        }
+        let message = errors[0]
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("an unnamed error");
+        bail!("GitHub GraphQL refused the query: {message}");
+    }
+    body.get("data")
+        .filter(|data| !data.is_null())
+        .cloned()
+        .context("the GitHub GraphQL response has no data")
 }
 
 pub(crate) const GITHUB_AUTH_REMEDY: &str = "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; authentication is checked again on the next poll.";
@@ -857,97 +900,6 @@ async fn lookup_github_token(
     let token = token.trim();
     anyhow::ensure!(!token.is_empty(), "gh returned an empty token");
     Ok(token.to_owned())
-}
-
-/// Merge one complete repository listing into the previous facts. Items are identified by
-/// their number within the observed repository, so a rename keeps every identity. A listing
-/// never removes a previous item or a field that this observation did not request.
-pub(crate) fn normalize_github_repository(
-    previous: Option<&Value>,
-    repository_id: u64,
-    pulls: &[Value],
-    issues: &[Value],
-    fields: &BTreeSet<String>,
-) -> Result<Value> {
-    if let Some(previous_id) = previous
-        .and_then(|value| value.get("repository_id"))
-        .and_then(Value::as_u64)
-    {
-        anyhow::ensure!(
-            previous_id == repository_id,
-            "the locator now names GitHub repository {repository_id}, not the observed repository {previous_id}"
-        );
-    }
-    let mut facts = previous
-        .and_then(Value::as_object)
-        .map(|previous| {
-            previous
-                .iter()
-                .filter(|(field, _)| matches!(field.as_str(), "pull_requests" | "issues"))
-                .map(|(field, value)| (field.clone(), value.clone()))
-                .collect::<serde_json::Map<_, _>>()
-        })
-        .unwrap_or_default();
-    facts.insert("repository_id".into(), Value::from(repository_id));
-    if fields.contains("pull_requests") {
-        let mut values = previous
-            .and_then(|value| value.get("pull_requests"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for pull in pulls {
-            let value = json!({
-                "number": pull.get("number").cloned().unwrap_or(Value::Null),
-                "url": pull.get("html_url").cloned().unwrap_or(Value::Null),
-                "title": pull.get("title").cloned().unwrap_or(Value::Null),
-                "head": pull.pointer("/head/sha").cloned().unwrap_or(Value::Null),
-                "branch": pull.pointer("/head/ref").cloned().unwrap_or(Value::Null),
-                "author": pull.pointer("/user/login").cloned().unwrap_or(Value::Null),
-                "state": "open",
-                "draft": pull.get("draft").cloned().unwrap_or(Value::Bool(false)),
-            });
-            let number = value.get("number");
-            if let Some(old) = values.iter_mut().find(|old| old.get("number") == number) {
-                *old = value;
-            } else if value.get("draft").and_then(Value::as_bool) == Some(false) {
-                values.push(value);
-            }
-        }
-        for value in &mut values {
-            if !pulls
-                .iter()
-                .any(|pull| pull.get("number") == value.get("number"))
-            {
-                value["state"] = Value::String("closed".into());
-            }
-        }
-        values.sort_by_key(|value| value.get("number").and_then(Value::as_u64));
-        facts.insert("pull_requests".into(), Value::Array(values));
-    }
-    if fields.contains("issues") {
-        let mut values = previous
-            .and_then(|value| value.get("issues"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for issue in issues
-            .iter()
-            .filter(|issue| issue.get("pull_request").is_none())
-        {
-            let value = json!({
-                "number": issue.get("number").cloned().unwrap_or(Value::Null),
-                "url": issue.get("html_url").cloned().unwrap_or(Value::Null),
-                "title": issue.get("title").cloned().unwrap_or(Value::Null),
-            });
-            let number = value.get("number");
-            if !values.iter().any(|old| old.get("number") == number) {
-                values.push(value);
-            }
-        }
-        values.sort_by_key(|value| value.get("number").and_then(Value::as_u64));
-        facts.insert("issues".into(), Value::Array(values));
-    }
-    Ok(Value::Object(facts))
 }
 
 /// An st agent on this host and the workspace it works in.
@@ -1402,51 +1354,6 @@ mod tests {
         assert_eq!(observation.facts["status"], "missing");
     }
 
-    #[test]
-    fn repository_discovery_filters_drafts_and_pull_requests_from_issues() {
-        let fields = BTreeSet::from(["pull_requests".into(), "issues".into()]);
-        let facts = normalize_github_repository(
-            None,
-            7,
-            &[
-                json!({"number": 1, "draft": true, "title": "draft"}),
-                json!({
-                    "number": 2, "draft": false, "title": "ready",
-                    "head": {"sha": "abc", "ref": "agent/ready"}, "user": {"login": "octo"},
-                }),
-            ],
-            &[
-                json!({"number": 2, "title": "PR", "pull_request": {}}),
-                json!({"number": 3, "title": "Issue"}),
-            ],
-            &fields,
-        )
-        .unwrap();
-        assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 1);
-        assert_eq!(facts["pull_requests"][0]["number"], 2);
-        assert_eq!(facts["pull_requests"][0]["branch"], "agent/ready");
-        assert_eq!(facts["pull_requests"][0]["author"], "octo");
-        assert_eq!(facts["issues"].as_array().unwrap().len(), 1);
-        assert_eq!(facts["issues"][0]["number"], 3);
-    }
-
-    #[test]
-    fn repository_discovery_retains_old_items_and_adds_a_ready_draft_once() {
-        let fields = BTreeSet::from(["pull_requests".into()]);
-        let previous = json!({"pull_requests": [{"number": 1, "title": "old"}]});
-        let facts = normalize_github_repository(
-            Some(&previous),
-            7,
-            &[json!({"number": 2, "draft": false, "title": "now ready"})],
-            &[],
-            &fields,
-        )
-        .unwrap();
-        assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 2);
-        let repeated = normalize_github_repository(Some(&facts), 7, &[], &[], &fields).unwrap();
-        assert_eq!(repeated["pull_requests"][1]["state"], "closed");
-    }
-
     /// A provider that accepts the connection and never answers must not hold its observer forever.
     #[tokio::test]
     async fn a_github_request_that_never_answers_times_out() {
@@ -1474,161 +1381,6 @@ mod tests {
         .expect("the request did not time out");
         assert!(observed.is_err());
         server.abort();
-    }
-
-    #[tokio::test]
-    async fn repository_observer_reuses_facts_after_an_etag_not_modified_response() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            // Two observers share a poll; a later poll and a refresh revalidate both URLs.
-            for index in 0..6 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0_u8; 1024];
-                    let size = stream.read(&mut chunk).await.unwrap();
-                    request.extend_from_slice(&chunk[..size]);
-                    if size == 0 || request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                requests.push(String::from_utf8(request).unwrap());
-                let (etag, body) = if index % 2 == 0 {
-                    ("\"repo-v1\"", r#"{"id":7}"#)
-                } else {
-                    (
-                        "\"issues-v1\"",
-                        r#"[{"number":7,"title":"An invented issue"}]"#,
-                    )
-                };
-                let response = if index < 2 {
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                } else {
-                    "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .into()
-                };
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests
-        });
-        let request = ObservationRequest {
-            provider: "github.repository".into(),
-            locator: "example/repo".into(),
-            fields: BTreeSet::from(["issues".into()]),
-            cursor: None,
-            previous_facts: None,
-            every_ms: None,
-            refresh: false,
-        };
-        let spender = "observer/orchid-etag-listing".to_owned();
-        let first = spend_as(
-            spender.clone(),
-            observe_github_repository_at(request.clone(), &base, Some("orchid-test-token")),
-        )
-        .await
-        .unwrap();
-        let second = spend_as(
-            spender.clone(),
-            observe_github_repository_at(
-                ObservationRequest {
-                    cursor: first.cursor.clone(),
-                    previous_facts: Some(first.facts.clone()),
-                    ..request
-                },
-                &base,
-                Some("orchid-test-token"),
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(second.facts, first.facts);
-        assert_eq!(second.facts["repository_id"], 7);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let third = spend_as(
-            spender.clone(),
-            observe_github_repository_at(
-                ObservationRequest {
-                    cursor: second.cursor.clone(),
-                    previous_facts: Some(second.facts.clone()),
-                    provider: "github.repository".into(),
-                    locator: "example/repo".into(),
-                    fields: BTreeSet::from(["issues".into()]),
-                    every_ms: Some(1),
-                    refresh: false,
-                },
-                &base,
-                Some("orchid-test-token"),
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(third.facts["issues"], second.facts["issues"]);
-        // Request counts are not facts: an unchanged listing records nothing new.
-        assert_eq!(third.facts, first.facts);
-        assert!(
-            first
-                .facts
-                .get("github_http_requests_since_start")
-                .is_none()
-        );
-        // The cached second poll sent nothing, and the revalidating third poll cost nothing.
-        let spent = github_usage_report()
-            .spenders
-            .into_iter()
-            .find(|report| report.spender == spender)
-            .expect("the observer's requests were counted");
-        assert_eq!(
-            (
-                spent.sent,
-                spent.not_modified,
-                spent.refused,
-                spent.counted_last_hour
-            ),
-            (4, 2, 0, 2)
-        );
-        let refreshed = observe_github_repository_at(
-            ObservationRequest {
-                cursor: third.cursor.clone(),
-                previous_facts: Some(third.facts.clone()),
-                provider: "github.repository".into(),
-                locator: "example/repo".into(),
-                fields: BTreeSet::from(["issues".into()]),
-                every_ms: None,
-                refresh: true,
-            },
-            &base,
-            Some("orchid-test-token"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(refreshed.facts["issues"], third.facts["issues"]);
-        let requests = server
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|request| request.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.contains("authorization: bearer orchid-test-token"))
-        );
-        assert!(requests[0].starts_with("get /repos/example/repo "));
-        assert!(requests[1].starts_with("get /repos/example/repo/issues?"));
-        assert!(!requests[0].contains("if-none-match"));
-        assert!(!requests[1].contains("if-none-match"));
-        assert!(requests[2].contains("if-none-match: \"repo-v1\""));
-        assert!(requests[3].contains("if-none-match: \"issues-v1\""));
-        assert!(
-            requests[4].contains("if-none-match: \"repo-v1\""),
-            "a refresh inside the cache window still asks GitHub"
-        );
-        assert!(requests[5].contains("if-none-match: \"issues-v1\""));
     }
 
     #[tokio::test]
@@ -1855,47 +1607,6 @@ mod tests {
             Some(GithubRefusal::Unauthenticated)
         ));
         assert!(refusal(StatusCode::NOT_FOUND, &[], "").is_none());
-    }
-
-    #[test]
-    fn a_renamed_repository_keeps_its_items_and_a_narrower_read_keeps_other_fields() {
-        let fields = BTreeSet::from(["pull_requests".into(), "issues".into()]);
-        let before = normalize_github_repository(
-            None,
-            7,
-            &[json!({"number": 4, "draft": false, "title": "PR", "html_url": "https://github.com/acme/old/pull/4"})],
-            &[json!({"number": 5, "title": "Issue", "html_url": "https://github.com/acme/old/issues/5"})],
-            &fields,
-        )
-        .unwrap();
-
-        let renamed = normalize_github_repository(
-            Some(&before),
-            7,
-            &[json!({"number": 4, "draft": false, "title": "PR", "html_url": "https://github.com/acme/new/pull/4"})],
-            &[json!({"number": 5, "title": "Issue", "html_url": "https://github.com/acme/new/issues/5"})],
-            &fields,
-        )
-        .unwrap();
-        assert_eq!(renamed["repository_id"], before["repository_id"]);
-        assert_eq!(
-            renamed["pull_requests"][0]["number"],
-            before["pull_requests"][0]["number"]
-        );
-
-        let narrower = normalize_github_repository(
-            Some(&before),
-            7,
-            &[],
-            &[],
-            &BTreeSet::from(["pull_requests".into()]),
-        )
-        .unwrap();
-        assert_eq!(narrower["issues"], before["issues"]);
-        assert_eq!(narrower["pull_requests"][0]["state"], "closed");
-
-        let error = normalize_github_repository(Some(&before), 8, &[], &[], &fields).unwrap_err();
-        assert!(error.to_string().contains("repository 8"), "{error}");
     }
 
     #[test]

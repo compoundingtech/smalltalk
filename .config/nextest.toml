@@ -32,3 +32,10 @@ not (
 [[profile.ci.overrides]]
 filter = 'package(st3) and test(/^fleet::outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts$/)'
 priority = 100
+
+# A boot canary's race that sometimes loses is the bug it exists to catch, so a retry that passes
+# would hide it. Start these early too: five seats launch together in one case.
+[[profile.ci.overrides]]
+filter = 'package(st3) and test(/^boot_canaries::/)'
+retries = 0
+priority = 100

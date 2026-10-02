@@ -811,8 +811,15 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("merged", boolean()),
                 ("created_at", string()),
                 ("updated_at", string()),
+                ("checks_state", string()),
                 ("checks", array()),
+                ("review_decision", string()),
                 ("reviews", array()),
+                ("merge_queue", object()),
+                ("comments", integer()),
+                ("last_comment", object()),
+                ("reactions", object()),
+                ("mentions", array()),
             ],
         ),
     );
@@ -828,9 +835,14 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("title", string()),
                 ("author", string()),
                 ("state", string()),
+                ("state_reason", string()),
                 ("created_at", string()),
                 ("updated_at", string()),
                 ("labels", array()),
+                ("comments", integer()),
+                ("last_comment", object()),
+                ("reactions", object()),
+                ("mentions", array()),
             ],
         ),
     );
@@ -2233,6 +2245,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("waiting_since", string()),
             ("legacy_request", string()),
             ("requester_declaration", string()),
+            ("request", object()),
         ],
         "work.person-done" | "work.person-cancelled" => &[
             ("attempt", integer()),
@@ -2240,6 +2253,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("summary", string()),
             ("key", string()),
             ("episode", string()),
+            ("answer", object()),
         ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
         | "work.released" => &[

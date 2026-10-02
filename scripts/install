@@ -26,6 +26,11 @@ if [[ -z $from ]]; then
   cargo build --release --locked --manifest-path "$repo/Cargo.toml" \
     -p st3 -p st3-migrate -p stui
   from=${CARGO_TARGET_DIR:-$repo/target}/release
+  # stui's speech helper, on a Mac whose Swift has the macOS 26 SDK; SmallTalk.app takes it in.
+  if [[ $(uname -s) == Darwin ]] && ! "$repo/apps/macos/listen/build.sh" "$from" >/dev/null; then
+    echo "install: the speech helper did not build here; stui will have no voice" >&2
+    rm -rf "$from/StListen.app"
+  fi
 fi
 
 for binary in "${binaries[@]}"; do

@@ -52,6 +52,21 @@ pub fn watch(agent_dir: &Path, wake: mpsc::Sender<()>) {
         queue.lock().unwrap().wakes.push(wake);
     }
 }
+/// The daemon's first mailbox replay has not arrived. A provider that is ready within the first
+/// second of a launch, as a fast one or a stand-in always is, asks before it can: that is "nothing
+/// known yet", never a reason to end the session, so callers wait and ask again.
+#[derive(Debug)]
+pub struct NotReplayed;
+impl std::fmt::Display for NotReplayed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("waiting for the daemon mailbox replay")
+    }
+}
+impl std::error::Error for NotReplayed {}
+pub fn is_not_replayed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NotReplayed>().is_some()
+}
+
 pub fn messages(agent_dir: &Path, inbox: &Path) -> anyhow::Result<Vec<Message>> {
     let queue = queues().lock().unwrap().get(agent_dir).cloned();
     match queue {
@@ -60,7 +75,7 @@ pub fn messages(agent_dir: &Path, inbox: &Path) -> anyhow::Result<Vec<Message>> 
             .unwrap()
             .messages
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("waiting for the daemon mailbox replay")),
+            .ok_or_else(|| NotReplayed.into()),
         None => crate::message::list_inbox(inbox),
     }
 }
@@ -89,7 +104,10 @@ mod tests {
     fn replay_and_unavailable_bodies_cannot_prune_uncertain_native_handoffs() {
         let root = tempfile::tempdir().unwrap();
         register(root.path());
-        assert!(messages(root.path(), &root.path().join("resources/inbox")).is_err());
+        assert!(
+            messages(root.path(), &root.path().join("resources/inbox"))
+                .is_err_and(|error| is_not_replayed(&error))
+        );
         replace_active(
             root.path(),
             Vec::new(),

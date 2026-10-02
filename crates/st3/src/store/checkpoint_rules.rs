@@ -15,10 +15,10 @@ use smallclaims::store::checkpoint::*;
 use smallclaims::store::checkpoint_agreement::*;
 
 /// The rule engine's version. It is part of the rules digest, so nodes agree on a checkpoint only
-/// when they run the same rules. Version 4 leaves repaired originals out of the sealed set and
-/// proves on the sealed claims' blobs only, so a node on version 3 seals different terms instead
-/// of verifying a different set or graph.
-pub const RULES_VERSION: u32 = 4;
+/// when they run the same rules. Version 5 leaves repaired originals out of the sealed set and
+/// proves on the sealed claims' blobs only, so a node on an earlier version seals different terms
+/// instead of verifying a different set or graph.
+pub const RULES_VERSION: u32 = 5;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -68,11 +68,12 @@ harness.usage semantics=response_rollup slot=subject,incarnation_id,model,accoun
 harness.usage semantics=session_cumulative slot=subject,incarnation_id keep=newest,largest-total_tokens
 harness.usage semantics=context_occupancy slot=subject,incarnation_id keep=newest
 harness.limits slot=subject keep=newest
+resource.observed actor=null observer=set slot=subject keep=newest
 render.applied slot=subject keep=newest min-age-before-cut=5d
 runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
 sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
 proof=the-sealed-claims-and-the-blobs-they-reference
-guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,shared-operation,writer-newest-envelope,whole-envelope
+guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
 witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
 
@@ -156,6 +157,16 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         }
         // Limits are read as each seat's newest reading.
         "harness.limits" => Some((Rule::Newest, slot(&[]))),
+        // An observer records a resource's complete facts in every observation, so its newest
+        // observation replaces the older ones. A repository observer records each item as its
+        // own resource, so each item keeps its latest state. A version that a subscription request
+        // or a message was made for shares their envelope and stays with them.
+        "resource.observed"
+            if claim.actor.is_none()
+                && fields(claim).is_some_and(|fields| fields.contains_key("observer")) =>
+        {
+            Some((Rule::Newest, slot(&[])))
+        }
         // A legacy per-response claim is summed by every usage read, so it stays.
         "harness.usage" => match field_str(claim, "semantics")? {
             "response_rollup" => Some((
@@ -433,17 +444,24 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
     }
 
     // D4: guards.
+    // A claim cited as evidence, or pinned as a mission run's input, is read by its ID.
     let cited = claims
         .iter()
         .flat_map(|sealed_claim| {
-            sealed_claim
-                .claim
-                .body
+            let body = &sealed_claim.claim.body;
+            let evidence = body
                 .get("evidence")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(Value::as_str)
+                .filter_map(Value::as_str);
+            let inputs = (sealed_claim.claim.kind == "mission-run.created")
+                .then(|| body.pointer("/fields/inputs").and_then(Value::as_object))
+                .flatten()
+                .into_iter()
+                .flat_map(|inputs| inputs.values())
+                .filter_map(|input| input.get("claim_id").and_then(Value::as_str));
+            evidence.chain(inputs)
         })
         .collect::<BTreeSet<_>>();
     let mut newest_envelope: BTreeMap<&str, u64> = BTreeMap::new();
@@ -892,6 +910,7 @@ impl Store {
             detail: "Bring the waiting machines back, upgrade them, or excuse a machine that stays away.".into(),
             mission: None, mission_run: None, step: None, targets: vec![checkpoint.clone()], requested_at_unix_ms: since,
             actions: vec![attention_action("inspect checkpoint", &["st", "replication", "checkpoint", "status"])],
+            request: None,
         }])
     }
 }

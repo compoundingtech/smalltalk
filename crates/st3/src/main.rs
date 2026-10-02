@@ -1956,9 +1956,13 @@ struct PtyServeFabricArgs {
 #[derive(Args)]
 struct PtySendArgs {
     subject: String,
+    /// Text typed as one line and followed by Enter a moment later; with --raw the exact bytes,
+    /// with --key a key name.
     value: String,
+    /// Send exactly these bytes and no Enter: escape sequences, such as a mouse report.
     #[arg(long, conflicts_with = "key")]
     raw: bool,
+    /// Send one named key, such as enter, escape or ctrl+c.
     #[arg(long, conflicts_with = "raw")]
     key: bool,
 }
@@ -2894,8 +2898,13 @@ struct WorkAskArgs {
     person: String,
     #[arg(long)]
     title: String,
-    #[arg(long)]
-    reason: String,
+    /// What the person reads. With --request it defaults to the request's question.
+    #[arg(long, required_unless_present = "request")]
+    reason: Option<String>,
+    /// A structured request as a JSON file (`-` reads stdin): a decision, a choice or
+    /// feedback, with named answers the person picks and you read back as data.
+    #[arg(long, value_name = "FILE", long_help = STRUCTURED_REQUEST_HELP)]
+    request: Option<PathBuf>,
     #[arg(long, conflicts_with = "new_run")]
     step: Option<String>,
     #[arg(long, conflicts_with = "step")]
@@ -2913,8 +2922,15 @@ struct WorkDoneArgs {
     subject: String,
     #[arg(long = "as")]
     actor: String,
-    #[arg(long, alias = "reason")]
-    summary: String,
+    /// The response in words. A structured answer derives it when omitted.
+    #[arg(long, alias = "reason", required_unless_present_any = ["answer", "text"])]
+    summary: Option<String>,
+    /// The ID of one of a structured request's named answers.
+    #[arg(long, value_name = "ID")]
+    answer: Option<String>,
+    /// Text for a structured request: feedback, a custom choice, or the changes requested.
+    #[arg(long)]
+    text: Option<String>,
     #[arg(long)]
     evidence: Vec<String>,
     #[arg(long)]
@@ -11005,6 +11021,48 @@ async fn run_attention(
     }
 }
 
+const STRUCTURED_REQUEST_HELP: &str = r##"A structured request as a JSON file (`-` reads stdin).
+
+A `decision` proposes one action: exactly one `accept` answer, one `decline` answer and at most
+one `request_changes` answer, each naming what happens next. A `choice` names 2 to 5 options,
+and `"custom": true` also takes the person's own words. `feedback` asks for text and has no
+answers. `why_person` says why no runtime fact or standing instruction settles it. Omit
+`recommendation` to make none. Subject kinds: pull_request, issue, document, mission, run,
+step, agent, host, commit, link; `revision` pins what was reviewed.
+
+  {"version": 1, "type": "decision",
+   "question": "Land #11 then #12?",
+   "why_person": "The owner approves merges to the public repository.",
+   "reasons": ["Checks are green on both heads."],
+   "recommendation": {"answer": "land", "reason": "Both are reviewed."},
+   "subjects": [{"kind": "pull_request", "label": "#11",
+                 "url": "https://github.com/OWNER/REPO/pull/11", "revision": "HEAD_SHA"}],
+   "answers": [
+     {"id": "land", "label": "Land #11 then #12", "outcome": "accept",
+      "consequence": "I queue #11, then #12."},
+     {"id": "keep-open", "label": "Keep both open", "outcome": "decline",
+      "consequence": "Nothing merges."},
+     {"id": "revise", "label": "Request changes", "outcome": "request_changes",
+      "consequence": "I make the changes and ask again."}]}
+
+The person answers with `st work done STEP --answer ID [--text TEXT]`; requesting changes,
+feedback and a custom choice need text. The resumed step's `person_answers` carries the answer
+as {"type", "outcome", "id", "label", "text"}: read it with `st work show STEP --json` and
+act on `id` and `outcome`, not on the words."##;
+
+/// Reads a structured request from a JSON file, or stdin for `-`. The daemon validates it.
+fn read_structured_request(path: &Path) -> Result<serde_json::Value> {
+    let text = if path == Path::new("-") {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        text
+    } else {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("read the request {}", path.display()))?
+    };
+    serde_json::from_str(&text).context("the request is not JSON")
+}
+
 async fn run_work(
     client: &Client,
     endpoint: &Endpoint,
@@ -11014,6 +11072,19 @@ async fn run_work(
     match command {
         WorkCommand::Ask(args) => {
             reject_foreign_agent_actor(&args.actor)?;
+            let request = args
+                .request
+                .as_deref()
+                .map(read_structured_request)
+                .transpose()?;
+            let reason = match (args.reason, &request) {
+                (Some(reason), _) => reason,
+                (None, Some(request)) => request["question"]
+                    .as_str()
+                    .context("the request needs a question")?
+                    .to_owned(),
+                (None, None) => unreachable!("clap requires --reason or --request"),
+            };
             let result: StepRunView = client
                 .post(
                     "/v1/work/ask",
@@ -11021,12 +11092,13 @@ async fn run_work(
                         legacy_request: None,
                         person: args.person,
                         title: args.title,
-                        reason: args.reason,
+                        reason,
                         actor: args.actor,
                         step: args.step,
                         new_run: args.new_run,
                         incarnation: args.incarnation,
                         idempotency_key: args.idempotency_key,
+                        request,
                     },
                 )
                 .await?;
@@ -11045,11 +11117,17 @@ async fn run_work(
                     &PersonStepResponse {
                         subject: args.subject,
                         actor: args.actor,
-                        summary: args.summary,
+                        summary: args.summary.unwrap_or_default(),
                         evidence: args.evidence,
                         episode: args.episode,
                         idempotency_key: args.idempotency_key.unwrap_or_else(|| {
                             format!("person-response:{}", uuid::Uuid::now_v7().simple())
+                        }),
+                        answer: (args.answer.is_some() || args.text.is_some()).then(|| {
+                            st3::person_request::AnswerInput {
+                                id: args.answer,
+                                text: args.text,
+                            }
                         }),
                     },
                 )
@@ -11286,6 +11364,25 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
     }
     for constraint in &work.constraints {
         let _ = writeln!(output, "Constraint: {constraint}");
+    }
+    for response in &work.person_answers {
+        let typed = response
+            .answer
+            .as_ref()
+            .map(|answer| {
+                let id = answer
+                    .id
+                    .as_deref()
+                    .map(|id| format!(" {id}"))
+                    .unwrap_or_default();
+                format!("{}{id}", answer.outcome)
+            })
+            .unwrap_or_else(|| response.status.clone());
+        let _ = writeln!(
+            output,
+            "Person answer: {typed}: {} ({}, {})",
+            response.summary, response.respondent, response.ask
+        );
     }
     if let Some(usage) = &work.usage {
         let _ = writeln!(output, "Usage: {}", render_usage(usage));
@@ -14654,6 +14751,15 @@ async fn drive_codex_native(
     } = paths.clone();
     let root = paths.state_root();
     let state_dir = root.join("state");
+    let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
+    if matches!(start, ProviderStart::Launch(_)) {
+        // The path can still hold the predecessor's terminal record. It is the predecessor's, never
+        // this incarnation's: only a byte change after this point is the new wrapper's claim.
+        loop_state.predecessor_harness_record = fs::read(&harness_state_path).ok();
+        loop_state.harness_record_started = false;
+    } else {
+        loop_state.harness_record_started = true;
+    }
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
@@ -14767,10 +14873,17 @@ async fn drive_codex_native(
                         }).await?;
                         loop_state.ready = true;
                     }
-                    if let Some(observed) = st_drivers::harness_state::read(
-                        &st_drivers::harness_state::harness_state_path(&agent_dir),
-                        None,
-                    ) {
+                    let current_record = fs::read(&harness_state_path).ok();
+                    loop_state.harness_record_started = harness_record_belongs_to_current_session(
+                        loop_state.harness_record_started,
+                        loop_state.predecessor_harness_record.as_deref(),
+                        current_record.as_deref(),
+                    );
+                    if let Some(observed) = loop_state
+                        .harness_record_started
+                        .then(|| st_drivers::harness_state::read(&harness_state_path, None))
+                        .flatten()
+                    {
                         publish_harness_activity(
                             client,
                             subject,
