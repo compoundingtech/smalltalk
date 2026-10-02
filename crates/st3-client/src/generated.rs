@@ -297,6 +297,40 @@ pub struct DocumentContent {
     pub bytes: Vec<u8>,
 }
 
+/// Token spend over a period, one row per agent, mission run, step, model, account and host.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsagePeriod {
+    pub since_ms: u64,
+    pub until_ms: u64,
+    pub rows: Vec<UsageRow>,
+}
+/// One group's spend. Costs are API-equivalent micro-dollars; `unpriced_tokens` had no price.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsageRow {
+    pub agent: String,
+    #[serde(default)]
+    pub mission_run: Option<String>,
+    #[serde(default)]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub pricing: Option<String>,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub cached_tokens: u64,
+    pub cost_microusd: u64,
+    pub reported_cost_microusd: u64,
+    pub unpriced_tokens: u64,
+}
+
 /// A normalized KDL node. Empty optional collections are omitted just as in the stored AST.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct CanonicalNode {

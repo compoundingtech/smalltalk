@@ -322,6 +322,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::request_latency),
         )
         .route("/v1/client/documents/content", get(client_v0::document_get))
+        .route("/v1/client/usage", get(client_v0::usage_period))
         .route(
             "/v1/client/subject-definition",
             get(client_v0::subject_definition),
@@ -12324,7 +12325,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(status, StatusCode::OK, "{repeated}");
         assert_eq!(repeated["id"], observation["id"]);
         let (_, report) = get_request(
-            app,
+            app.clone(),
             &format!("/v1/usage?since_ms=0&until_ms={}", client_now_ms() + 60_000),
         )
         .await;
@@ -12332,6 +12333,38 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(report["rows"][0]["total_tokens"], 29);
         assert_eq!(report["rows"][0]["cache_write_tokens"], 3);
         assert_eq!(report["rows"][0]["cached_tokens"], 20);
+        // Clients read the same rows, without the identities st does not know.
+        let (status, period) = get_request(
+            app.clone(),
+            &format!(
+                "/v1/client/usage?since_ms=0&until_ms={}",
+                client_now_ms() + 60_000
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{period}");
+        let period = period.get("value").unwrap_or(&period);
+        let row = &period["rows"][0];
+        assert_eq!(period["rows"].as_array().unwrap().len(), 1, "{period}");
+        assert_eq!(row["agent"], subject);
+        assert_eq!(row["total_tokens"], 29);
+        assert!(
+            row.get("mission_run").is_none() && row.get("step").is_none(),
+            "{row}"
+        );
+        let typed: st3_client::UsagePeriod = serde_json::from_value(period.clone()).unwrap();
+        assert_eq!(typed.rows[0].model.as_deref(), Some("claude-example"));
+        let backwards = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/client/usage?since_ms=2&until_ms=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(backwards.status(), StatusCode::UNPROCESSABLE_ENTITY);
         // The response timeline and its latest-retention rollup both stay local.
         assert_eq!(
             state.store.local_observations_after(0, 10).unwrap().len(),
