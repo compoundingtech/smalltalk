@@ -20,6 +20,8 @@ export function plainMessage(code: Code | string | undefined, message: string): 
     case 'not-found': return `it is gone: ${message}`;
     case 'forbidden': return `not allowed: ${message}`;
     case 'internal': return `st hit a problem: ${message}`;
+    case 'terminal-ended': return 'the terminal ended: its process exited';
+    case 'terminal-unavailable': return 'the terminal cannot be reached right now';
     default: return message;
   }
 }
@@ -35,7 +37,7 @@ export function plainError(error: unknown): string {
   return String(error);
 }
 
-const TRANSIENT = new Set<string>(['stale-fence', 'page-cursor-expired', 'cursor-gap', 'remote-unavailable', 'rate-limited', 'runtime-authority-indeterminate', 'internal']);
+const TRANSIENT = new Set<string>(['stale-fence', 'page-cursor-expired', 'cursor-gap', 'remote-unavailable', 'rate-limited', 'runtime-authority-indeterminate', 'terminal-unavailable', 'internal']);
 
 /** Whether an error st sent on a stream may clear if asked again: a race, a host out of reach, a load spike. A frame without a code (a subscription limit, say) may too. */
 export function isTransientCode(code: string | undefined): boolean {

@@ -581,8 +581,8 @@ async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
         .await
         .expect("an exited terminal must end the stream promptly");
     assert!(
-        matches!(ended, Err(ClientError::Api(ErrorCode::StaleFence, _, _))),
-        "an exited terminal must close the stream with stale-fence: {ended:?}"
+        matches!(ended, Err(ClientError::Api(ErrorCode::TerminalEnded, _, ref envelope)) if !envelope.retryable),
+        "an exited terminal must close the stream with non-retryable terminal-ended: {ended:?}"
     );
     server.abort();
 }

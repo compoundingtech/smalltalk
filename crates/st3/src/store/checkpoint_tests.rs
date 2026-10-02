@@ -247,6 +247,136 @@ fn harness(state: &str, reason: Option<&str>) -> Value {
     })
 }
 
+fn rollup(account: &str, at: u128, total: u64) -> Value {
+    json!({
+        "semantics": "response_rollup", "driver": "claude", "incarnation_id": "inc-1",
+        "model": "claude-example", "account": account, "owner_run": "mission-run/example",
+        "owner_step": "step-run/example/build", "host": "alder",
+        "total_tokens": total, "cost_microusd": total * 10, "observed_at_unix_ms": at as u64,
+    })
+}
+
+#[test]
+fn usage_rollups_keep_hourly_ends_in_the_window_and_one_baseline_before_it() {
+    const HOUR: u128 = 60 * 60 * 1000;
+    let window = CUT - 7 * DAY_MS;
+    let mut sealed = Sealed::default();
+    let mut usage = |sealed: &mut Sealed, at: u128, fields: Value| {
+        sealed.add("alder", at, draft("harness.usage", AGENT, fields))
+    };
+    let mut total = 0;
+    let mut series = |sealed: &mut Sealed, account: &str, at: u128| {
+        total += 100;
+        usage(sealed, at, rollup(account, at, total))
+    };
+    let before = [window - 3 * HOUR, window - 2 * HOUR, window - HOUR]
+        .map(|at| series(&mut sealed, "claude/aaaa", at));
+    let first_hour =
+        [10, 20, 50].map(|minutes| series(&mut sealed, "claude/aaaa", window + minutes * 60_000));
+    let second_hour =
+        [65, 90].map(|minutes| series(&mut sealed, "claude/aaaa", window + minutes * 60_000));
+    // Another account on the same step is its own series.
+    let other = [window - 2 * HOUR, window - HOUR].map(|at| series(&mut sealed, "claude/bbbb", at));
+    let legacy = [1, 2].map(|offset| {
+        usage(
+            &mut sealed,
+            T + offset,
+            json!({"semantics": "response", "driver": "claude", "incarnation_id": "inc-1", "total_tokens": 5}),
+        )
+    });
+    // The newest session reading is smaller than the one before it, so both stay.
+    let cumulative = [(10_u64, 1), (30, 2), (20, 3)].map(|(tokens, offset)| {
+        usage(
+            &mut sealed,
+            T + 10 + offset,
+            json!({"semantics": "session_cumulative", "driver": "codex", "incarnation_id": "inc-2", "total_tokens": tokens}),
+        )
+    });
+    let occupancy = [1, 2].map(|offset| {
+        usage(
+            &mut sealed,
+            T + 100 + offset,
+            json!({"semantics": "context_occupancy", "driver": "codex", "incarnation_id": "inc-2", "context_used_tokens": offset}),
+        )
+    });
+    let plan = plan_drops(&sealed.build());
+    assert_eq!(
+        dropped(&plan),
+        ids([
+            &before[0],
+            &before[1],
+            &first_hour[0],
+            &first_hour[1],
+            &second_hour[0],
+            &other[0],
+            &cumulative[0],
+            &occupancy[0],
+        ])
+    );
+    let _ = (legacy, first_hour[2].clone(), second_hour[1].clone());
+}
+
+#[test]
+fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
+    let store = Store::open_memory("alder").unwrap();
+    store
+        .append_claim_outcome(&input(
+            AGENT,
+            "harness.observed",
+            Some(AGENT),
+            json!({"state": "idle", "incarnation_id": "inc-1"}),
+            "harness",
+        ))
+        .unwrap();
+    let old = now_ms() - 9 * DAY_MS;
+    for (n, offset) in [0, 1, 2].into_iter().enumerate() {
+        store
+            .append_claim(&input(
+                AGENT,
+                "harness.usage",
+                Some(AGENT),
+                rollup(
+                    "claude/aaaa",
+                    old + offset * DAY_MS / 4,
+                    100 * (n as u64 + 1),
+                ),
+                &format!("rollup-{n}"),
+            ))
+            .unwrap();
+    }
+    let lifetime = store.usage_summary_at(AGENT, None, None).unwrap().unwrap();
+    assert_eq!(lifetime.total_tokens, 300);
+    let scratch = tempfile::tempdir().unwrap();
+    let cut = now_ms() + 1_000;
+    let (plan, proof) = store.plan_checkpoint(cut, scratch.path()).unwrap();
+    assert!(proof.passed, "{proof:?}");
+    assert_eq!(
+        plan.claims
+            .iter()
+            .filter(|claim| claim.kind == "harness.usage")
+            .count(),
+        2,
+        "{plan:?}"
+    );
+
+    let sealed = store.checkpoint_sealed_set(cut).unwrap();
+    let newest = sealed
+        .claims
+        .iter()
+        .rev()
+        .find(|claim| claim.claim.kind == "harness.usage")
+        .unwrap();
+    let mut wrong = plan.clone();
+    wrong.claims.push(claim_tombstone(newest));
+    let copy = scratch.path().join("wrong.sqlite3");
+    store.copy_store_to(&copy).unwrap();
+    let proof = prove_on_copy(&copy, &sealed, &wrong).unwrap();
+    assert!(
+        !proof.passed,
+        "dropping a series total changes lifetime usage"
+    );
+}
+
 #[test]
 fn harness_rule_keeps_every_position_a_reader_reads() {
     let mut sealed = Sealed::default();
