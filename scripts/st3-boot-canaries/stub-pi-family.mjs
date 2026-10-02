@@ -18,18 +18,19 @@ const record = (event, fields = {}) => fs.appendFileSync(receiptPath,
   JSON.stringify({ event, at: Date.now() / 1000, pid: process.pid, ...fields }) + '\n');
 const st = (...args) => childProcess.spawnSync(process.env.ST3_BIN, args, { encoding: 'utf8', timeout: 60000 });
 
-// What a model does when woken: read the message and claim the step it names.
+// What a model does when woken: read the message, then run the command the wake gives, exactly as
+// written. Nothing is added: a wake a model cannot follow verbatim fails the canary.
 const act = (content) => {
   const message = content.match(/graph="(message\/[0-9a-f]+)"/) ?? content.match(/message\/[0-9a-f]+/);
-  const step = content.match(/st work claim (step-run\/[^\s`]+)/);
+  const command = content.match(/Run `(st work claim [^`]+)`/);
   if (message) {
     const reference = message[1] ?? message[0];
     const result = st('conversations', 'read', reference, '--as', agent, '--json');
     record('read', { reference, exit: result.status, stderr: (result.stderr ?? '').slice(-1000) });
   }
-  if (step) {
-    const result = st('work', 'claim', step[1], '--as', agent);
-    record('claim', { step: step[1], exit: result.status, stderr: (result.stderr ?? '').slice(-1000) });
+  if (command) {
+    const result = st(...command[1].split(/\s+/).slice(1));
+    record('claim', { command: command[1], exit: result.status, stderr: (result.stderr ?? '').slice(-1000) });
   }
 };
 
