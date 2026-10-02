@@ -587,6 +587,9 @@ pub(crate) fn render_attention_show(
         let _ = writeln!(output, "STEP      {step}");
     }
     let _ = writeln!(output, "\n{}\n{}", style.heading("DETAIL"), item.detail);
+    if let Some(request) = &item.request {
+        output.push_str(&render_structured_request(request, style));
+    }
     if !item.targets.is_empty() {
         let _ = writeln!(output, "\n{}", style.heading("TARGETS"));
         for target in &item.targets {
@@ -603,6 +606,91 @@ pub(crate) fn render_attention_show(
                 .collect::<Vec<_>>()
                 .join(" ");
             let _ = writeln!(output, "  {}: {command}", action.label);
+        }
+    }
+    output
+}
+
+/// A structured request in reading order: question, recommendation, answers with what each
+/// does next, reasons, then the subjects to inspect.
+pub(crate) fn render_structured_request(request: &Value, style: OutputStyle) -> String {
+    let mut output = String::new();
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
+    let list = |value: &Value| value.as_array().cloned().unwrap_or_default();
+    let _ = writeln!(
+        output,
+        "\n{}  {}",
+        style.heading("REQUEST"),
+        text(&request["type"])
+    );
+    let _ = writeln!(output, "  {}", text(&request["question"]));
+    if let Some(summary) = request["summary"].as_str() {
+        let _ = writeln!(output, "  {summary}");
+    }
+    match request.get("recommendation") {
+        Some(recommendation) => {
+            let _ = writeln!(
+                output,
+                "  Recommended: {} ({})",
+                text(&recommendation["answer"]),
+                text(&recommendation["reason"])
+            );
+        }
+        None if request["type"] != "feedback" => {
+            let _ = writeln!(output, "  No recommendation.");
+        }
+        None => {}
+    }
+    let _ = writeln!(output, "  Why you: {}", text(&request["why_person"]));
+    let answers = list(&request["answers"]);
+    if !answers.is_empty() {
+        let _ = writeln!(output, "\n{}", style.heading("ANSWERS"));
+        for answer in &answers {
+            let outcome = answer["outcome"]
+                .as_str()
+                .map(|outcome| format!(" [{outcome}]"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "  {}  {}{outcome}",
+                text(&answer["id"]),
+                text(&answer["label"])
+            );
+            let _ = writeln!(output, "      then: {}", text(&answer["consequence"]));
+            for condition in list(&answer["conditions"]) {
+                let _ = writeln!(output, "      if: {}", text(&condition));
+            }
+        }
+        if request["custom"] == true {
+            let _ = writeln!(output, "  Or answer in your own words with --text.");
+        }
+    }
+    let reasons = list(&request["reasons"]);
+    if !reasons.is_empty() {
+        let _ = writeln!(output, "\n{}", style.heading("REASONS"));
+        for reason in reasons {
+            let _ = writeln!(output, "  • {}", text(&reason));
+        }
+    }
+    let subjects = list(&request["subjects"]);
+    if !subjects.is_empty() {
+        let _ = writeln!(output, "\n{}", style.heading("SUBJECTS"));
+        for subject in subjects {
+            let place = [&subject["ref"], &subject["url"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let revision = subject["revision"]
+                .as_str()
+                .map(|revision| format!(" @ {revision}"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "  {} {}  {place}{revision}",
+                text(&subject["kind"]),
+                text(&subject["label"])
+            );
         }
     }
     output
@@ -731,6 +819,25 @@ pub(crate) fn render_step_run(step: &StepRunView, style: OutputStyle, now_unix_m
         let _ = writeln!(output, "{}", style.heading("CONSTRAINTS"));
         for constraint in &step.constraints {
             let _ = writeln!(output, "  • {constraint}");
+        }
+    }
+    if !step.person_answers.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "{}", style.heading("PERSON ANSWERS"));
+        for response in &step.person_answers {
+            let answer = response.answer.as_ref();
+            let outcome = answer
+                .and_then(|answer| answer["outcome"].as_str())
+                .unwrap_or(response.status.as_str());
+            let id = answer
+                .and_then(|answer| answer["id"].as_str())
+                .map(|id| format!(" {id}"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "  • {outcome}{id}: {}  ({}, {})",
+                response.summary, response.respondent, response.ask
+            );
         }
     }
     output
@@ -1307,6 +1414,7 @@ mod tests {
             not_before_unix_ms: None,
             created_at_unix_ms: 1_000,
             updated_at_unix_ms: 2_000,
+            person_answers: Vec::new(),
         }
     }
 
@@ -1477,6 +1585,7 @@ mod tests {
                     "It is fixed".into(),
                 ],
             }],
+            request: None,
         };
         let rendered = render_attention_list(
             Some("person/alex"),
@@ -1847,5 +1956,36 @@ mod tests {
         let mut empty = generation;
         empty.steps.clear();
         assert!(render_generation(&empty, OutputStyle::plain()).contains("No steps."));
+    }
+
+    #[test]
+    fn a_structured_request_reads_question_recommendation_then_answers() {
+        let request = serde_json::json!({
+            "version": 1, "type": "decision",
+            "question": "Land #11 then #12?",
+            "why_person": "The owner approves merges.",
+            "recommendation": {"answer": "land", "reason": "Both are reviewed."},
+            "subjects": [{"kind": "pull_request", "label": "#11", "url": "https://example.com/pull/11", "revision": "aaa111"}],
+            "answers": [
+                {"id": "land", "label": "Land both", "outcome": "accept", "consequence": "I queue #11, then #12.", "conditions": ["checks stay green"]},
+                {"id": "keep-open", "label": "Keep both open", "outcome": "decline", "consequence": "Nothing merges."}
+            ]
+        });
+        let text = render_structured_request(&request, OutputStyle::plain());
+        let order = [
+            "REQUEST  decision",
+            "Land #11 then #12?",
+            "Recommended: land (Both are reviewed.)",
+            "Why you: The owner approves merges.",
+            "land  Land both [accept]",
+            "then: I queue #11, then #12.",
+            "if: checks stay green",
+            "keep-open  Keep both open [decline]",
+            "pull_request #11  https://example.com/pull/11 @ aaa111",
+        ];
+        let mut at = 0;
+        for line in order {
+            at += text[at..].find(line).unwrap_or_else(|| panic!("{line} in {text}"));
+        }
     }
 }

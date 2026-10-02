@@ -1059,6 +1059,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
                 new_run: Some(person.into()),
                 incarnation: None,
                 idempotency_key: format!("transport-{person}"),
+                request: None,
             })
             .unwrap()
     };
@@ -1123,6 +1124,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
         episode: attention.episode.clone(),
         summary: "Friday".into(),
         evidence: vec![],
+        answer: None,
     };
     assert!(
         read_only
@@ -1230,6 +1232,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
                 episode: alex.episode.clone(),
                 summary: "Friday".into(),
                 evidence: vec![],
+                answer: None,
             },
         )
         .await

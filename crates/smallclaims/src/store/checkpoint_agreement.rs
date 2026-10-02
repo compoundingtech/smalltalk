@@ -352,6 +352,10 @@ pub struct PendingCheckpointView {
     /// Participants that verified, and whether their digests match each other.
     pub verified: BTreeSet<String>,
     pub verifications_agree: bool,
+    /// When verifications disagree: each participant whose verification differs from this
+    /// node's, or from the first in canonical order when this node has not verified, and how.
+    #[serde(default)]
+    pub verifications_differ: BTreeMap<String, String>,
     /// The build each participant's newest seal names.
     pub builds: BTreeMap<String, String>,
 }
@@ -384,6 +388,28 @@ pub fn seal_difference(ours: &SealTerms, theirs: &SealTerms) -> String {
         differences.push("rules");
     }
     differences.join(", ")
+}
+
+pub fn verification_difference(ours: &VerifiedTerms, theirs: &VerifiedTerms) -> String {
+    [
+        (ours.participants != theirs.participants, "participants"),
+        (
+            ours.sealed_digest != theirs.sealed_digest,
+            "sealed envelopes",
+        ),
+        (ours.rules_digest != theirs.rules_digest, "rules"),
+        (ours.drop_digest != theirs.drop_digest, "drops"),
+        (
+            ours.retained_digest != theirs.retained_digest,
+            "retained claims",
+        ),
+        (ours.graph_digest != theirs.graph_digest, "graph"),
+        (ours.reader_digest != theirs.reader_digest, "reader answers"),
+    ]
+    .into_iter()
+    .filter_map(|(differs, name)| differs.then_some(name))
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 /// The agent that asks for attention about checkpoints on this node.
@@ -793,15 +819,36 @@ impl Store {
                 .is_none_or(|stable| stable.terms.cut_unix_ms < cut))
         .then(|| -> Result<PendingCheckpointView> {
             let checkpoint = checkpoint_name(cut);
-            let sealed = self.checkpoint_sealed_identities(cut, None)?;
-            let terms = SealTerms {
-                cut_unix_ms: cut,
-                participants: participants.clone(),
-                sealed_digest: sealed.digest,
-                rules_digest: self.runtime.checkpoint_rules_digest(),
+            let verified = first_verifications(&claims, &checkpoint);
+            // Once this node verified, its seal round is over: seals compare with the terms it
+            // verified, not with a rules digest a later build of this node carries.
+            let terms = match verified.get(&self.origin) {
+                Some((_, ours)) => SealTerms {
+                    cut_unix_ms: ours.cut_unix_ms,
+                    participants: ours.participants.clone(),
+                    sealed_digest: ours.sealed_digest.clone(),
+                    rules_digest: ours.rules_digest.clone(),
+                },
+                None => SealTerms {
+                    cut_unix_ms: cut,
+                    participants: participants.clone(),
+                    sealed_digest: self.checkpoint_sealed_identities(cut, None)?.digest,
+                    rules_digest: self.runtime.checkpoint_rules_digest(),
+                },
             };
             let seals = newest_seals(&claims, &checkpoint);
-            let verified = first_verifications(&claims, &checkpoint);
+            let reference = verified
+                .get(&self.origin)
+                .or_else(|| verified.values().next())
+                .map(|(_, terms)| terms.clone());
+            let verifications_differ = verified
+                .iter()
+                .filter_map(|(writer, (_, theirs))| {
+                    let ours = reference.as_ref()?;
+                    (theirs != ours)
+                        .then(|| (writer.clone(), verification_difference(ours, theirs)))
+                })
+                .collect();
             let builds = claims
                 .iter()
                 .filter(|claim| claim.subject == checkpoint && claim.kind == CHECKPOINT_SEALED)
@@ -833,6 +880,7 @@ impl Store {
                     .collect::<BTreeSet<_>>()
                     .len()
                     <= 1,
+                verifications_differ,
                 verified: verified.keys().cloned().collect(),
                 builds,
                 checkpoint,

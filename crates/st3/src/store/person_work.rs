@@ -2,6 +2,88 @@
 //! step_runs supplies their state. No separate attention record is created.
 use super::*;
 use crate::model::{PersonAskRequest, PersonStepResponse};
+use crate::person_request::{StructuredRequest, answer_summary};
+
+/// The ask's structured request in canonical form, or null for a free-text ask.
+fn canonical_request(input: &PersonAskRequest) -> Result<Value, St3Error> {
+    input
+        .request
+        .as_ref()
+        .map(|request| StructuredRequest::parse(request).map(|(_, canonical)| canonical))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+/// Adds the structured request to an ask claim body. A free-text ask's body stays exactly as
+/// before, so members that do not know the field still admit it.
+fn with_request(mut body: Value, request: &Value) -> Value {
+    if !request.is_null() {
+        body["fields"]["request"] = request.clone();
+    }
+    body
+}
+
+/// The structured request an ask claim carries. An ask from a newer build whose request this
+/// build cannot read is refused rather than answered as free text.
+fn structured_request(ask: &ClaimRecord) -> Result<Option<StructuredRequest>, St3Error> {
+    let Some(request) = ask.body["fields"].get("request").filter(|r| !r.is_null()) else {
+        return Ok(None);
+    };
+    serde_json::from_value::<StructuredRequest>(request.clone())
+        .ok()
+        .filter(|request| request.version == crate::person_request::REQUEST_VERSION)
+        .map(Some)
+        .ok_or_else(|| {
+            St3Error::new(
+                "unsupported-person-request",
+                "this ask's request needs a newer st to answer",
+            )
+        })
+}
+
+/// The answer the person gives and the summary history keeps. A free-text ask takes text
+/// only; a structured ask resolves the named answer against its request.
+fn resolve_answer(
+    ask: Option<&ClaimRecord>,
+    input: &PersonStepResponse,
+    cancel: bool,
+) -> Result<(Option<Value>, String), St3Error> {
+    let request = if cancel {
+        None
+    } else {
+        ask.map(structured_request).transpose()?.flatten()
+    };
+    if cancel || request.is_none() {
+        let Some(answer) = &input.answer else {
+            return Ok((None, input.summary.clone()));
+        };
+        if cancel || answer.id.is_some() {
+            return Err(St3Error::new(
+                "invalid-person-answer",
+                if cancel {
+                    "a cancelled ask has no answer"
+                } else {
+                    "this ask is free text; it has no named answers"
+                },
+            ));
+        }
+        let summary = if input.summary.trim().is_empty() {
+            answer.text.clone().unwrap_or_default()
+        } else {
+            input.summary.clone()
+        };
+        return Ok((None, summary));
+    }
+    let answer = request
+        .expect("checked above")
+        .answer(input.answer.as_ref(), &input.summary)?;
+    let summary = if input.summary.trim().is_empty() {
+        answer_summary(&answer)
+    } else {
+        input.summary.clone()
+    };
+    Ok((Some(answer), summary))
+}
 
 const STEP_QUERY: &str = "SELECT subject, run_id, step_path, definition_hash, status, attempt,
  assignee, available_to, agentless, title, goals, worker_reported, lease_owner,
@@ -164,6 +246,60 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
     Ok(true)
 }
 
+/// Adds person responses to a step view: the responses to asks this attempt made, as
+/// constraints and as data, or a person ask's own response as data.
+pub(super) fn enrich_responses(
+    connection: &Connection,
+    view: &mut StepRunView,
+) -> rusqlite::Result<()> {
+    let mut query = connection.prepare_cached(&canonical_sql(
+        "SELECT resolution.subject, resolution.actor, resolution.body, resolution.accepted_at_unix_ms,
+          json_extract(request.body,'$.fields.origin_step')=?1 FROM claims resolution JOIN claims request
+        ON request.subject=resolution.subject AND request.kind='work.person-asked'
+        WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
+          AND ((json_extract(request.body,'$.fields.origin_step')=?1
+                AND json_extract(request.body,'$.fields.origin_attempt')=?2)
+            OR (resolution.subject=?1 AND json_extract(resolution.body,'$.fields.attempt')=?2))
+        ORDER BY CANONICAL_ASC(resolution)",
+    ))?;
+    let responses = query
+        .query_map(params![view.subject, view.attempt], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<bool>>(4)?.unwrap_or(false),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (ask, actor, body, accepted, from_origin) in responses {
+        let Ok(body) = serde_json::from_str::<Value>(&body) else {
+            continue;
+        };
+        let fields = &body["fields"];
+        let Some(summary) = fields["summary"].as_str() else {
+            continue;
+        };
+        if from_origin {
+            view.constraints.push(format!("Person response: {summary}"));
+        }
+        view.person_answers.push(crate::model::PersonAnswerView {
+            ask,
+            status: fields["status"].as_str().unwrap_or("completed").into(),
+            summary: summary.into(),
+            respondent: actor.unwrap_or_default(),
+            answered_at_unix_ms: accepted.parse().unwrap_or(0),
+            answer: fields
+                .get("answer")
+                .filter(|answer| answer.is_object())
+                .cloned(),
+            evidence: serde_json::from_value(body["evidence"].clone()).unwrap_or_default(),
+        });
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn ask_person(&self, input: &PersonAskRequest) -> Result<StepRunView, St3Error> {
         if !input.person.starts_with("person/")
@@ -183,6 +319,7 @@ impl Store {
             return self.ask_person_in_new_run(input);
         }
         self.connection.batched(|tx| {
+            let structured = canonical_request(input)?;
             let origin_subject = normalize_step_run(input.step.as_deref().unwrap());
             let origin = step(tx, &origin_subject).map_err(internal)?
                 .ok_or_else(|| St3Error::new("missing-step-run", "the asking step does not exist"))?;
@@ -193,7 +330,8 @@ impl Store {
                 if existing.actor.as_deref() != Some(input.actor.as_str())
                     || existing.body["fields"]["person"] != input.person
                     || existing.body["fields"]["title"] != input.title
-                    || existing.body["fields"]["reason"] != input.reason {
+                    || existing.body["fields"]["reason"] != input.reason
+                    || existing.body["fields"]["request"] != structured {
                     return Err(St3Error::new("idempotency-conflict", "this ask key already names a different question"));
                 }
                 return step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
@@ -225,10 +363,10 @@ impl Store {
             let waiting_since = input.legacy_request.as_ref().map(|id| tx.query_row("SELECT accepted_at_unix_ms FROM claims WHERE id=?1 AND kind='attention.requested'", [id], |row| row.get::<_, String>(0))).transpose().map_err(internal)?;
             let evidence = input.legacy_request.iter().cloned().collect::<Vec<_>>();
             let claim = append_claim_tx(tx, &self.origin, &subject, "work.person-asked", Some(&input.actor),
-                &json!({"fields": {"run": origin.run, "generation": origin.generation,
+                &with_request(json!({"fields": {"run": origin.run, "generation": origin.generation,
                     "origin_step": origin_subject, "origin_attempt": origin.attempt,
                     "person": input.person, "title": input.title, "reason": input.reason,
-                    "key": input.idempotency_key, "attempt": 1, "status": "ready", "waiting_since": waiting_since, "legacy_request": input.legacy_request}}), &evidence, None).map_err(claim_append_error)?;
+                    "key": input.idempotency_key, "attempt": 1, "status": "ready", "waiting_since": waiting_since, "legacy_request": input.legacy_request}}), &structured), &evidence, None).map_err(claim_append_error)?;
             project(tx, &claim)?;
             let pause = append_claim_tx(tx, &self.origin, &origin_subject, "step-run.state", Some("daemon/runtime"),
                 &json!({"fields": {"status": "waiting-person", "reason": subject, "attempt": origin.attempt}}), &[claim.id], None).map_err(claim_append_error)?;
@@ -247,12 +385,18 @@ impl Store {
             let mut view = step(tx, &subject).map_err(internal)?
                 .ok_or_else(|| St3Error::new("missing-step-run", "the person step does not exist"))?;
             let ask = request(tx, &subject).map_err(internal)?;
+            // Checked after authority and fences below; a replay compares against it first.
+            let resolved = resolve_answer(ask.as_ref(), input, cancel);
             let kind = if cancel { "work.person-cancelled" } else { "work.person-done" };
             if let Some(existing) = tx.query_row(&canonical_sql("SELECT id, store_index, batch_id, subject, kind, origin,
                 actor, body, predecessors, accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind=?2
                 ORDER BY CANONICAL_DESC(claims) LIMIT 1"), params![subject, kind], claim_from_row).optional().map_err(internal)? {
                 if existing.body["fields"]["key"] == input.idempotency_key && existing.actor.as_deref() == Some(input.actor.as_str()) {
-                    if existing.body["fields"]["summary"] != input.summary || existing.body["evidence"] != json!(input.evidence)
+                    let Ok((answer, summary)) = &resolved else {
+                        return Err(St3Error::new("idempotency-conflict", "this response key already has another answer"));
+                    };
+                    if existing.body["fields"]["summary"] != *summary || existing.body["evidence"] != json!(input.evidence)
+                        || existing.body["fields"]["answer"] != answer.clone().unwrap_or_default()
                         || existing.body["fields"]["attempt"].as_u64() != Some(view.attempt as u64)
                         || input.episode.as_ref().is_some_and(|episode| existing.body["fields"]["episode"] != *episode) {
                         return Err(St3Error::new("idempotency-conflict", "this response key already has another summary"));
@@ -276,20 +420,27 @@ impl Store {
             if ask.is_none() && input.episode.as_ref().is_some_and(|episode| episode != &format!("{}:{}:{}", view.generation, view.attempt, view.readiness_epoch)) {
                 return Err(St3Error::new("stale-fence", "this authored person step has moved to another episode"));
             }
-            if input.summary.trim().is_empty() {
+            let (answer, summary) = resolved?;
+            if summary.trim().is_empty() {
                 return Err(St3Error::new("invalid-person-response", "a response needs a summary"));
             }
             let evidence = ask.as_ref().map(|a| vec![a.id.clone()]).unwrap_or_default();
-            let claim = append_claim_tx(tx, &self.origin, &subject, kind, Some(&input.actor),
-                &json!({"fields": {"attempt": view.attempt, "status": if cancel { "cancelled" } else { "completed" },
-                    "summary": input.summary, "key": input.idempotency_key, "episode": ask.as_ref().map(|a| a.id.clone()).unwrap_or_else(|| format!("{}:{}:{}", view.generation, view.attempt, view.readiness_epoch))}, "evidence": input.evidence}), &evidence, None).map_err(claim_append_error)?;
+            let mut body = json!({"fields": {"attempt": view.attempt, "status": if cancel { "cancelled" } else { "completed" },
+                "summary": summary, "key": input.idempotency_key, "episode": ask.as_ref().map(|a| a.id.clone()).unwrap_or_else(|| format!("{}:{}:{}", view.generation, view.attempt, view.readiness_epoch))}, "evidence": input.evidence});
+            if let Some(answer) = &answer {
+                body["fields"]["answer"] = answer.clone();
+            }
+            let claim = append_claim_tx(tx, &self.origin, &subject, kind, Some(&input.actor), &body, &evidence, None).map_err(claim_append_error)?;
             project(tx, &claim)?;
+            if let Some(ask) = ask.as_ref().filter(|a| !cancel && a.body["fields"]["origin_step"].is_null()) {
+                send_answer_tx(tx, &self.origin, ask, &claim, &summary, answer.as_ref())?;
+            }
             if let Some(origin) = ask.as_ref().and_then(|a| a.body["fields"]["origin_step"].as_str()) {
                 if let Some(origin_view) = step(tx, origin).map_err(internal)? {
                     if origin_view.status == "ready" {
                         let response = append_claim_tx(tx, &self.origin, origin, "step-run.state", Some("daemon/runtime"),
                             &json!({"fields": {"status": "ready", "attempt": origin_view.attempt, "readiness_epoch": origin_view.readiness_epoch,
-                                "reason": format!("Person response: {}", input.summary)}}), &[claim.id], None).map_err(claim_append_error)?;
+                                "reason": format!("Person response: {summary}")}}), &[claim.id], None).map_err(claim_append_error)?;
                         project_mission_run_update(tx, &response)?;
                     }
                 }
@@ -346,6 +497,7 @@ impl Store {
                     .then(|| format!("legacy-{}", &legacy.request[..16])),
                 incarnation: origin.and_then(|origin| origin.claim_incarnation),
                 idempotency_key: format!("legacy-person-ask:{}", legacy.request),
+                request: None,
             };
             match self.ask_person(&input) {
                 Ok(_) => changed = true,
@@ -404,26 +556,11 @@ impl Store {
                 "a daemon ask needs a daemon actor, a person, a title, a reason and a key",
             ));
         }
-        self.connection.batched(|tx| {
-            let identity = serde_json::to_string(&(actor, name, key)).map_err(internal)?;
-            let hash = hex::encode(Sha256::digest(identity.as_bytes()));
-            let generation = format!("ask-{}", &hash[..32]);
-            let subject = format!("step-run/{generation}/ask");
-            if request(tx, &subject).map_err(internal)?.is_some() {
-                return step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
-            }
-            let mission_id = format!("person-ask/{}", &hash[..32]);
-            let kdl = format!("version 2\nmission {mission_id:?} state=\"ready\" {{ goal {title:?}; step \"ask\" {{ assigned-to {person:?}; goal {reason:?}; }} }}");
-            let mut intent = crate::graph::parse_internal_intent(&kdl, &self.origin)?;
-            let mission = intent.missions.remove(&mission_id).ok_or_else(|| St3Error::new("internal", "the person mission could not be parsed"))?;
-            let claim = append_claim_tx(tx, &self.origin, &subject, "work.person-asked", Some(actor),
-                &json!({"fields": {"run": format!("mission-run/person-ask/{}", &hash[..32]),
-                    "generation": format!("run-generation/{generation}"),
-                    "person": person, "title": title, "reason": reason, "key": key,
-                    "attempt": 1, "status": "ready", "mission_spec": mission}}), &[], None).map_err(claim_append_error)?;
-            project(tx, &claim)?;
-            step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the ask could not be projected"))
-        }).map_err(internal)?
+        self.connection
+            .batched(|tx| {
+                ask_as_daemon_tx(tx, &self.origin, actor, person, title, reason, name, key)
+            })
+            .map_err(internal)?
     }
 
     fn ask_person_in_new_run(&self, input: &PersonAskRequest) -> Result<StepRunView, St3Error> {
@@ -438,6 +575,7 @@ impl Store {
                 "choose either --step or --new-run",
             ));
         }
+        let structured = canonical_request(input)?;
         self.connection.batched(|tx| {
             if !declaration_live(tx, &input.actor).map_err(internal)? {
                 return Err(St3Error::new("missing-ask-owner", "the requester must have a live declaration"));
@@ -451,7 +589,8 @@ impl Store {
             let generation = format!("ask-{}", &hash[..32]);
             let subject = format!("step-run/{generation}/ask");
             if let Some(existing) = request(tx, &subject).map_err(internal)? {
-                if existing.body["fields"]["person"] != input.person || existing.body["fields"]["title"] != input.title || existing.body["fields"]["reason"] != input.reason {
+                if existing.body["fields"]["person"] != input.person || existing.body["fields"]["title"] != input.title || existing.body["fields"]["reason"] != input.reason
+                    || existing.body["fields"]["request"] != structured {
                     return Err(St3Error::new("idempotency-conflict", "this ask key already names another question"));
                 }
                 return step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
@@ -464,14 +603,64 @@ impl Store {
             let waiting_since = input.legacy_request.as_ref().map(|id| tx.query_row("SELECT accepted_at_unix_ms FROM claims WHERE id=?1 AND kind='attention.requested'", [id], |row| row.get::<_, String>(0))).transpose().map_err(internal)?;
             let evidence = input.legacy_request.iter().cloned().collect::<Vec<_>>();
             let claim = append_claim_tx(tx, &self.origin, &subject, "work.person-asked", Some(&input.actor),
-                &json!({"fields": {"run": run, "generation": format!("run-generation/{generation}"),
+                &with_request(json!({"fields": {"run": run, "generation": format!("run-generation/{generation}"),
                     "person": input.person, "title": input.title, "reason": input.reason, "key": input.idempotency_key,
                     "attempt": 1, "status": "ready", "mission_spec": mission, "owner_run": desired.owner_run,
-                    "owner_generation": desired.owner_generation, "requester_declaration": desired.claim_id, "waiting_since": waiting_since, "legacy_request": input.legacy_request}}), &evidence, None).map_err(claim_append_error)?;
+                    "owner_generation": desired.owner_generation, "requester_declaration": desired.claim_id, "waiting_since": waiting_since, "legacy_request": input.legacy_request}}), &structured), &evidence, None).map_err(claim_append_error)?;
             project(tx, &claim)?;
             step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the ask could not be projected"))
         }).map_err(internal)?
     }
+}
+
+/// Tell the requester of a new-run ask what the person answered. A step-owned ask needs no
+/// message: the response readies the asking step again, and its wake reaches the seat.
+fn send_answer_tx(
+    tx: &Transaction<'_>,
+    origin: &str,
+    ask: &ClaimRecord,
+    response: &ClaimRecord,
+    summary: &str,
+    answer: Option<&Value>,
+) -> Result<(), St3Error> {
+    let Some(requester) = ask.actor.as_deref() else {
+        return Ok(());
+    };
+    let fields = &ask.body["fields"];
+    let title = fields["title"].as_str().unwrap_or_default();
+    let person = response.actor.as_deref().unwrap_or("the person");
+    let mut content = format!("{person} answered `{}`: {title}\n\n", ask.subject);
+    match answer.filter(|answer| answer["id"].is_string()) {
+        Some(answer) => {
+            content.push_str(&format!(
+                "Answer: {} ({})",
+                answer["label"].as_str().unwrap_or_default(),
+                answer["id"].as_str().unwrap_or_default()
+            ));
+            if let Some(text) = answer["text"].as_str() {
+                content.push_str(&format!("\n{text}"));
+            }
+        }
+        None => content.push_str(summary),
+    }
+    content.push_str(&format!(
+        "\n\nThe answer as data: `st work show {} --json` (person_answers).",
+        ask.subject
+    ));
+    let key = format!("person-answer:{}:{}", ask.subject, response.id);
+    let subject = format!(
+        "message/{}",
+        &hex::encode(Sha256::digest(key.as_bytes()))[..16]
+    );
+    let mut tags = vec![Value::String(format!("st3-person-answer:{}", ask.subject))];
+    if let Some(run) = fields["owner_run"].as_str() {
+        tags.push(Value::String(format!("mission-run:{run}")));
+    }
+    append_claim_tx(tx, origin, &subject, "message.sent", Some("daemon/runtime"),
+        &json!({"fields": {"from": "daemon/runtime", "to": requester, "content": content, "status": "sent",
+            "title": format!("Answered: {title}"), "in_reply_to": null, "tags": tags}, "evidence": [response.id]}),
+        &[], None).map_err(claim_append_error)?;
+    Ok(())
 }
 
 pub(super) fn project(tx: &Transaction<'_>, claim: &ClaimRecord) -> Result<bool, St3Error> {
@@ -610,6 +799,7 @@ mission "person-work" state="ready" {
             new_run: None,
             incarnation: Some("asker-one".into()),
             idempotency_key: "release-date".into(),
+            request: None,
         };
         (store, origin, input)
     }
@@ -648,6 +838,7 @@ mission "person-work" state="ready" {
             evidence: Vec::new(),
             episode: Some(item.episode.clone()),
             idempotency_key: "release-response".into(),
+            answer: None,
         };
         assert_eq!(
             store.finish_person_step(&response, false).unwrap_err().code,
@@ -717,6 +908,7 @@ mission "person-work" state="ready" {
             evidence: vec![],
             episode: None,
             idempotency_key: "late-response".into(),
+            answer: None,
         };
         assert_eq!(
             store.finish_person_step(&response, false).unwrap_err().code,
@@ -754,6 +946,7 @@ mission "person-work" state="ready" {
             evidence: vec![],
             episode: None,
             idempotency_key: "cancel-question".into(),
+            answer: None,
         };
         assert_eq!(
             store.finish_person_step(&response, true).unwrap().status,
@@ -762,6 +955,297 @@ mission "person-work" state="ready" {
         assert_eq!(
             store.mission_run(&ask.run).unwrap().unwrap().status,
             "cancelled"
+        );
+        assert!(
+            store
+                .messages(Some("agent/alder.asker"), true)
+                .unwrap()
+                .is_empty(),
+            "the requester's own cancel tells nobody"
+        );
+    }
+
+    fn gateway_decision() -> Value {
+        json!({
+            "version": 1,
+            "type": "decision",
+            "question": "Change the browser sign-in, then review the gateway again?",
+            "why_person": "Only the owner decides how browsers authenticate.",
+            "recommendation": {"answer": "revise-auth", "reason": "Native clients already pair this way."},
+            "subjects": [{"kind": "pull_request", "label": "#41", "url": "https://example.com/pull/41", "revision": "abc123"}],
+            "answers": [
+                {"id": "land", "label": "Land the gateway", "outcome": "accept", "consequence": "The gateway merges as it is."},
+                {"id": "keep-open", "label": "Keep it open", "outcome": "decline", "consequence": "Nothing merges."},
+                {"id": "revise-auth", "label": "Revise auth and review", "outcome": "request_changes", "consequence": "The author changes sign-in and asks again."}
+            ]
+        })
+    }
+
+    /// A structured ask shows its request to the person, takes only a named answer, and gives
+    /// the asker that answer as data when its step resumes.
+    #[test]
+    fn structured_ask_returns_the_named_answer_to_the_asker_as_data() {
+        let (store, origin, mut input) = fixture();
+        input.title = "Land the browser gateway?".into();
+        input.request = Some(gateway_decision());
+        let mut malformed = input.clone();
+        malformed.request.as_mut().unwrap()["answers"][1]["outcome"] = json!("accept");
+        assert_eq!(
+            store.ask_person(&malformed).unwrap_err().code,
+            "invalid-person-request"
+        );
+        let ask = store.ask_person(&input).unwrap();
+        let mut conflict = input.clone();
+        conflict.request.as_mut().unwrap()["question"] = json!("Land it now?");
+        assert_eq!(
+            store.ask_person(&conflict).unwrap_err().code,
+            "idempotency-conflict"
+        );
+        let item = store
+            .attention_items(Some("person/avery"))
+            .unwrap()
+            .into_iter()
+            .find(|item| item.subject == ask.subject)
+            .unwrap();
+        let request = item.request.clone().unwrap();
+        assert_eq!(request["answers"][2]["id"], "revise-auth");
+        assert_eq!(request["subjects"][0]["revision"], "abc123");
+        assert!(item.actions[0].argv.iter().any(|arg| arg == "--answer"));
+        let mut response = PersonStepResponse {
+            subject: ask.subject.clone(),
+            actor: "person/avery".into(),
+            summary: "yes".into(),
+            evidence: vec![],
+            episode: Some(item.episode.clone()),
+            idempotency_key: "gateway-answer".into(),
+            answer: None,
+        };
+        // Authority comes before the answer's shape.
+        response.actor = "person/robin".into();
+        assert_eq!(
+            store.finish_person_step(&response, false).unwrap_err().code,
+            "forbidden"
+        );
+        response.actor = "person/avery".into();
+        // A reply in words never selects an answer.
+        assert_eq!(
+            store.finish_person_step(&response, false).unwrap_err().code,
+            "answer-required"
+        );
+        response.summary = String::new();
+        response.answer = Some(crate::person_request::AnswerInput {
+            id: Some("revise-auth".into()),
+            text: Some("Pair browsers like the native clients.".into()),
+        });
+        assert_eq!(
+            store.finish_person_step(&response, false).unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            store.finish_person_step(&response, false).unwrap().status,
+            "completed"
+        );
+        let mut other = response.clone();
+        other.answer.as_mut().unwrap().id = Some("land".into());
+        other.answer.as_mut().unwrap().text = None;
+        assert_eq!(
+            store.finish_person_step(&other, false).unwrap_err().code,
+            "idempotency-conflict"
+        );
+        let expected = json!({
+            "type": "decision", "outcome": "request_changes", "id": "revise-auth",
+            "label": "Revise auth and review", "text": "Pair browsers like the native clients."
+        });
+        let check = |store: &Store| {
+            let resumed = store.step_run(&origin.subject).unwrap().unwrap();
+            assert_eq!(resumed.status, "ready");
+            assert_eq!(resumed.person_answers.len(), 1);
+            let answer = &resumed.person_answers[0];
+            assert_eq!(answer.ask, ask.subject);
+            assert_eq!(answer.respondent, "person/avery");
+            assert_eq!(answer.answer.as_ref(), Some(&expected));
+            assert_eq!(
+                answer.summary,
+                "Revise auth and review: Pair browsers like the native clients."
+            );
+            assert!(resumed.constraints.iter().any(|constraint| constraint
+                == "Person response: Revise auth and review: Pair browsers like the native clients."));
+            let own = store.step_run(&ask.subject).unwrap().unwrap();
+            assert_eq!(own.person_answers.len(), 1);
+            assert_eq!(own.person_answers[0].answer.as_ref(), Some(&expected));
+        };
+        check(&store);
+        store.replay_replication_graph().unwrap();
+        check(&store);
+        assert!(
+            store
+                .messages(Some("agent/alder.asker"), true)
+                .unwrap()
+                .is_empty(),
+            "a step-owned ask resumes its step instead of sending a message"
+        );
+    }
+
+    #[test]
+    fn new_run_decision_pushes_the_named_answer_to_the_requester() {
+        let (store, origin, mut input) = fixture();
+        store
+            .set_step_state(&origin.subject, "completed", None)
+            .unwrap();
+        input.step = None;
+        input.new_run = Some("gateway".into());
+        input.title = "Land the browser gateway?".into();
+        input.request = Some(gateway_decision());
+        let ask = store.ask_person(&input).unwrap();
+        store
+            .finish_person_step(
+                &PersonStepResponse {
+                    subject: ask.subject.clone(),
+                    actor: "person/avery".into(),
+                    summary: String::new(),
+                    evidence: vec![],
+                    episode: None,
+                    idempotency_key: "gateway-answer".into(),
+                    answer: Some(crate::person_request::AnswerInput {
+                        id: Some("revise-auth".into()),
+                        text: Some("Pair browsers like the native clients.".into()),
+                    }),
+                },
+                false,
+            )
+            .unwrap();
+        let messages = store.messages(Some("agent/alder.asker"), true).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains(
+            "Answer: Revise auth and review (revise-auth)\nPair browsers like the native clients."
+        ));
+    }
+
+    /// A free-text ask keeps working, takes no named answer, and keeps its claim body unchanged
+    /// so older members still admit it.
+    #[test]
+    fn free_text_ask_takes_words_and_refuses_a_named_answer() {
+        let (store, origin, input) = fixture();
+        let ask = store.ask_person(&input).unwrap();
+        let claim = request(&store.readers.get(), &ask.subject)
+            .unwrap()
+            .unwrap();
+        assert!(claim.body["fields"].get("request").is_none());
+        let item = store
+            .attention_items(Some("person/avery"))
+            .unwrap()
+            .into_iter()
+            .find(|item| item.subject == ask.subject)
+            .unwrap();
+        assert!(item.request.is_none());
+        let mut response = PersonStepResponse {
+            subject: ask.subject.clone(),
+            actor: "person/avery".into(),
+            summary: String::new(),
+            evidence: vec![],
+            episode: Some(item.episode),
+            idempotency_key: "free-text".into(),
+            answer: Some(crate::person_request::AnswerInput {
+                id: Some("friday".into()),
+                text: None,
+            }),
+        };
+        assert_eq!(
+            store.finish_person_step(&response, false).unwrap_err().code,
+            "invalid-person-answer"
+        );
+        response.answer = None;
+        response.summary = "Friday".into();
+        store.finish_person_step(&response, false).unwrap();
+        let resumed = store.step_run(&origin.subject).unwrap().unwrap();
+        assert_eq!(resumed.person_answers[0].summary, "Friday");
+        assert!(resumed.person_answers[0].answer.is_none());
+        let done = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT body FROM claims WHERE subject=?1 AND kind='work.person-done'",
+                [&ask.subject],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(!done.contains("\"answer\""));
+    }
+
+    /// A feedback ask in a run of its own: the person's text is the answer, and the asker reads
+    /// it from the ask step.
+    #[test]
+    fn new_run_feedback_ask_keeps_the_answer_on_the_ask() {
+        let (store, origin, mut input) = fixture();
+        store
+            .set_step_state(&origin.subject, "completed", None)
+            .unwrap();
+        input.step = None;
+        input.new_run = Some("page-feedback".into());
+        input.request = Some(json!({
+            "version": 1, "type": "feedback", "question": "What should the landing page say?",
+            "why_person": "It speaks in the owner's voice.",
+            "subjects": [{"kind": "document", "label": "Draft", "ref": "doc/example/landing"}]
+        }));
+        let ask = store.ask_person(&input).unwrap();
+        // An older client sends only words; feedback takes them as its text.
+        store
+            .finish_person_step(
+                &PersonStepResponse {
+                    subject: ask.subject.clone(),
+                    actor: "person/avery".into(),
+                    summary: "Lead with the phone.".into(),
+                    evidence: vec![],
+                    episode: None,
+                    idempotency_key: "page-feedback".into(),
+                    answer: None,
+                },
+                false,
+            )
+            .unwrap();
+        let own = store.step_run(&ask.subject).unwrap().unwrap();
+        assert_eq!(
+            own.person_answers[0].answer,
+            Some(
+                json!({"type": "feedback", "outcome": "feedback", "text": "Lead with the phone."})
+            )
+        );
+        // No step waits on a new-run ask, so the answer is pushed to its requester.
+        let messages = store.messages(Some("agent/alder.asker"), true).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from, "daemon/runtime");
+        assert_eq!(
+            messages[0].title.as_deref(),
+            Some("Answered: Choose a release date")
+        );
+        assert!(messages[0].content.contains("Lead with the phone."));
+        assert!(
+            messages[0]
+                .content
+                .contains(&format!("st work show {} --json", ask.subject))
+        );
+        // A replayed response does not send it again.
+        store
+            .finish_person_step(
+                &PersonStepResponse {
+                    subject: ask.subject.clone(),
+                    actor: "person/avery".into(),
+                    summary: "Lead with the phone.".into(),
+                    evidence: vec![],
+                    episode: None,
+                    idempotency_key: "page-feedback".into(),
+                    answer: None,
+                },
+                false,
+            )
+            .unwrap();
+        store.replay_replication_graph().unwrap();
+        assert_eq!(
+            store
+                .messages(Some("agent/alder.asker"), true)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -852,6 +1336,7 @@ agent "alder.asker" { workspace "/tmp"; command "true"; restart always; }
                             evidence: vec![],
                             episode: None,
                             idempotency_key: "review-release".into(),
+                            answer: None,
                         },
                         cancel,
                     )
@@ -913,6 +1398,7 @@ agent "alder.asker" { workspace "/tmp"; command "true"; restart always; }
                     evidence: vec![],
                     episode: None,
                     idempotency_key: "cancel-release".into(),
+                    answer: None,
                 },
                 true,
             )
@@ -996,6 +1482,7 @@ mission "writer-load" state="ready" {
                     evidence: vec![],
                     episode: None,
                     idempotency_key: "cancel-release".into(),
+                    answer: None,
                 },
                 true,
             )
@@ -1111,6 +1598,7 @@ mission "writer-load" state="ready" {
             evidence: vec![],
             episode: Some(item.episode),
             idempotency_key: "authored-response".into(),
+            answer: None,
         };
         assert_eq!(
             store.finish_person_step(&response, false).unwrap_err().code,
@@ -1161,6 +1649,7 @@ mission "writer-load" state="ready" {
                 evidence: vec![],
                 episode: None,
                 idempotency_key: format!("ended-{status}"),
+                answer: None,
             };
             assert_eq!(
                 store.finish_person_step(&response, false).unwrap_err().code,
@@ -1210,7 +1699,9 @@ mission "writer-load" state="ready" {
     fn a_later_question_in_the_same_attempt_does_not_revive_the_previous_ask() {
         let (store, origin, input) = fixture();
         let old = store.ask_person(&input).unwrap();
-        store.set_step_state(&origin.subject, "ready", None).unwrap();
+        store
+            .set_step_state(&origin.subject, "ready", None)
+            .unwrap();
         store.connection.batched(|tx| -> Result<()> {
             let claim = append_claim_tx(tx, "alder", &origin.subject, "work.claimed", Some(&input.actor),
                 &json!({"fields":{"attempt":1,"status":"claimed","claimant":input.actor,
@@ -1225,8 +1716,18 @@ mission "writer-load" state="ready" {
         assert!(items.iter().any(|item| item.subject == fresh.subject));
         assert!(items.iter().all(|item| item.subject != old.subject));
         store.reconcile_person_asks().unwrap();
-        assert_eq!(store.step_run(&origin.subject).unwrap().unwrap().status, "waiting-person");
-        assert_eq!(store.step_run(&origin.subject).unwrap().unwrap().blocked_reason, Some(fresh.subject));
+        assert_eq!(
+            store.step_run(&origin.subject).unwrap().unwrap().status,
+            "waiting-person"
+        );
+        assert_eq!(
+            store
+                .step_run(&origin.subject)
+                .unwrap()
+                .unwrap()
+                .blocked_reason,
+            Some(fresh.subject)
+        );
     }
 
     #[test]
@@ -1316,10 +1817,62 @@ mission "writer-load" state="ready" {
             evidence: vec![],
             episode: None,
             idempotency_key: "late-old-attempt".into(),
+            answer: None,
         };
         assert_eq!(
             store.finish_person_step(&response, false).unwrap_err().code,
             "stale-fence"
         );
     }
+}
+
+/// `Store::ask_person_as_daemon` inside a writer transaction the caller already holds, such as a
+/// resource observation that routes an item to a person.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ask_as_daemon_tx(
+    tx: &Transaction<'_>,
+    origin: &str,
+    actor: &str,
+    person: &str,
+    title: &str,
+    reason: &str,
+    name: &str,
+    key: &str,
+) -> Result<StepRunView, St3Error> {
+    let identity = serde_json::to_string(&(actor, name, key)).map_err(internal)?;
+    let hash = hex::encode(Sha256::digest(identity.as_bytes()));
+    let generation = format!("ask-{}", &hash[..32]);
+    let subject = format!("step-run/{generation}/ask");
+    if request(tx, &subject).map_err(internal)?.is_some() {
+        return step(tx, &subject)
+            .map_err(internal)?
+            .ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
+    }
+    let mission_id = format!("person-ask/{}", &hash[..32]);
+    let kdl = format!(
+        "version 2\nmission {mission_id:?} state=\"ready\" {{ goal {title:?}; step \"ask\" {{ assigned-to {person:?}; goal {reason:?}; }} }}"
+    );
+    let mut intent = crate::graph::parse_internal_intent(&kdl, origin)?;
+    let mission = intent
+        .missions
+        .remove(&mission_id)
+        .ok_or_else(|| St3Error::new("internal", "the person mission could not be parsed"))?;
+    let claim = append_claim_tx(
+        tx,
+        origin,
+        &subject,
+        "work.person-asked",
+        Some(actor),
+        &json!({"fields": {"run": format!("mission-run/person-ask/{}", &hash[..32]),
+            "generation": format!("run-generation/{generation}"),
+            "person": person, "title": title, "reason": reason, "key": key,
+            "attempt": 1, "status": "ready", "mission_spec": mission}}),
+        &[],
+        None,
+    )
+    .map_err(claim_append_error)?;
+    project(tx, &claim)?;
+    step(tx, &subject)
+        .map_err(internal)?
+        .ok_or_else(|| St3Error::new("missing-step-run", "the ask could not be projected"))
 }

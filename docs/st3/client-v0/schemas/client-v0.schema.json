@@ -157,6 +157,7 @@
             "source_kind": {"type": "string"},
             "episode": {"type": "string"},
             "action_parameters": {"type": "object"},
+            "request": { "$ref": "#/$defs/StructuredRequest", "description": "A person-step ask's structured request; absent on a free-text ask." },
             "source_id": { "$ref": "#/$defs/Id" },
             "person_id": { "$ref": "#/$defs/Id" },
             "requester_id": { "$ref": "#/$defs/Id" },
@@ -654,6 +655,7 @@
             "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "goals": { "type": "array", "items": { "type": "string" } },
             "constraints": { "type": "array", "items": { "type": "string" } }
+            ,"person_answers": { "type": "array", "items": { "$ref": "#/$defs/PersonAnswerRecord" }, "description": "Responses to the asks this attempt made, or a person ask's own response." }
             ,"usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }
           }
         }
@@ -693,7 +695,8 @@
             "upcoming_work": { "type": "array", "items": { "$ref": "#/$defs/WorkLabel" } },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
-            "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present only for a local native seat whose harness can take work; a stale path makes the agent `waiting`." }
+            "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present only for a local native seat whose harness can take work; a stale path makes the agent `waiting`." },
+            "subagents": { "type": "array", "items": { "$ref": "#/$defs/AgentSubagent" }, "description": "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." }
           }
         }
       ]
@@ -707,6 +710,21 @@
         "reason": { "type": ["string", "null"] },
         "polled_seconds_ago": { "type": ["integer", "null"], "minimum": 0 },
         "transport": { "type": ["string", "null"] }
+      }
+    },
+    "AgentSubagent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "driver", "lease_expires_at"],
+      "properties": {
+        "id": { "type": "string", "description": "The harness's own subagent ID, unique within its seat." },
+        "subagent_type": { "type": ["string", "null"] },
+        "description": { "type": ["string", "null"], "description": "One line." },
+        "driver": { "type": "string" },
+        "session_id": { "type": ["string", "null"], "description": "The harness session the subagent runs in." },
+        "work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }], "description": "The step the seat held when the subagent appeared." },
+        "started_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "lease_expires_at": { "$ref": "#/$defs/Timestamp" }
       }
     },
     "AgentRelationship": {
@@ -1281,7 +1299,7 @@
         "api_version": { "const": "st3.client.v0" },
         "id": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
+          "enum": ["attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
         "idempotency_key": { "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
@@ -1289,14 +1307,79 @@
       }
     },
     "AgentCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name", "harness"], "properties": {"name": {"type": "string", "minLength": 1}, "harness": {"enum": ["claude", "codex", "pi", "omp", "opencode"]}, "host": {"type": "string", "minLength": 1}, "model": {"type": "string", "minLength": 1}, "effort": {"type": "string", "minLength": 1}, "workspace": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1}, "message": {"type": "string", "minLength": 1}}},
+    "AgentStopParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}, "reason": {"type": "string"}}},
+    "AgentStartParameters": {"type": "object", "additionalProperties": false, "required": ["agent"], "properties": {"agent": {"$ref": "#/$defs/Id"}}},
     "TerminalCreateParameters": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1}, "host": {"type": "string", "minLength": 1}, "cwd": {"type": "string", "minLength": 1}}},
     "PersonAskParameters": {
       "type": "object", "additionalProperties": false, "required": ["person_id", "title", "reason"],
-      "properties": {"person_id": {"$ref": "#/$defs/Id"}, "title": {"type": "string"}, "reason": {"type": "string"}, "step_id": {"$ref": "#/$defs/Id"}, "new_run": {"type": "string"}}
+      "properties": {"person_id": {"$ref": "#/$defs/Id"}, "title": {"type": "string"}, "reason": {"type": "string"}, "step_id": {"$ref": "#/$defs/Id"}, "new_run": {"type": "string"}, "request": {"$ref": "#/$defs/StructuredRequest"}}
     },
     "PersonStepParameters": {
       "type": "object", "additionalProperties": false, "required": ["target_id", "summary", "episode"],
-      "properties": {"target_id": {"$ref": "#/$defs/Id"}, "summary": {"type": "string", "minLength": 1}, "episode": {"type": "string"}, "evidence": {"type": "array", "items": {"$ref": "#/$defs/Id"}}}
+      "properties": {"target_id": {"$ref": "#/$defs/Id"}, "summary": {"type": "string", "minLength": 1}, "episode": {"type": "string"}, "evidence": {"type": "array", "items": {"$ref": "#/$defs/Id"}}, "answer": {"$ref": "#/$defs/PersonAnswerInput"}}
+    },
+    "StructuredRequest": {
+      "type": "object", "additionalProperties": false, "required": ["version", "type", "question", "why_person"],
+      "description": "A typed question with named answers. A decision names one accept, one decline and at most one request_changes answer; a choice names 2 to 5 options; feedback asks for text.",
+      "properties": {
+        "version": {"const": 1},
+        "type": {"enum": ["decision", "choice", "feedback"]},
+        "question": {"type": "string", "minLength": 1},
+        "why_person": {"type": "string", "minLength": 1, "description": "Why only this person can answer."},
+        "summary": {"type": "string"},
+        "reasons": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+        "recommendation": {"type": "object", "additionalProperties": false, "required": ["answer", "reason"], "properties": {"answer": {"type": "string"}, "reason": {"type": "string"}}, "description": "Absent means no recommendation."},
+        "subjects": {"type": "array", "maxItems": 12, "items": {"$ref": "#/$defs/RequestSubject"}},
+        "answers": {"type": "array", "maxItems": 5, "items": {"$ref": "#/$defs/RequestAnswerOption"}},
+        "custom": {"type": "boolean", "description": "A choice also takes an answer in the person's own words."}
+      }
+    },
+    "RequestSubject": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "label"],
+      "properties": {
+        "kind": {"enum": ["pull_request", "issue", "document", "mission", "run", "step", "agent", "host", "commit", "link"]},
+        "label": {"type": "string"},
+        "ref": {"type": "string", "description": "A graph reference."},
+        "url": {"type": "string"},
+        "revision": {"type": "string", "description": "The revision the question is about, such as a reviewed head."}
+      }
+    },
+    "RequestAnswerOption": {
+      "type": "object", "additionalProperties": false, "required": ["id", "label", "consequence"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,47}$"},
+        "label": {"type": "string"},
+        "consequence": {"type": "string", "description": "What happens next when the person gives this answer."},
+        "outcome": {"enum": ["accept", "decline", "request_changes"], "description": "Required on a decision answer; absent on a choice option."},
+        "conditions": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "PersonAnswerInput": {
+      "type": "object", "additionalProperties": false,
+      "description": "A named answer id for a decision or choice; text for feedback, a custom choice, or the changes requested.",
+      "properties": {"id": {"type": "string"}, "text": {"type": "string"}}
+    },
+    "PersonAnswer": {
+      "type": "object", "required": ["type", "outcome"],
+      "properties": {
+        "type": {"enum": ["decision", "choice", "feedback"]},
+        "outcome": {"enum": ["accept", "decline", "request_changes", "selected", "custom", "feedback"]},
+        "id": {"type": "string"},
+        "label": {"type": "string"},
+        "text": {"type": "string"}
+      }
+    },
+    "PersonAnswerRecord": {
+      "type": "object", "required": ["ask", "status", "summary", "respondent", "answered_at_unix_ms"],
+      "properties": {
+        "ask": {"$ref": "#/$defs/Id"},
+        "status": {"enum": ["completed", "cancelled"]},
+        "summary": {"type": "string"},
+        "respondent": {"$ref": "#/$defs/Id"},
+        "answered_at_unix_ms": {"type": "integer", "minimum": 0},
+        "answer": {"$ref": "#/$defs/PersonAnswer"},
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/Id"}}
+      }
     },
     "TargetParameters": {
       "type": "object", "additionalProperties": false, "required": ["target_id"],
@@ -1306,6 +1389,8 @@
       "allOf": [{ "$ref": "#/$defs/ActionCommon" }],
       "oneOf": [
         {"properties": {"type": {"const": "agent.create"}, "parameters": {"$ref": "#/$defs/AgentCreateParameters"}}},
+        {"properties": {"type": {"const": "agent.stop"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStopParameters"}}},
+        {"properties": {"type": {"const": "agent.start"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStartParameters"}}},
         {"properties": {"type": {"const": "terminal.create"}, "parameters": {"$ref": "#/$defs/TerminalCreateParameters"}}},
         {"properties": {"type": {"const": "terminal.end"}, "parameters": {"$ref": "#/$defs/TargetParameters"}}},
         {"properties": {"type": {"const": "work.ask"}, "parameters": {"$ref": "#/$defs/PersonAskParameters"}}},
@@ -1679,7 +1764,7 @@
         "api_version": { "const": "st3.client.v0" },
         "error_version": { "const": "st3.client.error.v0" },
         "request_id": { "$ref": "#/$defs/Id" },
-        "code": { "enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "internal"] },
+        "code": { "enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "internal"] },
         "message": { "type": "string" },
         "retryable": { "type": "boolean" },
         "retry_after_ms": { "type": "integer", "minimum": 0 },

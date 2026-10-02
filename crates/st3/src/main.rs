@@ -1956,9 +1956,13 @@ struct PtyServeFabricArgs {
 #[derive(Args)]
 struct PtySendArgs {
     subject: String,
+    /// Text typed as one line and followed by Enter a moment later; with --raw the exact bytes,
+    /// with --key a key name.
     value: String,
+    /// Send exactly these bytes and no Enter: escape sequences, such as a mouse report.
     #[arg(long, conflicts_with = "key")]
     raw: bool,
+    /// Send one named key, such as enter, escape or ctrl+c.
     #[arg(long, conflicts_with = "raw")]
     key: bool,
 }
@@ -2896,8 +2900,13 @@ struct WorkAskArgs {
     person: String,
     #[arg(long)]
     title: String,
-    #[arg(long)]
-    reason: String,
+    /// What the person reads. With --request it defaults to the request's question.
+    #[arg(long, required_unless_present = "request")]
+    reason: Option<String>,
+    /// A structured request as a JSON file (`-` reads stdin): a decision, a choice or
+    /// feedback, with named answers the person picks and you read back as data.
+    #[arg(long, value_name = "FILE", long_help = STRUCTURED_REQUEST_HELP)]
+    request: Option<PathBuf>,
     #[arg(long, conflicts_with = "new_run")]
     step: Option<String>,
     #[arg(long, conflicts_with = "step")]
@@ -2915,8 +2924,15 @@ struct WorkDoneArgs {
     subject: String,
     #[arg(long = "as")]
     actor: String,
-    #[arg(long, alias = "reason")]
-    summary: String,
+    /// The response in words. A structured answer derives it when omitted.
+    #[arg(long, alias = "reason", required_unless_present_any = ["answer", "text"])]
+    summary: Option<String>,
+    /// The ID of one of a structured request's named answers.
+    #[arg(long, value_name = "ID")]
+    answer: Option<String>,
+    /// Text for a structured request: feedback, a custom choice, or the changes requested.
+    #[arg(long)]
+    text: Option<String>,
     #[arg(long)]
     evidence: Vec<String>,
     #[arg(long)]
@@ -8323,8 +8339,14 @@ fn render_checkpoint_status(status: &st3::store::CheckpointStatusView) -> String
             output.push_str(&format!("  differs     {writer}: {difference}\n"));
         }
         output.push_str(&format!("  verified    {}\n", names(&pending.verified)));
+        for (writer, difference) in &pending.verifications_differ {
+            output.push_str(&format!("  verifies    {writer}: different {difference}\n"));
+        }
         if !pending.verifications_agree {
-            output.push_str("  verifications disagree; see daemon diagnostics\n");
+            output.push_str(
+                "  verifications disagree, so this checkpoint is not stable; the next due \
+                 checkpoint tries again\n",
+            );
         }
     }
     output
@@ -10466,10 +10488,42 @@ fn render_client_agent(
             let _ = writeln!(output, "UPCOMING     {upcoming}");
         }
     }
+    for subagent in &agent.subagents {
+        let _ = writeln!(
+            output,
+            "SUBAGENT     {}",
+            subagent_line(subagent, Some(now_unix_ms))
+        );
+    }
     for runtime in &agent.runtime_ids {
         let _ = writeln!(output, "RUNTIME      {runtime}");
     }
     output
+}
+
+/// One line naming a running subagent: what it does, its type, and, given the time, when it
+/// started.
+fn subagent_line(subagent: &st3_client::AgentSubagent, now_unix_ms: Option<u128>) -> String {
+    let mut parts = vec![
+        subagent
+            .description
+            .clone()
+            .unwrap_or_else(|| subagent.id.clone()),
+    ];
+    if let Some(kind) = &subagent.subagent_type {
+        parts.push(kind.clone());
+    }
+    if let (Some(now), Some(started)) = (
+        now_unix_ms,
+        subagent
+            .started_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()),
+    ) {
+        let started = u128::try_from(started.timestamp_millis()).unwrap_or(0);
+        parts.push(format!("started {}", relative_time(started, now)));
+    }
+    parts.join(" · ")
 }
 
 fn render_client_agents(
@@ -10586,6 +10640,19 @@ fn render_client_agents(
                     agent.reachability
                 );
                 let _ = writeln!(output, "{member_prefix}   {}", agent.header.id);
+                // The subagents its harness runs now are its children.
+                for (index, subagent) in agent.subagents.iter().enumerate() {
+                    let branch = if index + 1 == agent.subagents.len() {
+                        "└─"
+                    } else {
+                        "├─"
+                    };
+                    let _ = writeln!(
+                        output,
+                        "{member_prefix}   {branch} {}",
+                        subagent_line(subagent, None)
+                    );
+                }
             }
         }
     }
@@ -11016,6 +11083,48 @@ async fn run_attention(
     }
 }
 
+const STRUCTURED_REQUEST_HELP: &str = r##"A structured request as a JSON file (`-` reads stdin).
+
+A `decision` proposes one action: exactly one `accept` answer, one `decline` answer and at most
+one `request_changes` answer, each naming what happens next. A `choice` names 2 to 5 options,
+and `"custom": true` also takes the person's own words. `feedback` asks for text and has no
+answers. `why_person` says why no runtime fact or standing instruction settles it. Omit
+`recommendation` to make none. Subject kinds: pull_request, issue, document, mission, run,
+step, agent, host, commit, link; `revision` pins what was reviewed.
+
+  {"version": 1, "type": "decision",
+   "question": "Land #11 then #12?",
+   "why_person": "The owner approves merges to the public repository.",
+   "reasons": ["Checks are green on both heads."],
+   "recommendation": {"answer": "land", "reason": "Both are reviewed."},
+   "subjects": [{"kind": "pull_request", "label": "#11",
+                 "url": "https://github.com/OWNER/REPO/pull/11", "revision": "HEAD_SHA"}],
+   "answers": [
+     {"id": "land", "label": "Land #11 then #12", "outcome": "accept",
+      "consequence": "I queue #11, then #12."},
+     {"id": "keep-open", "label": "Keep both open", "outcome": "decline",
+      "consequence": "Nothing merges."},
+     {"id": "revise", "label": "Request changes", "outcome": "request_changes",
+      "consequence": "I make the changes and ask again."}]}
+
+The person answers with `st work done STEP --answer ID [--text TEXT]`; requesting changes,
+feedback and a custom choice need text. The resumed step's `person_answers` carries the answer
+as {"type", "outcome", "id", "label", "text"}: read it with `st work show STEP --json` and
+act on `id` and `outcome`, not on the words."##;
+
+/// Reads a structured request from a JSON file, or stdin for `-`. The daemon validates it.
+fn read_structured_request(path: &Path) -> Result<serde_json::Value> {
+    let text = if path == Path::new("-") {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        text
+    } else {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("read the request {}", path.display()))?
+    };
+    serde_json::from_str(&text).context("the request is not JSON")
+}
+
 async fn run_work(
     client: &Client,
     endpoint: &Endpoint,
@@ -11025,6 +11134,19 @@ async fn run_work(
     match command {
         WorkCommand::Ask(args) => {
             reject_foreign_agent_actor(&args.actor)?;
+            let request = args
+                .request
+                .as_deref()
+                .map(read_structured_request)
+                .transpose()?;
+            let reason = match (args.reason, &request) {
+                (Some(reason), _) => reason,
+                (None, Some(request)) => request["question"]
+                    .as_str()
+                    .context("the request needs a question")?
+                    .to_owned(),
+                (None, None) => unreachable!("clap requires --reason or --request"),
+            };
             let result: StepRunView = client
                 .post(
                     "/v1/work/ask",
@@ -11032,12 +11154,13 @@ async fn run_work(
                         legacy_request: None,
                         person: args.person,
                         title: args.title,
-                        reason: args.reason,
+                        reason,
                         actor: args.actor,
                         step: args.step,
                         new_run: args.new_run,
                         incarnation: args.incarnation,
                         idempotency_key: args.idempotency_key,
+                        request,
                     },
                 )
                 .await?;
@@ -11056,11 +11179,17 @@ async fn run_work(
                     &PersonStepResponse {
                         subject: args.subject,
                         actor: args.actor,
-                        summary: args.summary,
+                        summary: args.summary.unwrap_or_default(),
                         evidence: args.evidence,
                         episode: args.episode,
                         idempotency_key: args.idempotency_key.unwrap_or_else(|| {
                             format!("person-response:{}", uuid::Uuid::now_v7().simple())
+                        }),
+                        answer: (args.answer.is_some() || args.text.is_some()).then(|| {
+                            st3::person_request::AnswerInput {
+                                id: args.answer,
+                                text: args.text,
+                            }
                         }),
                     },
                 )
@@ -11325,6 +11454,25 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
     }
     for constraint in &work.constraints {
         let _ = writeln!(output, "Constraint: {constraint}");
+    }
+    for response in &work.person_answers {
+        let typed = response
+            .answer
+            .as_ref()
+            .map(|answer| {
+                let id = answer
+                    .id
+                    .as_deref()
+                    .map(|id| format!(" {id}"))
+                    .unwrap_or_default();
+                format!("{}{id}", answer.outcome)
+            })
+            .unwrap_or_else(|| response.status.clone());
+        let _ = writeln!(
+            output,
+            "Person answer: {typed}: {} ({}, {})",
+            response.summary, response.respondent, response.ask
+        );
     }
     if let Some(usage) = &work.usage {
         let _ = writeln!(output, "Usage: {}", render_usage(usage));
@@ -12977,6 +13125,16 @@ async fn drive_st2_native(
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
     let mut replacement = DriverReplacement::new();
     let mut binding_watch = ClaudeBindingWatch::default();
+    // Claude's hooks keep the subagent ledger; this driver records it on the seat.
+    let mut subagents = (driver == "claude").then(|| {
+        st3::subagents::Publisher::start(
+            subject,
+            driver,
+            &incarnation,
+            &agent_dir,
+            st_drivers::subagents::now_ms(),
+        )
+    });
     loop {
         tokio::select! {
             frame = mailbox.recv() => {
@@ -12997,6 +13155,15 @@ async fn drive_st2_native(
                     loop_state = resume.loop_state;
                     task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
                     continue;
+                }
+                // The harness is gone, and its subagents with it. The reconciler ends any this
+                // cannot record once it sees the runtime exit.
+                if let Some(subagents) = subagents.as_mut() {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        subagents.end_all(client, "harness-exited", "its harness exited"),
+                    )
+                    .await;
                 }
                 loop {
                     let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
@@ -13230,6 +13397,11 @@ async fn drive_st2_native(
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+                if let Some(subagents) = subagents.as_mut()
+                    && let Err(error) = subagents.tick(client).await
+                {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 replacement.check();
@@ -14693,6 +14865,15 @@ async fn drive_codex_native(
     } = paths.clone();
     let root = paths.state_root();
     let state_dir = root.join("state");
+    let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
+    if matches!(start, ProviderStart::Launch(_)) {
+        // The path can still hold the predecessor's terminal record. It is the predecessor's, never
+        // this incarnation's: only a byte change after this point is the new wrapper's claim.
+        loop_state.predecessor_harness_record = fs::read(&harness_state_path).ok();
+        loop_state.harness_record_started = false;
+    } else {
+        loop_state.harness_record_started = true;
+    }
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
@@ -14704,6 +14885,14 @@ async fn drive_codex_native(
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
+    // The Codex control pump keeps the subagent ledger; this driver records it on the seat.
+    let mut subagents = st3::subagents::Publisher::start(
+        subject,
+        "codex",
+        &incarnation,
+        &agent_dir,
+        st_drivers::subagents::now_ms(),
+    );
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -14736,6 +14925,12 @@ async fn drive_codex_native(
                     task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
                     continue;
                 }
+                // The harness is gone, and its subagents with it.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    subagents.end_all(client, "harness-exited", "its harness exited"),
+                )
+                .await;
                 if let Err(error) = &outcome {
                     let reason = format!("{error:#}").chars().take(2_000).collect::<String>();
                     let _: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
@@ -14806,10 +15001,17 @@ async fn drive_codex_native(
                         }).await?;
                         loop_state.ready = true;
                     }
-                    if let Some(observed) = st_drivers::harness_state::read(
-                        &st_drivers::harness_state::harness_state_path(&agent_dir),
-                        None,
-                    ) {
+                    let current_record = fs::read(&harness_state_path).ok();
+                    loop_state.harness_record_started = harness_record_belongs_to_current_session(
+                        loop_state.harness_record_started,
+                        loop_state.predecessor_harness_record.as_deref(),
+                        current_record.as_deref(),
+                    );
+                    if let Some(observed) = loop_state
+                        .harness_record_started
+                        .then(|| st_drivers::harness_state::read(&harness_state_path, None))
+                        .flatten()
+                    {
                         publish_harness_activity(
                             client,
                             subject,
@@ -14881,6 +15083,16 @@ async fn drive_codex_native(
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+                subagents.set_timeline_incarnation(
+                    st_drivers::codex_app_server::current_runtime_incarnation(
+                        &state_dir,
+                        &identity,
+                        &runtime_id,
+                    ),
+                );
+                if let Err(error) = subagents.tick(client).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 // Only a bound session can be adopted, so wait for the binding before following
@@ -16965,6 +17177,70 @@ mod tests {
         assert!(card.contains(
             "FAULT        render refuses to change tracked file .claude/settings.local.json"
         ));
+    }
+
+    fn subagent_worker() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "agent", "id": "agent/crew/worker", "revision": "one",
+            "updated_at": "2026-10-02T09:00:00Z", "name": "Worker",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "owner_run_id": "mission-run/crew", "harness_state": "working",
+            "subagents": [
+                {"id": "a1", "subagent_type": "Explore", "description": "map the code",
+                 "driver": "claude", "work_id": "step-run/crew/build",
+                 "started_at": "2026-10-02T09:00:00Z",
+                 "lease_expires_at": "2026-10-02T09:10:00Z"},
+                {"id": "019a-thread", "subagent_type": null, "description": null,
+                 "driver": "codex", "started_at": null,
+                 "lease_expires_at": "2026-10-02T09:10:00Z"}
+            ]
+        })
+    }
+
+    #[test]
+    fn agent_card_lists_the_subagents_its_harness_runs() {
+        let st3_client::Resource::Agent(agent) = serde_json::from_value(subagent_worker()).unwrap()
+        else {
+            panic!("agent resource")
+        };
+        let started = 1_790_931_600_000_u128;
+        let card = render_client_agent(&agent, &[], started + 180_000);
+        assert!(
+            card.contains(
+                "SUBAGENT     map the code · Explore · started 3m ago\nSUBAGENT     019a-thread\n"
+            ),
+            "{card}"
+        );
+        // An agent without subagents prints no subagent line.
+        let quiet = render_client_agent(
+            &st3_client::Agent {
+                subagents: Vec::new(),
+                ..agent
+            },
+            &[],
+            started,
+        );
+        assert!(!quiet.contains("SUBAGENT"), "{quiet}");
+    }
+
+    #[test]
+    fn agent_tree_nests_running_subagents_under_their_agent() {
+        let page: ClientPage = serde_json::from_value(serde_json::json!({
+            "kind": "page", "collection": "agents",
+            "items": [subagent_worker()],
+            "page": {"limit": 50, "has_more": false}
+        }))
+        .unwrap();
+        let tree = render_client_agents(&page, true, false, "st agents tree");
+        assert_eq!(
+            tree,
+            "AGENT TREE  1\n\
+             └─ crew\n\
+             \x20  └─ worker  working · local\n\
+             \x20     agent/crew/worker\n\
+             \x20     ├─ map the code · Explore\n\
+             \x20     └─ 019a-thread\n"
+        );
     }
 
     #[test]

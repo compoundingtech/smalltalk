@@ -1291,7 +1291,13 @@ impl CodexInboxDelivery {
         if !due {
             return Ok(());
         }
-        let unread = crate::push_mailbox::messages(&self.config.agent_dir, &self.config.inbox)?;
+        // Codex can bind its thread before the daemon's first mailbox replay lands. Until then
+        // nothing is known, so nothing is pruned or delivered, and the next pass asks again.
+        let unread = match crate::push_mailbox::messages(&self.config.agent_dir, &self.config.inbox)
+        {
+            Err(error) if crate::push_mailbox::is_not_replayed(&error) => return Ok(()),
+            unread => unread?,
+        };
         self.reconcile_inbox(&unread)?;
         if self.rejected.as_ref().is_some_and(|rejected| {
             unread
@@ -4865,6 +4871,14 @@ fn pump_control(
                     _ => None,
                 };
                 delivery.observe_context(&message, state.thread_id(), active_turn);
+                // The subagent axis, for the same reason. Fail-open like the context record.
+                if let Err(error) = crate::subagents::observe_codex(
+                    &delivery.config.agent_dir,
+                    &message,
+                    state.thread_id(),
+                ) {
+                    tracing::warn!("st codex: subagent ledger write failed: {error:#}");
+                }
                 // The credential axis, taken here for the same reason: it reads a typed turn
                 // result no branch below looks at, and every one of them may `continue`.
                 delivery.observe_provider_auth(&message, state.thread_id());
@@ -5077,12 +5091,21 @@ fn model_from_codex_frames(frames: &[Value], turn_id: &str) -> Option<String> {
 }
 
 fn latest_codex_transcript(thread_id: &str) -> Result<Option<PathBuf>> {
-    let Some(home) = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-    else {
+    let Some(home) = codex_home() else {
         return Ok(None);
     };
+    latest_codex_transcript_in(&home, thread_id)
+}
+
+/// `$CODEX_HOME`, else `~/.codex`.
+pub fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+}
+
+/// The newest rollout file of Codex thread `thread_id` beneath `home/sessions`.
+pub fn latest_codex_transcript_in(home: &Path, thread_id: &str) -> Result<Option<PathBuf>> {
     let sessions = home.join("sessions");
     let mut stack = vec![sessions];
     let mut inspected = 0_usize;
@@ -5329,6 +5352,10 @@ fn wait_for_binding(
     }
 }
 
+fn stop_raised() -> bool {
+    crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn monitor_bound_tui(tui: &mut ProviderProcess, events: &Receiver<ControlEvent>) -> Result<TuiEnd> {
     loop {
         if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
@@ -5353,14 +5380,27 @@ fn monitor_bound_tui(tui: &mut ProviderProcess, events: &Receiver<ControlEvent>)
             | Ok(ControlEvent::SafeFallbackActivated { .. }) => {}
             Ok(ControlEvent::Bound) => {}
             Ok(ControlEvent::Observed) => {}
+            // A stop signals the whole process group: the app-server can end the control
+            // connection before this loop reads the flag the same signal raised. That race is a
+            // stop, not a control failure; a failure would leave the predecessor's "failed" record
+            // for the replacement to inherit.
             Ok(ControlEvent::Closed) => {
+                if stop_raised() {
+                    continue;
+                }
                 anyhow::bail!("Codex control connection closed while the TUI was live")
             }
             Ok(ControlEvent::Failed(error)) => {
+                if stop_raised() {
+                    continue;
+                }
                 anyhow::bail!("Codex control failed while the TUI was live: {error}")
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if stop_raised() {
+                    continue;
+                }
                 anyhow::bail!("Codex control observer ended while the TUI was live")
             }
         }

@@ -136,9 +136,10 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       name: 'linux-tests',
       stage: 'tests',
       setup: workspacePreparationSteps,
-      // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults.
+      // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults and a failed
+      // boot canary's evidence under target/boot-canaries.
       env: { CI_RUN_ID: '${{ github.run_id }}' },
-      extraLogs: 'target/messaging-faults/',
+      extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
     }),
     'linux-clippy': linuxStageJob({
       name: 'linux-clippy',

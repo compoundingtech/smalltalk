@@ -422,6 +422,11 @@ async fn conversation_changes_value(
 
 /// Follow one conversation for a collection socket: its newest page, then each change, until
 /// the socket stops listening. A change the server can no longer replay sends the page again.
+fn conversation_stream_error(id: &str, error: &ApiError) -> Value {
+    json!({"kind":"error", "id":id, "collection":"conversation", "code":client_error_code(Some(&error.code)), "message":error.message,
+        "retryable":client_error_retryable(error.status, Some(&error.code))})
+}
+
 async fn follow_conversation(
     state: AppState,
     session: ClientSession,
@@ -431,10 +436,7 @@ async fn follow_conversation(
     outbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
 ) {
     let remote = remote.as_deref();
-    let failed = |error: &ApiError| {
-        json!({"kind":"error", "id":id, "collection":"conversation", "code":client_error_code(Some(&error.code)), "message":error.message,
-        "retryable":client_error_retryable(error.status, Some(&error.code))})
-    };
+    let failed = |error: &ApiError| conversation_stream_error(&id, error);
     loop {
         // The cursor first, so nothing that lands while the page is read is lost.
         let start = match conversation_changes_value(&state, &session, &session_id, remote, None, 0)
@@ -995,6 +997,8 @@ const ACTIONS: &[&str] = &[
     "work.retry",
     "work.publish-mission",
     "agent.create",
+    "agent.stop",
+    "agent.start",
     "terminal.create",
     "terminal.end",
     "agent.queue-move",
@@ -1042,6 +1046,8 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "work.release",
     "work.retry",
     "agent.create",
+    "agent.stop",
+    "agent.start",
     "terminal.create",
     "terminal.end",
     "agent.queue-move",
@@ -1152,8 +1158,10 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
         } else if session.allows(scope)
-            && (!matches!(*action, "agent.create" | "terminal.create" | "terminal.end")
-                || require_creation_actor(session).is_ok())
+            && (!matches!(
+                *action,
+                "agent.create" | "agent.stop" | "agent.start" | "terminal.create" | "terminal.end"
+            ) || require_creation_actor(session).is_ok())
         {
             "granted"
         } else {
@@ -3836,13 +3844,13 @@ pub(super) fn timeline_value(
     if !timeline_retention_is_explicit(&timeline_claims, has_older_timeline) {
         return Err(ApiError {
             status: StatusCode::GONE,
-            code: "cursor-gap".into(),
-            message: "older timeline history was omitted without a typed truncation interval"
+            code: "timeline-history-incomplete".into(),
+            message: "the retained transcript start is incomplete: older history has no truncation interval"
                 .into(),
-            details: Box::new(serde_json::Map::from_iter([(
-                "full_resync".into(),
-                Value::Bool(true),
-            )])),
+            details: Box::new(serde_json::Map::from_iter([
+                ("full_resync".into(), Value::Bool(false)),
+                ("retained_history_incomplete".into(), Value::Bool(true)),
+            ])),
         });
     }
     let mut retained_entries = BTreeSet::new();
@@ -3855,12 +3863,12 @@ pub(super) fn timeline_value(
         if !retained_entries.contains(entry_id) && operation != Some("append") {
             return Err(ApiError {
                 status: StatusCode::GONE,
-                code: "cursor-gap".into(),
-                message: "the retained timeline begins after an entry's append operation".into(),
-                details: Box::new(serde_json::Map::from_iter([(
-                    "full_resync".into(),
-                    Value::Bool(true),
-                )])),
+                code: "timeline-history-incomplete".into(),
+                message: "the retained transcript start is incomplete: an entry's append operation is missing".into(),
+                details: Box::new(serde_json::Map::from_iter([
+                    ("full_resync".into(), Value::Bool(false)),
+                    ("retained_history_incomplete".into(), Value::Bool(true)),
+                ])),
             });
         }
         retained_entries.insert(entry_id.to_owned());
@@ -6442,7 +6450,7 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
-    if action == "agent.create" {
+    if matches!(action, "agent.create" | "agent.stop" | "agent.start") {
         return Some("control.runtimes");
     }
     if action == "work.done" {
@@ -7151,6 +7159,7 @@ async fn dispatch_action(
                         .transpose()?,
                     incarnation: request.fence.runtime_incarnation.clone(),
                     idempotency_key: request.idempotency_key.clone(),
+                    request: p.get("request").cloned(),
                 })
                 .map_err(ApiError::bad)?;
             signal_changed(state);
@@ -7179,6 +7188,17 @@ async fn dispatch_action(
                             .unwrap_or_default(),
                         episode: Some(parameter_string(p, "episode")?),
                         idempotency_key: request.idempotency_key.clone(),
+                        answer: p
+                            .get("answer")
+                            .map(|value| {
+                                serde_json::from_value(value.clone()).map_err(|_| {
+                                    ApiError::bad(St3Error::new(
+                                        "validation-failed",
+                                        "answer takes an optional id and optional text",
+                                    ))
+                                })
+                            })
+                            .transpose()?,
                     },
                     action == "work.cancel-ask",
                 )
@@ -7626,6 +7646,89 @@ async fn dispatch_action(
             )])
         }
         "terminal.detach" => Ok(vec![detach_terminal_attachment(state, session, request)?]),
+        action @ ("agent.stop" | "agent.start") => {
+            require_creation_actor(session)?;
+            let agent = client_detail_id("agent", &parameter_string(p, "agent")?);
+            if action == "agent.stop" {
+                serde_json::from_value::<st3_client::AgentStopParameters>(p.clone())
+                    .map_err(|error| validation(error.to_string()))?;
+            } else {
+                serde_json::from_value::<st3_client::AgentStartParameters>(p.clone())
+                    .map_err(|error| validation(error.to_string()))?;
+            }
+            let token = state
+                .store
+                .selected_desired_token(&agent)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("agent `{agent}` has no declaration"))
+                })?;
+            if request.fence.runtime_desired_revision.as_deref() != Some(token.as_str()) {
+                return Err(stale("the agent desired revision changed"));
+            }
+            let mut claim = state
+                .store
+                .claim_by_id(&token)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::internal("selected declaration is missing"))?;
+            let declared = loop {
+                let desired: crate::model::DesiredSubject =
+                    serde_json::from_value(claim.body).map_err(ApiError::internal)?;
+                if desired.kind == "agent" {
+                    if desired.owner_run.is_some() {
+                        return Err(validation(
+                            "mission-owned agents must be changed through their mission",
+                        ));
+                    }
+                    break desired;
+                }
+                if desired.kind != "stop" || claim.predecessors.len() != 1 {
+                    return Err(validation("agent has no unambiguous prior declaration"));
+                }
+                claim = state
+                    .store
+                    .claim_by_id(&claim.predecessors[0])
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(|| ApiError::internal("prior declaration is missing"))?;
+            };
+            let kdl = if action == "agent.stop" {
+                format!(
+                    "version 2\nstop {}\n",
+                    serde_json::to_string(&agent).map_err(ApiError::internal)?
+                )
+            } else {
+                let mut node =
+                    crate::graph::render_desired_node(&declared.desired).map_err(ApiError::bad)?;
+                let identity = agent.trim_start_matches("agent/");
+                let mut body = node.children_mut().take().unwrap_or_default();
+                if let Some(child) = body
+                    .nodes_mut()
+                    .iter_mut()
+                    .find(|child| child.name().value() == "identity")
+                {
+                    child.entries_mut()[0] = kdl::KdlEntry::new(identity);
+                } else {
+                    node.entries_mut()[0] = kdl::KdlEntry::new(identity);
+                }
+                if let Some(member) = declared.member {
+                    let mut host = kdl::KdlNode::new("host");
+                    host.entries_mut().push(kdl::KdlEntry::new(member.host));
+                    if let Some(child) = body
+                        .nodes_mut()
+                        .iter_mut()
+                        .find(|child| child.name().value() == "host")
+                    {
+                        *child = host;
+                    } else {
+                        body.nodes_mut().push(host);
+                    }
+                }
+                node.set_children(body);
+                format!("version 2\n{node}\n")
+            };
+            apply_runtime_control_intent(state, snapshot, request, authority_actor, kdl).await?;
+            Ok(vec![agent])
+        }
         "agent.queue-move" => {
             let agent = client_detail_id("agent", &parameter_string(p, "agent_id")?);
             let move_request = crate::model::SeatQueueMoveRequest {
@@ -8666,6 +8769,130 @@ subscription "watch/source" {
     }
 
     #[tokio::test]
+    async fn typed_agent_stop_down_seat_is_idempotent_and_start_restores_declaration() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let source = "version 2\nagent \"example/worker\" { workspace \"/tmp\"; command \"true\"; restart \"always\" }\n";
+        let intent = crate::graph::parse_intent(source, &state.node).unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "agent-control-fixture")
+            .unwrap();
+        let agent = "agent/example/worker";
+        let declaration = state.store.agent_declaration(agent, None).unwrap().unwrap();
+        let person = ClientSession::local(Some("person/alex")).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let stop = st3_client::ActionRequest::agent_stop(
+            "action/stop-down-seat",
+            "stop-down-seat-key-0001",
+            st3_client::Fence {
+                snapshot_id: snapshot.id.clone(),
+                runtime_desired_revision: Some(declaration.0.clone()),
+                ..Default::default()
+            },
+            st3_client::AgentStopParameters {
+                agent: agent.into(),
+                reason: Some("maintenance".into()),
+            },
+        )
+        .unwrap();
+        let stop: ActionRequest =
+            serde_json::from_value(serde_json::to_value(stop).unwrap()).unwrap();
+        let submit = |snapshot: ClientSnapshot, session: ClientSession, request| {
+            action(
+                State(state.clone()),
+                Extension(snapshot),
+                Extension(session),
+                Json(request),
+            )
+        };
+        let first = submit(snapshot.clone(), person.clone(), stop.clone())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            state.store.selected_desired_kind(agent).unwrap().as_deref(),
+            Some("stop")
+        );
+        let stopped = state.store.selected_desired_token(agent).unwrap().unwrap();
+        let replay = submit(new_client_snapshot(&state), person, stop)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(first["operation_id"], replay["operation_id"]);
+        assert_eq!(
+            state
+                .store
+                .selected_desired_token(agent)
+                .unwrap()
+                .as_deref(),
+            Some(stopped.as_str())
+        );
+        assert_eq!(
+            state
+                .store
+                .agent_declaration(agent, Some(&declaration.0))
+                .unwrap()
+                .unwrap()
+                .1,
+            declaration.1
+        );
+        let snapshot = new_client_snapshot(&state);
+        let start = st3_client::ActionRequest::agent_start(
+            "action/start-down-seat",
+            "start-down-seat-key-0001",
+            st3_client::Fence {
+                snapshot_id: snapshot.id.clone(),
+                runtime_desired_revision: Some(stopped),
+                ..Default::default()
+            },
+            st3_client::AgentStartParameters {
+                agent: agent.into(),
+            },
+        )
+        .unwrap();
+        let start: ActionRequest =
+            serde_json::from_value(serde_json::to_value(start).unwrap()).unwrap();
+        // The shared free-mode creation policy permits local agents without authority blocks.
+        let mut actor = ClientSession::local(Some("person/alex")).unwrap();
+        actor.actor = "agent/example/operator".into();
+        actor.authority_actor = actor.actor.clone();
+        assert!(require_creation_actor(&actor).is_ok());
+        let started = submit(snapshot, actor, start).await.unwrap().0;
+        assert_eq!(started["affected_ids"], json!([agent]));
+        assert_eq!(
+            state.store.selected_desired_kind(agent).unwrap().as_deref(),
+            Some("agent")
+        );
+        let restored = state
+            .store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.subject == agent)
+            .unwrap();
+        assert_eq!(restored.member.unwrap().host, state.node);
+        assert!(
+            state
+                .store
+                .claims_for(agent, Some("intent.desired"))
+                .unwrap()
+                .iter()
+                .any(|c| c.actor.as_deref() == Some("agent/example/operator"))
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_stop_uses_the_person_and_rejects_a_stale_desired_fence() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "client-control-test");
@@ -8739,6 +8966,47 @@ subscription "watch/source" {
         );
         let mut current = request;
         current.fence.runtime_desired_revision = Some(desired);
+        let typed_fence = st3_client::Fence {
+            snapshot_id: snapshot.id.clone(),
+            runtime_incarnation: Some(incarnation.into()),
+            runtime_desired_revision: current.fence.runtime_desired_revision.clone(),
+            ..st3_client::Fence::default()
+        };
+        let parameters = st3_client::TargetParameters {
+            target_id: "runtime/client-control-runtime".into(),
+            reason: Some("operator control".into()),
+            ..st3_client::TargetParameters::default()
+        };
+        // Before the generated Rust `Fence` carried the desired revision, these typed requests
+        // reached the daemon without it and were refused with 422.
+        let restart = st3_client::ActionRequest::runtime_restart(
+            "action/restart-worker",
+            "restart-worker-client-0001",
+            typed_fence.clone(),
+            parameters.clone(),
+        )
+        .unwrap();
+        let mut restart: ActionRequest =
+            serde_json::from_value(serde_json::to_value(restart).unwrap()).unwrap();
+        assert_eq!(
+            runtime_control_target(&state, &snapshot, &session, &restart).unwrap()["owner_id"],
+            owner
+        );
+        restart.fence.runtime_desired_revision = None;
+        assert_eq!(
+            runtime_control_target(&state, &snapshot, &session, &restart)
+                .unwrap_err()
+                .message,
+            "runtime control requires a desired revision fence"
+        );
+        let stop = st3_client::ActionRequest::runtime_stop(
+            "action/stop-worker",
+            "stop-worker-client-0001",
+            typed_fence,
+            parameters,
+        )
+        .unwrap();
+        current = serde_json::from_value(serde_json::to_value(stop).unwrap()).unwrap();
         assert_eq!(
             dispatch_action(&state, &snapshot, &session, &current)
                 .await
@@ -11961,6 +12229,96 @@ mission "example/zero-run" state="ready" {
     }
 
     #[test]
+    fn timeline_missing_append_is_permanent_on_http_and_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "timeline-retention-node");
+        let subject = "agent/timeline-retention-owner";
+        let incarnation = "timeline-retention-runtime:i1";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("timeline-retention-runtime".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("terminal".into(), Value::Bool(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("timeline-retention-runtime".into()),
+            })
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.timeline".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("operation".into(), json!("replace")),
+                    ("entry_id".into(), json!("timeline-entry/orphan")),
+                    ("sequence".into(), json!(1)),
+                    ("revision".into(), json!(2)),
+                    ("role".into(), json!("assistant")),
+                    ("entry_type".into(), json!("content")),
+                    ("final".into(), json!(false)),
+                    ("body".into(), json!({"text":"retained update"})),
+                    ("driver".into(), json!("codex")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let session_id = client_session_resources(
+            &state.store,
+            true,
+            &snapshot.created_at,
+            snapshot.store_index,
+            state.native_session_home.as_deref(),
+            false,
+        )
+        .unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for _ in 0..2 {
+            let snapshot = new_client_snapshot(&state);
+            let gap = timeline_value(
+                &state,
+                &snapshot,
+                &session,
+                session_id.trim_start_matches("session/"),
+                &ClientListQuery::default(),
+            )
+            .unwrap_err();
+            assert_eq!(gap.code, "timeline-history-incomplete");
+            assert!(gap.message.contains("append operation is missing"));
+            assert_eq!(gap.details["full_resync"], false);
+            let raw = json!({"code":gap.code,"message":gap.message,"details":gap.details});
+            assert_eq!(
+                client_error_envelope(gap.status, &raw, "test")["retryable"],
+                false
+            );
+            assert_eq!(
+                conversation_stream_error("conversation", &gap)["retryable"],
+                false
+            );
+        }
+        // An actual cursor/window race still admits a fresh read.
+        assert!(client_error_retryable(StatusCode::GONE, Some("cursor-gap")));
+    }
+
+    #[test]
     fn timeline_retention_requires_an_actual_typed_gap_interval() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "timeline-retention-node");
@@ -12051,8 +12409,9 @@ mission "example/zero-run" state="ready" {
         )
         .unwrap_err();
         assert_eq!(gap.status, StatusCode::GONE);
-        assert_eq!(gap.code, "cursor-gap");
-        assert_eq!(gap.details.get("full_resync"), Some(&Value::Bool(true)));
+        assert_eq!(gap.code, "timeline-history-incomplete");
+        assert_eq!(gap.details.get("full_resync"), Some(&Value::Bool(false)));
+        assert!(!client_error_retryable(gap.status, Some(&gap.code)));
 
         append_entry(
             4_098,
@@ -12072,7 +12431,7 @@ mission "example/zero-run" state="ready" {
             &ClientListQuery::default(),
         )
         .unwrap_err();
-        assert_eq!(insufficient.code, "cursor-gap");
+        assert_eq!(insufficient.code, "timeline-history-incomplete");
 
         append_entry(
             4_099,
@@ -12623,6 +12982,72 @@ mission "example/zero-run" state="ready" {
         assert!(!stored.contains(capability));
         assert!(!stored.contains("st3.cap."));
         assert!(!stored.contains("stream_capability"));
+    }
+
+    /// A member one build behind still routes to a terminal on a newer member whose seat reports
+    /// a claim kind it does not know yet (`harness.limits`): the valid runtime observation
+    /// decides, and the unknown claim waits for an upgrade.
+    #[test]
+    fn an_older_member_routes_to_a_terminal_despite_an_unknown_harness_claim() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let follower_root = tempfile::tempdir().unwrap();
+        let owner = test_state_named(owner_root.path(), "owner-node");
+        let mut follower = test_state_named(follower_root.path(), "follower-node");
+        let secret = follower_root.path().join("fleet-secret");
+        std::fs::write(&secret, [7_u8; 32]).unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        follower.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
+            node: "follower-node".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![crate::config::PeerConfig {
+                name: "owner-node".into(),
+                url: "http://127.0.0.1:9".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut registry = st3_schema::registry().clone();
+        registry.claims.remove("harness.limits").unwrap();
+        follower.store.set_claim_registry(registry);
+        let subject = "agent/fleet-terminal";
+        let claim = |kind: &str, fields: Value, key: &str| ClaimInput {
+            subject: subject.into(),
+            kind: kind.into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(fields).unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(key.into()),
+        };
+        owner
+            .store
+            .append_claim(&claim(
+                "runtime.observed",
+                json!({"runtime_id": "same-runtime-id", "incarnation_id": "same-runtime-id:i1",
+                       "status": "running", "terminal": true}),
+                "owner-running",
+            ))
+            .unwrap();
+        owner
+            .store
+            .append_claim(&claim(
+                "harness.limits",
+                json!({"driver": "claude", "incarnation_id": "same-runtime-id:i1",
+                       "weekly_percent": 40.0, "measured_at_unix_ms": 1_790_000_000_000_u64}),
+                "owner-limits",
+            ))
+            .unwrap();
+        follower
+            .store
+            .import_replication("owner-node", &owner.store.export_replication(0).unwrap())
+            .unwrap();
+        let status = follower.store.status(Some(subject)).unwrap();
+        assert_eq!(status.subjects[0].reachability, "reachable");
+        let live = remote_terminal_live_session(&follower, subject, "same-runtime-id:i1")
+            .unwrap_or_else(|error| panic!("{}: {}", error.code, error.message));
+        assert_eq!(live.owner_host_id, "host/owner-node");
+        assert_eq!(live.incarnation_id, "same-runtime-id:i1");
     }
 
     #[test]

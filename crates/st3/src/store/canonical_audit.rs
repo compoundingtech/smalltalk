@@ -768,6 +768,7 @@ message "audit-declared" {
             new_run: Some("audit-person-ask".into()),
             incarnation: None,
             idempotency_key: "audit-person-ask".into(),
+            request: None,
         })
         .unwrap();
     source

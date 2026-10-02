@@ -389,6 +389,7 @@ fn rust_field(name: &str) -> String {
         "type" => "entry_type".into(),
         "final" => "is_final".into(),
         "loop" => "loop_spec".into(),
+        "ref" => "reference".into(),
         other => other.into(),
     }
 }
@@ -517,6 +518,12 @@ fn validate_surfaces(
         "VisualizationNode",
         "VisualizationEdge",
         "VisualizationGroup",
+        "StructuredRequest",
+        "RequestSubject",
+        "RequestAnswerOption",
+        "PersonAnswerInput",
+        "PersonAnswer",
+        "PersonAnswerRecord",
     ] {
         validate_model(schema, definition, definition, definition, rust, swift)?;
     }

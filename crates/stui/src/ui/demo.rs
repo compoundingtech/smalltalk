@@ -466,6 +466,7 @@ fn agent(
         parent: None,
         details: AgentDetails::default(),
         terminal: !matches!(state, AgentState::Stopped),
+        subagents: Vec::new(),
     }
 }
 
@@ -563,6 +564,21 @@ fn agents() -> Vec<Agent> {
         "1h",
     ));
     list[4].parent = Some(s("agent/example/cos"));
+    // The builder has two subagents at work under its step.
+    list[0].subagents = vec![
+        Subagent {
+            id: s("a3f9e1"),
+            kind: Some(s("Explore")),
+            description: Some(s("map the parser's error paths")),
+            age: s("4m"),
+        },
+        Subagent {
+            id: s("b72c04"),
+            kind: Some(s("general-purpose")),
+            description: Some(s("run the slow tests")),
+            age: s("1m"),
+        },
+    ];
     list.push(Agent {
         id: s("session/unmanaged-1"),
         name: s("codex in ~/src/scratch"),
@@ -577,6 +593,7 @@ fn agents() -> Vec<Agent> {
         parent: None,
         details: AgentDetails::default(),
         terminal: false,
+        subagents: Vec::new(),
     });
     let detail =
         |goal: &str, claimed: &str, next: Option<&str>, queue: &[&str], state: &str| AgentDetails {

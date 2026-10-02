@@ -135,7 +135,8 @@ pub struct SealedEnvelope {
     pub records: usize,
 }
 
-/// The envelopes before a cut and their admitted claims, in canonical order.
+/// The envelopes before a cut and their admitted claims, less repaired originals, in canonical
+/// order.
 #[derive(Clone, Debug, Default)]
 pub struct SealedSet {
     pub cut_unix_ms: u128,
@@ -478,14 +479,20 @@ pub fn prove_on_copy(
     // Keep only the sealed set.
     transaction.execute_batch(
         "CREATE TEMP TABLE sealed_claims(id TEXT PRIMARY KEY);
+         CREATE TEMP TABLE sealed_blobs(hash TEXT PRIMARY KEY);
          CREATE TEMP TABLE sealed_envelopes(writer TEXT, sequence INTEGER, envelope_hash TEXT,
              PRIMARY KEY(writer, sequence, envelope_hash));",
     )?;
+    let mut blobs = BTreeSet::new();
     for sealed_claim in &sealed.claims {
         transaction.execute(
             "INSERT OR IGNORE INTO temp.sealed_claims(id) VALUES (?1)",
             [&sealed_claim.claim.id],
         )?;
+        collect_hash_fields(&sealed_claim.claim.body, &mut blobs);
+    }
+    for hash in &blobs {
+        transaction.execute("INSERT INTO temp.sealed_blobs(hash) VALUES (?1)", [hash])?;
     }
     for envelope in &sealed.envelopes {
         transaction.execute(
@@ -498,8 +505,12 @@ pub fn prove_on_copy(
         )?;
     }
     runtime.clear_checkpoint_projections(&transaction)?;
+    // Blobs go with the claims that reference them. Admission needs a claim's blobs, so every
+    // node that holds the sealed claims holds these, while the blobs of later claims depend on
+    // what has arrived since the cut. A trim deletes no blob.
     transaction.execute_batch(
         "DELETE FROM claims WHERE id NOT IN (SELECT id FROM temp.sealed_claims);
+         DELETE FROM blobs WHERE hash NOT IN (SELECT hash FROM temp.sealed_blobs);
          DELETE FROM replica_records WHERE NOT EXISTS (
              SELECT 1 FROM temp.sealed_envelopes s WHERE s.writer=replica_records.writer
                AND s.sequence=replica_records.sequence AND s.envelope_hash=replica_records.envelope_hash);",
@@ -575,13 +586,9 @@ impl Store {
         cut_unix_ms: u128,
         through_rowid: Option<i64>,
     ) -> Result<SealedSet> {
-        {
-            // Every local batch has an envelope before the planner reads them.
-            let mut connection = self.connection.write();
-            let transaction = connection.transaction()?;
-            seed_replica_envelopes_tx(&transaction, &self.origin, None)?;
-            transaction.commit()?;
-        }
+        // Seal only new batches. A full history scan under the writer stalls live requests
+        // every time a checkpoint is reconsidered, even when no new envelope is needed.
+        self.seal_local_batches()?;
         let connection = self.readers.get();
         // One read transaction, so the envelopes, the claims and the high water agree.
         let connection = connection.unchecked_transaction()?;
@@ -630,12 +637,17 @@ impl Store {
             .query_map([], |row| row.get::<_, Option<String>>(0))?
             .filter_map(|row| row.transpose())
             .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        // A repaired original is left out, as projections leave it out: a node holds its row
+        // only when it admitted the original before the repair arrived, so including it would
+        // make the set, and every digest of it, differ between nodes that hold the same
+        // envelopes.
         let claims = connection
             .prepare(&format!(
                 "SELECT {CLAIM_COLUMNS}, records.writer, records.sequence, records.envelope_hash,
                         records.state
                  FROM claims JOIN batches ON batches.id=claims.batch_id
                  JOIN replica_records records ON records.claim_id=claims.id
+                 WHERE records.state<>'repaired'
                  ORDER BY {CANONICAL_ORDER}"
             ))?
             .query_map([], |row| {
@@ -741,12 +753,7 @@ impl Store {
         cut_unix_ms: u128,
         through_rowid: Option<i64>,
     ) -> Result<SealedIdentities> {
-        {
-            let mut connection = self.connection.write();
-            let transaction = connection.transaction()?;
-            seed_replica_envelopes_tx(&transaction, &self.origin, None)?;
-            transaction.commit()?;
-        }
+        self.seal_local_batches()?;
         let connection = self.readers.get();
         let connection = connection.unchecked_transaction()?;
         let seal_rowid: i64 = connection.query_row(
@@ -757,7 +764,7 @@ impl Store {
         let seal_rowid = through_rowid.map_or(seal_rowid, |through| through.min(seal_rowid));
         let cut = i64::try_from(cut_unix_ms)?;
         // As in `checkpoint_sealed_set_through`: an envelope is before the cut when it and every
-        // claim admitted from it are dated before the cut.
+        // claim admitted from it, less repaired originals, are dated before the cut.
         let identities = connection
             .prepare(
                 "SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash
@@ -770,6 +777,7 @@ impl Store {
                        WHERE records.writer=envelopes.writer
                          AND records.sequence=envelopes.sequence
                          AND records.envelope_hash=envelopes.envelope_hash
+                         AND records.state<>'repaired'
                          AND CAST(claims.accepted_at_unix_ms AS INTEGER) >= ?1)
                  UNION
                  SELECT writer, sequence, envelope_hash FROM checkpoint_envelopes
