@@ -1629,7 +1629,9 @@ impl Ui {
             {
                 self.draw_pane(buf, content, &Pane::Terminal(id))
             }
-            Some(_) if focused => self.draw_main(buf, content),
+            // While Home floats over the glass, stui's own tab is Home: the focused group draws
+            // its pane like the others, not Home's selection (Nathan, 2026-10-02).
+            Some(_) if focused && !self.home_open() => self.draw_main(buf, content),
             Some(pane) => self.draw_pane(buf, content, &pane),
         }
     }
@@ -4577,6 +4579,25 @@ mod tests {
         assert!(ui.home_open());
         ctrl(&mut ui, 'h');
         assert!(!ui.home_open());
+    }
+
+    #[test]
+    fn the_pane_behind_home_keeps_showing_itself() {
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].id.clone();
+        ui.open_in_glass(Pane::Agent(Some(agent)), Open::Tab);
+        // What shows around Home's card: the glass's left edge, row by row.
+        let edge = |ui: &Ui| {
+            screen(ui)
+                .lines()
+                .skip(1)
+                .map(|line| line.chars().take(8).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let before = edge(&ui);
+        ui.open_home();
+        assert!(ui.home_open());
+        assert_eq!(edge(&ui), before, "the conversation, not Home's selection");
     }
 
     #[test]

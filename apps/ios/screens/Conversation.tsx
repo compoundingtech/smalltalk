@@ -235,7 +235,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
         : row.kind === 'bundle' ? <BundleView row={row} onToggle={toggle} />
         : row.kind === 'call' && !open.has(row.entry.id) ? <CallView entry={row.entry} tool={row.tool} onToggle={toggle} />
         // A long press opens the entry's text to select any part of it; iOS text selects only whole.
-        : <Pressable onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} /></Pressable>}
+        : <Pressable onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} brief={simpleOn && !finding} /></Pressable>}
       ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (issue ? `Not loaded yet: ${issue}. Trying again.` : status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 60 }}
       keyboardDismissMode="interactive"
@@ -301,7 +301,7 @@ const PendingView = memo(function PendingView({ pending }: { pending: Pending })
   </View>;
 });
 
-const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: ConversationEntry; open: boolean; onToggle: (id: string) => void }) {
+const EntryView = memo(function EntryView({ entry, open, onToggle, brief = false }: { entry: ConversationEntry; open: boolean; onToggle: (id: string) => void; brief?: boolean }) {
   const body = entry.body;
   switch (body.kind) {
     case 'user':
@@ -311,7 +311,7 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
       </View>;
     case 'assistant':
       return <View style={styles.entry}><Markdown selectable={false} text={body.text} color={c(RULES.assistant)} /></View>;
-    case 'mail': return <MailView entry={entry} body={body} open={open} onToggle={onToggle} />;
+    case 'mail': return <MailView entry={entry} body={body} open={open} onToggle={onToggle} brief={brief} />;
     case 'event': {
       const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : c(RULES.event.label);
       return <View style={[styles.entry, { flexDirection: 'row' }]}>
@@ -378,7 +378,7 @@ type Mail = Extract<ConversationEntry['body'], { kind: 'mail' }>;
 // Mail the person is part of leads; mail between others stays back and folds to a few rows,
 // like a tool call, until tapped. Mail to the person is filled like their own messages, and
 // their own says how far it got: ✓ st has it, ✓✓ the agent has it.
-const MailView = memo(function MailView({ entry, body, open, onToggle }: { entry: ConversationEntry; body: Mail; open: boolean; onToggle: (id: string) => void }) {
+const MailView = memo(function MailView({ entry, body, open, onToggle, brief = false }: { entry: ConversationEntry; body: Mail; open: boolean; onToggle: (id: string) => void; brief?: boolean }) {
   const rule = RULES.mail;
   const toYou = body.to === 'you';
   const look = folds(body) ? rule.between_others : rule.involving_you;
@@ -386,6 +386,16 @@ const MailView = memo(function MailView({ entry, body, open, onToggle }: { entry
   const limit = RULES.tool.collapsed_rows * LINE;
   const long = folds(body) && height > limit;
   const mark = body.from !== 'you' ? null : body.delivered ? rule.delivered : rule.sent;
+  // Simplified, mail between others is two lines until tapped: who to whom and the subject, then
+  // its first line (Nathan, 2026-10-02).
+  if (brief && folds(body) && !open) {
+    const lines = body.text.split('\n').map(line => line.trim()).filter(Boolean);
+    return <Pressable accessibilityRole="button" accessibilityState={{ expanded: false }} onPress={() => onToggle(entry.id)}
+      style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }]}>
+      <T numberOfLines={1}><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T color={c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}</T>
+      <T numberOfLines={1} color={c(look.text)}>{lines[0] ?? ''}{lines.length > 1 ? ' …' : ''}</T>
+    </Pressable>;
+  }
   return <Pressable disabled={!long} accessibilityRole={long ? 'button' : undefined} accessibilityState={long ? { expanded: open } : undefined} onPress={() => onToggle(entry.id)}
     style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }, toYou ? { backgroundColor: c(rule.to_you_fill) } : null]}>
     <T><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
