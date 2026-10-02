@@ -198,6 +198,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn subject_definition(&self, subject: &str, show_env_values: bool) -> Result<Envelope<SubjectDefinition>, ClientError> {{ self.get(&format!(\"/v1/client/subject-definition?subject={{}}&show_env_values={{show_env_values}}\", percent_encode(subject))).await }}"
             )?;
+        } else if id == "usage.period" {
+            writeln!(
+                out,
+                "    pub async fn usage_period(&self, since_ms: Option<u64>, until_ms: Option<u64>) -> Result<Envelope<UsagePeriod>, ClientError> {{ let mut query = Vec::new(); if let Some(since_ms) = since_ms {{ query.push(format!(\"since_ms={{since_ms}}\")); }} if let Some(until_ms) = until_ms {{ query.push(format!(\"until_ms={{until_ms}}\")); }} let query = if query.is_empty() {{ String::new() }} else {{ format!(\"?{{}}\", query.join(\"&\")) }}; self.get(&format!(\"/v1/client/usage{{query}}\")).await }}"
+            )?;
         } else if id == "document.get" {
             writeln!(
                 out,
@@ -293,6 +298,11 @@ fn swift_operation_methods(
                 | "agent-queue.get"
         ) {
             continue;
+        } else if id == "usage.period" {
+            writeln!(
+                out,
+                "    public func usagePeriod(sinceMS: UInt64? = nil, untilMS: UInt64? = nil) async throws -> Envelope<UsagePeriod> {{ var query: [URLQueryItem] = []; if let sinceMS {{ query.append(.init(name: \"since_ms\", value: String(sinceMS))) }}; if let untilMS {{ query.append(.init(name: \"until_ms\", value: String(untilMS))) }}; return try await get(\"v1/client/usage\", query: query) }}"
+            )?;
         } else if id == "document.get" {
             writeln!(
                 out,
@@ -473,6 +483,8 @@ fn validate_surfaces(
         "AgentDeclaration",
         "CanonicalNode",
         "SubjectDefinition",
+        "UsagePeriod",
+        "UsageRow",
         "LaunchPreview",
         "MissionRunSummary",
         "AgentQueue",
@@ -972,6 +984,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
+            )?;
+        } else if id == "usage.period" {
+            writeln!(
+                out,
+                "    async {method}(options: {{ since_ms?: number; until_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options)); }}"
             )?;
         } else if id == "document.get" {
             writeln!(

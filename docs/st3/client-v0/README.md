@@ -227,6 +227,20 @@ A definition is never truncated:
 when its serialized value exceeds `max_response_bytes - 4096` (reserving room for the envelope),
 the server returns `validation-failed` rather than an incomplete AST or KDL document.
 
+### Usage over a period
+
+`GET /v1/client/usage?since_ms=…&until_ms=…` reads token spend over a period: the last 24 hours
+when both are omitted, ending now when `until_ms` is omitted. It requires `read.projections`. The
+value is `UsagePeriod { since_ms, until_ms, rows }`, with one `UsageRow` per agent, mission run,
+step, model, paying account and host, largest first. A row carries the token counts (`total`,
+`input`, `output`, `cache_write`, `cache_write_1h`, `cached`), `cost_microusd` (API-equivalent
+cost: the harness's own figure when it reports one, else st's pricing table, named by `pricing`),
+`reported_cost_microusd` (the part the harness reported) and `unpriced_tokens` (tokens neither
+could price, which a client shows as unknown cost, never as free). An identity st does not know,
+such as the mission run of a standing seat, is absent from the row. A period whose start is after
+its end is `validation-failed`. The Rust method is `Client::usage_period(since_ms, until_ms)`;
+Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
+
 
 `operations` is the client-safe operational view: daemon health, host reachability, transport
 health, resource observers, and diagnostics. Some diagnostics compare the whole projection with

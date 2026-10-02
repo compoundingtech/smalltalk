@@ -90,7 +90,8 @@
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
             { "$ref": "#/$defs/TerminalScreen" },
-            { "$ref": "#/$defs/AgentQueue" }
+            { "$ref": "#/$defs/AgentQueue" },
+            { "$ref": "#/$defs/UsagePeriod" }
           ]
         }
       }
@@ -485,6 +486,37 @@
         "incarnation_count": { "type": "integer", "minimum": 0 },
         "aggregation": { "const": "cumulative-per-incarnation-else-response-deltas" },
         "context": { "$ref": "#/$defs/UsageContext" }
+      }
+    },
+    "UsagePeriod": {
+      "type": "object", "additionalProperties": false,
+      "required": ["since_ms", "until_ms", "rows"],
+      "properties": {
+        "since_ms": { "type": "integer", "minimum": 0 },
+        "until_ms": { "type": "integer", "minimum": 0 },
+        "rows": { "type": "array", "items": { "$ref": "#/$defs/UsageRow" } }
+      }
+    },
+    "UsageRow": {
+      "type": "object", "additionalProperties": false,
+      "required": ["agent", "total_tokens", "input_tokens", "output_tokens", "cache_write_tokens", "cache_write_1h_tokens", "cached_tokens", "cost_microusd", "reported_cost_microusd", "unpriced_tokens"],
+      "properties": {
+        "agent": { "$ref": "#/$defs/Id" },
+        "mission_run": { "$ref": "#/$defs/Id" },
+        "step": { "$ref": "#/$defs/Id" },
+        "model": { "type": "string" },
+        "account": { "type": "string" },
+        "host": { "type": "string" },
+        "pricing": { "type": "string" },
+        "total_tokens": { "type": "integer", "minimum": 0 },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cache_write_tokens": { "type": "integer", "minimum": 0 },
+        "cache_write_1h_tokens": { "type": "integer", "minimum": 0 },
+        "cached_tokens": { "type": "integer", "minimum": 0 },
+        "cost_microusd": { "type": "integer", "minimum": 0 },
+        "reported_cost_microusd": { "type": "integer", "minimum": 0 },
+        "unpriced_tokens": { "type": "integer", "minimum": 0 }
       }
     },
     "Mission": {

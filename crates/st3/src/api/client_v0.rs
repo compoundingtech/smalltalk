@@ -813,6 +813,44 @@ pub(super) async fn document_get(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct ClientUsageQuery {
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+}
+
+/// Token spend and its API-equivalent cost over a period (the last 24 hours unless asked), one
+/// row per agent, mission run, step, model, account and host, largest first. An identity st
+/// does not know (a standing seat has no mission run or step) is left out of its row.
+pub(super) async fn usage_period(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientUsageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let until_ms = query.until_ms.unwrap_or(client_now_ms() as u64);
+    let since_ms = query
+        .since_ms
+        .unwrap_or(until_ms.saturating_sub(86_400_000));
+    if since_ms > until_ms {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-usage-period",
+            "usage start must be before its end",
+        )));
+    }
+    let store = state.store.clone();
+    let mut rows = blocking_store(move || store.usage_period_rows(since_ms, until_ms)).await?;
+    for row in &mut rows {
+        if let Some(fields) = row.as_object_mut() {
+            fields.retain(|_, value| value.as_str() != Some(""));
+        }
+    }
+    Ok(Json(
+        json!({ "since_ms": since_ms, "until_ms": until_ms, "rows": rows }),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SubjectDefinitionQuery {
     subject: String,
     #[serde(default)]
