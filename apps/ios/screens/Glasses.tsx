@@ -28,12 +28,16 @@ function openPane(navigation: Navigation, pane: PaneTarget) {
 function paneGlyph(pane: PaneTarget): { glyph: string; color: string } {
   if (pane.gone) return { glyph: '○', color: theme.overlay1 };
   if (pane.needsYou) return { glyph: '◆', color: theme.person };
+  // Agents and missions are marked as in their own lists: working, idle, broken…
+  if (pane.status) return pane.status;
   const glyphs: Record<PaneTarget['kind'], string> = { agent: '●', mission: '◇', machine: '▣', terminal: '⌨', usage: '$', other: '·' };
   return { glyph: glyphs[pane.kind], color: theme.subtext0 };
 }
 
 function paneDetail(pane: PaneTarget): string {
   if (pane.gone) return 'gone';
+  if (pane.needsYou) return `${pane.kind} · needs you`;
+  if (pane.status) return `${pane.kind} · ${pane.status.word}`;
   return pane.kind === 'other' ? 'this app cannot show it yet' : pane.kind;
 }
 
