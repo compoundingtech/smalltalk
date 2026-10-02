@@ -262,8 +262,14 @@ name = "node-b"
 This accepts node-b's authenticated exchanges and never dials it. The equivalent command-line
 entry is `--peer node-b`. A peer is observed as up after a successful exchange in either
 direction. After 90 seconds without an exchange it is shown as `last-seen`, with the time
-of its last successful exchange, rather than as a fault. Doctor does not warn about absence,
-and delivery probes and their attention streaks wait for the member to exchange again.
+of its last successful exchange, rather than as a fault. It is `last-seen` sooner when an attempt
+to reach it has failed and it has missed a 35-second quiet exchange interval, as a frozen peer
+does; a failure within that interval can be a one-way route while the peer still dials in. The
+last failed attempt stays as the peer's `last_error`, with its time, until the next exchange. A
+sync measurement older than the quiet interval is marked `stale`, with the envelopes this node
+gained since. Doctor names every absent peer and how much this node has not sent it, and warns
+only for an absent listening member; a dial-out member or a config peer can be away for hours.
+Delivery probes and their attention streaks wait for the member to exchange again.
 A config-peer node can omit `peer_listen` and initiate every exchange itself; it still pushes
 and pulls the full graph.
 
