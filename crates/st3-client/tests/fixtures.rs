@@ -66,10 +66,10 @@ fn generated_models_decode_every_stream_fixture() {
         timeline.value.items[0].body,
         TimelineBody::Status(_)
     ));
-    assert!(matches!(
-        timeline.value.items[1].body,
-        TimelineBody::Message(_)
-    ));
+    match &timeline.value.items[1].body {
+        TimelineBody::Message(message) => assert_eq!(message.tags, ["dictated"]),
+        other => panic!("message body lost: {other:?}"),
+    }
     assert!(matches!(
         timeline.value.items[2].body,
         TimelineBody::Content(_)

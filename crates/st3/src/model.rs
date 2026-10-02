@@ -22,6 +22,10 @@ pub use smallclaims::replication::{
 
 pub const MAX_EVAL_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -2089,6 +2093,9 @@ pub struct StepRunView {
     pub execution_elapsed_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// What `work extend` has added to this attempt's execution budget.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub timeout_extension_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_age_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2253,6 +2260,19 @@ pub struct WorkRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub evidence: Vec<String>,
+    pub idempotency_key: String,
+}
+
+/// `work extend`: add `by_ms` to the execution budget of the attempt the actor holds.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkExtendRequest {
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    pub by_ms: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
     pub idempotency_key: String,
 }
 

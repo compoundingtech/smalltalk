@@ -1402,6 +1402,7 @@ mod tests {
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
+            timeout_extension_ms: 0,
             ready_age_ms: None,
             wake: None,
             progress_summary: None,

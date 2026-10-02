@@ -807,6 +807,20 @@ impl Store {
                 if !person_work::run_live(&connection, source, None, true)? {
                     continue;
                 }
+            } else if source.starts_with("step-run/") {
+                // A timeout fault holds while its attempt is still running past the same budget:
+                // an extension, a completion, a failure or a release ends it.
+                let Some(step) = person_work::step(&connection, source)? else {
+                    continue;
+                };
+                let extension =
+                    step_timeout_extension_at(&connection, source, step.attempt, as_of)?;
+                if !matches!(step.status.as_str(), "claimed" | "working" | "ready")
+                    || claim.body["fields"]["episode"].as_str()
+                        != Some(step_timeout_episode(source, step.attempt, extension).as_str())
+                {
+                    continue;
+                }
             } else if !source.starts_with("daemon/")
                 && !person_work::declaration_live(&connection, source)?
             {

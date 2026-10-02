@@ -143,7 +143,8 @@ final class St3ClientTests: XCTestCase {
         let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/timeline.json"))
         let timeline = try JSONDecoder().decode(Envelope<TimelinePage>.self, from: data).value
         guard case .status = timeline.items[0].body else { return XCTFail("status body lost") }
-        guard case .message = timeline.items[1].body else { return XCTFail("message body lost") }
+        guard case .message(let message) = timeline.items[1].body else { return XCTFail("message body lost") }
+        XCTAssertEqual(message.tags, ["dictated"])
         guard case .content(let content) = timeline.items[2].body else { return XCTFail("content body lost") }
         XCTAssertEqual(content.text, "Build the release.")
         guard case .toolCall(let call) = timeline.items[4].body else { return XCTFail("tool call lost") }

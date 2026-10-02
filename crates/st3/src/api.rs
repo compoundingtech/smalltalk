@@ -616,6 +616,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/work/mission/{*subject}", post(publish_work_mission))
         .route("/v1/work/wake/{*subject}", post(wake_work))
         .route("/v1/work/retry/{*subject}", post(retry_work))
+        .route("/v1/work/extend/{*subject}", post(extend_work))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/agent-queue-moves", post(move_agent_queue))
@@ -10513,6 +10514,34 @@ async fn post_work_action(
     AxumPath((action, subject)): AxumPath<(String, String)>,
     Json(request): Json<WorkRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    work_action_response(state, action, subject, request, None).await
+}
+
+/// Add time to the execution budget of the step attempt this seat holds.
+async fn extend_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<crate::model::WorkExtendRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let extend_ms = request.by_ms;
+    let request = WorkRequest {
+        actor: request.actor,
+        incarnation: request.incarnation,
+        summary: None,
+        reason: request.reason,
+        evidence: Vec::new(),
+        idempotency_key: request.idempotency_key,
+    };
+    work_action_response(state, "extend".into(), subject, request, Some(extend_ms)).await
+}
+
+async fn work_action_response(
+    state: AppState,
+    action: String,
+    subject: String,
+    request: WorkRequest,
+    extend_ms: Option<u64>,
+) -> Result<Json<StepRunView>, ApiError> {
     let actor = request
         .actor
         .as_deref()
@@ -10558,7 +10587,7 @@ async fn post_work_action(
     let quiet_renewal = action == "renew";
     let store = state.store.clone();
     let (mut response, desired) = blocking_action(move || {
-        let response = store.work_action(&subject, &action, &request)?;
+        let response = store.work_action_extending(&subject, &action, &request, extend_ms)?;
         let desired = store.desired_subjects().map_err(|error| {
             St3Error::new("store-read-failed", format!("read desired agents: {error}"))
         })?;

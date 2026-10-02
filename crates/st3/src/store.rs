@@ -160,6 +160,8 @@ pub struct AgentWorkQueue {
 }
 
 const AGENT_WORK_PREVIEW_LIMIT: usize = 5;
+/// The most one `work extend` adds to a step attempt's execution budget.
+const MAX_STEP_EXTENSION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// smalltalk's projection tables, and the indexes its folds read the claim log through. The
 /// graph creates its own tables first; see `smallclaims::store::SCHEMA`.
@@ -4922,6 +4924,29 @@ impl Store {
     /// The IDs of the active runs that `origin` created, oldest first. The reconciler builds each
     /// run's view on its own with [`Store::mission_run_for_reconcile`], so one run whose view
     /// cannot be built does not hide the others.
+    /// Live work that `seat` holds or is assigned in a run outside the root of `owner_run`.
+    pub fn seat_work_in_other_runs(&self, seat: &str, owner_run: &str) -> Result<Vec<String>> {
+        let owner = owner_run.strip_prefix("mission-run/").unwrap_or(owner_run);
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT step_runs.subject
+             FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
+             WHERE (step_runs.assignee=?1 OR step_runs.lease_owner=?1)
+               AND step_runs.status IN ('ready','claimed','working','verifying')
+               AND step_runs.generation_id=mission_runs.current_generation_id
+               AND mission_runs.status IN ('running','standing','blocked')
+               AND mission_runs.phase NOT LIKE 'cleanup-%'
+               AND mission_runs.phase<>'terminal'
+               AND mission_runs.root_run_id<>COALESCE(
+                     (SELECT root_run_id FROM mission_runs WHERE id=?2), ?2)
+             ORDER BY step_runs.subject LIMIT 3",
+        )?;
+        let subjects = statement
+            .query_map(params![seat, owner], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(subjects)
+    }
+
     pub fn active_mission_run_ids_for_origin(&self, origin: &str) -> Result<Vec<String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -6003,6 +6028,40 @@ impl Store {
         action: &str,
         request: &WorkRequest,
     ) -> Result<StepRunView, St3Error> {
+        self.work_action_extending(subject, action, request, None)
+    }
+
+    /// A work action; `extend_ms` is the time an `extend` adds to the attempt's execution budget.
+    pub fn work_action_extending(
+        &self,
+        subject: &str,
+        action: &str,
+        request: &WorkRequest,
+        extend_ms: Option<u64>,
+    ) -> Result<StepRunView, St3Error> {
+        if action == "extend" {
+            if !extend_ms.is_some_and(|by| (1..=MAX_STEP_EXTENSION_MS).contains(&by)) {
+                return Err(St3Error::new(
+                    "invalid-extension",
+                    "an extension adds between 1 millisecond and 7 days",
+                ));
+            }
+            if request
+                .reason
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty())
+            {
+                return Err(St3Error::new(
+                    "extension-needs-reason",
+                    "an extension records why the step needs more time; pass --reason",
+                ));
+            }
+        } else if extend_ms.is_some() {
+            return Err(St3Error::new(
+                "invalid-work-action",
+                "only an extension adds time",
+            ));
+        }
         let subject = normalize_step_run(subject);
         let actor = normalize_actor(
             request.actor.as_deref().ok_or_else(|| {
@@ -6280,6 +6339,13 @@ impl Store {
                         effective_incarnation,
                         Some(now + 600_000),
                     ),
+                    "extend" => (
+                        current.status.as_str(),
+                        current.worker_reported,
+                        Some(actor.clone()),
+                        effective_incarnation,
+                        Some(now + 600_000),
+                    ),
                     "complete" => ("verifying", true, None, None, None),
                     "fail" => ("failed", current.worker_reported, None, None, None),
                     "release" => ("ready", current.worker_reported, None, None, None),
@@ -6309,7 +6375,7 @@ impl Store {
                     actor_incarnation.as_deref(),
                     now,
                 )?;
-                let body = json!({"fields": {
+                let mut body = json!({"fields": {
                     "attempt": current.attempt,
                     "status": status,
                     "summary": request.summary,
@@ -6320,6 +6386,9 @@ impl Store {
                     "claim_expires_at_unix_ms": claim_expiry,
                     "readiness_epoch": readiness_epoch
                 }, "evidence": request.evidence});
+                if let Some(extend_ms) = extend_ms {
+                    body["fields"]["extend_ms"] = json!(extend_ms);
+                }
                 let claim_kind = match action {
                     "claim" => "work.claimed",
                     "renew" => "work.renewed",
@@ -6327,6 +6396,7 @@ impl Store {
                     "complete" => "work.submitted",
                     "fail" => "work.failed",
                     "release" => "work.released",
+                    "extend" => "work.extended",
                     _ => unreachable!("the work action was validated above"),
                 };
                 // Most renewals only extend the local operational lease. Publish an
@@ -23974,6 +24044,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         execution_started_at_unix_ms: None,
         execution_elapsed_ms: 0,
         timeout_ms: None,
+        timeout_extension_ms: 0,
         ready_age_ms: None,
         wake: None,
         progress_summary: None,
@@ -23987,6 +24058,34 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         updated_at_unix_ms: updated.parse().unwrap_or(0),
         person_answers: Vec::new(),
     })
+}
+
+/// What `work extend` has added to one step attempt's execution budget as of `snapshot_unix_ms`.
+pub(crate) fn step_timeout_extension_at(
+    connection: &Connection,
+    subject: &str,
+    attempt: u32,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<u64> {
+    Ok(connection
+        .query_row(
+            "SELECT COALESCE(SUM(CAST(json_extract(body, '$.fields.extend_ms') AS INTEGER)), 0)
+             FROM claims
+             WHERE subject=?1 AND kind='work.extended'
+               AND json_extract(body, '$.fields.attempt')=?2
+               AND CAST(accepted_at_unix_ms AS INTEGER)<=?3",
+            params![subject, attempt, snapshot_unix_ms as i64],
+            |row| row.get::<_, i64>(0),
+        )?
+        .max(0) as u64)
+}
+
+/// The episode of one attempt's timeout fault. An extension starts a new episode, so a step that
+/// runs out of its extended budget faults again.
+pub(crate) fn step_timeout_episode(subject: &str, attempt: u32, extension_ms: u64) -> String {
+    let key = format!("step-timeout:{subject}:{attempt}:{extension_ms}");
+    let digest = hex::encode(Sha256::digest(key.as_bytes()));
+    format!("attention/{}", &digest[..32])
 }
 
 fn enrich_step_queue(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
@@ -24010,6 +24109,8 @@ fn enrich_step_queue_at(
     )?;
     view.execution_started_at_unix_ms = execution_started_at_unix_ms;
     view.execution_elapsed_ms = execution_elapsed_ms;
+    view.timeout_extension_ms =
+        step_timeout_extension_at(connection, &view.subject, view.attempt, snapshot_unix_ms)?;
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
@@ -25557,6 +25658,8 @@ fn mission_run_view_with_enrichment_tx(
             )?;
             step.execution_started_at_unix_ms = started;
             step.execution_elapsed_ms = elapsed;
+            step.timeout_extension_ms =
+                step_timeout_extension_at(connection, &step.subject, step.attempt, now_ms())?;
         }
     }
     view.loops = loop_run_views_tx(connection, &view)?;

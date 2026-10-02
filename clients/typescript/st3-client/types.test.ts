@@ -65,3 +65,7 @@ const attachTerminal: ActionOf<'terminal.attach'> = {
     parameters: { target_id: 'terminal/agent/example' },
 };
 void attachTerminal;
+
+const dictatedBody: import('./Models.generated').TimelineMessageBody = { message_id: 'message/voice', tags: ['dictated'] };
+const dictatedTags: string[] | undefined = dictatedBody.tags;
+void dictatedTags;

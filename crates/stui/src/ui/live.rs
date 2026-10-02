@@ -384,8 +384,15 @@ pub fn run(context: Context) -> Result<()> {
                     });
                     changed = true;
                 }
-                feed::Update::ConversationFailed { target, message } => {
-                    ui.conversation_failed(&target, &message);
+                feed::Update::ConversationFailed {
+                    target,
+                    message,
+                    permanent,
+                } => {
+                    // A permanent refusal is said once, without "retrying".
+                    if !permanent {
+                        ui.conversation_failed(&target, &message);
+                    }
                     failed.insert(target, message);
                     changed = true;
                 }

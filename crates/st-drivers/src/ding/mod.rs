@@ -175,6 +175,15 @@ pub fn st3_notification_text(
     envelope
 }
 
+/// Annotate a dictated delivery without changing the durable message or its body digest.
+pub fn with_dictation_notice(notification: String, tags: &[String]) -> String {
+    if tags.iter().any(|tag| tag == "dictated") {
+        format!("(dictated by voice; it may contain transcription mistakes)\n{notification}")
+    } else {
+        notification
+    }
+}
+
 /// Escape markup characters so sender text cannot start or close an element. Attribute values
 /// also escape both quote characters.
 fn xml_escape(text: &str, attribute: bool) -> String {
@@ -313,13 +322,16 @@ fn poke_text_with_resolver(
         let sha256 = st3_tag(msg, ST3_SHA256_TAG)
             .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
             .map_or_else(|| st3_body_sha256(&msg.body), str::to_owned);
-        return st3_notification_text(
-            reference,
-            msg.from.as_deref().unwrap_or_default(),
-            st3_tag(msg, ST3_TO_TAG).unwrap_or(recipient),
-            msg.subject.as_deref(),
-            &msg.body,
-            &sha256,
+        return with_dictation_notice(
+            st3_notification_text(
+                reference,
+                msg.from.as_deref().unwrap_or_default(),
+                st3_tag(msg, ST3_TO_TAG).unwrap_or(recipient),
+                msg.subject.as_deref(),
+                &msg.body,
+                &sha256,
+            ),
+            &msg.tags,
         );
     }
     let subject = normalize_field(msg.subject.as_deref(), "(no subject)", SUBJECT_MAX_CHARS);
