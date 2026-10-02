@@ -2339,8 +2339,9 @@ impl Ui {
             glasses.home = true;
             glasses.palette = None;
         }
+        // Home opens over the glass: an attached terminal stays attached under it, and has the
+        // keys again when Home closes.
         self.tab = 0;
-        self.terminal = None;
         self.kdl = false;
         self.agent_form = false;
     }
@@ -2811,7 +2812,6 @@ impl Ui {
             Some(pane) => self.focus_pane(&pane),
             None => {
                 self.tab = 0;
-                self.terminal = None;
                 self.kdl = false;
             }
         }
@@ -2995,7 +2995,7 @@ impl Ui {
             return false;
         };
         if self.glasses.is_some() {
-            self.focused_pane() == Some(Pane::Terminal(view.agent.clone()))
+            !self.home_open() && self.focused_pane() == Some(Pane::Terminal(view.agent.clone()))
         } else {
             self.tab == 1
         }
@@ -4493,6 +4493,48 @@ mod tests {
             "{:?}",
             ui.effects
         );
+    }
+
+    #[test]
+    fn home_opens_over_an_attached_shell_without_detaching_it() {
+        let mut ui = glass();
+        ui.live = true;
+        let shell = "terminal/example-shell".to_owned();
+        ui.open_in_glass(Pane::Terminal(shell.clone()), Open::Tab);
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: shell.clone(),
+            title: "shell".into(),
+            name: "shell".into(),
+            lines: Vec::new(),
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: None,
+        });
+        assert!(ui.terminal_focused());
+        // From the sidebar, as a person picks what needs them.
+        ui.open_home();
+        assert!(ui.terminal.is_some(), "Home never detaches the shell");
+        assert!(!ui.terminal_focused(), "Home has the keys while it is open");
+        ui.effects.clear();
+        typed(&mut ui, "x");
+        assert!(
+            ui.effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::TerminalKey(_))),
+            "{:?}",
+            ui.effects
+        );
+        ui.close_home();
+        assert!(ui.terminal_focused(), "the shell has the keys again");
+        assert!(
+            screen(&ui).contains("Return · Ctrl+\\   shell"),
+            "{}",
+            screen(&ui)
+        );
+        // A focus with nothing in it (a group showing Home) moves focus and nothing else.
+        ui.show_focused();
+        assert!(ui.terminal.is_some());
     }
 
     #[test]
