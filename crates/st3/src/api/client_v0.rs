@@ -8495,7 +8495,7 @@ mod tests {
         assert_eq!(expired["code"], "page-cursor-expired");
         let (_, refreshed) = read("/v1/client/resources?opened_by=agent%2Falice".into()).await;
         assert_eq!(refreshed["value"]["items"], json!([all["value"]["items"][1].clone()]));
-        let (status, invalid) = read("/v1/client/resources?opened_by=person%2Falice".into()).await;
+        let (status, invalid) = read("/v1/client/resources?opened_by=person%2Fada".into()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
         assert_eq!(invalid["code"], "validation-failed");
     }
