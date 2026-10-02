@@ -31,6 +31,7 @@ pub mod pricing;
 pub use smallclaims::{performance, profile};
 pub mod projection;
 pub mod reconcile;
+pub mod rules;
 /// Observes git and gh calls without changing their command behavior.
 pub mod recorder;
 /// Summarizes command recorder logs from one or more hosts.

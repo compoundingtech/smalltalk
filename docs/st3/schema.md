@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `7b119c7f92c7c863e036a071b5c329589da605805a702121f0978e50949d68d5`
+Digest: `433d5f98f6332a27452c823d081733e5169d6c89cad26f956ea6858cff492e6b`
 
 ## Subject families
 
@@ -35,6 +35,7 @@ Digest: `7b119c7f92c7c863e036a071b5c329589da605805a702121f0978e50949d68d5`
 | `repair` | `repair/ID` | yes | An immutable receipt for a bounded graph or replication repair. |
 | `resource` | `resource/NAME` | yes | An observed external or durable fact bag. |
 | `revision-proposal` | `revision-proposal/ID` | no | A mission revision proposal. |
+| `rule` | `rule/NAME` | no | A permission rule, its mode, and the writes it audited. |
 | `run-generation` | `run-generation/ID` | no | An immutable mission-run generation. |
 | `schedule` | `schedule/RUN/LOCAL_ID` | no | A mission-run schedule. |
 | `step-run` | `step-run/GENERATION/PATH` | no | One step attempt lineage. |
@@ -138,6 +139,8 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `revision-proposal.approved` | `revision-proposal` | `authorized-requester` | `once-per-actor` | `durable` | `all_approved:boolean`, `preview_hash:string`, `reviewer:subject-reference` |  |
 | `revision-proposal.cancelled` | `revision-proposal` | `authorized-requester` | `once` | `durable` | `reason:string`, `status:string` |  |
 | `revision-proposal.created` | `revision-proposal` | `authorized-requester` | `once` | `durable` | `candidate_revision:string`, `compatible_steps:array`, `cutover:string`, `preview_hash:string`, `reason:string`, `reviewers:array`, `run:subject-reference`, `source_generation:subject-reference`, `status:string` |  |
+| `rule.audited` | `rule` | `system-only` | `append` | `durable` | `action!:string`, `actor!:string`, `rule!:string`, `target!:string` |  |
+| `rule.set` | `rule` | `system-only` | `append` | `durable` | `actors:array`, `description:string`, `except:array`, `kinds:array`, `mode!:string`, `subjects:array`, `unless_subjects:array` |  |
 | `run-generation.created` | `run-generation` | `system-only` | `once` | `durable` | `compatible_steps:array`, `predecessor:subject-reference`, `reason:string`, `revision:string`, `run:subject-reference`, `status:string` | `mission-run`, `revision` |
 | `run-generation.state` | `run-generation` | `system-only` | `state-transition` | `durable` | `phase:string`, `previous_phase:string`, `reason:string`, `status:string`, `successor:subject-reference` | `mission-run`, `step`, `completion`, `finally`, `revision`, `cancellation` |
 | `run-generation.superseded` | `run-generation` | `system-only` | `once` | `durable` | `phase:string`, `previous_phase:string`, `reason:string`, `status:string`, `successor:subject-reference` | `revision` |

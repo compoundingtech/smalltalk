@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-pub use file::{FleetFile, FleetMode, FleetRemoval, PeerConfig};
+pub use file::{FleetFile, FleetMode, FleetRemoval, PeerConfig, RemovalNotice};
 
 use crate::store::Store;
 

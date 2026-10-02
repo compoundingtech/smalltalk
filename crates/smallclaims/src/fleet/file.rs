@@ -46,6 +46,82 @@ pub struct FleetRemoval {
     pub code: String,
 }
 
+/// What a removed node learned from the signed refusal that ended its membership: the member
+/// that reported it, the refusal's code and message (which names who removed it and why when
+/// the member knows), and when. It lives in `STATE/fleet/removal.json`, beside `fleet.toml`,
+/// whose strict format older builds still read.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RemovalNotice {
+    pub reported_by: String,
+    /// `member-removed` or `member-left`.
+    pub code: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// When this node learned it; zero when only `fleet.toml` recorded the removal.
+    #[serde(default)]
+    pub learned_at_unix_ms: u128,
+}
+
+impl RemovalNotice {
+    pub fn path(state_dir: &Path) -> PathBuf {
+        state_dir.join("fleet").join("removal.json")
+    }
+
+    /// The removal `fleet.toml` records, with the details beside it when they were kept.
+    pub fn load(state_dir: &Path) -> Option<Self> {
+        let removed = FleetFile::load(state_dir).ok()??.removed?;
+        let notice = fs::read(Self::path(state_dir))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .filter(|notice| notice.code == removed.code);
+        Some(notice.unwrap_or(Self {
+            reported_by: removed.reported_by,
+            code: removed.code,
+            ..Self::default()
+        }))
+    }
+
+    pub fn save(&self, state_dir: &Path) -> Result<()> {
+        let path = Self::path(state_dir);
+        let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
+        fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+
+    /// One line for a person: who removed this node and what to do next.
+    pub fn describe(&self, fleet_id: Option<&str>) -> String {
+        let fleet = fleet_id.map(|id| format!(" {id}")).unwrap_or_default();
+        let what = if self.code == "member-left" {
+            format!("this node left fleet{fleet}")
+        } else {
+            format!("this node was removed from fleet{fleet}")
+        };
+        let detail = if self.message.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.message)
+        };
+        format!(
+            "{what}{detail}, as {} reported{}; it no longer syncs, and writes here stay here. \
+             Run st uninstall, or st fleet leave --offline to keep the local store as a \
+             local-only node that a member can invite again",
+            self.reported_by,
+            if self.learned_at_unix_ms == 0 {
+                String::new()
+            } else {
+                format!(" at {}", rfc3339(self.learned_at_unix_ms))
+            }
+        )
+    }
+}
+
+fn rfc3339(unix_ms: u128) -> String {
+    chrono::DateTime::from_timestamp_millis(unix_ms as i64)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| unix_ms.to_string())
+}
+
 /// `STATE/fleet/fleet.toml`: the fleet settings that `st fleet` commands write. Paths are
 /// relative to `STATE/fleet` unless absolute.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

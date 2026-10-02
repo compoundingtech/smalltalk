@@ -229,16 +229,29 @@ impl FleetContext {
 
     /// Record that a member refused this node for good, so it stops dialing and `st3 doctor`
     /// can say what happened.
-    fn mark_removed(&self, reported_by: &str, code: &str) {
-        self.removed
-            .store(true, std::sync::atomic::Ordering::Release);
+    fn mark_removed(&self, reported_by: &str, removed: &RemovedFromFleet) {
+        if self.removed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        eprintln!(
+            "st3: {reported_by} refused this node ({}): {}; it stops syncing",
+            removed.code, removed.message
+        );
         if let Some(state_dir) = &self.state_dir
             && let Ok(Some(mut file)) = crate::fleet::FleetFile::load(state_dir)
             && file.removed.is_none()
         {
+            // The details go beside fleet.toml first, so its removal always has them.
+            let _ = crate::fleet::RemovalNotice {
+                reported_by: reported_by.into(),
+                code: removed.code.clone(),
+                message: removed.message.clone(),
+                learned_at_unix_ms: crate::store::now_ms(),
+            }
+            .save(state_dir);
             file.removed = Some(crate::fleet::FleetRemoval {
                 reported_by: reported_by.into(),
-                code: code.into(),
+                code: removed.code.clone(),
             });
             let _ = file.save(state_dir);
         }
@@ -249,6 +262,8 @@ impl FleetContext {
 #[derive(Debug)]
 struct RemovedFromFleet {
     code: String,
+    /// The refusal's message, which names who removed this node and why when the member knows.
+    message: String,
 }
 
 impl std::fmt::Display for RemovedFromFleet {
@@ -1101,7 +1116,7 @@ async fn dial_peer<B: Backend>(
             }
             Err(error) => {
                 if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
-                    fleet.mark_removed(&peer.name, &removed.code);
+                    fleet.mark_removed(&peer.name, removed);
                     continue;
                 }
                 // A peer can leave an HTTP stream open without making progress. Once that
@@ -2110,7 +2125,15 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
             .and_then(|value| value["member_key"].as_str())
             .is_some_and(|key| Some(key) == fleet.own_key.as_deref());
         if matches!(code, "member-removed" | "member-left") && about_us {
-            return Err(RemovedFromFleet { code: code.into() }.into());
+            let message = refusal
+                .as_ref()
+                .and_then(|value| value["message"].as_str())
+                .unwrap_or_default();
+            return Err(RemovedFromFleet {
+                code: code.into(),
+                message: message.into(),
+            }
+            .into());
         }
         anyhow::bail!(
             "peer {} returned {status}: {}",

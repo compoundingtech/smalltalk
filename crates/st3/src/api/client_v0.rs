@@ -5442,6 +5442,8 @@ fn remote_terminal_live_session(
     })
 }
 
+/// How long a terminal attach capability stays valid, in milliseconds.
+const TERMINAL_ATTACHMENT_TTL_MS: u128 = 60_000;
 /// How long a viewer waits for a terminal's first screen before giving up.
 const TERMINAL_FIRST_SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// A gateway's owner long poll stays inside the peer relay's request deadline.
@@ -5512,6 +5514,59 @@ async fn terminal_screen_value(
 pub(super) struct TerminalScreenQuery {
     after: Option<String>,
     wait_ms: Option<u64>,
+    /// Also return the owner's best-effort session facts.
+    #[serde(default)]
+    facts: bool,
+}
+
+/// The most tags and the longest tag text a screen's facts carry.
+const TERMINAL_FACTS_TAGS: usize = 32;
+const TERMINAL_FACTS_TAG_BYTES: usize = 256;
+/// How long the owner waits for a session to report its stats before leaving facts out.
+const TERMINAL_FACTS_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The session's geometry, clients, uptime and tags as its owner sees them. Best effort: a
+/// session that does not answer in time has no facts, never a failed screen. Nothing here
+/// decides admission; the fences on actions still do.
+async fn terminal_facts(state: &AppState, id: &str) -> Option<Value> {
+    let live = terminal_live_session(state, &terminal_subject(id), None).ok()?;
+    let root = state.pty_root.clone();
+    tokio::task::spawn_blocking(move || {
+        let stats = pty_client::stats::query_stats_in_with_timeout(
+            &root,
+            &live.runtime_id,
+            TERMINAL_FACTS_TIMEOUT,
+        )
+        .ok()?;
+        let tags = pty_core::registry::read_metadata_in(&root, &live.runtime_id)
+            .and_then(|metadata| metadata.tags)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(key, value)| {
+                key.len() <= TERMINAL_FACTS_TAG_BYTES && value.len() <= TERMINAL_FACTS_TAG_BYTES
+            })
+            .take(TERMINAL_FACTS_TAGS)
+            .collect::<BTreeMap<_, _>>();
+        let mut process = json!({ "alive": stats.process.alive });
+        if let Some(code) = stats.process.exit_code {
+            process["exit_code"] = json!(code);
+        }
+        Some(json!({
+            "rows": stats.terminal.rows,
+            "columns": stats.terminal.cols,
+            "clients": {
+                "total": stats.clients.total,
+                "attached": stats.clients.attached,
+                "read_only": stats.clients.read_only,
+            },
+            "process": process,
+            "uptime_s": stats.uptime_seconds.and_then(|seconds| u64::try_from(seconds).ok()),
+            "tags": tags,
+        }))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 pub(super) async fn terminal_screen(
@@ -5531,7 +5586,14 @@ pub(super) async fn terminal_screen(
     )
     .await
     {
-        Ok(screen) => Ok(Json(screen)),
+        Ok(mut screen) => {
+            if query.facts
+                && let Some(facts) = terminal_facts(&state, &id).await
+            {
+                screen["facts"] = facts;
+            }
+            Ok(Json(screen))
+        }
         Err(error) if error.code == "runtime-not-local" => {
             let subject = terminal_subject(&id);
             let status = state
@@ -5559,11 +5621,15 @@ pub(super) async fn terminal_screen(
                     terminal_id,
                     after_revision,
                     wait_ms: wait_ms.min(TERMINAL_RELAY_WAIT_MS),
+                    facts: query.facts,
                 },
-                None => crate::peer::ClientReadOperation::TerminalScreen { terminal_id },
+                None => crate::peer::ClientReadOperation::TerminalScreen {
+                    terminal_id,
+                    facts: query.facts,
+                },
             };
-            let value = relay
-                .read(
+            let (mut value, provenance) = relay
+                .read_traced(
                     &host,
                     &crate::peer::ClientReadRequest {
                         authority_actor: session.authority_actor.clone(),
@@ -5573,6 +5639,15 @@ pub(super) async fn terminal_screen(
                 )
                 .await
                 .map_err(|error| remote_read_error(&host, error))?;
+            value["relay"] = json!({
+                "owner_host_id": provenance.owner_host_id,
+                "via": provenance.via,
+                "direct": provenance.direct,
+                "transport": provenance.transport,
+                "rtt_ms": provenance.rtt_ms,
+                "capability_ttl_s": TERMINAL_ATTACHMENT_TTL_MS / 1_000,
+                "fence_conflicts": provenance.fence_conflicts,
+            });
             Ok(Json(value))
         }
         Err(error) => Err(error),
@@ -5809,9 +5884,11 @@ async fn remote_terminal_stream_socket(
                     terminal_id: terminal_id.clone(),
                     after_revision,
                     wait_ms: TERMINAL_RELAY_WAIT_MS,
+                    facts: false,
                 },
                 None => crate::peer::ClientReadOperation::TerminalScreen {
                     terminal_id: terminal_id.clone(),
+                    facts: false,
                 },
             },
         };
@@ -6110,7 +6187,7 @@ fn create_terminal_attachment(
     let capability =
         derive_terminal_capability(state, &session.actor, &attachment_id, &live.owner_host_id)?;
     let digest = credential_digest(&capability);
-    let expires_at = client_now_ms() + 60_000;
+    let expires_at = client_now_ms() + TERMINAL_ATTACHMENT_TTL_MS;
     let appended = state.store.append_claim(&ClaimInput {
         subject,
         kind: "custom.client.terminal-attached".into(),
@@ -8278,6 +8355,7 @@ pub(super) async fn action(
                         relay: None,
                         request: crate::peer::ClientReadOperation::TerminalScreen {
                             terminal_id: client_detail_id("terminal", &target),
+                            facts: false,
                         },
                     },
                 )
@@ -12888,6 +12966,17 @@ mission "example/zero-run" state="ready" {
         )
         .await
         .unwrap();
+        // The owner's best-effort facts come from the session itself and stay out of the screen
+        // revision.
+        let facts = terminal_facts(&state, "agent/fence-test")
+            .await
+            .expect("a running session answers a stats query");
+        assert_eq!(facts["tags"]["keep"], "true", "{facts}");
+        assert_eq!(facts["process"]["alive"], true, "{facts}");
+        assert!(facts["rows"].as_u64().unwrap() >= 1, "{facts}");
+        assert!(facts["clients"]["total"].is_u64(), "{facts}");
+        assert!(facts["uptime_s"].is_u64(), "{facts}");
+        assert!(screen.get("facts").is_none());
         let snapshot = new_client_snapshot(&state);
         let fence = Fence {
             snapshot_id: snapshot.id.clone(),
