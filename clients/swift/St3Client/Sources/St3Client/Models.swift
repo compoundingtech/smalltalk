@@ -39,6 +39,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
+    case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
@@ -51,6 +52,8 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
         case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
+        case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
+        case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
         default: .unknown(raw)
         }
@@ -64,6 +67,8 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
         case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
+        case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
+        case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
         case .unknown(let value): value
         }
@@ -134,7 +139,15 @@ public struct AgentDeclaration: Codable, Sendable { public let id, revision, kdl
 public struct CanonicalNode: Codable, Sendable { public let name: String; public let arguments: [JSONValue]?; public let properties: [String: JSONValue]?; public let children: [CanonicalNode]? }
 public struct SubjectDefinition: Codable, Sendable { public let kind, subject, kdl, desiredRevision, desiredToken: String; public let desired: CanonicalNode; public let conflicts: [String]; enum CodingKeys: String, CodingKey { case kind, subject, desired, kdl, desiredRevision = "desired_revision", desiredToken = "desired_token", conflicts } }
 public struct LaunchPreview: Codable, Sendable { public let goal: String; public let steps, agents: [JSONValue]; public let gates: JSONValue; public let diagnosticsCount: UInt64; public let requestExcerpt: String; enum CodingKeys: String, CodingKey { case goal, steps, agents, gates, diagnosticsCount = "diagnostics_count", requestExcerpt = "request_excerpt" } }
-public struct MessageResource: Codable, Sendable { public let id, kind, revision, updatedAt, from, to, content, state, sentAt: String; public let title, inReplyTo, sessionID: String?; public let tags: [String]; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", from, to, title, content, state, sentAt = "sent_at", inReplyTo = "in_reply_to", sessionID = "session_id", tags, operational } }
+public struct MessageResource: Codable, Sendable { public let id, kind, revision, updatedAt, from, to, content, state, sentAt: String; public let title, inReplyTo, sessionID: String?; public let tags: [String]; public let attachments: [Attachment]?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", from, to, title, content, state, sentAt = "sent_at", inReplyTo = "in_reply_to", sessionID = "session_id", tags, attachments, operational } }
+/// What an upload answers: the reference to name in a message's attachments.
+public struct BlobUpload: Codable, Sendable, Equatable { public let blob, sha256, mediaType: String; public let size: UInt64; enum CodingKeys: String, CodingKey { case blob, sha256, size, mediaType = "media_type" } }
+/// One slice of an attachment: `data` is base64.
+public struct BlobChunk: Codable, Sendable, Equatable { public let sha256, data: String; public let size, offset: UInt64 }
+/// A file a message carries. The bytes stay on `origin`; read them with `Client.blob`.
+public struct Attachment: Codable, Sendable, Equatable { public let blob, sha256, mediaType, origin: String; public let name: String?; public let size: Int; enum CodingKeys: String, CodingKey { case blob, sha256, mediaType = "media_type", name, size, origin } }
+/// An upload to attach to a message: `blob` is the `blob/<sha256>` an upload answered.
+public struct AttachmentInput: Codable, Sendable, Equatable { public var blob: String; public var mediaType: String; public var name: String?; public init(blob: String, mediaType: String, name: String? = nil) { self.blob = blob; self.mediaType = mediaType; self.name = name }; enum CodingKeys: String, CodingKey { case blob, mediaType = "media_type", name } }
 public enum PlannerProvider: String, Codable, Sendable { case codex, claude, pi, omp, opencode }
 public struct PlannerConfig: Codable, Sendable { public let provider: PlannerProvider; public let model, effort: String? }
 public struct LaunchResource: Codable, Sendable { public let id, kind, revision, updatedAt, title, phase, request, planner: String; public let plannerConfig: PlannerConfig; public let target: JSONValue; public let variants, decisions, approvals: [String]; public let visualization: Visualization?; public let previewToken: String?; public let preview: LaunchPreview?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", title, phase, request, previewToken = "preview_token", preview, planner, plannerConfig = "planner_config", target, variants, decisions, approvals, visualization, operational } }
@@ -329,7 +342,8 @@ public struct AgentStopParameters: Codable, Sendable { public var agent: String;
 public struct AgentStartParameters: Codable, Sendable { public var agent: String; public init(agent: String) { self.agent = agent } }
 public struct WorkRetryParameters: Codable, Sendable { public var targetID: String; public var reason: String; public init(targetID: String, reason: String) { self.targetID = targetID; self.reason = reason }; enum CodingKeys: String, CodingKey { case targetID = "target_id", reason } }
 public struct AttentionResolveParameters: Codable, Sendable { public var attentionID: String; public var outcome: String; public var reason: String?; public init(attentionID: String, outcome: String, reason: String? = nil) { self.attentionID = attentionID; self.outcome = outcome; self.reason = reason }; enum CodingKeys: String, CodingKey { case attentionID = "attention_id", outcome, reason } }
-public struct MessageSendParameters: Codable, Sendable { public var to: String; public var content: String; public var title: String?; public var inReplyTo: String?; public var sessionID: String?; public var tags: [String]; public init(to: String, content: String, title: String? = nil, inReplyTo: String? = nil, sessionID: String? = nil, tags: [String] = []) { self.to = to; self.content = content; self.title = title; self.inReplyTo = inReplyTo; self.sessionID = sessionID; self.tags = tags }; enum CodingKeys: String, CodingKey { case to, content, title, inReplyTo = "in_reply_to", sessionID = "session_id", tags } }
+public struct MessageSendParameters: Codable, Sendable { public var to: String; public var content: String; public var title: String?; public var inReplyTo: String?; public var sessionID: String?; public var tags: [String]; public var attachments: [AttachmentInput]; public init(to: String, content: String, title: String? = nil, inReplyTo: String? = nil, sessionID: String? = nil, tags: [String] = [], attachments: [AttachmentInput] = []) { self.to = to; self.content = content; self.title = title; self.inReplyTo = inReplyTo; self.sessionID = sessionID; self.tags = tags; self.attachments = attachments }; enum CodingKeys: String, CodingKey { case to, content, title, inReplyTo = "in_reply_to", sessionID = "session_id", tags, attachments }
+    public func encode(to encoder: Encoder) throws { var container = encoder.container(keyedBy: CodingKeys.self); try container.encode(to, forKey: .to); try container.encode(content, forKey: .content); try container.encodeIfPresent(title, forKey: .title); try container.encodeIfPresent(inReplyTo, forKey: .inReplyTo); try container.encodeIfPresent(sessionID, forKey: .sessionID); try container.encode(tags, forKey: .tags); if !attachments.isEmpty { try container.encode(attachments, forKey: .attachments) } } }
 public struct LaunchTarget: Codable, Sendable {
     public enum Kind: String, Codable, Sendable { case newMission = "new-mission", missionRun = "mission-run" }
     public let kind: Kind

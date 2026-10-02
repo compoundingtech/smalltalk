@@ -44,6 +44,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "schema",
             "subject",
             "documents",
+            "blobs",
             "recorder",
             "activity",
             "import",

@@ -1314,7 +1314,7 @@ pub(super) fn authenticate(
     Ok(session)
 }
 
-fn require_scope(session: &ClientSession, scope: &str) -> Result<(), ApiError> {
+pub(super) fn require_scope(session: &ClientSession, scope: &str) -> Result<(), ApiError> {
     if session.allows(scope) {
         Ok(())
     } else {
@@ -7232,7 +7232,12 @@ async fn dispatch_action(
                     idempotency_key: request.idempotency_key.clone(),
                     from: authority_actor.clone(),
                     to,
-                    content: parameter_string(p, "content")?,
+                    // An attachment may travel alone; text is then optional.
+                    content: if p.get("attachments").is_some_and(|value| value.as_array().is_some_and(|list| !list.is_empty())) {
+                        p.get("content").and_then(Value::as_str).unwrap_or_default().to_owned()
+                    } else {
+                        parameter_string(p, "content")?
+                    },
                     title: p.get("title").and_then(Value::as_str).map(str::to_owned),
                     in_reply_to: p
                         .get("in_reply_to")
@@ -7246,6 +7251,15 @@ async fn dispatch_action(
                         .filter_map(Value::as_str)
                         .map(str::to_owned)
                         .collect(),
+                    attachments: p
+                        .get("attachments")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|_| {
+                            validation("attachments are `{blob, media_type, name?}` records")
+                        })?
+                        .unwrap_or_default(),
                 },
                 session_id,
             )?
@@ -11202,6 +11216,7 @@ mission "example/zero-run" state="ready" {
                 title: None,
                 in_reply_to: None,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             },
             Some("session/older-incarnation".into()),
         )
@@ -11258,6 +11273,7 @@ mission "example/zero-run" state="ready" {
                 title: Some("A question".into()),
                 in_reply_to: None,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             },
             None,
         )

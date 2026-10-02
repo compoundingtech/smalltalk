@@ -4286,6 +4286,7 @@ name = "st3-client"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "futures-util",
  "http-body-util",

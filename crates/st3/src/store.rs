@@ -16763,6 +16763,11 @@ fn message_view_tx(
                     .map(|value| canonical_child_strings(value, "tag"))
                     .unwrap_or_default()
             }),
+        attachments: actual
+            .get("attachments")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
         created_index,
     })
 }

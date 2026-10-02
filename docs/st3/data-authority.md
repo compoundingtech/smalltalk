@@ -123,6 +123,7 @@ order from the same admitted claims.
 | `batches` | Claim-log authority | Accepted local and replicated batch headers |
 | `claims` | Claim-log authority | Accepted local and replicated claims |
 | `blobs` | Content authority | Posted bytes, verified by SHA-256 |
+| `local_blob_uploads` | Local upload ledger | Who uploaded each attachment file; quota and early read access only |
 | `local_blobs` | Local upload staging | Bytes awaiting a durable claim reference; promotion into `blobs` commits with that claim |
 | `operations` | Projection | Claim `_operation` metadata |
 | `documents` | Projection | `doc.bound` claims and blobs |

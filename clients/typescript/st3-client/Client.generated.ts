@@ -148,14 +148,14 @@ export class St3Client {
         return this.discovered ?? this.capabilities();
     }
 
-    private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string): Promise<EnvelopeOf<T>> {
+    private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }): Promise<EnvelopeOf<T>> {
         const credential = await this.credential?.();
         const headers: Record<string, string> = { Accept: 'application/json' };
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
         if (credential) headers.Authorization = `Bearer ${credential}`;
-        if (body !== undefined) headers['Content-Type'] = 'application/json';
+        if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
         const response = await this.fetchImpl(this.baseUrl + path, {
-            method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+            method, headers, body: body === undefined ? undefined : raw ? (body as BodyInit) : JSON.stringify(body),
         });
         const payload: unknown = await response.json();
         if (!payload || typeof payload !== 'object' || (payload as { api_version?: unknown }).api_version !== API_VERSION) {
@@ -180,6 +180,38 @@ export class St3Client {
             throw new RangeError(`wait_ms exceeds negotiated maximum ${capabilities.value.limits.max_wait_ms}`);
         }
         return this.request<T>('GET', path);
+    }
+
+    /** Keep one image (PNG, JPEG, GIF or WebP, at most 10 MiB) on the member this client talks to. Name the answer's `blob` in a `message.send` attachment. */
+    uploadBlob(bytes: Blob | ArrayBuffer | Uint8Array, mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'): Promise<EnvelopeOf<BlobUpload>> {
+        return this.request<BlobUpload>('POST', '/v1/client/blobs', bytes, undefined, { contentType: mediaType });
+    }
+
+    /** Up to 512 KiB of an attachment from `offset`, base64 in `data`. */
+    blobChunk(sha256: string, options: { message?: string; offset?: number } = {}): Promise<EnvelopeOf<BlobChunk>> {
+        const query = new URLSearchParams();
+        query.set('offset', String(options.offset ?? 0));
+        if (options.message) query.set('message', options.message);
+        return this.request<BlobChunk>('GET', `/v1/client/blobs/${encodeURIComponent(sha256)}/chunk?${query}`);
+    }
+
+    /** A whole attachment, read in chunks. Pass the message that carries it. */
+    async blob(sha256: string, message?: string): Promise<Uint8Array> {
+        const parts: Uint8Array[] = [];
+        let received = 0;
+        for (;;) {
+            const chunk = (await this.blobChunk(sha256, { message, offset: received })).value;
+            const binary = atob(chunk.data);
+            const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+            if (bytes.length === 0 && received < chunk.size) throw new Error('A blob chunk came back empty');
+            parts.push(bytes);
+            received += bytes.length;
+            if (received >= chunk.size) break;
+        }
+        const whole = new Uint8Array(received);
+        let at = 0;
+        for (const part of parts) { whole.set(part, at); at += part.length; }
+        return whole;
     }
 
     async submitAction(request: ActionRequest): Promise<EnvelopeOf<ActionResult>> {

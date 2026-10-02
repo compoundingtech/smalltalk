@@ -486,6 +486,20 @@ An accepted action returns one stable operation ID and status. `202 accepted` me
 durable, not complete; clients follow operation events or read `/operations/{id}`. Result objects
 include affected stable IDs and the resulting snapshot ID.
 
+## Attachments
+
+A `message.send` action may carry `attachments: [{blob, media_type, name?}]`, up to four, and a
+message resource lists `attachments: [{blob, sha256, media_type, name, size, origin}]`. The bytes
+are not in the graph. [Attachments](../attachments.md) defines the limits, retention and delivery.
+
+- `POST /v1/client/blobs`: raw image body, `Content-Type` one of `image/png`, `image/jpeg`,
+  `image/gif`, `image/webp`, scope `control.messages`; answers `{blob, sha256, size, media_type}`.
+- `GET /v1/client/blobs/{sha256}?message=message/ID`: the raw bytes.
+- `GET /v1/client/blobs/{sha256}/chunk?message=message/ID&offset=N`: up to 512 KiB as base64 JSON,
+  with the total `size`. `Client::blob` / `blob()` in each client assembles the file.
+- Errors: `blob-too-large`, `unsupported-media-type`, `blob-content-mismatch`,
+  `blob-quota-exceeded`, `blob-not-found`, `blob-expired`.
+
 ## Event feed and resynchronization
 
 `GET /v1/client/events?after=CURSOR&limit=N&wait_ms=M` returns at most the negotiated event and byte
