@@ -13,6 +13,16 @@ pub enum ToolState {
     Failed,
 }
 
+/// An image a message carries: st reads it by `sha256`, for a reader of `message`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct MailImage {
+    pub sha256: String,
+    pub message: String,
+    pub media_type: String,
+    pub name: Option<String>,
+    pub size: u64,
+}
+
 #[derive(Clone, Debug, Hash, serde::Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Body {
@@ -35,6 +45,9 @@ pub enum Body {
         delivered: bool,
         /// Spoken and transcribed (st's `dictated` tag): it may hold transcription mistakes.
         dictated: bool,
+        /// The images it carries; their bytes stay with st until a reader opens one.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        images: Vec<MailImage>,
     },
     /// A graph event worth a line: a step became ready, a run started.
     Event(String),

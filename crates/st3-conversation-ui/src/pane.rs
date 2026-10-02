@@ -10,6 +10,8 @@ pub enum PaneIntent {
     Expand(String),
     Open(String),
     LoadOlder,
+    /// Show an image a message carries.
+    Image(crate::entry::MailImage),
 }
 
 #[derive(Default, Clone, Copy, Debug)]

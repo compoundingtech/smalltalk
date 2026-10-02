@@ -490,6 +490,7 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             body,
             delivered,
             dictated,
+            images,
         } => {
             // Mail the person is part of leads; mail between others stays in the background
             // and folds like a tool call until opened.
@@ -601,6 +602,24 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 };
                 fold_control(&mut doc, &entry.id, width, bar.clone(), label, theme);
             }
+            // Each image it carries is a line to open it by; a terminal draws no pictures here.
+            for image in images {
+                doc.targets.push(Target {
+                    line: doc.lines.len(),
+                    column: 0,
+                    width: width as u16,
+                    hit: PaneIntent::Image(image.clone()),
+                });
+                let name = image.name.as_deref().unwrap_or("image");
+                doc.line(Line::from(vec![
+                    Span::styled(bar.text.clone(), bar.style),
+                    Span::styled(
+                        format!("▣ {} · {}", text::sanitize(name), size(image.size)),
+                        on(fg(look.text, theme)),
+                    ),
+                    Span::styled("  open", on(theme.dim())),
+                ]));
+            }
         }
         Body::Pending {
             text: body,
@@ -675,6 +694,15 @@ fn fg(token: Token, theme: &Theme) -> Style {
 }
 
 /// "… 14 more lines · o or click to show"
+/// A file's size the way a person says it.
+fn size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KB", bytes.div_ceil(1024).max(1))
+    }
+}
+
 fn more(hidden: usize) -> String {
     format!("… {hidden} more lines · o or click to show")
 }
@@ -757,6 +785,7 @@ mod tests {
                     body: "The keys rotated.\n\nThree hosts still read the old ones.".into(),
                     delivered: false,
                     dictated: false,
+                    images: Vec::new(),
                 },
             )
         };
@@ -912,6 +941,7 @@ mod tests {
                     body: "ship the harbor fix".into(),
                     delivered: true,
                     dictated,
+                    images: Vec::new(),
                 },
             )
         };
@@ -927,6 +957,42 @@ mod tests {
         };
         assert!(head(true).contains("🎤"), "{}", head(true));
         assert!(!head(false).contains("🎤"));
+    }
+
+    #[test]
+    fn each_image_mail_carries_is_a_line_that_opens_it() {
+        let image = crate::MailImage {
+            sha256: "ab".repeat(32),
+            message: "message/picture".into(),
+            media_type: "image/png".into(),
+            name: Some("Screenshot.png".into()),
+            size: 1536 * 1024,
+        };
+        let mail = entry(
+            "message/picture",
+            Body::Mail {
+                from: "you".into(),
+                to: "planner".into(),
+                subject: String::new(),
+                body: String::new(),
+                delivered: false,
+                dictated: false,
+                images: vec![image.clone()],
+            },
+        );
+        let doc =
+            Cache::default().render(&[mail], 60, &HashSet::new(), "⠋", &crate::tests::theme());
+        let line = doc
+            .lines
+            .iter()
+            .position(|line| text::plain(line).contains("▣ Screenshot.png · 1.5 MB"))
+            .expect("a line for the image");
+        assert!(
+            doc.targets
+                .iter()
+                .any(|target| target.line == line && target.hit == PaneIntent::Image(image.clone())),
+            "the line opens the image"
+        );
     }
 
     #[test]
@@ -946,6 +1012,7 @@ mod tests {
                     body: body.clone(),
                     delivered: false,
                     dictated: false,
+                    images: Vec::new(),
                 },
             )
         };

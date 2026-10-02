@@ -269,6 +269,50 @@ fn png_size(path: &Path) -> Option<(u32, u32)> {
 }
 
 /// An image file's media type, by its extension: one st accepts (png, jpeg, gif, webp).
+/// Keep an image a message carried, read from st, under `dir/received`, named by its hash so a
+/// second open reuses it.
+pub fn received(
+    dir: &Path,
+    image: &st3_conversation_ui::MailImage,
+    bytes: &[u8],
+) -> std::io::Result<PathBuf> {
+    let extension = match image.media_type.as_str() {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    let dir = dir.join("received");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.{extension}", image.sha256));
+    if !path.exists() {
+        let partial = dir.join(format!(".{}.partial", image.sha256));
+        std::fs::write(&partial, bytes)?;
+        std::fs::rename(&partial, &path)?;
+    }
+    Ok(path)
+}
+
+/// Show a file with this machine's own viewer, when it has one: `open` on macOS, `xdg-open` on
+/// a Linux desktop. False when nothing here can show it (a server reached over SSH).
+pub fn show(path: &Path) -> bool {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    {
+        "xdg-open"
+    } else {
+        return false;
+    };
+    std::process::Command::new(opener)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 pub fn media_type(path: &Path) -> &'static str {
     match path
         .extension()
@@ -296,6 +340,29 @@ pub fn mention(attachments: &[Attachment]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_read_from_st_is_kept_once_by_its_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let image = st3_conversation_ui::MailImage {
+            sha256: "cd".repeat(32),
+            message: "message/picture".into(),
+            media_type: "image/jpeg".into(),
+            name: Some("photo.jpg".into()),
+            size: 3,
+        };
+        let path = received(root.path(), &image, b"one").unwrap();
+        assert_eq!(
+            path,
+            root.path()
+                .join("received")
+                .join(format!("{}.jpg", "cd".repeat(32)))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        // The same hash is the same image: a second open reuses the file.
+        assert_eq!(received(root.path(), &image, b"two").unwrap(), path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+    }
 
     #[test]
     fn kittys_clipboard_answer_is_its_data_packets_joined() {
