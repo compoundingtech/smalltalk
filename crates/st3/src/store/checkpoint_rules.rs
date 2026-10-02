@@ -621,8 +621,9 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
 }
 
 /// Tables projected from claims, children before the tables their foreign keys name.
-pub(crate) const PROJECTION_TABLES: [&str; 17] = [
+pub(crate) const PROJECTION_TABLES: [&str; 18] = [
     "operations",
+    "resource_observations",
     "desired",
     "documents",
     "events",
@@ -657,6 +658,7 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     project_replicated_base_claims(transaction)?;
     project_replicated_mission_runs(transaction)?;
     rebuild_planning_tx(transaction)?;
+    resources::rebuild(transaction)?;
     Ok(())
 }
 

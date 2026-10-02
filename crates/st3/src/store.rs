@@ -1,4 +1,5 @@
 mod glasses;
+mod resources;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -2341,6 +2342,7 @@ impl Store {
         let transaction = connection.transaction()?;
         rebuild_operations_tx(&transaction)?;
         rebuild_planning_tx(&transaction)?;
+        resources::rebuild(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -17259,6 +17261,9 @@ fn append_claim_tx(
         forced_batch,
     )?;
     insert_event(transaction, record.store_index, kind, subject, body)?;
+    if kind == "resource.observed" {
+        resources::refresh(transaction, subject)?;
+    }
     normalize_local_projection_timestamps_tx(
         transaction,
         subject,
@@ -22600,6 +22605,7 @@ fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3
     project_replicated_base_claims(transaction)?;
     project_replicated_mission_runs(transaction)?;
     rebuild_planning_tx(transaction).map_err(internal)?;
+    resources::rebuild(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -33153,7 +33159,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: runtime::compatibility_digest(&st3_schema::registry().digest()),
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
@@ -33224,7 +33230,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: runtime::compatibility_digest(&st3_schema::registry().digest()),
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
@@ -33272,7 +33278,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             projection_digests: Default::default(),
             peer: peer.into(),
             fleet_id: TEST_FLEET.into(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: runtime::compatibility_digest(&st3_schema::registry().digest()),
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
@@ -44518,6 +44524,7 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("documents", &["created_index"]),
     ("desired", &[]),
     ("message_index", &["created_index"]),
+    ("resource_observations", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),

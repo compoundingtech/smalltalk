@@ -763,14 +763,14 @@ impl Client {
         self.list_internal_with_filters(collection, cursor, limit, history, &[])
             .await
     }
-    async fn list_internal_with_filters(
+    async fn list_internal_with_filters<T: DeserializeOwned>(
         &self,
         collection: &str,
         cursor: Option<&str>,
         limit: Option<usize>,
         history: bool,
         filters: &[(&str, &str)],
-    ) -> Result<Envelope<Page>, ClientError> {
+    ) -> Result<Envelope<T>, ClientError> {
         let mut query = Vec::new();
         if let Some(cursor) = cursor {
             query.push(format!("cursor={}", percent_encode(cursor)));

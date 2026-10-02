@@ -4,6 +4,7 @@ use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use std::collections::BTreeSet;
 
 pub(super) mod raw_terminal;
+pub(super) mod resources;
 pub(super) mod search;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
@@ -8739,6 +8740,117 @@ mod tests {
             .unwrap()
             .remove(0);
         assert!(session_message_body(&claim).get("attachments").is_none());
+    }
+
+    #[tokio::test]
+    async fn resources_list_filters_latest_observations_and_fences_pages() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let observe = |subject: &str, kind: &str, facts: Value| {
+            state.store.append_client_claim(&crate::model::ClaimInput {
+                subject: subject.into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("kind".into(), json!(kind)), ("facts".into(), facts)]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap();
+        };
+        observe("resource/github/a", "vcs.pull-request", json!({"title":"Old", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
+        observe("resource/github/b", "vcs.pull-request", json!({"title":"Second", "opened_by":"agent/alice", "opened_by_run":"mission-run/two"}));
+        observe("resource/github/c", "vcs.pull-request", json!({"title":"Other", "opened_by":"agent/bob"}));
+        observe("resource/repository", "vcs.repository", json!({"url":"https://example.org/repository"}));
+        observe("resource/github/a", "vcs.pull-request", json!({"title":"New", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
+        let app = super::super::router(state.clone());
+        let read = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap())
+            }
+        };
+        let (status, all) = read("/v1/client/resources".into()).await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(all["value"]["items"].as_array().unwrap().iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["resource/github/a", "resource/github/b", "resource/github/c", "resource/repository"]);
+        assert_eq!(all["value"]["items"][0]["facts"]["title"], "New");
+        assert_eq!(all["value"]["items"][0]["opened_by"], "agent/alice");
+        assert_eq!(all["value"]["items"][0]["opened_by_run"], "mission-run/one");
+        chrono::DateTime::parse_from_rfc3339(all["value"]["items"][0]["observed_at"].as_str().unwrap()).unwrap();
+        assert_eq!(all["value"]["items"][3]["opened_by"], Value::Null);
+        let (status, run) = read("/v1/client/resources?opened_by=mission-run%2Fone&kind=vcs.pull-request".into()).await;
+        assert_eq!(status, StatusCode::OK, "{run}");
+        assert_eq!(run["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        let (status, repository) = read("/v1/client/resources?kind=vcs.repository".into()).await;
+        assert_eq!(status, StatusCode::OK, "{repository}");
+        assert_eq!(repository["value"]["items"], json!([all["value"]["items"][3].clone()]));
+        let filters = "opened_by=agent%2Falice&kind=vcs.pull-request&subject_prefix=resource%2Fgithub%2F&limit=1";
+        let (status, first) = read(format!("/v1/client/resources?{filters}")).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["value"]["filters"], json!({"opened_by":"agent/alice", "kind":"vcs.pull-request", "subject_prefix":"resource/github/"}));
+        assert_eq!(first["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        assert_eq!(first["value"]["page"]["has_more"], true);
+        let cursor = urlencoding::encode(first["value"]["page"]["next_cursor"].as_str().unwrap());
+        let continuation = format!("/v1/client/resources?{filters}&cursor={cursor}");
+        state.store.append_claim(&ClaimInput {
+            subject: "custom/test/unrelated".into(),
+            kind: "custom.test.marker".into(),
+            actor: None,
+            fields: BTreeMap::new(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
+        let (status, second) = read(continuation.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["snapshot"], first["snapshot"]);
+        assert_eq!(second["value"]["items"], json!([all["value"]["items"][1].clone()]));
+        assert_eq!(second["value"]["page"]["has_more"], false);
+        let (status, changed_filter) = read(format!("/v1/client/resources?opened_by=agent%2Fbob&cursor={cursor}")).await;
+        assert_eq!(status, StatusCode::GONE, "{changed_filter}");
+        assert_eq!(changed_filter["code"], "page-cursor-expired");
+        observe("resource/github/a", "vcs.pull-request", json!({"title":"Reassigned", "opened_by":"agent/bob"}));
+        let (status, expired) = read(continuation).await;
+        assert_eq!(status, StatusCode::GONE, "{expired}");
+        assert_eq!(expired["code"], "page-cursor-expired");
+        let (_, refreshed) = read("/v1/client/resources?opened_by=agent%2Falice".into()).await;
+        assert_eq!(refreshed["value"]["items"], json!([all["value"]["items"][1].clone()]));
+        let (status, invalid) = read("/v1/client/resources?opened_by=person%2Falice".into()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+        assert_eq!(invalid["code"], "validation-failed");
+    }
+
+    #[tokio::test]
+    async fn resources_list_requires_projection_read_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let credential = "resources-reader";
+        let app = super::super::fabric_router(state.clone());
+        for (scopes, expected) in [(json!([]), StatusCode::FORBIDDEN), (json!(["read.projections"]), StatusCode::OK)] {
+            state.store.append_claim(&ClaimInput {
+                subject: "custom/client/resources-reader".into(),
+                kind: "custom.client.pairing-completed".into(),
+                actor: Some("person/ada".into()),
+                fields: BTreeMap::from([
+                    ("credential_hash".into(), json!(credential_digest(credential))),
+                    ("session_actor".into(), json!("client/resources-reader")),
+                    ("person_id".into(), json!("person/ada")),
+                    ("scopes".into(), scopes),
+                    ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 60_000)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap();
+            let response = app.clone().oneshot(Request::builder()
+                .uri("/v1/client/resources")
+                .header(AUTHORIZATION, format!("Bearer {credential}"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 
     #[tokio::test]
