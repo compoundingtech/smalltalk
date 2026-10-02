@@ -75,7 +75,10 @@ final class St3ClientTests: XCTestCase {
         let envelope = try XCTUnwrap(definitions["ErrorEnvelope"] as? [String: Any])
         let properties = try XCTUnwrap(envelope["properties"] as? [String: Any])
         let code = try XCTUnwrap(properties["code"] as? [String: Any])
-        let codes = try XCTUnwrap(code["enum"] as? [String])
+        XCTAssertEqual(code["$ref"] as? String, "#/$defs/ErrorCode")
+        let errorCode = try XCTUnwrap(definitions["ErrorCode"] as? [String: Any])
+        let branches = try XCTUnwrap(errorCode["anyOf"] as? [[String: Any]])
+        let codes = try XCTUnwrap(branches.first?["enum"] as? [String])
         for raw in codes {
             let encoded = try JSONEncoder().encode(raw)
             let decoded = try JSONDecoder().decode(ErrorCode.self, from: encoded)

@@ -2899,7 +2899,11 @@ mod tests {
             "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
         ))
         .unwrap();
-        for raw in schema["$defs"]["ErrorEnvelope"]["properties"]["code"]["enum"]
+        assert_eq!(
+            schema["$defs"]["ErrorEnvelope"]["properties"]["code"]["$ref"],
+            "#/$defs/ErrorCode"
+        );
+        for raw in schema["$defs"]["ErrorCode"]["anyOf"][0]["enum"]
             .as_array()
             .unwrap()
         {
