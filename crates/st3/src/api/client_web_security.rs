@@ -43,18 +43,27 @@ impl BundleSecurity {
             if extension == Some("html") {
                 documents.push((path, source));
             } else {
-                let hash = format!("sha384-{}",
-                    base64::engine::general_purpose::STANDARD.encode(Sha384::digest(source.as_bytes())));
+                let hash = format!(
+                    "sha384-{}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(Sha384::digest(source.as_bytes()))
+                );
                 integrity.borrow_mut().insert(path.clone(), hash.clone());
-                let relative = entry.path().strip_prefix(root)?.to_str().context("UTF-8 module path")?;
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)?
+                    .to_str()
+                    .context("UTF-8 module path")?;
                 let url = bundle_url(mount, relative);
                 modules.insert(format!(
                     "<link rel=\"modulepreload\" href=\"{}\" integrity=\"{hash}\" crossorigin=\"anonymous\">",
                     html_escape::encode_double_quoted_attribute(url.path()),
                 ));
                 if let Some(style) = pressable_style(&source)? {
-                    styles.insert(format!(" 'sha256-{}'",
-                        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(style))));
+                    styles.insert(format!(
+                        " 'sha256-{}'",
+                        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(style))
+                    ));
                 }
             }
         }
@@ -63,16 +72,21 @@ impl BundleSecurity {
         // URLs (without runtime-added queries) are part of the supported build contract.
         let modules: String = modules.into_iter().collect();
         for (path, source) in documents {
-                let inserted = Cell::new(false);
-                let document_path = path.strip_prefix(root)?.to_str().context("UTF-8 HTML path")?;
-                let base = bundle_url(mount, document_path);
-                let mut rewritten = rewrite_str(
-                    &source,
-                    RewriteStrSettings {
-                        element_content_handlers: vec![
-                            element!("base", |_| Err("bundle HTML must not override its base URL".into())),
-                            element!("script[src], link[href]", |element| {
-                                (|| -> Result<()> {
+            let inserted = Cell::new(false);
+            let document_path = path
+                .strip_prefix(root)?
+                .to_str()
+                .context("UTF-8 HTML path")?;
+            let base = bundle_url(mount, document_path);
+            let mut rewritten = rewrite_str(
+                &source,
+                RewriteStrSettings {
+                    element_content_handlers: vec![
+                        element!("base", |_| Err(
+                            "bundle HTML must not override its base URL".into()
+                        )),
+                        element!("script[src], link[href]", |element| {
+                            (|| -> Result<()> {
                                 let script = element.tag_name() == "script";
                                 if script && !inserted.replace(true) {
                                     element.before(&modules, ContentType::Html);
@@ -81,8 +95,10 @@ impl BundleSecurity {
                                 let rel = html_escape::decode_html_entities(&raw_rel);
                                 let raw_kind = element.get_attribute("as").unwrap_or_default();
                                 let kind = html_escape::decode_html_entities(&raw_kind);
-                                anyhow::ensure!(!rel.contains('&') && !kind.contains('&'),
-                                    "ambiguous HTML entities in asset link attributes");
+                                anyhow::ensure!(
+                                    !rel.contains('&') && !kind.contains('&'),
+                                    "ambiguous HTML entities in asset link attributes"
+                                );
                                 let asset_link = rel.split_ascii_whitespace().any(|rel| {
                                     rel.eq_ignore_ascii_case("stylesheet")
                                         || rel.eq_ignore_ascii_case("modulepreload")
@@ -94,22 +110,29 @@ impl BundleSecurity {
                                     return Ok(());
                                 }
                                 let attribute = if script { "src" } else { "href" };
-                                let raw_source = element.get_attribute(attribute).unwrap_or_default();
+                                let raw_source =
+                                    element.get_attribute(attribute).unwrap_or_default();
                                 let source = html_escape::decode_html_entities(&raw_source);
                                 // Require path references, rather than accepting an absolute URL
                                 // which happens to match the sentinel used to resolve relative paths.
                                 anyhow::ensure!(
-                                    !source.is_empty() && !source.starts_with("//")
+                                    !source.is_empty()
+                                        && !source.starts_with("//")
                                         && !source.contains([':', '\\'])
                                         && !source.chars().any(char::is_control),
                                     "script/style URLs must be same-gateway paths"
                                 );
                                 let url = base.join(&source)?;
-                                anyhow::ensure!(url.origin() == base.origin()
-                                    && url.username().is_empty() && url.password().is_none(),
-                                    "script/style URLs must be same-gateway paths");
-                                let relative = url.path().strip_prefix(&format!("{mount}/"))
-                                    .context("script/style URL must stay inside the bundle mount")?;
+                                anyhow::ensure!(
+                                    url.origin() == base.origin()
+                                        && url.username().is_empty()
+                                        && url.password().is_none(),
+                                    "script/style URLs must be same-gateway paths"
+                                );
+                                let relative =
+                                    url.path().strip_prefix(&format!("{mount}/")).context(
+                                        "script/style URL must stay inside the bundle mount",
+                                    )?;
                                 let decoded = urlencoding::decode(relative)?;
                                 anyhow::ensure!(
                                     decoded.split('/').all(|part| part != ".." && part != ".")
@@ -118,13 +141,22 @@ impl BundleSecurity {
                                 );
                                 let file = std::fs::canonicalize(root.join(decoded.as_ref()))
                                     .context("resolve script/style asset")?;
-                                anyhow::ensure!(file.starts_with(root) && file.is_file(),
-                                    "script/style asset must stay inside static_dir");
+                                anyhow::ensure!(
+                                    file.starts_with(root) && file.is_file(),
+                                    "script/style asset must stay inside static_dir"
+                                );
                                 let mut hashes = integrity.borrow_mut();
                                 if !hashes.contains_key(&file) {
-                                    let bytes = std::fs::read(&file).context("read script/style asset")?;
-                                    hashes.insert(file.clone(), format!("sha384-{}",
-                                        base64::engine::general_purpose::STANDARD.encode(Sha384::digest(&bytes))));
+                                    let bytes =
+                                        std::fs::read(&file).context("read script/style asset")?;
+                                    hashes.insert(
+                                        file.clone(),
+                                        format!(
+                                            "sha384-{}",
+                                            base64::engine::general_purpose::STANDARD
+                                                .encode(Sha384::digest(&bytes))
+                                        ),
+                                    );
                                 }
                                 element.set_attribute("integrity", &hashes[&file])?;
                                 element.set_attribute("crossorigin", "anonymous")?;
@@ -135,28 +167,39 @@ impl BundleSecurity {
                                     path.push('?');
                                     path.push_str(query);
                                 }
-                                element.set_attribute(attribute, &html_escape::encode_double_quoted_attribute(&path))?;
+                                element.set_attribute(
+                                    attribute,
+                                    &html_escape::encode_double_quoted_attribute(&path),
+                                )?;
                                 Ok(())
-                                })().map_err(Into::into)
-                            }),
-                        ],
-                        ..RewriteStrSettings::default()
-                    },
-                ).with_context(|| format!("secure bundle HTML {}", path.display()))?;
-                if !inserted.get() {
-                    rewritten.push_str(&modules);
-                }
-                html.insert(path, Bytes::from(rewritten));
+                            })()
+                            .map_err(Into::into)
+                        }),
+                    ],
+                    ..RewriteStrSettings::default()
+                },
+            )
+            .with_context(|| format!("secure bundle HTML {}", path.display()))?;
+            if !inserted.get() {
+                rewritten.push_str(&modules);
+            }
+            html.insert(path, Bytes::from(rewritten));
         }
-        Ok(Self { html, style_sources: styles.into_iter().collect() })
+        Ok(Self {
+            html,
+            style_sources: styles.into_iter().collect(),
+        })
     }
 
     pub fn csp(&self, authority: Option<&str>) -> HeaderValue {
         // 'self' alone is not interoperable for WebSockets. Explicit scheme sources
         // preserve the exact gateway authority (including port), never a wildcard.
         let sockets = authority
-            .filter(|value| value.bytes().all(|byte| byte.is_ascii_alphanumeric()
-                || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')))
+            .filter(|value| {
+                value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+                })
+            })
             .and_then(|value| value.parse::<Authority>().ok())
             .map(|authority| format!(" ws://{authority} wss://{authority}"))
             .unwrap_or_default();
@@ -169,7 +212,8 @@ impl BundleSecurity {
 
 fn bundle_url(mount: &str, relative: &str) -> reqwest::Url {
     let mut url = reqwest::Url::parse("http://bundle.invalid/").expect("constant URL");
-    url.path_segments_mut().expect("HTTP URL supports path segments")
+    url.path_segments_mut()
+        .expect("HTTP URL supports path segments")
         .clear()
         .extend(mount[1..].split('/'))
         .extend(relative.split('/'));
@@ -187,25 +231,39 @@ fn pressable_style(source: &str) -> Result<Option<String>> {
     let suffix = "] {\n    touch-action: pan-x pan-y pinch-zoom;\n  }\n}";
     for (start, _) in source.match_indices('`') {
         let tail = &source[start + 1..];
-        let Some((template, after)) = tail.split_once('`') else { continue };
+        let Some((template, after)) = tail.split_once('`') else {
+            continue;
+        };
         if !after.starts_with(".trim()") {
             continue;
         }
         // Minifiers can escape newlines inside a template without changing its value.
         let template = template.replace("\\n", "\n");
-        let Some(selector) = template.trim().strip_prefix(prefix)
-            .and_then(|value| value.strip_suffix(suffix)) else { continue };
+        let Some(selector) = template
+            .trim()
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(suffix))
+        else {
+            continue;
+        };
         let known_selector = selector == "data-react-aria-pressable"
             || (source.contains("data-react-aria-pressable")
-                && selector.strip_prefix("${").and_then(|value| value.strip_suffix('}'))
-                    .is_some_and(|name| !name.is_empty()
-                        && name.bytes().enumerate().all(|(index, byte)| {
-                            byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$')
-                                || (index > 0 && byte.is_ascii_digit())
-                        })));
+                && selector
+                    .strip_prefix("${")
+                    .and_then(|value| value.strip_suffix('}'))
+                    .is_some_and(|name| {
+                        !name.is_empty()
+                            && name.bytes().enumerate().all(|(index, byte)| {
+                                byte.is_ascii_alphabetic()
+                                    || matches!(byte, b'_' | b'$')
+                                    || (index > 0 && byte.is_ascii_digit())
+                            })
+                    }));
         if known_selector {
             return Ok(Some(format!("{prefix}data-react-aria-pressable{suffix}")));
         }
     }
-    anyhow::bail!("unsupported React Aria pressable style in built JS; externalize that style or use the supported literal template (no unsafe-inline fallback)")
+    anyhow::bail!(
+        "unsupported React Aria pressable style in built JS; externalize that style or use the supported literal template (no unsafe-inline fallback)"
+    )
 }
