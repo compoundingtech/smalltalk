@@ -1051,7 +1051,7 @@ mission "release-report" state="ready" {
             .await
         }
     };
-    let refused = update("person/blake").await;
+    let refused = update("person/someone-else").await;
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("update-not-asked"));
     let posted = value(&update("person/avery").await);

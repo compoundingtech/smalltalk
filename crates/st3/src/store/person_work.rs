@@ -1232,7 +1232,7 @@ mission "person-work" state="ready" {
 
         // Not the person's work, not the person's message: refused.
         let mut stranger = input.clone();
-        stranger.person = "person/blake".into();
+        stranger.person = "person/someone-else".into();
         assert_eq!(
             store.ask_person(&stranger).unwrap_err().code,
             "update-not-asked"
