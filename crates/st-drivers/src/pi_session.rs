@@ -186,18 +186,20 @@ mod tests {
 
 /// Launch a native graph-owned session without legacy presence transport.
 pub fn run_native(
-    catalog_root: &Path,
+    paths: &crate::driver_paths::Paths,
     identity: String,
     runtime_id: String,
     argv: Vec<String>,
 ) -> Result<()> {
-    pi_family_session::run_for_with_environment(
-        catalog_root,
+    let environment = paths.environment(&identity);
+    pi_family_session::run_for_paths(
+        &paths.root,
+        &paths.agent_dir,
         identity,
         runtime_id,
         argv,
         &PI_KIND,
-        &[],
+        &environment,
         &[],
         None,
         false,
@@ -207,15 +209,15 @@ pub fn run_native(
 /// Adopt a native graph-owned session without legacy presence transport.
 #[allow(clippy::too_many_arguments)]
 pub fn adopt_native(
-    catalog_root: &Path,
+    paths: &crate::driver_paths::Paths,
     identity: String,
     runtime_id: String,
     pid: u32,
     session: String,
     seq: u64,
 ) -> Result<()> {
-    pi_family_session::adopt_for(
-        catalog_root,
+    pi_family_session::adopt_paths(
+        &paths.agent_dir,
         identity,
         runtime_id,
         &PI_KIND,

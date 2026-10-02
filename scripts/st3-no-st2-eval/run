@@ -283,6 +283,11 @@ agent "no-st2" {{
         checks["legacy_status_files"] = status_files
         if status_files:
             fail(f"the native seat created legacy status files: {status_files}")
+        catalogs = [str(path.relative_to(root)) for pattern in ("catalog.kdl", "agent.kdl")
+                    for path in (root / "state/drivers").rglob(pattern)]
+        checks["driver_catalog_files"] = catalogs
+        if catalogs:
+            fail(f"the native seat fabricated catalogs: {catalogs}")
         leftovers = [str(path) for path in root.rglob("st2") if path.is_dir()]
         if leftovers:
             fail(f"st2 state directories were created: {leftovers}")

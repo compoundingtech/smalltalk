@@ -2,9 +2,8 @@
 //!
 //! Every script in st3's hook set execs this, hidden from `--help`, with the harness's payload on
 //! stdin. The arguments and environment are the ones the seat's driver exports: the event name in
-//! the first argument, `CATALOG` (else `ST_ROOT`) for the driver's private catalog,
-//! `ST_CLAUDE_IDENTITY` (else `ST_AGENT`), and the `ST_CLAUDE_*` wrapper-session variables.
-//! Behaviour comes from the same library functions st2's CLI used, so no `st2` program runs.
+//! the first argument, resolved `ST_DRIVER_*` paths and identity, and the `ST_CLAUDE_*`
+//! wrapper-session fence. Already-running seats retain their catalog discovery fallback.
 //!
 //! Observation fails open, since a hook the harness waits on must not stop it. One case is loud:
 //! a SessionStart that leaves no native-session binding for the current wrapper session, because
@@ -70,6 +69,47 @@ fn hook_var(env: &dyn HookEnv, name: &str) -> Option<String> {
     st_drivers::contracts::env_with(name, &|key| env.raw_var(key))
 }
 
+fn hook_identity(env: &dyn HookEnv) -> Option<String> {
+    env.var(st_drivers::driver_paths::IDENTITY_ENV)
+        .or_else(|| hook_var(env, "ST_CLAUDE_IDENTITY"))
+        .or_else(|| {
+            env.var("ST_AGENT").map(|subject| {
+                subject
+                    .strip_prefix("agent/")
+                    .unwrap_or(&subject)
+                    .to_owned()
+            })
+        })
+}
+
+fn hook_paths(env: &dyn HookEnv, identity: &str) -> Result<st_drivers::driver_paths::Paths> {
+    if let Some(paths) =
+        st_drivers::driver_paths::Paths::from_environment(identity, &|name| env.raw_var(name))?
+    {
+        return Ok(paths);
+    }
+    // Compatibility for providers launched before explicit paths. Their immutable hook sets
+    // still exec the replaced binary, and their declarations stay intact until restart.
+    let root = env
+        .var("CATALOG")
+        .or_else(|| env.var("ST_ROOT"))
+        .context("the old hook has no driver catalog")?;
+    let root = PathBuf::from(root);
+    let root = root.canonicalize().unwrap_or(root);
+    let agent_dir = st_drivers::message::resolve_declared_dir(
+        &root,
+        identity,
+        &st_drivers::run::detect_host(),
+    )?
+    .context("the old hook's identity is not declared")?;
+    let session_dir = st_drivers::claude_session::state_dir(&root, identity);
+    Ok(st_drivers::driver_paths::Paths {
+        root,
+        agent_dir,
+        session_dir,
+    })
+}
+
 /// Run hook `name` and return the process exit code.
 pub fn run(
     name: &str,
@@ -85,15 +125,19 @@ pub fn run(
     match name {
         "claude-observe" => claude_observe(args, env, stdin, report),
         "claude-statusline" => {
-            let identity = hook_var(env, "ST_CLAUDE_IDENTITY").or_else(|| env.var("ST_AGENT"));
-            let root = env.var("CATALOG").or_else(|| env.var("ST_ROOT"));
-            let (Some(identity), Some(root)) = (identity, root) else {
-                // Claude writes the payload to this process; drain it so Claude never sees EPIPE.
+            let identity = hook_identity(env);
+            let Some(identity) = identity else {
                 let _ = std::io::copy(stdin, &mut std::io::sink());
                 return 0;
             };
-            let root = PathBuf::from(&root);
-            let root = root.canonicalize().unwrap_or(root);
+            let paths = match hook_paths(env, &identity) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    let _ = std::io::copy(stdin, &mut std::io::sink());
+                    eprintln!("st: Claude status line paths are unavailable: {error:#}");
+                    return 0;
+                }
+            };
             if env.var("ST3_MAILBOX_TRANSPORT").as_deref() == Some("push") {
                 // Every render reads graph authority; no display-name environment snapshot.
                 if let Ok(label) = live_claude_label(env, &identity) {
@@ -103,7 +147,12 @@ pub fn run(
                 }
             }
             // The tee records fail-open and chains to the operator's renderer itself.
-            match st_drivers::claude_session::run_statusline(&root, &identity) {
+            let rendered = if env.raw_var(st_drivers::driver_paths::ROOT_ENV).is_some() {
+                st_drivers::claude_session::run_statusline_paths(&paths.agent_dir, &identity)
+            } else {
+                st_drivers::claude_session::run_statusline(&paths.root, &identity)
+            };
+            match rendered {
                 Ok(()) => 0,
                 Err(error) => {
                     eprintln!("st: the Claude status line failed: {error:#}");
@@ -220,35 +269,56 @@ fn claude_observe(
     let mandatory = session_start
         && (hook_var(env, st_drivers::claude_session::RESUME_GENERATION_ENV).is_some()
             || hook_var(env, st_drivers::claude_session::EXPECTED_NATIVE_SESSION_ENV).is_some());
-    let identity = hook_var(env, "ST_CLAUDE_IDENTITY").or_else(|| env.var("ST_AGENT"));
-    // CATALOG first: it names the catalog that declares the agent, while ST_ROOT can be a bus root.
-    let root = env.var("CATALOG").or_else(|| env.var("ST_ROOT"));
-    let (Some(identity), Some(root)) = (identity, root) else {
+    let identity = hook_identity(env);
+    let Some(identity) = identity else {
         if session_start || mandatory {
             return unbound(
                 env,
                 report,
-                "the SessionStart hook has no agent identity or driver catalog in its environment",
+                "the SessionStart hook has no agent identity in its environment",
             );
         }
         return 0;
+    };
+    let paths = match hook_paths(env, &identity) {
+        Ok(paths) => paths,
+        Err(error) => {
+            if session_start || mandatory {
+                return unbound(
+                    env,
+                    report,
+                    &format!("the SessionStart hook has no valid driver paths: {error:#}"),
+                );
+            }
+            return 0;
+        }
     };
     if event.is_empty() {
         eprintln!("st: claude-observe needs the Claude hook event name");
         return 0;
     }
-    let root = PathBuf::from(&root);
-    let root = root.canonicalize().unwrap_or(root);
     let runtime_id = hook_var(env, st_drivers::claude_session::RUNTIME_ID_ENV)
         .unwrap_or_else(|| identity.clone());
-    if let Err(error) = st_drivers::claude_session::run_observe_payload(
-        &root,
-        &identity,
-        Some(&runtime_id),
-        event,
-        &raw,
-        &|name| env.raw_var(name),
-    ) {
+    let observed = if env.raw_var(st_drivers::driver_paths::ROOT_ENV).is_some() {
+        st_drivers::claude_session::run_observe_payload_paths(
+            &paths,
+            &identity,
+            &runtime_id,
+            event,
+            &raw,
+            &|name| env.raw_var(name),
+        )
+    } else {
+        st_drivers::claude_session::run_observe_payload(
+            &paths.root,
+            &identity,
+            Some(&runtime_id),
+            event,
+            &raw,
+            &|name| env.raw_var(name),
+        )
+    };
+    if let Err(error) = observed {
         if mandatory {
             eprintln!("st: the mandatory Claude SessionStart binding failed: {error:#}");
             return 1;
@@ -258,7 +328,7 @@ fn claude_observe(
     if !session_start {
         return 0;
     }
-    match session_start_binding(&root, &identity, env, &raw) {
+    match session_start_binding(&paths.agent_dir, env, &raw) {
         Ok(()) => 0,
         Err(reason) => unbound(env, report, &reason),
     }
@@ -266,8 +336,7 @@ fn claude_observe(
 
 /// Check that the SessionStart just applied bound this wrapper session to Claude's session.
 fn session_start_binding(
-    root: &Path,
-    identity: &str,
+    agent_dir: &Path,
     env: &dyn HookEnv,
     raw: &str,
 ) -> std::result::Result<(), String> {
@@ -278,15 +347,7 @@ fn session_start_binding(
         .as_str()
         .filter(|id| !id.is_empty())
         .ok_or("Claude's SessionStart payload names no session_id")?;
-    let agent_dir = st_drivers::message::resolve_declared_dir(root, identity, &st_drivers::run::detect_host())
-        .map_err(|error| format!("the driver catalog does not resolve: {error:#}"))?
-        .ok_or_else(|| {
-            format!(
-                "the driver catalog {} does not declare `{identity}`",
-                root.display()
-            )
-        })?;
-    match crate::hooks::claude_binding(&agent_dir, &wrapper) {
+    match crate::hooks::claude_binding(agent_dir, &wrapper) {
         Some(bound) if bound == native => Ok(()),
         Some(bound) => Err(format!(
             "the native-session binding names Claude session {bound}, not {native}"
@@ -482,6 +543,73 @@ mod tests {
         assert!(reported.is_empty());
         // Nothing lands in st2's state directory.
         assert!(!root.path().join("st2").exists());
+    }
+
+    #[test]
+    fn native_hooks_record_without_catalog_discovery_and_keep_session_fencing() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = st_drivers::driver_paths::Paths {
+            root: root.path().to_path_buf(),
+            agent_dir: root.path().join("observations"),
+            session_dir: root.path().join("sessions/claude"),
+        };
+        let mut env: BTreeMap<_, _> = paths.environment("example/seat").into_iter().collect();
+        env.extend([
+            ("ST_CLAUDE_RUNTIME_ID".into(), "example/seat".into()),
+            ("ST_CLAUDE_SESSION".into(), "current".into()),
+            ("ST_CLAUDE_SESSION_SEQ".into(), "1".into()),
+            // Poisoned inherited discovery settings must never be read.
+            (
+                "CATALOG".into(),
+                root.path().join("missing").display().to_string(),
+            ),
+        ]);
+        let seq =
+            st_drivers::harness_state::claim(&paths.agent_dir, "example/seat", "claude", "current")
+                .unwrap();
+        env.insert("ST_CLAUDE_SESSION_SEQ".into(), seq.to_string());
+        assert_eq!(
+            hook(
+                "claude-observe",
+                &["UserPromptSubmit"],
+                &env,
+                r#"{"session_id":"native-1","prompt":"hello"}"#
+            )
+            .0,
+            0
+        );
+        let record_path = st_drivers::harness_state::harness_state_path(&paths.agent_dir);
+        let current = std::fs::read(&record_path).unwrap();
+        let observed = st_drivers::harness_state::read(&record_path, None).unwrap();
+        assert_eq!(observed.state, st_drivers::harness_state::Activity::Active);
+        assert_eq!(observed.evidence_incarnation.as_deref(), Some("current"));
+        st_drivers::harness_state::claim(&paths.agent_dir, "example/seat", "claude", "successor")
+            .unwrap();
+        let successor = std::fs::read(&record_path).unwrap();
+        assert_ne!(current, successor);
+        assert_eq!(
+            hook(
+                "claude-observe",
+                &["Stop"],
+                &env,
+                r#"{"session_id":"native-1"}"#
+            )
+            .0,
+            0
+        );
+        assert_eq!(std::fs::read(&record_path).unwrap(), successor);
+        assert!(!root.path().join("catalog").exists());
+        assert!(!paths.agent_dir.join("agent.kdl").exists());
+        env.remove(st_drivers::driver_paths::SESSION_DIR_ENV);
+        let (code, reported) = hook(
+            "claude-observe",
+            &["SessionStart"],
+            &env,
+            r#"{"session_id":"native-1"}"#,
+        );
+        assert_eq!(code, 1);
+        // No reporting identity was supplied, but the hook still refuses the partial contract.
+        assert!(reported.is_empty());
     }
 
     #[test]

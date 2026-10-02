@@ -22,7 +22,6 @@ import type {
 const PROTOCOL = 2;
 
 const BIN = "ST_OMP_CHANNEL_BIN";
-const CATALOG = "ST_OMP_CHANNEL_CATALOG";
 const IDENTITY = "ST_OMP_CHANNEL_IDENTITY";
 const RUNTIME_ID = "ST_OMP_CHANNEL_RUNTIME_ID";
 const SESSION = "ST_OMP_CHANNEL_SESSION";
@@ -77,7 +76,6 @@ type HeldMessage = {
  */
 type Stash = {
   bin?: string;
-  catalog?: string;
   identity?: string;
   runtimeId?: string;
   session?: string;
@@ -218,7 +216,6 @@ const stash = (): Stash => {
   if (!globals.__stOmpChannel) {
     globals.__stOmpChannel = {
       bin: process.env[BIN],
-      catalog: process.env[CATALOG],
       identity: process.env[IDENTITY],
       runtimeId: process.env[RUNTIME_ID],
       session: process.env[SESSION],
@@ -227,7 +224,6 @@ const stash = (): Stash => {
       resumeGeneration: process.env[RESUME_GENERATION],
     };
     delete process.env[BIN];
-    delete process.env[CATALOG];
     delete process.env[IDENTITY];
     delete process.env[RUNTIME_ID];
     delete process.env[SESSION];
@@ -264,7 +260,7 @@ export default function (pi: ExtensionAPI) {
     try { await pi.setSessionName(state.label); }
     catch { ctx.ui?.notify?.("st: could not update the session name", "warning"); }
   };
-  const { bin, catalog, identity, runtimeId, session, seq } = state;
+  const { bin, identity, runtimeId, session, seq } = state;
   let expectedNativeSession = state.expectedNativeSession;
   let resumeGeneration = state.resumeGeneration;
 
@@ -295,7 +291,7 @@ export default function (pi: ExtensionAPI) {
 
   /** Open a channel and resolve with the hello's restored context (empty if none, or on timeout). */
   const open = async (ctx: ExtensionContext, reconnecting = false): Promise<string> => {
-    if (!bin || !catalog || !identity) return Promise.resolve("");
+    if (!bin || !identity) return Promise.resolve("");
     if (typeof ctx.isIdle !== "function") {
       // Refuse rather than degrade. Without a positive idle proof this extension cannot choose
       // between an idle send and a steer, and guessing would deliver into a running turn.
@@ -345,7 +341,7 @@ export default function (pi: ExtensionAPI) {
     if (resumeGeneration) channelEnv[RESUME_GENERATION] = resumeGeneration;
     const child = childProcess.spawn(
       bin,
-      ["--catalog", catalog, "driver", "omp-channel", "--identity", identity],
+      ["driver", "omp-channel", "--identity", identity],
       { stdio: ["pipe", "pipe", "inherit"], env: channelEnv },
     );
     state.child = child;
