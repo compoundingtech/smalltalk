@@ -10822,9 +10822,10 @@ pub(crate) fn append_work_wake_message(
         format!("{source} attempt {wake_attempt} ({reason})")
     };
     let content = format!(
-        "A mission step is ready: {0}. Run `st work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
+        "A mission step is ready: {0}. Run `st work claim {0} --as {2}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
+        agent,
     );
     let tag_value = format!(
         "{}@{}@{}@{}",
@@ -26000,6 +26001,13 @@ mission "work-alert" state="ready" {
             "A mission step is ready: {}",
             run.steps[0].subject
         )));
+        // The command runs as written: a work action needs `--as`, and a model that has to guess
+        // the rest guesses an incarnation that does not exist.
+        assert!(messages[0].content.contains(&format!(
+            "`st work claim {} --as agent/node.worker`",
+            run.steps[0].subject
+        )));
+        assert!(!messages[0].content.contains("--incarnation"));
         assert!(messages[0].content.contains("Title: Build the change"));
         assert!(messages[0].content.contains("Wake: automatic attempt 1"));
         assert!(!messages[0].content.contains("detailed instruction"));

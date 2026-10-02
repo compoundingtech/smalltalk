@@ -16,7 +16,7 @@ Real: the st3 daemon, `pty` sessions, the driver and channel processes, the exte
 loads into pi and omp, the mailbox, the work graph, and the `st` CLI the stand-in calls.
 
 Stand-in: the provider only. Each `stub-*` speaks the wire contract of its harness and does what a
-model does when woken: read the message, run `st work claim` on the step it names (`stubmodel.py`).
+model does when woken: read the message, run the command the wake gives, exactly as written (`stubmodel.py`).
 No login, no model, no tokens. The stand-ins answer instantly where real providers take seconds,
 so races the real ones hide are hit every time.
 

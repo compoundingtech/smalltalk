@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import time
 
@@ -29,13 +30,17 @@ def st(*args):
 
 
 def act(content):
-    """Read the message and claim the step it names, as a model following the wake would."""
+    """Read the message, then run the command the wake tells a model to run, exactly as written.
+
+    The stand-in adds nothing the text leaves out: a wake a model cannot follow verbatim fails the
+    canary, as it fails a real seat (a work action needs `--as`)."""
     message = re.search(r"graph=\"(message/[0-9a-f]+)\"", content) or re.search(r"message/[0-9a-f]+", content)
-    step = re.search(r"st work claim (step-run/[^\s`]+)", content)
+    command = re.search(r"Run `(st work claim [^`]+)`", content)
     if message:
         reference = message.group(1) if message.groups() else message.group(0)
         result = st("conversations", "read", reference, "--as", seat(), "--json")
         receipt("read", reference=reference, exit=result.returncode, stderr=result.stderr[-1000:])
-    if step:
-        result = st("work", "claim", step.group(1), "--as", seat())
-        receipt("claim", step=step.group(1), exit=result.returncode, stderr=result.stderr[-1000:])
+    if command:
+        argv = shlex.split(command.group(1))[1:]
+        result = st(*argv)
+        receipt("claim", command=command.group(1), exit=result.returncode, stderr=result.stderr[-1000:])
