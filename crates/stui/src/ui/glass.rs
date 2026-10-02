@@ -1850,8 +1850,8 @@ impl Ui {
             );
         }
         buf.set_line(area.x, area.y, &Line::from(spans), area.width);
-        // ▢═▢: two panes and a bridge, a pair of glasses.
-        let name = format!(" ▢═▢ {} ▾ ", glass.name);
+        // ▢: one space.
+        let name = format!(" ▢ {} ▾ ", glass.name);
         let width = text::width(&name) as u16;
         let x = area.x + area.width.saturating_sub(width);
         buf.set_stringn(
