@@ -329,6 +329,9 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     updated_at_unix_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
+-- A trim reads each envelope's dropped claims.
+CREATE INDEX IF NOT EXISTS checkpoint_claims_envelope
+ON checkpoint_claims(writer, sequence, envelope_hash);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
 ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 "#;
@@ -376,6 +379,8 @@ pub struct Store {
     /// transaction. Only tests change them.
     pub trim_fault: Mutex<Option<checkpoint_trim::TrimFault>>,
     pub trim_chunk_envelopes: AtomicUsize,
+    /// Extra time each trimmed row takes. Tests only.
+    pub trim_row_cost_micros: AtomicU64,
     /// The shortest wait between two replays for heals. A runtime's own tests set it to zero.
     pub heal_replay_backoff_ms: u128,
     /// The runtime whose projections this store keeps.
@@ -496,6 +501,7 @@ impl Store {
             shared_memory,
             trim_fault: Mutex::new(None),
             trim_chunk_envelopes: AtomicUsize::new(checkpoint_trim::TRIM_CHUNK_ENVELOPES),
+            trim_row_cost_micros: AtomicU64::new(0),
             heal_replay_backoff_ms: heal::HEAL_REPLAY_BACKOFF_MS,
             runtime,
         })

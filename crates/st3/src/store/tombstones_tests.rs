@@ -764,3 +764,100 @@ fn a_manifest_that_differs_in_any_tombstone_field_is_rejected() {
             .is_err()
     );
 }
+
+/// History a trim does not drop, as much as a fleet member held when its first trim stalled
+/// every write: claims and the operations that name them, in a peer's batch the planner never
+/// reads.
+fn production_history(store: &Store, claims: usize) {
+    let mut connection = store.connection.lock().unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "INSERT INTO batches(id, origin, replica_sequence, previous_hash, hash,
+                                 accepted_at_unix_ms)
+             VALUES ('batch/elm/1/history', 'elm', 1, NULL, 'history', '1')",
+            [],
+        )
+        .unwrap();
+    {
+        let mut claim = transaction
+            .prepare(
+                "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body,
+                                    predecessors, accepted_at_unix_ms)
+                 VALUES (?1, 'batch/elm/1/history', ?2, 'daemon.diagnostic', 'elm', NULL,
+                         '{\"fields\":{}}', '[]', '1')",
+            )
+            .unwrap();
+        let mut operation = transaction
+            .prepare(
+                "INSERT INTO operations(id, request_digest, canonical_claim_id, state)
+                 VALUES (?1, 'history', ?2, 'active')",
+            )
+            .unwrap();
+        for n in 0..claims {
+            let id = format!("{n:064x}");
+            claim
+                .execute(params![id, format!("daemon/elm-{}", n % 500)])
+                .unwrap();
+            operation.execute(params![format!("op/{n}"), id]).unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn a_trim_never_makes_a_write_wait_long() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(
+        Store::open(&directory.path().join("claims.sqlite3"), "alder").unwrap(),
+    );
+    store.bind_fleet(FLEET).unwrap();
+    write_diagnostics(&store, "daemon/alder", 1_500);
+    let cut = now_ms() + 1_000;
+    let plan = plan_drops(&store.checkpoint_sealed_set(cut).unwrap());
+    assert!(plan.claims.len() >= 1_000, "{}", plan.claims.len());
+    production_history(&store, 150_000);
+    // Every deleted row is slow, as on a store missing an index: 2,000 of them at once would
+    // hold the writer for four seconds.
+    store.set_trim_row_cost(std::time::Duration::from_millis(2));
+    let trimming = {
+        let store = store.clone();
+        let plan = plan.clone();
+        std::thread::spawn(move || {
+            let mut actions = Vec::new();
+            store
+                .trim_checkpoint(
+                    CHECKPOINT,
+                    cut,
+                    &plan.drop_digest,
+                    &plan.envelopes,
+                    &plan.claims,
+                    false,
+                    &mut actions,
+                )
+                .unwrap();
+            actions
+        })
+    };
+    let mut writes = 0;
+    let mut longest = std::time::Duration::ZERO;
+    while !trimming.is_finished() {
+        let started = std::time::Instant::now();
+        store
+            .append_claim(&diagnostic("daemon/birch", writes, "written during a trim"))
+            .unwrap();
+        longest = longest.max(started.elapsed());
+        writes += 1;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let actions = trimming.join().unwrap();
+    assert!(
+        matches!(&actions[..], [CheckpointAction::Trimmed { claims, .. }] if *claims == plan.claims.len()),
+        "{actions:?}"
+    );
+    assert!(writes >= 20, "only {writes} writes ran during the trim");
+    assert!(
+        longest < std::time::Duration::from_millis(500),
+        "a write waited {longest:?} for the trim"
+    );
+}
