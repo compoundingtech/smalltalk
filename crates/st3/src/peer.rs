@@ -2049,7 +2049,8 @@ mod tests {
                 }],
             })
             .await
-            .unwrap();
+            .unwrap()
+            .message;
         assert_eq!(message.attachments[0].origin, "host/owner-node");
 
         // Sync carries the claim to the gateway; the bytes are not part of it.

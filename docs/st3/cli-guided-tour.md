@@ -207,12 +207,18 @@ write paths:
 ```sh
 st conversations send --help
 st conversations reply --help
+st conversations status --help
 st conversations archive --help
 st conversations export --help
 ```
 
 Check role, ordering, partial/final state, tool calls and results, errors, token usage, reply
 threading, read/archive state, redaction, truncation, and pagination.
+
+Run one `send` twice: the second prints the same message ID, says on stderr that it was already
+sent, and sends nothing (`already_sent: true` and the first `sent_at` with `--json`). A send that
+times out prints its idempotency key and `st conversations status --idempotency-key KEY`, which
+answers `landed` with the message's delivery or `not landed`; running the same send again is safe.
 
 ### 7. `agents` and `machines` — who is doing what, where
 

@@ -22,12 +22,12 @@ use st3::model::{
     DocumentPutRequest, DocumentVersion, EvalStatus, EventRecord, IntentInput,
     LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
     LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
-    LaunchStartRequest, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
-    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest, MissionRunView,
-    MissionSpec, MissionState, OperationalRepairApplyRequest, OperationalRepairPlan,
-    OperationalRepairResult, PersonAskRequest, PersonStepResponse, PlannerSpec,
-    PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    LaunchStartRequest, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
+    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
+    MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
+    MissionRunView, MissionSpec, MissionState, OperationalRepairApplyRequest,
+    OperationalRepairPlan, OperationalRepairResult, PersonAskRequest, PersonStepResponse,
+    PlannerSpec, PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
     PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest,
     ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
     RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
@@ -3214,8 +3214,9 @@ enum MessageCommand {
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
-    /// Show delivery and read progress without changing the message lifecycle.
-    Status(MessageReferenceArgs),
+    /// Show delivery and read progress without changing the message lifecycle, or whether an
+    /// unconfirmed send landed.
+    Status(MessageStatusArgs),
     /// Read exact messages and optionally mark them read or archived.
     Read(MessageReadArgs),
     /// Reply to one canonical message ID while preserving its thread.
@@ -3285,7 +3286,9 @@ struct MessageSendArgs {
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
-    /// Reuse this key with the same message when retrying an unconfirmed send.
+    /// Name this message for retries. Without it the key comes from the sender, recipient, words
+    /// and attachments, so running the same command again within the hour (or the next) reports
+    /// the message already sent instead of sending it twice.
     #[arg(long)]
     idempotency_key: Option<String>,
 }
@@ -3332,7 +3335,8 @@ struct MessageReplyArgs {
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
-    /// Reuse this key with the same message when retrying an unconfirmed send.
+    /// Name this reply for retries. Without it the key comes from the sender, the message
+    /// replied to, the words and attachments, as for `send`.
     #[arg(long)]
     idempotency_key: Option<String>,
 }
@@ -3350,6 +3354,15 @@ struct MessageReferenceArgs {
     reference: String,
     #[arg(long)]
     tree: bool,
+}
+
+#[derive(Args)]
+struct MessageStatusArgs {
+    #[arg(required_unless_present = "idempotency_key")]
+    reference: Option<String>,
+    /// Whether a send or reply that st did not confirm landed, by the key its error printed.
+    #[arg(long, conflicts_with = "reference")]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -12556,44 +12569,33 @@ async fn run_message(
                 let from = blob_actor(Some(args.from.clone()), None)?;
                 upload_attachments(endpoint, &from, &args.attach).await?
             };
-            let Some(message) = send_message(client, args, attachments).await? else {
+            let Some(receipt) = send_message(client, args, attachments).await? else {
                 return Ok(());
             };
-            sync_message_projection(client).await?;
-            if json_output {
-                print_value(&message, true)
-            } else {
-                println!("{}", message.subject);
-                Ok(())
+            // The message has landed. A projection that misses it catches up on the next command;
+            // failing here would invite a resend of a message that was sent.
+            if let Err(error) = sync_message_projection(client).await {
+                eprintln!(
+                    "st: {} was sent (idempotency key {}), but the message projection was not refreshed: {}",
+                    receipt.message.subject,
+                    receipt.idempotency_key,
+                    plain_error(&error)
+                );
             }
+            print_message_receipt(&receipt, json_output)
         }
         MessageCommand::Status(args) => {
-            let value: Value = client
-                .get(&format!(
-                    "/v1/messages/delivery/{}",
-                    urlencoding::encode(&args.reference)
-                ))
-                .await?;
+            if let Some(key) = args.idempotency_key {
+                return print_message_key_status(client, &key, json_output).await;
+            }
+            let reference = args
+                .reference
+                .context("conversations status needs a message or --idempotency-key")?;
+            let value = message_delivery(client, &reference).await?;
             if json_output {
                 print_value(&value, true)
             } else {
-                println!(
-                    "{} · {} → {}",
-                    value["id"].as_str().unwrap_or("message"),
-                    value["from"].as_str().unwrap_or("sender"),
-                    value["to"].as_str().unwrap_or("recipient")
-                );
-                println!(
-                    "{} · {}",
-                    value
-                        .pointer("/delivery/phase")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                    value
-                        .pointer("/delivery/reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                );
+                print_message_delivery(&value);
                 Ok(())
             }
         }
@@ -12717,7 +12719,7 @@ async fn run_message(
                 let from = blob_actor(Some(args.from.clone()), None)?;
                 upload_attachments(endpoint, &from, &args.attach).await?
             };
-            let message = send_message(
+            let receipt = send_message(
                 client,
                 MessageSendArgs {
                     to: recipient,
@@ -12735,15 +12737,10 @@ async fn run_message(
                 attachments,
             )
             .await?;
-            let Some(message) = message else {
+            let Some(receipt) = receipt else {
                 return Ok(());
             };
-            if json_output {
-                print_value(&message, true)
-            } else {
-                println!("{}", message.subject);
-                Ok(())
-            }
+            print_message_receipt(&receipt, json_output)
         }
         MessageCommand::Archive(args) => {
             let actor = args
@@ -12871,7 +12868,7 @@ async fn send_message(
     client: &Client,
     args: MessageSendArgs,
     attachments: Vec<st3::model::AttachmentInput>,
-) -> Result<Option<MessageView>> {
+) -> Result<Option<MessageSendReceipt>> {
     let id = uuid::Uuid::now_v7().simple().to_string();
     let mission_id = format!("message/{id}");
     reject_foreign_agent_actor(&args.from)?;
@@ -12891,21 +12888,211 @@ async fn send_message(
         print!("{kdl}");
         return Ok(None);
     }
-    client
-        .send_message(&MessageSendRequest {
-            idempotency_key: args
-                .idempotency_key
-                .unwrap_or_else(|| format!("st3-message-send:{id}")),
-            from,
-            to,
-            content: args.body,
-            title: args.subject,
-            in_reply_to: args.in_reply_to,
-            tags: args.tags,
-            attachments,
+    let mut request = MessageSendRequest {
+        idempotency_key: String::new(),
+        from,
+        to,
+        content: args.body,
+        title: args.subject,
+        in_reply_to: args.in_reply_to,
+        tags: args.tags,
+        attachments,
+    };
+    request.idempotency_key = match args.idempotency_key {
+        Some(key) => key,
+        None => {
+            let incarnation = std::env::var("ST3_INCARNATION")
+                .ok()
+                .filter(|incarnation| !incarnation.is_empty());
+            let hour = message_key_hour();
+            let key = derived_message_key(&request, incarnation.as_deref(), hour);
+            // A send whose answer was lost just before the hour turned landed under the
+            // previous hour's key.
+            if let Some(previous) = hour.checked_sub(1) {
+                let previous = derived_message_key(&request, incarnation.as_deref(), previous);
+                match client.sent_message(&previous).await {
+                    Ok(Some(receipt)) => return Ok(Some(receipt)),
+                    Ok(None) => {}
+                    // A daemon from before the lookup has no such route. Its sends still repeat
+                    // only within the hour.
+                    Err(error) if st3::client::http_status(&error) == Some(404) => {}
+                    Err(error) => {
+                        return Err(error.context(format!(
+                            "st could not check whether this message was already sent, so nothing was sent with idempotency key {key}; running the same command again is safe"
+                        )));
+                    }
+                }
+            }
+            key
+        }
+    };
+    match client.send_message(&request).await {
+        Ok(receipt) => Ok(Some(receipt)),
+        Err(error) => Err(message_send_error(error, &request.idempotency_key)),
+    }
+}
+
+/// The prefix of a key a send derives from its message. The version changes with what goes in.
+const DERIVED_MESSAGE_KEY_PREFIX: &str = "st3-message:v1:";
+
+/// The UTC hour a derived message key belongs to. `ST3_MESSAGE_KEY_HOUR` stands in for the
+/// clock, so a test can send an hour later without waiting one.
+fn message_key_hour() -> u64 {
+    std::env::var("ST3_MESSAGE_KEY_HOUR")
+        .ok()
+        .and_then(|hour| hour.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                / 3600
         })
+}
+
+/// A send without `--idempotency-key` is named by what it sends: the sender, recipient, the
+/// message it answers, title, words, tags and attachments, the seat incarnation that sends it,
+/// and the hour. Running the same command again in that hour names the same message, so the
+/// daemon returns it instead of sending a second; the same words a few hours later are new.
+fn derived_message_key(
+    request: &MessageSendRequest,
+    incarnation: Option<&str>,
+    hour: u64,
+) -> String {
+    let attachments = request
+        .attachments
+        .iter()
+        .map(|attachment| json!([attachment.blob, attachment.media_type, attachment.name]))
+        .collect::<Vec<_>>();
+    let canonical = json!([
+        DERIVED_MESSAGE_KEY_PREFIX,
+        request.from,
+        request.to,
+        request.in_reply_to,
+        request.title,
+        request.content,
+        request.tags,
+        attachments,
+        incarnation,
+        hour,
+    ]);
+    let digest = hex::encode(Sha256::digest(canonical.to_string().as_bytes()));
+    format!("{DERIVED_MESSAGE_KEY_PREFIX}{}", &digest[..32])
+}
+
+/// Say what a failed send means for the sender: its key, how to tell whether it landed, and that
+/// running the same command again sends it at most once.
+fn message_send_error(error: anyhow::Error, key: &str) -> anyhow::Error {
+    let check = format!(
+        "st conversations status --idempotency-key {}",
+        shell_word(key)
+    );
+    let unconfirmed = format!(
+        "st did not confirm the message, so it may or may not have been sent. Check with `{check}`; running the same command again is safe and sends it at most once"
+    );
+    if let Some(error) = error.downcast_ref::<st3::client::MessageSendUnconfirmed>() {
+        return anyhow::anyhow!("{unconfirmed}. st did not answer: {}", error.reason());
+    }
+    // A refusal is an answer: the daemon wrote nothing for this key.
+    if st3::client::http_status(&error).is_some_and(|status| (400..500).contains(&status)) {
+        return error.context(format!("st refused the message (idempotency key {key})"));
+    }
+    error.context(unconfirmed)
+}
+
+/// `value` as one shell word.
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/@%+=,".contains(&byte))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
+/// A send's result. The human form prints the message alone on stdout, as for a new message,
+/// and says on stderr when the message had already been sent.
+fn print_message_receipt(receipt: &MessageSendReceipt, json_output: bool) -> Result<()> {
+    if json_output {
+        return print_value(receipt, true);
+    }
+    if receipt.already_sent {
+        eprintln!(
+            "st: {} was already sent{} (idempotency key {}); nothing new was sent",
+            receipt.message.subject,
+            receipt
+                .sent_at
+                .as_deref()
+                .map(|sent_at| format!(" at {sent_at}"))
+                .unwrap_or_default(),
+            receipt.idempotency_key
+        );
+    }
+    println!("{}", receipt.message.subject);
+    Ok(())
+}
+
+async fn message_delivery(client: &Client, reference: &str) -> Result<Value> {
+    client
+        .get(&format!(
+            "/v1/messages/delivery/{}",
+            urlencoding::encode(reference)
+        ))
         .await
-        .map(Some)
+}
+
+fn print_message_delivery(value: &Value) {
+    println!(
+        "{} · {} → {}",
+        value["id"].as_str().unwrap_or("message"),
+        value["from"].as_str().unwrap_or("sender"),
+        value["to"].as_str().unwrap_or("recipient")
+    );
+    println!(
+        "{} · {}",
+        value
+            .pointer("/delivery/phase")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        value
+            .pointer("/delivery/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    );
+}
+
+/// Whether a send or reply with this idempotency key landed, and if so its delivery.
+async fn print_message_key_status(client: &Client, key: &str, json_output: bool) -> Result<()> {
+    let receipt = client
+        .sent_message(key)
+        .await
+        .with_context(|| format!("look up the message sent with idempotency key {key}"))?;
+    let Some(receipt) = receipt else {
+        if json_output {
+            return print_value(&json!({"idempotency_key": key, "landed": false}), true);
+        }
+        println!(
+            "not landed · no message was sent with idempotency key {key}; sending it again sends it once"
+        );
+        return Ok(());
+    };
+    let mut value = message_delivery(client, &receipt.message.subject).await?;
+    if json_output {
+        value["idempotency_key"] = json!(key);
+        value["landed"] = json!(true);
+        value["sent_at"] = json!(receipt.sent_at);
+        return print_value(&value, true);
+    }
+    println!(
+        "landed · {} at {}",
+        receipt.message.subject,
+        receipt.sent_at.as_deref().unwrap_or("an unknown time")
+    );
+    print_message_delivery(&value);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20860,6 +21047,85 @@ mod tests {
             panic!("reply did not parse");
         };
         assert_eq!(reply.idempotency_key.as_deref(), Some("retry-a-reply"));
+
+        let status = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "status",
+            "--idempotency-key",
+            "retry-a-send",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Status(status),
+        } = status.command
+        else {
+            panic!("status did not parse");
+        };
+        assert_eq!(status.idempotency_key.as_deref(), Some("retry-a-send"));
+        assert!(status.reference.is_none());
+        assert!(Cli::try_parse_from(["st3", "conversations", "status"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "conversations",
+                "status",
+                "message/example",
+                "--idempotency-key",
+                "retry-a-send",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_derived_message_key_names_one_message_in_one_hour() {
+        let request = MessageSendRequest {
+            idempotency_key: String::new(),
+            from: "person/avery".into(),
+            to: "agent/example/worker".into(),
+            content: "The merge train is live.".into(),
+            title: Some("Merge train".into()),
+            in_reply_to: None,
+            tags: Vec::new(),
+            attachments: Vec::new(),
+        };
+        let key = derived_message_key(&request, None, 490_000);
+        // The key never changes between builds: a retry after an upgrade finds the first send.
+        assert_eq!(key, "st3-message:v1:31bd263335cbfc5fa34d30ccafe56f43");
+        assert_eq!(key, derived_message_key(&request.clone(), None, 490_000));
+        assert_ne!(key, derived_message_key(&request, None, 490_001));
+        assert_ne!(
+            key,
+            derived_message_key(&request, Some("incarnation/2"), 490_000)
+        );
+        let mut changes = Vec::new();
+        for change in 0..8 {
+            let mut changed = request.clone();
+            match change {
+                0 => changed.from = "person/blake".into(),
+                1 => changed.to = "agent/example/other".into(),
+                2 => changed.in_reply_to = Some("message/example".into()),
+                3 => changed.title = None,
+                4 => changed.content = "The merge train is paused.".into(),
+                5 => changed.tags = vec!["work".into()],
+                6 => {
+                    changed.attachments = vec![st3::model::AttachmentInput {
+                        blob: format!("blob/{}", "a".repeat(64)),
+                        media_type: "image/png".into(),
+                        name: None,
+                    }]
+                }
+                _ => changed.idempotency_key = "ignored".into(),
+            }
+            changes.push(derived_message_key(&changed, None, 490_000));
+        }
+        // Everything the message carries names it; the key field it fills does not.
+        assert!(changes[..7].iter().all(|changed| *changed != key));
+        assert_eq!(changes[7], key);
+
+        assert_eq!(shell_word("st3-message:v1:0f"), "st3-message:v1:0f");
+        assert_eq!(shell_word("it's mine"), r"'it'\''s mine'");
     }
 
     #[test]
