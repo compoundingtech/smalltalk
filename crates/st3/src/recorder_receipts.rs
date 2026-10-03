@@ -10,23 +10,30 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
+use notify::Watcher as _;
 use tokio::sync::{Notify, watch};
 
 use crate::{model::ClaimInput, recorder::Receipt, store::Store};
 
-/// Polls the recorder spool independently of resource observers.
+/// Watches the spool, with bounded exponential backoff scans as a fallback.
 pub async fn run(
     store: Arc<Store>,
     directory: PathBuf,
     notify: Arc<Notify>,
     event_notify: watch::Sender<u64>,
 ) {
+    let spool_wake = Arc::new(Notify::new());
+    let _watcher = spool_watcher(&directory, spool_wake.clone())
+        .map_err(|error| eprintln!("st3: recorder spool watch unavailable; using backoff: {error:#}"))
+        .ok();
+    let mut delay = Duration::from_secs(1);
     loop {
         let receipt_store = store.clone();
         let receipts = directory.clone();
         match tokio::task::spawn_blocking(move || ingest_once(&receipt_store, &receipts)).await {
-            Ok(Ok(0)) => {}
+            Ok(Ok(0)) => delay = (delay * 2).min(Duration::from_secs(60)),
             Ok(Ok(_)) => {
+                delay = Duration::from_secs(1);
                 crate::performance::record_wake("recorder receipts", Some("resource.observed"));
                 notify.notify_one();
                 event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
@@ -34,12 +41,25 @@ pub async fn run(
             Ok(Err(error)) => eprintln!("st3: recorder receipt ingestion failed: {error:#}"),
             Err(error) => eprintln!("st3: recorder receipt ingestion stopped: {error}"),
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::select! {
+            () = spool_wake.notified() => {}
+            () = tokio::time::sleep(delay) => {}
+        }
     }
 }
 
+fn spool_watcher(directory: &Path, wake: Arc<Notify>) -> Result<notify::RecommendedWatcher> {
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if event.is_ok() {
+            wake.notify_one();
+        }
+    })?;
+    watcher.watch(directory, notify::RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+
 /// Imports completed JSON files, returning how many new claims were appended.
-/// Invalid receipts are logged and discarded; unreadable files and failed claim appends remain.
+/// Invalid receipts are discarded; failed appends get five attempts, then a dead letter.
 /// A committed receipt is safe to replay if deletion fails: URL and actor identify its claim.
 pub fn ingest_once(store: &Store, directory: &Path) -> Result<usize> {
     let entries = match fs::read_dir(directory) {
@@ -50,6 +70,13 @@ pub fn ingest_once(store: &Store, directory: &Path) -> Result<usize> {
     let mut files = Vec::new();
     for entry in entries {
         let entry = entry.context("read recorder receipt entry")?;
+        if entry.file_type()?.is_file()
+            && entry.path().extension().is_some_and(|extension| extension == "tmp")
+            && entry.metadata()?.modified()?.elapsed().is_ok_and(|age| age >= Duration::from_secs(3600))
+        {
+            fs::remove_file(entry.path()).context("remove stale recorder temporary file")?;
+            continue;
+        }
         if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|extension| extension == "json") {
             files.push(entry.path());
         }
@@ -85,7 +112,22 @@ pub fn ingest_once(store: &Store, directory: &Path) -> Result<usize> {
                     eprintln!("st3: could not remove consumed recorder receipt {}: {error}", path.display());
                 }
             }
-            Err(error) => eprintln!("st3: recorder receipt {} failed: {error:#}", path.display()),
+            Err(error) => {
+                let stem = path.file_stem().unwrap().to_string_lossy();
+                let (base, attempts) = stem.rsplit_once(".attempt-")
+                    .and_then(|(base, attempt)| attempt.parse::<u32>().ok().map(|attempt| (base, attempt)))
+                    .unwrap_or((&stem, 0));
+                let attempts = attempts.saturating_add(1);
+                let destination = if attempts >= 5 {
+                    path.with_file_name(format!("{base}.dead-letter"))
+                } else {
+                    path.with_file_name(format!("{base}.attempt-{attempts}.json"))
+                };
+                fs::rename(&path, &destination).context("retain failed recorder receipt")?;
+                if attempts >= 5 {
+                    eprintln!("st3: dead-lettered recorder receipt {} after {attempts} attempts: {error:#}", destination.display());
+                }
+            }
         }
     }
     Ok(appended)
@@ -154,6 +196,57 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn spool_publication_wakes_an_idle_consumer() {
+        let spool = tempfile::tempdir().unwrap();
+        let wake = Arc::new(Notify::new());
+        let _watcher = spool_watcher(spool.path(), wake.clone()).unwrap();
+        fs::write(spool.path().join("receipt.tmp"), b"partial").unwrap();
+        fs::rename(spool.path().join("receipt.tmp"), spool.path().join("receipt.json")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), wake.notified()).await.unwrap();
+    }
+
+    #[test]
+    fn failed_append_is_dead_lettered_after_five_attempts() {
+        let store = Store::open_memory("receipt-node").unwrap();
+        store.append_claim(&ClaimInput {
+            subject: "resource/github/acme/demo/issue/9".into(),
+            kind: "resource.observed".into(), actor: None,
+            fields: BTreeMap::from([
+                ("kind".into(), json!("vcs.pull-request")),
+                ("facts".into(), json!({"number": 99})),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        fs::write(spool.path().join("1-1.json"), serde_json::to_vec(
+            &receipt("https://github.com/acme/demo/issues/9", "agent/builder", None)
+        ).unwrap()).unwrap();
+        for attempt in 1..=5 {
+            assert_eq!(ingest_once(&store, spool.path()).unwrap(), 0);
+            let name = if attempt == 5 { "1-1.dead-letter".into() }
+                else { format!("1-1.attempt-{attempt}.json") };
+            assert!(spool.path().join(name).exists());
+        }
+        assert_eq!(ingest_once(&store, spool.path()).unwrap(), 0);
+        assert!(spool.path().join("1-1.dead-letter").exists());
+    }
+
+    #[test]
+    fn stale_temporary_files_are_removed_but_active_publications_remain() {
+        let store = Store::open_memory("receipt-node").unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        let stale = spool.path().join("old.tmp");
+        let fresh = spool.path().join("new.tmp");
+        fs::write(&stale, b"partial").unwrap();
+        fs::write(&fresh, b"partial").unwrap();
+        fs::File::options().write(true).open(&stale).unwrap().set_times(
+            fs::FileTimes::new().set_modified(std::time::SystemTime::now() - Duration::from_secs(3601))
+        ).unwrap();
+        assert_eq!(ingest_once(&store, spool.path()).unwrap(), 0);
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+    }
+
     #[test]
     fn receipt_duplicates_collapse_and_consumed_files_disappear() {
         let store = Store::open_memory("receipt-node").unwrap();
@@ -212,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_attribution_is_first_writer_and_preserves_observer_facts() {
+    fn late_receipt_does_not_reassert_observer_snapshot_and_keeps_first_opener() {
         for (path, kind, segment) in [("issues", "vcs.issue", "issue"), ("pull", "vcs.pull-request", "pull-request")] {
             let store = Store::open_memory("receipt-node").unwrap();
             let url = format!("https://github.com/acme/demo/{path}/9");
@@ -231,10 +324,13 @@ mod tests {
             store.append_claim(&claim_input(receipt(&url, "agent/first", Some("first"))).unwrap()).unwrap();
             store.append_claim(&claim_input(receipt(&url, "agent/second", Some("second"))).unwrap()).unwrap();
             let facts = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
-            assert_eq!(facts["state"], "closed");
-            assert_eq!(facts["title"], "Latest title");
-            if kind == "vcs.pull-request" {
-                assert_eq!(facts["checks"], observed["checks"]);
+            assert!(facts.get("state").is_none());
+            assert!(facts.get("title").is_none());
+            assert!(facts.get("checks").is_none());
+            let claims = store.claims_page(Some(&subject), None, 0, None, false, 100).unwrap().claims;
+            for claim in claims.iter().filter(|claim| claim.body["fields"]["facts"]["opened_by"] == "agent/first") {
+                assert!(claim.body["fields"]["facts"].get("state").is_none());
+                assert!(claim.body["fields"]["facts"].get("title").is_none());
             }
             assert_eq!(facts["opened_by"], "agent/first");
             assert_eq!(facts["opened_by_run"], "mission-run/first");
@@ -271,8 +367,8 @@ mod tests {
             let facts = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
             assert_eq!(facts["opened_by_run"], prior["opened_by_run"]);
             assert!(facts.get("opened_by").is_none());
-            assert_eq!(facts["state"], prior["state"]);
-            assert_eq!(facts["title"], prior["title"]);
+            assert!(facts.get("state").is_none());
+            assert!(facts.get("title").is_none());
         }
     }
 }

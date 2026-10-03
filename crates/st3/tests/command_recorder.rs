@@ -652,6 +652,19 @@ fn create_receipts_preserve_raw_output_and_even_nonzero_exit_status() {
 }
 
 #[test]
+fn noncreating_modes_never_credit_a_url_in_the_body() {
+    for mode in ["--dry-run", "--dry-run=true", "--web", "-w", "--web=true", "--help", "-h"] {
+        let fixture = fixture("#!/bin/sh\nprintf 'https://github.com/owner/repo/pull/123\\n'\n");
+        let output = fixture.recorded("gh").args(["pr", "create", mode])
+            .env("ST_AGENT", "agent/example/builder").output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"https://github.com/owner/repo/pull/123\n");
+        assert!(fixture.receipts().is_empty(), "{mode}");
+        assert!(fixture.records()[0].get("receipt_url").is_none(), "{mode}");
+    }
+}
+
+#[test]
 fn only_leading_gh_create_arguments_enable_receipts() {
     let fixture = fixture("#!/bin/sh\nprintf 'https://github.com/owner/repo/issues/123\\n'\n");
     for (program, arguments) in [
