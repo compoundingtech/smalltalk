@@ -113,6 +113,33 @@ pub fn protect_server(runtime_id: &str, pid: u32, work_unit: &str) -> Result<Ser
     }
 }
 
+/// Whether the PTY server `pid` of `runtime_id` runs outside `work_unit`, moving it out first, so
+/// that ending `work_unit` leaves the server. A move [`protect_servers`] has under way counts once
+/// it lands.
+pub(crate) fn keep_server_apart(runtime_id: &str, pid: u32, work_unit: &str) -> bool {
+    match protect_server(runtime_id, pid, work_unit) {
+        Ok(ServerPlacement::Moved(_) | ServerPlacement::Already | ServerPlacement::Foreign) => true,
+        Ok(ServerPlacement::Unsupported) => false,
+        Err(_) => {
+            // The other mover's transient unit already exists, so this one was refused.
+            let deadline = Instant::now() + MOVE_TIMEOUT;
+            loop {
+                let Ok(cgroup) = process_cgroup(pid) else {
+                    // The server has exited.
+                    return true;
+                };
+                if slice_and_leaf(&cgroup).1 != work_unit {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 fn move_command(unit: &str, pid: u32, slice: Option<&str>, runtime_id: &str) -> Command {
     let mut command = Command::new("busctl");
     command.args([

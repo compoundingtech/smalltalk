@@ -1214,6 +1214,38 @@ pub struct Session {
     pub usage: Option<UsageSummary>,
 }
 
+/// Latest canonical resource observation; not an operational resource projection.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResourceObservation {
+    pub id: String,
+    pub kind: String,
+    pub facts: BTreeMap<String, Value>,
+    pub observed_at: String,
+    pub opened_by: Option<String>,
+    pub opened_by_run: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ResourcesFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_prefix: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResourcesPage {
+    pub kind: String,
+    pub collection: String,
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<ResourceObservation>,
+    pub page: PageInfo,
+    #[serde(default)]
+    pub sync: Option<SyncNotice>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Resource {

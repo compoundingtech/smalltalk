@@ -76,6 +76,24 @@ st missions start example/catalog-gate \
 For a different gate, syntax-check the exact script used by `exec`, ensure its tools are on the
 captured PATH, and make the owning step timeout strictly longer than the gate's `time-limit`.
 
+## Exit 0 to pass, 1 for not yet
+
+A gate's exit status is its answer. 0 passes. 1 means not yet: the step keeps waiting and st runs
+the gate again a minute later, then twice as long after each further not yet, up to every fifteen
+minutes. Any other status breaks the gate, and so does a check that cannot start, that something
+kills, that runs past its time limit, or that runs an `st` command st refused or that listed only
+part of a collection. A broken gate does not fail its step: the step waits, and whoever published
+the mission gets an attention item with the gate's output, to revise the gate.
+
+So decide what each failure means and exit accordingly. `verify-catalog-index.sh` exits 1 while the
+index is missing or wrong, which is not yet. [`test-pushed-branch.sh`](test-pushed-branch.sh) exits
+1 while the branch is not pushed or its tests fail, and lets any other failure, such as a worktree
+git cannot make, break the gate. A shell exits 127 for a command it cannot find and `make` exits 2
+when a target fails, so a bare `make test` breaks its gate when the tests fail; end it with
+`|| exit 1` when failing tests mean wait.
+
+An eval run is the exception: there any status but 0 fails the judge's step, as the eval's verdict.
+
 ## Three more rules that bite later
 
 **`${NAME}` belongs to st; `$NAME` belongs to the shell.** st substitutes `${ST_WORKSPACE}`,
@@ -84,11 +102,11 @@ rejects a publication that names an unknown one. The command itself runs through
 shell variables and substitutions as `$area` or `$(/usr/bin/date +%s)`. `${area}` would be read as
 an st variable and refused; write `$${area}` when the shell needs the braces.
 
-**A gate result is cached by the gate's definition and the step attempt.** A mechanical gate runs
-once for its owner, attempt, name, and exact command; asking again returns the first result. A
-retried step attempt runs its gates again, as [`wait-until-time.kdl`](wait-until-time.kdl) relies
-on. A loop's `until` gate belongs to the loop, not to one round, so end its command with
-`# round ${loop.round}` to check again each round; see
+**A gate result is kept by the gate's definition and the step attempt.** A mechanical gate's pass
+or broken result holds for its owner, attempt, name, and exact command; asking again returns it.
+Only not yet checks again on its own, as [`wait-until-time.kdl`](wait-until-time.kdl) relies on. A
+retried step attempt runs its gates again. A loop's `until` gate belongs to the loop, not to one
+round, so end its command with `# round ${loop.round}` to check again each round; see
 [`walkthrough-work.kdl`](walkthrough-work.kdl) and [`loop-until-green.kdl`](loop-until-green.kdl).
 
 **A gate on files checks the committed, pushed tree.** An agent's working tree can hold

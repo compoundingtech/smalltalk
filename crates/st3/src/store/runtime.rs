@@ -37,10 +37,12 @@ impl Runtime for SmalltalkRuntime {
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
         migrate_local_usage_seen(connection)?;
-        backfill_message_index(connection)
+        backfill_message_index(connection)?;
+        resources::create_schema(connection)
     }
 
     fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()> {
+        resources::open(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -68,7 +70,7 @@ impl Runtime for SmalltalkRuntime {
     }
 
     fn schema_digest(&self) -> String {
-        self.claim_registry().digest()
+        compatibility_digest(&self.claim_registry().digest())
     }
 
     fn classify_replicated_claim(
@@ -133,6 +135,7 @@ impl Runtime for SmalltalkRuntime {
     }
 
     fn after_projection(&self, transaction: &Transaction<'_>) -> Result<(), St3Error> {
+        resources::flush(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
     }
 
@@ -177,4 +180,14 @@ impl Runtime for SmalltalkRuntime {
     ) -> Result<Value> {
         checkpoint_rules::subject_answers(connection, subject, cut)
     }
+}
+
+/// The version of smalltalk's shared projection layout, beside the claim vocabulary. Nodes whose
+/// layouts differ keep exchanging claim authority but do not compare projection maps.
+const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.resources.v1";
+
+/// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.
+pub(crate) fn compatibility_digest(registry_digest: &str) -> String {
+    canonical_hash(&(SHARED_PROJECTION_LAYOUT, registry_digest))
+        .expect("projection compatibility identity serializes")
 }

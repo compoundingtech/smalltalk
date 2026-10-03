@@ -85,6 +85,7 @@
             { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/SubjectDefinition" },
             { "$ref": "#/$defs/Page" },
+            { "$ref": "#/$defs/ResourcesPage" },
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
             { "$ref": "#/$defs/ConversationChanges" },
@@ -1093,6 +1094,41 @@
         }
       ]
     },
+    "ResourceObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "facts", "observed_at", "opened_by", "opened_by_run"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "kind": { "type": "string" },
+        "facts": { "type": "object", "additionalProperties": true },
+        "observed_at": { "$ref": "#/$defs/Timestamp" },
+        "opened_by": { "type": ["string", "null"] },
+        "opened_by_run": { "type": ["string", "null"] }
+      }
+    },
+    "ResourcesFilter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "opened_by": { "type": "string" },
+        "kind": { "type": "string" },
+        "subject_prefix": { "type": "string" }
+      }
+    },
+    "ResourcesPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "collection", "filters", "items", "page"],
+      "properties": {
+        "kind": { "const": "page" },
+        "collection": { "const": "resources" },
+        "filters": { "type": "object", "additionalProperties": { "type": "string" } },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/ResourceObservation" } },
+        "page": { "$ref": "#/$defs/PageInfo" },
+        "sync": { "$ref": "#/$defs/SyncNotice" }
+      }
+    },
     "Resource": {
       "oneOf": [
         { "$ref": "#/$defs/Attention" }, { "$ref": "#/$defs/Message" },
@@ -1121,7 +1157,7 @@
       "required": ["kind", "collection", "filters", "items", "page"],
       "properties": {
         "kind": { "const": "page" },
-        "collection": { "type": "string" },
+        "collection": { "type": "string", "not": { "const": "resources" } },
         "filters": { "type": "object", "additionalProperties": { "type": "string" } },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
         "page": { "$ref": "#/$defs/PageInfo" },

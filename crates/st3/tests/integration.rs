@@ -24,6 +24,7 @@ mod fleet;
 mod gate_kinds;
 mod getting_started;
 mod hook_telemetry;
+mod human_gates;
 mod idle_budget;
 mod log_diet;
 mod messaging_faults;

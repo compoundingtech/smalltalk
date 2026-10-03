@@ -794,6 +794,10 @@ gate fails that step, as it did before.
 A gate in a loop's `until` answers each round: not yet ends the round without a pass, and a broken
 gate holds the loop for a revision.
 
+An eval run keeps the verdicts its judges give. Nobody revises an eval run, so there an exec gate
+that says not yet or is broken fails its boundary, as any status but 0 did before, and st raises no
+attention item.
+
 #### Check a gate before you publish it
 
 `st missions check FILE` runs each exec gate in the file once, now, on this host, with the
@@ -860,12 +864,34 @@ A newer st build can word the same gate's request differently and ask again for 
 The reviewer then sees one review: the newest request, which is the one the gate waits on, aged
 from the first request, on every node.
 
+Each reconcile pass asks a waiting gate for its owner's current generation, revision, definition
+and attempt. A request that went stale, because the step was retried or its definition changed,
+is asked again on the next pass, so an open step waiting on a person always has a request the
+person can answer. The reviewer's answer is the `gate.result` that the request's reviewer bound
+to it. The gate and the review list read answers by that one rule, so a later result from another
+actor cannot hide an answer from the gate while the list no longer offers the review.
+
+A loop's human gates (`until`, a person's candidate choice, `on-exhausted`) are asked of its
+`loop-run/GENERATION/PATH` subject, and are current while the step running the loop is on the
+attempt they were asked for. They are listed, approved and rejected like step gates. A for-each
+loop stored before that mode was removed asks an item's metric gate of
+`loop-run/GENERATION/PATH/item/ID` with the item's round as its attempt; that review is current
+until the loop records the item's round.
+
+The review list and each reviewer's attention agree: a review is offered exactly while its card
+is shown. Both need the gate's run, and every run above it, to be open and on the generation of
+the step that started it, each such parent step to be open (a failed one counts as closed until
+it is retried), and a subscription or schedule that delivered the run to still run. While that
+does not hold, an answer could change nothing, so the review is not listed and an answer is
+refused with the reason, such as which parent step failed. It is offered again once that step
+is retried.
+
 `st attention ls --as person/NAME` shows the selected person's pending KDL human gates together
 with their other current decisions and faults.
 
 The human view shows the mission, owner step, question, review targets, age, and exact decision commands. `--json` returns the same current review records as structured data.
 
-The list excludes resolved requests, old generations, changed definitions, old attempts, and terminal owners. A result from a different actor does not resolve a request.
+The list excludes resolved requests, old generations, changed definitions, old attempts, terminal owners, and runs whose parent step or delivering subscription has ended. A result from a different actor does not resolve a request.
 
 ### Human attention inbox
 
