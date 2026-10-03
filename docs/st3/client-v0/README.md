@@ -582,8 +582,15 @@ credential bound to that key. The resulting session returns the exact delegated 
 device-session actor, and granted scopes.
 Pairing codes expire after five minutes and reveal no fleet secret. The remote device cannot
 request its own actor or scopes. By default the trusted local begin grants projection reads,
-terminal reads, attention control, and launch control. For an intentionally trusted device that
-needs Chat sends, mission/work actions, runtime control, and terminal input, the initiating person
+glasses reads and control, terminal reads, attention control, and launch control. The begin
+request may narrow that default with `scopes`, a non-empty subset of exactly those limited
+scopes (`read.projections`, `read.glasses`, `control.glasses`, `terminal.read`,
+`control.attention`, `control.launches`); any other scope, or `scopes` combined with
+`full_control`, is rejected with a validation error. `st devices --as person/alex pair
+--read-only "Wall display"` requests `read.projections`, `read.glasses`, and `terminal.read`, so
+the device can observe but every attention, launch, and other action returns `403`. For an
+intentionally trusted device that needs Chat sends, mission/work actions, runtime control, and
+terminal input, the initiating person
 must use `st devices --as person/alex pair --full-control "Alex iPhone"` on the trusted local
 socket. The selected concrete scopes are sealed into that pairing; existing limited devices are
 not silently upgraded and must be re-paired, then revoked when no longer needed. Revocation takes

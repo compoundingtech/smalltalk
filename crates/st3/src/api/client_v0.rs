@@ -5134,6 +5134,8 @@ pub(super) struct PairingBegin {
     device_name: String,
     person_id: String,
     full_control: Option<bool>,
+    /// Narrows the default device grant; every entry must be a limited pairing scope.
+    scopes: Option<Vec<String>>,
 }
 
 pub(super) async fn pairing_begin(
@@ -5173,10 +5175,34 @@ pub(super) async fn pairing_begin(
     let subject = format!("custom/client/pairing-{}", &stable[..24]);
     let expires_at = client_now_ms() + 300_000;
     let person_id = request.person_id;
-    let scopes = if request.full_control.unwrap_or(false) {
-        ALL_SCOPES
-    } else {
-        LIMITED_PAIRING_SCOPES
+    let scopes: Vec<&str> = match (request.full_control.unwrap_or(false), request.scopes) {
+        (true, Some(_)) => {
+            return Err(validation(
+                "the pairing request cannot combine full control with explicit scopes",
+            ));
+        }
+        (true, None) => ALL_SCOPES.to_vec(),
+        (false, None) => LIMITED_PAIRING_SCOPES.to_vec(),
+        (false, Some(requested)) => {
+            if let Some(unknown) = requested
+                .iter()
+                .find(|scope| !LIMITED_PAIRING_SCOPES.contains(&scope.as_str()))
+            {
+                return Err(validation(format!(
+                    "the pairing scope `{unknown}` is not one of the limited pairing scopes: {}",
+                    LIMITED_PAIRING_SCOPES.join(", ")
+                )));
+            }
+            if requested.is_empty() {
+                return Err(validation("the pairing request must name at least one scope"));
+            }
+            // Canonical order, duplicates dropped.
+            LIMITED_PAIRING_SCOPES
+                .iter()
+                .copied()
+                .filter(|scope| requested.iter().any(|requested| requested == scope))
+                .collect()
+        }
     };
     state
         .store
