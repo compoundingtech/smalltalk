@@ -15,8 +15,8 @@ pub use environment::{
     login_environment_within, materialize_environment, overlay_environment, resolve_executable,
 };
 pub use isolate::{
-    Isolation, initialize_isolation, mode as isolation_mode, scope_unit, systemd_user_available,
-    warn_if_degraded, wrap as wrap_isolated,
+    Isolation, SCOPE_GRACE, end_scope, initialize_isolation, mode as isolation_mode, scope_unit,
+    signal_scope, systemd_user_available, warn_if_degraded, wrap as wrap_isolated,
 };
 pub use priority::{
     LIVE_WEIGHT, ServerPlacement, protect_server, protect_servers, report as priority_report,
