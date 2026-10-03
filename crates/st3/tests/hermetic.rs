@@ -10,7 +10,7 @@ fn fixture_commands_clear_host_seat_settings_before_adding_their_own() {
         .env("ST_AGENT", "agent/host/seat")
         .env("ST3_ENDPOINT", "/host-daemon.sock")
         .env("ST3_INCARNATION", "host-incarnation")
-        .env("ST3_PERSON", "person/host");
+        .env("ST3_PERSON", "person/pat");
     st3::test_support::clear_seat_environment(&mut command);
     command.env("ST3_ENDPOINT", "/fixture-daemon.sock")
         .args(["--noprofile", "--norc", "-c",

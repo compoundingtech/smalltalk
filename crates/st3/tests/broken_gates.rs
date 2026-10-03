@@ -351,7 +351,7 @@ mission "orchid/replay" state="ready" {
         health["message"].as_str().unwrap().contains(stuck),
         "{health}"
     );
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .env_clear()
         .env("HOME", root.path())
         .env("ST3_DAEMON_WAIT", "0")
