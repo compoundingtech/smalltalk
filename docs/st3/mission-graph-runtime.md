@@ -317,6 +317,8 @@ The daemon gives a running native harness 60 seconds to become ready. At the dea
 
 A mission can have one `finally` block. Final steps can depend on other final steps.
 
+A run's outcome follows its normal work. A final step that fails after that work completed does not fail the run: the run completes, the failed step stays on it with its reason, and st raises one fault for the run to `person/operator` that names each failed step and shows for a day after the run ends. A run whose normal work failed is failed, and a cancelled run is cancelled, with the final failure in its reason.
+
 Dependencies cannot cross the normal and final phases. A final step does not make normal work optional.
 
 Step revision protection adds to inherited mission protection. Direct agents in the step can revise that step subtree.
@@ -1415,6 +1417,8 @@ Cancellation also cancels active descendant mission runs. Each descendant uses i
 The terminal state is `cancelled` after successful final work. A final failure makes the run failed.
 
 After final work, st enters cleanup and stops every runtime owned by the mission run. A seat is never stopped while it holds a message nobody has read or work in a run outside this one. The run still finishes. The seat keeps its stop declaration, st checks it again every ten seconds, and it stops once the message is read and the other work ends. A person's own stop is not delayed.
+
+A final step that stops a seat completes once the stop asks nothing more of it: the seat is stopped, absent, never observed, already being stopped, or kept for the reasons above. A kept seat does not hold the step to its timeout, so the step never fails a run whose work succeeded. The deferral records a `stop-deferred` warning diagnostic on the seat.
 
 The run becomes terminal only after those runtime subjects report a stopped, absent, or exited state.
 

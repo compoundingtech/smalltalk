@@ -2,6 +2,9 @@
 use super::*;
 use crate::model::LoopSpec;
 
+/// How long a run whose cleanup failed shows that fault after it finishes.
+const FINAL_STEP_FAULT_MS: u128 = 24 * 60 * 60 * 1000;
+
 impl Store {
     pub(super) fn person_attention_items(
         &self,
@@ -868,7 +871,13 @@ impl Store {
                 continue;
             }
             if source.starts_with("mission-run/") {
-                if !person_work::run_live(&connection, source, None, true)? {
+                // A finished run's failed cleanup is a fault on a run that completed, so the run
+                // is no longer live. It stays for a day, then the failed step is all that remains.
+                let cleanup_fault = claim.body["fields"]["episode"]
+                    .as_str()
+                    .is_some_and(|episode| episode.starts_with("final-steps:"))
+                    && as_of.saturating_sub(failure.requested_at_unix_ms) < FINAL_STEP_FAULT_MS;
+                if !cleanup_fault && !person_work::run_live(&connection, source, None, true)? {
                     continue;
                 }
             } else if source.starts_with("step-run/") {

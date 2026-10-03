@@ -3,7 +3,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { isSnapshotChurn, listSessionPages, type Conversation, type SessionView } from './sessionView';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
 import { listCollectionPages } from './collectionPages';
@@ -344,6 +344,11 @@ function useAppStore() {
         const id = actionId();
         return client.terminalResize({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, rows, columns } });
       });
+    },
+    /** What was said in conversations, as st's search finds it; a string says why not. */
+    async searchConversations(text: string): Promise<ConversationSearch | string> {
+      if (!client || status !== 'online') return 'offline';
+      try { return (await client.conversationSearch(text, { limit: 20 })).value; } catch (e) { return errorText(e); }
     },
     async mission(id: string): Promise<Mission | null> {
       if (!client || status !== 'online') return missionDetailCache.current.get(id) ?? null;
