@@ -662,6 +662,8 @@ them, and every node deletes the same ones:
    envelopes in the inventory. The authority digest does not change, and peers, including builds
    without checkpoints, never send those envelopes again.
 
+[Checkpoints and trimming](checkpoints.md) explains the rules, with worked examples.
+
 A node that did not verify a stable checkpoint, such as one that joined later, adopts it. A peer
 lists the newest checkpoint it trimmed in its inventory. The node fetches the manifest of
 tombstones from that peer and checks the whole manifest against the verified drop digest before
