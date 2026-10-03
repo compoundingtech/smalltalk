@@ -903,7 +903,7 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             );
             assert_eq!(
                 daemon.store.message("message/unread").unwrap().unwrap().status,
-                "delivered"
+                "staged"
             );
             daemon.stop().await;
         }
