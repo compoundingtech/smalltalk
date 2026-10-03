@@ -130,8 +130,9 @@ impl Store {
         Ok(None)
     }
 
-    /// The agent that owns `fault`: the agent assigned to the failed step, else the requester
-    /// of its run or of a run above it when that is an agent, else `fallback`. Only a live agent
+    /// The agent that owns `fault`: the agent it names, as a broken gate names the agent that
+    /// published it, else the agent assigned to the failed step, else the requester of its run
+    /// or of a run above it when that is an agent, else `fallback`. Only a live agent
     /// declaration owns a fault, and a faulted agent never owns its own fault.
     pub(super) fn fault_owner(
         &self,
@@ -145,6 +146,9 @@ impl Store {
                 && current_desired_row(&connection, agent)?.is_some_and(|row| row.kind == "agent")
                 && person_work::declaration_live(&connection, agent)?)
         };
+        if owns(&fault.person)? {
+            return Ok(Some(fault.person.clone()));
+        }
         let mut step = fault.step.clone().or_else(|| {
             fault
                 .subject
@@ -785,6 +789,59 @@ impl Store {
         Ok(items)
     }
 
+    /// The broken exec gates of current run generations, each for the publisher it names. An
+    /// item holds while its generation is current and live and its step has not ended, and
+    /// closes when a revision replaces the generation.
+    pub(super) fn broken_gate_items(
+        &self,
+        person: Option<&str>,
+        as_of: u128,
+    ) -> Result<Vec<AttentionItemView>> {
+        let connection = self.readers.get();
+        let mut items = Vec::new();
+        for failure in self.operational_failures()? {
+            if failure.status != "pending"
+                || failure.requested_at_unix_ms > as_of
+                || person.is_some_and(|person| person != failure.reviewer)
+            {
+                continue;
+            }
+            let Some(claim) = self.claim_by_id(&failure.request)? else {
+                continue;
+            };
+            if claim.body["fields"]["condition"] != GATE_BROKEN_CONDITION {
+                continue;
+            }
+            let [run, generation, result, rest @ ..] = failure.targets.as_slice() else {
+                continue;
+            };
+            if !person_work::run_live(&connection, run, Some(generation), false)? {
+                continue;
+            }
+            let step = rest.first().cloned();
+            if let Some(step) = &step {
+                let Some(view) = person_work::step(&connection, step)? else {
+                    continue;
+                };
+                if matches!(view.status.as_str(), "completed" | "failed" | "cancelled") {
+                    continue;
+                }
+            }
+            let (run, result) = (run.clone(), result.clone());
+            let mut item = attention_item_from_failure(failure);
+            item.episode = claim.id;
+            item.subject = run.clone();
+            item.mission_run = Some(run.clone());
+            item.step = step;
+            item.actions = vec![
+                attention_action("inspect gate", &["st", "subject", "show", &result]),
+                attention_action("inspect run", &["st", "missions", "show", &run]),
+            ];
+            items.push(item);
+        }
+        Ok(items)
+    }
+
     pub(super) fn operational_attention_items(
         &self,
         person: Option<&str>,
@@ -807,6 +864,10 @@ impl Store {
             };
             let source = &claim.subject;
             if source.starts_with("loop-run/") || source.starts_with("observer/") {
+                continue;
+            }
+            // `broken_gate_items` reads broken gates, for their publisher.
+            if claim.body["fields"]["condition"] == GATE_BROKEN_CONDITION {
                 continue;
             }
             if source.starts_with("mission-run/") {

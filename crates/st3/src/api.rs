@@ -10797,12 +10797,14 @@ async fn revise_mission_run(
             planned.blockers.join("; "),
         )));
     }
+    // The revision records its publisher: a broken gate in it raises attention for them.
     state
         .store
-        .apply(
+        .apply_as(
             &publication,
             &planned.subject_tokens,
             &format!("{}:publish", request.idempotency_key),
+            Some(&actor),
         )
         .map_err(ApiError::bad)?;
     // A failed run has no active work to drain, so it adopts an unreviewed revision now.

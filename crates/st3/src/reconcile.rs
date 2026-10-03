@@ -42,6 +42,13 @@ const GATE_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// While every polled gate runner still runs, a pass runs at most this often for them, so a gate's
 /// time limit is still enforced.
 const GATE_POLL_PASS_INTERVAL: Duration = Duration::from_secs(60);
+/// An exec gate whose check said not yet checks again this long after its first check, doubling
+/// the wait after each further not yet up to [`GATE_RECHECK_MAX_MS`].
+const GATE_RECHECK_BASE_MS: u128 = 60_000;
+const GATE_RECHECK_MAX_MS: u128 = 15 * 60_000;
+/// How much of a gate check's output its result and attention item keep, from the end.
+const GATE_OUTPUT_LINES: usize = 40;
+const GATE_OUTPUT_BYTES: usize = 4_000;
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
 // A new harness can spend longer than the retry sequence reading its boot
 // contract before it claims work. Keep the quick delivery retries, but do not
@@ -531,6 +538,11 @@ pub struct Reconciler<R = NativeRuntime> {
     unrecorded_faults: Mutex<Vec<String>>,
     /// Step-timeout faults this reconciler has already raised, so a pass records each once.
     step_timeout_faults: Mutex<BTreeSet<String>>,
+    /// Broken-gate attention episodes this reconciler has already raised, so a pass that finds a
+    /// gate still broken does not read every operational failure again.
+    raised_broken_gates: Mutex<BTreeSet<String>>,
+    /// The wait before an exec gate's second check; see [`GATE_RECHECK_BASE_MS`].
+    gate_recheck_base_ms: u128,
     /// Each seat's last retention reading: when it was taken and why the seat stays.
     seat_retention: Mutex<HashMap<String, (u128, Option<String>)>>,
     fault_injection: Option<Arc<dyn FaultInjection>>,
@@ -636,6 +648,8 @@ impl Reconciler<NativeRuntime> {
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
             step_timeout_faults: Mutex::new(BTreeSet::new()),
+            raised_broken_gates: Mutex::new(BTreeSet::new()),
+            gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
             fault_injection: None,
             disk_probe: Some(Arc::new(crate::disk::disk_space)),
@@ -686,6 +700,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
             step_timeout_faults: Mutex::new(BTreeSet::new()),
+            raised_broken_gates: Mutex::new(BTreeSet::new()),
+            gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
             fault_injection: None,
             disk_probe: None,
@@ -4879,7 +4895,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     &variables,
                 )? {
                     GateOutcome::Pass => {}
-                    GateOutcome::Pending => return Ok(changed),
+                    // A broken mission gate waits for a revision, as a pending one waits.
+                    GateOutcome::Pending | GateOutcome::NotYet | GateOutcome::Broken(_) => {
+                        return Ok(changed);
+                    }
                     GateOutcome::Fail(reason) => {
                         normal_failed = true;
                         normal_failure_reason = Some(reason);
@@ -5262,7 +5281,22 @@ impl<R: RuntimeControl> Reconciler<R> {
                     for gate in &step.spec.gates {
                         match self.evaluate_mission_gate(run, &step, view, gate)? {
                             GateOutcome::Pass => {}
-                            GateOutcome::Pending => {
+                            GateOutcome::Pending | GateOutcome::NotYet => {
+                                gates_pass = false;
+                                break;
+                            }
+                            // A broken gate holds its step for a revision. A finally step cannot
+                            // take one, so it fails as before, with the gate's reason.
+                            GateOutcome::Broken(reason) if step.spec.finally => {
+                                changed |= self.store.set_step_state(
+                                    &view.subject,
+                                    "failed",
+                                    Some(&reason),
+                                )?;
+                                gates_pass = false;
+                                break;
+                            }
+                            GateOutcome::Broken(_) => {
                                 gates_pass = false;
                                 break;
                             }
@@ -6046,7 +6080,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                             passed = false;
                             break;
                         }
-                        GateOutcome::Pending | GateOutcome::Fail(_) => passed = false,
+                        // A broken gate holds the loop for a revision.
+                        GateOutcome::Broken(_) => {
+                            waiting = true;
+                            passed = false;
+                            break;
+                        }
+                        GateOutcome::Pending | GateOutcome::NotYet | GateOutcome::Fail(_) => {
+                            passed = false
+                        }
                     }
                 }
                 if waiting {
@@ -6140,7 +6182,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         {
                             return Ok(None);
                         }
-                        GateOutcome::Pending | GateOutcome::Fail(_) => 0.0,
+                        GateOutcome::Broken(_) => return Ok(None),
+                        GateOutcome::Pending | GateOutcome::NotYet | GateOutcome::Fail(_) => 0.0,
                     }
                 }
                 MetricSource::Field { subject, path } => {
@@ -7122,7 +7165,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 {
                     return Ok(false);
                 }
-                GateOutcome::Pending | GateOutcome::Fail(_) => passed = false,
+                GateOutcome::Broken(_) => return Ok(false),
+                GateOutcome::Pending | GateOutcome::NotYet | GateOutcome::Fail(_) => passed = false,
             }
         }
         self.record_once(
@@ -7229,8 +7273,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                         GateOutcome::Pass => {
                             return Ok(LoopCandidateSelection::Winner(*candidate));
                         }
-                        GateOutcome::Pending => return Ok(LoopCandidateSelection::Pending),
-                        GateOutcome::Fail(_) => {}
+                        GateOutcome::Pending | GateOutcome::Broken(_) => {
+                            return Ok(LoopCandidateSelection::Pending);
+                        }
+                        GateOutcome::NotYet | GateOutcome::Fail(_) => {}
                     }
                 }
                 Ok(LoopCandidateSelection::NoWinner)
@@ -7711,7 +7757,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     self.store
                         .set_step_state(&view.subject, "failed", Some(&review_reason))
                 }
-                GateOutcome::Pending => Ok(false),
+                GateOutcome::Pending | GateOutcome::NotYet | GateOutcome::Broken(_) => Ok(false),
             },
         }
     }
@@ -8467,6 +8513,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .find(|step| step.subject == subject)
                 .map_or(run.created_at_unix_ms, |step| step.created_at_unix_ms),
             attempt,
+            run: run.subject.clone(),
+            generation: run.generation.clone(),
         };
         self.evaluate_gate(&stage, &gate)
     }
@@ -8685,6 +8733,18 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// left every pass a wake per running step minutes later, so passes kept themselves going
     /// (1,585 wakes in five minutes on a member with fourteen running steps).
     fn arm_step_deadline(&self, handle: &tokio::runtime::Handle, step: &str, remaining: u64) {
+        self.arm_deadline(handle, step, remaining, "timer step-timeout");
+    }
+
+    /// Wake the reconciler in `remaining` ms for `key`, unless `key` already armed a wake at or
+    /// before then; `wake` names the timer in wake accounting.
+    fn arm_deadline(
+        &self,
+        handle: &tokio::runtime::Handle,
+        key: &str,
+        remaining: u64,
+        wake: &'static str,
+    ) {
         let now = now_ms();
         let deadline = now.saturating_add(u128::from(remaining));
         {
@@ -8693,25 +8753,25 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if armed
-                .get(step)
+                .get(key)
                 .is_some_and(|at| *at > now && *at <= deadline)
             {
                 return;
             }
-            armed.insert(step.to_owned(), deadline);
+            armed.insert(key.to_owned(), deadline);
         }
         let notify = self.notify.clone();
         let armed = self.step_deadlines.clone();
-        let step = step.to_owned();
+        let key = key.to_owned();
         handle.spawn(async move {
             tokio::time::sleep(Duration::from_millis(remaining)).await;
             {
                 let mut armed = armed.lock().unwrap_or_else(PoisonError::into_inner);
-                if armed.get(&step) == Some(&deadline) {
-                    armed.remove(&step);
+                if armed.get(&key) == Some(&deadline) {
+                    armed.remove(&key);
                 }
             }
-            crate::performance::record_wake("timer step-timeout", None);
+            crate::performance::record_wake(wake, None);
             notify.notify_one();
         });
     }
@@ -10373,7 +10433,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             let (verdict, reason) = match &outcome {
                 GateOutcome::Pass => ("pass", None),
                 GateOutcome::Fail(reason) => ("fail", Some(reason.clone())),
-                GateOutcome::Pending => unreachable!(),
+                GateOutcome::Pending | GateOutcome::NotYet | GateOutcome::Broken(_) => {
+                    unreachable!()
+                }
             };
             let mut fields = BTreeMap::from([
                 ("stage".into(), Value::String(stage.subject.clone())),
@@ -10390,6 +10452,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(outcome)
     }
 
+    /// Run an exec gate. Its check's exit status is its answer: 0 passes, 1 is not yet, and the
+    /// gate checks again later. Anything else breaks the gate: another status, a check that was
+    /// killed or ran past its time limit, a check that could not start, or an `st` call st refused
+    /// or that read part of a listing. A broken gate raises one attention item for its mission's
+    /// publisher and its boundary waits for a revision.
     #[allow(clippy::too_many_arguments)]
     fn run_mechanical(
         &self,
@@ -10413,85 +10480,119 @@ impl<R: RuntimeControl> Reconciler<R> {
                 "time_limit_ms": time_limit_ms,
             }),
         )?;
-        let runtime_id = result_subject.replace('/', ".");
-        if let Some(result) = self
+        // Each check records its result on the gate's first operation, so the newest result
+        // there is the gate's answer. A later check runs as its own operation.
+        let latest = self
             .store
-            .latest_claim(&result_subject, Some("gate.result"))?
-        {
-            let verdict = result
-                .body
-                .pointer("/fields/verdict")
-                .and_then(Value::as_str)
-                .unwrap_or("fail");
-            let reason = result
-                .body
-                .pointer("/fields/reason")
-                .and_then(Value::as_str)
-                .unwrap_or("the mechanical gate failed");
-            return Ok(if verdict == "pass" {
-                GateOutcome::Pass
+            .latest_claim(&result_subject, Some("gate.result"))?;
+        let check = match latest.as_ref() {
+            None => 1,
+            Some(result) => match gate_check_answer(result) {
+                "pass" => return Ok(GateOutcome::Pass),
+                "broken" => {
+                    let reason = gate_result_reason(result, "the gate is broken");
+                    self.raise_broken_gate(stage, name, &result_subject, result)?;
+                    return Ok(GateOutcome::Broken(reason));
+                }
+                "not-yet" => {
+                    let previous = result
+                        .body
+                        .pointer("/fields/value/check")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1);
+                    let next = previous.saturating_add(1);
+                    let started = self
+                        .store
+                        .latest_claim(
+                            &gate_check_subject(&result_subject, next),
+                            Some("gate.requested"),
+                        )?
+                        .is_some();
+                    let due = result
+                        .accepted_at_unix_ms
+                        .saturating_add(self.gate_recheck_delay_ms(previous));
+                    let now = now_ms();
+                    if !started && now < due {
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            self.arm_deadline(
+                                &handle,
+                                &result_subject,
+                                (due - now).min(u128::from(u64::MAX)) as u64,
+                                "timer gate-recheck",
+                            );
+                        }
+                        return Ok(GateOutcome::NotYet);
+                    }
+                    next
+                }
+                // A result an older st recorded: any status but 0 failed the gate.
+                _ => {
+                    return Ok(GateOutcome::Fail(gate_result_reason(
+                        result,
+                        "the mechanical gate failed",
+                    )));
+                }
+            },
+        };
+        if host != self.host {
+            return Ok(if check == 1 {
+                GateOutcome::Pending
             } else {
-                GateOutcome::Fail(reason.into())
+                GateOutcome::NotYet
             });
         }
-        if host != self.host {
-            return Ok(GateOutcome::Pending);
-        }
+        let operation = gate_check_subject(&result_subject, check);
+        let runtime_id = operation.replace('/', ".");
+        let report = self.gate_report_path(&runtime_id);
+        let check_result =
+            |exit_code: Option<i64>, calls: Vec<String>, reason: Option<String>| GateCheck {
+                name,
+                host,
+                result_subject: &result_subject,
+                operation: &operation,
+                check,
+                exit_code,
+                calls,
+                output: self.gate_output(&runtime_id),
+                start_failure: reason,
+            };
         if let Some(requested) = self
             .store
-            .latest_claim(&result_subject, Some("gate.requested"))?
+            .latest_claim(&operation, Some("gate.requested"))?
         {
             let elapsed = now_ms().saturating_sub(requested.accepted_at_unix_ms);
             if elapsed >= time_limit_ms as u128 {
-                self.stop_gate_runner(&result_subject, true)?;
-                let reason = format!("mechanical gate `{name}` exceeded {time_limit_ms}ms");
-                self.record_once(
-                    &result_subject,
-                    "gate.result",
-                    BTreeMap::from([
-                        ("verdict".into(), Value::String("fail".into())),
-                        ("reason".into(), Value::String(reason.clone())),
-                    ]),
-                )?;
-                return Ok(GateOutcome::Fail(reason));
+                self.stop_gate_runner(&operation, true)?;
+                let mut check = check_result(None, crate::gate_report::read(&report), None);
+                check.start_failure = Some(format!(
+                    "its check ran past its time limit of {}",
+                    render_duration_ms(time_limit_ms)
+                ));
+                return self.record_gate_check(stage, check);
             }
-            match self.runtime.observe_exec(&runtime_id)? {
-                Some(observation) if observation.status == "running" => {
-                    self.arm_gate_poll(&runtime_id);
-                    return Ok(GateOutcome::Pending);
-                }
+            return match self.runtime.observe_exec(&runtime_id)? {
                 Some(observation) if observation.status == "exited" => {
-                    let exit_code = self.gate_exit_code(&result_subject, &observation)?;
-                    let verdict = if exit_code == Some(0) { "pass" } else { "fail" };
-                    let reason = match exit_code {
-                        Some(_) => format!("mechanical gate `{name}` {verdict}"),
-                        None => format!(
-                            "mechanical gate `{name}` {verdict}: it exited without an exit status"
-                        ),
-                    };
-                    self.record_once(
-                        &result_subject,
-                        "gate.result",
-                        BTreeMap::from([
-                            ("verdict".into(), Value::String(verdict.into())),
-                            ("reason".into(), Value::String(reason.clone())),
-                        ]),
-                    )?;
-                    return Ok(if verdict == "pass" {
-                        GateOutcome::Pass
-                    } else {
-                        GateOutcome::Fail(reason)
-                    });
+                    let exit_code = self.gate_exit_code(&operation, &observation)?;
+                    let check = check_result(exit_code, crate::gate_report::read(&report), None);
+                    self.record_gate_check(stage, check)
                 }
                 _ => {
                     self.arm_gate_poll(&runtime_id);
-                    return Ok(GateOutcome::Pending);
+                    Ok(GateOutcome::Pending)
                 }
-            }
+            };
         }
 
+        if let Some(directory) = report.parent() {
+            std::fs::create_dir_all(directory)?;
+        }
+        match std::fs::remove_file(&report) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         self.record_once(
-            &result_subject,
+            &operation,
             "gate.requested",
             BTreeMap::from([
                 ("status".into(), Value::String("requested".into())),
@@ -10499,16 +10600,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("owner".into(), Value::String(stage.subject.clone())),
             ]),
         )?;
+        let mut environment = environment.clone();
+        environment.insert(
+            crate::gate_report::ENV.into(),
+            report.to_string_lossy().into_owned(),
+        );
         let member = MemberSpec {
             kind: MemberKind::Exec,
             host: host.into(),
-            runtime_id,
+            runtime_id: runtime_id.clone(),
             workspace: workspace.into(),
             workspace_create: false,
             cwd: workspace.into(),
             terminal: false,
             launch: LaunchSpec::Shell(command.into()),
-            environment: environment.clone(),
+            environment,
             tags: BTreeMap::new(),
             display_name: None,
             lifecycle: MemberLifecycle::Service,
@@ -10518,7 +10624,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             driver: Some("mechanical-gate".into()),
         };
         let desired = DesiredSubject {
-            subject: result_subject,
+            subject: operation.clone(),
             kind: "gate".into(),
             desired: Value::Null,
             member: Some(member.clone()),
@@ -10526,9 +10632,225 @@ impl<R: RuntimeControl> Reconciler<R> {
             owner_generation: None,
             owner_step: None,
         };
-        self.perform_start(&desired, &member, "the mechanical gate was requested")?;
+        // A check that cannot start, such as one whose workspace is missing, cannot answer.
+        if let Err(error) =
+            self.perform_start(&desired, &member, "the mechanical gate was requested")
+        {
+            let check = check_result(
+                None,
+                Vec::new(),
+                Some(format!("its check could not start: {error:#}")),
+            );
+            return self.record_gate_check(stage, check);
+        }
         self.arm_gate_poll(&member.runtime_id);
         Ok(GateOutcome::Pending)
+    }
+
+    /// Record one finished exec gate check on the gate's result subject and answer for it.
+    fn record_gate_check(&self, stage: &GateContext, check: GateCheck<'_>) -> Result<GateOutcome> {
+        let broken = if let Some(reason) = check.start_failure.clone() {
+            Some(reason)
+        } else if !check.calls.is_empty() {
+            Some(format!(
+                "an st call in its check was refused or read part of a listing: {}",
+                check.calls.join("; ")
+            ))
+        } else {
+            match check.exit_code {
+                Some(0 | 1) => None,
+                Some(127) => Some(
+                    "its check exited 127, the shell's status for a command it did not find; an exec gate exits 0 to pass and 1 for not yet"
+                        .into(),
+                ),
+                Some(code) if code > 128 => Some(format!(
+                    "its check exited {code}, as a process killed by signal {} does; an exec gate exits 0 to pass and 1 for not yet",
+                    code - 128
+                )),
+                Some(code) => Some(format!(
+                    "its check exited {code}; an exec gate exits 0 to pass and 1 for not yet"
+                )),
+                None => Some("its check ended without an exit status: something killed it".into()),
+            }
+        };
+        let (answer, reason) = match (&broken, check.exit_code) {
+            (Some(reason), _) => (
+                "broken",
+                format!("exec gate `{}` is broken: {reason}", check.name),
+            ),
+            (None, Some(0)) => ("pass", format!("exec gate `{}` passed", check.name)),
+            (None, _) => (
+                "not-yet",
+                format!(
+                    "exec gate `{}` is not ready yet (check {})",
+                    check.name, check.check
+                ),
+            ),
+        };
+        // The replicated verdict keeps the values every fleet build accepts; `value.answer`
+        // tells a not-yet `fail` and a broken `error` apart. See `gate_check_answer`.
+        let verdict = match answer {
+            "pass" => "pass",
+            "not-yet" => "fail",
+            _ => "error",
+        };
+        let mut value = serde_json::Map::from_iter([
+            ("answer".into(), Value::String(answer.into())),
+            ("check".into(), Value::from(check.check)),
+            ("host".into(), Value::String(check.host.into())),
+            (
+                "exit_code".into(),
+                check.exit_code.map_or(Value::Null, Value::from),
+            ),
+        ]);
+        if !check.output.is_empty() {
+            value.insert("output".into(), Value::String(check.output));
+        }
+        if !check.calls.is_empty() {
+            value.insert(
+                "calls".into(),
+                Value::Array(check.calls.into_iter().map(Value::String).collect()),
+            );
+        }
+        self.record_once(
+            check.result_subject,
+            "gate.result",
+            BTreeMap::from([
+                ("verdict".into(), Value::String(verdict.into())),
+                ("reason".into(), Value::String(reason.clone())),
+                ("gate".into(), Value::String(check.name.into())),
+                ("operation".into(), Value::String(check.operation.into())),
+                ("value".into(), Value::Object(value)),
+            ]),
+        )?;
+        Ok(match answer {
+            "pass" => GateOutcome::Pass,
+            "not-yet" => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let delay = self.gate_recheck_delay_ms(check.check);
+                    self.arm_deadline(
+                        &handle,
+                        check.result_subject,
+                        delay.min(u128::from(u64::MAX)) as u64,
+                        "timer gate-recheck",
+                    );
+                }
+                GateOutcome::NotYet
+            }
+            _ => {
+                if let Some(result) = self
+                    .store
+                    .latest_claim(check.result_subject, Some("gate.result"))?
+                {
+                    self.raise_broken_gate(stage, check.name, check.result_subject, &result)?;
+                }
+                GateOutcome::Broken(reason)
+            }
+        })
+    }
+
+    /// Raise the attention item for broken exec gate `name`, once per gate result and run
+    /// generation. It goes to the publisher of the run's mission revision: an agent receives it
+    /// as a fault, a person in their attention. It closes when a revision replaces the generation.
+    fn raise_broken_gate(
+        &self,
+        stage: &GateContext,
+        name: &str,
+        result_subject: &str,
+        result: &crate::model::ClaimRecord,
+    ) -> Result<()> {
+        if stage.run.is_empty() {
+            return Ok(());
+        }
+        let episode = format!("gate-broken:{}:{result_subject}", stage.generation);
+        if !self
+            .raised_broken_gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(episode.clone())
+        {
+            return Ok(());
+        }
+        // A revision st recorded without its publisher goes to whoever requested the run.
+        let publisher = match self.store.mission_run_publisher(&stage.run)? {
+            Some(publisher) => publisher,
+            None => self
+                .store
+                .mission_run(&stage.run)?
+                .map(|run| run.requester)
+                .unwrap_or_else(|| "person/operator".into()),
+        };
+        let fields = &result.body["fields"];
+        let host = fields["value"]["host"].as_str().unwrap_or("unknown");
+        let reason = gate_result_reason(result, "the gate is broken");
+        let why = reason
+            .strip_prefix(&format!("exec gate `{name}` is broken: "))
+            .unwrap_or(&reason);
+        let owner = match gate_owner_step(&stage.subject) {
+            Some(_) => format!("Step `{}` of {}", stage.name, stage.run),
+            None => format!("Mission run {}", stage.run),
+        };
+        let mut detail =
+            format!("{owner} waits on gate `{name}`, which is broken on host `{host}`: {why}.");
+        if let Some(output) = fields["value"]["output"]
+            .as_str()
+            .filter(|output| !output.trim().is_empty())
+        {
+            detail.push_str(&format!("\n\nOutput:\n{}", output.trim_end()));
+        }
+        detail.push_str(&format!(
+            "\n\nThe work waits; st does not fail it for a broken gate. Revise the mission with a gate that answers (exit 0 to pass, 1 for not yet): `st work revise {} FILE --as ACTOR --reason TEXT`. A revision that changes only gates keeps the work already submitted and checks the revised gates.",
+            stage.run
+        ));
+        let mut targets = vec![
+            stage.run.clone(),
+            stage.generation.clone(),
+            result_subject.to_owned(),
+        ];
+        if let Some(step) = gate_owner_step(&stage.subject) {
+            targets.push(step);
+        }
+        self.store.record_runtime_failure(
+            &episode,
+            &AttentionRequest {
+                reviewer: publisher,
+                title: format!("Gate `{name}` is broken"),
+                reason: detail,
+                severity: "error".into(),
+                targets,
+                actor: RECONCILER_ACTOR.into(),
+                idempotency_key: episode.clone(),
+            },
+            crate::store::GATE_BROKEN_CONDITION,
+        )?;
+        Ok(())
+    }
+
+    /// When an exec gate checks again after check `check` said not yet: a minute after the
+    /// first, doubling each time, and at most every fifteen minutes.
+    fn gate_recheck_delay_ms(&self, check: u64) -> u128 {
+        let doublings = u32::try_from(check.saturating_sub(1))
+            .unwrap_or(u32::MAX)
+            .min(16);
+        self.gate_recheck_base_ms
+            .saturating_mul(1_u128 << doublings)
+            .min(GATE_RECHECK_MAX_MS)
+    }
+
+    /// The file a gate check's `st` commands report refusals and partial listings to.
+    fn gate_report_path(&self, runtime_id: &str) -> PathBuf {
+        self.driver_state_dir.join("gate-reports").join(runtime_id)
+    }
+
+    /// The end of a gate check's output, for its result and attention item.
+    fn gate_output(&self, runtime_id: &str) -> String {
+        let log = self
+            .runtime
+            .read_exec_log(runtime_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        output_tail(&log, GATE_OUTPUT_LINES, GATE_OUTPUT_BYTES)
     }
 
     /// An exited gate runner's exit code. A runner that outlived a daemon restart is no longer
@@ -11811,7 +12133,7 @@ pub(crate) fn append_fault_message(
         content.push_str(&format!("\n\nInspect: {}", inspect.join(", ")));
     }
     content.push_str(&format!(
-        "\n\nThis fault is yours: st sends it to the agent assigned to the failed step, else to the run's requester, else to the fleet's fault agent, and never to a person's now. Retry, revise or cancel the work. If you need something only a person can give, ask with `st work ask`.\n\nSource: {}",
+        "\n\nThis fault is yours: st sends a broken gate to the agent that published its mission, and any other fault to the agent assigned to the failed step, else to the run's requester, else to the fleet's fault agent, and never to a person's now. Retry, revise or cancel the work. If you need something only a person can give, ask with `st work ask`.\n\nSource: {}",
         fault.subject
     ));
     let mut tags = vec![
@@ -12095,6 +12417,12 @@ fn token_usage_total(usage: &serde_json::Map<String, Value>) -> Option<u64> {
 enum GateOutcome {
     Pass,
     Pending,
+    /// An exec gate's check exited 1: the boundary waits, and the gate checks again later.
+    NotYet,
+    /// An exec gate cannot answer as written: its check exited with another status, was killed,
+    /// ran past its time limit, or made an `st` call st refused or read part of a listing. Its
+    /// mission's publisher has an attention item; the boundary waits for a revision.
+    Broken(String),
     Fail(String),
 }
 
@@ -12295,6 +12623,97 @@ fn gate_result_subject(stage: &GateContext, name: &str, definition: &Value) -> R
     let mut definition = definition.clone();
     definition["attempt"] = stage.attempt.into();
     gate_operation_subject(stage, name, &definition)
+}
+
+/// The operation exec gate check `check` runs as: the gate's result subject for the first
+/// check, and a subject beneath it for each later one.
+fn gate_check_subject(result_subject: &str, check: u64) -> String {
+    if check <= 1 {
+        result_subject.to_owned()
+    } else {
+        format!("{result_subject}/check/{check}")
+    }
+}
+
+/// The step a gate decides for: the step itself, or the step that owns a loop's round or
+/// candidate. A mission gate has none.
+fn gate_owner_step(subject: &str) -> Option<String> {
+    if subject.starts_with("step-run/") {
+        return Some(subject.to_owned());
+    }
+    let path = subject.strip_prefix("loop-run/")?;
+    let path = path.split("/round/").next().unwrap_or(path);
+    Some(format!("step-run/{path}"))
+}
+
+/// An exec gate result's answer: `pass`, `not-yet`, `broken`, or `fail` for a result an older
+/// st recorded, when any status but 0 failed the gate.
+fn gate_check_answer(result: &crate::model::ClaimRecord) -> &str {
+    let fields = &result.body["fields"];
+    match (
+        fields["verdict"].as_str(),
+        fields["value"]["answer"].as_str(),
+    ) {
+        (Some("pass"), _) => "pass",
+        (_, Some(answer @ ("not-yet" | "broken"))) => answer,
+        _ => "fail",
+    }
+}
+
+/// A gate result's recorded reason, or `default`.
+fn gate_result_reason(result: &crate::model::ClaimRecord, default: &str) -> String {
+    result
+        .body
+        .pointer("/fields/reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or(default)
+        .to_owned()
+}
+
+/// The last `lines` lines of `output`, at most `bytes` long, cut at a character boundary.
+fn output_tail(output: &str, lines: usize, bytes: usize) -> String {
+    let trimmed = output.trim_end();
+    let start = trimmed
+        .char_indices()
+        .rev()
+        .filter(|(_, c)| *c == '\n')
+        .nth(lines.saturating_sub(1))
+        .map_or(0, |(index, _)| index + 1);
+    let mut tail = &trimmed[start..];
+    if tail.len() > bytes {
+        let mut cut = tail.len() - bytes;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail = &tail[cut..];
+    }
+    tail.to_owned()
+}
+
+/// `ms` in the largest whole unit a person reads at a glance: `90s`, `10m`, `2h`.
+fn render_duration_ms(ms: u64) -> String {
+    match ms {
+        ms if ms >= 3_600_000 && ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
+        ms if ms >= 60_000 && ms % 60_000 == 0 => format!("{}m", ms / 60_000),
+        ms if ms % 1_000 == 0 => format!("{}s", ms / 1_000),
+        ms => format!("{ms}ms"),
+    }
+}
+
+/// One finished exec gate check, ready to record.
+struct GateCheck<'a> {
+    name: &'a str,
+    host: &'a str,
+    result_subject: &'a str,
+    operation: &'a str,
+    check: u64,
+    exit_code: Option<i64>,
+    /// The refusals and partial listings the check's `st` commands reported.
+    calls: Vec<String>,
+    output: String,
+    /// Why the check could not answer at all: it could not start or ran past its time limit.
+    start_failure: Option<String>,
 }
 
 fn now_ms() -> u128 {
@@ -12733,6 +13152,8 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             name: "checks".into(),
             started_at_unix_ms: now_ms(),
             attempt: 1,
+            run: "mission-run/test".into(),
+            generation: "run-generation/test".into(),
         };
 
         assert!(matches!(
@@ -15982,10 +16403,12 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
     fn a_mechanical_gate_that_outlives_a_daemon_restart_takes_its_drivers_exit_status() {
         // After a restart the runner is no longer the daemon's child: the exec runtime finds it
         // gone without an exit status. Only its `st3 driver exec` report says how it ended.
+        // Exit 1 is not yet and another status breaks the gate; neither fails the run.
         for (report, run_status, verdict) in [
             (Some(0), "completed", "pass"),
-            (Some(1), "failed", "fail"),
-            (None, "failed", "fail"),
+            (Some(1), "running", "not-yet"),
+            (Some(7), "running", "broken"),
+            (None, "running", "broken"),
         ] {
             let store = Arc::new(Store::open_memory("node").unwrap());
             let source = r#"
@@ -16076,11 +16499,11 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
                 .latest_claim(&subject, Some("gate.result"))
                 .unwrap()
                 .expect("the gate has no result");
-            assert_eq!(result.body["fields"]["verdict"], verdict, "{report:?}");
+            assert_eq!(gate_check_answer(&result), verdict, "{report:?}");
             if report.is_none() {
                 assert_eq!(
                     result.body["fields"]["reason"],
-                    "mechanical gate `verify` fail: it exited without an exit status"
+                    "exec gate `verify` is broken: its check ended without an exit status: something killed it"
                 );
             }
             assert_eq!(
@@ -16089,6 +16512,522 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
                 "{report:?}"
             );
         }
+    }
+
+    /// Publish `source` as `actor`, as `st missions publish --as ACTOR` records its publisher.
+    fn publish_as(
+        store: &Store,
+        source: &str,
+        key: &str,
+        actor: &str,
+    ) -> crate::model::MissionSpec {
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &planned.subject_tokens, key, Some(actor))
+            .unwrap();
+        intent
+            .missions
+            .into_values()
+            .next()
+            .expect("the source has a mission")
+    }
+
+    /// A mission whose one agentless step waits on exec gate `verify`.
+    fn exec_gate_mission(command: &str, workspace: &str) -> String {
+        format!(
+            r#"
+version 2
+
+mission "proof" state="ready" {{
+  goal "Prove the gate contract."
+  completion {{ when "all-steps-exhausted" }}
+  step "verify" {{
+    title "The suite passes on main"
+    gate "verify" {{
+      exec {command:?}
+      host "node"
+      workspace {workspace:?}
+      time-limit "1m"
+    }}
+  }}
+}}
+"#
+        )
+    }
+
+    fn start_proof_run(store: &Store, key: &str) -> crate::model::MissionRunView {
+        store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "proof".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: key.into(),
+            })
+            .unwrap()
+    }
+
+    /// The gate runners started so far, oldest first.
+    fn gate_runners(runtime: &FakeRuntime) -> Vec<MemberSpec> {
+        runtime
+            .started_members
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|member| member.driver.as_deref() == Some("mechanical-gate"))
+            .cloned()
+            .collect()
+    }
+
+    fn exit_gate_runner(
+        runtime: &FakeRuntime,
+        runner: &MemberSpec,
+        code: Option<i64>,
+        output: &str,
+    ) {
+        runtime
+            .logs
+            .lock()
+            .unwrap()
+            .insert(runner.runtime_id.clone(), output.into());
+        runtime.execs.lock().unwrap().insert(
+            runner.runtime_id.clone(),
+            RuntimeObservation {
+                runtime_id: runner.runtime_id.clone(),
+                terminal: false,
+                status: "exited".into(),
+                exit_code: code,
+                incarnation_id: Some(format!("{}-one", runner.runtime_id)),
+            },
+        );
+    }
+
+    /// The subject a gate runner's driver reports for: its gate operation.
+    fn gate_runner_subject(runner: &MemberSpec) -> String {
+        let crate::model::LaunchSpec::Argv(argv) = &runner.launch else {
+            panic!("the gate runner is not wrapped by its driver");
+        };
+        argv[argv.iter().position(|arg| arg == "--subject").unwrap() + 1].clone()
+    }
+
+    fn step_of<'a>(
+        run: &'a crate::model::MissionRunView,
+        path: &str,
+    ) -> &'a crate::model::StepRunView {
+        run.steps.iter().find(|step| step.step == path).unwrap()
+    }
+
+    #[test]
+    fn an_exec_gate_that_says_not_yet_checks_again_until_it_passes() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        publish_as(
+            &store,
+            &exec_gate_mission("test -e merged", "."),
+            "not-yet-source",
+            "person/pat",
+        );
+        let run = start_proof_run(&store, "not-yet-run");
+        let runtime = Arc::new(FakeRuntime::default());
+        let mut reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        // Check again on the next pass rather than a minute later.
+        reconciler.gate_recheck_base_ms = 0;
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let first = gate_runners(&runtime)
+            .pop()
+            .expect("the gate did not start");
+        let result_subject = gate_runner_subject(&first);
+        exit_gate_runner(&runtime, &first, Some(1), "");
+        reconciler.reconcile_once().unwrap();
+
+        let result = store
+            .latest_claim(&result_subject, Some("gate.result"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.body["fields"]["value"]["answer"], "not-yet");
+        assert_eq!(result.body["fields"]["value"]["check"], 1);
+        let current = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(current.status, "running");
+        // An agentless step works while its gates decide.
+        assert_eq!(step_of(&current, "verify").status, "working");
+        assert!(
+            store
+                .attention_items(Some("person/pat"))
+                .unwrap()
+                .is_empty()
+        );
+
+        reconciler.reconcile_once().unwrap();
+        let runners = gate_runners(&runtime);
+        assert_eq!(runners.len(), 2, "the gate did not check again");
+        let second = runners.last().unwrap();
+        assert_eq!(
+            gate_runner_subject(second),
+            format!("{result_subject}/check/2")
+        );
+        exit_gate_runner(&runtime, second, Some(0), "");
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let result = store
+            .latest_claim(&result_subject, Some("gate.result"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.body["fields"]["value"]["answer"], "pass");
+        assert_eq!(result.body["fields"]["value"]["check"], 2);
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn a_not_yet_gate_waits_a_minute_and_doubles_its_wait_to_fifteen_minutes() {
+        let reconciler = Reconciler::new(
+            Arc::new(Store::open_memory("node").unwrap()),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let waits = [1, 2, 3, 4, 5, 6, 100].map(|check| reconciler.gate_recheck_delay_ms(check));
+        assert_eq!(
+            waits,
+            [60_000, 120_000, 240_000, 480_000, 900_000, 900_000, 900_000]
+        );
+    }
+
+    #[test]
+    fn a_broken_exec_gate_holds_its_step_and_asks_its_publisher_to_revise() {
+        // Each exit is how one of the four broken gates ended, or how a gate cannot answer.
+        for (code, output, report, expected) in [
+            (
+                Some(101),
+                "error: linker `mold` not found\n",
+                None,
+                "exited 101",
+            ),
+            (Some(127), "sh: 1: cargo: not found\n", None, "did not find"),
+            (Some(137), "", None, "killed by signal 9"),
+            (None, "", None, "without an exit status"),
+            (
+                Some(1),
+                "",
+                Some(
+                    "st refused `st missions ls --limit 500`: the mission limit must be 1 through 200",
+                ),
+                "the mission limit must be 1 through 200",
+            ),
+            (
+                Some(0),
+                "",
+                Some("`st documents ls` listed 100 items and more exist"),
+                "listed 100 items",
+            ),
+        ] {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            publish_as(
+                &store,
+                &exec_gate_mission("cargo test -p example --test suite", "."),
+                "broken-source",
+                "person/pat",
+            );
+            let run = start_proof_run(&store, "broken-run");
+            let runtime = Arc::new(FakeRuntime::default());
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+            for _ in 0..4 {
+                reconciler.reconcile_once().unwrap();
+            }
+            let runner = gate_runners(&runtime)
+                .pop()
+                .expect("the gate did not start");
+            let report_path = runner.environment[crate::gate_report::ENV].clone();
+            if let Some(line) = report {
+                std::fs::create_dir_all(Path::new(&report_path).parent().unwrap()).unwrap();
+                std::fs::write(&report_path, format!("{line}\n")).unwrap();
+            }
+            exit_gate_runner(&runtime, &runner, code, output);
+            for _ in 0..3 {
+                reconciler.reconcile_once().unwrap();
+            }
+
+            let result = store
+                .latest_claim(&gate_runner_subject(&runner), Some("gate.result"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.body["fields"]["value"]["answer"], "broken",
+                "{code:?} {report:?}"
+            );
+            let reason = result.body["fields"]["reason"].as_str().unwrap();
+            assert!(reason.contains(expected), "{reason}");
+            let current = store.mission_run(&run.id).unwrap().unwrap();
+            assert_eq!(current.status, "running", "{code:?} {report:?}");
+            assert_eq!(step_of(&current, "verify").status, "working");
+            // Every fleet build accepts the replicated verdict.
+            assert_eq!(result.body["fields"]["verdict"], "error");
+
+            // The person who published the gate has one item naming the gate, host and output.
+            let items = store.attention_items(Some("person/pat")).unwrap();
+            assert_eq!(items.len(), 1, "{items:#?}");
+            let item = &items[0];
+            assert_eq!(item.title, "Gate `verify` is broken");
+            assert_eq!(item.mission_run.as_deref(), Some(run.subject.as_str()));
+            assert!(item.detail.contains("on host `node`"), "{}", item.detail);
+            assert!(item.detail.contains(expected), "{}", item.detail);
+            assert!(item.detail.contains(output.trim()), "{}", item.detail);
+            assert!(item.detail.contains("st work revise"), "{}", item.detail);
+            // A person's broken gate is not also an agent's fault.
+            assert!(
+                store
+                    .fault_snapshot(now_ms())
+                    .unwrap()
+                    .iter()
+                    .all(|fault| !fault.item.title.contains("is broken"))
+            );
+            // Later passes neither run the broken gate again nor raise a second item.
+            reconciler.reconcile_once().unwrap();
+            assert_eq!(gate_runners(&runtime).len(), 1);
+            assert_eq!(store.attention_items(Some("person/pat")).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn an_exec_gate_that_cannot_start_or_outlives_its_time_limit_is_broken() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        publish_as(
+            &store,
+            &exec_gate_mission("true", "/nonexistent-gate-workspace"),
+            "unstartable-source",
+            "person/pat",
+        );
+        let run = start_proof_run(&store, "unstartable-run");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let current = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(current.status, "running");
+        let items = store.attention_items(Some("person/pat")).unwrap();
+        assert_eq!(items.len(), 1, "{items:#?}");
+        assert!(
+            items[0].detail.contains("could not start"),
+            "{}",
+            items[0].detail
+        );
+        assert!(items[0].detail.contains("/nonexistent-gate-workspace"));
+
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        publish_as(
+            &store,
+            &exec_gate_mission("sleep 600", ".").replace("time-limit \"1m\"", "time-limit \"1s\""),
+            "slow-source",
+            "person/pat",
+        );
+        let run = start_proof_run(&store, "slow-run");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let runner = gate_runners(&runtime)
+            .pop()
+            .expect("the gate did not start");
+        runtime.execs.lock().unwrap().insert(
+            runner.runtime_id.clone(),
+            RuntimeObservation {
+                runtime_id: runner.runtime_id.clone(),
+                terminal: false,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some("slow-one".into()),
+            },
+        );
+        std::thread::sleep(Duration::from_millis(1_100));
+        reconciler.reconcile_once().unwrap();
+        assert!(runtime.kills.lock().unwrap().contains(&runner.runtime_id));
+        let result = store
+            .latest_claim(&gate_runner_subject(&runner), Some("gate.result"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.body["fields"]["value"]["answer"], "broken");
+        assert!(
+            result.body["fields"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("ran past its time limit of 1s")
+        );
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "running"
+        );
+    }
+
+    #[test]
+    fn a_gate_revision_keeps_the_submitted_work_and_its_publisher_agent_gets_the_fault() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = |gate: &str| {
+            format!(
+                r#"
+version 2
+
+agent "worker" {{ workspace "/tmp"; command "true" }}
+agent "planner" {{ workspace "/tmp"; command "true" }}
+
+mission "proof" state="ready" {{
+  goal "Land the change."
+  completion {{ when "all-steps-exhausted" }}
+  step "land" {{
+    assigned-to "agent/worker"
+    goal "Land the change on main."
+    gate "the suite passes on main" {{
+      exec {gate:?}
+      host "node"
+      workspace "."
+      time-limit "1m"
+    }}
+  }}
+}}
+"#
+            )
+        };
+        let broken = "export PATH=/usr/bin:/bin; cargo test -p example --test suite";
+        publish_as(&store, &source(broken), "regate-one", "agent/node.planner");
+        let run = start_proof_run(&store, "regate-run");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        for member in runtime.started_members.lock().unwrap().iter() {
+            runtime.ptys.lock().unwrap().push(RuntimeObservation {
+                runtime_id: member.runtime_id.clone(),
+                terminal: true,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some("current".into()),
+            });
+        }
+        for _ in 0..2 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let land = step_of(&store.mission_run(&run.id).unwrap().unwrap(), "land")
+            .subject
+            .clone();
+        let request = |key: &str| crate::model::WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("current".into()),
+            summary: Some("Merged the change.".into()),
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .work_action(&land, "claim", &request("claim"))
+            .unwrap();
+        store
+            .work_action(&land, "complete", &request("complete"))
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let runner = gate_runners(&runtime)
+            .pop()
+            .expect("the gate did not start");
+        exit_gate_runner(
+            &runtime,
+            &runner,
+            Some(101),
+            "error: linker `mold` not found\n",
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let held = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(held.status, "running");
+        assert_eq!(step_of(&held, "land").status, "verifying");
+        let faults = store.fault_snapshot(now_ms()).unwrap();
+        let fault = faults
+            .iter()
+            .find(|fault| fault.item.title == "Gate `the suite passes on main` is broken")
+            .expect("the publisher has no fault");
+        assert_eq!(fault.owner.as_deref(), Some("agent/node.planner"));
+        assert_eq!(fault.item.step.as_deref(), Some(land.as_str()));
+
+        // The publisher corrects only the gate. The work stays submitted and the new gate checks it.
+        let fixed = "export PATH=/opt/mold/bin:/usr/bin:/bin; cargo test -p example --test suite";
+        let revised = publish_as(&store, &source(fixed), "regate-two", "agent/node.planner");
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &revised,
+                "agent/node.planner",
+                "the gate's PATH lacked mold",
+                "regate-revision",
+            )
+            .unwrap();
+        let carried = step_of(&adopted, "land");
+        assert_ne!(carried.subject, land);
+        assert_eq!(
+            (carried.status.as_str(), carried.worker_reported),
+            ("verifying", true)
+        );
+        assert!(
+            store
+                .fault_snapshot(now_ms())
+                .unwrap()
+                .iter()
+                .all(|fault| !fault.item.title.contains("is broken")),
+            "the replaced generation's fault is still open"
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let runner = gate_runners(&runtime).pop().unwrap();
+        assert!(gate_runner_subject(&runner).contains(&carried.subject.replace('/', ".")));
+        exit_gate_runner(&runtime, &runner, Some(0), "test result: ok\n");
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
     }
 
     #[test]
@@ -18654,6 +19593,8 @@ schedule "unready" {{
             name: "window".into(),
             started_at_unix_ms: 0,
             attempt,
+            run: "mission-run/window".into(),
+            generation: "run-generation/generation".into(),
         };
         let definition = serde_json::json!({"type": "mechanical", "command": "/usr/bin/true"});
         let first = gate_result_subject(&stage(1), "open", &definition).unwrap();

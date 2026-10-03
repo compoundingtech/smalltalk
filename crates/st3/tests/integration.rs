@@ -5,6 +5,7 @@
 
 mod agents_restart;
 mod boot_canaries;
+mod broken_gates;
 mod client_creation;
 mod client_glasses;
 mod client_v0_cli;

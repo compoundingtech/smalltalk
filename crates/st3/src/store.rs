@@ -3443,6 +3443,42 @@ impl Store {
         }))
     }
 
+    /// The actor that published the mission revision `run` works to: a broken gate's attention
+    /// goes to it. A nested run works to its root run's revision.
+    pub(crate) fn mission_run_publisher(&self, run: &str) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let id = run.strip_prefix("mission-run/").unwrap_or(run);
+        let Some(header) = mission_run_header_tx(&connection, id).optional()? else {
+            return Ok(None);
+        };
+        let root_id = header
+            .root_mission_run
+            .strip_prefix("mission-run/")
+            .unwrap_or(&header.root_mission_run);
+        let root = if root_id == header.id {
+            header
+        } else {
+            let Some(root) = mission_run_header_tx(&connection, root_id).optional()? else {
+                return Ok(None);
+            };
+            root
+        };
+        let mission = root
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&root.mission);
+        Ok(connection
+            .query_row(
+                "SELECT claims.actor FROM mission_revisions
+                 JOIN claims ON claims.id=mission_revisions.claim_id
+                 WHERE mission_revisions.mission_id=?1 AND mission_revisions.revision=?2",
+                params![mission, root.revision],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn mission_run(&self, run: &str) -> Result<Option<MissionRunView>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
         let connection = self.readers.get();
@@ -11165,6 +11201,12 @@ impl Store {
     ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
         items.extend(self.person_attention_items(person, as_of)?);
+        // A person who published a broken gate is the one to correct it.
+        items.extend(
+            self.broken_gate_items(person, as_of)?
+                .into_iter()
+                .filter(|item| item.person.starts_with("person/")),
+        );
         self.current_attention(items, as_of)
     }
 
@@ -11175,6 +11217,11 @@ impl Store {
     pub fn fault_snapshot(&self, as_of: u128) -> Result<Vec<FaultView>> {
         let mut items = self.subscription_fault_items(as_of)?;
         items.extend(self.operational_attention_items(None, as_of)?);
+        items.extend(
+            self.broken_gate_items(None, as_of)?
+                .into_iter()
+                .filter(|item| !item.person.starts_with("person/")),
+        );
         items.extend(self.checkpoint_attention_items(None, as_of)?);
         let fallback = self.fleet_fault_agent()?;
         self.current_attention(items, as_of)?
@@ -20010,6 +20057,10 @@ fn operational_annotation(
 /// How long a mission whose run failed or was cancelled stays in the current missions view.
 pub(crate) const RECENTLY_ENDED_MS: u128 = 24 * 60 * 60 * 1000;
 
+/// The condition of a broken exec gate's operational failure. Its item goes to the publisher of
+/// the run's mission revision: a person reads it in their attention, an agent as a fault.
+pub(crate) const GATE_BROKEN_CONDITION: &str = "gate-broken";
+
 /// The earliest end that still counts as recent.
 pub(crate) fn recently_ended_since() -> u128 {
     now_ms().saturating_sub(RECENTLY_ENDED_MS)
@@ -24621,10 +24672,13 @@ fn carried_revision_step_paths(
 ) -> BTreeSet<String> {
     let old_definitions = flattened_step_definition_hashes(old);
     let new_definitions = flattened_step_definition_hashes(new);
+    let regated = regated_submitted_steps(old, new, current);
     let dependencies = flattened_dependencies(new);
     let mut unstable = new_definitions
         .iter()
-        .filter(|(path, hash)| old_definitions.get(*path) != Some(*hash))
+        .filter(|(path, hash)| {
+            old_definitions.get(*path) != Some(*hash) && !regated.contains(*path)
+        })
         .map(|(path, _)| path.clone())
         .collect::<BTreeSet<_>>();
     loop {
@@ -24652,6 +24706,51 @@ fn carried_revision_step_paths(
             .map(|step| step.step.clone()),
     );
     compatible
+}
+
+/// The steps a revision changes only in their gates while their worker's submitted work waits
+/// on those gates, as it does behind a broken gate. They keep the submission: the successor
+/// generation checks the work against the revised gates rather than asking for it again.
+fn regated_submitted_steps(
+    old: &MissionSpec,
+    new: &MissionSpec,
+    current: &[StepRunView],
+) -> BTreeSet<String> {
+    let old_steps = flatten_mission_step_specs(old)
+        .into_iter()
+        .map(|step| (step.path.as_str(), step))
+        .collect::<BTreeMap<_, _>>();
+    flatten_mission_step_specs(new)
+        .into_iter()
+        .filter(|step| {
+            current.iter().any(|view| {
+                view.step == step.path && view.status == "verifying" && view.worker_reported
+            }) && old_steps.get(step.path.as_str()).is_some_and(|old| {
+                old.definition_hash != step.definition_hash
+                    && step_definition_without_gates(old) == step_definition_without_gates(step)
+            })
+        })
+        .map(|step| step.path.clone())
+        .collect()
+}
+
+/// A step's definition with its gates, and the gates and definition hashes of any steps nested
+/// in it, left out.
+fn step_definition_without_gates(step: &crate::model::StepSpec) -> Value {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(fields) => {
+                fields.remove("gates");
+                fields.remove("definition_hash");
+                fields.values_mut().for_each(strip);
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(step).unwrap_or(Value::Null);
+    strip(&mut value);
+    value
 }
 
 fn flattened_step_definition_hashes(mission: &MissionSpec) -> BTreeMap<String, String> {
@@ -40949,6 +41048,92 @@ version 2
             evidence: Vec::new(),
             idempotency_key: key.into(),
         }
+    }
+
+    #[test]
+    fn a_gate_only_revision_keeps_submitted_work_and_any_other_change_starts_it_again() {
+        let store = Store::open_memory("node").unwrap();
+        let source = |gate: &str, goal: &str| {
+            format!(
+                r#"
+version 2
+
+  mission "carry" state="ready" {{
+    goal "Keep submitted work across a gate revision."
+    step "work" {{
+      assigned-to "agent/worker"
+      goal {goal:?}
+      gate "checked" {{ exec {gate:?}; host "node"; workspace "/tmp" }}
+    }}
+  }}
+"#
+            )
+        };
+        publish_carry(&store, &source("exit 2", "Do the work."), "regate-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "regate-run".into(),
+            })
+            .unwrap();
+        let work = |run: &MissionRunView| {
+            run.steps
+                .iter()
+                .find(|step| step.step == "work")
+                .unwrap()
+                .clone()
+        };
+        let first = work(&run).subject;
+        store.set_step_state(&first, "ready", None).unwrap();
+        store
+            .work_action(&first, "claim", &carry_request("one", "regate-claim"))
+            .unwrap();
+        let submitted = store
+            .work_action(&first, "complete", &carry_request("one", "regate-complete"))
+            .unwrap();
+        assert_eq!(submitted.status, "verifying");
+
+        let regated = publish_carry(&store, &source("exit 0", "Do the work."), "regate-two");
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &regated,
+                "person/requester",
+                "the gate was broken",
+                "regate-revision",
+            )
+            .unwrap();
+        let carried = work(&adopted);
+        assert_ne!(carried.subject, first);
+        assert_eq!(
+            (
+                carried.status.as_str(),
+                carried.worker_reported,
+                carried.attempt
+            ),
+            ("verifying", true, 1)
+        );
+
+        let rewritten = publish_carry(&store, &source("exit 0", "Do other work."), "regate-three");
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &rewritten,
+                "person/requester",
+                "the work changed",
+                "regate-goal-revision",
+            )
+            .unwrap();
+        let restarted = work(&adopted);
+        assert_eq!(
+            (restarted.status.as_str(), restarted.worker_reported),
+            ("pending", false)
+        );
     }
 
     #[test]
