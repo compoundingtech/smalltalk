@@ -11,7 +11,8 @@
 //! performance report, the busiest of twelve five-minute windows on 2026-10-03: seats posting harness
 //! events and claims, paging their mailboxes and reading their desired state, the replication
 //! worker exporting and receiving exchanges with a peer, lease renewals, status and work reads,
-//! and a person moving through stui. Only kinds and rates; no contents.
+//! and a person moving through stui. Thirty seats also hold event long-polls open. Only kinds and
+//! rates; no contents.
 //!
 //! The daemon runs on its own runtime, and the load on another, so the CPU it reports is the
 //! daemon's: the process's CPU less the load threads' (and the peer store's writer, which stands
@@ -35,7 +36,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use st3::api::AppState;
 use st3::client::Client;
-use st3::model::WorkRequest;
+use st3::model::{EventRecord, WorkRequest};
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
@@ -58,6 +59,9 @@ const CPU_BUDGET: f64 = 2.0;
 
 /// Requests in flight at once before the load stops adding more; a daemon this far behind fails.
 const IN_FLIGHT_LIMIT: usize = 256;
+
+const LONG_POLL: &str = "seat event long poll";
+const SEATS: usize = 30;
 
 /// One kind of request, how many the busy host served each second, and its p99 budget.
 struct Load {
@@ -114,6 +118,8 @@ struct Report {
     seconds: f64,
     /// The daemon's average CPU over the run, in cores.
     daemon_cores: f64,
+    #[serde(default)]
+    long_poll_seats: usize,
     paths: BTreeMap<String, PathReport>,
     failed: BTreeMap<String, usize>,
 }
@@ -182,6 +188,12 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         {
             failures.push(format!("{}: never answered", load.name));
         }
+    }
+    if report.long_poll_seats != SEATS {
+        failures.push(format!(
+            "only {} of {SEATS} seats completed a long-poll",
+            report.long_poll_seats
+        ));
     }
     if report.daemon_cores > CPU_BUDGET {
         failures.push(format!(
@@ -381,7 +393,7 @@ fn run(
         daemon.spawn(
             async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
         );
-        let subjects = fleet_subjects(&store, 30);
+        let subjects = fleet_subjects(&store, SEATS);
         // Every seat runs, so its driver may publish harness events.
         for seat in &subjects.seats {
             let mut running =
@@ -454,10 +466,13 @@ fn run(
     let failed = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let running = Arc::new(AtomicBool::new(true));
+    let long_poll_seats = Arc::new(AtomicUsize::new(0));
     let cpu_before = (process_cpu(), load_cpu(&peer_threads));
+    let cursor = context.store.index().unwrap();
     let started = Instant::now();
     load.block_on(async {
         let mut tasks = Vec::new();
+        let mut polls = Vec::new();
         for (index, kind) in MIX.iter().enumerate() {
             let (context, timings, failed, in_flight, running) = (
                 context.clone(),
@@ -529,8 +544,60 @@ fn run(
                 }
             }));
         }
+        for seat in &context.subjects.seats {
+            let (client, seat, timings, failed, running, long_poll_seats) = (
+                context.client.clone(),
+                seat.clone(),
+                timings.clone(),
+                failed.clone(),
+                running.clone(),
+                long_poll_seats.clone(),
+            );
+            polls.push(tokio::spawn(async move {
+                let mut cursor = cursor;
+                let mut answered = false;
+                while running.load(Ordering::Relaxed) {
+                    let path = format!(
+                        "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=30000",
+                        urlencoding::encode(&seat)
+                    );
+                    let started = Instant::now();
+                    match client.get::<Vec<EventRecord>>(&path).await {
+                        Ok(events) => {
+                            if !answered {
+                                long_poll_seats.fetch_add(1, Ordering::Relaxed);
+                                answered = true;
+                            }
+                            if let Some(last) = events.last() {
+                                cursor = last.store_index;
+                            }
+                            timings
+                                .lock()
+                                .unwrap()
+                                .entry(LONG_POLL.into())
+                                .or_default()
+                                .push(started.elapsed());
+                        }
+                        Err(error) => {
+                            *failed
+                                .lock()
+                                .unwrap()
+                                .entry(format!("{LONG_POLL}: {error}"))
+                                .or_default() += 1;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }));
+        }
         tokio::time::sleep(duration).await;
         running.store(false, Ordering::Relaxed);
+        // Cancelling outstanding quiet waits keeps their deliberate timeout outside the CPU
+        // drain window. Otherwise up to 30 idle seconds would dilute the daemon's average CPU.
+        for poll in polls {
+            poll.abort();
+            let _ = poll.await;
+        }
         for task in tasks {
             let _ = task.await;
         }
@@ -570,6 +637,7 @@ fn run(
         claims,
         seconds: elapsed,
         daemon_cores: daemon_cpu / elapsed,
+        long_poll_seats: long_poll_seats.load(Ordering::Relaxed),
         paths,
         failed,
     }
@@ -734,6 +802,10 @@ fn runtime_of(seat: &str) -> String {
 
 /// A request's budget: its kind's, or for a person read, its route's.
 fn budget(budgets: &BTreeMap<&str, Duration>, name: &str) -> Duration {
+    // A successful quiet poll intentionally waits 30 seconds before answering.
+    if name == LONG_POLL {
+        return Duration::from_secs(31);
+    }
     if let Some(route) = name.strip_prefix("person read ") {
         let budget = PERSON_READS
             .iter()

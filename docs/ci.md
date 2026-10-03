@@ -218,7 +218,10 @@ with `opt-level = 1` only to generate the stores faster.
 dispatch. It serves a store the size of a busy host's (scale 1, about 240,000 claims) to the
 request mix and rates that host's daemon reported in its busiest five-minute window (30 requests a
 second: harness events, mailbox pages, claims, desired state, delivery holds, replication rounds,
-renewals, status and work reads, and a person's reads), with the reconciler running. It fails when
+renewals, status and work reads, and a person's reads), with the reconciler running and 30
+concurrent seat event long-polls. Quiet polls have a 31-second budget for their intentional
+30-second wait; mailbox WebSockets require authenticated native drivers and are excluded.
+It fails when
 a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
 main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a
 regression is what passes several. Main's successful runs add their report
