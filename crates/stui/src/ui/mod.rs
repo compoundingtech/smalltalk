@@ -2772,7 +2772,7 @@ impl Ui {
 
     fn scroll_pane(&self, key: &str, delta: isize) {
         let info = self.frame.borrow();
-        let Some(pane) = info.panes.iter().find(|pane| pane.key == key) else {
+        let Some(pane) = info.panes.iter().rev().find(|pane| pane.key == key) else {
             return;
         };
         let mut panes = self.conversation_state.panes.borrow_mut();
@@ -4150,6 +4150,7 @@ impl Ui {
                         .and_then(|selection| {
                             info.panes
                                 .iter()
+                                .rev()
                                 .find(|pane| pane.key == selection.pane)
                                 .map(|pane| (pane.rect, pane.top))
                         })
@@ -4412,10 +4413,13 @@ impl Ui {
     }
 
     fn pane_point(&self, column: u16, row: u16) -> Option<(String, usize, u16)> {
+        // The pane drawn last is the one on top (Home over the glass shows a pane under the
+        // same key as the one beneath it).
         let info = self.frame.borrow();
         let pane = info
             .panes
             .iter()
+            .rev()
             .find(|pane| contains(pane.rect, column, row))?;
         Some((
             pane.key.clone(),
@@ -4427,7 +4431,11 @@ impl Ui {
     fn selected_text(&self) -> Option<String> {
         let selection = self.conversation_state.selection.as_ref()?;
         let info = self.frame.borrow();
-        let pane = info.panes.iter().find(|pane| pane.key == selection.pane)?;
+        let pane = info
+            .panes
+            .iter()
+            .rev()
+            .find(|pane| pane.key == selection.pane)?;
         Some(selection.text(&pane.lines))
     }
 
