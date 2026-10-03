@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const RUN: &str = "mission-run/orchid/replay";
-const PUBLISHER: &str = "person/rowan";
+const PUBLISHER: &str = "person/pat";
 
 struct Daemon {
     root: PathBuf,
@@ -154,14 +154,11 @@ impl Daemon {
     fn gate_result(&self, path: &str) -> Option<Value> {
         let step = self.step(path)["subject"].as_str()?.to_owned();
         let operation = format!("gate-operation/{}/", step.replace('/', "."));
-        self.gate_results()
-            .into_iter()
-            .filter(|claim| {
-                claim["subject"]
-                    .as_str()
-                    .is_some_and(|subject| subject.starts_with(&operation))
-            })
-            .last()
+        self.gate_results().into_iter().rev().find(|claim| {
+            claim["subject"]
+                .as_str()
+                .is_some_and(|subject| subject.starts_with(&operation))
+        })
     }
 
     fn attention(&self) -> Vec<Value> {

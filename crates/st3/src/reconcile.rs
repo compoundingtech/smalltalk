@@ -10754,11 +10754,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
         let fields = &result.body["fields"];
         let host = fields["value"]["host"].as_str().unwrap_or("unknown");
-        let mut detail = format!(
-            "{} on host `{host}`: {}.",
-            stage.name,
-            gate_result_reason(result, "the gate is broken")
-        );
+        let reason = gate_result_reason(result, "the gate is broken");
+        let why = reason
+            .strip_prefix(&format!("exec gate `{name}` is broken: "))
+            .unwrap_or(&reason);
+        let owner = match gate_owner_step(&stage.subject) {
+            Some(_) => format!("Step `{}` of {}", stage.name, stage.run),
+            None => format!("Mission run {}", stage.run),
+        };
+        let mut detail =
+            format!("{owner} waits on gate `{name}`, which is broken on host `{host}`: {why}.");
         if let Some(output) = fields["value"]["output"]
             .as_str()
             .filter(|output| !output.trim().is_empty())
