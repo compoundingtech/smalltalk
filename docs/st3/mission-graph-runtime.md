@@ -1588,6 +1588,15 @@ Repeated failures of this condition keep one attention item open per schedule.
 The runtime withdraws it when a subsequent occurrence successfully starts work.
 
 The runtime gives each occurrence a deterministic mission run and a unique workspace below the declared root.
+The occurrence belongs to the schedule's stable identity, across parent revisions, re-publication,
+child revision changes and daemon restarts. An already reached tick is never replayed by
+`catch-up "latest"`. Members admitting the same tick while apart converge on one run and initial
+generation; the first creation in canonical claim order supplies its child definition.
+
+A fleet member holds scheduled admission until it has completed an exchange since startup, and
+while replication reports missing history or a deferred projection. A local-only daemon and a
+fleet's sole member can admit immediately. Other fleet members may continue local work during a
+partition; a cold member needs a peer exchange before starting scheduled work.
 
 The mission steps are normal claimable work. A schedule does not start another occurrence while its prior mission run remains active.
 

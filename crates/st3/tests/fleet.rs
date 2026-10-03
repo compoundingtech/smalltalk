@@ -515,6 +515,157 @@ async fn joined(root: &Path, sponsor: &Node, name: &str, extra: &[&str]) -> Node
     node
 }
 
+/// Re-publication and parent revisions must preserve the weekly occurrence, even after its
+/// child finishes. Put the next real weekly tick close enough to exercise it in this daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduled_occurrence_survives_parent_reapply_revision_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let mut node = Node::new(root.path(), "orchard");
+    node.start().await;
+    let child_file = node.root.join("child.kdl");
+    let mut revisions = Vec::new();
+    for label in ["apple", "pear"] {
+        let source = format!(
+            r#"version 2
+mission "harvest" state="ready" {{
+  completion {{ when "all-steps-exhausted" }}
+  goal "Harvest {label}."
+  step "done" {{ agentless }}
+}}"#
+        );
+        revisions.push(
+            st3::parse_intent(&source, "orchard").unwrap().missions["harvest"]
+                .revision
+                .clone(),
+        );
+        fs::write(&child_file, source).unwrap();
+        node.st_ok(&[
+            "missions",
+            "publish",
+            child_file.to_str().unwrap(),
+            "--as",
+            PERSON,
+        ]);
+    }
+    let next = chrono::Utc::now() + chrono::Duration::seconds(30);
+    let anchor =
+        (next - chrono::Duration::days(7)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let parent_file = node.root.join("parent.kdl");
+    let parent = |revision: &str| {
+        format!(
+            r#"version 2
+mission "orchard/weekly" state="ready" {{
+  goal "Maintain the orchard."
+  schedule "cycle" {{
+    host "orchard"
+    every "7d"
+    anchor "{anchor}"
+    catch-up "latest"
+    work {{ mission "harvest@{revision}"; workspace "{}" }}
+  }}
+  step "retire" {{
+    agentless
+    gate "retire" type="human" {{ reviewer "{PERSON}"; question "Retire the orchard?" }}
+  }}
+}}"#,
+            node.root.join("cycles").display()
+        )
+    };
+    fs::write(&parent_file, parent(&revisions[0])).unwrap();
+    node.st_ok(&[
+        "missions",
+        "publish",
+        parent_file.to_str().unwrap(),
+        "--as",
+        PERSON,
+    ]);
+    node.st_ok(&[
+        "missions",
+        "start",
+        "orchard/weekly",
+        "--id",
+        "orchard/weekly",
+        "--workspace",
+        node.root.to_str().unwrap(),
+        "--as",
+        PERSON,
+    ]);
+    wait_until("the first weekly child finishes", 15, || async {
+        node.claims().await.iter().any(|claim| {
+            claim["kind"] == "mission-run.state" && claim["body"]["fields"]["status"] == "completed"
+        })
+    })
+    .await;
+
+    for index in 0..4 {
+        fs::write(&parent_file, parent(&revisions[index % 2])).unwrap();
+        node.st_ok(&[
+            "missions",
+            "publish",
+            parent_file.to_str().unwrap(),
+            "--as",
+            PERSON,
+        ]);
+        if index > 0 {
+            node.st_ok(&[
+                "work",
+                "revise",
+                "mission-run/orchard/weekly",
+                parent_file.to_str().unwrap(),
+                "--reason",
+                "Select the next harvest revision",
+                "--as",
+                PERSON,
+            ]);
+        }
+        // Let the daemon reach a quiet pass, including any incorrectly admitted duplicate.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let claims = node.claims().await;
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| claim["kind"] == "schedule.work-started")
+                .count(),
+            1,
+            "parent publication/revision replayed the due weekly tick"
+        );
+    }
+    node.restart().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        node.claims()
+            .await
+            .iter()
+            .filter(|claim| claim["kind"] == "schedule.work-started")
+            .count(),
+        1,
+        "restart replayed the due weekly tick"
+    );
+    wait_until("the next genuine weekly tick starts", 35, || async {
+        node.claims()
+            .await
+            .iter()
+            .filter(|claim| claim["kind"] == "schedule.work-started")
+            .count()
+            >= 2
+    })
+    .await;
+    let claims = node.claims().await;
+    assert_eq!(
+        claims
+            .iter()
+            .filter(|claim| claim["kind"] == "schedule.work-started")
+            .count(),
+        2
+    );
+    let occurrences: Vec<_> = claims
+        .iter()
+        .filter(|claim| claim["kind"] == "schedule.occurrence-reached")
+        .map(|claim| claim["body"]["fields"]["occurrence"].as_u64().unwrap())
+        .collect();
+    assert_eq!(occurrences, vec![0, 1]);
+}
+
 /// A stopped origin's earlier running claims must not fence a seat placed on another host.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_seat_is_reachable_after_a_cross_host_move() {
