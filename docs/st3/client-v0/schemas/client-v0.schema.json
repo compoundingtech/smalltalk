@@ -613,6 +613,25 @@
       }
     },
     "WorkState": {"enum": ["waiting-person", "waiting", "ready", "claimed", "blocked", "verifying", "completed", "failed", "cancelled"]},
+    "WorkEvidence": {
+      "type": "object",
+      "required": ["kind", "reference"],
+      "properties": {
+        "kind": { "enum": ["document", "external", "claim", "subject", "unknown"] },
+        "reference": { "type": "string" }
+      }
+    },
+    "WorkReport": {
+      "type": "object",
+      "required": ["claim_id", "attempt", "at", "summary", "evidence"],
+      "properties": {
+        "claim_id": { "$ref": "#/$defs/Revision" },
+        "attempt": { "type": "integer", "minimum": 0 },
+        "at": { "$ref": "#/$defs/Timestamp" },
+        "summary": { "type": "string" },
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/WorkEvidence" } }
+      }
+    },
     "MissionStep": {
       "type": "object",
       "required": ["id", "path", "state", "attempt", "since"],
@@ -627,6 +646,8 @@
         "agentless": { "type": "boolean" },
         "since": { "$ref": "#/$defs/Timestamp" },
         "last_progress": { "type": ["string", "null"] },
+        "progress_report": { "oneOf": [{ "$ref": "#/$defs/WorkReport" }, { "type": "null" }] },
+        "completion_report": { "oneOf": [{ "$ref": "#/$defs/WorkReport" }, { "type": "null" }] },
         "blocked_reason": { "type": ["string", "null"] },
         "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
         "goals": { "type": "array", "items": { "type": "string" } },
@@ -664,6 +685,8 @@
             "title": { "type": ["string", "null"] },
             "assigned_to": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "last_progress": { "type": ["string", "null"] },
+            "progress_report": { "oneOf": [{ "$ref": "#/$defs/WorkReport" }, { "type": "null" }] },
+            "completion_report": { "oneOf": [{ "$ref": "#/$defs/WorkReport" }, { "type": "null" }] },
             "state": { "$ref": "#/$defs/WorkState" },
             "attempt": { "type": "integer", "minimum": 0 },
             "readiness_epoch": { "type": "integer", "minimum": 0 },

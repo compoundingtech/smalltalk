@@ -1735,6 +1735,8 @@ fn mission_resources_filtered(
                                     "agentless": step.agentless,
                                     "since": client_timestamp(step.updated_at_unix_ms),
                                     "last_progress": step.progress_summary,
+                                    "progress_report": client_work_report(step.progress_report.as_ref()),
+                                    "completion_report": client_work_report(step.completion_report.as_ref()),
                                     "blocked_reason": step.blocked_reason,
                                     "blockers": step.blockers,
                                     "goals": step.goals,

@@ -525,6 +525,8 @@ fn validate_surfaces(
         "PersonAnswerInput",
         "PersonAnswer",
         "PersonAnswerRecord",
+        "WorkReport",
+        "WorkEvidence",
     ] {
         validate_model(schema, definition, definition, definition, rust, swift)?;
     }

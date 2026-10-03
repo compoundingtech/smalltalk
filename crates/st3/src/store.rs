@@ -24569,6 +24569,8 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         progress_summary: None,
         progress_at_unix_ms: None,
         completion_summary: None,
+        progress_report: None,
+        completion_report: None,
         readiness_epoch: row.get(19)?,
         blocked_reason: row.get(15)?,
         blockers: Vec::new(),
@@ -24643,49 +24645,68 @@ fn enrich_step_summaries_at(
     view: &mut StepRunView,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
-    let mut statement = connection.prepare_cached(&canonical_sql(
-        "SELECT kind, body, accepted_at_unix_ms FROM claims
-         WHERE subject=?1 AND kind IN ('work.progress','work.submitted')
-         ORDER BY CANONICAL_ASC(claims)",
-    ))?;
-    let events = statement
-        .query_map([&view.subject], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    view.progress_summary = None;
-    view.progress_at_unix_ms = None;
-    view.completion_summary = None;
-    for (kind, body, accepted) in events {
-        let accepted = accepted.parse::<u128>().unwrap_or(0);
-        if accepted > snapshot_unix_ms {
-            break;
-        }
-        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
-        let fields = body.get("fields").unwrap_or(&body);
-        if fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(view.attempt)) {
-            continue;
-        }
-        let Some(summary) = fields
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|summary| !summary.is_empty())
-        else {
-            continue;
-        };
-        if kind == "work.progress" {
-            view.progress_summary = Some(summary.to_owned());
-            view.progress_at_unix_ms = Some(accepted);
+    view.progress_report =
+        latest_work_report_at(connection, view, "work.progress", snapshot_unix_ms, true)?;
+    view.completion_report =
+        latest_work_report_at(connection, view, "work.submitted", snapshot_unix_ms, true)?;
+    // An evidence-only report is useful in detail, but must not erase the previous
+    // nonempty summary that older clients read through last_progress.
+    let summary_report = |kind: &str, report: &Option<crate::model::WorkReportView>| {
+        if report
+            .as_ref()
+            .is_some_and(|report| report.summary.is_empty())
+        {
+            latest_work_report_at(connection, view, kind, snapshot_unix_ms, false)
         } else {
-            view.completion_summary = Some(summary.to_owned());
+            Ok(report.clone())
         }
-    }
+    };
+    let progress = summary_report("work.progress", &view.progress_report)?;
+    let completion = summary_report("work.submitted", &view.completion_report)?;
+    view.progress_summary = progress.as_ref().map(|report| report.summary.clone());
+    view.progress_at_unix_ms = progress.as_ref().map(|report| report.at_unix_ms);
+    view.completion_summary = completion.as_ref().map(|report| report.summary.clone());
     Ok(())
+}
+
+fn latest_work_report_at(
+    connection: &Connection,
+    view: &StepRunView,
+    kind: &str,
+    snapshot_unix_ms: u128,
+    include_evidence_only: bool,
+) -> rusqlite::Result<Option<crate::model::WorkReportView>> {
+    // Return at most one report for this kind and attempt. The subject/kind index keeps
+    // a long-lived worker's renewals and unrelated history out of these reads. SQL trim
+    // uses the same whitespace codepoints as Rust str::trim, preserving summary selection.
+    connection.query_row(
+        &canonical_sql(
+            "SELECT id, body, accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind=?2
+               AND json_extract(body, '$.fields.attempt')=?3
+               AND CAST(accepted_at_unix_ms AS INTEGER)<=?4
+               AND (length(trim(COALESCE(json_extract(body, '$.fields.summary'), ''),
+                   char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)))>0
+                    OR (?5 AND json_array_length(body, '$.evidence')>0))
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+        ),
+        params![view.subject, kind, view.attempt, snapshot_unix_ms as i64, include_evidence_only],
+        |row| {
+            let body: String = row.get(1)?;
+            let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            let accepted: String = row.get(2)?;
+            Ok(crate::model::WorkReportView {
+                claim_id: row.get(0)?,
+                attempt: view.attempt,
+                at_unix_ms: accepted.parse().unwrap_or(0),
+                summary: body["fields"]["summary"].as_str().unwrap_or_default().trim().to_owned(),
+                evidence: body["evidence"].as_array().into_iter().flatten()
+                    .filter_map(Value::as_str)
+                    .map(|reference| crate::model::WorkEvidenceView::from_reference(reference.to_owned()))
+                    .collect(),
+            })
+        },
+    ).optional()
 }
 
 fn enrich_step_queue_for_reconcile_at(
@@ -40015,7 +40036,19 @@ mission "summaries" state="ready" {
             incarnation: Some("current".into()),
             summary: summary.map(str::to_owned),
             reason: None,
-            evidence: Vec::new(),
+            evidence: if key == "complete-1" {
+                vec![
+                    format!("doc/report@{}", "a".repeat(64)),
+                    "https://example.invalid/review/7".into(),
+                    "opaque-result".into(),
+                    "person/reviewer".into(),
+                    "c".repeat(64),
+                ]
+            } else if matches!(key, "progress-evidence" | "complete-2") {
+                vec!["step-run/reported/result".into()]
+            } else {
+                Vec::new()
+            },
             idempotency_key: key.into(),
         };
 
@@ -40039,6 +40072,7 @@ mission "summaries" state="ready" {
             ("progress-1", Some("Reading the renderer")),
             ("progress-2", Some("  Tests pass\n")),
             ("progress-3", None),
+            ("progress-empty", Some(" \n\t\u{2003}")),
         ] {
             store
                 .work_action(subject, "progress", &request(key, summary))
@@ -40048,6 +40082,37 @@ mission "summaries" state="ready" {
         assert_eq!(working.progress_summary.as_deref(), Some("Tests pass"));
         assert!(working.progress_at_unix_ms.is_some());
         assert_eq!(working.completion_summary, None);
+
+        let progress_report = working.progress_report.as_ref().unwrap();
+        assert_eq!(progress_report.summary, "Tests pass");
+        assert_eq!(progress_report.attempt, 1);
+        assert!(progress_report.evidence.is_empty());
+        assert_eq!(progress_report.claim_id.len(), 64);
+        // A later report must not leak into a snapshot taken before its claim.
+        let connection = store.connection.lock().unwrap();
+        let mut earlier = working.clone();
+        enrich_step_summaries_at(
+            &connection,
+            &mut earlier,
+            progress_report.at_unix_ms.saturating_sub(1),
+        )
+        .unwrap();
+        assert_ne!(
+            earlier.progress_report.as_ref().map(|r| &r.claim_id),
+            Some(&progress_report.claim_id)
+        );
+        drop(connection);
+        let evidence_only = store
+            .work_action(subject, "progress", &request("progress-evidence", None))
+            .unwrap();
+        assert_eq!(
+            evidence_only.progress_summary.as_deref(),
+            Some("Tests pass")
+        );
+        let latest_report = evidence_only.progress_report.as_ref().unwrap();
+        assert!(latest_report.summary.is_empty());
+        assert_eq!(latest_report.evidence[0].kind, "subject");
+        assert_ne!(latest_report.claim_id, progress_report.claim_id);
 
         store
             .work_action(
@@ -40065,6 +40130,28 @@ mission "summaries" state="ready" {
             Some("Opened the pull request")
         );
 
+        let report = submitted.completion_report.as_ref().unwrap();
+        assert_eq!(report.attempt, 1);
+        assert_ne!(report.claim_id, progress_report.claim_id);
+        assert_eq!(
+            report
+                .evidence
+                .iter()
+                .map(|e| e.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["document", "external", "unknown", "subject", "claim"]
+        );
+        store.set_step_state(subject, "completed", None).unwrap();
+        assert_eq!(
+            store
+                .step_run(subject)
+                .unwrap()
+                .unwrap()
+                .completion_report
+                .as_ref(),
+            Some(report)
+        );
+
         store
             .set_step_state(subject, "failed", Some("the gate failed"))
             .unwrap();
@@ -40076,6 +40163,21 @@ mission "summaries" state="ready" {
             "attempt 1 progress is stale"
         );
         assert_eq!(retried.completion_summary, None);
+        assert_eq!(retried.progress_report, None);
+        assert_eq!(retried.completion_report, None);
+        store.set_step_state(subject, "ready", None).unwrap();
+        store
+            .work_action(subject, "claim", &request("claim-2", None))
+            .unwrap();
+        store
+            .work_action(subject, "complete", &request("complete-2", None))
+            .unwrap();
+        let second = store.step_run(subject).unwrap().unwrap();
+        let report = second.completion_report.as_ref().unwrap();
+        assert_eq!(report.attempt, 2);
+        assert!(report.summary.is_empty());
+        assert_eq!(report.evidence[0].kind, "subject");
+        assert_eq!(second.completion_summary, None);
     }
 
     #[test]
@@ -40251,6 +40353,14 @@ version 2
             .work_action(&submitted, "complete", &request("delivery-submit"))
             .unwrap();
 
+        let original_submitted = submitted.clone();
+        let original_report = store
+            .step_run(&submitted)
+            .unwrap()
+            .unwrap()
+            .completion_report
+            .unwrap();
+
         let second = publish(
             "Use the revised mission constraint without redoing delivered work.",
             "delivery-two",
@@ -40280,6 +40390,17 @@ version 2
         assert!(submitted.worker_reported);
         assert!(submitted.claimant.is_none());
         assert!(submitted.claim_incarnation.is_none());
+        assert_ne!(submitted.subject, original_submitted);
+        assert_eq!(
+            store
+                .step_run(&original_submitted)
+                .unwrap()
+                .unwrap()
+                .completion_report
+                .as_ref(),
+            Some(&original_report),
+            "superseding the owner must not erase its reported evidence"
+        );
     }
 
     #[test]

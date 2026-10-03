@@ -12144,6 +12144,30 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
     for constraint in &work.constraints {
         let _ = writeln!(output, "Constraint: {constraint}");
     }
+    for (label, report) in [
+        ("Progress", &work.progress_report),
+        ("Completion reported", &work.completion_report),
+    ] {
+        if let Some(report) = report {
+            output.push_str(&presentation::render_work_report(
+                "",
+                label,
+                &report.claim_id,
+                report.attempt,
+                &report.at,
+                &report.summary,
+                report
+                    .evidence
+                    .iter()
+                    .map(|item| (item.kind.as_str(), item.reference.as_str())),
+            ));
+        }
+    }
+    if work.progress_report.is_none() {
+        if let Some(summary) = &work.last_progress {
+            let _ = writeln!(output, "Progress: {summary}");
+        }
+    }
     for response in &work.person_answers {
         let typed = response
             .answer
@@ -18949,6 +18973,8 @@ mod tests {
             StepRunView {
                 status: "verifying".into(),
                 completion_summary: Some("Published the guide".into()),
+                progress_report: None,
+                completion_report: None,
                 ..step(
                     "step-run/two/docs",
                     "Write the guide",
@@ -19750,6 +19776,61 @@ mod tests {
             rendered.contains("peek: st terminals peek agent/release"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn work_detail_shows_distinct_reports_and_document_navigation() {
+        let page = fixture_product_page(&["work"], false);
+        let ClientResource::Work(work) = &page.items[0] else {
+            panic!("work fixture");
+        };
+        let mut work = work.clone();
+        work.state = "completed".into();
+        work.progress_report = Some(st3_client::WorkReport {
+            claim_id: "a".repeat(64),
+            attempt: 1,
+            at: "2026-01-01T00:00:00Z".into(),
+            summary: "Awaiting review".into(),
+            evidence: vec![],
+        });
+        let document = format!("doc/report@{}", "b".repeat(64));
+        work.completion_report = Some(st3_client::WorkReport {
+            claim_id: "c".repeat(64),
+            attempt: 1,
+            at: "2026-01-01T00:01:00Z".into(),
+            summary: "Review approved; merge queued".into(),
+            evidence: vec![
+                st3_client::WorkEvidence {
+                    kind: "document".into(),
+                    reference: document.clone(),
+                },
+                st3_client::WorkEvidence {
+                    kind: "external".into(),
+                    reference: "https://example.invalid/review/7".into(),
+                },
+                st3_client::WorkEvidence {
+                    kind: "unknown".into(),
+                    reference: "opaque-value".into(),
+                },
+            ],
+        });
+        let output = render_client_work_detail(&work);
+        assert!(
+            output.contains("Progress (attempt 1, 2026-01-01T00:00:00Z): Awaiting review"),
+            "{output}"
+        );
+        assert!(output.contains("Completion reported (attempt 1, 2026-01-01T00:01:00Z): Review approved; merge queued"), "{output}");
+        assert!(
+            output.contains(&format!("st documents get '{document}'")),
+            "{output}"
+        );
+        assert!(output.contains("evidence (external): https://example.invalid/review/7"));
+        assert!(output.contains("evidence (unknown): opaque-value"));
+        assert!(!output.contains("st documents get 'opaque-value'"));
+        work.completion_report.as_mut().unwrap().summary.clear();
+        let evidence_only = render_client_work_detail(&work);
+        assert!(evidence_only.contains(": (no summary)"));
+        assert!(evidence_only.contains(&format!("st documents get '{document}'")));
     }
 
     #[test]

@@ -2106,6 +2106,48 @@ pub struct LoopRoundView {
     pub recorded_at_unix_ms: u128,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkReportView {
+    pub claim_id: String,
+    pub attempt: u32,
+    pub at_unix_ms: u128,
+    pub summary: String,
+    pub evidence: Vec<WorkEvidenceView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkEvidenceView {
+    pub kind: String,
+    pub reference: String,
+}
+
+impl WorkEvidenceView {
+    pub fn from_reference(reference: String) -> Self {
+        let hash = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit());
+        let kind = if reference.starts_with("doc/")
+            && reference
+                .rsplit_once('@')
+                .is_some_and(|(_, digest)| hash(digest))
+        {
+            "document"
+        } else if reqwest::Url::parse(&reference)
+            .is_ok_and(|url| matches!(url.scheme(), "https" | "http") && url.host_str().is_some())
+        {
+            "external"
+        } else if hash(&reference) || reference.strip_prefix("claim/").is_some_and(hash) {
+            "claim"
+        } else if st3_schema::registry().subject(&reference).is_some() {
+            "subject"
+        } else {
+            "unknown"
+        };
+        Self {
+            kind: kind.into(),
+            reference,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StepRunView {
     pub subject: String,
@@ -2165,6 +2207,10 @@ pub struct StepRunView {
     /// The `work complete` summary for the current attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_report: Option<WorkReportView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report: Option<WorkReportView>,
     pub readiness_epoch: u32,
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
