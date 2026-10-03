@@ -1,0 +1,52 @@
+version 2
+
+// Land a pull request and verify main with st's built-in gates instead of shell commands.
+//
+// The worker merges the invented pull request, st confirms main is green with it, and the worker
+// stores a handoff. Each gate is a built-in kind that st answers itself:
+//
+// - `merged` passes once the pull request merged; one that closed unmerged breaks the gate.
+// - `ci-passed` passes once the named GitHub check run or commit status succeeded on main's head.
+// - `cargo-test` fetches origin/main, builds the named test target in a worktree st keeps for the
+//   repository, and runs it. Failing tests are not yet; a target that does not build on this host
+//   breaks the gate, and the mission's publisher hears about it.
+// - `document` passes once the named document is stored. It runs no command, and publication does
+//   not need the document to exist yet.
+//
+// `merged`, `ci-passed` and `cargo-test` are exec gates st writes for you, so they check again
+// while not yet and `st missions check` runs them. GitHub reads use the token st's observers use.
+//
+// The run workspace is a clone of the invented project.
+//
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions check examples/st3/land-and-verify.kdl --workspace /srv/example/app \
+//     --input pull_request=example/app#42
+//   st missions publish examples/st3/land-and-verify.kdl --workspace /srv/example/app \
+//     --as person/operator
+//   st missions start example/app/land-and-verify --id example/app/land-and-verify/42 \
+//     --input pull_request=example/app#42 --workspace /srv/example/app --as person/operator
+
+mission "example/app/land-and-verify" state="ready" {
+  goal "Land the invented parser fix and confirm main is green with it."
+  input "pull_request" kind="text"
+
+  step "land" timeout="2h" {
+    assigned-to "agent/example/worker"
+    goal "Review pull request ${input.pull_request} and merge it once its checks pass."
+    gate "the pull request merged" { merged "${input.pull_request}" }
+  }
+
+  step "verify" {
+    agentless
+    depends-on { step "land" completed }
+    gate "linux-gate passed on main" { ci-passed "linux-gate" repo="example/app" branch="main" }
+    gate "the parser suite passes on main" { cargo-test "parser" package="example-app" }
+  }
+
+  step "handoff" timeout="30m" {
+    assigned-to "agent/example/worker"
+    depends-on { step "verify" completed }
+    goal "Write a short release handoff and store it with st documents put as the document the gate names."
+    gate "the handoff is stored" { document "doc/example/app/handoff/${ST_MISSION_RUN}" }
+  }
+}

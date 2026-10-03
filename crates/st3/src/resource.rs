@@ -7,6 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 
+/// What the built-in `merged` and `ci-passed` gates read from GitHub.
+pub mod github_gates;
 mod github_repository;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};

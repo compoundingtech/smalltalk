@@ -23,6 +23,7 @@ mod examples;
 mod fault_isolation;
 mod first_sync;
 mod fleet;
+mod gate_kinds;
 mod getting_started;
 mod hook_telemetry;
 mod human_gates;

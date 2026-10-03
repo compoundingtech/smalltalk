@@ -225,6 +225,12 @@ enum Command {
     },
     /// Generate one shell completion script.
     Completions(CompletionsArgs),
+    /// Answer one built-in gate check, as built-in gates run it: exit 0 to pass, 1 for not yet,
+    /// and 3 when the check cannot answer.
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
+    },
     /// Print the st agent skill bundled in this binary, or install it for each harness.
     Skill(SkillArgs),
     #[command(hide = true)]
@@ -1607,8 +1613,11 @@ enum MissionViewCommand {
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
-    /// Publish exact authored mission KDL after preview.
+    /// Publish exact authored mission KDL after preview, once its exec gates pass a check.
     Publish(MissionPublishArgs),
+    /// Run each exec gate in a mission file once, now, the way a run would, and report its
+    /// answer: pass (exit 0), not yet (exit 1), broken (anything else), or unchecked.
+    Check(MissionCheckArgs),
     /// Start one run from the current ready mission revision.
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
@@ -1652,6 +1661,61 @@ struct MissionPublishArgs {
     /// Complete person or agent subject authoring the publication.
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
+    /// The workspace a run would use, where publish first checks each exec gate.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Publish without first running each exec gate once to refuse a broken one.
+    #[arg(long)]
+    no_gate_check: bool,
+}
+
+#[derive(Args)]
+struct MissionCheckArgs {
+    /// KDL file to check; use `-` to read standard input.
+    file: PathBuf,
+    /// The workspace a run would use: `${ST_WORKSPACE}` and relative gate workspaces stand for
+    /// it.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// A mission input value for the check, as `missions start` takes it. A gate that reads an
+    /// input without one is unchecked.
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
+}
+
+#[derive(Subcommand)]
+enum GateCommand {
+    /// Whether a pull request has merged; one that closed unmerged cannot pass.
+    Merged {
+        /// OWNER/REPO#NUMBER.
+        pull_request: String,
+    },
+    /// Whether the check run or commit status named CHECK passed on a commit or branch head.
+    CiPassed {
+        check: String,
+        /// OWNER/REPO.
+        #[arg(long)]
+        repo: String,
+        /// A commit SHA or a branch name.
+        #[arg(long = "ref")]
+        reference: String,
+    },
+    /// Whether a cargo test target passes at a ref, built in a worktree st keeps between checks.
+    CargoTest {
+        /// The test target, as `cargo test --test TARGET` names it.
+        target: String,
+        #[arg(long)]
+        package: String,
+        /// The ref to test; its remote is fetched first.
+        #[arg(long = "ref", default_value = "origin/main")]
+        reference: String,
+        /// The repository, or a directory inside it.
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        /// The worktree to build in; st keeps one beneath its state directory by default.
+        #[arg(long)]
+        worktree: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
@@ -3838,6 +3902,45 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Driver(args) => run_driver(&immediate, args, cli.catalog.as_deref()).await,
+        Command::Gate { command } => run_gate(command).await,
+    }
+}
+
+/// `st gate KIND`: print the answer and exit with the status an exec gate reads.
+async fn run_gate(command: GateCommand) -> Result<()> {
+    use st3::resource::github_gates;
+    let answer = match command {
+        GateCommand::Merged { pull_request } => {
+            github_gates::pull_request_merged(&pull_request).await
+        }
+        GateCommand::CiPassed {
+            check,
+            repo,
+            reference,
+        } => github_gates::check_passed(&repo, &reference, &check).await,
+        GateCommand::CargoTest {
+            target,
+            package,
+            reference,
+            repository,
+            worktree,
+        } => {
+            tokio::task::spawn_blocking(move || {
+                st3::gate_kinds::cargo_test(&st3::gate_kinds::CargoTest {
+                    target: &target,
+                    package: &package,
+                    reference: &reference,
+                    repository: &repository,
+                    worktree: worktree.as_deref(),
+                })
+            })
+            .await?
+        }
+    };
+    println!("{}", answer.describe());
+    match answer.exit_code() {
+        0 => Ok(()),
+        code => Err(CommandExit(code).into()),
     }
 }
 
@@ -4250,6 +4353,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         native_session_home: std::env::var_os("HOME").map(PathBuf::from),
         planner_default: config.planner.clone(),
     };
+    st3::gate_check::set_endpoint(config.socket.display().to_string());
     let reconciler = Arc::new(Reconciler::native(
         store.clone(),
         &config.state_dir,
@@ -4902,6 +5006,7 @@ async fn run_mission_view(
             Ok(())
         }
         MissionViewCommand::Publish(args) => publish_mission_file(client, args, json_output).await,
+        MissionViewCommand::Check(args) => check_mission_file(client, args, json_output).await,
         MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
         MissionViewCommand::Cancel(args) => {
             cancel_mission_run(client, endpoint, args, json_output).await
@@ -4947,6 +5052,9 @@ async fn publish_mission_file(
         mission.blockers.join("; ")
     );
     warn_ignored_authority(&mission);
+    if !args.no_gate_check {
+        check_before_publish(client, &intent, &args.workspace).await?;
+    }
     let resolved = mission.resolved_intent;
     let response: ApplyResponse = client
         .post(
@@ -4967,6 +5075,168 @@ async fn publish_mission_file(
         .map(|(subject, revision)| json!({"subject": subject, "revision": revision}))
         .collect();
     print_value(&value, json_output)
+}
+
+/// Run each exec gate once before a publication and refuse it when one is broken.
+async fn check_before_publish(
+    client: &Client,
+    intent: &IntentInput,
+    workspace: &Path,
+) -> Result<()> {
+    let mut announced = false;
+    let checked = run_gate_check(client, intent, workspace, &[], |view, item| {
+        if !announced {
+            eprintln!("{}", gate_check_heading(view));
+            announced = true;
+        }
+        eprint!("{}", render_gate_check_item(item));
+    })
+    .await?;
+    let Some(view) = checked else {
+        eprintln!("st: this st daemon cannot check exec gates; publishing without the check");
+        return Ok(());
+    };
+    let broken = view
+        .gates
+        .iter()
+        .filter(|item| item.answer == "broken")
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        broken.is_empty(),
+        "{} exec gate{} cannot answer as written, so st did not publish: {}. Correct {}, or publish with --no-gate-check",
+        broken.len(),
+        if broken.len() == 1 { "" } else { "s" },
+        broken
+            .iter()
+            .map(|item| format!(
+                "`{}` ({})",
+                item.gate,
+                item.reason.as_deref().unwrap_or("broken")
+            ))
+            .collect::<Vec<_>>()
+            .join("; "),
+        if broken.len() == 1 { "it" } else { "them" }
+    );
+    Ok(())
+}
+
+/// `st missions check FILE`: exit status 1 when a gate is broken.
+async fn check_mission_file(
+    client: &Client,
+    args: MissionCheckArgs,
+    json_output: bool,
+) -> Result<()> {
+    let (kdl, source_name) = read_intent(Some(&args.file))?;
+    let intent = IntentInput { kdl, source_name };
+    let mut announced = false;
+    let checked = run_gate_check(
+        client,
+        &intent,
+        &args.workspace,
+        &args.inputs,
+        |view, item| {
+            if json_output {
+                return;
+            }
+            if !announced {
+                println!("{}", gate_check_heading(view));
+                announced = true;
+            }
+            print!("{}", render_gate_check_item(item));
+        },
+    )
+    .await?;
+    let view = checked.context("this st daemon cannot check exec gates; update it")?;
+    if json_output {
+        print_value(&view, true)?;
+    } else if view.gates.is_empty() {
+        println!("No exec gates to check.");
+    }
+    if view.gates.iter().any(|item| item.answer == "broken") {
+        return Err(CommandExit(1).into());
+    }
+    Ok(())
+}
+
+/// Run each exec gate of `intent` once on the daemon and wait for every answer, handing each one
+/// to `report` as it arrives. `None` when the daemon predates gate checks.
+async fn run_gate_check(
+    client: &Client,
+    intent: &IntentInput,
+    workspace: &Path,
+    inputs: &[(String, String)],
+    mut report: impl FnMut(&st3::model::GateCheckView, &st3::model::GateCheckItemView),
+) -> Result<Option<st3::model::GateCheckView>> {
+    let workspace = std::path::absolute(workspace)
+        .with_context(|| format!("resolve the workspace {}", workspace.display()))?;
+    let request = st3::model::GateCheckRequest {
+        intent: intent.clone(),
+        workspace: workspace.display().to_string(),
+        inputs: inputs.iter().cloned().collect(),
+    };
+    let mut view: st3::model::GateCheckView = match client.post("/v1/gate-checks", &request).await {
+        Ok(view) => view,
+        Err(error) if matches!(st3::client::http_status(&error), Some(404 | 405)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut reported = 0;
+    loop {
+        while let Some(item) = view.gates.get(reported) {
+            if matches!(item.answer.as_str(), "waiting" | "running") {
+                break;
+            }
+            report(&view, item);
+            reported += 1;
+        }
+        if view.finished {
+            return Ok(Some(view));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        view = client
+            .get(&format!(
+                "/v1/gate-checks/{}",
+                urlencoding::encode(&view.id)
+            ))
+            .await?;
+    }
+}
+
+fn gate_check_heading(view: &st3::model::GateCheckView) -> String {
+    format!(
+        "Checking {} exec gate{} on {}, one at a time:",
+        view.gates.len(),
+        if view.gates.len() == 1 { "" } else { "s" },
+        view.host
+    )
+}
+
+/// One gate's answer: its label, owner and name, why it is broken or unchecked, and the end of a
+/// broken check's output.
+fn render_gate_check_item(item: &st3::model::GateCheckItemView) -> String {
+    use std::fmt::Write as _;
+    let label = match item.answer.as_str() {
+        "not-yet" => "not yet",
+        answer => answer,
+    };
+    let mut output = format!("  {label:<9}  {} · {}", item.owner, item.gate);
+    if let Some(code) = item.exit_code {
+        let _ = write!(output, " · exit {code}");
+    }
+    if item.elapsed_ms >= 1_000 {
+        let _ = write!(output, " · {:.1}s", item.elapsed_ms as f64 / 1_000.0);
+    }
+    output.push('\n');
+    if let Some(reason) = &item.reason {
+        let _ = writeln!(output, "             {reason}");
+    }
+    if item.answer == "broken" {
+        for line in item.output.lines() {
+            let _ = writeln!(output, "             | {line}");
+        }
+    }
+    output
 }
 
 async fn cancel_mission_run(
@@ -7929,6 +8199,41 @@ fn render_performance(view: &Value) -> String {
                 let _ = write!(out, "  {kind}");
             }
             out.push('\n');
+        }
+    }
+    if let Some(corrections) = view["incremental_corrections"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        let _ = writeln!(
+            out,
+            "INCREMENTAL CORRECTIONS  count · item (writes an incremental pass would have missed; each is a bug)"
+        );
+        for row in corrections {
+            let _ = writeln!(
+                out,
+                "  {}  {}",
+                row["count"],
+                row["item"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    if let Some(evaluations) = view["incremental_evaluations"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        let _ = writeln!(
+            out,
+            "RECONCILE EVALUATIONS  count · CPU ms · item · whether an incremental pass would run it"
+        );
+        for row in evaluations {
+            let _ = writeln!(
+                out,
+                "  {}  {:.1}  {}",
+                row["count"],
+                row["cpu_ms"].as_f64().unwrap_or(0.0),
+                row["item"].as_str().unwrap_or("?")
+            );
         }
     }
     if let Some(wakes) = view["reconciler_wakes"].as_array() {
@@ -22914,6 +23219,8 @@ mission "review" state="ready" {
                 file,
                 at_index: None,
                 actor: "person/test".into(),
+                workspace: root.to_owned(),
+                no_gate_check: false,
             },
             true,
         )

@@ -66,6 +66,7 @@ st missions ls
 st missions show --help
 st missions show mission-run/64bcc9227e0166a571e09117d35c572e
 st missions publish --help
+st missions check --help
 st missions start --help
 st missions cancel --help
 st missions outcome --help

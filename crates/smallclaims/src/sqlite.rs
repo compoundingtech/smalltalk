@@ -67,6 +67,9 @@ pub struct WriterGuard<'a> {
     pub committed_index: &'a AtomicU64,
     /// When profiling, when this thread took the writer.
     pub acquired: Option<std::time::Instant>,
+    /// The connection's changed-row count when it was lent, so the rows this thread changed are
+    /// noted for it when it gives the connection back; see `touched::writes`.
+    pub changes_at_lend: u64,
 }
 
 impl WriterConnection {
@@ -110,6 +113,7 @@ impl WriterConnection {
             .recv()
             .expect("the writer thread lends its connection");
         WriterGuard {
+            changes_at_lend: connection.total_changes(),
             connection: Some(connection),
             give_back,
             committed_index: &self.committed_index,
@@ -128,9 +132,15 @@ impl WriterConnection {
         debug_assert_no_pinned_read();
         let outcome = Mutex::new(None);
         let slot = &outcome;
+        let changed_rows = AtomicU64::new(0);
+        let changed = &changed_rows;
         let run: Box<dyn FnOnce(&Transaction<'_>) -> bool + Send + '_> = Box::new(move |tx| {
+            let before = tx.total_changes();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(tx)));
             let succeeded = matches!(result, Ok(Ok(_)));
+            if succeeded {
+                changed.store(tx.total_changes().saturating_sub(before), Ordering::Relaxed);
+            }
             *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
             succeeded
         });
@@ -153,7 +163,10 @@ impl WriterConnection {
         let result = outcome.into_inner().unwrap_or_else(PoisonError::into_inner);
         match (result, committed) {
             (Some(Err(panic)), _) => std::panic::resume_unwind(panic),
-            (Some(Ok(result)), Ok(())) => Ok(result),
+            (Some(Ok(result)), Ok(())) => {
+                crate::touched::note_writes(changed_rows.load(Ordering::Relaxed));
+                Ok(result)
+            }
             // The batch failed to begin or to commit, or failed before it ran this write.
             (_, Err(error)) => Err(error),
             (None, Ok(())) => Err("the writer answered a write it did not run".into()),
@@ -324,6 +337,11 @@ impl Drop for WriterGuard<'_> {
         if let Ok(index) = current_index(&connection) {
             self.committed_index.store(index, Ordering::Release);
         }
+        crate::touched::note_writes(
+            connection
+                .total_changes()
+                .saturating_sub(self.changes_at_lend),
+        );
         crate::profile::writer_released(self.acquired.take());
         let _ = self.give_back.send(connection);
     }
