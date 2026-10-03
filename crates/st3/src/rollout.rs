@@ -53,6 +53,8 @@ pub struct Operation {
     pub allowed_work: BTreeMap<String, u32>,
     pub native_session_id: Option<String>,
     pub native_path: Option<String>,
+    #[serde(default)]
+    pub native_account: Option<String>,
     pub replacement_incarnation: Option<String>,
     pub forced: bool,
     pub blocking: Vec<String>,
@@ -189,6 +191,27 @@ pub fn blockers(store: &Store, subject: &str, operation: &Operation) -> Result<V
     blockers.sort();
     blockers.dedup();
     Ok(blockers)
+}
+
+pub fn bound_account(store: &Store, subject: &str, incarnation: &str) -> Result<Option<String>> {
+    Ok(store
+        .claims_for(subject, Some("harness.session-file"))?
+        .into_iter()
+        .rev()
+        .find(|claim| {
+            claim
+                .body
+                .pointer("/fields/incarnation_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(incarnation)
+        })
+        .and_then(|claim| {
+            claim
+                .body
+                .pointer("/fields/account_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }))
 }
 
 pub fn binding(

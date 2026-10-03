@@ -315,10 +315,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if !current()? {
                     return Ok(true);
                 }
+                let native_account =
+                    rollout::bound_account(&self.store, agent, &operation.old_incarnation)?;
                 if operation
                     .native_session_id
                     .as_deref()
-                    .is_some_and(|original| original != session)
+                    .is_some_and(|original| {
+                        original != session || operation.native_account != native_account
+                    })
                 {
                     phase(
                         &operation,
@@ -329,6 +333,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     return Ok(true);
                 }
                 operation.native_session_id = Some(session);
+                operation.native_account = native_account;
                 operation.native_path = path.or(operation.native_path.clone());
                 operation.forced = force;
                 phase(&operation, "stopping", None, &blockers)?;
@@ -593,12 +598,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                             && c.body.pointer("/fields/code").and_then(Value::as_str)
                                 == Some(crate::suspension::RESUME_UNAVAILABLE_CODE)
                     });
+                let account_mismatch = binding.is_some()
+                    && rollout::bound_account(&self.store, agent, replacement)?
+                        != operation.native_account;
                 let mismatch = binding.as_ref().is_some_and(|(harness, session, _)| {
                     Some(harness.as_str()) != old.driver.as_deref()
                         || Some(session.as_str()) != operation.native_session_id.as_deref()
                 });
                 if refused
                     || mismatch
+                    || account_mismatch
                     || observation.status != "running"
                     || now_ms()
                         >= operation

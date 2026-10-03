@@ -17,7 +17,7 @@ immediate publication behavior. New seats start normally; unchanged launches and
 keep their original launch lineage. Missions and schedules keep their existing semantics, including
 preserving active runs after omission.
 
-The initial supported cutover is a top-level native PTY seat on its existing host and harness family.
+The initial supported cutover is a top-level native PTY seat on its existing host, harness family and native login account.
 Authored session selectors and unsupported native launches are refused before publication. Every
 active admitted daemon must advertise seat-rollout support before the policy can be activated.
 

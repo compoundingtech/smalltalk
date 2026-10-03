@@ -477,6 +477,7 @@ fn rollout_preview_refuses_host_harness_and_authored_session_transitions() {
     for (host, harness, args) in [
         ("cobalt", "claude", "model \"second\";"),
         ("amber", "codex", "model \"second\";"),
+        ("amber", "claude", "account \"cloud\"; model \"second\";"),
         ("amber", "claude", "args \"--resume\" \"authored-session\";"),
     ] {
         let mut opts = options(&store, 20);

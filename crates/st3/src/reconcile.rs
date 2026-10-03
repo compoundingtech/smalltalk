@@ -4402,6 +4402,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .or_insert_with(|| value.clone());
         }
         self.bind_account(subject, member, &mut launch_member)?;
+        if let Some(id) = member.environment.get(crate::rollout::OPERATION_ENV) {
+            let operation = self.store.rollout(&subject.subject)?.context("rollout disappeared before account selection")?;
+            anyhow::ensure!(operation.id == *id && operation.native_account.as_deref() == launch_member.environment.get("ST3_ACCOUNT").map(String::as_str),
+                "strict rollout cannot carry a conversation between native login accounts");
+        }
         for variable in [
             crate::rollout::OPERATION_ENV,
             crate::rollout::PREDECESSOR_ENV,

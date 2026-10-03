@@ -617,9 +617,9 @@ pub(super) fn plan_tx(
             } else if s.starts_with("schedule/") {
                 "update future occurrences; retain created runs".to_owned()
             } else if let Some(prior) = existing {
-                let old_member = claim(transaction, &prior.claim, None)?
-                    .and_then(|c| serde_json::from_value::<DesiredSubject>(c.body).ok())
-                    .and_then(|d| d.member);
+                let old_subject = claim(transaction, &prior.claim, None)?
+                    .and_then(|c| serde_json::from_value::<DesiredSubject>(c.body).ok());
+                let old_member = old_subject.as_ref().and_then(|d| d.member.clone());
                 match (
                     input.subjects.get(s).and_then(|d| d.member.as_ref()),
                     old_member,
@@ -627,6 +627,10 @@ pub(super) fn plan_tx(
                     (Some(new), Some(old)) => {
                         let changed = new.launch_changes(&old);
                         if options.rollout.is_some() && !changed.is_empty() {
+                            if old_subject.as_ref().and_then(|d| crate::accounts::harness_binding(&d.desired))
+                                != input.subjects.get(s).and_then(|d| crate::accounts::harness_binding(&d.desired)) {
+                                blockers.push(format!("{s}: when-idle requires the same native account binding"));
+                            }
                             if let Err(refusal) = crate::native_resume::rollout_support(new) {
                                 blockers.push(format!("{s}: {}", refusal.reason));
                             }

@@ -283,10 +283,20 @@ fn rollout_drains_then_resumes_once_across_disk_reopens() {
     );
     seat.reopen();
     seat.step();
-    assert_eq!(seat.operation().phase, "verifying");
+    assert_eq!(
+        seat.operation().phase,
+        "verifying",
+        "{:?}",
+        seat.operation().reason
+    );
     seat.reopen();
     seat.step();
-    assert_eq!(seat.operation().phase, "verifying");
+    assert_eq!(
+        seat.operation().phase,
+        "verifying",
+        "{:?}",
+        seat.operation().reason
+    );
     seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
@@ -358,7 +368,12 @@ fn rollout_session_mismatch_stops_only_failed_replacement_and_never_falls_back()
     for _ in 0..5 {
         seat.step();
     }
-    assert_eq!(seat.operation().phase, "verifying");
+    assert_eq!(
+        seat.operation().phase,
+        "verifying",
+        "{:?}",
+        seat.operation().reason
+    );
     seat.binding("replacement-1", "wrong-session");
     seat.step();
     assert_eq!(seat.operation().phase, "failed");
@@ -567,7 +582,12 @@ fn rollout_recovers_a_spawn_receipt_gap_from_the_exact_driver_marker() {
     seat.binding("replacement-1", "native-one");
     seat.reopen();
     seat.step();
-    assert_eq!(seat.operation().phase, "verifying");
+    assert_eq!(
+        seat.operation().phase,
+        "verifying",
+        "{:?}",
+        seat.operation().reason
+    );
     seat.reopen();
     seat.step();
     assert_eq!(seat.operation().phase, "running");
@@ -648,7 +668,12 @@ fn rollout_retry_after_failed_verification_keeps_the_original_conversation() {
     for _ in 0..3 {
         seat.step();
     }
-    assert_eq!(seat.operation().phase, "verifying");
+    assert_eq!(
+        seat.operation().phase,
+        "verifying",
+        "{:?}",
+        seat.operation().reason
+    );
     assert_eq!(
         seat.runtime.starts.lock().unwrap()[1].environment[crate::suspension::RESUME_ENV],
         "native-one"
@@ -746,34 +771,93 @@ fn rollout_rechecks_pending_replies_and_the_physical_render_fence() {
 
 #[test]
 fn rollout_pending_person_work_can_resume_and_finish_while_new_work_waits() {
-    let seat = Seat::new();
-    let run = seat.work();
-    let request = |key: &str| crate::model::WorkRequest {
-        actor: Some(SUBJECT.into()),
-        incarnation: Some("original-1".into()),
-        summary: Some("tending".into()),
-        reason: None,
-        evidence: Vec::new(),
-        idempotency_key: key.into(),
-    };
-    seat.store
-        .work_action(&run.steps[0].subject, "claim", &request("claim"))
-        .unwrap();
-    let ask = seat
-        .store
-        .ask_person(&crate::model::PersonAskRequest {
-            legacy_request: None,
-            person: "person/operator".into(),
-            title: "Which bed?".into(),
-            reason: "Choose the next bed".into(),
-            actor: SUBJECT.into(),
-            step: Some(run.steps[0].subject.clone()),
-            new_run: None,
+    for retire in [false, true] {
+        let seat = Seat::new();
+        let run = seat.work();
+        let request = |key: &str| crate::model::WorkRequest {
+            actor: Some(SUBJECT.into()),
             incarnation: Some("original-1".into()),
-            request: None,
-            idempotency_key: "bed".into(),
-        })
-        .unwrap();
+            summary: Some("tending".into()),
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        seat.store
+            .work_action(&run.steps[0].subject, "claim", &request("claim"))
+            .unwrap();
+        let ask = seat
+            .store
+            .ask_person(&crate::model::PersonAskRequest {
+                legacy_request: None,
+                person: "person/operator".into(),
+                title: "Which bed?".into(),
+                reason: "Choose the next bed".into(),
+                actor: SUBJECT.into(),
+                step: Some(run.steps[0].subject.clone()),
+                new_run: None,
+                incarnation: Some("original-1".into()),
+                request: None,
+                idempotency_key: "bed".into(),
+            })
+            .unwrap();
+        seat.publish(
+            2,
+            if retire { "" } else { "second" },
+            Some(Policy::when_idle(1_800_000, false)),
+            retire,
+        );
+        seat.store.reconcile_person_asks().unwrap();
+        seat.step();
+        seat.store.reconcile_person_asks().unwrap();
+        seat.ack();
+        seat.busy(false);
+        seat.step();
+        assert_eq!(seat.operation().phase, "draining");
+        assert!(
+            seat.operation()
+                .blocking
+                .iter()
+                .any(|b| b == "pending-person-work")
+        );
+        seat.store
+            .finish_person_step(
+                &crate::model::PersonStepResponse {
+                    subject: ask.subject,
+                    actor: "person/operator".into(),
+                    summary: "The north bed".into(),
+                    evidence: Vec::new(),
+                    episode: None,
+                    answer: None,
+                    idempotency_key: "north".into(),
+                },
+                false,
+            )
+            .unwrap();
+        seat.store
+            .work_action(&run.steps[0].subject, "claim", &request("resume"))
+            .unwrap();
+        assert_eq!(
+            seat.store
+                .work_action(&run.steps[1].subject, "claim", &request("unrelated"))
+                .unwrap_err()
+                .code,
+            "seat-rollout-draining"
+        );
+        seat.store
+            .work_action(&run.steps[0].subject, "complete", &request("done"))
+            .unwrap();
+        seat.store
+            .set_step_state(&run.steps[0].subject, "completed", None)
+            .unwrap();
+        seat.step();
+        assert_eq!(seat.operation().phase, "stopping");
+    }
+}
+
+#[test]
+fn rollout_refuses_to_move_the_original_conversation_between_login_accounts() {
+    let seat = Seat::new();
+    seat.append("harness.session-file",json!({"harness":"claude","session_id":"native-one","incarnation_id":"original-1","account_ref":"cloud"}));
     seat.publish(
         2,
         "second",
@@ -783,44 +867,17 @@ fn rollout_pending_person_work_can_resume_and_finish_while_new_work_waits() {
     seat.step();
     seat.ack();
     seat.busy(false);
-    seat.step();
-    assert_eq!(seat.operation().phase, "draining");
+    for _ in 0..4 {
+        seat.step();
+    }
+    assert_eq!(seat.operation().phase, "failed");
     assert!(
         seat.operation()
-            .blocking
-            .iter()
-            .any(|b| b == "pending-person-work")
+            .reason
+            .unwrap()
+            .contains("native login accounts")
     );
-    seat.store
-        .finish_person_step(
-            &crate::model::PersonStepResponse {
-                subject: ask.subject,
-                actor: "person/operator".into(),
-                summary: "The north bed".into(),
-                evidence: Vec::new(),
-                episode: None,
-                answer: None,
-                idempotency_key: "north".into(),
-            },
-            false,
-        )
-        .unwrap();
-    seat.store
-        .work_action(&run.steps[0].subject, "claim", &request("resume"))
-        .unwrap();
-    assert_eq!(
-        seat.store
-            .work_action(&run.steps[1].subject, "claim", &request("unrelated"))
-            .unwrap_err()
-            .code,
-        "seat-rollout-draining"
-    );
-    seat.store
-        .work_action(&run.steps[0].subject, "complete", &request("done"))
-        .unwrap();
-    seat.store
-        .set_step_state(&run.steps[0].subject, "completed", None)
-        .unwrap();
-    seat.step();
-    assert_eq!(seat.operation().phase, "stopping");
+    assert_eq!(seat.operation().native_account.as_deref(), Some("cloud"));
+    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert_eq!(*seat.runtime.stops.lock().unwrap(), vec!["original-1"]);
 }

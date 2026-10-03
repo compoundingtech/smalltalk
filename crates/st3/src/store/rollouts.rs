@@ -117,6 +117,10 @@ fn operation(connection: &Connection, subject: &str) -> Result<Option<Operation>
                     .as_str()
                     .map(str::to_owned)
                     .or(operation.native_session_id);
+                operation.native_account = state["native_account"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or(operation.native_account);
                 operation.native_path = state["native_path"]
                     .as_str()
                     .map(str::to_owned)
@@ -151,6 +155,54 @@ fn operation(connection: &Connection, subject: &str) -> Result<Option<Operation>
         operation.phase = "superseded".into();
     }
     Ok(Some(operation))
+}
+
+/// A pending person ask remains attached to the still-running retiring seat until
+/// its existing work finishes or the original incarnation actually ends.
+pub(super) fn retiring_ask_live(
+    connection: &Connection,
+    ask: &ClaimRecord,
+) -> Result<bool, St3Error> {
+    let Some(subject) = ask.actor.as_deref() else {
+        return Ok(false);
+    };
+    let Some(selected) = selection(connection, subject)? else {
+        return Ok(false);
+    };
+    if selected.desired.kind != "stop" {
+        return Ok(false);
+    }
+    let fields = &ask.body["fields"];
+    let Some(step) = fields["origin_step"].as_str() else {
+        return Ok(false);
+    };
+    let Some(attempt) = fields["origin_attempt"].as_u64() else {
+        return Ok(false);
+    };
+    let actual = latest_actual(connection, subject)
+        .map_err(internal)?
+        .unwrap_or(Value::Null);
+    let Some(incarnation) = actual["incarnation_id"]
+        .as_str()
+        .filter(|_| actual["status"] == "running")
+    else {
+        return Ok(false);
+    };
+    if let Some(operation) = operation(connection, subject)? {
+        return Ok(operation.holds_seat()
+            && operation.old_incarnation == incarnation
+            && operation.allowed_work.get(step).copied().map(u64::from) == Some(attempt));
+    }
+    // Publication can precede the owner's first reconciliation pass.
+    connection
+        .query_row(
+            "SELECT status='waiting-person' AND attempt=?2 FROM step_runs WHERE subject=?1",
+            params![step, attempt],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|result| result.unwrap_or(false))
+        .map_err(internal)
 }
 
 pub(super) fn intake_held(
@@ -302,7 +354,7 @@ impl Store {
                 policy: policy.clone(), publication_policy: selected.policy, old_incarnation: incarnation.into(),
                 old_member: old.clone(), deadline_unix_ms: now.saturating_add(policy.deadline_ms.into()),
                 requested_by: Some(actor.into()), requested_at_unix_ms: now, phase: if ended { "stopping" } else { "draining" }.into(),
-                phase_at_unix_ms: now, drain_ack: None, start_attempted: false, allowed_work, native_session_id: carry.and_then(|o|o.native_session_id.clone()), native_path: carry.and_then(|o|o.native_path.clone()), replacement_incarnation: None,
+                phase_at_unix_ms: now, drain_ack: None, start_attempted: false, allowed_work, native_session_id: carry.and_then(|o|o.native_session_id.clone()), native_path: carry.and_then(|o|o.native_path.clone()), native_account: carry.and_then(|o|o.native_account.clone()), replacement_incarnation: None,
                 forced: false, blocking: Vec::new(), reason: None };
             let claim = append_claim_tx(tx, self.origin(), subject, "runtime.action.requested", Some(actor),
                 &json!({"fields":{"action":"rollout","operation":key,"rollout":operation},"evidence":[expected_token]}),
