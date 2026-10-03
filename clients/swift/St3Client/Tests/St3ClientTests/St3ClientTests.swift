@@ -136,6 +136,8 @@ final class St3ClientTests: XCTestCase {
         XCTAssertEqual(work.blockers, [])
         guard case .agent(let agent) = resources[8] else { return XCTFail("agent discriminator lost") }
         XCTAssertEqual(agent.runtimeIDs, ["runtime/release-agent"])
+        XCTAssertEqual(agent.workspace, "/srv/example/release")
+        XCTAssertEqual(agent.checkout?.branch, "release")
         guard case .runtime(let runtime) = resources[9] else { return XCTFail("runtime discriminator lost") }
         XCTAssertEqual(runtime.ownerHostID, "host/host-a")
         XCTAssertEqual(runtime.incarnationID, "runtime-9:2026-09-20T11:06:30Z")

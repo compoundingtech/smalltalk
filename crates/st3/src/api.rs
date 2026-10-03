@@ -1999,12 +1999,15 @@ fn client_agent_resources_uncached(
         .map(|subject| subject.subject.clone())
         .collect::<Vec<_>>();
     // Declarations, usage and faults of the listed agents only, not of every subject.
-    let desired_hosts = store
+    let desired_agents = store
         .desired_subjects_named(&agent_subjects)?
         .into_iter()
         .filter_map(|desired| {
-            let host = desired.member.map(|member| member.host)?;
-            Some((desired.subject, client_host_id(&host)))
+            let member = desired.member?;
+            let checkout = crate::checkout::Checkout::from_desired(&desired.desired).map(|checkout| json!({
+                "repository": checkout.repository, "base": checkout.base, "branch": checkout.branch
+            }));
+            Some((desired.subject, (client_host_id(&member.host), member.workspace, checkout)))
         })
         .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
@@ -2204,7 +2207,9 @@ fn client_agent_resources_uncached(
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
                 "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
                 "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),
-                "host_id": desired_hosts.get(&subject.subject),
+                "host_id": desired_agents.get(&subject.subject).map(|(host, _, _)| host),
+                "workspace": desired_agents.get(&subject.subject).map(|(_, workspace, _)| workspace),
+                "checkout": desired_agents.get(&subject.subject).and_then(|(_, _, checkout)| checkout.as_ref()),
                 "last_activity_at": last_activity_at.map(client_timestamp),
                 "silent_since": silent_since.map(client_timestamp),
                 "fault": fault,
