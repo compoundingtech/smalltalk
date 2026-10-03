@@ -10172,9 +10172,17 @@ async fn list_messages_page(
         None => state.store.index().map_err(ApiError::internal)?,
     };
     let after = cursor.as_ref().map(|cursor| cursor.after);
+    let native_delivery = peer.is_some() && !query.include_closed;
     let store = state.store.clone();
     let (items, next_after) = blocking_store(move || {
-        store.messages_page(to.as_deref(), query.include_closed, after, through, limit)
+        let (mut items, next_after) =
+            store.messages_page(to.as_deref(), query.include_closed, after, through, limit)?;
+        if native_delivery {
+            for message in &mut items {
+                crate::blobs::annotate_delivery(&store, message)?;
+            }
+        }
+        Ok((items, next_after))
     })
     .await?;
     let next_cursor = next_after
@@ -10214,10 +10222,19 @@ async fn list_messages(
         recipient.as_deref(),
         query.include_closed,
     );
+    let native_delivery = peer.is_some() && !query.include_closed;
     let store = state.store.clone();
-    blocking_store(move || store.messages(recipient.as_deref(), query.include_closed))
-        .await
-        .map(Json)
+    blocking_store(move || {
+        let mut messages = store.messages(recipient.as_deref(), query.include_closed)?;
+        if native_delivery {
+            for message in &mut messages {
+                crate::blobs::annotate_delivery(&store, message)?;
+            }
+        }
+        Ok(messages)
+    })
+    .await
+    .map(Json)
 }
 
 async fn read_message(

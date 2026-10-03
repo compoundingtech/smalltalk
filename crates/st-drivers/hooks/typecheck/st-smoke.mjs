@@ -108,6 +108,13 @@ if (driver === "omp") {
   await events.get("context")({messages:[{role:"user",content:"TOP LEVEL ONLY"}]},ctx);
   await until(()=>read().some(frame=>frame.type==="read"&&frame.meta?.messageId===pending.messageId));
 }
+const imageMeta = {messageId:"message/image-only"};
+const imagePart = {type:"image", data:"iVBORw0KGgo=", mimeType:"image/png"};
+send({type:"message", content:"1 attachments", images:[imagePart], meta:imageMeta});
+await until(()=>read().some(frame=>frame.type==="delivered"&&frame.meta?.messageId===imageMeta.messageId));
+assert.deepEqual(handoffs.at(-1), [{type:"text",text:"1 attachments"}, imagePart]);
+await events.get("context")({messages:[{role:"user",content:handoffs.at(-1)}]},ctx);
+await until(()=>read().some(frame=>frame.type==="read"&&frame.meta?.messageId===imageMeta.messageId));
 assert.ok(!fs.existsSync(path.join(dir,"resources/inbox")));
 assert.ok(!fs.existsSync(path.join(dir,"resources/archive")));
 await events.get("session_shutdown")(driver==="pi"?{reason:"quit"}:{},ctx);

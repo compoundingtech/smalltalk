@@ -45,11 +45,14 @@ const HELLO_TIMEOUT_MS = 5000;
 // command is backgrounded as before. It was chosen below st3's 15-second work-wake retry.
 const HOLD_MAX_MS = 10_000;
 
+type ImagePart = { type: "image"; data: string; mimeType: string };
+
 type Frame = {
   type?: string;
   protocol?: number;
   sessionContext?: string;
   content?: string;
+  images?: ImagePart[];
   deliverAs?: "steer" | "followUp";
   meta?: Record<string, unknown>;
   seat?: { subject?: string; desired?: { display_name?: string }; member?: { display_name?: string; tags?: Record<string, string> } };
@@ -58,6 +61,7 @@ type Frame = {
 /** A message the channel sent that omp has not been handed yet. */
 type HeldMessage = {
   content: string;
+  images?: ImagePart[];
   deliverAs: "steer" | "followUp";
   meta?: Record<string, unknown>;
   /** The channel that sent it. A retired channel's successor re-sends what it never acknowledged. */
@@ -469,6 +473,7 @@ export default function (pi: ExtensionAPI) {
         }
         await receive({
           content: frame.content,
+          images: frame.images,
           deliverAs: frame.deliverAs ?? "steer",
           meta: frame.meta,
           channel: child,
@@ -627,7 +632,9 @@ export default function (pi: ExtensionAPI) {
   // together reaches omp as one message.
   const handOff = async (messages: HeldMessage[]) => {
     const [first] = messages;
-    const content = messages.map((message) => message.content).join("\n\n");
+    const content: Parameters<ExtensionAPI["sendUserMessage"]>[0] = messages.some((message) => message.images?.length)
+      ? messages.flatMap((message) => [{ type: "text" as const, text: message.content }, ...(message.images ?? [])])
+      : messages.map((message) => message.content).join("\n\n");
     for (const message of messages) {
       const messageId = message.meta?.messageId;
       if (typeof messageId === "string") {

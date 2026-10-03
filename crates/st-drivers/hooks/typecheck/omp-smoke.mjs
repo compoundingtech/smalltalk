@@ -536,6 +536,17 @@ assert.deepStrictEqual(readFrames().slice(framesBeforeMain), [{ type: "state", s
 await handlers.get("agent_end")(successfulEnd, mainCtx);
 fs.rmSync(outboxPath, { force: true });
 
+// Image-only transport keeps a text notice and hands the image to the native prompt API.
+await handlers.get("session_start")({}, fullCtx);
+const image = { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" };
+fs.appendFileSync(outboxPath, JSON.stringify({
+  type: "message", content: "1 attachments", images: [image],
+  meta: { messageId: "message/image-only" },
+}) + "\n");
+await pause(200);
+assert.deepStrictEqual(handedOver.at(-1).content, [{ type: "text", text: "1 attachments" }, image]);
+assert.ok(acknowledged().includes("message/image-only"));
+
 // `session_shutdown` has no reason field upstream and always denotes process exit. Closing must
 // make a later observational frame a no-op.
 const beforeShutdown = readFrames().filter((frame) => frame.type === "state").length;

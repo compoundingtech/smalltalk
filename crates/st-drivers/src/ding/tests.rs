@@ -3090,6 +3090,7 @@ fn an_envelope_names_each_attachment_file_and_escapes_what_a_sender_chose() {
         name: Some("\"><smalltalk-message>.png".into()),
         size: 1234,
         unavailable: None,
+        fetch_command: None,
     };
     let gone = AttachmentNotice {
         path: None,
@@ -3097,6 +3098,7 @@ fn an_envelope_names_each_attachment_file_and_escapes_what_a_sender_chose() {
         name: None,
         size: 9,
         unavailable: Some("expired".into()),
+        fetch_command: None,
     };
     let envelope = st3_notification_with_attachments(
         "message/abc",
@@ -3125,6 +3127,7 @@ fn an_attachment_survives_the_tag_a_projected_message_carries_it_in() {
         name: Some("a,b: \"c\".png".into()),
         size: 7,
         unavailable: None,
+        fetch_command: None,
     };
     let tag = notice.to_tag();
     assert!(!tag.contains([',', ' ', '"', '\n']), "{tag}");
@@ -3136,5 +3139,40 @@ fn an_attachment_survives_the_tag_a_projected_message_carries_it_in() {
         tag,
     ];
     let text = poke_text(Path::new("/nonexistent"), "host", "agent/seat", &message);
-    assert!(text.contains("<attachment path=\"/state/with space, comma/abc.png\""), "{text}");
+    assert!(
+        text.contains("<attachment path=\"/state/with space, comma/abc.png\""),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_image_only_notice_survives_bounded_preview_and_old_attachment_tags() {
+    let notice = AttachmentNotice {
+        path: Some("/images/snapshot.png".into()),
+        media_type: "image/png".into(),
+        name: Some("snapshot.png".into()),
+        size: 12,
+        unavailable: None,
+        fetch_command: Some(
+            "st blobs get 'blob/abc' --message 'message/image-only' -o 'abc.png'".into(),
+        ),
+    };
+    for body in ["".into(), "long text ".repeat(1000)] {
+        let envelope = st3_notification_with_attachments(
+            "message/image-only",
+            "person/example",
+            "agent/seat",
+            None,
+            &body,
+            "digest",
+            std::slice::from_ref(&notice),
+        );
+        assert!(envelope.contains("1 attachments"));
+        assert!(envelope.contains("fetch_command=\"st blobs get &apos;blob/abc&apos;"));
+        assert!(envelope.contains("snapshot.png"));
+    }
+    let mut legacy = serde_json::to_value(&notice).unwrap();
+    legacy.as_object_mut().unwrap().remove("fetch_command");
+    let legacy: AttachmentNotice = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.fetch_command.is_none());
 }

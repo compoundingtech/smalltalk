@@ -113,7 +113,15 @@ pub fn st3_ping_text(reference: &str, from: &str, subject: Option<&str>, body: &
     let person_message = from.starts_with("person/");
     let from = normalize_field(Some(from), "unknown", SENDER_MAX_CHARS);
     let subject = normalize_field(subject, "(no subject)", SUBJECT_MAX_CHARS);
-    let header = format!("[PING from st3] {reference} from {from}: {subject}");
+    let mut header = format!("[PING from st3] {reference} from {from}: {subject}");
+    if let Some(count) = body
+        .strip_prefix("[st attachments: ")
+        .and_then(|body| body.split_once(" attachments]"))
+        .and_then(|(count, _)| count.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+    {
+        header.push_str(&format!(" ({count} attachments)"));
+    }
     let (preview, truncated) = st3_body_preview(body);
     let mut notice = if preview.is_empty() {
         header
@@ -155,6 +163,8 @@ pub struct AttachmentNotice {
     pub size: u64,
     /// Why there is no `path`, such as `expired`.
     pub unavailable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_command: Option<String>,
 }
 
 impl AttachmentNotice {
@@ -191,6 +201,41 @@ impl AttachmentNotice {
     }
 }
 
+/// Attachment metadata also travels as text so older drivers cannot silently drop it.
+pub fn attachment_summary(attachments: &[AttachmentNotice]) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+    let mut summary = format!("[st attachments: {} attachments]\n", attachments.len());
+    for attachment in attachments {
+        let name = normalize_field(attachment.name.as_deref(), "image", 80);
+        summary.push_str(&format!(
+            "{name} ({}, {} bytes)",
+            normalize_line(&attachment.media_type),
+            attachment.size
+        ));
+        if let Some(reason) = &attachment.unavailable {
+            summary.push_str(&format!(
+                "; attachment could not be fetched: {}",
+                normalize_line(reason)
+            ));
+        }
+        if let Some(command) = &attachment.fetch_command {
+            summary.push_str(&format!("; read with {command}"));
+        }
+        summary.push('\n');
+    }
+    summary
+}
+
+pub fn attachment_notices(message: &Message) -> Vec<AttachmentNotice> {
+    message
+        .tags
+        .iter()
+        .filter_map(|tag| AttachmentNotice::from_tag(tag))
+        .collect()
+}
+
 /// [`st3_notification_text`] with one `<attachment/>` element per file inside the envelope, after
 /// the body. Each value is escaped like the envelope's own attributes.
 pub fn st3_notification_with_attachments(
@@ -207,7 +252,10 @@ pub fn st3_notification_with_attachments(
     let id = graph.strip_prefix("message/").unwrap_or(&graph);
     let from = normalize_field(Some(from), "unknown", ADDRESS_MAX_CHARS);
     let to = normalize_field(Some(to), "unknown", ADDRESS_MAX_CHARS);
-    let subject = normalize_field(subject, "(no subject)", SUBJECT_MAX_CHARS);
+    let mut subject = normalize_field(subject, "(no subject)", SUBJECT_MAX_CHARS);
+    if !attachments.is_empty() {
+        subject.push_str(&format!(" ({} attachments)", attachments.len()));
+    }
     let sha256 = normalize_field(Some(body_sha256), "unknown", 64);
     let mut envelope = format!(
         "<smalltalk-message id=\"{}\" from=\"{}\" to=\"{}\" subject=\"{}\" sha256=\"{}\" graph=\"{}\">\n",
@@ -218,6 +266,23 @@ pub fn st3_notification_with_attachments(
         xml_escape(&sha256, true),
         xml_escape(&graph, true),
     );
+    if !attachments.is_empty() {
+        // This line is outside the bounded body preview, including image-only messages.
+        envelope.push_str(&format!("{} attachments\n", attachments.len()));
+        for attachment in attachments {
+            if let Some(reason) = &attachment.unavailable {
+                envelope.push_str(&xml_escape(
+                    &format!(
+                        "attachment could not be fetched: {} ({})",
+                        normalize_field(attachment.name.as_deref(), "image", 80),
+                        normalize_line(reason)
+                    ),
+                    false,
+                ));
+                envelope.push('\n');
+            }
+        }
+    }
     let (preview, truncated) = st3_body_preview(body);
     if !preview.is_empty() {
         envelope.push_str(&xml_escape(&preview, false));
@@ -240,7 +305,13 @@ pub fn st3_notification_with_attachments(
             envelope.push_str(&format!(" name=\"{}\"", xml_escape(&name, true)));
         }
         if let Some(reason) = &attachment.unavailable {
-            envelope.push_str(&format!(" unavailable=\"{}\"", xml_escape(&normalize_line(reason), true)));
+            envelope.push_str(&format!(
+                " unavailable=\"{}\"",
+                xml_escape(&normalize_line(reason), true)
+            ));
+        }
+        if let Some(command) = &attachment.fetch_command {
+            envelope.push_str(&format!(" fetch_command=\"{}\"", xml_escape(command, true)));
         }
         envelope.push_str("/>\n");
     }

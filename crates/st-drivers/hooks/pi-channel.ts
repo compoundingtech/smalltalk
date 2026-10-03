@@ -40,11 +40,14 @@ const SEQ = "ST_PI_CHANNEL_SEQ";
 // never worth a hung agent.
 const HELLO_TIMEOUT_MS = 5000;
 
+type ImagePart = { type: "image"; data: string; mimeType: string };
+
 type Frame = {
   type?: string;
   protocol?: number;
   sessionContext?: string;
   content?: string;
+  images?: ImagePart[];
   deliverAs?: "steer" | "followUp";
   meta?: Record<string, unknown>;
 };
@@ -282,15 +285,18 @@ export default function (pi: ExtensionAPI) {
         }
         if (frame.type !== "message" || typeof frame.content !== "string") return;
         try {
+          const content: Parameters<ExtensionAPI["sendUserMessage"]>[0] = frame.images?.length
+            ? [{ type: "text", text: frame.content }, ...frame.images]
+            : frame.content;
           // `deliverAs` is required only while a turn is streaming, and an idle send that carries
           // one is rejected, so the idle proof selects the call shape. It never selects the policy.
           // Not optional-chained: `ctx.isIdle?.() ?? true` would read a missing idle proof as
           // "idle" and silently turn every mid-turn delivery into a plain send. st pins the
           // surfaces whose skew is silent, and this is the one such surface in this file.
           if (ctx.isIdle()) {
-            await pi.sendUserMessage(frame.content);
+            await pi.sendUserMessage(content);
           } else {
-            await pi.sendUserMessage(frame.content, { deliverAs: frame.deliverAs ?? "steer" });
+            await pi.sendUserMessage(content, { deliverAs: frame.deliverAs ?? "steer" });
           }
           send({ type: "delivered", meta: frame.meta });
         } catch (error) {
