@@ -1510,7 +1510,7 @@ fn mission_resources_filtered(
     let scope = selected_id
         .map(|selected| vec![selected.to_owned()])
         .or_else(|| page_ids.map(|ids| ids.to_vec()));
-    // A detail reads its runs' current steps with their headers, two reads for every run.
+    // Base cards use headers and current-step summaries; only a selected detail enriches below.
     let runs = if let Some(selected) = selected_id {
         store.mission_run_summaries_for_missions(&[selected.to_owned()])?
     } else if let Some(ids) = page_ids {
