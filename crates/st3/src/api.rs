@@ -540,6 +540,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/by-key", get(message_by_key))
         .route("/v1/status", get(status))
         .route("/v1/desired/{*subject}", get(get_desired))
+        .route("/v1/resource-references/{*subject}", get(resource_referrers))
         .route("/v1/events", get(events))
         .route("/v1/doctor", get(doctor))
         .route("/v1/repair", get(operational_repair_plan))
@@ -2283,8 +2284,8 @@ fn client_agent_resources_uncached(
     Ok(agents.into_iter().map(|(_, value)| value).collect())
 }
 
-/// A declaration's resource edges as client-v0 shows them: read-only references to ordinary
-/// resource subjects. `uri` is null while the referenced subject has not arrived.
+/// Read-only edges with an explicit authored kind and URI resolution state.
+/// Subject edges do not require a URI locator; missing URI locators are omitted, not null.
 pub(crate) fn client_declared_resources(
     references: &[crate::model::DeclaredResourceReference],
     uris: &BTreeMap<String, String>,
@@ -2292,12 +2293,23 @@ pub(crate) fn client_declared_resources(
     references
         .iter()
         .map(|reference| {
-            json!({
+            let mut value = json!({
                 "name": reference.name,
                 "subject": reference.subject,
-                "uri": uris.get(&reference.subject),
+                "kind": reference.kind,
+                "resolution": match reference.kind {
+                    crate::model::ResourceReferenceKind::Subject => "not-applicable",
+                    crate::model::ResourceReferenceKind::Uri if uris.contains_key(&reference.subject) => "resolved",
+                    crate::model::ResourceReferenceKind::Uri => "unresolved",
+                },
                 "reason": reference.reason,
-            })
+            });
+            if reference.kind == crate::model::ResourceReferenceKind::Uri {
+                if let Some(uri) = uris.get(&reference.subject) {
+                    value["uri"] = json!(uri);
+                }
+            }
+            value
         })
         .collect()
 }
@@ -10846,6 +10858,16 @@ struct StatusQuery {
     history: bool,
 }
 
+async fn resource_referrers(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.declared_resource_referrers(&subject))
+        .await
+        .map(Json)
+}
+
 /// One subject's desired record. Each Claude seat's status line reads it on every render (every
 /// five seconds), which a full status reduction of the seat made a tenth of a core on a member.
 async fn get_desired(
@@ -11186,7 +11208,9 @@ fn scope_eval_desired_subjects(
     let mut shared = Vec::new();
     for (subject, desired) in &mut intent.subjects {
         let Some(current) = selected.get(subject.as_str()) else {
-            desired.owner_run = Some(owner_run.to_owned());
+            if crate::graph::declared_uri(&desired.desired).is_none() {
+                desired.owner_run = Some(owner_run.to_owned());
+            }
             continue;
         };
         if *current == desired {
@@ -15835,8 +15859,8 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(
             agent["resources"],
             json!([
-                { "name": "goal", "subject": subject(goal), "uri": goal, "reason": "seat goal" },
-                { "name": "worktree", "subject": subject(worktree), "uri": worktree, "reason": null },
+                { "name": "goal", "subject": subject(goal), "kind": "uri", "resolution": "resolved", "uri": goal, "reason": "seat goal" },
+                { "name": "worktree", "subject": subject(worktree), "kind": "uri", "resolution": "resolved", "uri": worktree, "reason": null },
             ])
         );
         let typed: st3_client::Resource = serde_json::from_value(agent).unwrap();
@@ -15858,11 +15882,24 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let kdl = crate::graph::render_agent_desired_kdl(&tree, &uris).unwrap();
         let reparsed = crate::graph::parse_test_intent(&kdl, "node").unwrap();
         assert_eq!(reparsed.subjects["agent/ada/seat"].desired, tree);
+        let unresolved = client_declared_resources(
+            &crate::graph::declared_resources(&tree), &BTreeMap::new(),
+        );
+        assert_eq!(unresolved[0]["kind"], "uri");
+        assert_eq!(unresolved[0]["resolution"], "unresolved");
+        assert_eq!(unresolved[0]["subject"], subject(goal));
+        assert!(unresolved[0].get("uri").is_none());
+
+        publish("subject", "  resource \"tracker\" subject=\"resource/github/example/issue/1\" reason=\"tracking\"\n");
+        assert_eq!(
+            read()["resources"],
+            json!([{"name": "tracker", "subject": "resource/github/example/issue/1", "kind": "subject", "resolution": "not-applicable", "reason": "tracking"}]),
+        );
 
         publish("drop", &format!("  resource \"goal\" uri=\"{goal}\" reason=\"seat goal\"\n"));
         assert_eq!(
             read()["resources"],
-            json!([{ "name": "goal", "subject": subject(goal), "uri": goal, "reason": "seat goal" }])
+            json!([{ "name": "goal", "subject": subject(goal), "kind": "uri", "resolution": "resolved", "uri": goal, "reason": "seat goal" }])
         );
         assert_eq!(
             state
@@ -18849,12 +18886,16 @@ host "local" { document "doc/hosts/eval@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let mut fixture = parse_intent(
             r#"version 2
 resource "eval/fixture" { kind "filesystem.file" }
-agent "eval/fixture/worker" { workspace "/tmp"; command "true"; restart "never" }
+agent "eval/fixture/worker" { workspace "/tmp"; command "true"; restart "never"; resource "goal" uri="https://example.com/shared"; }
 "#,
             "node",
         )
         .unwrap();
         scope_eval_desired_subjects(&mut fixture, &current, "mission-run/eval-run").unwrap();
+        let resource = crate::graph::declared_resources(
+            &fixture.subjects["agent/eval/fixture/worker"].desired,
+        );
+        assert_eq!(fixture.subjects[&resource[0].subject].owner_run, None);
         assert_eq!(
             fixture.subjects["resource/eval/fixture"]
                 .owner_run
