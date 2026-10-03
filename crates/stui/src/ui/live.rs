@@ -1371,6 +1371,9 @@ fn moved_sessions(
 
 /// The quiet line above a conversation's oldest entry: how to see more, that more is on its
 /// way, why it could not come, or that this is where the session starts.
+/// The entry above a conversation's oldest that says how far back it goes.
+pub(crate) const HISTORY_NOTE: &str = "history";
+
 fn history_note(timeline: &st3_conversation_ui::Timeline) -> Option<super::view::Entry> {
     use st3_conversation_ui::Body;
     let older = &timeline.older;
@@ -1386,7 +1389,7 @@ fn history_note(timeline: &st3_conversation_ui::Timeline) -> Option<super::view:
         "Start of this session · earlier ones: st conversations sessions".to_owned()
     };
     Some(super::view::Entry {
-        id: "history".into(),
+        id: HISTORY_NOTE.into(),
         at: String::new(),
         body: Body::Event(text),
     })
