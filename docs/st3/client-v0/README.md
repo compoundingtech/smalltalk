@@ -832,6 +832,32 @@ rules, adding a required action parameter, or changing action semantics requires
 version or API version. Clients preserve unknown enum cases for display but never send an action
 whose capability version they do not understand.
 
+### Inline schema semantics
+
+The shared JSON Schema carries client semantics next to the wire constraints, not in a separate
+registry. Standard Draft 2020-12 validators ignore these `x-st-*` annotations:
+
+- `x-st-ref` names the subject family, a set of allowed families, or `*` for a generic subject.
+  Named IDs retain the `family/non-whitespace-suffix` wire shape, including nested suffixes.
+  Mission run-generation maps validate both mission-run keys and run-generation values.
+- `x-st-brand` distinguishes opaque cursors, revisions, preview tokens, idempotency keys, and
+  screen revisions. They remain strings on the wire; compare for equality and echo them unchanged.
+- `x-st-codec` identifies RFC 3339 timestamps, Unix epoch milliseconds, millisecond/second
+  durations, and redacted credentials. Units and credential sensitivity are explicit.
+- Root `x-st-integers: "json-safe"` declares the safe-integer policy for generated JSON clients.
+  Existing JSON Schema bounds still apply.
+
+Evolving mission, agent, timeline, and error enums use `anyOf` with known values plus a string
+branch. Consumers accept future strings without changing their wire value. `Resource` includes
+`UnknownResource`, which preserves a future kind's valid header and arbitrary payload. Its kind
+exclusion prevents malformed known resources from falling through that branch. The generated raw
+Rust, Swift, and TypeScript `Resource` types model known kinds only, so TypeScript keeps
+discriminant narrowing on `kind`.
+
+Daemon conformance uses a strict test-only view of the same schema: it closes composed resource
+fields, tightens open enums to known values, and removes `UnknownResource`. Consumer tolerance
+does not authorize producers to emit undeclared cases or weaken family-ID validation.
+
 ## Conformance assets
 
 [`schemas/client-v0.schema.json`](schemas/client-v0.schema.json) contains the shared wire types.
