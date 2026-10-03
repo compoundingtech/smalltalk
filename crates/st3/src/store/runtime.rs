@@ -126,8 +126,9 @@ impl Runtime for SmalltalkRuntime {
         &self,
         transaction: &Transaction<'_>,
         origin: &str,
+        through: u64,
     ) -> Result<bool, St3Error> {
-        try_project_simple_replication_tx(transaction, origin)
+        try_project_simple_replication_tx(transaction, origin, through)
     }
 
     fn replay_from_nothing(&self, transaction: &Transaction<'_>) -> Result<(), St3Error> {
@@ -146,6 +147,15 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner);
         cache.views.clear();
         cache.statuses.clear();
+        drop(cache);
+        self.agent_status_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.agent_resources_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])] {

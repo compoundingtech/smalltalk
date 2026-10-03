@@ -359,6 +359,8 @@ pub struct Store {
     pub replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     /// Held while replicated envelopes are admitted; see `validate_replication_backlog`.
     pub admission: Mutex<()>,
+    /// Serializes projection passes while they lend the writer back between chunks.
+    pub projection: Mutex<()>,
     pub replication_timers: ReplicationTimers,
     /// Admitted replicated claims wait for a projection a catching-up node deferred.
     pub replication_projection_deferred: AtomicBool,
@@ -494,6 +496,7 @@ impl Store {
             replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
             admission: Mutex::new(()),
+            projection: Mutex::new(()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_deferred: AtomicBool::new(false),
             last_replication_projection_unix_ms: AtomicU64::new(0),
@@ -2820,6 +2823,10 @@ pub const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 /// Envelopes admitted per writer transaction. Admission takes 2-3 ms per envelope on a populated
 /// store, so a chunk holds the writer for well under a second.
 pub const ADMISSION_CHUNK_ENVELOPES: usize = 256;
+
+/// Newly admitted claims projected per writer transaction. A catch-up page must not keep
+/// queued lease renewals and messages behind its entire incremental projection.
+pub const PROJECTION_CHUNK_CLAIMS: usize = 128;
 
 /// The most envelopes this build takes in one exchange, which it says in each inventory it
 /// sends. Admission commits once per pass, so a page this size admits well within the peer
@@ -5414,79 +5421,140 @@ impl Store {
     }
 
     pub fn project_replication_backlog(&self) -> Result<bool> {
-        let mut connection = self.connection.write();
+        self.project_replication_backlog_chunks(|| {})
+    }
+
+    /// Exercise reads and queued writes between committed projection chunks.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn project_replication_backlog_with_yield(&self, between: impl FnMut()) -> Result<bool> {
+        self.project_replication_backlog_chunks(between)
+    }
+
+    fn project_replication_backlog_chunks(&self, mut between: impl FnMut()) -> Result<bool> {
+        let _projecting = self
+            .projection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let _timing = time_stage(&self.replication_timers.projection);
         self.replication_projection_deferred
-            .store(false, Ordering::Release);
+            .store(true, Ordering::Release);
         self.last_replication_projection_unix_ms
             .store(now_ms() as u64, Ordering::Release);
-        let transaction = connection.transaction()?;
-        let result = (|| -> Result<bool, St3Error> {
-            // An incremental projection that fails is rolled back and replaced by a full replay,
-            // which quarantines the claim it cannot project instead of failing the graph.
-            transaction
-                .execute_batch("SAVEPOINT project_incremental")
-                .map_err(internal)?;
-            let incremental = crate::profile::span("projection/incremental");
-            let projected = match self.runtime.project_incremental(&transaction, &self.origin) {
-                Ok(projected) => {
-                    transaction
-                        .execute_batch("RELEASE project_incremental")
-                        .map_err(internal)?;
-                    projected
+        // Finish the backlog observed at entry. New receives can admit more between chunks;
+        // their own projection pass will take those up without keeping this one alive forever.
+        let target = self.index()?;
+        let mut chunked = false;
+        loop {
+            let mut connection = self.connection.write();
+            let transaction = connection.transaction()?;
+            let frontier: u64 = transaction
+                .query_row(
+                    "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
+                    [],
+                    |row| row.get::<_, Option<u64>>(0),
+                )
+                .optional()?
+                .flatten()
+                .unwrap_or(0);
+            let through = transaction
+                .query_row(
+                    "SELECT MAX(store_index) FROM (
+                SELECT store_index FROM claims WHERE store_index>?1 AND store_index<=?2
+                ORDER BY store_index LIMIT ?3)",
+                    params![frontier, target, PROJECTION_CHUNK_CLAIMS as i64],
+                    |row| row.get::<_, Option<u64>>(0),
+                )?
+                .unwrap_or(target.max(frontier));
+            let result = (|| -> Result<bool, St3Error> {
+                // An incremental projection that fails is rolled back and replaced by a full replay,
+                // which quarantines the claim it cannot project instead of failing the graph.
+                transaction
+                    .execute_batch("SAVEPOINT project_incremental")
+                    .map_err(internal)?;
+                let incremental = crate::profile::span("projection/incremental");
+                let projected =
+                    match self
+                        .runtime
+                        .project_incremental(&transaction, &self.origin, through)
+                    {
+                        Ok(projected) => {
+                            transaction
+                                .execute_batch("RELEASE project_incremental")
+                                .map_err(internal)?;
+                            projected
+                        }
+                        Err(error) => {
+                            crate::profile::note(&format!(
+                                "replay: incremental failed: {}",
+                                error.code
+                            ));
+                            transaction
+                                .execute_batch(
+                                    "ROLLBACK TO project_incremental; RELEASE project_incremental",
+                                )
+                                .map_err(internal)?;
+                            false
+                        }
+                    };
+                drop(incremental);
+                if !projected {
+                    #[cfg(any(test, feature = "test-support"))]
+                    FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
+                    let _replay = crate::profile::span("projection/full-replay");
+                    crate::profile::note("projection: full replay");
+                    self.runtime.replay_from_nothing(&transaction)?;
+                } else {
+                    crate::profile::note("projection: incremental");
                 }
-                Err(error) => {
-                    crate::profile::note(&format!("replay: incremental failed: {}", error.code));
-                    transaction
-                        .execute_batch(
-                            "ROLLBACK TO project_incremental; RELEASE project_incremental",
-                        )
-                        .map_err(internal)?;
-                    false
-                }
-            };
-            drop(incremental);
-            if !projected {
-                #[cfg(any(test, feature = "test-support"))]
-                FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
-                let _replay = crate::profile::span("projection/full-replay");
-                crate::profile::note("projection: full replay");
-                self.runtime.replay_from_nothing(&transaction)?;
-            } else {
-                crate::profile::note("projection: incremental");
-            }
-            self.runtime.after_projection(&transaction)?;
-            Ok(!projected)
-        })();
-        match result {
-            Ok(replayed) => {
-                transaction.execute(
+                self.runtime.after_projection(&transaction)?;
+                Ok(!projected)
+            })();
+            match result {
+                Ok(replayed) => {
+                    // A fallback replay folds the whole log, including anything admitted after
+                    // this pass started. An incremental chunk advances only its bounded frontier.
+                    let through = if replayed {
+                        current_index_tx(&transaction)?
+                    } else {
+                        through
+                    };
+                    transaction.execute(
                     "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
                      VALUES ('graph', 'healthy', ?1, ?2)
                      ON CONFLICT(aggregate) DO UPDATE SET status='healthy', last_good_store_index=excluded.last_good_store_index,
                         error_code=NULL, error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
-                    params![current_index_tx(&transaction)?, now_ms().to_string()],
+                    params![through, now_ms().to_string()],
                 )?;
-                transaction.commit()?;
-                drop(connection);
-                if replayed {
-                    self.runtime.forget_views();
+                    transaction.commit()?;
+                    drop(connection);
+                    // Readers may have cached the preceding prefix at the same admitted store
+                    // index. Its projection changed even when no additional claim arrived.
+                    chunked |= through < target;
+                    if replayed || chunked {
+                        self.runtime.forget_views();
+                    }
+                    if through < target {
+                        between();
+                        continue;
+                    }
+                    if self.verdicts_due.swap(false, Ordering::AcqRel) {
+                        self.judge_claims(true)?;
+                    }
+                    self.replication_projection_deferred
+                        .store(through < self.index()?, Ordering::Release);
+                    return Ok(true);
                 }
-                if self.verdicts_due.swap(false, Ordering::AcqRel) {
-                    self.judge_claims(true)?;
-                }
-                Ok(true)
-            }
-            Err(error) => {
-                transaction.rollback()?;
-                connection.execute(
+                Err(error) => {
+                    transaction.rollback()?;
+                    connection.execute(
                     "INSERT INTO projection_health(aggregate, status, error_code, error_message, updated_at_unix_ms)
                      VALUES ('graph', 'stale', ?1, ?2, ?3)
                      ON CONFLICT(aggregate) DO UPDATE SET status='stale', error_code=excluded.error_code,
                         error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
                     params![error.code, error.message, now_ms().to_string()],
                 )?;
-                Ok(false)
+                    return Ok(false);
+                }
             }
         }
     }
