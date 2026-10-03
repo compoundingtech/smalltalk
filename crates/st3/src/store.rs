@@ -14311,6 +14311,7 @@ impl Store {
                 | "work.submitted"
                 | "work.failed"
                 | "work.released"
+                | "work.extended"
                 | "subagent.appeared"
                 | "subagent.renewed"
                 | "subagent.ended"
@@ -17343,6 +17344,61 @@ fn rebuild_derived_tables_once_tx(transaction: &Transaction<'_>) -> Result<()> {
         [DERIVED_TABLES_VERSION],
     )?;
     Ok(())
+}
+
+fn mark_work_extensions_projected_tx(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('work_extended_projection_rules','1')",
+        [],
+    )?;
+    Ok(())
+}
+
+fn work_extension_roots_tx(transaction: &Transaction<'_>) -> Result<(BTreeSet<String>, bool)> {
+    let subjects = transaction
+        .prepare("SELECT DISTINCT subject FROM claims WHERE kind='work.extended'")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut roots = BTreeSet::new();
+    let mut unresolved = false;
+    for subject in subjects {
+        if let Some(root) = run_tree_of_tx(transaction, &subject).map_err(anyhow::Error::new)? {
+            roots.insert(root);
+            // A generation claim can name the owning run before its creation reaches us.
+            // The reference alone does not establish that the extension was projected.
+            unresolved |= !transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM step_runs WHERE subject=?1)",
+                [&subject],
+                |row| row.get::<_, bool>(0),
+            )?;
+        } else {
+            unresolved = true;
+        }
+    }
+    Ok((roots, unresolved))
+}
+
+/// Older full replays skipped extensions while local writes and run-tree rebuilds applied them.
+/// Repair only their owning trees once, preserving local lease renewals and historical checkpoint
+/// authority. This does not rebuild unrelated trees or operations.
+fn migrate_work_extension_projections_tx(transaction: &Transaction<'_>) -> Result<usize> {
+    let current: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='work_extended_projection_rules' AND value='1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if current {
+        return Ok(0);
+    }
+    let (roots, _) = work_extension_roots_tx(transaction)?;
+    let rebuilt = roots.len();
+    for root in roots {
+        rebuild_run_tree_tx(transaction, &root).map_err(anyhow::Error::new)?;
+    }
+    if !work_extension_roots_tx(transaction)?.1 {
+        mark_work_extensions_projected_tx(transaction)?;
+    }
+    Ok(rebuilt)
 }
 
 fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
@@ -23778,7 +23834,7 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
             1 => "claims.kind IN ('mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
                   'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
                   'step-run.carried','step-run.state','step-run.retried',
-                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released','work.person-asked','work.person-done','work.person-cancelled')",
+                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released','work.extended','work.person-asked','work.person-done','work.person-cancelled')",
             _ => "claims.kind='step-run.carried'",
         };
         let mut statement = transaction
@@ -26411,7 +26467,7 @@ fn step_execution_timing_at(
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1
            AND claims.kind IN ('step-run.state','step-run.carried','work.claimed','work.renewed',
-                               'work.progress','work.submitted','work.failed','work.released','work.person-asked','work.person-done','work.person-cancelled')
+                               'work.progress','work.submitted','work.failed','work.released','work.extended','work.person-asked','work.person-done','work.person-cancelled')
          ORDER BY CANONICAL_ASC(claims)",
     ))?;
     let events = statement
@@ -26517,7 +26573,7 @@ pub(crate) fn fold_step_timing(
                     .and_then(Value::as_u64)
                     .map(u128::from);
             }
-            "work.renewed" | "work.progress" if started.is_some() => {
+            "work.renewed" | "work.progress" | "work.extended" if started.is_some() => {
                 lease_expires = fields
                     .get("claim_expires_at_unix_ms")
                     .and_then(Value::as_u64)
@@ -33277,6 +33333,24 @@ version 2
             .unwrap();
     }
 
+    fn worker_extend(worker: &Store, step: &str) -> StepRunView {
+        worker
+            .work_action_extending(
+                step,
+                "extend",
+                &WorkRequest {
+                    actor: Some("agent/worker.one".into()),
+                    incarnation: Some("worker-generation".into()),
+                    summary: None,
+                    reason: Some("the invented test needs more time".into()),
+                    evidence: Vec::new(),
+                    idempotency_key: "extension-budget".into(),
+                },
+                Some(300_000),
+            )
+            .unwrap()
+    }
+
     /// Receive `source`'s new envelopes and project them, and say whether that replayed the
     /// graph from nothing.
     fn projection_replayed(target: &Store, relay: &str, source: &Store) -> bool {
@@ -33289,6 +33363,566 @@ version 2
         FULL_REPLAYS.with(|replays| replays.set(0));
         assert!(target.project_replication_backlog().unwrap());
         FULL_REPLAYS.with(std::cell::Cell::get) > 0
+    }
+
+    #[test]
+    fn work_extensions_project_locally_and_remotely_without_full_replay() {
+        let (controller, worker, step) = replicated_step_pair();
+        worker_work(&worker, &step, "claim", None, "extension-claim");
+        assert!(!projection_replayed(&controller, "worker", &worker));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("observer.sqlite3");
+        let observer = Store::open(&path, "observer").unwrap();
+        receive_and_project(
+            &observer,
+            "controller",
+            &exchange_from(&controller, &ReplicationInventory::default()),
+        );
+        let extended = worker_extend(&worker, &step);
+        assert_eq!(extended.timeout_extension_ms, 300_000);
+        worker_work(&worker, &step, "renew", None, "extension-quiet-renewal");
+        let quiet_lease = worker
+            .step_run(&step)
+            .unwrap()
+            .unwrap()
+            .claim_expires_at_unix_ms;
+
+        // This local extension was already applied. The next peer exchange must not turn it
+        // into a full-store replay, and must preserve the local lease and execution budget.
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        let projected = worker.step_run(&step).unwrap().unwrap();
+        assert_eq!(projected.status, "claimed");
+        assert_eq!(projected.claim_expires_at_unix_ms, quiet_lease);
+        assert_eq!(projected.blocked_reason, extended.blocked_reason);
+        let incremental = graph_digest_of(&worker);
+        worker.replay_replication_graph().unwrap();
+        assert_eq!(incremental, graph_digest_of(&worker));
+        assert_eq!(
+            worker
+                .step_run(&step)
+                .unwrap()
+                .unwrap()
+                .timeout_extension_ms,
+            300_000
+        );
+        assert_eq!(
+            worker
+                .step_run(&step)
+                .unwrap()
+                .unwrap()
+                .claim_expires_at_unix_ms,
+            quiet_lease
+        );
+
+        // The remote extension arrives after a newer local state update. Rebuild only this run
+        // tree in canonical order rather than overwriting that update or replaying the store.
+        controller
+            .set_step_state(&step, "blocked", Some("a newer update"))
+            .unwrap();
+        assert!(!projection_replayed(&controller, "worker", &worker));
+        assert!(!projection_replayed(&observer, "controller", &controller));
+        for store in [&controller, &observer] {
+            let projected = store.step_run(&step).unwrap().unwrap();
+            assert_eq!(projected.status, "blocked");
+            assert_eq!(projected.timeout_extension_ms, 300_000);
+            let incremental = graph_digest_of(store);
+            store.replay_replication_graph().unwrap();
+            assert_eq!(incremental, graph_digest_of(store));
+            let replayed = store.step_run(&step).unwrap().unwrap();
+            assert_eq!(projected.status, replayed.status);
+            assert_eq!(
+                projected.timeout_extension_ms,
+                replayed.timeout_extension_ms
+            );
+            assert_eq!(projected.attempt, replayed.attempt);
+        }
+        let digest = graph_digest_of(&observer);
+        let copy = directory.path().join("checkpoint-replay.sqlite3");
+        observer.copy_store_to(&copy).unwrap();
+        let mut connection = Connection::open(&copy).unwrap();
+        projection_digest::register(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        checkpoint_rules::replay_from_nothing(&transaction).unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(
+            digest,
+            projection_digest::root(&projection_digest::tables(&connection).unwrap())
+        );
+        let mut restored = step_run_row_tx(&connection, &step).unwrap().unwrap();
+        enrich_step_queue(&connection, &mut restored).unwrap();
+        let projected = observer.step_run(&step).unwrap().unwrap();
+        assert_eq!(restored.status, projected.status);
+        assert_eq!(
+            restored.claim_expires_at_unix_ms,
+            projected.claim_expires_at_unix_ms
+        );
+        assert_eq!(restored.blocked_reason, projected.blocked_reason);
+        assert_eq!(
+            restored.timeout_extension_ms,
+            projected.timeout_extension_ms
+        );
+        drop(observer);
+        let reopened = Store::open(&path, "observer").unwrap();
+        assert_eq!(digest, graph_digest_of(&reopened));
+        assert_eq!(
+            reopened
+                .step_run(&step)
+                .unwrap()
+                .unwrap()
+                .timeout_extension_ms,
+            300_000
+        );
+    }
+
+    #[test]
+    fn work_extensions_upgrade_repairs_affected_trees_once_and_keeps_local_renewals() {
+        let (controller, worker, step) = replicated_step_pair();
+        worker_work(&worker, &step, "claim", None, "upgrade-extension-claim");
+        let previous = worker.step_run(&step).unwrap().unwrap();
+        let extended = worker_extend(&worker, &step);
+        worker_work(&worker, &step, "renew", None, "upgrade-extension-quiet");
+        let quiet_lease = worker
+            .step_run(&step)
+            .unwrap()
+            .unwrap()
+            .claim_expires_at_unix_ms;
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        let corrected = graph_digest_of(&worker);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("upgrade.sqlite3");
+        worker.copy_store_to(&path).unwrap();
+        {
+            let connection = Connection::open(&path).unwrap();
+            projection_digest::register(&connection).unwrap();
+            // A pre-fix full replay left the last claim's state rather than the extension's.
+            connection.execute_batch(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('canonical_shared_projection_rules','2');
+                 INSERT OR REPLACE INTO meta(key,value) VALUES('derived_tables_version','2');",
+            ).unwrap();
+            connection
+                .execute(
+                    "UPDATE step_runs SET blocked_reason=?2, lease_expires_at_unix_ms=?3,
+                    updated_at_unix_ms=?4 WHERE subject=?1",
+                    params![
+                        step,
+                        previous.blocked_reason,
+                        previous
+                            .claim_expires_at_unix_ms
+                            .map(|value| value.to_string()),
+                        previous.updated_at_unix_ms.to_string()
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "DELETE FROM meta WHERE key='work_extended_projection_rules'",
+                    [],
+                )
+                .unwrap();
+            // A full-store/operations rebuild would remove this unrelated derived row.
+            connection
+                .execute(
+                    "INSERT INTO operations(id,request_digest,canonical_claim_id,state)
+                 SELECT 'op/unrelated-upgrade','digest',id,'active' FROM claims
+                 WHERE kind='work.extended' LIMIT 1",
+                    [],
+                )
+                .unwrap();
+        }
+        let upgraded = Store::open(&path, "worker").unwrap();
+        assert_eq!(
+            upgraded
+                .smalltalk
+                .work_extension_roots_rebuilt
+                .load(Ordering::Relaxed),
+            1
+        );
+        let projected = upgraded.step_run(&step).unwrap().unwrap();
+        assert_eq!(projected.status, "claimed");
+        assert_eq!(projected.timeout_extension_ms, 300_000);
+        assert_eq!(projected.blocked_reason, extended.blocked_reason);
+        assert_eq!(projected.claim_expires_at_unix_ms, quiet_lease);
+        {
+            let connection = upgraded.readers.get();
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM operations WHERE id='op/unrelated-upgrade')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT value FROM meta WHERE key='work_extended_projection_rules'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "1"
+            );
+        }
+        // The operations sentinel is outside the corrected graph's real authority.
+        upgraded
+            .connection
+            .write()
+            .execute("DELETE FROM operations WHERE id='op/unrelated-upgrade'", [])
+            .unwrap();
+        assert_eq!(corrected, graph_digest_of(&upgraded));
+        drop(upgraded);
+        let reopened = Store::open(&path, "worker").unwrap();
+        assert_eq!(
+            reopened
+                .smalltalk
+                .work_extension_roots_rebuilt
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(corrected, graph_digest_of(&reopened));
+        assert_eq!(
+            reopened
+                .step_run(&step)
+                .unwrap()
+                .unwrap()
+                .claim_expires_at_unix_ms,
+            quiet_lease
+        );
+    }
+
+    #[test]
+    fn work_extensions_upgrade_and_adopt_a_v5_certificate_without_changing_its_terms() {
+        use smallclaims::store::checkpoint::checkpoint_name;
+        use smallclaims::store::checkpoint_agreement::{SealTerms, certificates};
+        let (controller, worker, step) = replicated_step_pair();
+        worker_work(&worker, &step, "claim", None, "historic-extension-claim");
+        for index in 0..5 {
+            controller
+                .append_claim(&ClaimInput {
+                    subject: "daemon/controller".into(),
+                    kind: "daemon.diagnostic".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("severity".into(), json!("warning")),
+                        ("code".into(), json!("invented")),
+                        ("reason".into(), json!(format!("observation {index}"))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        assert!(!projection_replayed(&controller, "worker", &worker));
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        let scratch = tempfile::tempdir().unwrap();
+        let cut = now_ms() + 1;
+        let checkpoint = checkpoint_name(cut);
+        let mut legacy_digest = Sha256::new();
+        legacy_digest.update(b"st3-checkpoint-rules-v1\0");
+        legacy_digest.update(5_u32.to_be_bytes());
+        legacy_digest.update(checkpoint_rules::RULES_DESCRIPTION.as_bytes());
+        let legacy_digest = hex::encode(legacy_digest.finalize());
+        assert_ne!(legacy_digest, rules_digest());
+        let sealed = controller.checkpoint_sealed_identities(cut, None).unwrap();
+        let terms = SealTerms {
+            cut_unix_ms: cut,
+            participants: BTreeSet::from(["controller".into(), "worker".into()]),
+            sealed_digest: sealed.digest.clone(),
+            rules_digest: legacy_digest.clone(),
+        };
+        for node in [&controller, &worker] {
+            node.publish_seal(&checkpoint, &terms, &sealed, None)
+                .unwrap();
+        }
+        let (_, mut plan, proof) = controller
+            .plan_checkpoint_through(cut, None, scratch.path())
+            .unwrap();
+        assert!(proof.passed, "{proof:?}");
+        assert!(!plan.claims.is_empty());
+        // The sealed set contains no extensions: v5 and v6 have identical graph/timing proof
+        // here. Retain the real v5 rule identity when constructing its historical certificate.
+        plan.rules_digest = legacy_digest;
+        for node in [&controller, &worker] {
+            node.publish_verification(&checkpoint, &terms, &plan, &proof)
+                .unwrap();
+        }
+        assert!(!projection_replayed(&controller, "worker", &worker));
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        let certificate = certificates(&worker.checkpoint_claims().unwrap(), &checkpoint);
+        assert_eq!(certificate.len(), 1);
+
+        // An extension after the historic cut survives its v5 drops and changes the live graph.
+        let previous = worker.step_run(&step).unwrap().unwrap();
+        let extended = worker_extend(&worker, &step);
+        worker_work(&worker, &step, "renew", None, "historic-extension-quiet");
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        let path = scratch.path().join("historic-upgrade.sqlite3");
+        worker.copy_store_to(&path).unwrap();
+        {
+            let connection = Connection::open(&path).unwrap();
+            projection_digest::register(&connection).unwrap();
+            connection.execute_batch(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('canonical_shared_projection_rules','2');
+                 INSERT OR REPLACE INTO meta(key,value) VALUES('derived_tables_version','2');",
+            ).unwrap();
+            connection.execute("UPDATE step_runs SET blocked_reason=?2, updated_at_unix_ms=?3 WHERE subject=?1",
+                params![step, previous.blocked_reason, previous.updated_at_unix_ms.to_string()]).unwrap();
+            connection
+                .execute(
+                    "DELETE FROM meta WHERE key='work_extended_projection_rules'",
+                    [],
+                )
+                .unwrap();
+        }
+        let upgraded = Store::open(&path, "worker").unwrap();
+        let before = upgraded.step_run(&step).unwrap().unwrap();
+        assert_eq!(before.blocked_reason, extended.blocked_reason);
+        assert_eq!(before.timeout_extension_ms, 300_000);
+        let graph = graph_digest_of(&upgraded);
+        let reader_cut = now_ms();
+        let reader =
+            checkpoint_rules::subject_answers(&upgraded.readers.get(), &step, reader_cut).unwrap();
+        let mut actions = Vec::new();
+        controller
+            .trim_checkpoint(
+                &checkpoint,
+                cut,
+                &plan.drop_digest,
+                &plan.envelopes,
+                &plan.claims,
+                false,
+                &mut actions,
+            )
+            .unwrap();
+        let manifest = controller.checkpoint_manifest(&checkpoint, cut).unwrap();
+        assert!(!upgraded.adopt_checkpoint(&manifest).unwrap().is_empty());
+        assert_eq!(graph, graph_digest_of(&upgraded));
+        let after = upgraded.step_run(&step).unwrap().unwrap();
+        assert_eq!(before.status, after.status);
+        assert_eq!(before.blocked_reason, after.blocked_reason);
+        assert_eq!(
+            before.claim_expires_at_unix_ms,
+            after.claim_expires_at_unix_ms
+        );
+        assert_eq!(before.timeout_extension_ms, after.timeout_extension_ms);
+        // Use the same cut for time-dependent reader answers.
+        let reader_after =
+            checkpoint_rules::subject_answers(&upgraded.readers.get(), &step, reader_cut).unwrap();
+        assert_eq!(reader, reader_after);
+        assert_eq!(
+            certificates(&upgraded.checkpoint_claims().unwrap(), &checkpoint),
+            certificate
+        );
+        assert_eq!(
+            upgraded.checkpoint_manifest(&checkpoint, cut).unwrap(),
+            manifest
+        );
+        assert!(upgraded.adopt_checkpoint(&manifest).unwrap().is_empty());
+        drop(upgraded);
+        let reopened = Store::open(&path, "worker").unwrap();
+        assert_eq!(
+            certificates(&reopened.checkpoint_claims().unwrap(), &checkpoint),
+            certificate
+        );
+        assert_eq!(
+            reopened.checkpoint_manifest(&checkpoint, cut).unwrap(),
+            manifest
+        );
+        assert_eq!(graph, graph_digest_of(&reopened));
+    }
+
+    #[test]
+    fn work_extensions_waiting_for_run_creation_survive_upgrade_and_later_projection() {
+        let (_, worker, step) = replicated_step_pair();
+        worker_work(&worker, &step, "claim", None, "delayed-extension-claim");
+        let extended = worker_extend(&worker, &step);
+        let extension = worker
+            .claims_for(&step, Some("work.extended"))
+            .unwrap()
+            .remove(0);
+        let sequence: u64 = worker
+            .readers
+            .get()
+            .query_row(
+                "SELECT replica_sequence FROM batches WHERE id=?1",
+                [&extension.batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut first = exchange_from(&worker, &ReplicationInventory::default());
+        first
+            .envelopes
+            .retain(|envelope| envelope.writer == "worker" && envelope.sequence == sequence);
+        assert_eq!(first.envelopes.len(), 1);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("delayed.sqlite3");
+        let target = Store::open(&path, "delayed").unwrap();
+        receive_and_project(&target, "worker", &first);
+        assert!(target.step_run(&step).unwrap().is_none());
+        // The generation reference can arrive before the owning run as well. Knowing the
+        // root's name is insufficient evidence that the extension has been projected.
+        let generation = step
+            .trim_start_matches("step-run/")
+            .split('/')
+            .next()
+            .unwrap();
+        let (run, revision): (String, String) = worker
+            .readers
+            .get()
+            .query_row(
+                "SELECT run_id, revision FROM run_generations WHERE id=?1",
+                [generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        {
+            let mut connection = target.connection.write();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &target.origin,
+                &format!("run-generation/{generation}"),
+                "run-generation.created",
+                None,
+                &json!({"fields": {"run": format!("mission-run/{run}"), "revision": revision}}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        target
+            .connection
+            .write()
+            .execute(
+                "DELETE FROM meta WHERE key='work_extended_projection_rules'",
+                [],
+            )
+            .unwrap();
+        drop(target);
+        let target = Store::open(&path, "delayed").unwrap();
+        assert!(
+            !target
+                .readers
+                .get()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM meta WHERE key='work_extended_projection_rules')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "an unresolved extension must not be marked migrated"
+        );
+        // An older store that still needs the canonical full replay must leave the same
+        // migration pending until the owning run arrives.
+        target
+            .connection
+            .write()
+            .execute(
+                "DELETE FROM meta WHERE key='canonical_shared_projection_rules'",
+                [],
+            )
+            .unwrap();
+        drop(target);
+        let target = Store::open(&path, "delayed").unwrap();
+        assert!(
+            !target
+                .readers
+                .get()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM meta WHERE key='work_extended_projection_rules')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        assert!(!projection_replayed(&target, "worker", &worker));
+        let projected = target.step_run(&step).unwrap().unwrap();
+        assert_eq!(
+            projected.timeout_extension_ms,
+            extended.timeout_extension_ms
+        );
+        assert_eq!(projected.blocked_reason, extended.blocked_reason);
+        assert_eq!(
+            projected.claim_expires_at_unix_ms,
+            extended.claim_expires_at_unix_ms
+        );
+        let digest = graph_digest_of(&target);
+        target.replay_replication_graph().unwrap();
+        assert_eq!(digest, graph_digest_of(&target));
+        drop(target);
+        let target = Store::open(&path, "delayed").unwrap();
+        assert_eq!(
+            target
+                .readers
+                .get()
+                .query_row(
+                    "SELECT value FROM meta WHERE key='work_extended_projection_rules'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(digest, graph_digest_of(&target));
+    }
+
+    #[test]
+    fn work_extensions_sync_authority_with_previous_projection_rules_without_comparing_graphs() {
+        let (controller, worker, step) = replicated_step_pair();
+        worker_work(&worker, &step, "claim", None, "mixed-extension-claim");
+        worker_extend(&worker, &step);
+        let legacy = canonical_hash(&(
+            "st3.shared-projections.resources.v1",
+            st3_schema::registry().digest(),
+        ))
+        .unwrap();
+        let mut exchange = exchange_from(&worker, &controller.replication_inventory().unwrap());
+        assert_ne!(exchange.schema_digest, legacy);
+        exchange.schema_digest = legacy.clone();
+        controller
+            .receive_replication_exchange_asking("worker", TEST_FLEET, &exchange, true)
+            .unwrap();
+        let admitted = controller.validate_replication_backlog().unwrap();
+        assert_eq!(admitted.unknown, 0);
+        assert_eq!(admitted.invalid, 0);
+        assert!(controller.project_replication_backlog().unwrap());
+        assert_eq!(
+            controller
+                .step_run(&step)
+                .unwrap()
+                .unwrap()
+                .timeout_extension_ms,
+            300_000
+        );
+        let mut summary = worker.export_replication_summary(TEST_FLEET).unwrap();
+        summary.schema_digest = legacy;
+        summary.graph_digest = "invented-previous-layout-graph".into();
+        summary
+            .projection_digests
+            .insert("step_runs".into(), "invented-previous-layout-table".into());
+        let receipt = controller
+            .receive_replication_exchange_asking("worker", TEST_FLEET, &summary, true)
+            .unwrap();
+        assert!(!receipt.heal);
+        let status = controller
+            .replication_status(true, Some(TEST_FLEET), &["worker".into()])
+            .unwrap();
+        assert!(status.peers[0].projection_comparison_waiting);
+        assert!(status.peers[0].differing_tables.is_empty());
+        assert!(!status.peers[0].sync.as_ref().unwrap().diverged);
+        assert_eq!(status.unhealthy_projections, 0);
+        assert_eq!(
+            status.authority_digest,
+            worker
+                .replication_status(true, Some(TEST_FLEET), &[])
+                .unwrap()
+                .authority_digest
+        );
     }
 
     /// A seat's own lease renewals, and the lane, runtime-action and intake claims its node writes,

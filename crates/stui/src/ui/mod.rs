@@ -217,7 +217,8 @@ pub(crate) struct TerminalView {
 /// The entry at the top of a pane read back, how far into it, and the top it gave.
 struct Anchor {
     entry: String,
-    offset: usize,
+    /// Lines from the entry's start to the top; negative when the top is above it.
+    offset: isize,
     top: usize,
 }
 
@@ -287,7 +288,8 @@ pub struct Ui {
     /// Inputs whose text came from voice; their next message is tagged `dictated`.
     dictated: HashSet<String>,
     /// The agent details pane beside the conversation.
-    details: bool,
+    /// Agents whose details pane is hidden beside their conversation; each agent its own.
+    details_hidden: HashSet<String>,
     /// The Missions tab shows the selected mission's whole declaration.
     kdl: bool,
     /// Agents and Missions list as the graph's path tree instead of grouped by state.
@@ -314,7 +316,8 @@ pub struct Ui {
     /// not change with every commit.
     pub(crate) build: bool,
     /// A pane too narrow for details beside the conversation shows them instead of it.
-    details_here: bool,
+    /// Agents whose narrow pane shows their details in place of the conversation.
+    details_here: HashSet<String>,
     /// Finding text in a conversation.
     find: Option<Find>,
     /// The new agent form, kept while the person looks elsewhere.
@@ -389,7 +392,7 @@ impl Ui {
             answering: None,
             changes_answer: None,
             dictated: HashSet::new(),
-            details: true,
+            details_hidden: HashSet::new(),
             kdl: false,
             tree: false,
             usage_by: usage::By::default(),
@@ -402,7 +405,7 @@ impl Ui {
             snoozed: HashSet::new(),
             glasses: None,
             build: false,
-            details_here: false,
+            details_here: HashSet::new(),
             find: None,
             new_agent: None,
             agent_form: false,
@@ -527,12 +530,19 @@ impl Ui {
         shown.then_some(self.usage_hours)
     }
 
-    /// Details beside the conversation, or in its place when the pane is too narrow for both.
+    /// Details beside the conversation, or in its place when the pane is too narrow for both;
+    /// for the agent shown, not every agent (Nathan, 2026-10-03).
     fn toggle_details(&mut self) {
-        if self.frame.borrow().agent_narrow {
-            self.details_here = !self.details_here;
+        let Some(agent) = self.selected_id() else {
+            return;
+        };
+        let set = if self.frame.borrow().agent_narrow {
+            &mut self.details_here
         } else {
-            self.details = !self.details;
+            &mut self.details_hidden
+        };
+        if !set.remove(&agent) {
+            set.insert(agent);
         }
     }
 
@@ -1649,7 +1659,11 @@ impl Ui {
             self.frame.borrow_mut().agent_narrow = narrow;
         }
         // Too narrow for details beside the conversation: `i` shows them in its place.
-        if narrow && self.details_here && !agent.unmanaged && self.composing(&agent.id) {
+        if narrow
+            && self.details_here.contains(&agent.id)
+            && !agent.unmanaged
+            && self.composing(&agent.id)
+        {
             buf.set_stringn(
                 area.x,
                 area.y,
@@ -1677,7 +1691,8 @@ impl Ui {
             );
             return;
         }
-        let area = if self.details && !agent.unmanaged && area.width >= 90 {
+        let details = !self.details_hidden.contains(&agent.id);
+        let area = if details && !agent.unmanaged && area.width >= 90 {
             let side = (area.width / 3).clamp(30, 44);
             let pane = Rect {
                 x: area.x + area.width - side,
@@ -1731,10 +1746,10 @@ impl Ui {
         );
         if !agent.unmanaged && (!narrow || self.composing(&agent.id)) {
             // In a space, letters type: details is a chord.
-            let key = if self.glasses.is_some() { "alt+i" } else { "i" };
+            let key = if self.glasses.is_some() { "ctrl+d" } else { "i" };
             let label = if narrow {
                 format!(" {key} details ")
-            } else if self.details {
+            } else if !self.details_hidden.contains(&agent.id) {
                 format!(" {key} hide details ▸ ")
             } else {
                 format!(" ◂ {key} details ")
@@ -2034,21 +2049,27 @@ impl Ui {
                 && anchor.top == state.top
                 && let Some((_, start)) = doc.entries.iter().find(|(id, _)| *id == anchor.entry)
             {
-                state.top = start + anchor.offset;
+                state.top = start.saturating_add_signed(anchor.offset);
             }
             state.reconcile(total, height);
-            match doc
-                .entries
-                .iter()
+            // The note about earlier entries stays first while they load above it, so the
+            // place is kept by the first entry read instead.
+            let entries = || {
+                doc.entries
+                    .iter()
+                    .filter(|(id, _)| id != live::HISTORY_NOTE)
+            };
+            match entries()
                 .rev()
                 .find(|(_, start)| *start <= state.top)
+                .or_else(|| entries().next())
             {
                 Some((entry, start)) if !state.follow => {
                     anchors.insert(
                         key.to_owned(),
                         Anchor {
                             entry: entry.clone(),
-                            offset: state.top - start,
+                            offset: state.top as isize - *start as isize,
                             top: state.top,
                         },
                     );
@@ -2570,20 +2591,20 @@ impl Ui {
                 ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
                 ("end", "jump to the newest message and follow it"),
                 ("ctrl+f", "find in this conversation"),
-                ("alt+o", "expand or collapse tool output"),
+                ("ctrl+e  alt+o", "expand or collapse tool output"),
                 (
-                    "alt+shift+o",
+                    "ctrl+p  alt+shift+o",
                     "simplified view: tool calls fold to a line (this device)",
                 ),
                 (
-                    "alt+i  ctrl+i",
-                    "the agent's details beside it (ctrl+i where the terminal tells it from tab)",
+                    "ctrl+d  alt+i",
+                    "this agent's details beside it (ctrl+i too, where the terminal tells it from tab)",
                 ),
                 ("drag", "select text in one pane; release copies it"),
                 ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
                 (
-                    "alt+r  alt+x",
-                    "resend or clear a message that was not sent",
+                    "ctrl+r  alt+x",
+                    "resend or clear a message that was not sent (alt+r resends too)",
                 ),
                 ("ctrl+c", "stop the agent (asks first)"),
                 ("tab  shift+tab", "the next or previous tab"),
@@ -2772,7 +2793,7 @@ impl Ui {
 
     fn scroll_pane(&self, key: &str, delta: isize) {
         let info = self.frame.borrow();
-        let Some(pane) = info.panes.iter().find(|pane| pane.key == key) else {
+        let Some(pane) = info.panes.iter().rev().find(|pane| pane.key == key) else {
             return;
         };
         let mut panes = self.conversation_state.panes.borrow_mut();
@@ -4150,6 +4171,7 @@ impl Ui {
                         .and_then(|selection| {
                             info.panes
                                 .iter()
+                                .rev()
                                 .find(|pane| pane.key == selection.pane)
                                 .map(|pane| (pane.rect, pane.top))
                         })
@@ -4412,10 +4434,13 @@ impl Ui {
     }
 
     fn pane_point(&self, column: u16, row: u16) -> Option<(String, usize, u16)> {
+        // The pane drawn last is the one on top (Home over the glass shows a pane under the
+        // same key as the one beneath it).
         let info = self.frame.borrow();
         let pane = info
             .panes
             .iter()
+            .rev()
             .find(|pane| contains(pane.rect, column, row))?;
         Some((
             pane.key.clone(),
@@ -4427,7 +4452,11 @@ impl Ui {
     fn selected_text(&self) -> Option<String> {
         let selection = self.conversation_state.selection.as_ref()?;
         let info = self.frame.borrow();
-        let pane = info.panes.iter().find(|pane| pane.key == selection.pane)?;
+        let pane = info
+            .panes
+            .iter()
+            .rev()
+            .find(|pane| pane.key == selection.pane)?;
         Some(selection.text(&pane.lines))
     }
 
@@ -5556,6 +5585,76 @@ mod tests {
                 .join("\n")
                 .contains("a reply arrives below")
         );
+    }
+
+    #[test]
+    fn earlier_entries_loaded_above_keep_what_was_being_read_in_place() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let id = ui.selected_id().unwrap();
+        let Some(Load::Ready(entries)) = ui.world.conversations.get_mut(&id) else {
+            panic!("the demo agent has a conversation")
+        };
+        entries.insert(
+            0,
+            Entry {
+                id: live::HISTORY_NOTE.into(),
+                at: String::new(),
+                body: Body::Event("Scroll up for earlier entries".into()),
+            },
+        );
+        let first = entries[1].id.clone();
+        frame(&ui, 120, 30);
+        let pane = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key.starts_with("chat:"))
+            .map(|pane| pane.rect)
+            .unwrap();
+        // Up to the very top, where the earlier entries are asked for.
+        for _ in 0..40 {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: pane.x + 2,
+                row: pane.y + 2,
+                modifiers: KeyModifiers::NONE,
+            });
+            frame(&ui, 120, 30);
+        }
+        assert!(ui.take_older_wanted().contains(&id));
+        let shown = |ui: &Ui| {
+            frame(ui, 120, 30)[usize::from(pane.y) + 1..usize::from(pane.y) + 8]
+                .iter()
+                .map(|line| {
+                    line.chars()
+                        .take(usize::from(pane.x + pane.width) - 2)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = shown(&ui);
+        assert!(before.join("\n").contains("Scroll up for earlier"));
+        // A page of earlier entries arrives under the note, above what was read.
+        let Some(Load::Ready(entries)) = ui.world.conversations.get_mut(&id) else {
+            panic!("the demo agent has a conversation")
+        };
+        for index in 0..20 {
+            entries.insert(
+                1,
+                Entry {
+                    id: format!("earlier-{index}"),
+                    at: "08:00".into(),
+                    body: Body::Assistant(format!("an earlier entry {index}")),
+                },
+            );
+        }
+        assert_ne!(entries[1].id, first);
+        let after = shown(&ui);
+        // What was below the note is where it was; the earlier entries are above, to scroll to.
+        assert_eq!(after[1..], before[1..], "{after:#?}");
+        assert!(!after.join("\n").contains("Scroll up for earlier"));
     }
 
     #[test]

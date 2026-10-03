@@ -2385,6 +2385,16 @@ impl Ui {
                     self.find_in(agent, "");
                 }
             }
+            // Ctrl chords work on a Mac, where Option types characters instead (Nathan,
+            // 2026-10-03); the Alt chords stay where Alt is Alt.
+            KeyCode::Char('e') if control && conversation.is_some() => self.toggle_all_tools(),
+            KeyCode::Char('p') if control && conversation.is_some() => self.toggle_simple(),
+            KeyCode::Char('d') if control && conversation.is_some() => self.toggle_details(),
+            KeyCode::Char('r') if control && conversation.is_some() && self.live => {
+                if let Some(entry) = self.undelivered() {
+                    self.effects.push(Effect::Resend { entry });
+                }
+            }
             KeyCode::Char('o') if alt && conversation.is_some() => self.toggle_all_tools(),
             KeyCode::Char('O') if alt && conversation.is_some() => self.toggle_simple(),
             KeyCode::Char('i') if alt && conversation.is_some() => self.toggle_details(),
@@ -3573,6 +3583,31 @@ mod tests {
         press(&mut ui, KeyCode::BackTab, KeyModifiers::SHIFT);
         assert_eq!(tabs(&ui), (0, 1, both));
         assert!(screen(&ui).contains("Weekly release"));
+    }
+
+    #[test]
+    fn details_are_per_agent_and_ctrl_chords_work_where_option_types() {
+        let mut ui = glass();
+        let atlas = "agent/example/atlas/builder".to_owned();
+        ui.open_in_glass(Pane::Agent(Some(atlas.clone())), Open::Tab);
+        // Nathan, 2026-10-03: hiding one agent's details hid every agent's.
+        ctrl(&mut ui, 'd');
+        assert!(!ui.editing, "a chord, not typing");
+        assert!(ui.details_hidden.contains(&atlas));
+        ui.open_in_glass(Pane::Agent(Some("agent/example/cos".into())), Open::Tab);
+        assert!(!ui.details_hidden.contains("agent/example/cos"));
+        // Ctrl+P is the simplified view and Ctrl+E opens the tool calls, on a Mac too.
+        ui.open_in_glass(Pane::Agent(Some(atlas.clone())), Open::Here);
+        let simple = ui.simple;
+        ctrl(&mut ui, 'p');
+        assert_ne!(ui.simple, simple);
+        let expanded = ui.conversation_state.expanded.clone();
+        ctrl(&mut ui, 'e');
+        assert!(!ui.editing);
+        assert_ne!(
+            ui.conversation_state.expanded, expanded,
+            "ctrl+e opens the tool calls"
+        );
     }
 
     #[test]
@@ -5001,6 +5036,41 @@ mod tests {
         // Back on its tab, the shell shows again.
         ui.open_in_glass(Pane::Terminal(shell), Open::Here);
         assert!(screen(&ui).contains("echo in the shell"));
+    }
+
+
+    #[test]
+    fn text_on_home_over_the_glass_selects_and_copies() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut ui = glass();
+        ui.open_home();
+        let shown = screen(&ui);
+        let (row, line) = shown
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("1,204,881 rows"))
+            .expect("Home shows the selected request");
+        let start = line.find("1,204,881").unwrap();
+        let column = line[..start].chars().count() as u16;
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.mouse(mouse(MouseEventKind::Down(MouseButton::Left), column));
+        ui.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), column + 13));
+        screen(&ui);
+        assert_eq!(ui.selected_text().as_deref(), Some("1,204,881 rows"));
+        ui.mouse(mouse(MouseEventKind::Up(MouseButton::Left), column + 13));
+        assert!(ui.home_open(), "a drag on Home keeps it open");
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text == "Copied 1 line"),
+            "{:?}",
+            ui.flash
+        );
     }
 
     #[test]
