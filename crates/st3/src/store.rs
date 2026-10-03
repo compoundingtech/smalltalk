@@ -8555,6 +8555,7 @@ impl Store {
             || !matches!(
                 input.kind.as_str(),
                 "harness.observed" | "harness.usage" | "harness.limits" | "harness.timeline"
+                    | "harness.todo.observed"
             )
             || input.actor.as_deref() != Some(input.subject.as_str())
             || input.idempotency_key.is_none()
@@ -10897,16 +10898,37 @@ impl Store {
 
     /// The newest claim or local observation of `kind` for `subject`.
     pub fn latest_observation(&self, subject: &str, kind: &str) -> Result<Option<ClaimRecord>> {
+        self.latest_observation_at(subject, kind, i64::MAX as u64)
+    }
+
+    /// The newest accepted claim or local reading within a client's graph snapshot.
+    /// Local observations share their surrounding graph index, rather than advancing it.
+    pub fn latest_observation_at(
+        &self, subject: &str, kind: &str, at_index: u64,
+    ) -> Result<Option<ClaimRecord>> {
         smallclaims::touched::note_read(|| subject.to_owned());
-        let claim = self.latest_claim(subject, Some(kind))?;
+        let at_index = at_index.min(i64::MAX as u64);
+        let claim = {
+            let connection = self.readers.get();
+            connection.query_row(
+                &canonical_sql(
+                    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                    predecessors, accepted_at_unix_ms FROM claims
+                    WHERE subject=?1 AND kind=?2 AND store_index<=?3
+                    ORDER BY CANONICAL_DESC(claims) LIMIT 1"
+                ),
+                params![subject, kind, at_index],
+                claim_from_row,
+            ).optional()?
+        };
         let local = {
             let connection = self.readers.get();
             connection
                 .query_row(
                     &format!(
-                        "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id DESC LIMIT 1"
+                        "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 AND after_store_index<=?3 ORDER BY id DESC LIMIT 1"
                     ),
-                    params![subject, kind],
+                    params![subject, kind, at_index],
                     |row| local_observation_from_row(&self.origin, row),
                 )
                 .optional()?
@@ -46049,6 +46071,44 @@ mod harness_event_tests {
                 idempotency_key: Some("producer-event".into()),
             },
         }
+    }
+    #[test]
+    fn harness_todo_event_replay_and_runtime_fencing_preserve_latest_snapshot() {
+        let store = Store::open_memory("amber").unwrap();
+        runtime(&store, "runtime-a", "running");
+        let mut input = event("harness.observed");
+        input.claim.kind = "harness.todo.observed".into();
+        input.claim.fields = serde_json::from_value(json!({
+            "harness":"omp","session_id":"native-a","incarnation_id":"runtime-a",
+            "observed_at":"2026-10-03T15:00:00Z","source_op":"block",
+            "phases":[{"name":"Review","tasks":[
+                {"content":"Review claim","status":"blocked","blocker":"Await review"}
+            ]}],"totals":{"pending":0,"in_progress":0,"completed":0,"blocked":1},
+            "truncated":false
+        })).unwrap();
+        let (first, changed) = store.append_harness_event(&input).unwrap();
+        assert!(changed);
+        let (replay, changed) = store.append_harness_event(&input).unwrap();
+        assert!(!changed);
+        assert_eq!(replay.body["fields"], first.body["fields"]);
+        let original = input.claim.fields.clone();
+        input.claim.fields.insert("source_op".into(), json!("hydrate"));
+        assert_eq!(store.append_harness_event(&input).unwrap_err().code, "idempotency-mismatch");
+        input.claim.fields = original;
+        input.sequence = 2;
+        input.claim.fields.insert("phases".into(), json!([]));
+        input.claim.fields.insert("totals".into(), json!({
+            "pending":0,"in_progress":0,"completed":0,"blocked":0
+        }));
+        input.claim.fields.insert("source_op".into(), json!("clear"));
+        let (cleared, changed) = store.append_harness_event(&input).unwrap();
+        assert!(changed);
+        assert_eq!(cleared.body["fields"]["phases"], json!([]));
+        runtime(&store, "runtime-b", "running");
+        input.sequence = 3;
+        assert_eq!(store.append_harness_event(&input).unwrap_err().code, "stale-harness-event-session");
+        let current = store.latest_observation(SEAT, "harness.todo.observed").unwrap().unwrap();
+        assert_eq!(current.body["fields"]["source_op"], "clear");
     }
     #[test]
     fn native_event_admission_fences_every_retention_and_replays_lost_acknowledgements() {

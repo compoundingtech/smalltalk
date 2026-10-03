@@ -536,6 +536,165 @@ assert.deepStrictEqual(readFrames().slice(framesBeforeMain), [{ type: "state", s
 await handlers.get("agent_end")(successfulEnd, mainCtx);
 fs.rmSync(outboxPath, { force: true });
 
+// st3's dedicated todo observation is deliberately absent from the legacy st2 asset.
+if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo")) {
+  const totals = (pending = 0, in_progress = 0, completed = 0, blocked = 0) =>
+    ({ pending, in_progress, completed, blocked });
+  const todos = () => readFrames().filter((frame) => frame.type === "todo");
+  const sourceTime = "2026-10-03T12:00:00.000Z";
+  const phase = (status = "in_progress", content = "Review", blocker) => [{
+    name: "Work", tasks: [{ content, status, ...(blocker === undefined ? {} : { blocker }) }],
+  }];
+  const toolEntry = (id, op, phases, isError = false) => ({
+    id, type: "message", timestamp: sourceTime,
+    message: { role: "toolResult", toolName: "todo", isError, details: { op, phases } },
+  });
+  let branch = [
+    toolEntry("init", "init", phase()),
+    toolEntry("failed", "done", phase("completed"), true),
+    toolEntry("view", "view", phase("completed")),
+    { id: "unstructured", type: "message", timestamp: sourceTime,
+      message: { role: "toolResult", toolName: "todo", details: { op: "done" } } },
+  ];
+  let nativeSession = "session-todo";
+  const todoCtx = {
+    ...bareCtx,
+    sessionManager: {
+      getSessionId: () => nativeSession,
+      getBranch: () => branch,
+      // A newer result on a different branch MUST NOT seed this binding.
+      getEntries: () => [...branch, toolEntry("unrelated", "block", phase("blocked", "Wrong branch", "No"))],
+    },
+  };
+  const startCount = todos().length;
+  await handlers.get("session_start")({}, todoCtx);
+  await pause(50);
+  assert.deepStrictEqual(todos().slice(startCount), [{
+    type: "todo", session: nativeSession, source_op: "hydrate", observed_at: sourceTime,
+    phases: phase(), totals: totals(0, 1), truncated: false,
+  }], "hydrate newest successful structured non-view result from current branch");
+  const firstTodo = readFrames().findIndex((frame) => frame.type === "todo" && frame.session === nativeSession);
+  assert.ok(readFrames().slice(0, firstTodo).some((frame) => frame.type === "ready" && frame.sessionId === nativeSession));
+  const execute = async (op, phases, flags = {}) => handlers.get("tool_execution_end")({
+    toolName: "todo", toolCallId: `todo-${op}`, result: { details: { op, phases } }, ...flags,
+  }, todoCtx);
+  await execute("done", phase("completed"), { isError: true });
+  await execute("done", phase("completed"), {
+    result: { isError: true, details: { op: "done", phases: phase("completed") } },
+  });
+  await execute("view", phase("completed"));
+  await execute("start", phase());
+  await pause(50);
+  assert.strictEqual(todos().length, startCount + 1, "error/view/unchanged mutations do not replace snapshot");
+  branch.push(toolEntry("done", "done", phase("completed")));
+  await execute("done", phase("completed"));
+  await pause(50);
+  assert.deepStrictEqual(todos().at(-1).totals, totals(0, 0, 1));
+  assert.strictEqual(todos().at(-1).source_op, "done");
+  assert.ok(Number.isFinite(Date.parse(todos().at(-1).observed_at)));
+  assert.strictEqual(todos().at(-1).session, nativeSession);
+  branch.push(toolEntry("block", "block", phase("blocked", "Review", "Waiting for approval")));
+  await execute("block", phase("blocked", "Review", "Waiting for approval"));
+  await pause(50);
+  assert.deepStrictEqual(todos().at(-1).phases, phase("blocked", "Review", "Waiting for approval"));
+
+  // /todo writes a custom entry without emitting an extension event. The channel's bounded
+  // polling interval must observe it even while idle, including an explicit clear.
+  branch.push({ id: "human", type: "custom", customType: "user_todo_edit", timestamp: sourceTime,
+    data: { phases: phase("pending", "Human task") } });
+  await pause(1100);
+  assert.strictEqual(todos().at(-1).source_op, "user_edit");
+  assert.deepStrictEqual(todos().at(-1).phases, phase("pending", "Human task"));
+  branch.push({ id: "human-clear", type: "custom", customType: "user_todo_edit", timestamp: sourceTime,
+    data: { phases: [] } });
+  await pause(1100);
+  assert.deepStrictEqual(todos().at(-1).phases, []);
+  assert.deepStrictEqual(todos().at(-1).totals, totals());
+  assert.strictEqual(todos().at(-1).truncated, false);
+  await handlers.get("session_start")({}, todoCtx);
+  await pause(50);
+  assert.strictEqual(todos().at(-1).source_op, "hydrate", "clear survives a new binding");
+  assert.strictEqual(todos().at(-1).observed_at, sourceTime);
+
+  branch = [toolEntry("older-branch", "init", phase("pending", "Branch task"))];
+  await handlers.get("session_tree")({}, todoCtx);
+  await pause(50);
+  assert.deepStrictEqual(todos().at(-1).phases, phase("pending", "Branch task"));
+  assert.strictEqual(todos().at(-1).source_op, "hydrate");
+  branch = [];
+  await handlers.get("session_tree")({}, todoCtx);
+  await pause(50);
+  assert.deepStrictEqual(todos().at(-1).phases, [], "no branch snapshot clears another branch's work");
+  nativeSession = "session-todo-next";
+  const beforeNewSession = readFrames().length;
+  await handlers.get("session_branch")({}, todoCtx);
+  await pause(50);
+  const newSessionFrames = readFrames().slice(beforeNewSession);
+  assert.strictEqual(newSessionFrames[0].type, "session");
+  assert.strictEqual(newSessionFrames[0].sessionId, nativeSession);
+  assert.strictEqual(todos().at(-1).session, nativeSession);
+  assert.deepStrictEqual(todos().at(-1).totals, totals());
+
+  // OMP 18.4.4 eval/js/tool-bridge persists committed nested todo calls through the
+  // same user_todo_edit path; the enclosing eval event need not expose nested results.
+  branch.push({ id: "eval-todo", type: "custom", customType: "user_todo_edit", timestamp: sourceTime,
+    data: { phases: phase("in_progress", "Nested eval task") } });
+  await handlers.get("tool_execution_end")({ toolName: "eval", result: {} }, todoCtx);
+  await pause(50);
+  assert.deepStrictEqual(todos().at(-1).phases, phase("in_progress", "Nested eval task"));
+  const beforeReconnect = todos().length;
+  const todoPid = Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1));
+  process.kill(todoPid, "SIGKILL");
+  await pause(1100);
+  assert.strictEqual(todos().length, beforeReconnect + 1, "reconnect reseeds identical snapshot");
+  assert.strictEqual(todos().at(-1).source_op, "hydrate");
+  assert.strictEqual(todos().at(-1).observed_at, sourceTime);
+
+  const large = Array.from({ length: 17 }, (_, index) => ({
+    name: "🦀".repeat(40), tasks: Array.from({ length: index === 0 ? 101 : 1 }, () => ({
+      content: "Task", status: "pending", blocker: "Waiting",
+    })),
+  }));
+  await execute("init", large);
+  await pause(50);
+  const bounded = todos().at(-1);
+  assert.strictEqual(bounded.truncated, true);
+  assert.deepStrictEqual(bounded.totals, totals(117));
+  assert.strictEqual(bounded.phases.length, 16);
+  assert.strictEqual(bounded.phases.flatMap((item) => item.tasks).length, 100);
+  assert.strictEqual(bounded.phases[0].name, "🦀".repeat(32));
+  await execute("init", [{ name: "Unicode", tasks: [{
+    content: "🦀".repeat(160), status: "pending", blocker: "🦀".repeat(160),
+  }] }]);
+  await pause(50);
+  assert.strictEqual(todos().at(-1).truncated, true);
+  assert.strictEqual(todos().at(-1).phases[0].tasks[0].content, "🦀".repeat(128));
+  assert.strictEqual(todos().at(-1).phases[0].tasks[0].blocker, "🦀".repeat(128));
+  const escaping = [{ name: "Escaping", tasks: Array.from({ length: 100 }, () => ({
+    content: "\u0000".repeat(512), status: "blocked", blocker: "\u0000".repeat(512),
+  })) }];
+  await execute("init", escaping);
+  await pause(50);
+  const capped = todos().at(-1);
+  assert.strictEqual(capped.truncated, true);
+  assert.deepStrictEqual(capped.totals, totals(0, 0, 0, 100));
+  assert.ok(Buffer.byteLength(JSON.stringify(capped)) < 64 * 1024);
+  assert.ok(capped.phases[0].tasks.length < 100, "escaping drops trailing tasks instead of reporting partial totals");
+  await execute("drop", [{ name: "Dropped", tasks: [
+    { content: "Dropped task", status: "abandoned" }, { content: "Live", status: "pending" },
+  ] }]);
+  await pause(50);
+  assert.deepStrictEqual(todos().at(-1).phases, [{ name: "Dropped", tasks: [{ content: "Live", status: "pending" }] }]);
+  assert.deepStrictEqual(todos().at(-1).totals, totals(1));
+  assert.strictEqual(todos().at(-1).truncated, true);
+  await execute("rm", []);
+  await pause(50);
+  assert.deepStrictEqual(todos().at(-1).phases, []);
+  assert.deepStrictEqual(todos().at(-1).totals, totals());
+  assert.strictEqual(todos().at(-1).truncated, false);
+  await handlers.get("session_shutdown")({}, todoCtx);
+}
+
 // `session_shutdown` has no reason field upstream and always denotes process exit. Closing must
 // make a later observational frame a no-op.
 const beforeShutdown = readFrames().filter((frame) => frame.type === "state").length;

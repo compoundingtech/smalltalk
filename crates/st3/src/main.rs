@@ -11813,6 +11813,26 @@ fn render_client_agent(
         agent.driver.as_deref().unwrap_or("none"),
         agent.harness_state.as_deref().unwrap_or("unobserved")
     );
+    if let Some(todo) = &agent.todo {
+        let snapshot = &todo.snapshot;
+        let _ = write!(output, "Todo         ");
+        if let Some(active) = snapshot.phases.iter().flat_map(|phase| &phase.tasks)
+            .find(|task| task.status == st3_client::HarnessTaskStatus::InProgress)
+        {
+            let _ = write!(output, "▶ {} · ", active.content);
+        }
+        let totals = &snapshot.totals;
+        let total = u128::from(totals.pending) + u128::from(totals.in_progress)
+            + u128::from(totals.completed) + u128::from(totals.blocked);
+        let _ = write!(output, "{}/{total} done · {} blocked", totals.completed, totals.blocked);
+        if snapshot.truncated {
+            output.push_str(" · truncated");
+        }
+        if todo.stale {
+            output.push_str(" · stale");
+        }
+        output.push('\n');
+    }
     if let Some(fault) = &agent.fault {
         let _ = writeln!(output, "FAULT        {fault}");
     }
@@ -15692,6 +15712,26 @@ impl NativeObservations {
                     )
                     .await?;
                 }
+                "harness-todo" => {
+                    let mut fields: BTreeMap<String, Value> =
+                        serde_json::from_value(event.payload.clone())?;
+                    fields.remove("incarnation");
+                    fields.insert("incarnation_id".into(), event.runtime_incarnation.clone().into());
+                    let _: ClaimRecord = publisher.post(
+                        "/v1/claims",
+                        &ClaimInput {
+                            subject: subject.into(),
+                            kind: "harness.todo.observed".into(),
+                            actor: Some(subject.into()),
+                            fields,
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(format!(
+                                "harness-todo:{subject}:{}:{}", event.runtime_incarnation, event.sequence,
+                            )),
+                        },
+                    ).await?;
+                }
                 "harness-timeline" => {
                     let operation: st_drivers::harness_timeline::Operation =
                         serde_json::from_slice(&raw)?;
@@ -16461,9 +16501,13 @@ fn accept_managed_channel_frame(
     line: &str,
 ) -> Result<bool> {
     if let Some(observer) = observer.as_mut()
-        && let Ok(frame) = serde_json::from_str(line)
+        && let Ok(frame) = serde_json::from_str::<Value>(line)
     {
         observer.observe(&frame)?;
+        if frame["type"] == "todo" {
+            // The managed observer committed this snapshot to the durable outbox already.
+            return Ok(false);
+        }
     }
     let publish = state.accept_frame(line);
     if observer.is_some() {
@@ -16581,8 +16625,18 @@ async fn run_pi_channel(
             &session,
             seq,
             &runtime,
-        )?)
+        )?.with_native_session(state.native_session.clone()))
     } else {
+        None
+    };
+    let mut todo_observations = if driver == "omp" && observer.is_none() {
+        let token = hex::encode(Sha256::digest(format!("{subject}:{incarnation}").as_bytes()));
+        let dir = catalog.join(".st3-channel-outbox").join(token);
+        st_drivers::harness_events::enable(&dir, &incarnation)?;
+        state.todo_outbox = Some(dir.clone());
+        Some(NativeObservations::start(&dir, &incarnation)?)
+    } else {
+        state.todo_outbox = None;
         None
     };
     let transport = format!("{driver}-channel");
@@ -16655,6 +16709,9 @@ async fn run_pi_channel(
                                 .publish(client, subject, driver, &incarnation, &session)
                                 .await;
                         }
+                        if let Some(observations) = todo_observations.as_mut() {
+                            observations.drain(client, subject, driver, &mut false).await?;
+                        }
                         return Ok(());
                     }
                     Some(st_drivers::reexec::StdinChunk::Failed(error)) => {
@@ -16675,6 +16732,11 @@ async fn run_pi_channel(
                     if let Err(error) = observer.heartbeat() {
                         warn_pi_channel(subject, &error, &mut last_warning);
                     }
+                }
+                if let Some(observations) = todo_observations.as_mut()
+                    && let Err(error) = observations.drain(client, subject, driver, &mut false).await
+                {
+                    warn_pi_channel(subject, &error, &mut last_warning);
                 }
                 if let Err(error) = state
                     .pending
@@ -16882,6 +16944,10 @@ async fn run_pi_channel(
 struct PiChannelResume {
     incarnation: String,
     session: String,
+    #[serde(default)]
+    native_session: Option<String>,
+    #[serde(default)]
+    todo_outbox: Option<PathBuf>,
     delivered: BTreeSet<String>,
     failed_handoffs: BTreeMap<String, u32>,
     #[serde(default)]
@@ -16902,6 +16968,21 @@ impl PiChannelResume {
             return false;
         };
         match frame.get("type").and_then(Value::as_str) {
+            Some("todo") => {
+                let Some(fields) = st_drivers::pi_channel::todo_observation(
+                    &frame, "omp", self.native_session.as_deref(), &self.incarnation,
+                ) else {
+                    return false;
+                };
+                if let Some(dir) = &self.todo_outbox
+                    && let Err(error) = st_drivers::harness_events::write_channel_todo(
+                        dir, &self.incarnation, &json!(fields),
+                    )
+                {
+                    tracing::warn!("st omp channel: recording todo failed: {error:#}");
+                }
+                true
+            }
             Some("state") => {
                 let Some(state) = frame.get("state").and_then(Value::as_str) else {
                     return false;
@@ -16946,6 +17027,7 @@ impl PiChannelResume {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 self.pending.native_session = Some((native.to_owned(), path));
+                self.native_session = Some(native.to_owned());
                 true
             }
             Some("delivered") => {
@@ -19204,6 +19286,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn harness_todo_graph_channel_rehydrates_and_spools_only_current_binding() {
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let mut state = PiChannelResume {
+            incarnation: "runtime-a".into(),
+            todo_outbox: Some(root.path().into()),
+            ..PiChannelResume::default()
+        };
+        let frame = json!({
+            "type":"todo","session":"native-a","source_op":"hydrate",
+            "observed_at":"2026-10-03T15:00:00Z","phases":[],
+            "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
+            "truncated":false
+        }).to_string();
+        assert!(!state.accept_frame(&frame));
+        assert!(state.accept_frame(r#"{"type":"ready","sessionId":"native-a"}"#));
+        assert!(state.accept_frame(&frame));
+        let events = st_drivers::harness_events::pending(root.path(), 100).unwrap();
+        assert_eq!(events[0].payload["source_op"], "hydrate");
+        assert_eq!(events[0].payload["phases"], json!([]));
+        let mut resumed: PiChannelResume =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(resumed.accept_frame(r#"{"type":"session","sessionId":"native-b"}"#));
+        assert!(!resumed.accept_frame(&frame));
+        assert_eq!(st_drivers::harness_events::pending(root.path(), 100).unwrap().len(), 1);
+    }
+
+    #[test]
     fn client_api_errors_print_in_plain_words_with_their_code() {
         let api = st3_client::ClientError::Api(
             st3_client::ErrorCode::StaleFence,
@@ -20039,6 +20149,46 @@ mod tests {
         let codex: Value =
             serde_json::from_str(&native_delivery_report("app-server", None)).unwrap();
         assert!(codex.get("channel").is_none());
+    }
+
+    #[test]
+    fn agent_card_todo_preserves_snapshot_and_reports_active_blocked_empty_truncated_stale() {
+        let mut agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
+            "kind":"agent", "id":"agent/worker", "revision":"one",
+            "updated_at":"2026-10-03T09:00:00Z", "name":"Worker",
+            "state":"running", "reachability":"local", "runtime_ids":[],
+            "todo": {
+                "claim_id":"claim/todo", "accepted_at":"2026-10-03T09:00:00Z", "stale":false,
+                "snapshot": {
+                    "harness":"omp", "session_id":"native", "incarnation_id":"one",
+                    "observed_at":"2026-10-03T09:00:00Z", "source_op":"update",
+                    "phases":[{"name":"Build", "tasks":[
+                        {"content":"Compile", "status":"in_progress", "blocker":null},
+                        {"content":"Deploy", "status":"blocked", "blocker":"Approval"},
+                        {"content":"Later", "status":"in_progress", "blocker":null}
+                    ]}],
+                    "totals":{"pending":4,"in_progress":2,"completed":3,"blocked":1},
+                    "truncated":true
+                }
+            }
+        })).unwrap();
+        let card = render_client_agent(&agent, &[], 0);
+        assert!(card.contains("Todo         ▶ Compile · 3/10 done · 1 blocked · truncated\n"));
+        assert!(!card.contains("▶ Later"));
+        let value = serde_json::to_value(&agent).unwrap();
+        assert_eq!(value["todo"]["snapshot"]["phases"][0]["tasks"][1]["blocker"], "Approval");
+        assert_eq!(value["todo"]["claim_id"], "claim/todo");
+        let todo = agent.todo.as_mut().unwrap();
+        todo.stale = true;
+        todo.snapshot.phases.clear();
+        todo.snapshot.truncated = false;
+        todo.snapshot.totals = st3_client::HarnessTodoTotals {
+            pending: 0, in_progress: 0, completed: 0, blocked: 0,
+        };
+        assert!(render_client_agent(&agent, &[], 0).contains("Todo         0/0 done · 0 blocked · stale\n"));
+        agent.todo = None;
+        assert!(!render_client_agent(&agent, &[], 0).contains("Todo"));
+        assert!(serde_json::to_value(agent).unwrap()["todo"].is_null());
     }
 
     #[test]

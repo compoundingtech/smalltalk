@@ -516,6 +516,11 @@ pub struct EventObserver {
     context: harness_context::Writer,
     timeline: crate::harness_timeline::Writer,
     last_heartbeat: std::time::Instant,
+    agent_dir: std::path::PathBuf,
+    owner: String,
+    runtime: String,
+    driver: &'static str,
+    native_session: Option<String>,
 }
 impl EventObserver {
     pub fn new(
@@ -541,9 +546,32 @@ impl EventObserver {
                 .with_session(session),
             timeline: crate::harness_timeline::Writer::new(agent_dir, driver, session),
             last_heartbeat: std::time::Instant::now(),
+            agent_dir: agent_dir.into(),
+            owner: session.into(),
+            runtime: runtime_id.into(),
+            driver,
+            native_session: None,
         })
     }
+    /// The channel resume state already authenticated this binding before re-exec.
+    pub fn with_native_session(mut self, native_session: Option<String>) -> Self {
+        self.native_session = native_session;
+        self
+    }
     pub fn observe(&mut self, frame: &Value) -> Result<()> {
+        if matches!(frame["type"].as_str(), Some("session" | "ready")) {
+            self.native_session = frame["sessionId"].as_str()
+                .filter(|id| !id.is_empty()).map(str::to_owned);
+        }
+        if let Some(fields) = todo_observation(
+            frame, self.driver, self.native_session.as_deref(), &self.runtime,
+        ) {
+            let mut payload = serde_json::to_value(fields)?;
+            payload["incarnation"] = Value::String(self.owner.clone());
+            crate::harness_events::write_snapshot(
+                &self.agent_dir, "harness-todo", &serde_json::to_vec(&payload)?,
+            )?;
+        }
         if let Some(observation) = state_observation(frame) {
             self.state.observe(observation)?;
         }
@@ -559,6 +587,33 @@ impl EventObserver {
         }
         Ok(())
     }
+}
+
+/// Normalize only structured snapshots from the currently bound native session. Transport
+/// supplied identity is never accepted as claim provenance.
+pub fn todo_observation(
+    frame: &Value,
+    driver: &str,
+    native_session: Option<&str>,
+    runtime: &str,
+) -> Option<std::collections::BTreeMap<String, Value>> {
+    if driver != "omp" || frame["type"] != "todo"
+        || native_session.is_none() || frame["session"].as_str() != native_session
+    {
+        return None;
+    }
+    let mut fields = std::collections::BTreeMap::from([
+        ("harness".into(), Value::String(driver.into())),
+        ("session_id".into(), Value::String(native_session?.into())),
+        ("incarnation_id".into(), Value::String(runtime.into())),
+    ]);
+    for key in ["observed_at", "source_op", "phases", "totals", "truncated"] {
+        fields.insert(key.into(), frame.get(key)?.clone());
+    }
+    st3_schema::registry().validate_claim(
+        "agent/channel", "harness.todo.observed", &fields,
+    ).ok()?;
+    Some(fields)
 }
 
 /// The observed-state frame the shipped extension emits on the harness's own turn boundaries.
@@ -892,6 +947,58 @@ fn message_frame(msg: message::Message, identity: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn todo_frame() -> Value {
+        serde_json::json!({
+            "type":"todo", "session":"native-a", "observed_at":"2026-10-03T15:00:00Z",
+            "source_op":"block", "phases":[{"name":"Review","tasks":[
+                {"content":"Review claim","status":"blocked","blocker":"Await review"}
+            ]}], "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":1},
+            "truncated":false
+        })
+    }
+
+    #[test]
+    fn harness_todo_normalizer_requires_current_binding_and_valid_snapshot() {
+        let frame = todo_frame();
+        assert!(todo_observation(&frame, "omp", None, "runtime-a").is_none());
+        assert!(todo_observation(&frame, "omp", Some("native-b"), "runtime-a").is_none());
+        assert!(todo_observation(&frame, "pi", Some("native-a"), "runtime-a").is_none());
+        let fields = todo_observation(&frame, "omp", Some("native-a"), "runtime-a").unwrap();
+        assert_eq!(fields["incarnation_id"], "runtime-a");
+        assert_eq!(fields["phases"][0]["tasks"][0]["blocker"], "Await review");
+        let mut malformed = frame;
+        malformed["phases"][0]["tasks"][0]["status"] = "invented".into();
+        assert!(todo_observation(&malformed, "omp", Some("native-a"), "runtime-a").is_none());
+    }
+
+    #[test]
+    fn harness_todo_managed_observer_spools_and_fences_superseded_owner() {
+        let root = tempfile::tempdir().unwrap();
+        crate::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let seq = harness_state::claim(root.path(), "agent/example", "omp", "provider-a").unwrap();
+        let mut observer = EventObserver::new(
+            root.path(), "agent/example", "omp", "provider-a", seq, "runtime-a",
+        ).unwrap();
+        observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-a"})).unwrap();
+        observer.observe(&todo_frame()).unwrap();
+        let events = crate::harness_events::pending(root.path(), 100).unwrap();
+        let event = events.iter().find(|event| event.kind == "harness-todo").unwrap();
+        assert_eq!(event.runtime_incarnation, "runtime-a");
+        assert_eq!(event.payload["session_id"], "native-a");
+        let prepared = serde_json::json!({"fields":event.payload});
+        assert_eq!(crate::harness_events::prepare_publication(
+            root.path(), event.sequence, "harness.todo.observed:", &prepared,
+        ).unwrap(), prepared);
+        assert_eq!(crate::harness_events::prepare_publication(
+            root.path(), event.sequence, "harness.todo.observed:", &serde_json::json!({"changed":true}),
+        ).unwrap(), prepared);
+        crate::harness_events::enable(root.path(), "runtime-b").unwrap();
+        harness_state::claim(root.path(), "agent/example", "omp", "provider-b").unwrap();
+        assert!(observer.observe(&todo_frame()).is_err());
+        assert_eq!(crate::harness_events::pending(root.path(), 100).unwrap()
+            .iter().filter(|event| event.kind == "harness-todo").count(), 1);
+    }
 
     #[test]
     fn omp_channel_binds_native_session_before_readiness() {

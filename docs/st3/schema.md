@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `8282e4800a05b2d3833c5bda12437aa1cc3217049021a21bcf747ee2e9db5865`
+Digest: `6c6e12636059c609189edfeaf83fe1312d2522ae8e77527d28d4c2970d9f1eff`
 
 ## Subject families
 
@@ -97,6 +97,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `harness.session-file` | `agent` | `authorized-requester` | `append` | `durable` | `account_ref:string`, `agent:subject-reference(agent)`, `discovery_revision:string`, `harness!:string`, `incarnation_id:string`, `modified_at:string`, `path:string`, `session_id!:string`, `source_session:string`, `status:string` |  |
 | `harness.telemetry` | `agent` | `same-subject-actor` | `append` | `local` | `driver!:string`, `incarnation_id!:string`, `signals!:object`, `unit!:string` |  |
 | `harness.timeline` | `agent` | `same-subject-actor` | `append` | `local` | `body!:object`, `driver!:string`, `entry_id!:string`, `entry_type!:string`, `final!:boolean`, `incarnation_id!:string`, `observed_at_unix_ms:integer`, `operation!:string`, `revision!:integer`, `role!:string`, `sequence:integer`, `source_id:string` |  |
+| `harness.todo.observed` | `agent` | `same-subject-actor` | `append` | `latest` | `harness!:string`, `incarnation_id!:string`, `observed_at!:string`, `phases!:array`, `session_id!:string`, `source_op!:string`, `totals!:object`, `truncated!:boolean` |  |
 | `harness.usage` | `agent` | `same-subject-actor` | `append` | `latest` | `account:string`, `cache_write_1h_tokens:integer`, `cache_write_tokens:integer`, `cached_tokens:integer`, `compactions:integer`, `context_used_percent:number`, `context_used_tokens:integer`, `context_window_tokens:integer`, `cost:number`, `cost_microusd:integer`, `currency:string`, `driver!:string`, `host:string`, `incarnation_id!:string`, `input_tokens:integer`, `last_compaction_ms:integer`, `last_compaction_trigger:string`, `model:string`, `observed_at_unix_ms:integer`, `output_tokens:integer`, `owner_run:string`, `owner_step:string`, `pricing:string`, `reported_cost_microusd:integer`, `semantics!:string`, `total_tokens:integer`, `unpriced_tokens:integer` |  |
 | `intent.desired` | `*` | `authorized-requester` | `state-transition` | `durable` | `desired:object`, `kind:string`, `revision:string` | `account`, `agent`, `doc`, `exec`, `host`, `lane`, `message`, `observer`, `mission`, `mission-run`, `planning-session`, `pty`, `resource`, `schedule`, `step`, `stop`, `subscription` |
 | `lane.approved` | `lane` | `authorized-participant` | `append` | `durable` | `entry!:subject-reference`, `reason:string` |  |
@@ -193,3 +194,11 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 `resource.observed` validates facts against the resource kind. Custom resource facts remain open.
 
 A `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.
+
+## Harness todo snapshots
+
+`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.
+
+Each phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Any shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.
+
+OMP's native `abandoned` tasks are omitted rather than relabeled as completed, with `truncated: true`. Their enclosing phase is preserved when it fits. Totals count the full source snapshot's four representable statuses; abandoned tasks do not contribute to a total. Truncation can therefore reflect an unrepresented native status as well as text/list bounds. The OMP producer reserves 4 KiB of the serialized-fields budget for authenticated provenance.

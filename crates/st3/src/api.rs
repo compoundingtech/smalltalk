@@ -1878,6 +1878,13 @@ fn client_agent_resources(
             item["updated_at"] = Value::String(at.to_owned());
         }
         overlay_delivery_presence(item, &local_host);
+        // Latest-retention local observations can advance without changing the graph cache key.
+        item["todo"] = client_v0::agent_todo(
+            store,
+            item["id"].as_str().unwrap_or_default(),
+            item["incarnation_id"].as_str(),
+            snapshot_index,
+        )?;
     }
     overlay_subagents(store, &mut items)?;
     Ok(items)

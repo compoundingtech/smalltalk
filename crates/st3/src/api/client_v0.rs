@@ -2752,6 +2752,33 @@ pub(super) async fn missions_tree(
     Ok(Json(json!({ "snapshot": snapshot, "value": view })))
 }
 
+/// Preserve the latest accepted observation even after its session or incarnation changes.
+pub(super) fn agent_todo(
+    store: &Store,
+    subject: &str,
+    incarnation: Option<&str>,
+    index: u64,
+) -> anyhow::Result<Value> {
+    let latest = |kind| store.latest_observation_at(subject, kind, index);
+    let Some(claim) = latest("harness.todo.observed")? else {
+        return Ok(Value::Null);
+    };
+    let snapshot = st3_schema::HarnessTodoSnapshot::deserialize(
+        claim.body.get("fields").unwrap_or(&claim.body),
+    )?;
+    let session = latest("harness.session-file")?;
+    let session_fields = session.as_ref().map(|claim| claim.body.get("fields").unwrap_or(&claim.body));
+    let stale = incarnation != Some(snapshot.incarnation_id.as_str())
+        || session_fields.and_then(|fields| fields["session_id"].as_str())
+            != Some(snapshot.session_id.as_str());
+    Ok(json!({
+        "snapshot": snapshot,
+        "claim_id": claim.id,
+        "accepted_at": client_timestamp(claim.accepted_at_unix_ms),
+        "stale": stale,
+    }))
+}
+
 fn desired_child_arg(value: &Value, name: &str) -> Option<String> {
     value
         .get("children")?
@@ -8645,6 +8672,63 @@ mod tests {
             assert_collection_frame_conforms(&frame);
         }
         assert_collection_frame_conforms(&json!({"kind":"resync", "id":"minimal"}));
+    }
+
+    #[test]
+    fn agent_todo_projection_selects_latest_at_snapshot_and_fences_native_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/todo-worker";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: fields.as_object().unwrap().iter()
+                    .map(|(key, value)| (key.clone(), value.clone())).collect(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        assert!(agent_todo(&state.store, subject, Some("one"), state.store.index().unwrap()).unwrap().is_null());
+        append("runtime.observed", json!({
+            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+        }));
+        append("harness.session-file", json!({
+            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/session"
+        }));
+        let before = state.store.index().unwrap();
+        let cached = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        assert!(cached.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+        let snapshot = json!({
+            "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
+            "observed_at":"2026-10-03T09:00:00Z", "source_op":"update",
+            "phases":[{"name":"Build","tasks":[{"content":"Deploy","status":"blocked","blocker":"Approval"}]}],
+            "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":1}, "truncated":false
+        });
+        let first = append("harness.todo.observed", snapshot.clone());
+        assert!(crate::store::local_observation_position(&first).is_some());
+        assert_eq!(state.store.index().unwrap(), before);
+        let refreshed = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        assert_eq!(refreshed.iter().find(|agent| agent["id"] == subject).unwrap()["todo"]["snapshot"], snapshot);
+        let first_value = agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
+        assert_eq!(first_value["snapshot"], snapshot);
+        assert_eq!(first_value["claim_id"], first.id);
+        assert_eq!(first_value["stale"], false);
+        assert_eq!(agent_todo(&state.store, subject, Some("two"), first.store_index).unwrap()["stale"], true);
+        let mut empty = snapshot;
+        empty["phases"] = json!([]);
+        empty["totals"]["blocked"] = json!(0);
+        empty["truncated"] = json!(true);
+        append("harness.session-file", json!({
+            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/fence"
+        }));
+        let second = append("harness.todo.observed", empty.clone());
+        let latest = agent_todo(&state.store, subject, Some("one"), second.store_index).unwrap();
+        assert_eq!(latest["snapshot"], empty);
+        assert_eq!(latest["claim_id"], second.id);
+        assert_eq!(agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"], first.id);
+        let changed = append("harness.session-file", json!({
+            "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
+        }));
+        assert_eq!(agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"], true);
     }
 
     #[tokio::test]
