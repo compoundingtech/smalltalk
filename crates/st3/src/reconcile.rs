@@ -509,6 +509,9 @@ pub struct Reconciler<R = NativeRuntime> {
     incremental: crate::incremental::Incremental,
     /// Fail a pass that makes a correction an incremental pass would have missed (tests).
     strict_incremental: bool,
+    /// Skip items nothing changed for, between periodic full passes. Off in test reconcilers,
+    /// whose every pass checks what an incremental pass would have missed.
+    skip_unneeded: bool,
     /// The wake each running step has armed for its timeout or lease expiry, by step subject.
     step_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
@@ -624,6 +627,7 @@ impl Reconciler<NativeRuntime> {
             gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
             incremental: Default::default(),
             strict_incremental: false,
+            skip_unneeded: std::env::var("ST3_INCREMENTAL").as_deref() != Ok("off"),
             step_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
@@ -676,6 +680,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
             incremental: Default::default(),
             strict_incremental: true,
+            skip_unneeded: false,
             step_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
@@ -4650,9 +4655,27 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut active_generations = BTreeSet::new();
         let mut active_steps = BTreeSet::new();
         let mut changed = false;
+        let full = !self.skip_unneeded || self.incremental.take_full_pass(now_ms());
         for id in &ids {
             let subject = format!("mission-run/{id}");
             let needed = self.incremental.needs(&subject, now_ms());
+            if !full && !needed {
+                // Nothing it read changed and nothing is due. It stays active: keep its caches,
+                // faults and file watchers as its last evaluation left them.
+                for key in self.incremental.reads_of(&subject) {
+                    if key.starts_with("run-generation/") {
+                        active_generations.insert(key);
+                    } else if key.starts_with("step-run/") {
+                        active_steps.insert(key);
+                    } else if key.starts_with("file/") {
+                        self.file_watchers_used
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(key);
+                    }
+                }
+                continue;
+            }
             let cpu_started = crate::incremental::thread_cpu();
             let writes = smallclaims::touched::writes();
             let feed_before =
@@ -11151,6 +11174,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let notify = self.notify.clone();
         let observations = self.file_observations.clone();
+        let incremental = self.incremental.clone();
         let watched_subject = subject.to_owned();
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -11159,6 +11183,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&watched_subject);
+                    // A file change is not a claim: mark what read the file.
+                    incremental.touch(&watched_subject);
                     crate::performance::record_wake("file watch", None);
                     notify.notify_one();
                 }
@@ -12398,14 +12424,12 @@ fn gate_result_subject(stage: &GateContext, name: &str, definition: &Value) -> R
 }
 
 fn now_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+    smallclaims::store::now_ms()
 }
 
 #[cfg(test)]
 mod tests {
+    mod differential;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};

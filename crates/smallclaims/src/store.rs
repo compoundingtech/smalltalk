@@ -1169,11 +1169,26 @@ pub fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> 
     })
 }
 
+thread_local! {
+    /// A clock a simulation sets for its own thread; see [`set_thread_clock`].
+    static THREAD_CLOCK: std::cell::Cell<Option<u128>> = const { std::cell::Cell::new(None) };
+}
+
+/// The time every reader and the reconciler compare against: the system clock, or the time a
+/// simulation set for this thread.
 pub fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+    THREAD_CLOCK.with(std::cell::Cell::get).unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    })
+}
+
+/// Fix the clock this thread reads at `at` (unix ms), or give it back the system clock with
+/// `None`. Only simulations set it; pair it with `set_write_clock_at` so writes are dated alike.
+pub fn set_thread_clock(at: Option<u128>) {
+    THREAD_CLOCK.with(|clock| clock.set(at));
 }
 
 /// The kinds the membership fold reads.
