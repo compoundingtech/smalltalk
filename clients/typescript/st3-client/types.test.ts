@@ -1,4 +1,4 @@
-import type { ActionOf } from './Models.generated';
+import type { ActionOf, ConversationSearchHit, TimelineMessageBody } from './Models.generated.ts';
 
 const valid: ActionOf<'launch.approve'> = {
     api_version: 'st3.client.v0',
@@ -21,14 +21,14 @@ void missingFence;
 
 // Every resource keeps its fields: a resource kind missing from ResourceHeader's kinds would make
 // its type `never`, and these would not compile.
-import type { Glass, Machine } from './Models.generated';
+import type { Glass, Machine } from './Models.generated.ts';
 const glass = null as unknown as Glass;
 const glassName: string | undefined = glass.body?.name;
 const machine = null as unknown as Machine;
 const machineHost: string = machine.host_id;
 void glassName; void machineHost;
 
-import type { GlassBody, GlassLayout } from './Models.generated';
+import type { GlassBody, GlassLayout } from './Models.generated.ts';
 const groupedBody: GlassBody = { name: 'Main', layout: { split: 'right', ratio: 0.3, children: [
     { tabs: [{ title: 'Work', pane: 'opaque:key' }] }, { tabs: [] },
 ] } };
@@ -66,15 +66,15 @@ const attachTerminal: ActionOf<'terminal.attach'> = {
 };
 void attachTerminal;
 
-const dictatedBody: import('./Models.generated').TimelineMessageBody = { message_id: 'message/voice', tags: ['dictated'] };
+const dictatedBody: TimelineMessageBody = { message_id: 'message/voice', tags: ['dictated'] };
 const dictatedTags: string[] | undefined = dictatedBody.tags;
 void dictatedTags;
 
-const searchHit: import('./Models.generated').ConversationSearchHit = { conversation_id: 'session/scribe', entry_id: 'timeline-entry/note', agent_id: 'agent/scribe', timestamp: '2026-10-02T00:00:00Z', entry_type: 'content', excerpt: 'orchid' };
+const searchHit: ConversationSearchHit = { conversation_id: 'session/scribe', entry_id: 'timeline-entry/note', agent_id: 'agent/scribe', timestamp: '2026-10-02T00:00:00Z', entry_type: 'content', excerpt: 'orchid' };
 void searchHit;
 
 // Rust None and TypeScript omission are both supported wire shapes.
-import type { CollectionCommand, CollectionFrame } from './Models.generated';
+import type { CollectionCommand, CollectionFrame } from './Models.generated.ts';
 const nullFilters: CollectionCommand = { kind: 'subscribe', id: 'agents', collection: 'agents', person: null, actor: null, status: null };
 const currentTerminal: CollectionCommand = { kind: 'subscribe', id: 'term', collection: 'terminal', terminal: 'terminal/example', capability: 'proof' };
 const nullIncarnation: CollectionCommand = { ...currentTerminal, incarnation: null };
