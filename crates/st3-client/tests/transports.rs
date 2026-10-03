@@ -546,6 +546,7 @@ async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
         changed.value.lines[1].runs[1],
         TerminalRun {
             text: "echo".into(),
+            cells: Some(4),
             fg: Some(TerminalColor::Palette(2)),
             bold: true,
             ..TerminalRun::default()
