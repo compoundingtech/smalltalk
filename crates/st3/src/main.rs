@@ -15221,10 +15221,16 @@ async fn refuse_native_resume(
             st3::suspension::RESUME_UNAVAILABLE_CODE
         )),
     };
-    let _ = retry_while_daemon_unreachable(subject, || {
+    if let Err(error) = retry_while_daemon_unreachable(subject, || {
         client.post::<_, ClaimRecord>("/v1/claims", &diagnostic)
     })
-    .await;
+    .await
+    {
+        let _ = write_driver_log(
+            subject,
+            &json!({"type":"native_resume_refusal_unrecorded","error":format!("{error:#}")}).to_string(),
+        );
+    }
     anyhow::anyhow!(
         "{driver} cannot resume its native session ({}): {}",
         refusal.code,
@@ -16383,6 +16389,22 @@ async fn drive_codex_native(
                     task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
                     continue;
                 }
+                // A resume that ended before its thread bound was refused by Codex itself, such
+                // as a thread with no rollout. The wrapper can end cleanly and leave the reason in
+                // its harness record. The refusal goes first, so nothing after it can delay it.
+                if reported_session.is_none() && st3::native_resume::requested().is_some() {
+                    let reason = match &outcome {
+                        Err(error) => format!("{error:#}"),
+                        Ok(()) => st_drivers::harness_state::read(&harness_state_path, None)
+                            .and_then(|observed| observed.reason)
+                            .unwrap_or_else(|| "Codex ended before it bound the resumed thread".into()),
+                    };
+                    let refusal = st3::native_resume::Refusal {
+                        code: "harness-refused",
+                        reason: reason.chars().take(2_000).collect(),
+                    };
+                    let _ = refuse_native_resume(client, subject, &incarnation, "codex", refusal).await;
+                }
                 if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
@@ -16409,22 +16431,6 @@ async fn drive_codex_native(
                         expected_subject: None,
                         idempotency_key: Some(format!("codex-driver-failed:{subject}:{incarnation}")),
                     }).await;
-                }
-                // A resume that ended before its thread bound was refused by Codex itself, such
-                // as a thread with no rollout. The wrapper can end cleanly and leave the reason
-                // in its harness record.
-                if reported_session.is_none() && st3::native_resume::requested().is_some() {
-                    let reason = match &outcome {
-                        Err(error) => format!("{error:#}"),
-                        Ok(()) => st_drivers::harness_state::read(&harness_state_path, None)
-                            .and_then(|observed| observed.reason)
-                            .unwrap_or_else(|| "Codex ended before it bound the resumed thread".into()),
-                    };
-                    let refusal = st3::native_resume::Refusal {
-                        code: "harness-refused",
-                        reason: reason.chars().take(2_000).collect(),
-                    };
-                    let _ = refuse_native_resume(client, subject, &incarnation, "codex", refusal).await;
                 }
                 return outcome;
             },

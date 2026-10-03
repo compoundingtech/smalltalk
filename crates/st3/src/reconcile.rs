@@ -193,6 +193,9 @@ fn claude_trust_prompt(screen: &str) -> bool {
     .all(|phrase| screen.contains(phrase))
 }
 
+/// How long a resume that ended without a reason waits for its driver's typed refusal.
+const RESUME_REFUSAL_GRACE_MS: u128 = 5_000;
+
 fn claim_incarnation(claim: &crate::model::ClaimRecord) -> Option<&str> {
     claim
         .body
@@ -3869,6 +3872,23 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     }
                                 }
                         });
+                    // A driver records why it could not resume as it ends; give that record a
+                    // moment to land after the harness's last observation.
+                    if diagnostic.is_none()
+                        && self
+                            .store
+                            .latest_observation(agent, "harness.observed")?
+                            .is_some_and(|claim| {
+                                now_ms().saturating_sub(claim.accepted_at_unix_ms)
+                                    < RESUME_REFUSAL_GRACE_MS
+                            })
+                    {
+                        self.arm_restart(
+                            &format!("resume-refusal:{agent}"),
+                            now_ms().saturating_add(1_000),
+                        );
+                        return Ok(());
+                    }
                     let (code, reason) = match diagnostic {
                         Some(claim) => (
                             claim
