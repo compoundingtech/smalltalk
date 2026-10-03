@@ -2024,7 +2024,7 @@ struct PtyStreamArgs {
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     /// The stream capability from `terminals attach-info`; can be set through the environment.
-    #[arg(long, env = "ST3_TERMINAL_CAPABILITY")]
+    #[arg(long, env = "ST3_TERMINAL_CAPABILITY", allow_hyphen_values = true)]
     capability: String,
     #[arg(long)]
     incarnation: Option<String>,
@@ -22115,6 +22115,34 @@ mod tests {
                 command: PtyCommand::DetachClient(_)
             }
         ));
+    }
+
+    #[test]
+    fn terminal_stream_accepts_capabilities_beginning_with_hyphens() {
+        for capability in ["-test-capability", "--test-capability"] {
+            let stream = Cli::try_parse_from([
+                "st3",
+                "terminals",
+                "stream",
+                "terminal/agent/example/worker",
+                "--capability",
+                capability,
+                "--incarnation",
+                "runtime-1",
+                "--count",
+                "3",
+            ])
+            .unwrap();
+            let Command::Terminals {
+                command: PtyCommand::Stream(args),
+            } = stream.command
+            else {
+                panic!("stream did not parse");
+            };
+            assert_eq!(args.capability, capability);
+            assert_eq!(args.incarnation.as_deref(), Some("runtime-1"));
+            assert_eq!(args.count, Some(3));
+        }
     }
 
     #[test]
