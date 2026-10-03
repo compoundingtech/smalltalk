@@ -4277,6 +4277,7 @@ impl Ui {
                 }
                 self.open_from_sidebar();
             }
+            Hit::Usage => self.toggle_usage(),
             Hit::SidebarSection(section) => {
                 if let Some(glasses) = self.glasses.as_mut() {
                     glasses.sidebar.section = section;
