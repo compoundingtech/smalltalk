@@ -373,11 +373,20 @@ fn resolve_node_documents(node: &mut KdlNode, bindings: &BTreeMap<String, String
             entry.set_value(replacement);
         }
     }
+    let gate = node.name().value() == "gate";
     if let Some(children) = node.children_mut() {
         for child in children.nodes_mut() {
-            resolve_node_documents(child, bindings);
+            if !(gate && is_document_gate(child)) {
+                resolve_node_documents(child, bindings);
+            }
         }
     }
+}
+
+/// A gate's `document` predicate waits for a document that may not exist yet, so publication
+/// neither requires nor pins it.
+fn is_document_gate(node: &KdlNode) -> bool {
+    node.name().value() == "document"
 }
 
 fn parse_desired_node(
@@ -1690,6 +1699,14 @@ pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec,
             "only a human gate accepts a mode",
         ));
     }
+    if gate_type.is_none()
+        && body
+            .nodes()
+            .iter()
+            .any(|child| BUILT_IN_EXEC_GATES.contains(&child.name().value()))
+    {
+        return parse_built_in_gate(name, body, default_host);
+    }
     if gate_type
         .as_deref()
         .is_some_and(|kind| matches!(kind, "llm" | "human"))
@@ -1713,6 +1730,141 @@ pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec,
         ));
     }
     parse_predicate_gate(&body.nodes()[0], name)
+}
+
+/// The built-in gate kinds that run as exec gates; see `crate::gate_kinds`.
+const BUILT_IN_EXEC_GATES: &[&str] = &["merged", "ci-passed", "cargo-test"];
+
+/// A built-in gate kind, stored as the exec gate it expands to: an `st gate` subcommand that
+/// exits 0 to pass, 1 for not yet and 3 when the gate cannot answer. `host` defaults to `local`,
+/// `workspace` to `${ST_WORKSPACE}`, and `time-limit` to two minutes, or an hour for `cargo-test`.
+fn parse_built_in_gate(
+    name: String,
+    body: &KdlDocument,
+    default_host: &str,
+) -> Result<GateSpec, St3Error> {
+    let kinds = body
+        .nodes()
+        .iter()
+        .filter(|child| BUILT_IN_EXEC_GATES.contains(&child.name().value()))
+        .collect::<Vec<_>>();
+    let [check] = kinds.as_slice() else {
+        return Err(St3Error::new(
+            "invalid-gate-shape",
+            format!("gate `{name}` needs exactly one built-in check"),
+        ));
+    };
+    let kind = check.name().value();
+    reject_unknown_children(
+        body,
+        &[kind, "host", "workspace", "time-limit"],
+        "gate",
+        &name,
+    )?;
+    for field in ["host", "workspace", "time-limit"] {
+        unique_child(body, field)?;
+    }
+    reject_type(check)?;
+    let word = |value: &str| crate::gate_kinds::shell_word(value);
+    let required = |property: &str| -> Result<String, St3Error> {
+        property_string(check, property)?.ok_or_else(|| {
+            St3Error::new(
+                "missing-gate-field",
+                format!("gate `{name}` needs {kind} {property}=\"...\""),
+            )
+        })
+    };
+    let (command, default_time_limit_ms) = match kind {
+        "merged" => {
+            ensure_no_properties(check)?;
+            let locator = one_string(check)?;
+            if !locator.contains("${") {
+                validate_pull_request_locator(&locator)?;
+            }
+            (
+                format!("\"$ST3_BIN\" gate merged {}", word(&locator)),
+                120_000,
+            )
+        }
+        "ci-passed" => {
+            ensure_only_properties(check, &["repo", "commit", "branch"])?;
+            let name_of_check = one_string(check)?;
+            let repository = required("repo")?;
+            let reference = match (
+                property_string(check, "commit")?,
+                property_string(check, "branch")?,
+            ) {
+                (Some(reference), None) | (None, Some(reference)) => reference,
+                _ => {
+                    return Err(St3Error::new(
+                        "invalid-gate-shape",
+                        format!("gate `{name}` needs ci-passed commit=\"SHA\" or branch=\"NAME\""),
+                    ));
+                }
+            };
+            (
+                format!(
+                    "\"$ST3_BIN\" gate ci-passed {} --repo {} --ref {}",
+                    word(&name_of_check),
+                    word(&repository),
+                    word(&reference)
+                ),
+                120_000,
+            )
+        }
+        _ => {
+            ensure_only_properties(check, &["package", "ref", "worktree"])?;
+            let target = one_string(check)?;
+            let package = required("package")?;
+            let reference = property_string(check, "ref")?.unwrap_or_else(|| "origin/main".into());
+            let worktree = property_string(check, "worktree")?
+                .map(|worktree| format!(" --worktree {}", word(&worktree)))
+                .unwrap_or_default();
+            (
+                format!(
+                    "\"$ST3_BIN\" gate cargo-test {} --package {} --ref {}{worktree}",
+                    word(&target),
+                    word(&package),
+                    word(&reference)
+                ),
+                3_600_000,
+            )
+        }
+    };
+    let time_limit_ms = child_string(body, "time-limit")?
+        .map(|value| parse_duration(&value, true))
+        .transpose()?
+        .unwrap_or(default_time_limit_ms);
+    Ok(GateSpec::Mechanical {
+        name,
+        command,
+        host: placement_host(
+            child_string(body, "host")?.unwrap_or_else(|| "local".into()),
+            default_host,
+        ),
+        workspace: child_string(body, "workspace")?.unwrap_or_else(|| "${ST_WORKSPACE}".into()),
+        environment: BTreeMap::new(),
+        time_limit_ms,
+    })
+}
+
+fn validate_pull_request_locator(locator: &str) -> Result<(), St3Error> {
+    let valid = locator
+        .rsplit_once('#')
+        .is_some_and(|(repository, number)| {
+            number.parse::<u64>().is_ok()
+                && repository.split_once('/').is_some_and(|(owner, name)| {
+                    !owner.is_empty() && !name.is_empty() && !name.contains('/')
+                })
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(St3Error::new(
+            "invalid-pull-request",
+            format!("`{locator}` is not a pull request; write OWNER/REPO#NUMBER"),
+        ))
+    }
 }
 
 pub(crate) fn gate_name(gate: &GateSpec) -> &str {
@@ -1744,6 +1896,22 @@ fn parse_predicate_gate(child: &KdlNode, name: String) -> Result<GateSpec, St3Er
             ensure_no_properties(child)?;
             let subject = one_string(child)?;
             validate_full_subject(&subject)?;
+            Ok(GateSpec::Exists { name, subject })
+        }
+        // A named document exists: any version of `doc/NAME`, or the exact `doc/NAME@SHA256`.
+        // Publication leaves the name as written; see `collect_document_refs`.
+        "document" => {
+            ensure_no_properties(child)?;
+            let subject = one_string(child)?;
+            if !subject.starts_with("doc/") {
+                return Err(St3Error::new(
+                    "invalid-document-reference",
+                    format!("gate `{name}` names `{subject}`; a document gate needs doc/NAME"),
+                ));
+            }
+            if !subject.contains("${") {
+                validate_document_ref(&subject)?;
+            }
             Ok(GateSpec::Exists { name, subject })
         }
         "empty" => {
@@ -4317,8 +4485,11 @@ fn collect_document_refs(node: &KdlNode, output: &mut BTreeSet<String>) -> Resul
         }
     }
     if let Some(children) = node.children() {
+        let gate = node.name().value() == "gate";
         for child in children.nodes() {
-            collect_document_refs(child, output)?;
+            if !(gate && is_document_gate(child)) {
+                collect_document_refs(child, output)?;
+            }
         }
     }
     Ok(())
@@ -5606,6 +5777,119 @@ version 2
             panic!("the test gate is not mechanical");
         };
         assert_eq!(host, "node-a");
+    }
+
+    #[test]
+    fn built_in_gates_expand_to_st_gate_commands() {
+        let source = r#"
+version 2
+
+  mission "proof" state="ready" {
+    goal "Land the change."
+    step "land" {
+      gate "the fix merged" { merged "acme/app#42" }
+      gate "CI passed on main" { ci-passed "linux-gate" repo="acme/app" branch="main" }
+      gate "CI passed on the release" {
+        ci-passed "st/ci" repo="acme/app" commit="${input.commit}"
+        host "builder"
+        time-limit "5m"
+      }
+      gate "the suite passes on main" {
+        cargo-test "log_diet" package="st3"
+        workspace "repo"
+      }
+      gate "the handoff is published" { document "doc/acme/handoff" }
+    }
+    input "commit" kind="text"
+  }
+"#;
+        let intent = parse_test_intent(source, "node-a").unwrap();
+        let gates = &intent.missions["proof"].steps["land"].gates;
+        let mechanical = |index: usize| match &gates[index] {
+            GateSpec::Mechanical {
+                command,
+                host,
+                workspace,
+                time_limit_ms,
+                ..
+            } => (
+                command.as_str(),
+                host.as_str(),
+                workspace.as_str(),
+                *time_limit_ms,
+            ),
+            other => panic!("gate {index} is not an exec gate: {other:?}"),
+        };
+        assert_eq!(
+            mechanical(0),
+            (
+                r#""$ST3_BIN" gate merged acme/app#42"#,
+                "node-a",
+                "${ST_WORKSPACE}",
+                120_000
+            )
+        );
+        assert_eq!(
+            mechanical(1).0,
+            r#""$ST3_BIN" gate ci-passed linux-gate --repo acme/app --ref main"#
+        );
+        assert_eq!(
+            mechanical(2),
+            (
+                r#""$ST3_BIN" gate ci-passed st/ci --repo acme/app --ref '${input.commit}'"#,
+                "builder",
+                "${ST_WORKSPACE}",
+                300_000
+            )
+        );
+        assert_eq!(
+            mechanical(3),
+            (
+                r#""$ST3_BIN" gate cargo-test log_diet --package st3 --ref origin/main"#,
+                "node-a",
+                "repo",
+                3_600_000
+            )
+        );
+        assert!(matches!(
+            &gates[4],
+            GateSpec::Exists { subject, .. } if subject == "doc/acme/handoff"
+        ));
+        // Publication neither requires nor pins the document a gate waits for.
+        assert!(intent.document_refs.is_empty());
+        let resolved = resolve_document_references(
+            source,
+            &BTreeMap::from([("doc/acme/handoff".into(), "a".repeat(64))]),
+        )
+        .unwrap();
+        assert!(
+            resolved.contains(r#"document "doc/acme/handoff""#),
+            "{resolved}"
+        );
+
+        for (gate, code) in [
+            (r#"merged "acme/app""#, "invalid-pull-request"),
+            (
+                r#"ci-passed "linux-gate" repo="acme/app""#,
+                "invalid-gate-shape",
+            ),
+            (r#"cargo-test "log_diet""#, "missing-gate-field"),
+            (r#"document "resource/acme""#, "invalid-document-reference"),
+            (
+                r#"merged "acme/app#1"
+        merged "acme/app#2""#,
+                "invalid-gate-shape",
+            ),
+        ] {
+            let source = format!(
+                "version 2\nmission \"bad\" state=\"ready\" {{\n  goal \"Reject it.\"\n  step \"one\" {{\n    gate \"bad\" {{\n        {gate}\n    }}\n  }}\n}}\n"
+            );
+            assert_eq!(
+                parse_test_intent(&source, "node-a").unwrap_err().code,
+                code,
+                "{gate}"
+            );
+        }
     }
 
     #[test]

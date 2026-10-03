@@ -225,6 +225,12 @@ enum Command {
     },
     /// Generate one shell completion script.
     Completions(CompletionsArgs),
+    /// Answer one built-in gate check, as built-in gates run it: exit 0 to pass, 1 for not yet,
+    /// and 3 when the check cannot answer.
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
+    },
     /// Print the st agent skill bundled in this binary, or install it for each harness.
     Skill(SkillArgs),
     #[command(hide = true)]
@@ -1652,6 +1658,41 @@ struct MissionPublishArgs {
     /// Complete person or agent subject authoring the publication.
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
+}
+
+#[derive(Subcommand)]
+enum GateCommand {
+    /// Whether a pull request has merged; one that closed unmerged cannot pass.
+    Merged {
+        /// OWNER/REPO#NUMBER.
+        pull_request: String,
+    },
+    /// Whether the check run or commit status named CHECK passed on a commit or branch head.
+    CiPassed {
+        check: String,
+        /// OWNER/REPO.
+        #[arg(long)]
+        repo: String,
+        /// A commit SHA or a branch name.
+        #[arg(long = "ref")]
+        reference: String,
+    },
+    /// Whether a cargo test target passes at a ref, built in a worktree st keeps between checks.
+    CargoTest {
+        /// The test target, as `cargo test --test TARGET` names it.
+        target: String,
+        #[arg(long)]
+        package: String,
+        /// The ref to test; its remote is fetched first.
+        #[arg(long = "ref", default_value = "origin/main")]
+        reference: String,
+        /// The repository, or a directory inside it.
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        /// The worktree to build in; st keeps one beneath its state directory by default.
+        #[arg(long)]
+        worktree: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
@@ -3830,6 +3871,45 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Driver(args) => run_driver(&immediate, args, cli.catalog.as_deref()).await,
+        Command::Gate { command } => run_gate(command).await,
+    }
+}
+
+/// `st gate KIND`: print the answer and exit with the status an exec gate reads.
+async fn run_gate(command: GateCommand) -> Result<()> {
+    use st3::resource::github_gates;
+    let answer = match command {
+        GateCommand::Merged { pull_request } => {
+            github_gates::pull_request_merged(&pull_request).await
+        }
+        GateCommand::CiPassed {
+            check,
+            repo,
+            reference,
+        } => github_gates::check_passed(&repo, &reference, &check).await,
+        GateCommand::CargoTest {
+            target,
+            package,
+            reference,
+            repository,
+            worktree,
+        } => {
+            tokio::task::spawn_blocking(move || {
+                st3::gate_kinds::cargo_test(&st3::gate_kinds::CargoTest {
+                    target: &target,
+                    package: &package,
+                    reference: &reference,
+                    repository: &repository,
+                    worktree: worktree.as_deref(),
+                })
+            })
+            .await?
+        }
+    };
+    println!("{}", answer.describe());
+    match answer.exit_code() {
+        0 => Ok(()),
+        code => Err(CommandExit(code).into()),
     }
 }
 

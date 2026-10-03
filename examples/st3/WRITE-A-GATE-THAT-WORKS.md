@@ -4,6 +4,23 @@ This example verifies an invented catalog index with
 [`gate-recovery.kdl`](gate-recovery.kdl) and
 [`verify-catalog-index.sh`](verify-catalog-index.sh).
 
+## First, look for a built-in gate
+
+Most gates check something st can answer itself. Use these instead of a command:
+
+```kdl
+gate "the handoff is published" { document "doc/example/catalog/handoff" }
+gate "the fix merged" { merged "example/catalog#42" }
+gate "linux-gate passed on main" { ci-passed "linux-gate" repo="example/catalog" branch="main" }
+gate "the index suite passes on main" { cargo-test "index" package="catalog" }
+```
+
+A `document` gate never greps a listing that shows only its first page, and `cargo-test` tells
+failing tests (not yet) from a build this host cannot make (broken).
+[`land-and-verify.kdl`](land-and-verify.kdl) uses all four, and the
+[mission reference](../../docs/st3/mission-graph-runtime.md#built-in-gates) explains each one.
+When none fits, write an exec gate, as the rest of this guide does.
+
 ## Failure first: time limits and unchecked scripts
 
 A gate like this is fragile:

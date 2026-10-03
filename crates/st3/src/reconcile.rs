@@ -10235,6 +10235,18 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn evaluate_gate(&self, stage: &GateContext, gate: &GateSpec) -> Result<GateOutcome> {
         let outcome = match gate {
+            // A document exists once any version of its name is stored, or its exact version.
+            GateSpec::Exists { subject, .. } if subject.starts_with("doc/") => {
+                let exists = match subject.rsplit_once('@') {
+                    Some((name, hash)) => self.store.get_document(name, hash)?.is_some(),
+                    None => self.store.latest_document_hash(subject)?.is_some(),
+                };
+                if exists {
+                    GateOutcome::Pass
+                } else {
+                    GateOutcome::Pending
+                }
+            }
             GateSpec::Exists { subject, .. } => {
                 self.ensure_file_observation(subject)?;
                 if self.subject_value(subject)?.is_some_and(|actual| {
@@ -19583,6 +19595,66 @@ schedule "unready" {{
         assert_eq!(
             store.mission_run(&run.id).unwrap().unwrap().status,
             "running"
+        );
+    }
+
+    #[test]
+    fn a_document_gate_passes_once_its_document_is_stored() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+
+mission "handoff" state="ready" {
+  goal "Publish the handoff."
+  completion { when "all-steps-exhausted" }
+  step "publish" {
+    agentless
+    gate "the handoff is published" { document "doc/example/${ST_MISSION_RUN}/handoff" }
+  }
+}
+"#,
+            "document-gate-source",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "handoff".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "document-gate-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "running"
+        );
+        store
+            .put_document(
+                &format!("doc/example/{}/handoff", run.id),
+                b"The handoff.",
+                &None,
+                "document-gate-put",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "completed"
         );
     }
 

@@ -17,6 +17,8 @@ pub mod driver_hook;
 pub mod environment;
 pub(crate) mod external_sessions;
 pub mod fleet;
+/// Built-in gate kinds: what gates shelled out for most, answered by st itself.
+pub mod gate_kinds;
 /// What an `st` command run inside an exec gate reports about itself.
 pub mod gate_report;
 pub mod graph;
