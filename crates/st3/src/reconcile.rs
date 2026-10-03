@@ -7834,9 +7834,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     && (view.assigned_to.as_deref() == Some(subject.as_str())
                         || view.available_to.iter().any(|agent| agent == subject))
             });
-            if intent.subjects.is_empty() {
-                return Ok(false);
-            }
+        }
+        self.keep_stops_by_hand(&mut intent, run)?;
+        if assigned_agents_only && intent.subjects.is_empty() {
+            return Ok(false);
         }
         for subject in intent.subjects.values_mut() {
             subject.owner_run = Some(run.subject.clone());
@@ -7986,6 +7987,32 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(changed)
     }
 
+    /// Leave out of `intent` each seat a person or an agent stopped while this generation of
+    /// `run` declared it. Declaring it again would undo that stop on the next daemon start,
+    /// or on the next pass for a step's seat; `st agents start` starts it again.
+    fn keep_stops_by_hand(
+        &self,
+        intent: &mut crate::model::NormalizedIntent,
+        run: &MissionRunView,
+    ) -> Result<()> {
+        let agents = intent
+            .subjects
+            .iter()
+            .filter(|(_, desired)| desired.kind == "agent")
+            .map(|(subject, _)| subject.clone())
+            .collect::<Vec<_>>();
+        if agents.is_empty() {
+            return Ok(());
+        }
+        let stopped = self
+            .store
+            .stopped_by_hand(&agents, &run.subject, &run.generation)?;
+        intent
+            .subjects
+            .retain(|subject, _| !stopped.contains(subject));
+        Ok(())
+    }
+
     fn materialize_mission_declarations(
         &self,
         run: &MissionRunView,
@@ -8017,6 +8044,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     && current.owner_generation.as_deref() == Some(run.generation.as_str())
             })
         });
+        self.keep_stops_by_hand(&mut intent, run)?;
         for subject in intent.subjects.values_mut() {
             subject.owner_run = Some(run.subject.clone());
             subject.owner_generation = Some(run.generation.clone());

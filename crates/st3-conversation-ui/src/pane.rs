@@ -61,6 +61,8 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// The selected text as the person would paste it: without the edge stui draws beside a
+    /// message, the indent its body sits at, or the fences it draws around code.
     pub fn text(&self, lines: &[Line<'_>]) -> String {
         let (start, end) = order(self.anchor, self.head);
         let mut out = Vec::new();
@@ -75,10 +77,44 @@ impl Selection {
             } else {
                 usize::MAX
             };
-            out.push(columns(&plain, from, to).trim_end().to_owned());
+            let piece = columns(&plain, from.max(edge(&plain)), to);
+            if fence(&piece) {
+                continue;
+            }
+            out.push(piece.trim_end().to_owned());
         }
-        out.join("\n")
+        dedent(out).join("\n")
     }
+}
+
+/// The display columns a message's edge ("▎ ", after any indent) takes at a line's start.
+fn edge(line: &str) -> usize {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    match line[indent..].strip_prefix('▎') {
+        Some(rest) if rest.is_empty() || rest.starts_with(' ') => indent + 2,
+        _ => 0,
+    }
+}
+
+/// A code fence the renderer drew: "```" and an optional language, nothing else.
+fn fence(line: &str) -> bool {
+    line.trim()
+        .strip_prefix("```")
+        .is_some_and(|language| !language.contains(char::is_whitespace))
+}
+
+/// Remove the indent every non-empty line shares.
+fn dedent(lines: Vec<String>) -> Vec<String> {
+    let indent = lines
+        .iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.len() - line.trim_start_matches(' ').len())
+        .min()
+        .unwrap_or(0);
+    lines
+        .into_iter()
+        .map(|line| line.get(indent..).unwrap_or_default().to_owned())
+        .collect()
 }
 
 /// Keep one state per embedding surface; keys retain scroll and drafts across pane switches.

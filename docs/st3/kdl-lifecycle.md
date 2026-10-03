@@ -165,7 +165,11 @@ does not rename an existing seat: pass its complete subject when moving it to an
 `--model`, `--effort`, and `--arg` require a typed `harness` block and are refused for
 `command`/`argv` declarations. `--harness` alone can explicitly switch the launch style.
 After a stop, start restores the unambiguous prior agent declaration. If none is available,
-apply authored KDL instead. `--print-kdl` reads the daemon's declaration and prints the same
+apply authored KDL instead. A mission seat starts only on the declaration its run gave it: start
+refuses the override flags for it, says so when its run still declares it, and refuses once the
+run has ended. A stop of a mission seat by a person or an agent holds while the run's generation
+lasts; the run does not declare the seat again, even after the daemon restarts, until someone
+starts it. A new generation declares its seats afresh. `--print-kdl` reads the daemon's declaration and prints the same
 effective KDL without publishing it. New seats still default to Claude, the current directory,
 and `restart always`.
 

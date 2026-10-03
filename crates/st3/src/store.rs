@@ -1012,6 +1012,19 @@ pub struct MissionRunStateMoment {
     pub outcome: Option<MissionRunOutcomeView>,
 }
 
+/// A selected stop and the seat declaration it ended.
+#[derive(Clone, Debug)]
+pub struct EndedDeclaration {
+    /// The selected stop.
+    pub stop: DesiredSubject,
+    /// The stop's claim, the seat's selected desired token.
+    pub token: String,
+    /// Who published the stop; the daemon's own stops record no writer.
+    pub writer: Option<String>,
+    /// The agent declaration the stop ended.
+    pub declaration: DesiredSubject,
+}
+
 /// A kept agent status: the snapshot it answers, the agent projection index it was reduced at,
 /// whether it includes history, and the status.
 type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
@@ -9646,6 +9659,190 @@ impl Store {
             &BTreeMap::from([(subject.to_owned(), heads)]),
             idempotency_key,
             writer.as_deref(),
+        )
+    }
+
+    /// The seat declaration that the stop selected for `subject` ended, or `None` when the
+    /// selected declaration is not a stop. A stop that replaced another stop is followed back
+    /// to the declaration they ended; a merge of several is ambiguous and also gives `None`.
+    pub fn declaration_ended_by_stop(&self, subject: &str) -> Result<Option<EndedDeclaration>> {
+        let connection = self.readers.get();
+        let Some((stop, writer)) = connection
+            .query_row(
+                "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                        desired.owner_run, desired.owner_generation, desired.owner_step,
+                        desired.claim_id, claims.actor
+                 FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
+                 WHERE desired.subject = ?1 AND desired.kind = 'stop'",
+                [subject],
+                |row| {
+                    Ok((
+                        (desired_from_row(row)?, row.get::<_, String>(7)?),
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let (stop, token) = stop;
+        let mut claim = claim_by_id_tx(&connection, &token)?;
+        // A seat is stopped and started a few times at most; the bound only guards a cycle.
+        for _ in 0..64 {
+            let Some(current) = claim else {
+                return Ok(None);
+            };
+            let desired: DesiredSubject = serde_json::from_value(current.body)?;
+            if desired.kind == "agent" {
+                return Ok(Some(EndedDeclaration {
+                    stop,
+                    token,
+                    writer,
+                    declaration: desired,
+                }));
+            }
+            let [predecessor] = current.predecessors.as_slice() else {
+                return Ok(None);
+            };
+            if desired.kind != "stop" {
+                return Ok(None);
+            }
+            claim = claim_by_id_tx(&connection, predecessor)?;
+        }
+        Ok(None)
+    }
+
+    /// The subjects among `subjects` that a person or an agent stopped while `generation` of
+    /// `run` declared them. Such a stop holds for the rest of that generation, across daemon
+    /// restarts, until someone starts the seat again; the run does not declare it again.
+    pub fn stopped_by_hand(
+        &self,
+        subjects: &[String],
+        run: &str,
+        generation: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut stopped = BTreeSet::new();
+        for desired in self.desired_subjects_named(subjects)? {
+            // A run's own stop and a generation's retirement record their owner; only a stop
+            // published at the root, as `st agents stop` does, is someone's decision.
+            if desired.kind != "stop"
+                || desired.owner_run.is_some()
+                || desired.owner_generation.is_some()
+            {
+                continue;
+            }
+            let Some(ended) = self.declaration_ended_by_stop(&desired.subject)? else {
+                continue;
+            };
+            if ended.writer.is_some()
+                && ended.declaration.owner_run.as_deref() == Some(run)
+                && ended.declaration.owner_generation.as_deref() == Some(generation)
+            {
+                stopped.insert(desired.subject);
+            }
+        }
+        Ok(stopped)
+    }
+
+    /// Start a stopped mission seat again on the declaration its run gave it. `expected` fences
+    /// the selected stop. A seat its run already declares is returned unchanged, and a run that
+    /// ended or moved to another generation since the stop cannot start it.
+    pub fn start_mission_seat(
+        &self,
+        subject: &str,
+        expected: Option<&str>,
+        actor: &str,
+        idempotency_key: &str,
+    ) -> Result<ApplyResponse, St3Error> {
+        let Some(ended) = self.declaration_ended_by_stop(subject).map_err(internal)? else {
+            return Err(St3Error::new(
+                "seat-not-stopped",
+                format!("`{subject}` is not a stopped seat with one prior declaration"),
+            ));
+        };
+        if let Some(expected) = expected
+            && expected != ended.token
+        {
+            return Err(St3Error::new(
+                "stale-seat-declaration",
+                format!("the selected declaration of `{subject}` changed"),
+            ));
+        }
+        let declaration = ended.declaration;
+        let (Some(owner_run), Some(owner_generation)) = (
+            declaration.owner_run.clone(),
+            declaration.owner_generation.clone(),
+        ) else {
+            return Err(St3Error::new(
+                "seat-not-mission-owned",
+                format!("`{subject}` is not a mission seat"),
+            ));
+        };
+        let run_id = owner_run.strip_prefix("mission-run/").unwrap_or(&owner_run);
+        let (status, phase, generation) = self
+            .readers
+            .get()
+            .query_row(
+                "SELECT status, phase, 'run-generation/' || current_generation_id
+                 FROM mission_runs WHERE id=?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "mission-run-missing",
+                    format!("`{subject}` belongs to `{owner_run}`, which this node does not have"),
+                )
+            })?;
+        if is_terminal_run_state(&status)
+            || !matches!(phase.as_str(), "normal" | "revision-draining")
+        {
+            return Err(St3Error::new(
+                "mission-run-ended",
+                format!("`{owner_run}` is {status} ({phase}); its seats cannot start again"),
+            ));
+        }
+        if owner_generation != generation {
+            return Err(St3Error::new(
+                "mission-generation-moved",
+                format!(
+                    "`{owner_run}` moved to {generation} after `{subject}` stopped; its new generation declares its seats"
+                ),
+            ));
+        }
+        let heads = {
+            let connection = self.readers.get();
+            let transaction = connection.unchecked_transaction().map_err(internal)?;
+            intent_leaves_tx(&transaction, subject).map_err(internal)?
+        };
+        let normalized = json!({ "agent": subject, "start": ended.token });
+        let intent = NormalizedIntent {
+            schema: "st3.v1".into(),
+            source_hash: canonical_hash(&normalized).map_err(internal)?,
+            subjects: BTreeMap::from([(subject.to_owned(), declaration)]),
+            missions: BTreeMap::new(),
+            mission_runs: BTreeMap::new(),
+            planning_sessions: BTreeMap::new(),
+            resource_refreshes: Vec::new(),
+            replica_repairs: Vec::new(),
+            document_refs: BTreeSet::new(),
+            deprecated_syntax: BTreeSet::new(),
+            normalized,
+        };
+        self.apply_as(
+            &intent,
+            &BTreeMap::from([(subject.to_owned(), heads)]),
+            idempotency_key,
+            Some(actor),
         )
     }
 
@@ -24615,6 +24812,25 @@ fn carried_claim_successor_tx(
              WHERE run_id=?1 AND step_path=?2 AND lease_owner=?3 AND generation_id<>?4
                AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
             params![run_id, step.step, actor, generation_id_from_subject(&step.generation)],
+            step_run_from_row,
+        )
+        .optional()
+}
+
+/// Return the current-generation step that took the place of a superseded step, whoever holds it.
+fn current_generation_successor_tx(
+    connection: &Connection,
+    step: &StepRunView,
+) -> rusqlite::Result<Option<StepRunView>> {
+    let run_id = step.run.strip_prefix("mission-run/").unwrap_or(&step.run);
+    connection
+        .query_row(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+             FROM step_runs
+             WHERE run_id=?1 AND step_path=?2 AND generation_id<>?3
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
+            params![run_id, step.step, generation_id_from_subject(&step.generation)],
             step_run_from_row,
         )
         .optional()
