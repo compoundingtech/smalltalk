@@ -2515,6 +2515,17 @@ fn normalize_omp(
         .unwrap_or_else(|| format!("native/{sequence}"));
     push_message(items, sequence, &timestamp, role, &message_id);
     match native_role {
+        Some("toolResult") if message.get("toolCallId").is_some_and(Value::is_string) => {
+            push_tool_result_with_status(
+                items,
+                sequence + 1,
+                &timestamp,
+                message["toolCallId"].as_str().unwrap_or_default(),
+                message.get("content").cloned().unwrap_or(Value::Null),
+                message.get("isError").and_then(Value::as_bool).unwrap_or(false),
+            );
+            return;
+        }
         // A shell command the person ran with `!`: shown as the harness recorded it, without
         // attributing it to the agent.
         Some("bashExecution") => {
@@ -3320,6 +3331,60 @@ mod tests {
                 .iter()
                 .any(|item| item["type"] == "tool_result" && item["body"]["call_id"] == "c1")
         );
+    }
+
+    // Native OMP call/result pairs captured on 2026-10-02, with tool input/output redacted.
+    fn omp_tool_result_fixture() -> Vec<Value> {
+        include_str!("../fixtures/omp-tool-results.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn omp_message_tool_result_success_correlates_with_call() {
+        let fixture = omp_tool_result_fixture();
+        let mut items = Vec::new();
+        for (offset, entry) in fixture[..2].iter().enumerate() {
+            normalize_omp(ExternalDriver::Omp, entry, offset as u64 * 16, "", &mut items);
+        }
+        let call = items.iter().find(|item| item["type"] == "tool_call").unwrap();
+        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+        assert_eq!(result["body"]["call_id"], call["body"]["call_id"]);
+        assert_eq!(result["body"]["status"], "success");
+        assert_eq!(result["body"]["content"], fixture[1]["message"]["content"]);
+        assert_eq!(result["timestamp"], fixture[1]["timestamp"]);
+    }
+
+    #[test]
+    fn omp_message_tool_result_error_retains_status_and_text() {
+        let fixture = omp_tool_result_fixture();
+        let mut items = Vec::new();
+        for (offset, entry) in fixture[2..].iter().enumerate() {
+            normalize_omp(ExternalDriver::Omp, entry, offset as u64 * 16, "", &mut items);
+        }
+        let call = items.iter().find(|item| item["type"] == "tool_call").unwrap();
+        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+        assert_eq!(result["body"]["call_id"], call["body"]["call_id"]);
+        assert_eq!(result["body"]["status"], "error");
+        assert_eq!(result["body"]["content"], fixture[3]["message"]["content"]);
+    }
+
+    #[test]
+    fn omp_message_tool_result_legacy_block_remains_correlated() {
+        let mut entry = omp_tool_result_fixture()[1].clone();
+        let message = entry["message"].as_object_mut().unwrap();
+        let call_id = message.remove("toolCallId").unwrap();
+        let content = message.remove("content").unwrap();
+        message.insert("content".to_owned(), json!([{
+            "type": "toolResult", "toolCallId": call_id, "content": content
+        }]));
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &entry, 0, "", &mut items);
+        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+        assert_eq!(result["body"]["call_id"], call_id);
+        assert_eq!(result["body"]["status"], "success");
+        assert_eq!(result["body"]["content"], content);
     }
 
     #[test]
