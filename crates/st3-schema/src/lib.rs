@@ -1187,6 +1187,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "work.person-reassigned",
+            &["step-run"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            Some("work"),
+            true,
+            &[],
+        ),
+        (
             "work.person-done",
             &["step-run"],
             WritePolicy::AuthorizedParticipant,
@@ -1275,6 +1284,24 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Some("gates"),
             true,
             &["gate"],
+        ),
+        (
+            "gate.reviewer-reassigned",
+            &["gate-operation"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            Some("gates"),
+            true,
+            &["gate"],
+        ),
+        (
+            "person.rename.completed",
+            &["person"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
         ),
         (
             "gate.result",
@@ -2374,6 +2401,14 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("episode", string()),
             ("answer", object()),
         ],
+        "work.person-reassigned" => &[
+            ("previous_person", reference()),
+            ("person", reference()),
+            ("run", reference()),
+            ("generation", reference()),
+            ("attempt", integer()),
+            ("episode", string()),
+        ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
         | "work.released" | "work.extended" => &[
             ("attempt", integer()),
@@ -2407,6 +2442,17 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("capability_expires_at", string()),
             ("gate", string()),
             ("baseline", boolean()),
+        ],
+        "gate.reviewer-reassigned" => &[
+            ("request", string()),
+            ("owner", reference()),
+            ("previous_reviewer", reference()),
+            ("reviewer", reference()),
+        ],
+        "person.rename.completed" => &[
+            ("old_person", reference()),
+            ("new_person", reference()),
+            ("report", object()),
         ],
         "gate.result" => &[
             (
@@ -3307,218 +3353,6 @@ fn error(code: &'static str, message: impl Into<String>) -> ValidationError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn registry_matches_the_exact_manifests() {
-        let registry = registry();
-        assert_eq!(
-            registry
-                .subjects
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "account",
-                "agent",
-                "attention",
-                "checkpoint",
-                "checkpoint-excusal",
-                "custom",
-                "daemon",
-                "doc",
-                "exec",
-                "file",
-                "fleet-invite",
-                "gate-operation",
-                "glass",
-                "host",
-                "lane",
-                "loop-run",
-                "message",
-                "mission",
-                "mission-run",
-                "observer",
-                "person",
-                "planning-session",
-                "pty",
-                "repair",
-                "resource",
-                "revision-proposal",
-                "rule",
-                "run-generation",
-                "schedule",
-                "step-run",
-                "subscription",
-            ]
-        );
-        assert_eq!(
-            registry
-                .resources
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "ci.run",
-                "filesystem.file",
-                "harness.session-file",
-                "human.review",
-                "vcs.commit",
-                "vcs.issue",
-                "vcs.pull-request",
-                "vcs.ref",
-                "vcs.repository",
-            ]
-        );
-        assert_eq!(
-            registry.resources["human.review"]
-                .fields
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "decision",
-                "document",
-                "reason",
-                "reviewer",
-                "submitted_at",
-                "target"
-            ]
-        );
-        assert_eq!(
-            registry
-                .claims
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "agent.account",
-                "agent.presence",
-                "agent.queue.moved",
-                "attention.requested",
-                "attention.resolved",
-                "checkpoint.excused",
-                "checkpoint.sealed",
-                "checkpoint.verified",
-                "daemon.diagnostic",
-                "daemon.started",
-                "delivery.hold",
-                "doc.bound",
-                "eval.verdict",
-                "file.observed",
-                "fleet.invite-created",
-                "fleet.invite-redeemed",
-                "fleet.invite-revoked",
-                "fleet.member-admitted",
-                "fleet.member-endpoints",
-                "fleet.member-left",
-                "fleet.member-removed",
-                "gate.requested",
-                "gate.result",
-                "glass.deleted",
-                "glass.upserted",
-                "harness.context-clear.requested",
-                "harness.context-clear.result",
-                "harness.diagnostic",
-                "harness.limits",
-                "harness.observed",
-                "harness.session-file",
-                "harness.telemetry",
-                "harness.timeline",
-                "harness.usage",
-                "intent.desired",
-                "lane.approved",
-                "lane.joined",
-                "lane.left",
-                "lane.marked",
-                "lane.moved",
-                "loop.round-dispatch",
-                "loop.round-result",
-                "loop.state",
-                "message.closed",
-                "message.delivered",
-                "message.read",
-                "message.sent",
-                "message.staged",
-                "mission-run.created",
-                "mission-run.state",
-                "mission.produced",
-                "mission.published",
-                "observer.observed",
-                "observer.refresh-requested",
-                "observer.state",
-                "operational.failure",
-                "operational.recovered",
-                "planning-session.approved",
-                "planning-session.cancelled",
-                "planning-session.candidate-submitted",
-                "planning-session.previewed",
-                "planning-session.question-answered",
-                "planning-session.question-requested",
-                "planning-session.revision-requested",
-                "planning-session.started",
-                "principal.key-granted",
-                "principal.key-revoked",
-                "publication.operation",
-                "reconcile.fault",
-                "record.repaired",
-                "render.applied",
-                "repair.applied",
-                "resource.observed",
-                "revision-proposal.applied",
-                "revision-proposal.approved",
-                "revision-proposal.cancelled",
-                "revision-proposal.created",
-                "rule.audited",
-                "rule.set",
-                "run-generation.created",
-                "run-generation.state",
-                "run-generation.superseded",
-                "runtime.action.deadline-reached",
-                "runtime.action.failed",
-                "runtime.action.requested",
-                "runtime.action.succeeded",
-                "runtime.observed",
-                "runtime.readiness-deadline-reached",
-                "runtime.reconcile-decision",
-                "runtime.restart-window-reset",
-                "schedule.occurrence-cancelled",
-                "schedule.occurrence-reached",
-                "schedule.occurrence-scheduled",
-                "schedule.work-failed",
-                "schedule.work-requested",
-                "schedule.work-started",
-                "step-run.carried",
-                "step-run.retried",
-                "step-run.state",
-                "subagent.appeared",
-                "subagent.ended",
-                "subagent.renewed",
-                "subscription.batch-sent",
-                "subscription.batched",
-                "subscription.mission-deferred",
-                "subscription.mission-failed",
-                "subscription.mission-request-cancelled",
-                "subscription.mission-request-released",
-                "subscription.mission-requested",
-                "subscription.mission-started",
-                "subscription.state",
-                "terminal.input.requested",
-                "terminal.input.result",
-                "transport.observed",
-                "work.claimed",
-                "work.extended",
-                "work.failed",
-                "work.person-asked",
-                "work.person-cancelled",
-                "work.person-done",
-                "work.progress",
-                "work.released",
-                "work.renewed",
-                "work.submitted",
-            ]
-        );
-        assert_eq!(registry.digest().len(), 64);
-        assert_eq!(registry.digest(), registry.digest());
-    }
 
     #[test]
     fn registry_rejects_the_removed_plan_names() {

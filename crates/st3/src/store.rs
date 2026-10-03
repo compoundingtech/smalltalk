@@ -84,7 +84,9 @@ pub use smallclaims::store::{
 
 mod attention_snapshot;
 mod checkpoint_rules;
+mod human_review_reassignment;
 mod limits;
+mod person_rename;
 mod person_work;
 mod subagents;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
@@ -10826,16 +10828,23 @@ impl Store {
         pending_human_reviews_tx(&connection, reviewer)
     }
 
+    /// The current reviewer of this exact immutable gate request, including one-shot repairs.
+    pub fn human_review_reviewer(&self, request: &ClaimRecord) -> Result<String> {
+        human_review_reassignment::reviewer_tx(&self.readers.get(), request)
+    }
+
     /// Every human gate request as (request, owner, reviewer): the episodes a human gate's
     /// attention card can name, open or long closed.
     pub fn human_gate_requests(&self) -> Result<Vec<(String, String, String)>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT id, json_extract(body, '$.fields.owner'), json_extract(body, '$.fields.reviewer')
-             FROM claims INDEXED BY claims_human_gate_request_index
-             WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL
-               AND json_extract(body, '$.fields.owner') IS NOT NULL",
-        )?;
+        let mut statement = connection.prepare(&canonical_sql(&format!(
+            "SELECT request.id, json_extract(request.body, '$.fields.owner'), {}
+             FROM claims request INDEXED BY claims_human_gate_request_index
+             WHERE request.kind='gate.requested' AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
+               AND json_extract(request.body, '$.fields.owner') IS NOT NULL
+             ORDER BY CANONICAL_ASC(request)",
+            human_review_reassignment::reviewer_sql("request", None),
+        )))?;
         statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()
@@ -18644,7 +18653,7 @@ fn human_review_currency(
 ) -> Result<std::result::Result<HumanReviewView, String>> {
     let fields = request.body.get("fields").unwrap_or(&request.body);
     let text = |name: &str| fields.get(name).and_then(Value::as_str);
-    let (Some(owner), Some(reviewer), Some(mission_revision), Some(step_definition)) = (
+    let (Some(owner), Some(_reviewer), Some(mission_revision), Some(step_definition)) = (
         text("owner"),
         text("reviewer"),
         text("mission_revision"),
@@ -18784,6 +18793,7 @@ fn human_review_currency(
             })
             .unwrap_or_default()
     };
+    let reviewer = human_review_reassignment::reviewer_tx(connection, &request)?;
     Ok(Ok(HumanReviewView {
         operation: fields
             .get("operation")
@@ -18797,7 +18807,7 @@ fn human_review_currency(
         generation: run.generation,
         step,
         title,
-        reviewer: reviewer.to_owned(),
+        reviewer,
         mode: fields
             .get("mode")
             .and_then(Value::as_str)
@@ -18824,8 +18834,9 @@ fn reviewer_answer_sql(result: &str) -> String {
         "{result}.subject=request.subject
          AND {result}.kind='gate.result'
          AND json_extract({result}.body, '$.fields.request')=request.id
-         AND {result}.actor=json_extract(request.body, '$.fields.reviewer')
-         AND json_extract({result}.body, '$.fields.verdict') IN ('pass','fail','feedback')"
+         AND {result}.actor={}
+         AND json_extract({result}.body, '$.fields.verdict') IN ('pass','fail','feedback')",
+        human_review_reassignment::reviewer_sql("request", Some(result)),
     )
 }
 
@@ -18898,46 +18909,54 @@ fn pending_human_reviews_tx(
     reviewer: Option<&str>,
 ) -> Result<Vec<HumanReviewView>> {
     let requests = {
-        let mut statement = connection.prepare(&canonical_sql(&format!(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
              FROM claims request INDEXED BY claims_human_gate_request_index
              WHERE request.kind='gate.requested'
                AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
-               AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
-               AND NOT EXISTS (SELECT 1 FROM claims result WHERE {})
              ORDER BY CANONICAL_ASC(request)",
-            reviewer_answer_sql("result")
-        )))?;
+        ))?;
         statement
-            .query_map([reviewer], claim_from_row)?
+            .query_map([], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()?
     };
-    // A build that words a gate's request differently asks the same gate again. The reviewer
-    // answers the newest request, which is the one the gate waits on, and has waited since the
-    // first.
-    let mut reviews: Vec<HumanReviewView> = Vec::new();
+    // A differently worded request supersedes an older copy of the same published gate.
+    // Group by its original reviewer before filtering effective assignments or answers:
+    // repairing or answering the newest copy must never reopen the superseded OLD card.
+    let mut reviews: Vec<(HumanReviewView, String)> = Vec::new();
     for request in requests {
+        let original_reviewer = request.body["fields"]["reviewer"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         let Some(review) = current_human_review(connection, request)? else {
             continue;
         };
-        match reviews.iter_mut().find(|kept| {
+        match reviews.iter_mut().find(|(kept, original)| {
             kept.owner == review.owner
-                && kept.reviewer == review.reviewer
+                && *original == original_reviewer
                 && kept.attempt == review.attempt
         }) {
-            Some(kept) => {
+            Some((kept, _)) => {
                 let first = kept.requested_at_unix_ms.min(review.requested_at_unix_ms);
-                if review.requested_at_unix_ms >= kept.requested_at_unix_ms {
-                    *kept = review;
-                }
+                // Requests arrive here in the canonical total order, including time ties.
+                *kept = review;
                 kept.requested_at_unix_ms = first;
             }
-            None => reviews.push(review),
+            None => reviews.push((review, original_reviewer)),
         }
     }
-    Ok(reviews)
+    let mut pending = Vec::with_capacity(reviews.len());
+    for (review, _) in reviews {
+        if reviewer.is_none_or(|person| person == review.reviewer)
+            && human_review_answer_tx(connection, &review.request)?.is_none()
+        {
+            pending.push(review);
+        }
+    }
+    Ok(pending)
 }
 
 fn attention_request_view_tx(
@@ -22650,6 +22669,7 @@ fn try_project_simple_replication_tx(
                 claim.kind.as_str(),
                 "intent.desired"
                     | "work.person-asked"
+                    | "work.person-reassigned"
                     | "work.person-done"
                     | "work.person-cancelled"
                     | "doc.bound"
@@ -22689,7 +22709,7 @@ fn try_project_simple_replication_tx(
         // before its ask, or a later local update, has the same result as canonical replay.
         if matches!(
             claim.kind.as_str(),
-            "work.person-asked" | "work.person-done" | "work.person-cancelled"
+            "work.person-asked" | "work.person-reassigned" | "work.person-done" | "work.person-cancelled"
         ) && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
         {
             dirty.insert(aggregate);
@@ -23329,7 +23349,7 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
             1 => "claims.kind IN ('mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
                   'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
                   'step-run.carried','step-run.state','step-run.retried',
-                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released','work.person-asked','work.person-done','work.person-cancelled')",
+                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released','work.person-asked','work.person-reassigned','work.person-done','work.person-cancelled')",
             _ => "claims.kind='step-run.carried'",
         };
         let mut statement = transaction

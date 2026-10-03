@@ -55,7 +55,7 @@ use crate::model::{
     SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
     WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
-use crate::model::{PersonAskRequest, PersonStepResponse};
+use crate::model::{PersonAskRequest, PersonRenameReport, PersonRenameRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
@@ -448,6 +448,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/gate-checks/{id}", get(read_gate_check))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
+        .route("/v1/persons/rename", post(rename_person))
         .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/agents/start", post(start_mission_seat))
         .route("/v1/agents/suspend", post(suspend_agent))
@@ -4726,6 +4727,7 @@ async fn guard_bound_request(
         "/v1/intent/apply",
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
+        "/v1/persons/rename",
         "/v1/agents/restart",
         "/v1/agents/start",
         "/v1/agents/suspend",
@@ -8858,6 +8860,15 @@ async fn rename_agent(
     Ok(Json(response))
 }
 
+async fn rename_person(
+    State(state): State<AppState>,
+    Json(request): Json<PersonRenameRequest>,
+) -> Result<Json<PersonRenameReport>, ApiError> {
+    let response = state.store.rename_person(&request).map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
 async fn apply(
     State(state): State<AppState>,
     Json(request): Json<ApplyRequest>,
@@ -9719,12 +9730,11 @@ async fn post_review(
             .claim_by_id(&pending.request)
             .map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::internal("the pending review request does not exist"))?;
-        let reviewer = review_request
-            .body
-            .pointer("/fields/reviewer")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiError::internal("a human review request has no reviewer"))?;
-        if actor.as_deref() != Some(reviewer) {
+        let reviewer = state
+            .store
+            .human_review_reviewer(&review_request)
+            .map_err(ApiError::internal)?;
+        if actor.as_deref() != Some(reviewer.as_str()) {
             return Err(ApiError::bad(St3Error::new(
                 "wrong-reviewer",
                 format!("the pending review requires `{reviewer}`"),
@@ -13063,6 +13073,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         for path in [
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
+            "/v1/persons/rename",
             "/v1/agents/restart",
             "/v1/agents/start",
             "/v1/agents/suspend",
@@ -20050,6 +20061,25 @@ version 2
             json!(mission_request.accepted_at_unix_ms)
         );
 
+        let repair = json!({
+            "old_person": "person/alex",
+            "new_person": "person/robin",
+            "actor": "person/operator",
+            "idempotency_key": "review-api-person-rename",
+        });
+        let (status, renamed) =
+            json_request(app.clone(), "/v1/persons/rename", repair.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{renamed}");
+        assert_eq!(renamed["reassigned_reviews"], json!([run.subject, step.subject]));
+        let (status, repeated) =
+            json_request(app.clone(), "/v1/persons/rename", repair).await;
+        assert_eq!(status, StatusCode::OK, "{repeated}");
+        assert_eq!(renamed, repeated);
+        assert_eq!(
+            store.claim_by_id(&mission_again.id).unwrap().unwrap().body["fields"]["reviewer"],
+            "person/alex"
+        );
+
         let body = |actor: &str| {
             serde_json::to_value(ReviewRequest {
                 decision: "approved".into(),
@@ -20062,7 +20092,7 @@ version 2
         let (status, rejected) = json_request(
             app.clone(),
             &format!("/v1/reviews/{}", run.subject),
-            body("person/someone-else"),
+            body("person/alex"),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
@@ -20071,7 +20101,7 @@ version 2
         let (status, accepted_mission) = json_request(
             app.clone(),
             &format!("/v1/reviews/{}", run.subject),
-            body("person/alex"),
+            body("person/robin"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{accepted_mission}");
@@ -20085,7 +20115,7 @@ version 2
         let missing_reason = serde_json::to_value(ReviewRequest {
             decision: "rejected".into(),
             reason: None,
-            actor: Some("person/alex".into()),
+            actor: Some("person/robin".into()),
             expected_subject: None,
         })
         .unwrap();
@@ -20101,7 +20131,7 @@ version 2
         let reject = serde_json::to_value(ReviewRequest {
             decision: "rejected".into(),
             reason: Some("the evidence is incomplete".into()),
-            actor: Some("person/alex".into()),
+            actor: Some("person/robin".into()),
             expected_subject: None,
         })
         .unwrap();

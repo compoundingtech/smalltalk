@@ -2,6 +2,7 @@
 //! step_runs supplies their state. No separate attention record is created.
 use super::*;
 use crate::model::{PersonAskRequest, PersonStepResponse};
+use crate::model::PersonRenameRequest;
 use crate::person_request::{StructuredRequest, answer_summary};
 
 /// The ask's structured request in canonical form, or null for a free-text ask.
@@ -805,8 +806,73 @@ fn send_answer_tx(
     Ok(())
 }
 
+/// Reassignment captures only the current open episode. The original ask remains immutable,
+/// including its requester and originally addressed person.
+pub(super) fn reassign_person_steps_tx(
+    tx: &Transaction<'_>,
+    origin: &str,
+    input: &PersonRenameRequest,
+) -> Result<Vec<String>, St3Error> {
+    let as_of = now_ms();
+    let mut query = tx.prepare(
+        "SELECT subject FROM step_runs WHERE assignee=?1 AND status IN ('ready','pending') ORDER BY subject",
+    ).map_err(internal)?;
+    let subjects = query.query_map([&input.old_person], |row| row.get::<_, String>(0))
+        .map_err(internal)?.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)?;
+    let mut reassigned = Vec::new();
+    for subject in subjects {
+        let Some(mut view) = step(tx, &subject).map_err(internal)? else { continue };
+        apply_effective_step_state(tx, &mut view, as_of).map_err(internal)?;
+        if !matches!(view.status.as_str(), "ready" | "pending")
+            || !run_live(tx, &view.run, Some(&view.generation), false).map_err(internal)?
+        {
+            continue;
+        }
+        let ask = request(tx, &subject).map_err(internal)?;
+        if let Some(ask) = &ask {
+            if !current(tx, ask, as_of).map_err(internal)? {
+                continue;
+            }
+        }
+        let episode = ask.as_ref().map(|ask| ask.id.clone()).unwrap_or_else(|| {
+            format!("{}:{}:{}", view.generation, view.attempt, view.readiness_epoch)
+        });
+        let evidence = ask.map(|ask| vec![ask.id]).unwrap_or_default();
+        let claim = append_claim_tx(tx, origin, &subject, "work.person-reassigned", Some(&input.actor),
+            &json!({"fields": {"previous_person": input.old_person, "person": input.new_person,
+                "run": view.run, "generation": view.generation, "attempt": view.attempt, "episode": episode}}),
+            &evidence, None).map_err(claim_append_error)?;
+        project(tx, &claim)?;
+        reassigned.push(subject);
+    }
+    Ok(reassigned)
+}
+
 pub(super) fn project(tx: &Transaction<'_>, claim: &ClaimRecord) -> Result<bool, St3Error> {
     let fields = &claim.body["fields"];
+    if claim.kind == "work.person-reassigned" {
+        let Some(view) = step(tx, &claim.subject).map_err(internal)? else {
+            return Ok(true);
+        };
+        let ask = request(tx, &claim.subject).map_err(internal)?;
+        let episode = ask.map(|ask| ask.id).unwrap_or_else(|| {
+            format!("{}:{}:{}", view.generation, view.attempt, view.readiness_epoch)
+        });
+        if fields["run"].as_str() != Some(view.run.as_str())
+            || fields["generation"].as_str() != Some(view.generation.as_str())
+            || fields["attempt"].as_u64() != Some(u64::from(view.attempt))
+            || fields["episode"].as_str() != Some(episode.as_str())
+        {
+            return Ok(true);
+        }
+        tx.execute(
+            "UPDATE step_runs SET assignee=?2,updated_at_unix_ms=?3
+             WHERE subject=?1 AND assignee=?4 AND status IN ('ready','pending')",
+            params![claim.subject, fields["person"].as_str(), claim.accepted_at_unix_ms.to_string(),
+                fields["previous_person"].as_str()],
+        ).map_err(internal)?;
+        return Ok(true);
+    }
     if claim.kind == "work.person-asked" {
         let run = fields["run"]
             .as_str()
@@ -2355,5 +2421,205 @@ mission "writer-load" state="ready" {
             store.finish_person_step(&response, false).unwrap_err().code,
             "stale-fence"
         );
+    }
+
+    fn rename_request() -> PersonRenameRequest {
+        PersonRenameRequest {
+            old_person: "person/avery".into(),
+            new_person: "person/robin".into(),
+            actor: "person/operator".into(),
+            idempotency_key: "repair-avery".into(),
+        }
+    }
+
+    fn rename_claim_count(store: &Store) -> u64 {
+        store.readers.get().query_row("SELECT COUNT(*) FROM claims", [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn rename_moves_authored_and_asked_inboxes_without_changing_history() {
+        let (store, origin, input) = fixture();
+        let ask = store.ask_person(&input).unwrap();
+        let original = request(&store.readers.get(), &ask.subject).unwrap().unwrap();
+        let run = store.mission_run(&origin.run).unwrap().unwrap();
+        let review = run.steps.iter().find(|step| step.step == "review").unwrap();
+        store.set_step_state(&review.subject, "ready", None).unwrap();
+        let before = store.attention_items(Some("person/avery")).unwrap();
+        let repair = rename_request();
+        let report = store.rename_person(&repair).unwrap();
+        let mut expected = vec![ask.subject.clone(), review.subject.clone()];
+        expected.sort();
+        assert_eq!(report.reassigned_steps, expected);
+        assert_eq!(report.run_requesters, vec![origin.run.clone()]);
+        assert!(store.attention_items(Some("person/avery")).unwrap().is_empty());
+        let after = store.attention_items(Some("person/robin")).unwrap();
+        assert_eq!(after.len(), 2);
+        for old in &before {
+            let new = after.iter().find(|item| item.subject == old.subject).unwrap();
+            assert_eq!(new.episode, old.episode);
+            assert_eq!(new.requester_id, old.requester_id);
+            assert_eq!(new.person, "person/robin");
+        }
+        let preserved = request(&store.readers.get(), &ask.subject).unwrap().unwrap();
+        assert_eq!(preserved.body, original.body);
+        assert_eq!(preserved.actor, original.actor);
+        assert_eq!(preserved.id, original.id);
+        let count = rename_claim_count(&store);
+        assert_eq!(store.rename_person(&repair).unwrap(), report);
+        assert_eq!(rename_claim_count(&store), count);
+        let mut conflicting = repair.clone();
+        conflicting.new_person = "person/blair".into();
+        assert_eq!(store.rename_person(&conflicting).unwrap_err().code, "idempotency-conflict");
+        conflicting = repair.clone();
+        conflicting.actor = "person/blair".into();
+        assert_eq!(store.rename_person(&conflicting).unwrap_err().code, "idempotency-conflict");
+        store.replay_replication_graph().unwrap();
+        assert_eq!(store.rename_person(&repair).unwrap(), report);
+        for item in after {
+            let mut response = PersonStepResponse {
+                subject: item.subject.clone(),
+                actor: "person/avery".into(),
+                summary: "Reviewed".into(),
+                evidence: vec![],
+                episode: Some(item.episode),
+                idempotency_key: format!("renamed-answer:{}", item.subject),
+                answer: None,
+            };
+            assert_eq!(store.finish_person_step(&response, false).unwrap_err().code, "forbidden");
+            response.actor = "person/robin".into();
+            assert_eq!(store.finish_person_step(&response, false).unwrap().status, "completed");
+        }
+        assert_eq!(request(&store.readers.get(), &ask.subject).unwrap().unwrap().actor, original.actor);
+        assert_eq!(store.claim_by_id(&original.id).unwrap().unwrap().body, original.body);
+    }
+
+    #[test]
+    fn rename_preserves_pending_episode_and_requester_cancel_authority() {
+        let (store, origin, input) = fixture();
+        let ask = store.ask_person(&input).unwrap();
+        let review = store.mission_run(&origin.run).unwrap().unwrap().steps.into_iter()
+            .find(|step| step.step == "review").unwrap();
+        assert_eq!(review.status, "pending");
+        let report = store.rename_person(&rename_request()).unwrap();
+        assert!(report.reassigned_steps.contains(&review.subject));
+        let moved = store.step_run(&review.subject).unwrap().unwrap();
+        assert_eq!(moved.status, review.status);
+        assert_eq!(moved.attempt, review.attempt);
+        assert_eq!(moved.generation, review.generation);
+        assert_eq!(moved.readiness_epoch, review.readiness_epoch);
+        assert_eq!(moved.assigned_to.as_deref(), Some("person/robin"));
+        let response = PersonStepResponse {
+            subject: ask.subject,
+            actor: input.actor,
+            summary: "Not needed".into(),
+            evidence: vec![],
+            episode: None,
+            idempotency_key: "cancel-renamed".into(),
+            answer: None,
+        };
+        assert_eq!(store.finish_person_step(&response, true).unwrap().status, "cancelled");
+        assert_eq!(store.step_run(&origin.subject).unwrap().unwrap().status, "ready");
+    }
+
+    #[test]
+    fn rename_leaves_retired_stale_and_answered_asks_untouched() {
+        for invalidation in ["retired", "retry", "answered", "owner-ended"] {
+            let (store, origin, input) = fixture();
+            let ask = store.ask_person(&input).unwrap();
+            match invalidation {
+                "retired" => {
+                    let stop = crate::graph::parse_internal_intent("version 2\nstop \"agent/alder.asker\"", "alder").unwrap();
+                    store.apply_internal(&stop, "retire-rename-requester").unwrap();
+                }
+                "retry" => {
+                    store.set_step_state(&origin.subject, "failed", Some("retry")).unwrap();
+                    store.retry_step(&origin.subject, "retry", 0).unwrap();
+                }
+                "answered" => {
+                    store.finish_person_step(&PersonStepResponse {
+                        subject: ask.subject.clone(),
+                        actor: "person/avery".into(),
+                        summary: "Friday".into(),
+                        evidence: vec![],
+                        episode: None,
+                        idempotency_key: "answer-before-rename".into(),
+                        answer: None,
+                    }, false).unwrap();
+                }
+                "owner-ended" => { store.set_mission_run_state(&origin.run, "cancelled", "terminal", Some("ended")).unwrap(); }
+                _ => unreachable!(),
+            }
+            let prior = store.step_run(&ask.subject).unwrap().unwrap();
+            let original = request(&store.readers.get(), &ask.subject).unwrap().unwrap();
+            let report = store.rename_person(&rename_request()).unwrap();
+            assert!(!report.reassigned_steps.contains(&ask.subject), "{invalidation}");
+            let unchanged = store.step_run(&ask.subject).unwrap().unwrap();
+            assert_eq!(unchanged.assigned_to, prior.assigned_to, "{invalidation}");
+            assert_eq!(unchanged.status, prior.status, "{invalidation}");
+            assert_eq!(request(&store.readers.get(), &ask.subject).unwrap().unwrap().body, original.body);
+            store.replay_replication_graph().unwrap();
+            assert_eq!(store.step_run(&ask.subject).unwrap().unwrap().assigned_to, prior.assigned_to);
+        }
+    }
+
+    #[test]
+    fn rename_before_ask_replication_converges_and_receipt_survives_reopen() {
+        let (source, origin, input) = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rename.sqlite3");
+        let target = Store::open(&path, "birch").unwrap();
+        target.project_replication_backlog().unwrap();
+        receive(&source, &target);
+        let ask = source.ask_person(&input).unwrap();
+        let asking = source.export_replication_exchange_answering(
+            TEST_FLEET, &target.replication_inventory().unwrap(), &[]).unwrap();
+        let repair = rename_request();
+        let report = source.rename_person(&repair).unwrap();
+        let mut renaming = source.export_replication_exchange_answering(
+            TEST_FLEET, &target.replication_inventory().unwrap(), &[]).unwrap();
+        renaming.envelopes.retain(|envelope| !asking.envelopes.iter().any(|old| old.hash == envelope.hash));
+        receive_exchange(&target, &renaming);
+        assert!(target.step_run(&ask.subject).unwrap().is_none());
+        receive_exchange(&target, &asking);
+        assert_eq!(target.step_run(&ask.subject).unwrap().unwrap().assigned_to.as_deref(), Some("person/robin"));
+        assert_eq!(target.rename_person(&repair).unwrap(), report);
+        assert_eq!(target.mission_run(&origin.run).unwrap().unwrap().requester, "person/avery");
+        let count = rename_claim_count(&target);
+        drop(target);
+        let reopened = Store::open(&path, "birch").unwrap();
+        assert_eq!(reopened.rename_person(&repair).unwrap(), report);
+        assert_eq!(rename_claim_count(&reopened), count);
+        assert!(reopened.attention_items(Some("person/avery")).unwrap().is_empty());
+        assert!(reopened.attention_items(Some("person/robin")).unwrap().iter().any(|item| item.subject == ask.subject));
+    }
+
+    #[test]
+    fn stale_reassignment_fences_cannot_move_a_different_episode_or_person() {
+        for fence in ["generation", "attempt", "episode", "previous_person"] {
+            let (store, origin, input) = fixture();
+            let ask = store.ask_person(&input).unwrap();
+            let original = request(&store.readers.get(), &ask.subject).unwrap().unwrap();
+            let mut fields = json!({
+                "run": ask.run, "generation": ask.generation, "attempt": ask.attempt,
+                "episode": original.id, "previous_person": "person/avery", "person": "person/robin",
+            });
+            fields[fence] = match fence {
+                "generation" => json!("run-generation/not-current"),
+                "attempt" => json!(ask.attempt + 1),
+                "episode" => json!("another-episode"),
+                "previous_person" => json!("person/blair"),
+                _ => unreachable!(),
+            };
+            store.connection.batched(|tx| -> Result<()> {
+                let claim = append_claim_tx(tx, "alder", &ask.subject, "work.person-reassigned",
+                    Some("person/operator"), &json!({"fields": fields}), &[], None)?;
+                project(tx, &claim).unwrap();
+                Ok(())
+            }).unwrap().unwrap();
+            assert_eq!(store.step_run(&ask.subject).unwrap().unwrap().assigned_to.as_deref(), Some("person/avery"), "{fence}");
+            assert_eq!(store.step_run(&origin.subject).unwrap().unwrap().status, "waiting-person");
+            store.replay_replication_graph().unwrap();
+            assert_eq!(store.step_run(&ask.subject).unwrap().unwrap().assigned_to.as_deref(), Some("person/avery"), "{fence}");
+        }
     }
 }

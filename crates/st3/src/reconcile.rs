@@ -8854,6 +8854,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .and_then(Value::as_str)
                     .filter(|reason| !reason.trim().is_empty())
                     .context("a request for changes has no feedback text")?;
+                let reviewer = decision
+                    .actor
+                    .as_deref()
+                    .context("human feedback has no reviewer actor")?;
                 self.apply_human_feedback(subject, attempt, reviewer, reason, &decision.id)?;
                 Ok(GateOutcome::Pending)
             }
