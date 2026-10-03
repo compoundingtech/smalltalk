@@ -502,6 +502,8 @@ pub struct Reconciler<R = NativeRuntime> {
     gate_poll_armed: Arc<AtomicBool>,
     /// The gate runners the gate poll watches.
     gate_poll_runtimes: Arc<Mutex<BTreeSet<String>>>,
+    /// The wake each running step has armed for its timeout or lease expiry, by step subject.
+    step_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_cursors: Arc<Mutex<HashMap<String, Option<String>>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
@@ -613,6 +615,7 @@ impl Reconciler<NativeRuntime> {
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
             gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
+            step_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
@@ -662,6 +665,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
             gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
+            step_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
@@ -8179,19 +8183,50 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let notify = self.notify.clone();
             let timeout_remaining = (timeout as u128).saturating_sub(elapsed);
             let lease_remaining = view
                 .claim_expires_at_unix_ms
                 .map_or(timeout_remaining, |expiry| expiry.saturating_sub(now_ms()));
             let remaining = timeout_remaining.min(lease_remaining).max(1) as u64;
-            handle.spawn(async move {
-                tokio::time::sleep(Duration::from_millis(remaining)).await;
-                crate::performance::record_wake("timer step-timeout", None);
-                notify.notify_one();
-            });
+            self.arm_step_deadline(&handle, &view.subject, remaining);
         }
         Ok(false)
+    }
+
+    /// Wake the reconciler in `remaining` ms for `step`, unless the step already armed a wake at
+    /// or before then. Every pass asks again for every running step; arming a new timer each time
+    /// left every pass a wake per running step minutes later, so passes kept themselves going
+    /// (1,585 wakes in five minutes on a member with fourteen running steps).
+    fn arm_step_deadline(&self, handle: &tokio::runtime::Handle, step: &str, remaining: u64) {
+        let now = now_ms();
+        let deadline = now.saturating_add(u128::from(remaining));
+        {
+            let mut armed = self
+                .step_deadlines
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if armed
+                .get(step)
+                .is_some_and(|at| *at > now && *at <= deadline)
+            {
+                return;
+            }
+            armed.insert(step.to_owned(), deadline);
+        }
+        let notify = self.notify.clone();
+        let armed = self.step_deadlines.clone();
+        let step = step.to_owned();
+        handle.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(remaining)).await;
+            {
+                let mut armed = armed.lock().unwrap_or_else(PoisonError::into_inner);
+                if armed.get(&step) == Some(&deadline) {
+                    armed.remove(&step);
+                }
+            }
+            crate::performance::record_wake("timer step-timeout", None);
+            notify.notify_one();
+        });
     }
 
     /// Why a run-owned stop must wait for `seat`: it holds a message nobody has read, or work in a
@@ -12018,6 +12053,39 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_running_step_arms_one_wake_however_many_passes_ask() {
+        let notify = Arc::new(Notify::new());
+        let reconciler = Reconciler::new(
+            Arc::new(Store::open_memory("node").unwrap()),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            notify.clone(),
+        );
+        let handle = tokio::runtime::Handle::current();
+        // Twenty passes ask for the same lease expiry; the later ones ask for a later one.
+        for pass in 0..20 {
+            reconciler.arm_step_deadline(&handle, "step-run/example/work", 60_000 + pass);
+        }
+        assert_eq!(reconciler.step_deadlines.lock().unwrap().len(), 1);
+        tokio::time::timeout(Duration::from_secs(61), notify.notified())
+            .await
+            .expect("the step's wake fires at its deadline");
+        // One wake, not twenty: nothing more is pending.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(120), notify.notified())
+                .await
+                .is_err()
+        );
+        assert!(reconciler.step_deadlines.lock().unwrap().is_empty());
+        // An earlier deadline replaces a later one.
+        reconciler.arm_step_deadline(&handle, "step-run/example/work", 60_000);
+        reconciler.arm_step_deadline(&handle, "step-run/example/work", 5_000);
+        tokio::time::timeout(Duration::from_secs(6), notify.notified())
+            .await
+            .expect("an earlier deadline wakes at its own time");
     }
 
     #[tokio::test(start_paused = true)]
