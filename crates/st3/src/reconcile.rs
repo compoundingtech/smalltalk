@@ -3819,6 +3819,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
+        self.bind_account(subject, member, &mut launch_member)?;
         // Only a resume names a native session. A daemon started inside a resumed seat inherits
         // that seat's, and must not hand it to every seat it launches.
         if !member
@@ -3843,7 +3844,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .contains_key(crate::suspension::RESUME_ENV)
             && let Some(harness) = member.driver.as_deref()
         {
-            crate::suspension::continue_session(&self.store, &subject.subject, harness)?
+            crate::suspension::continue_session(
+                &self.store,
+                &subject.subject,
+                harness,
+                launch_member.environment.get("ST3_ACCOUNT").map(String::as_str),
+            )?
         } else {
             None
         };
@@ -3981,6 +3987,53 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         self.signal_changed();
+        Ok(())
+    }
+
+    /// Point a seat whose harness block binds an account (or a pool) at that account's login
+    /// directory, and name the account so the seat's usage and limits are read against it. A seat
+    /// with no binding keeps the harness's default login: nothing here touches its environment.
+    fn bind_account(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        launch: &mut MemberSpec,
+    ) -> Result<()> {
+        launch.environment.remove("ST3_ACCOUNT");
+        if subject.kind != "agent" {
+            return Ok(());
+        }
+        let Some(binding) = crate::accounts::harness_binding(&subject.desired) else {
+            return Ok(());
+        };
+        let variable = crate::accounts::login_environment_name(&binding.driver)
+            .context("an account binding needs a harness with a login directory")?;
+        let seat = self
+            .store
+            .account_for_start(&subject.subject, &binding, &member.host, now_ms())
+            .map_err(|reason| anyhow::anyhow!("{}: {reason}", subject.subject))?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let directory =
+            crate::accounts::expand_login(&seat.login, home.as_deref()).with_context(|| {
+                format!(
+                    "account `{}` login `{}` needs HOME",
+                    seat.account.name, seat.login
+                )
+            })?;
+        anyhow::ensure!(
+            directory.is_dir(),
+            "account `{}` has no login directory at {}; sign in there first with {variable}={} {}",
+            seat.account.name,
+            directory.display(),
+            directory.display(),
+            binding.driver,
+        );
+        launch
+            .environment
+            .insert(variable.into(), directory.to_string_lossy().into_owned());
+        launch
+            .environment
+            .insert("ST3_ACCOUNT".into(), seat.account.name);
         Ok(())
     }
 
@@ -15934,6 +15987,270 @@ mission "feedback-review" state="ready" {
             Some(std::env::current_exe().unwrap())
         );
         assert!(!members[0].environment.contains_key("PATH"));
+    }
+
+    fn account_source(logins: &Path, workspace: &Path, harness_body: &str) -> String {
+        format!(
+            r#"
+            version 2
+
+              account "ada/one" {{
+                provider "openai"
+                owner "person/ada"
+                login {one:?}
+              }}
+              account "ada/two" {{
+                provider "openai"
+                owner "person/ada"
+                login {two:?}
+              }}
+              agent "worker" {{
+                workspace {workspace:?}
+                harness "codex" {{ {harness_body} }}
+              }}
+              agent "plain" {{
+                workspace {workspace:?}
+                harness "codex" {{}}
+              }}
+        "#,
+            one = logins.join("one").display().to_string(),
+            two = logins.join("two").display().to_string(),
+            workspace = workspace.display().to_string(),
+        )
+    }
+
+    #[test]
+    fn a_seat_bound_to_an_account_starts_on_its_login_and_an_unbound_seat_is_untouched() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let logins = tempfile::tempdir().unwrap();
+        fs::create_dir(logins.path().join("one")).unwrap();
+        fs::create_dir(logins.path().join("two")).unwrap();
+        let source = account_source(logins.path(), workspace.path(), "account \"ada/two\"");
+        apply_source(&store, &source, "bound-account");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        let members = runtime.started_members.lock().unwrap();
+        let environment = |seat: &str| {
+            members
+                .iter()
+                .find(|member| member.environment.get("ST_AGENT").map(String::as_str) == Some(seat))
+                .unwrap_or_else(|| panic!("{seat} did not start"))
+                .environment
+                .clone()
+        };
+        let bound = environment("agent/node.worker");
+        assert_eq!(
+            bound.get("CODEX_HOME").map(String::as_str),
+            Some(logins.path().join("two").to_str().unwrap())
+        );
+        assert_eq!(
+            bound.get("ST3_ACCOUNT").map(String::as_str),
+            Some("ada/two")
+        );
+        let plain = environment("agent/node.plain");
+        assert!(!plain.contains_key("CODEX_HOME") && !plain.contains_key("ST3_ACCOUNT"));
+    }
+
+    #[test]
+    fn a_pooled_seat_starts_on_the_account_with_the_most_usage_left_and_stays_there() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let logins = tempfile::tempdir().unwrap();
+        fs::create_dir(logins.path().join("one")).unwrap();
+        fs::create_dir(logins.path().join("two")).unwrap();
+        let source = account_source(
+            logins.path(),
+            workspace.path(),
+            "account-pool \"person/ada\"",
+        );
+        apply_source(&store, &source, "pooled-account");
+        let reading = |seat: &str, account: &str, weekly: f64| ClaimInput {
+            subject: seat.into(),
+            kind: "harness.limits".into(),
+            actor: Some(seat.into()),
+            fields: BTreeMap::from([
+                ("driver".into(), Value::String("codex".into())),
+                ("account".into(), Value::String(format!("codex/{account}"))),
+                ("account_ref".into(), Value::String(account.into())),
+                ("weekly_percent".into(), Value::from(weekly)),
+                ("measured_at_unix_ms".into(), Value::from(now_ms() as u64)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        store
+            .append_claim(&reading("agent/node.elsewhere-1", "ada/one", 70.0))
+            .unwrap();
+        store
+            .append_claim(&reading("agent/node.elsewhere-2", "ada/two", 30.0))
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        let started = runtime.started_members.lock().unwrap();
+        let pooled = started
+            .iter()
+            .find(|member| {
+                member.environment.get("ST_AGENT").map(String::as_str) == Some("agent/node.worker")
+            })
+            .expect("the pooled seat started");
+        assert_eq!(pooled.environment["ST3_ACCOUNT"], "ada/two");
+        assert_eq!(
+            store
+                .seat_account_choice("agent/node.worker")
+                .unwrap()
+                .as_deref(),
+            Some("ada/two")
+        );
+        drop(started);
+
+        // The seat keeps its account when the other account has more left later.
+        store
+            .append_claim(&reading("agent/node.elsewhere-2", "ada/two", 90.0))
+            .unwrap();
+        let binding = store
+            .seat_binding("agent/node.worker")
+            .unwrap()
+            .expect("the seat declares a pool");
+        let kept = store
+            .account_for_start("agent/node.worker", &binding, "node", now_ms())
+            .unwrap();
+        assert_eq!(kept.account.name, "ada/two");
+    }
+
+    #[test]
+    fn a_relaunch_continues_a_native_session_only_on_the_account_that_bound_it() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let logins = tempfile::tempdir().unwrap();
+        fs::create_dir(logins.path().join("one")).unwrap();
+        fs::create_dir(logins.path().join("two")).unwrap();
+        let source = account_source(
+            logins.path(),
+            workspace.path(),
+            "account-pool \"person/ada\"",
+        );
+        apply_source(&store, &source, "account-continuation");
+        let seat = "agent/node.worker";
+        store
+            .choose_seat_account(seat, "ada/one", now_ms())
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "harness.session-file".into(),
+                actor: Some(seat.into()),
+                fields: BTreeMap::from([
+                    ("harness".into(), Value::String("codex".into())),
+                    ("session_id".into(), Value::String("native-one".into())),
+                    ("account_ref".into(), Value::String("ada/one".into())),
+                    (
+                        "path".into(),
+                        Value::String(
+                            logins
+                                .path()
+                                .join("one/sessions/native-one.jsonl")
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let subject = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == seat)
+            .unwrap();
+        let member = subject.member.as_ref().unwrap();
+        reconciler
+            .perform_start(&subject, member, "same account restart")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .started_members
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .environment[crate::suspension::CONTINUE_ENV],
+            "native-one"
+        );
+
+        store
+            .choose_seat_account(seat, "ada/two", now_ms())
+            .unwrap();
+        reconciler
+            .perform_start(&subject, member, "account switch")
+            .unwrap();
+        let started = runtime.started_members.lock().unwrap();
+        let switched = started.last().unwrap();
+        assert_eq!(switched.environment["ST3_ACCOUNT"], "ada/two");
+        assert!(
+            !switched
+                .environment
+                .contains_key(crate::suspension::CONTINUE_ENV)
+        );
+        assert!(
+            !switched
+                .environment
+                .contains_key(crate::suspension::CONTINUE_PATH_ENV)
+        );
+    }
+
+    #[test]
+    fn a_seat_whose_account_has_no_login_directory_does_not_start() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let logins = tempfile::tempdir().unwrap();
+        let source = account_source(logins.path(), workspace.path(), "account \"ada/one\"");
+        apply_source(&store, &source, "missing-login");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        let _ = reconciler.reconcile_once();
+
+        let started = runtime.started_members.lock().unwrap();
+        assert!(
+            started.iter().all(
+                |member| member.environment.get("ST_AGENT").map(String::as_str)
+                    != Some("agent/node.worker")
+            ),
+            "a seat bound to a login that is not there must not fall back to the default login"
+        );
     }
 
     #[test]

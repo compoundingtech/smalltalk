@@ -8764,6 +8764,8 @@ pub(crate) fn request_resume(
 
 #[derive(Deserialize)]
 struct NativeSessionReport {
+    #[serde(default)]
+    account_ref: Option<String>,
     subject: String,
     actor: String,
     incarnation_id: String,
@@ -8807,6 +8809,9 @@ async fn report_native_session(
     ]);
     if let Some(path) = request.path {
         fields.insert("path".into(), Value::String(path));
+    }
+    if let Some(account) = request.account_ref.filter(|name| !name.is_empty()) {
+        fields.insert("account_ref".into(), Value::String(account));
     }
     let claim = state
         .store
@@ -13189,7 +13194,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         // Only the seat itself reports its native session.
         let report = |actor: &str| {
             json!({"subject": subject, "actor": actor, "incarnation_id": incarnation,
-                   "harness": "claude", "session_id": "native-one"})
+                   "harness": "claude", "session_id": "native-one", "account_ref": "ada/one"})
         };
         let (_, body) = json_request(
             app.clone(),
@@ -13201,6 +13206,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let (status, body) =
             json_request(app.clone(), "/v1/agents/native-session", report(subject)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["body"]["fields"]["account_ref"], "ada/one");
         append(
             "harness.observed",
             json!({"state": "idle", "incarnation_id": incarnation, "quiescent": true,

@@ -338,6 +338,9 @@ pub struct UsagePeriod {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsageLimit {
     pub account: String,
+    /// The declared account the measuring seat ran on, when it was bound to one.
+    #[serde(default)]
+    pub account_ref: Option<String>,
     pub driver: String,
     #[serde(default)]
     pub plan: Option<String>,

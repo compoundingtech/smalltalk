@@ -181,7 +181,15 @@ fn append_event(tx: &Connection, kind: &str, body: &Value) -> Result<()> {
         [format!("provider-runtime:{token}")],
         |r| r.get(0),
     )?;
-    let body = serde_json::to_string(body)?;
+    // Capture the binding at the producer. A successor may drain this event after switching
+    // accounts, so its own environment cannot supply the event's paying account.
+    let mut body = body.clone();
+    body["account_ref"] = std::env::var("ST3_ACCOUNT")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let body = serde_json::to_string(&body)?;
     anyhow::ensure!(
         bytes.saturating_add(body.len() as u64) <= MAX_PENDING_BYTES,
         "harness event spool is full; observation was not committed"
@@ -812,6 +820,42 @@ mod protocol_tests {
             io::ErrorKind::WouldBlock
         );
     }
+    #[test]
+    fn account_capture_child() {
+        let Some(directory) = std::env::var_os("ST_ACCOUNT_TEST_DIRECTORY") else {
+            return;
+        };
+        let runtime = std::env::var("ST_ACCOUNT_TEST_RUNTIME").unwrap();
+        let directory = Path::new(&directory);
+        enable(directory, &runtime).unwrap();
+        claim(directory, "example/seat", "claude", &runtime).unwrap();
+    }
+
+    #[test]
+    fn account_switch_keeps_the_source_account_on_queued_events() {
+        let root = tempfile::tempdir().unwrap();
+        for (runtime, account) in [("runtime-one", "ada/one"), ("runtime-two", "ada/two")] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "harness_events::protocol_tests::account_capture_child"])
+                .env("ST_ACCOUNT_TEST_DIRECTORY", root.path())
+                .env("ST_ACCOUNT_TEST_RUNTIME", runtime)
+                .env("ST3_ACCOUNT", account)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let events = pending(root.path(), 100).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].runtime_incarnation, "runtime-one");
+        assert_eq!(events[0].payload["account_ref"], "ada/one");
+        assert_eq!(events[1].runtime_incarnation, "runtime-two");
+        assert_eq!(events[1].payload["account_ref"], "ada/two");
+    }
+
     #[test]
     fn new_runtime_does_not_relabel_unacknowledged_history_or_accept_unknown_formats() {
         let root = tempfile::tempdir().unwrap();

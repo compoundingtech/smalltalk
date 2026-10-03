@@ -82,6 +82,7 @@ pub use smallclaims::store::{
     newest_seals, stable_checkpoints, valid_fleet_node_name, verify_checkpoint_manifest,
 };
 
+mod accounts;
 mod attention_snapshot;
 mod checkpoint_rules;
 mod limits;
@@ -549,6 +550,14 @@ CREATE TABLE IF NOT EXISTS local_limit_stops (
     seat TEXT NOT NULL,
     stopped_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY(account, episode, seat)
+);
+-- The account each pooled seat this node starts runs on, chosen when the seat starts and kept
+-- until a restart moves it to another account in its pool. Local: only the node that runs a seat
+-- decides which of its owner's logins that seat uses.
+CREATE TABLE IF NOT EXISTS local_seat_accounts (
+    seat TEXT PRIMARY KEY,
+    account TEXT NOT NULL,
+    chosen_at_unix_ms INTEGER NOT NULL
 );
 -- Each response already counted, with when the harness recorded it. A response is remembered
 -- for `USAGE_RESPONSE_HORIZON_MS`, longer than any harness keeps a response in the record st

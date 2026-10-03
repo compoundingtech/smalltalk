@@ -654,10 +654,11 @@ pub struct Tokens {
     pub total_tokens: u64,
 }
 
-/// The tokens of every response in a Claude subagent transcript beneath `home`'s Claude projects
-/// directory. Claude writes a response's usage on each of its lines; the last one counts.
-pub fn claude_transcript_tokens(transcript: &Path, home: &Path) -> Result<Tokens> {
-    let allowed = home.join(".claude/projects").canonicalize()?;
+/// The tokens of every response in a Claude subagent transcript beneath the projects directory of
+/// `claude_config` (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). Claude writes a response's usage on
+/// each of its lines; the last one counts.
+pub fn claude_transcript_tokens(transcript: &Path, claude_config: &Path) -> Result<Tokens> {
+    let allowed = claude_config.join("projects").canonicalize()?;
     let transcript = transcript.canonicalize()?;
     anyhow::ensure!(
         transcript.starts_with(&allowed)
@@ -1148,7 +1149,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            claude_transcript_tokens(&transcript, home.path()).unwrap(),
+            claude_transcript_tokens(&transcript, &home.path().join(".claude")).unwrap(),
             Tokens {
                 input_tokens: 20,
                 output_tokens: 206,
@@ -1159,6 +1160,6 @@ mod tests {
         );
         let outside = home.path().join("agent-x.jsonl");
         fs::write(&outside, line("m1", 1)).unwrap();
-        assert!(claude_transcript_tokens(&outside, home.path()).is_err());
+        assert!(claude_transcript_tokens(&outside, &home.path().join(".claude")).is_err());
     }
 }

@@ -347,6 +347,11 @@ an agent; the legacy `ask` setting is accepted but never sends raw events to a p
 Each seat is stopped once per weekly window: start it again and it stays up until the reset. Give
 every node that hosts seats the same `[limits]`.
 
+A person who owns more than one Claude or Codex account declares them and binds a seat to one or to
+a pool; a pooled seat at its limit restarts on another account instead of stopping, and `st usage`
+names each account ([model accounts](docs/st3/accounts.md)). A seat that binds nothing runs on the
+harness's default login.
+
 The seat starts its harness in the workspace with no prompt. It stays idle, taking no turn, until
 a person types in its terminal or a message is posted to it. A seat you declare as
 `fleet/PROJECT/...` may also publish, start, and revise missions under `fleet/PROJECT/*`;

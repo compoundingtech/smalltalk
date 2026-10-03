@@ -565,6 +565,7 @@
       "required": ["account", "driver", "measured_at_unix_ms", "measured_by", "host", "seats"],
       "properties": {
         "account": { "type": "string" },
+        "account_ref": { "type": "string" },
         "driver": { "type": "string" },
         "plan": { "type": "string" },
         "five_hour_percent": { "type": "number", "minimum": 0 },
