@@ -12,6 +12,8 @@ Use these documents for implementation details:
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.
 - [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
   are recorded and replicated.
+- [Shell completion](cli-completion/spec.md) defines live entity candidates, their descriptions,
+  and short-name resolution; [requirements](cli-completion/requirements.md).
 - [Lanes](lanes.md) defines the ordered lanes a mission run works through, such as the merge
   train, and `st lanes`.
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
