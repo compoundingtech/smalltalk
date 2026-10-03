@@ -22,9 +22,10 @@ and the gate has only `contents: read` permission. Forks do not receive publishi
 
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
 `linux-gate` is the single required check: it needs the three jobs and passes only when every one of
-them succeeded (a skipped or cancelled stage fails it). The stage jobs use the Namespace shape
-`nscloud-ubuntu-24.04-amd64-16x32` (16 vCPUs, 32 GB); `genie-freshness`, `isolation-vm` and the
-`linux-gate` aggregate use `namespace-profile-linux-x86-64`. `scripts/ci-linux STAGE` runs one stage:
+them succeeded (a skipped or cancelled stage fails it). Every job, the stages included, uses
+`namespace-profile-linux-x86-64`. The stages ran on the bigger shape
+`nscloud-ubuntu-24.04-amd64-16x32` (16 vCPUs, 32 GB) until 2026-10-03, when that label stopped
+getting runners while the profile's jobs still started. `scripts/ci-linux STAGE` runs one stage:
 
 - `linux-tests`: prepares the provider component fixtures, installs matching rendered st2 hooks,
   builds the selected test executables with dev/test debug info and incremental compilation

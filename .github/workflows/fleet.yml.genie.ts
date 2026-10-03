@@ -88,11 +88,7 @@ export default githubWorkflow({
     group: 'workspace-${{ github.event.pull_request.number || github.run_id }}-${{ github.event_name }}',
     'cancel-in-progress': '${{ github.event_name == \'pull_request\' }}',
   },
-  // actionlint must know the Namespace shape label the stage jobs use.
-  actionlint: {
-    ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
-  },
+  actionlint: defaultActionlintConfig,
   jobs: {
     // Namespace runners are already authenticated. Manual runs record the platform resource limits
     // alongside the CI workload so queue concurrency can be chosen from the actual account capacity.
