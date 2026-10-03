@@ -42,18 +42,16 @@ use crate::provider_session::{
     describe_exit, install_signal_handler,
 };
 use crate::session_control::SessionControl;
-use crate::{delivery_ledger, ding, harness_context, harness_version, message, status};
+use crate::{delivery_ledger, ding, harness_context, message, status};
 
-/// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
-/// (1.18, measured at 1.18.19). The live `/doc` check below guards the shape; this list guards
-/// the semantics behind it.
-///
-/// Admission is per minor so a patch bump inside a verified minor keeps native delivery instead
-/// of silently degrading to none — the profile shipping 1.18.25 against a 1.18.19 allowlist is
-/// exactly that case. The tradeoff is explicit: `/doc` still catches a SHAPE change on any
-/// version, but a SEMANTIC change within an admitted minor would not be caught, which is the
-/// risk this widening accepts. A new MINOR still needs the surfaces re-verified.
-const SUPPORTED_OPENCODE_MINORS: [(u32, u32); 1] = [(1, 18)];
+mod admission;
+
+pub(crate) fn probe_admission(
+    binary: &Path,
+    scratch: &crate::harness_admission::Scratch,
+) -> Result<Vec<crate::harness_admission::Measurement>> {
+    admission::probe(binary, scratch)
+}
 
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(2);
@@ -129,37 +127,14 @@ pub fn run_with_paths(
         !opencode_argv.is_empty(),
         "opencode driver '{runtime_id}' has no provider argv"
     );
-    let version_probe = supported_version(&opencode_argv[0]);
-    let (version_ok, producer_version, support, version_failure) = match version_probe {
-        Ok(version) => {
-            let supported = version_is_supported(&version);
-            if !supported {
-                tracing::warn!(
-                    "st opencode-session: version {version} is unverified (supported minors: {}); native delivery disabled",
-                    harness_version::series_display(&SUPPORTED_OPENCODE_MINORS)
-                );
-            }
-            (
-                supported,
-                Some(version),
-                if supported {
-                    DiagnosticSupport::Supported
-                } else {
-                    DiagnosticSupport::Unsupported
-                },
-                (!supported).then_some(DiagnosticReason::UnsupportedVersion),
-            )
-        }
-        Err(error) => {
-            tracing::warn!("st opencode-session: cannot read opencode version: {error:#}");
-            (
-                false,
-                None,
-                DiagnosticSupport::Unknown,
-                Some(DiagnosticReason::VersionProbeFailed),
-            )
-        }
-    };
+    let admission =
+        crate::harness_admission::admit(&opencode_argv[0], DiagnosticDriver::OpenCode, None);
+    let version_ok = admission.passed();
+    let producer_version = admission.version.clone();
+    let support = admission.support();
+    if !version_ok {
+        tracing::warn!("{}", admission.explanation(DiagnosticDriver::OpenCode));
+    }
 
     let port = allocate_port()?;
     let password = random_password()?;
@@ -185,15 +160,7 @@ pub fn run_with_paths(
             producer_version.clone(),
             support,
         );
-        if let Some(reason) = version_failure {
-            diagnostics.publish(
-                DiagnosticStage::VersionGate,
-                reason,
-                DiagnosticSource::VersionProbe,
-            );
-        } else {
-            diagnostics.clear(DiagnosticStage::VersionGate);
-        }
+        admission.publish(&mut diagnostics);
         Session {
             client,
             version_ok,
@@ -688,32 +655,6 @@ fn stop_provider_group(child: &mut ProviderProcess) -> Result<Option<ExitStatus>
     Ok(child.wait().ok())
 }
 
-fn supported_version(binary: &str) -> Result<String> {
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("running {binary} --version"))?;
-    anyhow::ensure!(output.status.success(), "{binary} --version failed");
-    let version = String::from_utf8_lossy(&output.stdout);
-    let version = version
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    anyhow::ensure!(!version.is_empty(), "{binary} --version printed nothing");
-    Ok(version)
-}
-
-/// Whether a reported opencode version is inside a verified MINOR. This is the whole admission
-/// decision, named so a test can exercise the same code the wrapper runs rather than re-deriving
-/// it — an assertion that re-implements the rule cannot notice the rule changing.
-fn version_is_supported(version: &str) -> bool {
-    harness_version::find_release(version, "opencode")
-        .is_some_and(|(_, release)| SUPPORTED_OPENCODE_MINORS.contains(&release.series()))
-}
-
 /// Verify the served OpenAPI document still carries every arm st2 consumes. Substring markers are
 /// deliberate: the document nests these identifiers at unstable depths across versions, and the
 /// check must name what went missing rather than fail on structure.
@@ -758,6 +699,8 @@ struct Client {
     auth: String,
     /// The SSE silence horizon; [`SSE_SILENCE`] in production, shrunk only by tests.
     sse_silence: Duration,
+    /// Admission bounds disposable response captures without changing live transport policy.
+    response_limit: Option<u64>,
 }
 
 impl Client {
@@ -766,6 +709,7 @@ impl Client {
             addr: format!("127.0.0.1:{port}"),
             auth: base64(format!("opencode:{password}").as_bytes()),
             sse_silence: SSE_SILENCE,
+            response_limit: None,
         }
     }
 
@@ -806,7 +750,12 @@ impl Client {
             line.clear();
         }
         let mut body = Vec::new();
-        reader.read_to_end(&mut body)?;
+        if let Some(limit) = self.response_limit {
+            reader.take(limit + 1).read_to_end(&mut body)?;
+            anyhow::ensure!(body.len() as u64 <= limit, "admission HTTP response exceeded capture bound");
+        } else {
+            reader.read_to_end(&mut body)?;
+        }
         Ok((status, body))
     }
 
@@ -2149,34 +2098,6 @@ mod tests {
 
     /// Pins the admitted set itself: widening opencode has to be a deliberate edit here, beside
     /// the verification the minor was admitted on.
-    #[test]
-    fn admitted_opencode_minors_are_exactly_the_measured_set() {
-        assert_eq!(SUPPORTED_OPENCODE_MINORS, [(1, 18)]);
-    }
-
-    /// The principal's actual case: the profile ships 1.18.25 against a list built at 1.18.19.
-    /// A patch inside the verified minor must keep native delivery rather than degrade to none.
-    #[test]
-    fn a_patch_inside_an_admitted_opencode_minor_keeps_native_delivery() {
-        for version in ["1.18.19", "1.18.25"] {
-            assert!(
-                version_is_supported(version),
-                "{version} is inside verified minor 1.18"
-            );
-        }
-    }
-
-    /// Fail closed the other way: a different minor, a neighbouring minor sharing a prefix, and
-    /// unparseable output must all leave native delivery disabled.
-    #[test]
-    fn other_minors_and_garbled_versions_stay_unverified() {
-        for version in ["1.19.0", "1.180.0", "2.18.0", "1.18", "not-a-version", ""] {
-            assert!(
-                !version_is_supported(version),
-                "{version} must not be treated as verified"
-            );
-        }
-    }
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 

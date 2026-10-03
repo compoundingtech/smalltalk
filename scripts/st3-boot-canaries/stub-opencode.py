@@ -17,6 +17,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -43,6 +44,11 @@ PROVIDERS = {"providers": [{"id": "opencode", "name": "OpenCode Zen", "source": 
 messages = {}
 streams = []
 lock = threading.Lock()
+config = json.loads(os.environ.get("OPENCODE_CONFIG_CONTENT", "{}"))
+admission = config.get("provider", {}).get("admission")
+persisted = []
+permissions = []
+admission_turn = None
 
 
 def publish(event):
@@ -73,7 +79,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/session/status":
             self.reply(200, {})
         elif path in ("/permission", "/question"):
-            self.reply(200, [])
+            self.reply(200, permissions if path == "/permission" else [])
+        elif path == f"/session/{SESSION}/message":
+            self.reply(200, persisted)
         elif path == "/session":
             self.reply(200, [{"id": SESSION, "time": {"updated": int(time.time() * 1000)}}])
         elif path.startswith("/session/") and path.count("/") == 2:
@@ -95,7 +103,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, True)
         elif path.endswith("/prompt_async"):
             request = json.loads(body or b"{}")
-            identifier = request.get("messageID")
+            identifier = request.get("messageID") or ("admission-user" if admission else None)
             if not identifier:
                 return self.reply(400)
             first = identifier not in messages
@@ -104,6 +112,14 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(204)
             if first:
                 threading.Thread(target=answer, args=(identifier, text), daemon=True).start()
+        elif admission and path == "/permission/admission-permission/reply":
+            if json.loads(body) != {"reply": "once"}:
+                return self.reply(400)
+            permissions.clear()
+            publish({"type": "permission.replied", "properties": {
+                "sessionID": SESSION, "requestID": "admission-permission", "reply": "once"}})
+            self.reply(200)
+            threading.Thread(target=finish_admission, daemon=True).start()
         else:
             self.reply(404)
 
@@ -134,12 +150,55 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def answer(identifier, text):
+    if admission:
+        return start_admission(identifier, text)
     stubmodel.receipt("turn", text=text)
     publish({"type": "session.status", "properties": {"sessionID": SESSION, "status": {"type": "busy"}}})
     stubmodel.act(text)
     publish({"type": "message.updated", "properties": {"info": {
         "id": f"assistant-{identifier}", "role": "assistant", "parentID": identifier,
         "sessionID": SESSION}}})
+    publish({"type": "session.idle", "properties": {"sessionID": SESSION}})
+    publish({"type": "session.status", "properties": {"sessionID": SESSION, "status": {"type": "idle"}}})
+
+
+def completion(messages):
+    endpoint = admission["options"]["baseURL"]
+    request = urllib.request.Request(endpoint + "/chat/completions",
+        json.dumps({"messages": messages}).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(request) as response:
+        deltas = [json.loads(line[6:])["choices"][0]["delta"]
+                  for line in response.read().decode().splitlines()
+                  if line.startswith("data: ") and line != "data: [DONE]"]
+    return "".join(delta.get("content", "") for delta in deltas), [
+        call for delta in deltas for call in delta.get("tool_calls", [])]
+
+
+def start_admission(identifier, text):
+    global admission_turn
+    persisted.append({"info": {"id": identifier, "role": "user", "sessionID": SESSION},
+                      "parts": [{"type": "text", "text": text}]})
+    native_messages = [{"role": "user", "content": text}]
+    _, calls = completion(native_messages)
+    call = calls[0]
+    command = json.loads(call["function"]["arguments"])["command"]
+    assert call["function"]["name"] == "bash" and command == "printf ADMISSION_FIXTURE"
+    admission_turn = identifier, native_messages, call["id"]
+    publish({"type": "session.status", "properties": {"sessionID": SESSION, "status": {"type": "busy"}}})
+    ask = {"id": "admission-permission", "sessionID": SESSION, "permission": "bash",
+           "metadata": {"command": command}, "tool": {"callID": call["id"]}}
+    publish({"type": "permission.asked", "properties": ask})
+    permissions.append(ask)
+
+
+def finish_admission():
+    identifier, native_messages, call_id = admission_turn
+    native_messages.append({"role": "tool", "tool_call_id": call_id, "content": "ADMISSION_FIXTURE"})
+    text, _ = completion(native_messages)
+    info = {"id": "admission-assistant", "role": "assistant", "parentID": identifier,
+            "sessionID": SESSION, "time": {"completed": 1}, "finish": "stop"}
+    persisted.append({"info": info, "parts": [{"type": "text", "text": text}]})
+    publish({"type": "message.updated", "properties": {"info": info}})
     publish({"type": "session.idle", "properties": {"sessionID": SESSION}})
     publish({"type": "session.status", "properties": {"sessionID": SESSION, "status": {"type": "idle"}}})
 
