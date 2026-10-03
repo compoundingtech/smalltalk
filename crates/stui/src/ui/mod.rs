@@ -109,6 +109,9 @@ struct Demo {
     harbor_seen: Option<Instant>,
 }
 
+/// How long an update stays open on Home before it counts as read.
+const UPDATE_READ_AFTER: Duration = Duration::from_secs(3);
+
 /// A request the live loop sends to st. The demo never produces these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -264,6 +267,10 @@ pub struct Ui {
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
+    /// The update open on Home and since when: one left open a moment counts as read.
+    update_open: Option<(String, Instant)>,
+    /// Updates marked read from here, so each is sent once.
+    updates_read: HashSet<String>,
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
@@ -372,6 +379,8 @@ impl Ui {
             quit: false,
             live: false,
             effects: Vec::new(),
+            update_open: None,
+            updates_read: HashSet::new(),
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
@@ -3188,6 +3197,44 @@ impl Ui {
         }
     }
 
+    /// Mark the focused update read: st clears it from Home and tells nobody (nothing waits).
+    fn read_update(&mut self) {
+        let Some(id) = self.attention_focus() else {
+            return;
+        };
+        if !self.updates_read.insert(id.clone()) {
+            return;
+        }
+        if self.live {
+            self.effects.push(Effect::Attention {
+                id,
+                action: "work.done".into(),
+                reason: Some("Read".into()),
+                answer: Some("read".into()),
+            });
+        } else {
+            self.flash("Read · demo: nothing was sent");
+        }
+    }
+
+    /// An update left open on Home for a moment has been read (docs: it clears when the person
+    /// opens it). Passing over it with the arrows does not count.
+    pub(crate) fn read_open_update(&mut self) {
+        let open = self
+            .attention_focus()
+            .filter(|_| !self.help && self.popover.is_none())
+            .filter(|_| self.current_kind() == Some("update"));
+        match (open, &self.update_open) {
+            (None, _) => self.update_open = None,
+            (Some(id), Some((shown, since))) if *shown == id => {
+                if since.elapsed() >= UPDATE_READ_AFTER {
+                    self.read_update();
+                }
+            }
+            (Some(id), _) => self.update_open = Some((id, Instant::now())),
+        }
+    }
+
     fn current_kind(&self) -> Option<&'static str> {
         let id = self.attention_focus()?;
         self.world
@@ -3278,6 +3325,7 @@ impl Ui {
                         }
                     }
                     ("request", 'y' | 'n') => self.confirm = Some(key),
+                    ("update", 'r') => self.read_update(),
                     ("message", 'm') => self.act('m'),
                     _ => {}
                 }
@@ -5186,6 +5234,72 @@ mod tests {
             "{:?}",
             ui.effects
         );
+    }
+
+    #[test]
+    fn an_update_shows_what_was_asked_for_and_clears_once_read() {
+        let mut world = demo::world();
+        let item = Attention {
+            id: "attention/update".into(),
+            tier: Tier::Later,
+            title: "The audit you asked for".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Update {
+                from: "Chief of Staff".into(),
+                body: "All three machines run main.".into(),
+                about: "message/0123456789abcdef".into(),
+                subjects: vec![("the audit".into(), "https://example.com/audit".into())],
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/update")
+            .unwrap();
+        ui.select(at);
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in [
+            "All three machines run main.",
+            "message/0123456789abcdef",
+            "https://example.com/audit",
+            "Nothing waits on this",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        // Open, but only just: not read yet.
+        ui.read_open_update();
+        assert!(ui.effects.is_empty());
+        // r reads it, once.
+        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, answer: Some(answer), .. }]
+                if id == "attention/update" && answer == "read"),
+            "{:?}",
+            ui.effects
+        );
+        // Left open a moment, it counts as read without a key.
+        ui.effects.clear();
+        ui.updates_read.clear();
+        ui.update_open = Some((
+            "attention/update".into(),
+            Instant::now() - UPDATE_READ_AFTER,
+        ));
+        ui.read_open_update();
+        assert_eq!(ui.effects.len(), 1);
     }
 
     #[test]
