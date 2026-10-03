@@ -1085,7 +1085,10 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
         for (column, kind) in columns {
             let before_generation = projection_digest::generation(&connection).unwrap();
             let transaction = connection.transaction().unwrap();
-            let expression = if *table == "operations" && column == "state" {
+            let expression = if *table == "claims" && column == "body" {
+                // JSON expression indexes require valid JSON even for deliberate corruption.
+                "json_set(body, '$.fields.__canonical_audit', 'changed')".to_owned()
+            } else if *table == "operations" && column == "state" {
                 "CASE state WHEN 'active' THEN 'conflict' ELSE 'active' END".to_owned()
             } else if *table == "desired" && column == "member" {
                 // The host index requires valid JSON; concatenate to keep ordinary TEXT,
