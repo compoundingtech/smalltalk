@@ -3210,6 +3210,22 @@ struct WorkPublishMissionArgs {
 
 #[derive(Subcommand)]
 enum MessageCommand {
+    /// Search readable messages and normalized agent transcripts, newest first.
+    Search {
+        text: String,
+        #[arg(long = "as", value_parser = parse_actor_subject)]
+        actor: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        /// Include entries at or after this RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+
     /// Send one durable normalized message to a person or agent.
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
@@ -12811,6 +12827,53 @@ async fn run_message(
                 .collect::<Vec<_>>();
             thread.sort_by_key(|message| message.created_index);
             print_value(&thread, json_output)
+        }
+        MessageCommand::Search {
+            text,
+            actor,
+            agent,
+            since,
+            cursor,
+            limit,
+        } => {
+            anyhow::ensure!(
+                (1..=200).contains(&limit),
+                "the search limit must be 1 through 200"
+            );
+            let response = generated_client(endpoint, actor.as_deref().or(configured_person))?
+                .conversation_search(
+                    &text,
+                    agent.as_deref(),
+                    since.as_deref(),
+                    cursor.as_deref(),
+                    Some(limit),
+                )
+                .await?;
+            if json_output {
+                return print_value(&response, true);
+            }
+            for hit in &response.value.items {
+                println!(
+                    "{}  {}  {}\n{}\n",
+                    hit.timestamp, hit.conversation_id, hit.entry_id, hit.excerpt
+                );
+            }
+            println!(
+                "{} matches on {} (indexed {})",
+                response.value.items.len(),
+                response.value.host_id,
+                response.value.indexed_at
+            );
+            if response.value.refreshing {
+                eprintln!("The search index is refreshing; repeat this search for newer text.");
+            }
+            for source in &response.value.incomplete_sources {
+                eprintln!("Incomplete history: {source}");
+            }
+            if let Some(cursor) = response.value.page.next_cursor {
+                println!("Older matches: repeat this search with --cursor {cursor}");
+            }
+            Ok(())
         }
         MessageCommand::Sessions {
             actor,
