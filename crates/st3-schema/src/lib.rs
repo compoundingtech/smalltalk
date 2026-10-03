@@ -736,6 +736,12 @@ fn build_registry() -> Registry {
             false,
         ),
         (
+            "owned-set",
+            "owned-set/NAME",
+            "A graph-owned set of declarations with source ordering and omission retirement.",
+            false,
+        ),
+        (
             "planning-session",
             "planning-session/ID",
             "A durable planning session.",
@@ -1120,6 +1126,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["doc"],
         ),
         (
+            "owned-set.revised",
+            &["owned-set"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("owned-sets"),
+            true,
+            &[],
+        ),
+        (
             "mission.published",
             &["mission"],
             WritePolicy::AuthorizedRequester,
@@ -1483,6 +1498,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             WritePolicy::SameSubjectActor,
             Cardinality::Append,
             Some("runtimes"),
+            true,
+            &[],
+        ),
+        (
+            "workspace.observed",
+            &["agent"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            None,
             true,
             &[],
         ),
@@ -2276,13 +2300,20 @@ fn claim_retention(kind: &str) -> Retention {
         | "runtime.action.deadline-reached" => Retention::SystemLocal,
         // Other nodes read the current harness state and usage: step readiness is judged on
         // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
-        "harness.observed" | "harness.usage" | "harness.todo.observed" => Retention::Latest,
+        "harness.observed" | "harness.usage" | "harness.todo.observed" | "workspace.observed" => {
+            Retention::Latest
+        }
         _ => Retention::Durable,
     }
 }
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
+        "workspace.observed" => &[
+            ("host", required_string()),
+            ("workspace", required_string()),
+            ("repository", string()),
+        ],
         "harness.todo.observed" => &[
             ("harness", required_string()),
             ("session_id", required_string()),
@@ -2329,6 +2360,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("hash", string()),
             ("size", integer()),
             ("executable", boolean()),
+        ],
+        "owned-set.revised" => &[
+            ("revision", required_string()),
+            ("body", required_object()),
         ],
         "mission.published" => &[
             ("revision", string()),
@@ -2622,6 +2657,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("fields", array()),
         ],
         "daemon.started" => &[
+            ("features", object()),
             ("status", required_enum(&["running"])),
             ("pid", integer()),
             ("version", string()),
@@ -3684,6 +3720,7 @@ mod tests {
                 "mission",
                 "mission-run",
                 "observer",
+                "owned-set",
                 "person",
                 "planning-session",
                 "pty",
@@ -3796,6 +3833,7 @@ mod tests {
                 "observer.state",
                 "operational.failure",
                 "operational.recovered",
+                "owned-set.revised",
                 "planning-session.approved",
                 "planning-session.cancelled",
                 "planning-session.candidate-submitted",
@@ -3864,6 +3902,7 @@ mod tests {
                 "work.released",
                 "work.renewed",
                 "work.submitted",
+                "workspace.observed",
             ]
         );
         assert_eq!(registry.digest().len(), 64);

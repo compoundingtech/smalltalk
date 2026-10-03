@@ -560,6 +560,8 @@ pub struct Reconciler<R = NativeRuntime> {
     batch_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     /// When a failed `checkout` may run Git again, and why it failed, by agent subject.
     checkout_retries: Arc<Mutex<HashMap<String, (u128, String)>>>,
+    /// A branch checked out elsewhere is a configuration conflict, held until the checkout changes.
+    checkout_conflicts: Mutex<HashMap<String, (u64, Checkout, PathBuf, String)>>,
     /// The last agent declaration's run-end checkout and workspace, by subject, with the store
     /// index of the subject's newest declaration it was read from.
     declared_checkouts: Mutex<HashMap<String, (u64, Option<(Checkout, String)>)>>,
@@ -689,6 +691,7 @@ impl Reconciler<NativeRuntime> {
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             batch_deadlines: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
+            checkout_conflicts: Mutex::new(HashMap::new()),
             declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
             launched_members: Mutex::new(HashMap::new()),
@@ -749,6 +752,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             batch_deadlines: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
+            checkout_conflicts: Mutex::new(HashMap::new()),
             declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
             launched_members: Mutex::new(HashMap::new()),
@@ -1659,6 +1663,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         let active = desired.iter().collect::<Vec<_>>();
         let mut member_errors = BTreeMap::new();
         for subject in &active {
+            if self.store.owned_desired_guard(subject).is_err() {
+                continue;
+            }
             if subject.kind == "stop" {
                 continue;
             }
@@ -1670,12 +1677,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                 continue;
             };
             let workspace = Path::new(&member.workspace);
-            if workspace.is_dir() {
-                continue;
-            }
             let checkout = (subject.kind == "agent")
                 .then(|| Checkout::from_desired(&subject.desired))
                 .flatten();
+            if workspace.is_dir() {
+                if let Some(checkout) = &checkout
+                    && let Err(error) = checkout.validate_workspace(workspace)
+                {
+                    member_errors.insert(subject.subject.clone(), error);
+                    continue;
+                }
+                if subject.kind == "agent" {
+                    self.observe_agent_workspace(&subject.subject, member)?;
+                }
+                continue;
+            }
             let result = if let Some(checkout) = checkout {
                 self.create_checkout(&subject.subject, &checkout, workspace)
                     .and_then(|failure| match failure {
@@ -1692,12 +1708,15 @@ impl<R: RuntimeControl> Reconciler<R> {
             if let Err(error) = result.with_context(|| format!("workspace {}", workspace.display()))
             {
                 member_errors.insert(subject.subject.clone(), error);
+            } else if subject.kind == "agent" {
+                self.observe_agent_workspace(&subject.subject, member)?;
             }
         }
         let renderable = active
             .iter()
             .copied()
             .filter(|subject| !member_errors.contains_key(&subject.subject))
+            .filter(|subject| self.store.owned_desired_guard(subject).is_ok())
             .collect::<Vec<_>>();
         // A live member is evaluated again when a claim it read, its runtime, its exec state or
         // its screen changed, when its time came, or when its workspace or render failed.
@@ -1864,6 +1883,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         drop(unreadable_span);
         let members_span = crate::profile::span("pass/members");
         for subject in &active {
+            if self.store.owned_desired_guard(subject).is_err() {
+                continue;
+            }
             if subject.kind == "stop" {
                 let _member_span = crate::profile::span("pass/member stop");
                 let item = format!("stop:{}", subject.subject);
@@ -3599,6 +3621,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         ptys: Option<&HashMap<String, RuntimeObservation>>,
         actual_origin: Option<Option<String>>,
     ) -> Result<()> {
+        self.store.owned_desired_guard(subject)?;
         let Some(actual) = self.store.latest_actual_value(&subject.subject)? else {
             // A stop-only declaration with no observed runtime is already satisfied.
             // Only its declaring host may project that fact. Otherwise every peer
@@ -3713,6 +3736,22 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    fn observe_agent_workspace(&self, subject: &str, member: &MemberSpec) -> Result<()> {
+        let mut fields = BTreeMap::from([
+            ("host".into(), Value::String(self.host.clone())),
+            ("workspace".into(), Value::String(member.workspace.clone())),
+        ]);
+        if let Some(repository) =
+            crate::repositories::workspace_repository(Path::new(&member.workspace))
+        {
+            fields.insert(
+                "repository".into(),
+                Value::String(repository.display().to_string()),
+            );
+        }
+        self.record_once(subject, "workspace.observed", fields)
+    }
+
     /// Create a declared checkout before its agent starts. Returns why the workspace is still
     /// unavailable. After a failure, Git runs again only after `CHECKOUT_RETRY_MS`.
     fn create_checkout(
@@ -3721,6 +3760,23 @@ impl<R: RuntimeControl> Reconciler<R> {
         checkout: &Checkout,
         workspace: &Path,
     ) -> Result<Option<String>> {
+        let declaration = self.store.newest_claim_index(subject, "intent.desired")?;
+        {
+            let mut conflicts = self
+                .checkout_conflicts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some((revision, prior, path, failure)) = conflicts.get(subject) {
+                if *revision == declaration && prior == checkout && path == workspace {
+                    return Ok(Some(failure.clone()));
+                }
+                conflicts.remove(subject);
+                self.checkout_retries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(subject);
+            }
+        }
         let now = now_ms();
         if let Some((_, failure)) = self
             .checkout_retries
@@ -3756,6 +3812,24 @@ impl<R: RuntimeControl> Reconciler<R> {
                     "checkout of {} failed: {error:#}",
                     checkout.repository.display()
                 );
+                if error
+                    .downcast_ref::<crate::checkout::BranchInUse>()
+                    .is_some()
+                {
+                    self.checkout_conflicts
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(
+                            subject.into(),
+                            (
+                                declaration,
+                                checkout.clone(),
+                                workspace.to_path_buf(),
+                                failure.clone(),
+                            ),
+                        );
+                    return Ok(Some(failure));
+                }
                 let retry_at = now.saturating_add(CHECKOUT_RETRY_MS);
                 self.checkout_retries
                     .lock()
@@ -3786,30 +3860,32 @@ impl<R: RuntimeControl> Reconciler<R> {
         )
     }
 
-    /// The checkout and workspace of a stopped agent whose owning run has ended. A run's cleanup
-    /// replaces the agent's declaration with a stop, so the checkout comes from the last agent
-    /// declaration.
+    /// The checkout and workspace of an explicitly stopped top-level seat or a stopped mission
+    /// agent whose run has ended. The checkout comes from the last agent declaration.
     fn finished_run_checkout(
         &self,
         subject: &DesiredSubject,
     ) -> Result<Option<(Checkout, String)>> {
-        let Some(run) = subject.owner_run.as_deref() else {
-            return Ok(None);
-        };
         let Some((checkout, workspace)) = self.declared_run_end_checkout(&subject.subject)? else {
             return Ok(None);
         };
         // A run stops its owned agents in its cleanup phase, before it becomes terminal.
-        let run_ended = self.store.mission_run(run)?.is_some_and(|run| {
-            matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
-                || run.phase == "terminal"
-                || run.phase.starts_with("cleanup-")
-        });
+        let run_ended = match subject.owner_run.as_deref() {
+            None => subject.kind == "stop",
+            Some(run) => self.store.mission_run(run)?.is_some_and(|run| {
+                matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+                    || run.phase == "terminal"
+                    || run.phase.starts_with("cleanup-")
+            }),
+        };
         let stopped = self
             .store
             .latest_actual_value(&subject.subject)?
             .is_some_and(|actual| {
-                actual_field(&actual, "status").and_then(Value::as_str) == Some("stopped")
+                matches!(
+                    actual_field(&actual, "status").and_then(Value::as_str),
+                    Some("stopped" | "absent")
+                )
             });
         Ok((run_ended && stopped).then_some((checkout, workspace)))
     }
@@ -4067,6 +4143,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         reason: &str,
     ) -> Result<()> {
+        self.store.owned_desired_guard(subject)?;
         // A member whose start keeps failing waits between attempts and then parks with one
         // attention request, instead of spawning again on every pass. A gate runner fails its gate.
         if matches!(subject.kind.as_str(), "agent" | "exec" | "pty")
@@ -4242,9 +4319,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("operation".into(), Value::String(operation.clone())),
             ]),
         )?;
+        self.store.owned_desired_guard(subject)?;
+        // Capture the token before starting; a publication during start must not relabel the launch.
+        let desired_token = self.launch_token(&subject.subject)?;
         if let Err(error) = self.runtime.start(&launch_member) {
             let reason = error.to_string();
-            let desired_token = self.launch_token(&subject.subject)?;
             let prior_failures = self.start_failures(&subject.subject, &desired_token)?;
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
@@ -4271,19 +4350,28 @@ impl<R: RuntimeControl> Reconciler<R> {
             )?;
             return Err(error).context("start member runtime");
         }
-        let desired_token = self.launch_token(&subject.subject)?;
+        let incarnation = if member.terminal {
+            self.runtime.snapshot_ptys().ok().and_then(|items| {
+                items.into_iter().find(|item| item.runtime_id == member.runtime_id)
+            })
+        } else {
+            self.runtime.observe_exec(&member.runtime_id).ok().flatten()
+        }
+        .and_then(|item| item.incarnation_id);
+        let mut fields = BTreeMap::from([
+            ("action".into(), Value::String("start".into())),
+            ("desired_token".into(), Value::String(desired_token)),
+            ("runtime_id".into(), Value::String(member.runtime_id.clone())),
+            ("reason".into(), Value::String(reason.into())),
+        ]);
+        if let Some(incarnation) = incarnation {
+            fields.insert("incarnation_id".into(), Value::String(incarnation));
+        }
         self.store.append_claim(&ClaimInput {
             subject: subject.subject.clone(),
             kind: "runtime.action.succeeded".into(),
             actor: None,
-            fields: BTreeMap::from([
-                ("desired_token".into(), Value::String(desired_token)),
-                (
-                    "runtime_id".into(),
-                    Value::String(member.runtime_id.clone()),
-                ),
-                ("reason".into(), Value::String(reason.into())),
-            ]),
+            fields,
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: None,
@@ -9818,6 +9906,9 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Record this schedule's next occurrence and arm its timer.
     fn reconcile_schedule(&self, schedule: &DesiredSubject) -> Result<()> {
+        self.store
+            .owned_desired_guard(schedule)
+            .map_err(anyhow::Error::new)?;
         let Some(spec) = crate::graph::schedule_spec(&schedule.desired, &self.host) else {
             return Ok(());
         };
@@ -10124,6 +10215,9 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// for a lasting reason is failed so the schedule can fire again. A request that waits for
     /// something this host has not received yet stays pending, and the schedule records why.
     fn reconcile_schedule_work(&self, schedule: &DesiredSubject) -> Result<()> {
+        self.store
+            .owned_desired_guard(schedule)
+            .map_err(anyhow::Error::new)?;
         // Every peer replicates the same requests. Only the host that requested the work starts it.
         let requests = self
             .store
@@ -16297,6 +16391,63 @@ mission "feedback-review" state="ready" {
     }
 
     #[test]
+    fn a_successful_launch_records_its_action_incarnation_and_desired_token() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        apply_source(
+            &store,
+            &format!(
+                "version 2\nagent \"worker\" {{ workspace {:?}; command \"true\" }}\n",
+                workspace.path().display().to_string()
+            ),
+            "launch-receipt",
+        );
+        let subject = store
+            .desired_subject_with_writer("agent/node.worker")
+            .unwrap()
+            .unwrap()
+            .0;
+        let member = subject.member.as_ref().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let observation = RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: member.terminal,
+            status: "starting".into(),
+            exit_code: None,
+            incarnation_id: Some("launch-1".into()),
+        };
+        runtime.ptys.lock().unwrap().push(observation.clone());
+        runtime
+            .execs
+            .lock()
+            .unwrap()
+            .insert(member.runtime_id.clone(), observation);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime,
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .perform_start(&subject, member, "test launch")
+            .unwrap();
+        let receipt = store
+            .observations_for(&subject.subject, "runtime.action.succeeded")
+            .unwrap()
+            .into_iter()
+            .find(|c| c.body["fields"]["action"] == "start")
+            .unwrap();
+        assert_eq!(receipt.body["fields"]["incarnation_id"], "launch-1");
+        assert_eq!(
+            receipt.body["fields"]["desired_token"].as_str(),
+            store
+                .selected_desired_token(&subject.subject)
+                .unwrap()
+                .as_deref()
+        );
+    }
+
+    #[test]
     fn a_started_member_gets_its_graph_identity() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
@@ -19583,6 +19734,123 @@ agent "worker" {
             .declared_run_end_checkout("agent/node.worker")
             .unwrap();
         assert_eq!(parses() - before, 2);
+    }
+
+    #[test]
+    fn a_top_level_checkout_leaves_after_stop_and_workspace_observations_do_not_repeat() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = crate::checkout::test_support::repository(root.path());
+        let workspace = root.path().join("worker");
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; checkout {:?} base=\"origin/main\" branch=\"worker\" remove-at-run-end=#true; command \"true\"; restart \"never\" }}\n",
+            workspace.to_str().unwrap(),
+            repository.to_str().unwrap()
+        );
+        apply_source(&store, &source, "top-level-checkout");
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let declared = store.desired_subjects().unwrap().remove(0);
+        let checkout = Checkout::from_desired(&declared.desired).unwrap();
+        checkout.create(&workspace).unwrap();
+        let member = declared.member.as_ref().unwrap();
+        reconciler
+            .observe_agent_workspace(&declared.subject, member)
+            .unwrap();
+        let index = store.index().unwrap();
+        reconciler
+            .observe_agent_workspace(&declared.subject, member)
+            .unwrap();
+        assert_eq!(store.index().unwrap(), index);
+        assert_eq!(
+            crate::repositories::host_repositories(&store, "node")
+                .unwrap()
+                .repositories
+                .len(),
+            1
+        );
+        apply_source(
+            &store,
+            "version 2\nstop \"agent/node.worker\"\n",
+            "stop-top-level-checkout",
+        );
+        let stopped = store.desired_subjects().unwrap().remove(0);
+        // A stop request alone cannot remove a running agent's files.
+        assert!(
+            reconciler
+                .finished_run_checkout(&stopped)
+                .unwrap()
+                .is_none()
+        );
+        reconciler
+            .record_once(
+                &declared.subject,
+                "runtime.observed",
+                BTreeMap::from([("status".into(), "stopped".into())]),
+            )
+            .unwrap();
+        reconciler
+            .remove_checkout_after_run(&stopped, &BTreeSet::new())
+            .unwrap();
+        assert!(!workspace.exists());
+        assert!(
+            checkout.create(&workspace).is_ok(),
+            "the branch stays for a later seat"
+        );
+        reconciler.record_once(&declared.subject, "runtime.observed", BTreeMap::from([("status".into(), "absent".into())])).unwrap();
+        reconciler.remove_checkout_after_run(&stopped, &BTreeSet::new()).unwrap();
+        assert!(!workspace.exists(), "a seat that never launched can also clean up after stop");
+    }
+
+    #[test]
+    fn a_branch_in_use_names_its_worktree_without_arming_checkout_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = crate::checkout::test_support::repository(root.path());
+        let existing = root.path().join("existing");
+        let checkout = Checkout {
+            repository,
+            base: "origin/main".into(),
+            branch: "parser".into(),
+            remove_at_run_end: false,
+        };
+        checkout.create(&existing).unwrap();
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let reconciler = Reconciler::new(
+            store,
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let workspace = root.path().join("new");
+        let failure = reconciler
+            .create_checkout("agent/node.worker", &checkout, &workspace)
+            .unwrap()
+            .unwrap();
+        assert!(failure.contains(existing.to_str().unwrap()), "{failure}");
+        assert!(reconciler.checkout_retries.lock().unwrap().is_empty());
+        assert!(reconciler.delayed_restarts.lock().unwrap().is_empty());
+        checkout.remove(&existing).unwrap();
+        assert_eq!(
+            reconciler
+                .create_checkout("agent/node.worker", &checkout, &workspace)
+                .unwrap(),
+            Some(failure)
+        );
+        let revised = Checkout {
+            branch: "revised".into(),
+            ..checkout
+        };
+        assert!(
+            reconciler
+                .create_checkout("agent/node.worker", &revised, &workspace)
+                .unwrap()
+                .is_none()
+        );
+        assert!(workspace.is_dir());
     }
 
     #[test]

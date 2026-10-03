@@ -63,7 +63,7 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
     if collection == "glasses" { return !kind.starts_with("glass."); }
-    matches!(kind, "daemon.diagnostic" | "transport.observed")
+    matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
 
@@ -1160,6 +1160,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
@@ -3096,6 +3097,29 @@ pub(super) async fn machines(
         move |state, snapshot| machine_resources(state, history, snapshot, &session),
     )
     .await
+}
+
+pub(super) async fn host_repositories(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let host = id
+        .strip_suffix("/repositories")
+        .ok_or_else(|| ApiError::not_found("host read not found"))?
+        .trim_start_matches("host/");
+    let host = if host == "local" {
+        state.node.clone()
+    } else {
+        host.to_owned()
+    };
+    creation_string(&host, "host", 160)?;
+    let value =
+        blocking_store(move || crate::repositories::host_repositories(&state.store, &host)).await?;
+    Ok(Json(
+        serde_json::to_value(value).map_err(ApiError::internal)?,
+    ))
 }
 
 fn device_resources(
@@ -7255,6 +7279,8 @@ async fn create_agent(
         serde_json::from_value(request.parameters.clone())
             .map_err(|error| validation(error.to_string()))?;
     creation_string(&parameters.name, "name", 160)?;
+    crate::creation::validate_agent_checkout(&parameters)
+        .map_err(|error| validation(error.to_string()))?;
     if !crate::skill::HARNESSES.contains(&parameters.harness.as_str()) {
         return Err(validation("unknown harness"));
     }
@@ -7263,6 +7289,9 @@ async fn create_agent(
         ("effort", &parameters.effort),
         ("host", &parameters.host),
         ("description", &parameters.description),
+        ("repo", &parameters.repo),
+        ("base", &parameters.base),
+        ("branch", &parameters.branch),
     ] {
         if let Some(value) = value {
             creation_string(value, field, 4096)?;
@@ -9529,6 +9558,71 @@ subscription "watch/source" {
             .0;
             assert_eq!(retry["affected_ids"], result["affected_ids"]);
         }
+    }
+
+    #[tokio::test]
+    async fn agent_create_checkout_fields_are_durable_and_invalid_choices_do_not_write() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "example");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        let request = |parameters: Value| ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/worktree".into(),
+            action_type: "agent.create".into(),
+            idempotency_key: "agent-worktree-fields".into(),
+            fence: Fence::default(),
+            parameters,
+        };
+        for parameters in [
+            json!({"name":"parser", "harness":"codex", "branch":"parser"}),
+            json!({"name":"parser", "harness":"codex", "remove_at_run_end":true}),
+            json!({"name":"parser", "harness":"codex", "repo":"relative/repo"}),
+            json!({"name":"parser", "harness":"codex", "repo":"/work/repo", "branch":"--unsafe"}),
+        ] {
+            let index = state.store.index().unwrap();
+            assert!(
+                create_agent(
+                    &state,
+                    &new_client_snapshot(&state),
+                    &session,
+                    &request(parameters)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(state.store.index().unwrap(), index);
+        }
+        // The selected host owns these paths. A gateway does not probe its own disk for them.
+        let input = request(
+            json!({"name":"example/parser", "harness":"codex", "host":"host/other", "workspace":"/work/parser", "repo":"/work/repo", "base":"main", "branch":"example/parser", "remove_at_run_end":true}),
+        );
+        let ids = create_agent(&state, &new_client_snapshot(&state), &session, &input)
+            .await
+            .unwrap();
+        assert_eq!(ids, ["agent/example/parser"]);
+        let desired = state.store.desired_subjects().unwrap().remove(0);
+        assert_eq!(desired.member.as_ref().unwrap().host, "other");
+        assert!(!desired.member.as_ref().unwrap().workspace_create);
+        let checkout = crate::checkout::Checkout::from_desired(&desired.desired).unwrap();
+        assert_eq!(checkout.repository, Path::new("/work/repo"));
+        assert_eq!(checkout.base, "main");
+        assert_eq!(checkout.branch, "example/parser");
+        assert!(checkout.remove_at_run_end);
+        let read = host_repositories(
+            State(state.clone()),
+            Extension(session.clone()),
+            AxumPath("host/other/repositories".into()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(read["repositories"][0]["path"], "/work/repo");
+        assert_eq!(
+            create_agent(&state, &new_client_snapshot(&state), &session, &input)
+                .await
+                .unwrap(),
+            ids
+        );
     }
 
     #[tokio::test]
