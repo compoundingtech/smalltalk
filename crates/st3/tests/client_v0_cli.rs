@@ -92,6 +92,43 @@ fn value(output: &Output) -> Value {
     })
 }
 
+#[test]
+fn person_admission_exception_is_local_reversible_and_never_spawns_the_producer() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let producer = root.path().join("omp");
+    let marker = root.path().join("producer-called");
+    std::fs::write(&producer, format!("#!/bin/sh\nprintf called > '{}'\nexit 1\n", marker.display())).unwrap();
+    std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |action: &str, agent: bool| {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"));
+        command.env_remove("ST_AGENT").env_remove("ST_MISSION_RUN")
+            .arg("--json").args(["admission", action, "omp", "--binary"])
+            .arg(&producer).arg("--state-dir").arg(root.path().join("state"));
+        if action == "override" { command.args(["--reason", "local offline probe exception"]); }
+        if agent { command.env("ST_AGENT", "agent/fixture/worker"); }
+        command.output().unwrap()
+    };
+    let refused = run("override", true);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("person's terminal"));
+    assert!(!root.path().join("state").exists());
+    let output = run("override", false);
+    let result = value(&output);
+    assert_eq!(result["overridden"], true);
+    let record = PathBuf::from(result["record"].as_str().unwrap());
+    assert!(record.starts_with(root.path().join("state/drivers/sessions/harness-admission")));
+    let bytes = std::fs::read(&record).unwrap();
+    let exception: Value = serde_json::from_slice(&bytes).unwrap();
+    let (_, extension) = st3::hooks::FILES.iter().find(|(name, _)| *name == "omp-channel.ts").unwrap();
+    assert_eq!(exception["identity"]["adapterDigest"], format!("{:x}", Sha256::digest(extension)));
+    assert!(exception.get("measurements").is_none());
+    assert_eq!(std::fs::metadata(&record).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(value(&run("revoke", false))["overridden"], false);
+    assert!(!record.exists());
+    assert!(!marker.exists(), "the exception commands run neither --version nor the native probe");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_policy() {
     let root = tempfile::tempdir().unwrap();
