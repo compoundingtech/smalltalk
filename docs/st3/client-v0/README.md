@@ -436,6 +436,11 @@ entry and increments its revision; it cannot change the entry's ID, sequence, ro
 `finalize` makes the entry immutable. Tool results must refer to a preceding tool call. Timeline
 pages and updates are bounded by the negotiated byte and item limits.
 
+Pi-family native replay recognizes OMP's message-level `role: "toolResult"` records: the
+`toolCallId` correlates the result with its call, `isError` selects error or success status, and
+the result's text content is retained. Legacy tool-result blocks inside message content remain
+supported.
+
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
 `details.reason: native-session-unidentified` and `details.session_id`, explaining that the
