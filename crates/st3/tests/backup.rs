@@ -112,5 +112,26 @@ async fn a_live_backup_download_restores_and_leaves_the_daemon_serving_reads() {
     let report: backup::RestoreReport = serde_json::from_slice(&output.stdout).unwrap();
     assert!(report.projections_match);
     assert_eq!(report.tables["claim_sources"].count, 1100);
+    let remote = Store::open_memory("birch").unwrap();
+    remote
+        .put_document(
+            "doc/remote",
+            b"A replicated document.\n",
+            &None,
+            "remote-document",
+        )
+        .unwrap();
+    let exchange = remote
+        .export_replication_exchange("test-fleet", &Default::default())
+        .unwrap();
+    store
+        .receive_replication_exchange("birch", "test-fleet", &exchange)
+        .unwrap();
+    store.validate_replication_backlog().unwrap();
+    let pending = root.path().join("pending.jsonl");
+    let error = backup::create(&endpoint, &pending).await.unwrap_err();
+    assert!(error.to_string().contains("fully projected"), "{error:#}");
+    assert!(!pending.exists());
+    store.project_replication_backlog().unwrap();
     server.abort();
 }

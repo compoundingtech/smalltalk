@@ -95,7 +95,13 @@ pub async fn create(endpoint: &Endpoint, destination: &Path) -> Result<()> {
         ),
         Endpoint::Http(base) => (reqwest::Client::new(), format!("{base}/v1/backup")),
     };
-    let response = client.get(url).send().await?.error_for_status()?;
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    ensure!(
+        status.is_success(),
+        "backup export failed ({status}): {}",
+        response.text().await?
+    );
     let mut stream = response.bytes_stream();
     while let Some(bytes) = stream.next().await {
         output.write_all(&bytes?).await?;

@@ -4,7 +4,10 @@
 envelopes on a pooled read worker in pages of 512, then downloads the completed archive. Writes
 and other requests continue while it reads. A slow download does not keep the database snapshot
 open. The daemon needs temporary disk space for the archive; the destination is published only
-once its checksum and end record verify. Existing backup files are never overwritten.
+once its checksum and end record verify. Existing backup files are never overwritten. If
+replication has admitted claims whose projections are still pending, or the graph is stale,
+export refuses before writing an archive; retry after the graph has recovered. A missing writer
+predecessor also prevents publication until that history arrives.
 
 ```sh
 st backup create before-upgrade.jsonl
@@ -40,8 +43,9 @@ to 128 MiB; export refuses a larger record before publishing a file:
   writer's public key and signature when present. Envelopes sort by writer, sequence, hash;
   projections replay claims in their normal canonical total order.
 - `signatures`: sync signature records, including additional signatures held for those envelopes.
-- `checkpoint`: the sync manifest of the newest applied checkpoint, including older tombstones.
-  Restore verifies it against the certificate claims through normal checkpoint adoption.
+- `checkpoint`: the sync manifest of the newest applied or in-progress trim, including older
+  tombstones. Restore initializes empty checkpoint state through the normal certificate checks,
+  even if the source knew a newer certificate it had not applied yet.
 - `end`: envelope count and SHA-256 of all preceding bytes, including line endings.
 
 Restore verifies signatures, envelope and claim hashes through normal admission, checks writer

@@ -87,6 +87,20 @@ impl Store {
                 if max_batch_rowid(&self.readers.get())? > seeded_through {
                     return Ok(None);
                 }
+                // Admission and projection commit separately. Only a snapshot whose persisted
+                // projection frontier covers its log can promise the same graph on restore.
+                let health: Option<(String, u64)> = self.readers.get().query_row(
+                    "SELECT status,last_good_store_index FROM projection_health WHERE aggregate='graph'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional()?;
+                let admitted: u64 = self.readers.get().query_row(
+                    "SELECT value FROM meta WHERE key='replication_admitted_index'", [],
+                    |row| row.get::<_, String>(0),
+                )?.parse()?;
+                anyhow::ensure!(
+                    health.map_or(admitted == 0, |(status, through)| status == "healthy" && through >= admitted),
+                    "backup requires a healthy, fully projected graph; retry after replication catches up"
+                );
                 let header = self.backup_header()?;
                 let mut hash = Sha256::new();
                 write_record(output, &mut hash, &Record::Header(header.clone()))?;
@@ -123,15 +137,33 @@ impl Store {
                         write_record(output, &mut hash, &Record::Signatures(signatures))?;
                     }
                 }
-                if let Some(checkpoint) = self.trimmed_checkpoint()? {
+                // A trim records its complete certified tombstones before deleting any rows.
+                // A snapshot between deletion chunks must include that manifest too.
+                let checkpoint: Option<(String, u128)> = self
+                    .readers
+                    .get()
+                    .query_row(
+                        "SELECT id,cut_unix_ms FROM checkpoints
+                     WHERE state IN ('trimming','trimmed') AND drop_digest IS NOT NULL
+                     ORDER BY cut_unix_ms DESC LIMIT 1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                u128::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((checkpoint, cut_unix_ms)) = checkpoint {
                     // The manifest is the sync representation, verified against signed certificate
                     // claims on restore. No SQL or local checkpoint bookkeeping enters the archive.
                     let mut after = None;
                     loop {
                         let page = self.manifest_page(
                             &CheckpointManifestRequest {
-                                checkpoint: checkpoint.id.clone(),
-                                cut_unix_ms: checkpoint.cut_unix_ms,
+                                checkpoint: checkpoint.clone(),
+                                cut_unix_ms,
                                 after,
                             },
                             PAGE,
@@ -143,6 +175,7 @@ impl Store {
                         }
                     }
                 }
+                self.check_backup_chains()?;
                 serde_json::to_writer(
                     &mut *output,
                     &Record::End {
@@ -300,7 +333,7 @@ impl Store {
         // admitted before their arrival. Preserve that history, including doctor residue.
         self.replay_replication_graph()?;
         if let Some(manifest) = checkpoint {
-            self.adopt_checkpoint(manifest)?;
+            self.restore_checkpoint_history(manifest)?;
             self.replay_replication_graph()?;
         }
         self.check_backup_chains()?;
@@ -340,33 +373,47 @@ impl Store {
 
     fn check_backup_chains(&self) -> Result<()> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT origin,replica_sequence,previous_hash FROM batches ORDER BY origin,replica_sequence,id"
+        let mut statement = connection.prepare_cached(
+            "SELECT rowid,origin,replica_sequence,previous_hash FROM batches
+             WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
         )?;
-        let mut rows = statement.query([])?;
         let mut predecessor = connection.prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM batches WHERE origin=?1 AND replica_sequence=?2 AND hash=?3)
                  OR EXISTS(SELECT 1 FROM checkpoint_envelopes WHERE writer=?1 AND sequence=?2)"
         )?;
-        while let Some(row) = rows.next()? {
-            let writer: String = row.get(0)?;
-            let sequence: u64 = row.get(1)?;
-            let link: Option<String> = row.get(2)?;
-            if let Some(link) = link {
-                anyhow::ensure!(sequence > 0, "backup writer chain has an invalid root");
-                // Retained predecessors must match their exact batch hash. A predecessor
-                // removed by a verified checkpoint has only its certified wire identity left.
-                let found: bool =
-                    predecessor.query_row(params![writer, sequence - 1, link], |r| r.get(0))?;
-                anyhow::ensure!(
-                    found,
-                    "backup writer chain has a missing or broken predecessor"
-                );
-            } else {
-                anyhow::ensure!(
-                    sequence <= 1,
-                    "backup writer chain starts after a missing predecessor"
-                );
+        let mut after = 0_i64;
+        loop {
+            let page = statement
+                .query_map(params![after, PAGE], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if page.is_empty() {
+                break;
+            }
+            for (rowid, writer, sequence, link) in page {
+                after = rowid;
+                if let Some(link) = link {
+                    anyhow::ensure!(sequence > 0, "backup writer chain has an invalid root");
+                    // Retained predecessors must match their exact batch hash. A predecessor
+                    // removed by a verified checkpoint has only its certified wire identity left.
+                    let found: bool =
+                        predecessor.query_row(params![writer, sequence - 1, link], |r| r.get(0))?;
+                    anyhow::ensure!(
+                        found,
+                        "backup writer chain has a missing or broken predecessor; retry after replication catches up"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        sequence <= 1,
+                        "backup writer chain starts after a missing predecessor"
+                    );
+                }
             }
         }
         Ok(())
@@ -551,6 +598,38 @@ mod tests {
     }
 
     #[test]
+    fn an_unprojected_snapshot_is_refused_before_any_archive_bytes_are_written() {
+        let root = tempfile::tempdir().unwrap();
+        let writer = Store::open_memory("alder").unwrap();
+        diagnostic(&writer, "not projected yet");
+        let database = root.path().join("source.db");
+        let source = Store::open(&database, "birch").unwrap();
+        let worker = Store::open(&database, "birch").unwrap();
+        let exchange = writer
+            .export_replication_exchange("test-fleet", &ReplicationInventory::default())
+            .unwrap();
+        worker
+            .receive_replication_exchange("alder", "test-fleet", &exchange)
+            .unwrap();
+        worker.validate_replication_backlog().unwrap();
+        let mut output = Vec::new();
+        let error = source.write_backup(&mut output).unwrap_err();
+        assert!(error.to_string().contains("fully projected"), "{error:#}");
+        assert!(output.is_empty());
+        diagnostic(
+            &source,
+            "a local write must not hide the pending projection",
+        );
+        assert!(source.write_backup(&mut output).is_err());
+        assert!(output.is_empty());
+        worker.project_replication_backlog().unwrap();
+        let path = root.path().join("projected.jsonl");
+        let header = archive(&source, &path);
+        let report = backup::restore(&path, &root.path().join("restored.db")).unwrap();
+        assert_eq!(header.graph_digest, report.graph_digest);
+    }
+
+    #[test]
     fn offline_export_finishes_upgrade_recovery_before_recording_digests() {
         let root = tempfile::tempdir().unwrap();
         let current = Store::open_memory("alder").unwrap();
@@ -721,6 +800,36 @@ mod tests {
     }
 
     #[test]
+    fn create_refuses_a_partial_writer_chain_until_the_missing_envelope_arrives() {
+        let root = tempfile::tempdir().unwrap();
+        let writer = Store::open_memory("alder").unwrap();
+        diagnostic(&writer, "first");
+        diagnostic(&writer, "second");
+        let source = Store::open_memory("birch").unwrap();
+        let mut exchange = writer
+            .export_replication_exchange("test-fleet", &ReplicationInventory::default())
+            .unwrap();
+        let first = exchange.envelopes.remove(0);
+        source
+            .receive_replication_exchange("alder", "test-fleet", &exchange)
+            .unwrap();
+        source.validate_replication_backlog().unwrap();
+        source.project_replication_backlog().unwrap();
+        let error = source.write_backup(&mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("predecessor"), "{error:#}");
+        exchange.envelopes = vec![first];
+        source
+            .receive_replication_exchange("alder", "test-fleet", &exchange)
+            .unwrap();
+        source.validate_replication_backlog().unwrap();
+        source.project_replication_backlog().unwrap();
+        let path = root.path().join("complete.jsonl");
+        let header = archive(&source, &path);
+        let report = backup::restore(&path, &root.path().join("restored.db")).unwrap();
+        assert_eq!(report.graph_digest, header.graph_digest);
+    }
+
+    #[test]
     fn restore_rejects_a_missing_writer_chain_predecessor() {
         let root = tempfile::tempdir().unwrap();
         let source = Store::open_memory("alder").unwrap();
@@ -758,6 +867,13 @@ mod tests {
         }
         assert!(source.trimmed_checkpoint().unwrap().is_some());
         assert!(source.checkpointed_envelopes().unwrap() > 0);
+        assert_eq!(
+            source
+                .restore_checkpoint_history(&CheckpointManifest::default())
+                .unwrap_err()
+                .code,
+            "checkpoint-history-exists"
+        );
         let path = root.path().join("trimmed.jsonl");
         let header = archive(&source, &path);
         let target = root.path().join("restored.db");
@@ -772,6 +888,75 @@ mod tests {
             source.checkpointed_envelopes().unwrap(),
             restored.checkpointed_envelopes().unwrap()
         );
+    }
+
+    #[test]
+    fn a_backup_during_an_interrupted_trim_preserves_the_complete_log() {
+        let root = tempfile::tempdir().unwrap();
+        let source = Store::open_memory("alder").unwrap();
+        source.bind_fleet("test-fleet").unwrap();
+        for index in 0..12 {
+            diagnostic(&source, &format!("note-{index}"));
+        }
+        let context = CheckpointContext {
+            now_unix_ms: now_ms() + 3 * 86_400_000,
+            configured_peers: vec![],
+            scratch: root.path().join("scratch"),
+            reviewer: "person/operator".into(),
+        };
+        for _ in 0..2 {
+            source.checkpoint_step(&context).unwrap();
+        }
+        source.set_trim_fault(Some(TrimFault::AfterChunk(1)));
+        assert!(source.checkpoint_step(&context).is_err());
+        assert!(source.trimmed_checkpoint().unwrap().is_none());
+        assert!(source.checkpointed_envelopes().unwrap() > 0);
+        let path = root.path().join("trimming.jsonl");
+        let header = archive(&source, &path);
+        let report = backup::restore(&path, &root.path().join("restored.db")).unwrap();
+        assert_eq!(report.log_digest, header.log_digest);
+        assert!(report.projections_match);
+    }
+
+    #[test]
+    fn a_backup_keeps_trimmed_history_when_a_newer_certificate_is_not_applied_yet() {
+        let root = tempfile::tempdir().unwrap();
+        let source = Store::open_memory("alder").unwrap();
+        source.bind_fleet("test-fleet").unwrap();
+        for index in 0..12 {
+            diagnostic(&source, &format!("note-{index}"));
+        }
+        let mut context = CheckpointContext {
+            now_unix_ms: now_ms() + 3 * 86_400_000,
+            configured_peers: vec![],
+            scratch: root.path().join("scratch"),
+            reviewer: "person/operator".into(),
+        };
+        for _ in 0..3 {
+            source.checkpoint_step(&context).unwrap();
+        }
+        let applied = source.trimmed_checkpoint().unwrap().unwrap();
+        diagnostic(&source, "after the first trim");
+        context.now_unix_ms += 86_400_000;
+        for _ in 0..2 {
+            source.checkpoint_step(&context).unwrap();
+        }
+        assert_eq!(source.trimmed_checkpoint().unwrap().unwrap(), applied);
+        assert!(
+            source
+                .checkpoint_status(context.now_unix_ms, &context.configured_peers)
+                .unwrap()
+                .newest_stable
+                .unwrap()
+                .terms
+                .cut_unix_ms
+                > applied.cut_unix_ms
+        );
+        let path = root.path().join("certified.jsonl");
+        let header = archive(&source, &path);
+        let report = backup::restore(&path, &root.path().join("restored.db")).unwrap();
+        assert_eq!(report.log_digest, header.log_digest);
+        assert!(report.projections_match);
     }
 
     #[test]
