@@ -661,6 +661,19 @@ gate "text omits value" { lacks "message/report" "UNVERIFIED" }
 
 `field` uses this argument order: path, full subject, operator, value. Operators are `is`, `starts-with`, and `contains`.
 
+An `exit_code` field gate on an `exec/...` subject fails when the exec has ended and
+its selected launch cannot restart, including a missing exit code after the process was killed.
+The failure names the exec and its exit code. A running exec or an exec that can restart keeps
+an unsatisfied gate pending. `restart "never"` cannot restart; `restart "on-failure"` cannot
+restart after exit 0. An observation from an older launch does not fail a new declaration's gate.
+Other subjects and fields retain their pending behavior. This predicate rule is separate from
+the exec gate contract below.
+
+`st missions show RUN` lists unresolved predicates of this kind under `STUCK GATES` (and
+`stuck_gates` in JSON), even when an earlier gate still waits. `st doctor` reports them in
+the `terminal-exec-gates` check. These diagnostics only inspect active runs and never decide a
+gate or change a step's state.
+
 Use `every` to apply one or more field predicates to every item in an observed list:
 
 ```kdl

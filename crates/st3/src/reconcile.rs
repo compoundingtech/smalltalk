@@ -5419,7 +5419,46 @@ impl<R: RuntimeControl> Reconciler<R> {
         if let Some(exit_code) = observation.exit_code {
             fields.insert("exit_code".into(), Value::from(exit_code));
         }
-        self.record_once(&subject.subject, "runtime.observed", fields)
+        let mut evidence = Vec::new();
+        if member.kind == MemberKind::Exec {
+            // Launch receipts stay on the runtime's node. Carry the launched declaration as
+            // evidence on its durable observation so predicates read the same proof everywhere.
+            if let Some(token) = self
+                .store
+                .observations_for(&subject.subject, "runtime.action.succeeded")?
+                .iter()
+                .rev()
+                .find_map(|claim| {
+                    let fields = &claim.body["fields"];
+                    if observation
+                        .incarnation_id
+                        .as_deref()
+                        .zip(fields["incarnation_id"].as_str())
+                        .is_some_and(|(observed, launched)| observed != launched)
+                    {
+                        return None;
+                    }
+                    fields["desired_token"].as_str().map(str::to_owned)
+                })
+            {
+                evidence.push(token);
+            } else if let Some(prior) = self
+                .store
+                .latest_claim(&subject.subject, Some("runtime.observed"))?
+                && prior.body["fields"]["incarnation_id"].as_str()
+                    == observation.incarnation_id.as_deref()
+            {
+                // Retention can trim a long-running exec's local launch receipt.
+                evidence = prior.body["evidence"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+            }
+        }
+        self.record_once_with_evidence(&subject.subject, "runtime.observed", fields, evidence)
     }
 
     fn record_once(
@@ -5428,12 +5467,23 @@ impl<R: RuntimeControl> Reconciler<R> {
         kind: &str,
         fields: BTreeMap<String, Value>,
     ) -> Result<()> {
+        self.record_once_with_evidence(subject, kind, fields, Vec::new())
+    }
+
+    fn record_once_with_evidence(
+        &self,
+        subject: &str,
+        kind: &str,
+        fields: BTreeMap<String, Value>,
+        evidence: Vec<String>,
+    ) -> Result<()> {
         if self
             .store
             .latest_observation(subject, kind)?
             .is_some_and(|claim| {
                 claim.body.get("fields")
                     == Some(&serde_json::to_value(&fields).unwrap_or(Value::Null))
+                    && claim.body.get("evidence") == Some(&serde_json::json!(evidence))
             })
         {
             return Ok(());
@@ -5443,7 +5493,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             kind: kind.into(),
             actor: None,
             fields,
-            evidence: Vec::new(),
+            evidence,
             expected_subject: None,
             idempotency_key: None,
         })?;
@@ -11267,11 +11317,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                     return Ok(GateOutcome::Pending);
                 };
                 let found = observed_field_value(&actual, subject, path);
-                let Some(found) = found.as_ref() else {
-                    return Ok(GateOutcome::Pending);
-                };
-                if compare_value(found, operator, value) {
+                if found
+                    .as_ref()
+                    .is_some_and(|found| compare_value(found, operator, value))
+                {
                     GateOutcome::Pass
+                } else if let Some(reason) =
+                    terminal_exec_field_gate_failure(&self.store, gate, &actual)?
+                {
+                    GateOutcome::Fail(reason)
                 } else {
                     GateOutcome::Pending
                 }
@@ -13400,6 +13454,7 @@ fn token_usage_total(usage: &serde_json::Map<String, Value>) -> Option<u64> {
     found.then_some(total)
 }
 
+#[derive(Debug)]
 enum GateOutcome {
     Pass,
     Pending,
@@ -13588,6 +13643,135 @@ fn compare_value(found: &Value, operator: &str, expected: &Value) -> bool {
         },
         _ => false,
     }
+}
+
+/// An exec's exit code cannot change after its selected launch ends without a restart.
+/// Read only graph observations and declarations: runtime polling and wall time must not
+/// influence a predicate verdict on a replica or during replay.
+fn terminal_exec_field_gate_failure(
+    store: &Store,
+    gate: &GateSpec,
+    actual: &Value,
+) -> Result<Option<String>> {
+    let GateSpec::Field {
+        name,
+        path,
+        subject,
+        operator,
+        value,
+    } = gate
+    else {
+        return Ok(None);
+    };
+    if !subject.starts_with("exec/")
+        || path != "exit_code"
+        || observed_field_value(actual, subject, path)
+            .as_ref()
+            .is_some_and(|found| compare_value(found, operator, value))
+    {
+        return Ok(None);
+    }
+    let Some(status @ ("exited" | "vanished" | "stopped")) =
+        actual_field(actual, "status").and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Some((desired, _)) = store.desired_subject_with_writer(subject)? else {
+        return Ok(None);
+    };
+    let Some(member) = desired
+        .member
+        .filter(|member| member.kind == MemberKind::Exec)
+    else {
+        return Ok(None);
+    };
+    let exit_code = actual_field(actual, "exit_code").and_then(Value::as_i64);
+    let restarts = member.lifecycle == MemberLifecycle::Service
+        && match member.restart {
+            RestartType::Always => true,
+            RestartType::OnFailure => exit_code != Some(0),
+            RestartType::Never => false,
+        };
+    if restarts {
+        return Ok(None);
+    }
+    if member.lifecycle == MemberLifecycle::Service {
+        let lineage = store.launch_lineage(subject)?;
+        let observed = store.latest_claim(subject, Some("runtime.observed"))?;
+        if !observed.is_some_and(|claim| {
+            claim.body["evidence"].as_array().is_some_and(|evidence| {
+                evidence
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|token| lineage.iter().any(|desired| desired == token))
+            })
+        }) {
+            return Ok(None);
+        }
+    }
+    let exit = exit_code.map_or_else(|| "unknown".into(), |code| code.to_string());
+    Ok(Some(format!(
+        "field gate `{name}` cannot pass: exec `{subject}` is {status} with exit code {exit} and will not restart; expected `{path}` {operator} {value}"
+    )))
+}
+
+/// Impossible exit-code gates in an active run, including gates behind another pending gate.
+/// This is a read-only diagnostic and never records a gate verdict or changes work state.
+pub(crate) fn stuck_field_gates(
+    store: &Store,
+    run: &MissionRunView,
+    mission: &MissionSpec,
+) -> Result<Vec<String>> {
+    if !matches!(run.status.as_str(), "running" | "standing" | "blocked") {
+        return Ok(Vec::new());
+    }
+    let mut stuck = Vec::new();
+    let mut inspect =
+        |owner: &str, gates: &[GateSpec], variables: &BTreeMap<String, String>| -> Result<()> {
+            for gate in gates {
+                if !matches!(gate, GateSpec::Field { path, .. } if path == "exit_code") {
+                    continue;
+                }
+                let mut gate = gate.clone();
+                expand_gate(&mut gate, variables, &run.workspace)?;
+                let GateSpec::Field { subject, .. } = &gate else {
+                    unreachable!()
+                };
+                if subject.starts_with("exec/")
+                    && let Some(actual) = store.latest_actual_value(subject)?
+                    && let Some(reason) = terminal_exec_field_gate_failure(store, &gate, &actual)?
+                {
+                    stuck.push(format!("{owner}: {reason}"));
+                }
+            }
+            Ok(())
+        };
+    let flat = flatten_mission_steps(mission);
+    for step in &flat {
+        if let Some(view) = run.steps.iter().find(|view| view.step == step.spec.path)
+            && matches!(view.status.as_str(), "claimed" | "working" | "verifying")
+        {
+            inspect(
+                &view.subject,
+                &step.spec.gates,
+                &run_variables(run, step, view),
+            )?;
+        }
+    }
+    if run.phase == "normal"
+        && flat.iter().filter(|step| !step.spec.finally).all(|step| {
+            run.steps
+                .iter()
+                .any(|view| view.step == step.spec.path && view.status == "completed")
+        })
+    {
+        inspect(
+            &run.subject,
+            &mission.gates,
+            &crate::store::mission_run_variables(run, &run.revision),
+        )?;
+    }
+    Ok(stuck)
 }
 
 fn gate_operation_subject(stage: &GateContext, name: &str, definition: &Value) -> Result<String> {
@@ -14136,6 +14320,139 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         tokio::time::timeout(Duration::from_secs(10), notify.notified())
             .await
             .expect("a long gate still gets a pass every minute");
+    }
+
+    #[test]
+    fn exec_exit_code_field_gates_fail_only_after_the_selected_launch_is_terminal() {
+        for (restart, status, exit_code, expected, fails, passes) in [
+            ("never", "running", None, 0, false, false),
+            ("never", "starting", Some(2), 0, false, false),
+            ("never", "exited", Some(0), 0, false, true),
+            ("never", "exited", Some(1), 0, true, false),
+            ("never", "exited", Some(2), 0, true, false),
+            ("never", "exited", None, 0, true, false),
+            ("never", "vanished", None, 0, true, false),
+            ("never", "stopped", Some(2), 0, true, false),
+            ("always", "exited", Some(2), 0, false, false),
+            ("on-failure", "exited", Some(2), 0, false, false),
+            ("on-failure", "exited", None, 0, false, false),
+            ("on-failure", "exited", Some(0), 1, true, false),
+        ] {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            apply_source(
+                &store,
+                &format!(
+                    "version 2\nexec \"orchid/probe\" {{ workspace \"/tmp\"; command \"true\"; restart \"{restart}\" }}"
+                ),
+                "exec",
+            );
+            let reconciler = Reconciler::new(
+                store.clone(),
+                Arc::new(FakeRuntime::default()),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+            reconciler.reconcile_once().unwrap();
+            let desired = store
+                .desired_subject_with_writer("exec/orchid/probe")
+                .unwrap()
+                .unwrap()
+                .0;
+            reconciler
+                .record_member(
+                    &desired,
+                    &RuntimeObservation {
+                        runtime_id: desired.member.as_ref().unwrap().runtime_id.clone(),
+                        terminal: false,
+                        status: status.into(),
+                        exit_code,
+                        incarnation_id: None,
+                    },
+                    false,
+                )
+                .unwrap();
+            let gate = GateSpec::Field {
+                name: "prepared".into(),
+                path: "exit_code".into(),
+                subject: "exec/orchid/probe".into(),
+                operator: "is".into(),
+                value: serde_json::json!(expected),
+            };
+            let stage = GateContext {
+                subject: "step-run/orchid/prepare".into(),
+                name: "prepare".into(),
+                started_at_unix_ms: 0,
+                attempt: 1,
+                run: "mission-run/orchid".into(),
+                generation: "run-generation/orchid".into(),
+                eval: false,
+            };
+            let outcome = reconciler.evaluate_gate(&stage, &gate).unwrap();
+            assert_eq!(
+                matches!(outcome, GateOutcome::Fail(_)),
+                fails,
+                "{restart} {status} {exit_code:?}: {outcome:?}"
+            );
+            assert_eq!(matches!(outcome, GateOutcome::Pass), passes, "{outcome:?}");
+            // A replica has no local launch receipt. Replaying the replicated observation
+            // and its declaration evidence must still give the same predicate decision.
+            let replica = Store::open_memory("replica").unwrap();
+            let batch = store.export_replication(0).unwrap();
+            replica.import_replication("node", &batch).unwrap();
+            assert!(
+                replica
+                    .observations_for("exec/orchid/probe", "runtime.action.succeeded")
+                    .unwrap()
+                    .is_empty()
+            );
+            let reason = |store: &Store| {
+                terminal_exec_field_gate_failure(
+                    store,
+                    &gate,
+                    &store
+                        .latest_actual_value("exec/orchid/probe")
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            assert_eq!(reason(&store), reason(&replica));
+            replica.import_replication("node", &batch).unwrap();
+            assert_eq!(reason(&store), reason(&replica));
+            if let GateOutcome::Fail(reason) = outcome {
+                assert!(reason.contains("exec/orchid/probe"), "{reason}");
+                assert!(
+                    reason.contains(&format!(
+                        "exit code {}",
+                        exit_code.map_or_else(|| "unknown".into(), |code| code.to_string())
+                    )),
+                    "{reason}"
+                );
+            }
+            let mut status_gate = gate.clone();
+            if let GateSpec::Field { path, value, .. } = &mut status_gate {
+                *path = "status".into();
+                *value = serde_json::json!("waiting-for-a-different-state");
+            }
+            assert!(matches!(
+                reconciler.evaluate_gate(&stage, &status_gate).unwrap(),
+                GateOutcome::Pending
+            ));
+            // A revised declaration must be allowed to launch again, even with restart never.
+            apply_source(
+                &store,
+                &format!(
+                    "version 2\nexec \"orchid/probe\" {{ workspace \"/tmp\"; command \"exit 0\"; restart \"{restart}\" }}"
+                ),
+                "revised-exec",
+            );
+            if !passes {
+                assert!(matches!(
+                    reconciler.evaluate_gate(&stage, &gate).unwrap(),
+                    GateOutcome::Pending
+                ));
+            }
+        }
     }
 
     #[test]
