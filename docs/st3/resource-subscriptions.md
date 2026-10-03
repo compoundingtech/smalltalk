@@ -47,7 +47,10 @@ opened one. When a pull request appears or moves to a new head, the observing ho
 agent on that host whose workspace has the pull request's branch checked out. When exactly one
 agent has it, the listing records that agent as `opened_by` and its mission run as `opened_by_run`.
 A pull request keeps an opener once named, so a reviewer or fixer that later checks out the branch
-does not take it over. When no agent is named, a mission run that published
+does not take it over. Like an issue's, each attribution fact stays across every later write to
+the pull request resource: a publisher's partial snapshot such as `{state: merged}`, a
+`github.pull-request` observation that never reads it, and a later claim that names another opener
+(Nathan, 2026-10-03, #778 rule 5). When no agent is named, a mission run that published
 `resource/mission-run/RUN/pull-request` for the pull request becomes its `opened_by_run`. A review
 mission routes its findings to that agent or run.
 
