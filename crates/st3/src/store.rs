@@ -54231,6 +54231,7 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("desired", &[]),
     ("arrangements", &["changed_index"]),
     ("arrangement_registers", &[]),
+    ("declared_resource_edges", &[]),
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),

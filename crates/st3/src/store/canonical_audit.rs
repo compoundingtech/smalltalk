@@ -8,6 +8,7 @@ const SHARED_TABLES: &[(&str, &[&str])] = &[
     ("desired", &[]),
     ("arrangements", &["changed_index"]),
     ("arrangement_registers", &[]),
+    ("declared_resource_edges", &[]),
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),
@@ -417,7 +418,7 @@ fn write_audit_history(source: &Store) {
     publish_takeover(
         source,
         &format!(
-            "{TAKEOVER_SOURCE}\nagent \"alder.worker\" {{ workspace \"/tmp/audit\"; command \"true\" }}"
+            "{TAKEOVER_SOURCE}\nagent \"alder.worker\" {{ workspace \"/tmp/audit\"; command \"true\"; resource \"change\" subject=\"resource/audit/pull-request/1\" reason=\"Review the change.\" }}"
         ),
         "audit-desired",
     );
