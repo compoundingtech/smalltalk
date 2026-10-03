@@ -1,4 +1,4 @@
-use crate::{Body, Entry, ToolState, clean_message_text};
+use crate::{Body, Entry, MailImage, ToolState, clean_message_text};
 use serde_json::Value;
 use st3_client::{TimelineBody, TimelineEntry, TimelineRole, TimelineToolStatus};
 use std::collections::{BTreeMap, BTreeSet};
@@ -91,17 +91,31 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     ("", None) => ("Small Talk".to_owned(), String::new()),
                     (from, to) => (name(from), name(to.unwrap_or_default())),
                 };
+                let images = message
+                    .attachments
+                    .iter()
+                    .filter(|attachment| attachment.media_type.starts_with("image/"))
+                    .map(|attachment| MailImage {
+                        sha256: attachment.sha256.clone(),
+                        message: message.message_id.clone(),
+                        media_type: attachment.media_type.clone(),
+                        name: attachment.name.clone(),
+                        size: attachment.size,
+                    })
+                    .collect::<Vec<_>>();
                 Body::Mail {
                     from,
                     to,
                     subject: message.title.clone().unwrap_or_default(),
-                    body: if body.is_empty() {
+                    // A message may be only its images.
+                    body: if body.is_empty() && images.is_empty() {
                         "(notification)".into()
                     } else {
                         body
                     },
                     delivered: false,
                     dictated: message.tags.iter().any(|tag| tag == "dictated"),
+                    images,
                 }
             };
             stamped.push((
@@ -460,6 +474,7 @@ fn harness_bodies(
             body: clean_message_text(&unescape(&block)),
             delivered: false,
             dictated: false,
+            images: Vec::new(),
         });
     }
     // A `<channel>` delivery announces mail that is already in the stream, so it becomes one line.

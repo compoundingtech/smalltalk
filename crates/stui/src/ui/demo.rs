@@ -1212,6 +1212,7 @@ fn cos_conversation() -> Vec<Entry> {
                 ),
                 delivered: false,
                 dictated: false,
+                images: Vec::new(),
             },
         ),
         e(
@@ -1238,6 +1239,7 @@ fn cos_conversation() -> Vec<Entry> {
                 ),
                 delivered: false,
                 dictated: false,
+                images: Vec::new(),
             },
         ),
         e(
@@ -1414,6 +1416,7 @@ pub fn late_mail() -> Entry {
             ),
             delivered: false,
             dictated: false,
+            images: Vec::new(),
         },
     )
 }
