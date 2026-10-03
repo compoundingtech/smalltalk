@@ -460,6 +460,10 @@ const PROBES: &[Probe] = &[
         "GET /v1/client/conversations/{id}/changes",
         "/v1/client/conversations/{session}/changes",
     ),
+    get(
+        "GET /v1/client/conversations/search",
+        "/v1/client/conversations/search?text=invented&limit=20",
+    ),
     get("GET /v1/client/missions", "/v1/client/missions"),
     get("GET /v1/client/missions-tree", "/v1/client/missions-tree"),
     get(
