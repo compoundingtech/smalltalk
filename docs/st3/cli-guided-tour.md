@@ -497,8 +497,10 @@ st gh watch --help
 st gh ls --all
 ```
 
-`watch` and `unwatch` are agent-only and mutating, and `watch` asks GitHub about the thread, so the
-live human tour reviews help and `ls --all`; the automated watch tests cover the rest.
+`comment` posts as the seat and records the new comment's GitHub ID as its own, so the seat's
+watches skip it; `own URL` records one posted some other way. `watch`, `unwatch`, `comment` and
+`own` are agent-only and mutating, and they reach GitHub, so the live human tour reviews help and
+`ls --all`; the automated watch tests cover the rest.
 
 ### 19. `skill` — how an agent seat uses st
 

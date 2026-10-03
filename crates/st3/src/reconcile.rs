@@ -27683,6 +27683,88 @@ agent "example.reviewer" { workspace "/tmp"; command "true" }"#,
         assert_eq!(view["ended"], "merged");
     }
 
+    /// Two seats post as one GitHub login and watch one thread. A comment one seat recorded as
+    /// its own wakes only the other, which hears whose it was; an unrecorded comment from that
+    /// login wakes both, since a person may share it. A wake that reached the poster before its
+    /// record did closes when the record lands.
+    #[test]
+    fn a_seats_own_comment_wakes_only_the_other_seat_by_its_github_id() {
+        let fixture = WatchFixture::new();
+        let planner = "agent/example.planner";
+        let reviewer = "agent/example.reviewer";
+        let thread = crate::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+        fixture.watch("acme/garden#12", planner);
+        fixture.watch("acme/garden#12", reviewer);
+        let by = |id: u64, login: &str, seconds_ago: i64| serde_json::json!({"kind": "comment", "id": id, "author": login, "at": just_now(seconds_ago)});
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({}))]}));
+        fixture
+            .store
+            .record_github_post(
+                planner,
+                &thread,
+                "comment",
+                95,
+                "https://github.com/acme/garden/pull/12#issuecomment-95",
+                "fleet-login",
+            )
+            .unwrap();
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [by(95, "fleet-login", 30), by(96, "fleet-login", 20), by(97, "fern", 10)]}))]}));
+        assert_eq!(
+            fixture.wakes(planner),
+            [
+                "@fleet-login commented on acme/garden#12",
+                "@fern commented on acme/garden#12"
+            ]
+        );
+        assert_eq!(
+            fixture.wakes(reviewer),
+            [
+                "agent/example.planner (as @fleet-login) commented on acme/garden#12",
+                "@fleet-login commented on acme/garden#12",
+                "@fern commented on acme/garden#12",
+            ]
+        );
+
+        // The observing host saw the reviewer's comment before its record arrived.
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [by(98, "fleet-login", 5)]}))]}));
+        let open = |agent: &str| {
+            fixture
+                .store
+                .messages(Some(agent), false)
+                .unwrap()
+                .into_iter()
+                .filter(|message| message.content.contains("#issuecomment-98"))
+                .count()
+        };
+        assert_eq!(open(reviewer), 1);
+        fixture
+            .store
+            .record_github_post(
+                reviewer,
+                &thread,
+                "comment",
+                98,
+                "https://github.com/acme/garden/pull/12#issuecomment-98",
+                "fleet-login",
+            )
+            .unwrap();
+        assert_eq!(open(reviewer), 0, "the record closes the reviewer's wake");
+        assert_eq!(open(planner), 1, "the planner still hears it");
+
+        // The first seat to record an ID keeps it.
+        let refused = fixture
+            .store
+            .record_github_post(planner, &thread, "comment", 98, "", "fleet-login")
+            .unwrap_err();
+        assert_eq!(refused.code, "github-post-registered");
+        fixture
+            .store
+            .record_github_post(reviewer, &thread, "comment", 98, "", "fleet-login")
+            .unwrap();
+    }
+
     /// The host that declared a watch ends it when its deadline passes, with a final wake, and
     /// when its seat stops, without one, and stops each ended watch's declaration. The
     /// repository's standing observer stops once no running watch uses it.

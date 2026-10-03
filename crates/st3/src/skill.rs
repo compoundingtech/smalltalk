@@ -89,6 +89,7 @@ mod tests {
             "`work cancel-ask PERSON_STEP --as \"$ST_AGENT\" --reason TEXT`",
             "Keys typed into another agent's terminal",
             "`\"$ST3_BIN\" gh watch OWNER/REPO#N --as \"$ST_AGENT\"`",
+            "`gh comment OWNER/REPO#N --body-file FILE --as \"$ST_AGENT\"`",
         ] {
             assert!(body.contains(usage), "{usage}");
         }

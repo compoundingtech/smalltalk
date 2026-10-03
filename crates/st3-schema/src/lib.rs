@@ -630,6 +630,12 @@ fn build_registry() -> Registry {
             "A single-use fleet join invite.",
             false,
         ),
+        (
+            "github-post",
+            "github-post/OWNER/REPO/KIND/ID",
+            "A GitHub comment or review an agent seat posted, by its GitHub ID.",
+            false,
+        ),
         ("host", "host/NAME", "A graph host.", false),
         (
             "lane",
@@ -1901,6 +1907,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["subscription"],
         ),
         (
+            "github.posted",
+            &["github-post"],
+            WritePolicy::SystemOnly,
+            Cardinality::Once,
+            Some("subscriptions"),
+            true,
+            &[],
+        ),
+        (
             "subscription.watch-ended",
             &["subscription"],
             WritePolicy::SystemOnly,
@@ -3101,6 +3116,15 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("entries", required_array()),
             ("delivery_key", required_string()),
         ],
+        "github.posted" => &[
+            ("agent", required_reference_to(&["agent"])),
+            ("repository", required_string()),
+            ("item", required_integer()),
+            ("kind", required_enum(&["comment", "review"])),
+            ("id", required_integer()),
+            ("url", string()),
+            ("login", string()),
+        ],
         "subscription.watch-ended" => &[
             (
                 "reason",
@@ -3355,6 +3379,7 @@ mod tests {
                 "file",
                 "fleet-invite",
                 "gate-operation",
+                "github-post",
                 "glass",
                 "host",
                 "lane",
@@ -3439,6 +3464,7 @@ mod tests {
                 "fleet.member-removed",
                 "gate.requested",
                 "gate.result",
+                "github.posted",
                 "glass.deleted",
                 "glass.upserted",
                 "harness.context-clear.requested",

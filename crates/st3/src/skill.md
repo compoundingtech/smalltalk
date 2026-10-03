@@ -45,7 +45,7 @@ A fault arrives as a message to the agent that owns it, which retries, revises o
 
 ## GitHub
 
-`"$ST3_BIN" gh watch OWNER/REPO#N --as "$ST_AGENT"` wakes this seat once for each new comment or review on that issue or pull request, each time the required checks on its current head turn pass or fail, and when it closes or merges, which ends the watch; `--until 4h` ends it sooner. `gh ls` lists this seat's watches and `gh unwatch OWNER/REPO#N` ends one.
+`"$ST3_BIN" gh watch OWNER/REPO#N --as "$ST_AGENT"` wakes this seat once for each new comment or review on that issue or pull request, each time the required checks on its current head turn pass or fail, and when it closes or merges, which ends the watch; `--until 4h` ends it sooner. `gh ls` lists this seat's watches and `gh unwatch OWNER/REPO#N` ends one. A comment posted with `gh comment OWNER/REPO#N --body-file FILE --as "$ST_AGENT"` (or a review, with `--review approve|request-changes|comment`) is recorded as this seat's by its GitHub ID, so it wakes no watch of this seat, and the thread is watched; `gh own URL` records one posted another way.
 
 ## Other agents' terminals
 

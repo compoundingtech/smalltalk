@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `7073d20d4b56b904016360a315855951a5c6d24c1731c47ee9d4813a8e73e40e`
+Digest: `8282e4800a05b2d3833c5bda12437aa1cc3217049021a21bcf747ee2e9db5865`
 
 ## Subject families
 
@@ -21,6 +21,7 @@ Digest: `7073d20d4b56b904016360a315855951a5c6d24c1731c47ee9d4813a8e73e40e`
 | `file` | `file/HOST:/ABSOLUTE_PATH` | no | A read-only file gate target. |
 | `fleet-invite` | `fleet-invite/ID` | no | A single-use fleet join invite. |
 | `gate-operation` | `gate-operation/IDENTITY` | no | One gate evaluation attempt. |
+| `github-post` | `github-post/OWNER/REPO/KIND/ID` | no | A GitHub comment or review an agent seat posted, by its GitHub ID. |
 | `glass` | `glass/person/NAME/UUID` | no | A private person workspace. |
 | `host` | `host/NAME` | no | A graph host. |
 | `lane` | `lane/RUN/LOCAL_ID` | no | A mission-run lane: an ordered line of entries its run works through front first. |
@@ -85,6 +86,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `fleet.member-removed` | `host` | `system-only` | `append` | `durable` | `high_water!:integer`, `member_key:string`, `reason!:string`, `removed_by:subject-reference(person)` |  |
 | `gate.requested` | `gate-operation` | `system-only` | `once` | `durable` | `attempt:integer`, `baseline:boolean`, `capability_expires_at:string`, `capability_hash:string`, `decisions:array`, `gate:string`, `mission_revision:string`, `mode:string`, `model:string`, `operation:subject-reference`, `owner:subject-reference`, `question:string`, `review_targets:array`, `reviewer:subject-reference`, `runner:string`, `status:string`, `step_definition:string`, `token_budget:integer`, `tools:array` | `gate` |
 | `gate.result` | `gate-operation` | `capability-holder` | `append` | `durable` | `baseline:boolean`, `decision:string`, `field:string`, `gate:string`, `operation:subject-reference`, `reason:string`, `request:string`, `stage:string`, `token_usage:integer`, `value:any`, `verdict!:string` | `gate` |
+| `github.posted` | `github-post` | `system-only` | `once` | `durable` | `agent!:subject-reference(agent)`, `id!:integer`, `item!:integer`, `kind!:string`, `login:string`, `repository!:string`, `url:string` |  |
 | `glass.deleted` | `glass` | `authorized-requester` | `append` | `durable` | `base_revision:string`, `replaced_revision:string` |  |
 | `glass.upserted` | `glass` | `authorized-requester` | `append` | `durable` | `base_revision:string`, `body:object`, `replaced_revision:string` |  |
 | `harness.context-clear.requested` | `agent` | `authorized-requester` | `append` | `durable` | `context_epoch:string`, `incarnation_id:string`, `operation_status:string`, `runtime_id:string` |  |

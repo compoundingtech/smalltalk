@@ -116,11 +116,28 @@ fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
         .into_iter()
         .next();
     let messages = if binding.component == "delivery" {
-        store
+        let mut messages = Vec::new();
+        for message in store
             .messages(Some(&binding.subject), false)?
             .into_iter()
             .filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered"))
-            .collect()
+        {
+            // A watch never tells a seat about what it posted: a wake for a comment the seat
+            // recorded closes here, and a thread's wakes wait while the seat's post is in flight.
+            if let Some((locator, kind, id)) = crate::github_watch::named_object(&message) {
+                if crate::github_watch::post_in_flight(&binding.subject, &message) {
+                    continue;
+                }
+                if store.github_post_agent(&locator, &kind, id)?.as_deref()
+                    == Some(binding.subject.as_str())
+                {
+                    store.close_own_post_wakes(&binding.subject)?;
+                    continue;
+                }
+            }
+            messages.push(message);
+        }
+        messages
     } else {
         Vec::new()
     };

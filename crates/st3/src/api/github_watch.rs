@@ -22,6 +22,31 @@ pub struct UnwatchRequest {
     pub agent: Option<String>,
 }
 
+/// Post a comment, or a pull request review, as one seat.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CommentRequest {
+    pub actor: String,
+    pub thread: String,
+    pub body: String,
+    /// `approve`, `request-changes` or `comment` posts a pull request review instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
+    /// Watch the thread too, unless the seat already does.
+    #[serde(default = "watch_by_default")]
+    pub watch: bool,
+}
+
+fn watch_by_default() -> bool {
+    true
+}
+
+/// Record a comment or review a seat posted some other way, by its URL.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OwnRequest {
+    pub actor: String,
+    pub url: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct WatchesQuery {
     #[serde(default)]
@@ -159,6 +184,271 @@ pub(super) async fn watch(
     Ok(Json(view))
 }
 
+/// A comment or review GitHub answered with: its kind, ID, link and author.
+#[derive(Debug)]
+struct Posted {
+    kind: &'static str,
+    id: u64,
+    url: String,
+    login: String,
+}
+
+fn posted(kind: &'static str, answer: &Value) -> Result<Posted, ApiError> {
+    Ok(Posted {
+        kind,
+        id: answer
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| bad("github-unreachable", "GitHub's answer named no ID"))?,
+        url: answer
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        login: answer
+            .pointer("/user/login")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    })
+}
+
+async fn github_send(
+    request: reqwest::RequestBuilder,
+    token: &str,
+    what: &str,
+) -> Result<Value, ApiError> {
+    let response = request
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| {
+            bad(
+                "github-unreachable",
+                format!("GitHub did not answer: {error}"),
+            )
+        })?;
+    let status = response.status();
+    let answer = response.json::<Value>().await.unwrap_or(Value::Null);
+    if status.is_success() {
+        return Ok(answer);
+    }
+    let message = answer
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Err(bad(
+        if status == reqwest::StatusCode::NOT_FOUND {
+            "github-thread-not-found"
+        } else {
+            "github-refused"
+        },
+        format!("GitHub refused {what} with HTTP {status}: {message}"),
+    ))
+}
+
+/// Post a comment, or a review of a pull request, and return what GitHub created.
+async fn post_at(
+    api_base: &str,
+    token: &str,
+    thread: &ThreadRef,
+    body: &str,
+    review: Option<&str>,
+) -> Result<Posted, ApiError> {
+    let client = crate::resource::github_api_client();
+    let base = format!("{api_base}/repos/{}", thread.locator());
+    match review {
+        None => {
+            let answer = github_send(
+                client
+                    .post(format!("{base}/issues/{}/comments", thread.number))
+                    .json(&json!({"body": body})),
+                token,
+                "the comment",
+            )
+            .await?;
+            posted("comment", &answer)
+        }
+        Some(review) => {
+            let event = match review {
+                "approve" => "APPROVE",
+                "request-changes" => "REQUEST_CHANGES",
+                "comment" => "COMMENT",
+                other => {
+                    return Err(bad(
+                        "invalid-github-review",
+                        format!("a review is approve, request-changes or comment, not `{other}`"),
+                    ));
+                }
+            };
+            let answer = github_send(
+                client
+                    .post(format!("{base}/pulls/{}/reviews", thread.number))
+                    .json(&json!({"body": body, "event": event})),
+                token,
+                "the review",
+            )
+            .await?;
+            posted("review", &answer)
+        }
+    }
+}
+
+/// The comment or review a GitHub URL names: `#issuecomment-ID` or `#pullrequestreview-ID`.
+fn object_of(url: &str) -> Result<(ThreadRef, &'static str, u64), ApiError> {
+    let thread = ThreadRef::parse(url).map_err(ApiError::bad)?;
+    let fragment = url
+        .rsplit_once('#')
+        .map(|(_, fragment)| fragment)
+        .unwrap_or_default();
+    let (kind, id) = if let Some(id) = fragment.strip_prefix("issuecomment-") {
+        ("comment", id)
+    } else if let Some(id) = fragment.strip_prefix("pullrequestreview-") {
+        ("review", id)
+    } else {
+        return Err(bad(
+            "invalid-github-post",
+            "the URL names no comment (#issuecomment-ID) or review (#pullrequestreview-ID)",
+        ));
+    };
+    let id = id
+        .parse::<u64>()
+        .map_err(|_| bad("invalid-github-post", format!("`{id}` is not a GitHub ID")))?;
+    Ok((thread, kind, id))
+}
+
+/// Read a comment or review by its ID, and the login this daemon's token posts as.
+async fn read_object_at(
+    api_base: &str,
+    token: &str,
+    thread: &ThreadRef,
+    kind: &'static str,
+    id: u64,
+) -> Result<(Posted, String), ApiError> {
+    let client = crate::resource::github_api_client();
+    let base = format!("{api_base}/repos/{}", thread.locator());
+    let url = if kind == "review" {
+        format!("{base}/pulls/{}/reviews/{id}", thread.number)
+    } else {
+        format!("{base}/issues/comments/{id}")
+    };
+    let object = posted(
+        kind,
+        &github_send(client.get(url), token, "the read").await?,
+    )?;
+    let me = github_send(client.get(format!("{api_base}/user")), token, "the read").await?;
+    let login = me
+        .get("login")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok((object, login))
+}
+
+pub(super) async fn comment(
+    State(state): State<AppState>,
+    Json(request): Json<CommentRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let thread = ThreadRef::parse(&request.thread).map_err(ApiError::bad)?;
+    if !request.actor.starts_with("agent/") {
+        return Err(bad(
+            "watch-needs-a-seat",
+            "st gh comment posts as an agent seat; run it inside the seat",
+        ));
+    }
+    if request.body.trim().is_empty() {
+        return Err(bad("empty-github-comment", "the comment has no text"));
+    }
+    let token = crate::resource::github_token().await.map_err(|_| {
+        bad(
+            "github-unauthenticated",
+            crate::resource::GITHUB_AUTH_REMEDY,
+        )
+    })?;
+    // The seat's wakes on this thread wait until st knows the new comment's ID.
+    let in_flight = crate::github_watch::PostInFlight::begin(&request.actor, &thread);
+    let posted = post_at(
+        &crate::resource::github_api_base(),
+        &token,
+        &thread,
+        &request.body,
+        request.review.as_deref(),
+    )
+    .await?;
+    let store = state.store.clone();
+    let actor = request.actor.clone();
+    let watch = request.watch;
+    let recorded_thread = thread.clone();
+    let (record, view) = blocking_action(move || {
+        let record = store.record_github_post(
+            &actor,
+            &recorded_thread,
+            posted.kind,
+            posted.id,
+            &posted.url,
+            &posted.login,
+        )?;
+        let view = if watch && store.live_watch(&recorded_thread.watch(&actor))?.is_none() {
+            Some(store.declare_watch(&recorded_thread, &actor, None)?)
+        } else {
+            store.watch_view(&recorded_thread.watch(&actor))?
+        };
+        Ok((record, view))
+    })
+    .await?;
+    drop(in_flight);
+    signal_changed(&state);
+    let mut record = record;
+    record["watch"] = view.unwrap_or(Value::Null);
+    Ok(Json(record))
+}
+
+pub(super) async fn own(
+    State(state): State<AppState>,
+    Json(request): Json<OwnRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !request.actor.starts_with("agent/") {
+        return Err(bad(
+            "watch-needs-a-seat",
+            "a comment is recorded as one agent seat's; run st gh own inside the seat",
+        ));
+    }
+    let (thread, kind, id) = object_of(&request.url)?;
+    let token = crate::resource::github_token().await.map_err(|_| {
+        bad(
+            "github-unauthenticated",
+            crate::resource::GITHUB_AUTH_REMEDY,
+        )
+    })?;
+    let (object, login) = read_object_at(
+        &crate::resource::github_api_base(),
+        &token,
+        &thread,
+        kind,
+        id,
+    )
+    .await?;
+    if object.login.is_empty() || !object.login.eq_ignore_ascii_case(&login) {
+        return Err(bad(
+            "github-post-not-ours",
+            format!(
+                "{kind} {id} was posted by @{}, not by @{login}, the login this host posts as",
+                object.login
+            ),
+        ));
+    }
+    let store = state.store.clone();
+    let actor = request.actor.clone();
+    let record = blocking_action(move || {
+        store.record_github_post(&actor, &thread, kind, id, &object.url, &object.login)
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(record))
+}
+
 pub(super) async fn unwatch(
     State(state): State<AppState>,
     Json(request): Json<UnwatchRequest>,
@@ -256,6 +546,106 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         base
+    }
+
+    /// A GitHub where this token posts as `fleet-login`, with one comment of its own and one of
+    /// a person's.
+    async fn posting_github() -> String {
+        let app = Router::new()
+            .route(
+                "/repos/acme/garden/issues/12/comments",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body["body"], "The seed list is ready.");
+                    Json(json!({"id": 501, "user": {"login": "fleet-login"},
+                        "html_url": "https://github.com/acme/garden/pull/12#issuecomment-501"}))
+                }),
+            )
+            .route(
+                "/repos/acme/garden/pulls/12/reviews",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body["event"], "REQUEST_CHANGES");
+                    Json(json!({"id": 7001, "user": {"login": "fleet-login"},
+                        "html_url": "https://github.com/acme/garden/pull/12#pullrequestreview-7001"}))
+                }),
+            )
+            .route(
+                "/repos/acme/garden/issues/comments/502",
+                get(|| async { Json(json!({"id": 502, "user": {"login": "nathan-example"}})) }),
+            )
+            .route(
+                "/repos/acme/garden/issues/comments/503",
+                get(|| async { Json(json!({"id": 503, "user": {"login": "Fleet-Login"},
+                    "html_url": "https://github.com/acme/garden/issues/12#issuecomment-503"})) }),
+            )
+            .route("/user", get(|| async { Json(json!({"login": "fleet-login"})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn a_post_returns_its_github_id_and_only_this_logins_posts_can_be_recorded() {
+        let github = posting_github().await;
+        let thread = ThreadRef::parse("acme/garden#12").unwrap();
+        let comment = post_at(
+            &github,
+            "orchid-token",
+            &thread,
+            "The seed list is ready.",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((comment.kind, comment.id), ("comment", 501));
+        assert_eq!(comment.login, "fleet-login");
+        let review = post_at(
+            &github,
+            "orchid-token",
+            &thread,
+            "Two fixes.",
+            Some("request-changes"),
+        )
+        .await
+        .unwrap();
+        assert_eq!((review.kind, review.id), ("review", 7001));
+        assert_eq!(
+            post_at(&github, "orchid-token", &thread, "x", Some("maybe"))
+                .await
+                .unwrap_err()
+                .code,
+            "invalid-github-review"
+        );
+
+        let (thread, kind, id) =
+            object_of("https://github.com/acme/garden/issues/12#issuecomment-502").unwrap();
+        let (object, login) = read_object_at(&github, "orchid-token", &thread, kind, id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (object.login.as_str(), login.as_str()),
+            ("nathan-example", "fleet-login")
+        );
+        let (thread, kind, id) =
+            object_of("https://github.com/acme/garden/issues/12#issuecomment-503").unwrap();
+        let (object, login) = read_object_at(&github, "orchid-token", &thread, kind, id)
+            .await
+            .unwrap();
+        assert!(object.login.eq_ignore_ascii_case(&login));
+        assert_eq!(
+            object_of("https://github.com/acme/garden/pull/12#pullrequestreview-7001")
+                .unwrap()
+                .1,
+            "review"
+        );
+        assert_eq!(
+            object_of("https://github.com/acme/garden/pull/12")
+                .unwrap_err()
+                .code,
+            "invalid-github-post"
+        );
     }
 
     #[tokio::test]

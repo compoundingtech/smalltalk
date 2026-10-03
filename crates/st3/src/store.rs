@@ -1778,11 +1778,31 @@ pub(crate) fn end_watch_tx(
 
 /// The seat that registered a comment or review, by its GitHub ID, never by login.
 pub(crate) fn github_posted_by_tx(
-    _connection: &Connection,
-    _thread: &crate::github_watch::ThreadRef,
-    _entry: &Value,
+    connection: &Connection,
+    thread: &crate::github_watch::ThreadRef,
+    entry: &Value,
 ) -> Result<Option<String>, St3Error> {
-    Ok(None)
+    let (kind, id) = crate::resource::recent_comment_key(entry);
+    github_post_agent_tx(connection, &thread.locator(), &kind, id)
+}
+
+/// The seat that registered the comment or review `kind` `id` of a repository.
+pub(crate) fn github_post_agent_tx(
+    connection: &Connection,
+    locator: &str,
+    kind: &str,
+    id: u64,
+) -> Result<Option<String>, St3Error> {
+    let subject = crate::github_watch::github_post_subject(locator, kind, id);
+    let body = connection
+        .prepare_cached("SELECT body FROM claims WHERE subject=?1 AND kind='github.posted' LIMIT 1")
+        .map_err(internal)?
+        .query_row([&subject], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(internal)?;
+    Ok(body
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|body| body["fields"]["agent"].as_str().map(str::to_owned)))
 }
 
 /// The live agent that owns a repository item, and why: the agent named as its opener while its

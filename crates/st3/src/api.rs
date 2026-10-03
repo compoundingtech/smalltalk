@@ -635,6 +635,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/github/watch", post(github_watch::watch))
         .route("/v1/github/unwatch", post(github_watch::unwatch))
         .route("/v1/github/watches", get(github_watch::watches))
+        .route("/v1/github/comment", post(github_watch::comment))
+        .route("/v1/github/own", post(github_watch::own))
         .route("/v1/work/done", post(done_person_step))
         .route("/v1/work/cancel-ask", post(cancel_person_ask))
         .route("/v1/work", get(list_work))

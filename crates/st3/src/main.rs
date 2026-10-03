@@ -2923,6 +2923,48 @@ enum GhCommand {
     Unwatch(GhUnwatchArgs),
     /// List this seat's watches, running and ended in the last day, or every seat's with --all.
     Ls(GhLsArgs),
+    /// Post a comment, or a pull request review, as this seat. st records the new comment's
+    /// GitHub ID as this seat's, so it wakes no watch of this seat and other seats' wakes name
+    /// this seat; it also watches the thread unless --no-watch.
+    #[command(
+        after_help = "Examples:\n  st gh comment acme/garden#12 --body 'The seed list is ready.'\n  st gh comment acme/garden#12 --body-file review.md --review request-changes"
+    )]
+    Comment(GhCommentArgs),
+    /// Record a comment or review this seat posted some other way, by its URL, as this seat's.
+    /// A watch that already reported it woke the seat once.
+    Own(GhOwnArgs),
+}
+
+#[derive(Args)]
+struct GhCommentArgs {
+    /// OWNER/REPO#NUMBER, or the issue or pull request URL.
+    thread: String,
+    /// The comment's text.
+    #[arg(
+        long,
+        conflicts_with = "body_file",
+        required_unless_present = "body_file"
+    )]
+    body: Option<String>,
+    /// Read the comment's text from a file, or `-` for standard input.
+    #[arg(long)]
+    body_file: Option<PathBuf>,
+    /// Post a pull request review instead: approve, request-changes or comment.
+    #[arg(long)]
+    review: Option<String>,
+    /// Post without watching the thread.
+    #[arg(long)]
+    no_watch: bool,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+}
+
+#[derive(Args)]
+struct GhOwnArgs {
+    /// The comment's or review's URL: …#issuecomment-ID or …#pullrequestreview-ID.
+    url: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
 }
 
 #[derive(Args)]
@@ -4110,6 +4152,8 @@ fn guard_mutating_cli_actor(
         Command::Gh { command } => match command {
             GhCommand::Watch(args) => Some(args.actor.as_str()),
             GhCommand::Unwatch(args) => Some(args.actor.as_str()),
+            GhCommand::Comment(args) => Some(args.actor.as_str()),
+            GhCommand::Own(args) => Some(args.actor.as_str()),
             GhCommand::Ls(_) => None,
         },
         _ => None,
@@ -4200,6 +4244,58 @@ async fn run_gh(client: &st3::client::Client, command: GhCommand, json: bool) ->
             } else {
                 println!("{agent} has no running watch on {thread}.");
             }
+        }
+        GhCommand::Comment(args) => {
+            let body = match (args.body, args.body_file) {
+                (Some(body), _) => body,
+                (None, Some(path)) if path.as_os_str() == "-" => {
+                    let mut body = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut body)?;
+                    body
+                }
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?,
+                (None, None) => anyhow::bail!("give the comment's text with --body or --body-file"),
+            };
+            let posted: Value = client
+                .post(
+                    "/v1/github/comment",
+                    &json!({"actor": args.actor, "thread": args.thread, "body": body,
+                        "review": args.review, "watch": !args.no_watch}),
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&posted)?);
+                return Ok(());
+            }
+            let text = |name: &str| posted.get(name).and_then(Value::as_str).unwrap_or_default();
+            println!(
+                "Posted {} {} as this seat's: {}",
+                text("kind"),
+                posted["id"],
+                text("url")
+            );
+            if let Some(watch) = posted.get("watch").filter(|watch| !watch.is_null()) {
+                println!("Watching {}", gh_watch_line(watch, false));
+            }
+        }
+        GhCommand::Own(args) => {
+            let recorded: Value = client
+                .post(
+                    "/v1/github/own",
+                    &json!({"actor": args.actor, "url": args.url}),
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&recorded)?);
+                return Ok(());
+            }
+            println!(
+                "Recorded {} {} on {} as this seat's.",
+                recorded["kind"].as_str().unwrap_or_default(),
+                recorded["id"],
+                recorded["thread"].as_str().unwrap_or_default()
+            );
         }
         GhCommand::Ls(args) => {
             let agent = if args.all {

@@ -354,6 +354,20 @@ first 600 characters; the text is never stored in the graph.
 The host that declared a watch ends it without a wake when its seat's declaration ends, and with a
 final wake when its deadline passes, and then stops its declaration.
 
+Every fleet agent posts as one GitHub login, so a login cannot say which seat wrote a comment.
+`st gh comment OWNER/REPO#N --body-file FILE` posts through the seat's daemon, records the new
+comment's GitHub ID as the seat's (`github.posted` on `github-post/OWNER/REPO/KIND/ID`), and
+watches the thread unless `--no-watch`; `--review approve|request-changes|comment` posts a pull
+request review instead. `st gh own URL` records a comment or review posted some other way, and
+refuses one whose author is not the login this host posts as. The first seat to record an ID keeps
+it.
+
+A seat never wakes for what it recorded. The observing host writes no wake for it when the record
+has reached it, and the seat's own host, which knows its posts at once, withdraws any wake that
+arrived first and holds a thread's wakes while the seat's post is in flight. No one else waits:
+every other seat's wake about a recorded comment names the seat that posted it, and a comment from
+the shared login that no seat recorded wakes every watcher, since a person may share the login.
+
 ## Retention
 
 Each item resource keeps its latest state. An observation replicates only a change, and a checkpoint

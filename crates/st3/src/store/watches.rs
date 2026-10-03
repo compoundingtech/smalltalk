@@ -295,4 +295,94 @@ impl Store {
         }
         Ok(views)
     }
+
+    /// Record that a seat posted a comment or review, by its GitHub ID. The first seat to record
+    /// an ID keeps it; recording it again as that seat changes nothing.
+    pub fn record_github_post(
+        &self,
+        agent: &str,
+        thread: &ThreadRef,
+        kind: &str,
+        id: u64,
+        url: &str,
+        login: &str,
+    ) -> Result<Value, St3Error> {
+        let locator = thread.locator();
+        if let Some(owner) = self.github_post_agent(&locator, kind, id)? {
+            if owner != agent {
+                return Err(St3Error::new(
+                    "github-post-registered",
+                    format!("{kind} {id} on {thread} is already recorded as {owner}'s"),
+                ));
+            }
+        } else {
+            self.append_claim(&ClaimInput {
+                subject: github_watch::github_post_subject(&locator, kind, id),
+                kind: "github.posted".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("agent".into(), Value::String(agent.to_owned())),
+                    ("repository".into(), Value::String(locator.clone())),
+                    ("item".into(), Value::from(thread.number)),
+                    ("kind".into(), Value::String(kind.to_owned())),
+                    ("id".into(), Value::from(id)),
+                    ("url".into(), Value::String(url.to_owned())),
+                    ("login".into(), Value::String(login.to_owned())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("github-posted:{locator}:{kind}:{id}")),
+            })?;
+        }
+        self.close_own_post_wakes(agent)?;
+        Ok(json!({
+            "agent": agent,
+            "thread": thread.to_string(),
+            "kind": kind,
+            "id": id,
+            "url": url,
+        }))
+    }
+
+    /// The seat that recorded a comment or review, by its GitHub ID.
+    pub fn github_post_agent(
+        &self,
+        locator: &str,
+        kind: &str,
+        id: u64,
+    ) -> Result<Option<String>, St3Error> {
+        let connection = self.readers.get();
+        github_post_agent_tx(&connection, locator, kind, id)
+    }
+
+    /// Withdraw each undelivered wake of a seat about a comment or review it recorded as its own,
+    /// so the seat never hears about what it posted. Such a wake exists when another host observed
+    /// the comment before the seat's record reached it.
+    pub fn close_own_post_wakes(&self, agent: &str) -> Result<Vec<String>, St3Error> {
+        let mut closed = Vec::new();
+        for message in self
+            .messages(Some(agent), false)
+            .map_err(internal)?
+            .into_iter()
+            .filter(|message| matches!(message.status.as_str(), "sent" | "staged"))
+        {
+            let Some((locator, kind, id)) = github_watch::named_object(&message) else {
+                continue;
+            };
+            if self.github_post_agent(&locator, &kind, id)?.as_deref() != Some(agent) {
+                continue;
+            }
+            self.append_claim(&ClaimInput {
+                subject: message.subject.clone(),
+                kind: "message.closed".into(),
+                actor: Some("daemon/runtime".into()),
+                fields: BTreeMap::from([("status".into(), Value::String("closed".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("message-closed:{}", message.subject)),
+            })?;
+            closed.push(message.subject);
+        }
+        Ok(closed)
+    }
 }
