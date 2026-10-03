@@ -160,7 +160,9 @@ work and generations without changing the seat's identity.
 
 `st agents start EXISTING --as person/NAME` keeps the seat's declaration. Only fields explicitly
 passed through `--host`, `--workspace`, `--harness`, `--model`, `--effort`, or `--arg` are changed;
-unspecified restart, launch, environment, and other settings remain intact. A placement override
+unspecified restart, launch, environment, and other settings remain intact. A running seat whose
+workspace, harness, model, effort or arguments change this way restarts on the new declaration and
+continues its harness's last native session. A placement override
 does not rename an existing seat: pass its complete subject when moving it to another host.
 `--model`, `--effort`, and `--arg` require a typed `harness` block and are refused for
 `command`/`argv` declarations. `--harness` alone can explicitly switch the launch style.

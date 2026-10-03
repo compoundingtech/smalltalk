@@ -536,6 +536,9 @@ pub struct Reconciler<R = NativeRuntime> {
     /// index of the subject's newest declaration it was read from.
     declared_checkouts: Mutex<HashMap<String, (u64, Option<(Checkout, String)>)>>,
     materialized_mission_generations: Mutex<BTreeSet<String>>,
+    /// Each running seat's incarnation and the member it was launched from, read once per
+    /// incarnation, so a pass compares the declared launch without reading the store.
+    launched_members: Mutex<HashMap<String, (String, Option<MemberSpec>)>>,
     retired_predecessor_generations: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     mission_declaration_parses: std::sync::atomic::AtomicUsize,
@@ -649,6 +652,7 @@ impl Reconciler<NativeRuntime> {
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
+            launched_members: Mutex::new(HashMap::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
@@ -701,6 +705,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
+            launched_members: Mutex::new(HashMap::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
@@ -1627,6 +1632,38 @@ impl<R: RuntimeControl> Reconciler<R> {
                 match observed {
                     Some(observation) if observation.status == "running" => {
                         self.record_member(subject, &observation, true)?;
+                        if let Some(changes) =
+                            self.declared_launch_changes(subject, member, &observation)?
+                        {
+                            // Rendering must succeed before we shut down a still-running seat.
+                            if let Some(error) = blocked.take() {
+                                return Err(error);
+                            }
+                            self.record_once(
+                                &subject.subject,
+                                "runtime.reconcile-decision",
+                                BTreeMap::from([
+                                    ("decision".into(), Value::String("restart".into())),
+                                    ("reachability".into(), Value::String("reachable".into())),
+                                    (
+                                        "reason".into(),
+                                        Value::String(format!(
+                                            "the declared {} changed",
+                                            changes.join(" and ")
+                                        )),
+                                    ),
+                                ]),
+                            )?;
+                            self.reconcile_runtime_stop(
+                                &subject.subject,
+                                &member.runtime_id,
+                                member.terminal,
+                                observation.incarnation_id.as_deref(),
+                                member.shutdown_timeout_ms,
+                                Some(&observation),
+                            )?;
+                            return Ok(());
+                        }
                         self.reconcile_claude_auth_screen(subject, member, &observation)?;
                         self.reconcile_claude_trust_screen(
                             subject,
@@ -2875,6 +2912,60 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Whether the latest launch was for the selected declaration, or for a revision it only
     /// relabels. Older launches do not count: after A → B → A the seat runs A again.
+    /// What a running seat's declaration changed about how it launches since its running
+    /// incarnation started, when that matters: its host, workspace, harness, terminal, command,
+    /// model or arguments. A seat st did not launch, or whose launch it no longer has, has
+    /// nothing to compare and keeps running.
+    fn declared_launch_changes(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: &RuntimeObservation,
+    ) -> Result<Option<Vec<&'static str>>> {
+        if subject.kind != "agent" || member.lifecycle != MemberLifecycle::Service {
+            return Ok(None);
+        }
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(None);
+        };
+        let mut launched = self
+            .launched_members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let launched = match launched.get(&subject.subject) {
+            Some((known, launched)) if known == incarnation => launched.clone(),
+            _ => {
+                // The latest start this node made launched the running incarnation; an adopted
+                // runtime it did not start has none, or an older one it then outlived.
+                let read = self
+                    .store
+                    .observations_for(&subject.subject, "runtime.action.succeeded")?
+                    .iter()
+                    .rev()
+                    .find_map(|claim| {
+                        claim
+                            .body
+                            .pointer("/fields/desired_token")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .map(|token| self.store.claim_by_id(&token))
+                    .transpose()?
+                    .flatten()
+                    .and_then(|claim| serde_json::from_value::<DesiredSubject>(claim.body).ok())
+                    .and_then(|desired| desired.member);
+                launched.insert(
+                    subject.subject.clone(),
+                    (incarnation.to_owned(), read.clone()),
+                );
+                read
+            }
+        };
+        Ok(launched
+            .map(|launched| member.launch_changes(&launched))
+            .filter(|changes| !changes.is_empty()))
+    }
+
     fn member_was_launched_for_selected_desired(&self, subject: &str) -> Result<bool> {
         let lineage = self.store.launch_lineage(subject)?;
         Ok(self
@@ -3445,6 +3536,34 @@ impl<R: RuntimeControl> Reconciler<R> {
             launch_member
                 .environment
                 .remove(crate::suspension::RESUME_ENV);
+        }
+        // Every other relaunch of a seat continues the native session its harness last bound,
+        // so a restart, a hangup or a changed declaration never loses the conversation.
+        launch_member
+            .environment
+            .remove(crate::suspension::CONTINUE_ENV);
+        launch_member
+            .environment
+            .remove(crate::suspension::CONTINUE_PATH_ENV);
+        let continued = if subject.kind == "agent"
+            && !member
+                .environment
+                .contains_key(crate::suspension::RESUME_ENV)
+            && let Some(harness) = member.driver.as_deref()
+        {
+            crate::suspension::continue_session(&self.store, &subject.subject, harness)?
+        } else {
+            None
+        };
+        if let Some((session, path)) = continued {
+            launch_member
+                .environment
+                .insert(crate::suspension::CONTINUE_ENV.into(), session);
+            if let Some(path) = path {
+                launch_member
+                    .environment
+                    .insert(crate::suspension::CONTINUE_PATH_ENV.into(), path);
+            }
         }
         launch_member
             .environment
