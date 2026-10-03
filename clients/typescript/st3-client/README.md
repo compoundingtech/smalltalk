@@ -4,11 +4,14 @@
 
 The client uses standard `fetch`, so callers can supply a fetch implementation and a credential callback. Call `discover()` before rendering capability-dependent controls. List and event limits are checked against the server's advertised bounds. Submit fenced actions with the generated typed methods, then use `followOperation(operation_id)` for accepted actions. `terminalStream` opens the screen stream a `terminal.attach` capability allows and calls `onScreen` with each changed screen; it needs a WebSocket that accepts headers, such as React Native's, or a `socket` factory. `collectionStream` opens the one collections socket: `subscribe` holds a window of missions, attention, agents, or work, `subscribeTerminal` follows a terminal with its attach capability, and `subscribeConversation` follows an agent's or a session's conversation, each by a client-chosen ID; `onFrame` receives every frame. `applyWindow` folds `snapshot` and `changes` frames into a window's ordered rows. Commands sent before the socket opens wait for it.
 
+The default transport binds `globalThis.fetch` to `globalThis`, preserving the receiver required by browser implementations. Supplying `fetchImpl` overrides that default without rebinding the custom implementation.
+
 Run the local contract checks with:
 
 ```sh
 cargo run -p st3-client-codegen -- --check
 apps/ios/node_modules/.bin/tsc --strict --noEmit --target ES2020 --module esnext --moduleResolution bundler --lib es2020,dom clients/typescript/st3-client/index.ts clients/typescript/st3-client/types.test.ts
+apps/ios/node_modules/.bin/tsc --strict --noEmit --target ES2020 --module esnext --moduleResolution bundler --lib es2020,dom --typeRoots apps/ios/node_modules/@types --types node clients/typescript/st3-client/fetch-receiver.test.ts
 node --test clients/typescript/st3-client/contract.test.cjs
 ```
 
