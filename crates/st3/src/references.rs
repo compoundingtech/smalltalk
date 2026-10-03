@@ -347,7 +347,10 @@ fn subject_references(
             if subscription.stopped {
                 return Ok(());
             }
-            if !scope.subject(graph, &subscription.observer)? {
+            // st declares a repository's standing observer for the first subscription to it.
+            if crate::github_watch::standing_locator(&subscription.observer).is_none()
+                && !scope.subject(graph, &subscription.observer)?
+            {
                 let scoped = subscription
                     .observer
                     .strip_prefix("observer/")

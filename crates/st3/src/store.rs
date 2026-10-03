@@ -7370,7 +7370,9 @@ impl Store {
                 && let Some(subscription) = crate::graph::subscription_spec(&desired.desired)
                 && !subscription.stopped
             {
-                if !known(&subscription.observer)? {
+                if crate::github_watch::standing_locator(&subscription.observer).is_none()
+                    && !known(&subscription.observer)?
+                {
                     warnings.push(format!(
                         "subscription `{}` references missing observer `{}`",
                         desired.subject, subscription.observer

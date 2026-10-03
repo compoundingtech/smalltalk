@@ -331,9 +331,34 @@ person ends any seat's with `--agent`. `st gh ls` lists a seat's watches, runnin
 last day, and `--all` every seat's.
 
 Every watch of a repository, from any host, uses one standing observer,
-`observer/github/OWNER/REPO` on `resource/github/OWNER/REPO`, which no mission run owns. The first
-watch of the repository declares it on its host, which polls it every 30 seconds while a watch uses
-it; the host stops it once no running watch does. No issue or pull request has a poller of its own.
+`observer/github/OWNER/REPO`, which no mission run owns. The first watch of the repository declares
+it on its host, which polls it every 30 seconds; the host stops it once no running subscription
+uses it. No issue or pull request has a poller of its own.
+
+The standing observer records into `resource/github/OWNER/REPO`, unless another observer of the
+repository runs: then it records into that observer's resource and keeps that resource from then
+on. Subscriptions are grouped by resource, so a poll by either observer delivers to the
+subscriptions of both, and every item has one resource.
+
+A mission subscription can name a standing observer too, as an intake does:
+
+```kdl
+subscription "pull-request-reviews" {
+  observer "observer/github/acme/garden"
+  on "pull_requests"
+  delivery "mission" { mission "acme/review"; resource "source"; workspace "/srv/reviews" }
+}
+```
+
+The run declares the standing observer when it starts, and its host keeps it running while the
+subscription runs. Cancelling the run stops its subscriptions, never the observer, which stops
+only once nothing uses it. To move an intake from an observer of its own onto the standing observer,
+revise its run so its subscriptions keep their names and name the standing observer instead, and
+drop its own observer. The revision declares the standing observer before the old observer stops,
+so the standing observer takes the old one's resource; an observer that never recorded anything
+starts from the cursor of the observer that last recorded into its resource. Item facts, delivery
+keys and pending requests stay where they were, so the move delivers nothing twice and misses
+nothing.
 
 The write that records an observation decides each watch's wakes from its item's prior facts:
 

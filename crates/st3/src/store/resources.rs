@@ -138,6 +138,45 @@ fn prefix_successor(prefix: &str) -> Option<String> {
 }
 
 impl Store {
+    /// The cursor of the observer that last recorded into `resource`, for `observer` when it has
+    /// none of its own: it starts where that observer left the resource, so what changed between
+    /// their polls is read as a change rather than taken as already known.
+    pub(crate) fn inherited_observer_cursor(
+        &self,
+        resource: &str,
+        observer: &str,
+    ) -> Result<Option<String>> {
+        let prefix = format!("{resource}/");
+        let upper = prefix_successor(&prefix).unwrap_or_default();
+        let recorder = {
+            let connection = self.readers.get();
+            connection
+                .query_row(
+                    "SELECT json_extract(claims.body, '$.fields.observer')
+                     FROM resource_observations JOIN claims ON claims.id=resource_observations.claim_id
+                     WHERE resource_observations.subject=?1
+                        OR (resource_observations.subject>=?2 AND resource_observations.subject<?3)
+                     ORDER BY resource_observations.observed_at DESC LIMIT 1",
+                    params![resource, prefix, upper],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+        };
+        let Some(recorder) = recorder.filter(|recorder| recorder != observer) else {
+            return Ok(None);
+        };
+        Ok(self
+            .latest_claim(&recorder, Some("observer.observed"))?
+            .and_then(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/cursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }))
+    }
+
     /// Constant-work version, independent of claims that do not change resource rows.
     pub(crate) fn resource_collection_version(&self) -> Result<String> {
         let connection = self.readers.get();

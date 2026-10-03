@@ -986,22 +986,57 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// Keep each GitHub watch this host declared true to its seat and deadline: stop the
     /// declaration of a watch that ended, end one whose seat is retired or fresh without a wake,
     /// end one whose deadline passed with a final wake, and start the standing observer again when
-    /// a running watch has none. Stop each standing observer this host declared once no running
-    /// watch uses it, and look again at the next deadline.
+    /// a running watch has none. A mission's subscription to a standing observer, such as an
+    /// intake's, keeps it running the same way. Stop each standing observer this host declared
+    /// once no running subscription uses it, and look again at the next deadline.
     pub(crate) fn reconcile_github_watches(&self, desired: &[DesiredSubject]) -> Result<()> {
         let now = now_ms();
         let mut next_deadline: Option<u128> = None;
         let mut used_observers = BTreeSet::new();
-        let watches = desired
+        let observers = desired
             .iter()
-            .filter(|subject| {
-                subject.kind == "subscription" && subject.subject.starts_with("subscription/watch/")
+            .filter(|subject| subject.kind == "observer")
+            .filter_map(|subject| {
+                crate::graph::observer_spec(&subject.desired)
+                    .map(|spec| (subject.subject.clone(), spec))
             })
+            .collect::<Vec<_>>();
+        let mut ensured = BTreeSet::new();
+        let mut ensure = |locator: String| -> Result<()> {
+            if ensured.insert(locator.clone()) {
+                self.store.ensure_standing_observer(&locator, &observers)?;
+            }
+            Ok(())
+        };
+        let subscriptions = desired
+            .iter()
+            .filter(|subject| subject.kind == "subscription")
             .filter_map(|subject| {
                 let spec = crate::graph::subscription_spec(&subject.desired)?;
-                let watch = spec.watch.clone()?;
-                (!spec.stopped).then_some((subject, spec, watch))
+                (!spec.stopped).then_some((subject, spec))
             })
+            .collect::<Vec<_>>();
+        for (subject, spec) in &subscriptions {
+            if subject.subject.starts_with("subscription/watch/") {
+                continue;
+            }
+            let Some(locator) = crate::github_watch::standing_locator(&spec.observer) else {
+                continue;
+            };
+            used_observers.insert(spec.observer.clone());
+            if self
+                .store
+                .selected_desired_origin(&subject.subject)?
+                .as_deref()
+                == Some(self.host.as_str())
+            {
+                ensure(locator)?;
+            }
+        }
+        let watches = subscriptions
+            .iter()
+            .filter(|(subject, _)| subject.subject.starts_with("subscription/watch/"))
+            .filter_map(|(subject, spec)| Some((*subject, spec, spec.watch.clone()?)))
             .collect::<Vec<_>>();
         for (subject, spec, watch) in watches {
             let Some((thread, _)) = crate::github_watch::watch_parts(&subject.subject) else {
@@ -1042,18 +1077,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                 next_deadline = Some(next_deadline.map_or(until, |next| next.min(until)));
             }
             used_observers.insert(spec.observer.clone());
-            self.store.ensure_watch_observer(&thread)?;
+            ensure(thread.locator())?;
         }
         for observer in desired.iter().filter(|subject| {
             subject.kind == "observer"
                 && subject.owner_run.is_none()
                 && subject.subject.starts_with("observer/github/")
         }) {
-            // Only a standing repository observer, as a watch declares it, is this stage's.
+            // Only a standing repository observer is this stage's.
             let running = crate::graph::observer_spec(&observer.desired).is_some_and(|spec| {
-                !spec.stopped
-                    && spec.provider == "github.repository"
-                    && crate::github_watch::is_standing_observer(&observer.subject, &spec.resource)
+                !spec.stopped && crate::github_watch::is_standing_observer(&observer.subject, &spec)
             });
             if running
                 && !used_observers.contains(&observer.subject)
@@ -8951,7 +8984,25 @@ impl<R: RuntimeControl> Reconciler<R> {
         let response = self
             .store
             .apply_internal(&intent, &format!("materialize:{}", run.generation))?;
-        Ok(response.changed)
+        // A subscription to a repository's standing observer declares it here, before a
+        // superseded generation's own observer of the repository stops, so the standing observer
+        // takes that observer's resource and nothing between their polls goes unobserved.
+        let standing = intent
+            .subjects
+            .values()
+            .filter(|subject| subject.kind == "subscription")
+            .filter_map(|subject| crate::graph::subscription_spec(&subject.desired))
+            .filter(|spec| !spec.stopped)
+            .filter_map(|spec| crate::github_watch::standing_locator(&spec.observer))
+            .collect::<BTreeSet<_>>();
+        let mut changed = response.changed;
+        if !standing.is_empty() {
+            let observers = self.store.repository_observers()?;
+            for locator in standing {
+                changed |= self.store.ensure_standing_observer(&locator, &observers)?;
+            }
+        }
+        Ok(changed)
     }
 
     fn reject_runtime_collisions(
@@ -10924,6 +10975,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
+        // A repository observer that never recorded anything continues from the observer that
+        // last recorded into its resource, such as the intake observer a standing observer
+        // replaces, so nothing changed between their polls is missed.
+        let cursor = match cursor {
+            None if spec.provider == "github.repository" => self
+                .store
+                .inherited_observer_cursor(&spec.resource, &observer.subject)?,
+            cursor => cursor,
+        };
         let agent_workspaces = agent_workspaces.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -27902,6 +27962,293 @@ agent "example.reviewer" { workspace "/tmp"; command "true" }"#,
         // Watching again starts the observer again.
         fixture.store.declare_watch(&twelve, planner, None).unwrap();
         assert!(fixture.running(&fixture.observer) && fixture.running(&planner_watch));
+    }
+
+    /// A watch on a repository that an intake already observes uses the intake's resource, so
+    /// the repository's item facts live in one place and either observer's poll serves both.
+    #[test]
+    fn a_standing_observer_takes_the_resource_a_running_observer_of_its_repository_uses() {
+        let fixture = WatchFixture::new();
+        apply_source(
+            &fixture.store,
+            r#"version 2
+resource "github/acme/old" { kind "vcs.repository" }
+observer "intake" {
+  resource "resource/github/acme/old"; provider "github.repository"; locator "Acme/Garden"
+  field "pull_requests"
+}"#,
+            "intake-observer",
+        );
+        fixture.watch("acme/garden#12", "agent/example.planner");
+        let standing = fixture
+            .store
+            .desired_subjects_named(std::slice::from_ref(&fixture.observer))
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|observer| crate::graph::observer_spec(&observer.desired))
+            .unwrap();
+        assert_eq!(standing.resource, "resource/github/acme/old");
+        assert!(
+            fixture
+                .store
+                .desired_subjects_named(std::slice::from_ref(&fixture.resource))
+                .unwrap()
+                .is_empty(),
+            "the standing observer declares no resource of its own"
+        );
+    }
+
+    /// An intake run revised onto its repository's standing observer keeps its subscriptions,
+    /// and the standing observer takes over the intake observer's resource and cursor: what the
+    /// intake already delivered is not delivered again, and what changed afterwards is delivered
+    /// once. Cancelling the run stops only its own subscriptions, and the standing observer stops
+    /// when nothing uses it; declared again, it keeps the resource.
+    #[test]
+    fn an_intake_revised_onto_the_standing_observer_delivers_each_item_once() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-mission");
+        let intake = |observer: &str, own: &str| {
+            format!(
+                r#"version 2
+resource "github/acme/old" {{ kind "vcs.repository" }}
+resource "retired" {{ kind "human.review" }}
+mission "intake" state="ready" {{
+  goal "Review every new pull request head and triage every new issue."
+  {own}
+  subscription "reviews" {{
+    observer "{observer}"; on "pull_requests"
+    delivery "mission" {{ mission "review"; resource "source"; workspace "/tmp/st3-reviews" }}
+  }}
+  subscription "triage" {{
+    observer "{observer}"; on "issues"
+    delivery "mission" {{ mission "review"; resource "source"; workspace "/tmp/st3-triage" }}
+  }}
+  step "retire" {{
+    agentless
+    gate "retired" {{ field "retired" "resource/retired" "is" "true" }}
+  }}
+}}"#
+            )
+        };
+        apply_source(
+            &store,
+            &intake(
+                "observer/repository",
+                r#"observer "repository" {
+    resource "resource/github/acme/old"; provider "github.repository"; locator "Acme/Garden"
+    field "pull_requests"; field "issues"
+  }"#,
+            ),
+            "intake-first",
+        );
+        let first = store.mission_spec("intake", None).unwrap().unwrap();
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "intake-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let own = format!("observer/{}/repository", run.id);
+        let standing = "observer/github/acme/garden";
+        let resource = "resource/github/acme/old";
+        let reviews = format!("subscription/{}/reviews", run.id);
+        let triage = format!("subscription/{}/triage", run.id);
+        let declared = |subject: &str| {
+            store
+                .desired_subjects_named(&[subject.to_owned()])
+                .unwrap()
+                .into_iter()
+                .next()
+        };
+        let observer = |subject: &str| {
+            declared(subject).and_then(|item| crate::graph::observer_spec(&item.desired))
+        };
+        let subscription = |subject: &str| {
+            declared(subject).and_then(|item| crate::graph::subscription_spec(&item.desired))
+        };
+        let observe = |observer_subject: &str, cursor: &str, pulls: Value, issues: Value| {
+            let desired = store.desired_subjects().unwrap();
+            let resources = desired
+                .iter()
+                .filter_map(|item| {
+                    let spec = crate::graph::observer_spec(&item.desired)?;
+                    (!spec.stopped).then(|| (item.subject.clone(), spec.resource))
+                })
+                .collect::<HashMap<_, _>>();
+            let subscriptions = desired
+                .iter()
+                .filter_map(|item| {
+                    let spec = crate::graph::subscription_spec(&item.desired)?;
+                    (!spec.stopped
+                        && resources.get(&spec.observer).map(String::as_str) == Some(resource))
+                    .then(|| (item.subject.clone(), spec))
+                })
+                .collect::<Vec<_>>();
+            store
+                .record_resource_observation(
+                    observer_subject,
+                    &store.selected_desired_revision(observer_subject).unwrap().unwrap(),
+                    None,
+                    resource,
+                    Some(cursor),
+                    &serde_json::json!({"repository_id": 41, "pull_requests": pulls, "issues": issues}),
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap();
+        };
+        let requested = |subscription: &str| {
+            store
+                .claims_for(subscription, Some("subscription.mission-requested"))
+                .unwrap()
+                .into_iter()
+                .map(|claim| {
+                    claim.body["fields"]["resource"]
+                        .as_str()
+                        .unwrap()
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let pull = |number: u64, head: char| serde_json::json!({"number": number, "head": head.to_string().repeat(40), "state": "open", "draft": false});
+        let issue = |number: u64| serde_json::json!({"number": number, "state": "open"});
+
+        // The intake's own observer: a baseline, then a new head and a new issue.
+        assert!(observer(&own).is_some_and(|spec| !spec.stopped));
+        observe(
+            &own,
+            "c1",
+            serde_json::json!([pull(1, 'a')]),
+            serde_json::json!([issue(2)]),
+        );
+        observe(
+            &own,
+            "c2",
+            serde_json::json!([pull(1, 'b')]),
+            serde_json::json!([issue(3)]),
+        );
+        assert_eq!(requested(&reviews), [1]);
+        assert_eq!(requested(&triage), [3]);
+
+        // The revision moves both subscriptions onto the standing observer, which takes the
+        // intake observer's resource; the intake observer stops.
+        apply_source(&store, &intake(standing, ""), "intake-second");
+        let second = store.mission_spec("intake", None).unwrap().unwrap();
+        store
+            .adopt_mission_revision(
+                &run.id,
+                &second,
+                "person/test",
+                "intake reads the standing observer",
+                "intake-move",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let moved = observer(standing).expect("the revision declares the standing observer");
+        assert!(!moved.stopped);
+        assert_eq!(moved.resource, resource);
+        assert!(declared(standing).unwrap().owner_run.is_none());
+        assert!(observer(&own).is_none_or(|spec| spec.stopped));
+        for subject in [&reviews, &triage] {
+            let spec = subscription(subject).unwrap();
+            assert!(!spec.stopped, "{subject} keeps running");
+            assert_eq!(spec.observer, standing);
+        }
+        assert_eq!(
+            store
+                .inherited_observer_cursor(resource, standing)
+                .unwrap()
+                .as_deref(),
+            Some("c2"),
+            "the standing observer starts where the intake observer left off"
+        );
+
+        // The standing observer sees what the intake observer saw, and what changed since.
+        observe(
+            standing,
+            "c3",
+            serde_json::json!([pull(1, 'b'), pull(4, 'c')]),
+            serde_json::json!([issue(3), issue(5)]),
+        );
+        observe(
+            standing,
+            "c4",
+            serde_json::json!([pull(1, 'd')]),
+            serde_json::json!([]),
+        );
+        observe(
+            standing,
+            "c4",
+            serde_json::json!([pull(1, 'd')]),
+            serde_json::json!([]),
+        );
+        assert_eq!(requested(&reviews), [1, 4, 1]);
+        assert_eq!(requested(&triage), [3, 5]);
+
+        // Another subscription to the standing observer outlives the intake run.
+        apply_source(
+            &store,
+            r#"version 2
+agent "example.watcher" { workspace "/tmp"; command "true" }
+subscription "elsewhere" {
+  observer "observer/github/acme/garden"; on "issues"; to "agent/example.watcher"
+  delivery "message"
+}"#,
+            "elsewhere",
+        );
+        store
+            .request_mission_run_cancellation(&run.id, "intake retired")
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        for subject in [&reviews, &triage] {
+            assert!(
+                subscription(subject).is_none_or(|spec| spec.stopped),
+                "{subject} stops with its run"
+            );
+        }
+        assert!(subscription("subscription/elsewhere").is_some_and(|spec| !spec.stopped));
+        assert!(observer(standing).is_some_and(|spec| !spec.stopped));
+
+        apply_source(
+            &store,
+            "version 2\nsubscription \"elsewhere\" { stop }\n",
+            "elsewhere-stops",
+        );
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            observer(standing).is_some_and(|spec| spec.stopped),
+            "nothing uses the standing observer"
+        );
+        let observers = store.repository_observers().unwrap();
+        assert!(
+            store
+                .ensure_standing_observer("acme/garden", &observers)
+                .unwrap()
+        );
+        assert_eq!(observer(standing).unwrap().resource, resource);
     }
 
     /// The intake pipeline: a new pull request head that a live agent owns reaches that agent as

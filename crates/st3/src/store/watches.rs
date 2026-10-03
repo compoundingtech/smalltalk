@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::github_watch::{self, ThreadRef};
+use crate::model::ObserverSpec;
 
 /// What ended watches `st gh ls` still shows, by how recently they ended.
 const ENDED_SHOWN_FOR_MS: u128 = 24 * 60 * 60 * 1000;
@@ -48,28 +49,111 @@ impl Store {
 
     /// Declare the repository's standing observer on this host unless it is running.
     pub(crate) fn ensure_watch_observer(&self, thread: &ThreadRef) -> Result<bool, St3Error> {
-        let running = self
-            .desired_subjects_named(&[thread.observer()])
-            .map_err(internal)?
-            .into_iter()
-            .next()
-            .and_then(|observer| crate::graph::observer_spec(&observer.desired))
-            .is_some_and(|spec| !spec.stopped);
-        if running {
+        let observers = self.repository_observers()?;
+        self.ensure_standing_observer(&thread.locator(), &observers)
+    }
+
+    /// Declare a repository's standing observer on this host unless it runs on the resource it
+    /// should record into (`standing_resource`). `observers` is every declared observer.
+    pub(crate) fn ensure_standing_observer(
+        &self,
+        locator: &str,
+        observers: &[(String, ObserverSpec)],
+    ) -> Result<bool, St3Error> {
+        let subject = github_watch::standing_observer(locator);
+        let current = observers
+            .iter()
+            .find(|(observer, _)| *observer == subject)
+            .map(|(_, spec)| spec);
+        let resource = self.standing_resource(locator, &subject, current, observers)?;
+        if current.is_some_and(|spec| !spec.stopped && spec.resource == resource) {
             return Ok(false);
         }
+        let declare_resource = self
+            .desired_subjects_named(std::slice::from_ref(&resource))
+            .map_err(internal)?
+            .is_empty();
         let intent = crate::graph::parse_internal_intent(
-            &github_watch::observer_source(thread),
+            &github_watch::observer_source(locator, &resource, declare_resource),
             &self.origin,
         )?;
         self.apply_internal(
             &intent,
-            &format!("github-watch-observer:{}", thread.locator()),
+            &format!("github-watch-observer:{locator}:{resource}"),
         )?;
         Ok(true)
     }
 
-    /// A watch that is declared, not stopped, and not ended, with its declaration.
+    /// The resource a repository's standing observer records into. While another observer of the
+    /// repository runs, it is that observer's resource: both then record the same item facts,
+    /// and a poll by either delivers to the subscriptions of both, so moving a subscription from
+    /// one to the other neither repeats nor misses anything. Otherwise the standing observer
+    /// keeps the resource it last had, and a repository it never observed gets
+    /// `resource/github/OWNER/REPO`.
+    fn standing_resource(
+        &self,
+        locator: &str,
+        subject: &str,
+        current: Option<&ObserverSpec>,
+        observers: &[(String, ObserverSpec)],
+    ) -> Result<String, St3Error> {
+        if let Some((_, spec)) = observers.iter().find(|(observer, spec)| {
+            observer != subject
+                && !spec.stopped
+                && spec.provider == "github.repository"
+                && spec.locator.eq_ignore_ascii_case(locator)
+        }) {
+            return Ok(spec.resource.clone());
+        }
+        if let Some(spec) = current.filter(|spec| !spec.stopped) {
+            return Ok(spec.resource.clone());
+        }
+        // A stop keeps no resource; the declarations before it do.
+        let declared = self
+            .claims_for(subject, Some("intent.desired"))
+            .map_err(internal)?
+            .into_iter()
+            .rev()
+            .find_map(|claim| {
+                claim
+                    .body
+                    .get("desired")
+                    .and_then(crate::graph::observer_spec)
+                    .filter(|spec| !spec.stopped && !spec.resource.is_empty())
+            });
+        Ok(declared.map_or_else(
+            || github_watch::default_resource(locator),
+            |spec| spec.resource,
+        ))
+    }
+
+    /// Every declared observer, by subject.
+    pub(crate) fn repository_observers(&self) -> Result<Vec<(String, ObserverSpec)>, St3Error> {
+        let connection = self.readers.get();
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT subject, body FROM desired WHERE kind='observer' ORDER BY subject",
+            )
+            .map_err(internal)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(internal)?;
+        let mut observers = Vec::new();
+        for row in rows {
+            let (subject, body) = row.map_err(internal)?;
+            if let Some(spec) = serde_json::from_str::<Value>(&body)
+                .ok()
+                .as_ref()
+                .and_then(crate::graph::observer_spec)
+            {
+                observers.push((subject, spec));
+            }
+        }
+        Ok(observers)
+    }
+
     pub(crate) fn live_watch(
         &self,
         subject: &str,
@@ -248,7 +332,13 @@ impl Store {
         let Some((thread, _)) = github_watch::watch_parts(subject) else {
             return Ok(None);
         };
-        let resource = thread.resource();
+        let resource = self
+            .desired_subjects_named(&[thread.observer()])
+            .map_err(internal)?
+            .into_iter()
+            .next()
+            .and_then(|observer| crate::graph::observer_spec(&observer.desired))
+            .map_or_else(|| thread.resource(), |spec| spec.resource);
         let mut facts = None;
         for segment in ["pull-request", "issue"] {
             facts = self
