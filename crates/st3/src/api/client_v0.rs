@@ -847,10 +847,16 @@ pub(super) async fn agent_declaration(
     let lookup_subject = subject.clone();
     let store = state.store.clone();
     let revision = query.revision;
-    let (declaration, revisions) = blocking_store(move || {
+    let (declaration, revisions, uris) = blocking_store(move || {
         let declaration = store.agent_declaration(&lookup_subject, revision.as_deref())?;
         let revisions = store.agent_declaration_revisions(&lookup_subject)?;
-        Ok((declaration, revisions))
+        let uris = match &declaration {
+            Some((_, tree)) => {
+                store.declared_resource_uris(&crate::graph::declared_resources(tree))?
+            }
+            None => BTreeMap::new(),
+        };
+        Ok((declaration, revisions, uris))
     })
     .await?;
     let Some((revision, mut tree)) = declaration else {
@@ -859,7 +865,7 @@ pub(super) async fn agent_declaration(
     if !query.show_env_values {
         crate::graph::redact_agent_env_values(&mut tree);
     }
-    let kdl = crate::graph::render_agent_desired_kdl(&tree).map_err(ApiError::bad)?;
+    let kdl = crate::graph::render_agent_desired_kdl(&tree, &uris).map_err(ApiError::bad)?;
     Ok(Json(json!({
         "id": subject,
         "revision": revision,
@@ -999,7 +1005,8 @@ pub(super) async fn subject_definition(
             if !show_env_values {
                 crate::graph::redact_agent_env_values(&mut desired);
             }
-            let kdl = crate::graph::render_agent_desired_kdl(&desired)?;
+            let uris = store.declared_resource_uris(&crate::graph::declared_resources(&desired))?;
+            let kdl = crate::graph::render_agent_desired_kdl(&desired, &uris)?;
             let revision = status.desired_revision
                 .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired revision"))?;
             let token = status.desired_token
@@ -1504,6 +1511,11 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
         .into_iter()
         .map(|d| (d.mission.subject.clone(), d))
         .collect::<BTreeMap<_, _>>();
+    let resource_uris = store.declared_resource_uris(
+        definitions
+            .values()
+            .flat_map(|definition| &definition.mission.resources),
+    )?;
     ids.iter().map(|id| {
         let overview = store.mission_overview(id, 3)?;
         let newest = overview["newest"].as_array().expect("overview previews");
@@ -1559,6 +1571,8 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
             "run_details":details,"active_runs":active,"total_runs":overview["total_runs"],
             "run_counts":overview["counts"],"runs_truncated":overview["total_runs"].as_u64().unwrap_or(0)>newest.len() as u64,
             "run_generations":generations,"must_act":must_act,
+            "resources":crate::api::client_declared_resources(
+                definition.map_or(&[][..], |d| d.mission.resources.as_slice()), &resource_uris),
             "operational":{"layer":if historical {"history"} else {"current"},"actionable":!historical,"reasons":[]}}))
     }).collect()
 }
@@ -1631,6 +1645,11 @@ fn mission_resources_filtered(
     for mission in definitions.keys() {
         missions.entry(mission.clone()).or_default();
     }
+    let resource_uris = store.declared_resource_uris(
+        definitions
+            .values()
+            .flat_map(|(definition, _)| &definition.resources),
+    )?;
     let page_runs = missions
         .values()
         .flatten()
@@ -1897,6 +1916,10 @@ fn mission_resources_filtered(
                 "run_generations": run_generations,
                 "visualization": visualization,
                 "usage": usage,
+                "resources": crate::api::client_declared_resources(
+                    definition.map_or(&[][..], |(definition, _)| definition.resources.as_slice()),
+                    &resource_uris,
+                ),
                 "operational": {
                     "layer": if historical { "history" } else { "current" },
                     "actionable": !historical,
@@ -8268,8 +8291,12 @@ async fn dispatch_action(
                     serde_json::to_string(&agent).map_err(ApiError::internal)?
                 )
             } else {
-                let mut node =
-                    crate::graph::render_desired_node(&declared.desired).map_err(ApiError::bad)?;
+                let uris = state
+                    .store
+                    .declared_resource_uris(&crate::graph::declared_resources(&declared.desired))
+                    .map_err(ApiError::internal)?;
+                let mut node = crate::graph::render_agent_node(&declared.desired, &uris)
+                    .map_err(ApiError::bad)?;
                 let identity = agent.trim_start_matches("agent/");
                 let mut body = node.children_mut().take().unwrap_or_default();
                 if let Some(child) = body
@@ -9170,7 +9197,7 @@ mod tests {
                 "children": [{ "name": "child", "arguments": [null] }],
             }],
         });
-        let rendered = crate::graph::render_agent_desired_kdl(&desired).unwrap();
+        let rendered = crate::graph::render_agent_desired_kdl(&desired, &BTreeMap::new()).unwrap();
         let document = rendered.parse::<kdl::KdlDocument>().unwrap();
         assert_eq!(document.nodes()[0].name().value(), "version");
         assert_eq!(document.nodes()[1].name().value(), "agent");
@@ -11460,6 +11487,85 @@ mission "example/steps" state="ready" {
         unstarted.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         assert_eq!(unstarted.len(), 2);
         assert_eq!(tree["unstarted_missions"], json!(unstarted));
+    }
+
+    #[test]
+    fn missions_show_the_resources_their_published_revision_names() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "resource-node");
+        let uri = "https://github.com/compoundingtech/smalltalk/issues/752";
+        let source = format!(
+            "version 2\nmission \"example/tracked\" state=\"ready\" {{\n  goal \"Track the issue.\"\n  resource \"tracker\" uri=\"{uri}\" reason=\"tracking issue\"\n}}\n"
+        );
+        let intent = crate::graph::parse_intent(&source, "resource-node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply_as(&intent, &preview.subject_tokens, "publish", Some("person/ada"))
+            .unwrap();
+        let expected = json!([{
+            "name": "tracker",
+            "subject": format!("resource/uri/{}", hex::encode(Sha256::digest(uri))),
+            "uri": uri,
+            "reason": "tracking issue",
+        }]);
+        let index = state.store.index().unwrap();
+        let detail =
+            mission_resources(&state.store, index, true, Some("mission/example/tracked")).unwrap();
+        assert_eq!(detail[0]["resources"], expected);
+        let cards =
+            mission_list_cards(&state.store, &["mission/example/tracked".to_owned()]).unwrap();
+        assert_eq!(cards[0]["resources"], expected);
+        let typed: st3_client::Resource = serde_json::from_value(cards[0].clone()).unwrap();
+        let st3_client::Resource::Mission(typed) = typed else {
+            panic!("a mission resource");
+        };
+        assert_eq!(typed.resources[0].uri.as_deref(), Some(uri));
+
+        // Republish without the edge: both client views use the current revision, while the
+        // URI subject remains available to other declarations that still reference it.
+        let source =
+            "version 2\nmission \"example/tracked\" state=\"ready\" {\n  goal \"Track the issue.\"\n}\n";
+        let intent = crate::graph::parse_intent(source, "resource-node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.to_owned(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply_as(&intent, &preview.subject_tokens, "remove", Some("person/ada"))
+            .unwrap();
+        let detail = mission_resources(
+            &state.store,
+            state.store.index().unwrap(),
+            true,
+            Some("mission/example/tracked"),
+        )
+        .unwrap();
+        assert_eq!(detail[0]["resources"], json!([]));
+        let cards =
+            mission_list_cards(&state.store, &["mission/example/tracked".to_owned()]).unwrap();
+        assert_eq!(cards[0]["resources"], json!([]));
+        let subject = format!("resource/uri/{}", hex::encode(Sha256::digest(uri)));
+        assert_eq!(
+            state.store.selected_desired_kind(&subject).unwrap().as_deref(),
+            Some("resource")
+        );
     }
 
     #[test]
