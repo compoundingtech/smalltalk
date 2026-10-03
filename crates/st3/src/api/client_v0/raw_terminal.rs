@@ -108,13 +108,7 @@ pub(crate) async fn stream(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     authorize(&session, query.mode)?;
-    let protocols = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .collect::<Vec<_>>();
+    let protocols = stream_protocols(&headers);
     let capabilities = protocols
         .iter()
         .filter_map(|protocol| protocol.strip_prefix(TERMINAL_CAPABILITY_PROTOCOL_PREFIX))
@@ -135,7 +129,7 @@ pub(crate) async fn stream(
     if !live.terminal {
         return Err(validation("raw attachment requires a terminal runtime"));
     }
-    consume_terminal_attachment_mode(
+    let viewer = consume_terminal_attachment_mode(
         &state,
         &session,
         &client_detail_id("terminal", &id),
@@ -175,7 +169,10 @@ pub(crate) async fn stream(
         .protocols([SUBPROTOCOL])
         .max_message_size(CHUNK * 4)
         .max_frame_size(CHUNK * 4)
-        .on_upgrade(move |socket| splice(socket, transport, Some(query.mode))))
+        .on_upgrade(move |socket| async move {
+            let _viewer = viewer;
+            splice(socket, transport, Some(query.mode)).await;
+        }))
 }
 
 /// One bounded byte splice; closing either direction drops the persistent owner connection.
