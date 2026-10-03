@@ -53,3 +53,5 @@ The simulator asks before it opens each link it is handed, so a headless run can
 For screenshots without a real st, `node demoGateway.mjs 8791` serves invented data: attention, missions, agents, one conversation, and one terminal. Pair a Debug simulator with `com.compoundingtech.smalltalk.starter://pair?gateway=http://<the Mac's LAN or Tailscale IPv4>:8791&id=demo&code=demo`. It is not authenticated; never point a Release build or a device at it.
 
 Generated `ios/`, build output, signing material, local configuration, and proof screenshots are ignored by Git. Do not commit Apple team/device IDs, credentials, machine paths, or private network addresses. Expo SDK 57 needs the `expo-build-properties` scene-lifecycle opt-in for Xcode 27/iOS 27.
+
+An opt-in Debug fabric carrier has its own [build and isolated proof instructions](modules/st-fabric/README.md). Default builds do not link it. Its temporary client uses only a native-created loopback listener and leaves the saved Tailscale or LAN gateway unchanged.
