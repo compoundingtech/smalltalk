@@ -705,6 +705,7 @@ not change it. A terminal action may use an older snapshot from the same host, w
 and explicit revision fences still apply. Attach/detach do not require a screen sequence fence.
 `revision` digests the rest of
 the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
+The optional `kitty_keyboard` mode carries the active Kitty keyboard enhancement bitmask.
 
 Each line keeps its plain `text`, without trailing spaces, and adds `runs`: styled text from column
 zero. A run has `text` and, when they differ from the terminal default, `fg` and `bg` colors and
@@ -712,6 +713,9 @@ zero. A run has `text` and, when they differ from the terminal default, `fg` and
 a palette index from 0 to 255, where 0 to 15 are the client's ANSI theme colors, or a `#rrggbb`
 string. The runs spell `text`, followed by any trailing blanks that are visible because of their
 background, inverse, or underline. Hidden text is sent as spaces.
+Optional line `wrapped` marks automatic continuation to the next row. Optional run `cells`
+records display width rather than text length; `strikethrough` is present when set, and `link`
+contains the hyperlink `uri`. Generated Rust, Swift, and TypeScript models preserve these fields.
 
 When the terminal's runtime incarnation changes or its process exits, the server sends one
 `stale-fence` error envelope and closes the stream, with the error code as the close reason. Other

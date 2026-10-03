@@ -2307,12 +2307,16 @@ pub struct TerminalLine {
     /// Styled runs from column zero. Their text, without trailing spaces, is `text`.
     #[serde(default)]
     pub runs: Vec<TerminalRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapped: Option<bool>,
     pub redacted: bool,
     pub truncated: bool,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct TerminalRun {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cells: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fg: Option<TerminalColor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2327,6 +2331,14 @@ pub struct TerminalRun {
     pub underline: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inverse: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strikethrough: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<TerminalLink>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TerminalLink {
+    pub uri: String,
 }
 /// A palette index (0-255) or a `#rrggbb` color. An absent color is the terminal default.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2364,6 +2376,8 @@ pub struct TerminalModes {
     pub focus_events: bool,
     pub mouse_tracking: String,
     pub mouse_encoding: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kitty_keyboard: Option<u32>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TerminalScreen {
