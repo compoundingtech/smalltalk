@@ -461,6 +461,175 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_after_catchup() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/restart-todo";
+    let mut daemon = Daemon::new(root);
+    daemon.store = Arc::new(Store::open(&root.join("graph.sqlite"), "restart-node").unwrap());
+    daemon.observe_running(seat, "previous-runtime");
+    daemon.start_with_binding(true).await;
+    let registry = root.join("local-pty");
+    std::fs::create_dir_all(&registry).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(registry.join("seat.sock")).unwrap();
+    std::fs::write(registry.join("seat.pid"), std::process::id().to_string()).unwrap();
+    let started = "2026-10-03T20:00:00.000Z";
+    std::fs::write(registry.join("seat.json"), json!({
+        "createdAt": started, "tags": {"st3.subject": seat},
+    }).to_string()).unwrap();
+    let incarnation = format!("{}:{started}", std::process::id());
+    use sha2::Digest as _;
+    let dir = root.join("catalog/.st3-channel-outbox")
+        .join(hex::encode(sha2::Sha256::digest(seat.as_bytes())))
+        .join(hex::encode(sha2::Sha256::digest(incarnation.as_bytes())));
+    let todo = json!({"type":"todo", "session":"native", "observed_at":"2026-10-03T20:00:01Z",
+        "source_op":"hydrate", "phases":[{"name":"Restart","tasks":[
+            {"content":"Preserved through graph lag","status":"in_progress"}
+        ]}], "totals":{"pending":0,"in_progress":1,"completed":0,"blocked":0},
+        "truncated":false});
+    st_drivers::harness_events::enable(&dir, &incarnation).unwrap();
+    let fields = st_drivers::pi_channel::todo_observation(&todo, "omp", Some("native"), &incarnation).unwrap();
+    st_drivers::harness_events::write_channel_todo(&dir, &incarnation, &json!(fields)).unwrap();
+    let event = st_drivers::harness_events::pending(&dir, 10).unwrap().remove(0);
+    let mut bad_fields: BTreeMap<String, Value> = serde_json::from_value(event.payload).unwrap();
+    bad_fields.remove("incarnation");
+    let rejected = ClaimInput {
+        subject: seat.into(), kind: "harness.todo.observed".into(), actor: Some(seat.into()),
+        fields: bad_fields, evidence: vec![], expected_subject: None,
+        idempotency_key: Some(format!("harness-todo:{seat}:{incarnation}:{}", event.sequence)),
+    };
+    st_drivers::harness_events::prepare_publication(&dir, event.sequence,
+        "harness.todo.observed:", &serde_json::to_value(rejected).unwrap()).unwrap();
+    let mut channel = seat_command(root, &daemon.socket)
+        .env("PTY_ROOT", &registry)
+        .env("ST_AGENT", seat)
+        .env("ST3_ACCOUNT", std::env::var("ST3_ACCOUNT").unwrap_or_default())
+        .arg("--catalog").arg(root.join("catalog"))
+        .args(["driver", "omp-channel", "--identity", "restart-todo"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let mut input = channel.stdin.take().unwrap();
+    let output = channel.stdout.take().unwrap();
+    let (frames, received) = std::sync::mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(frame) = serde_json::from_str(&line) { let _ = frames.send(frame); }
+        }
+    });
+    assert_eq!(received.recv_timeout(Duration::from_secs(10)).unwrap()["type"], "hello");
+    for frame in [
+        json!({"type":"ready", "sessionId":"native"}),
+        json!({"type":"state", "state":"idle"}),
+        todo,
+    ] { writeln!(input, "{frame}").unwrap(); }
+    input.flush().unwrap();
+    daemon.send("message/restart-todo-mail", seat, "GRAPH LAG MAIL");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let frame = match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(frame) => frame,
+            Err(error) => panic!("waiting for graph-lag delivery: {error}; stderr: {}", stop(channel)),
+        };
+        assert_ne!(frame["type"], "hello", "delivery must not reconnect");
+        if frame["type"] == "message" {
+            assert!(frame.to_string().contains("GRAPH LAG MAIL"));
+            break;
+        }
+    }
+    assert_alive(&mut channel, "the graph-lag channel");
+    assert!(daemon.store.claims_for(seat, Some("harness.todo.observed")).unwrap().is_empty());
+    daemon.observe_running(seat, &incarnation);
+    let deadline = Instant::now() + Duration::from_secs(65);
+    while !daemon.store.claims_for(seat, Some("harness.todo.observed")).unwrap_or_default().iter()
+            .any(|claim| claim.body.pointer("/fields/incarnation_id").and_then(Value::as_str)
+                    == Some(incarnation.as_str())
+                && claim.body.pointer("/fields/phases/0/tasks/0/content").and_then(Value::as_str)
+                    == Some("Preserved through graph lag"))
+    {
+        assert!(Instant::now() < deadline, "hydration after graph catch-up: {}", driver_log(root));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_alive(&mut channel, "the caught-up channel");
+    wait_until("the repaired retry is acknowledged", Duration::from_secs(5), || {
+        st_drivers::harness_events::pending(&dir, 10).unwrap().is_empty()
+    }).await;
+    let connection = rusqlite::Connection::open(st_drivers::harness_events::database_path(&dir)).unwrap();
+    let old_slots: u64 = connection.query_row(
+        "SELECT COUNT(*) FROM prepared WHERE slot='harness.todo.observed:'", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(old_slots, 0);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!driver_log(root).contains("unknown-claim-field"), "{}", driver_log(root));
+    assert!(stop(channel).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribution() {
+    use sha2::Digest as _;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/drain-accounts";
+    let incarnation = "account-runtime";
+    let mut daemon = Daemon::new(root);
+    daemon.store = Arc::new(Store::open(&root.join("graph.sqlite"), "restart-node").unwrap());
+    daemon.observe_running(seat, incarnation);
+    daemon.start_with_binding(true).await;
+    let mut channel = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat).env("ST3_ACCOUNT", "successor/different-account")
+        .arg("--catalog").arg(root.join("catalog"))
+        .args(["driver", "omp-channel", "--identity", "drain-accounts"])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let dir = root.join("catalog/.st3-channel-outbox")
+        .join(hex::encode(sha2::Sha256::digest(seat.as_bytes())))
+        .join(hex::encode(sha2::Sha256::digest(incarnation.as_bytes())));
+    wait_until("the native drain binds its spool", Duration::from_secs(10), || {
+        st_drivers::harness_events::enabled(&dir)
+    }).await;
+    st_drivers::harness_state::claim(&dir, "drain-accounts", "omp", "account-producer").unwrap();
+    let now = st_drivers::message::now_ms();
+    st_drivers::harness_events::write_snapshot(&dir, "harness-context", &serde_json::to_vec(&json!({
+        "schema":"st.harness-context.v1", "agent":"drain-accounts", "harness":"omp",
+        "incarnation":"account-producer", "observedAtMs":now, "writtenAtMs":now,
+        "sessionTotalTokens":123, "account":"omp/provider-account",
+        "rateLimits":{"fiveHour":37,"sevenDay":41},
+    })).unwrap()).unwrap();
+    let mut timeline = st_drivers::harness_timeline::Writer::new(&dir, "omp", "account-producer");
+    timeline.append("account-response", st_drivers::harness_timeline::Role::System,
+        st_drivers::harness_timeline::EntryType::Usage, json!({
+            "semantics":"response", "model":"example", "account":"omp/provider-account",
+            "input_tokens":10,"output_tokens":2,"total_tokens":12,
+        }), true).unwrap();
+    wait_until("limits and usage publish through the native drain", Duration::from_secs(10), || {
+        !daemon.store.claims_for(seat, Some("harness.limits")).unwrap_or_default().is_empty()
+            && daemon.store.claims_for(seat, Some("harness.usage")).unwrap_or_default().iter()
+                .any(|claim| claim.body.pointer("/fields/semantics").and_then(Value::as_str)
+                    == Some("session_cumulative"))
+            && !daemon.store.claims_for(seat, Some("harness.timeline")).unwrap_or_default().is_empty()
+    }).await;
+    let limits = daemon.store.claims_for(seat, Some("harness.limits")).unwrap().pop().unwrap();
+    let cumulative = daemon.store.claims_for(seat, Some("harness.usage")).unwrap().into_iter()
+        .find(|claim| claim.body.pointer("/fields/semantics").and_then(Value::as_str)
+            == Some("session_cumulative")).unwrap();
+    let timeline = daemon.store.claims_for(seat, Some("harness.timeline")).unwrap().pop().unwrap();
+    let captured = std::env::var("ST3_ACCOUNT").ok().filter(|account| !account.is_empty());
+    let account = captured.as_ref().map(|account| {
+        st_drivers::account::account_label("omp", &format!("declared:{account}"))
+    }).unwrap_or_else(|| "omp/provider-account".into());
+    assert_eq!(limits.body.pointer("/fields/account").and_then(Value::as_str), Some(account.as_str()));
+    assert_eq!(limits.body.pointer("/fields/account_ref").and_then(Value::as_str), captured.as_deref());
+    assert_eq!(limits.body.pointer("/fields/five_hour_percent").and_then(Value::as_f64), Some(37.0));
+    assert_eq!(cumulative.body.pointer("/fields/total_tokens").and_then(Value::as_u64), Some(123));
+    assert_eq!(cumulative.body.pointer("/fields/account").and_then(Value::as_str),
+        captured.as_ref().map(|_| account.as_str()));
+    assert_eq!(timeline.body.pointer("/fields/body/account").and_then(Value::as_str), Some(account.as_str()));
+    assert_eq!(timeline.body.pointer("/fields/body/total_tokens").and_then(Value::as_u64), Some(12));
+    assert_alive(&mut channel, "the attribution channel");
+    assert!(stop(channel).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_omp_ask_clears_without_poisoning_the_next_incarnation() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();

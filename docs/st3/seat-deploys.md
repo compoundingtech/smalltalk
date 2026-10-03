@@ -38,6 +38,12 @@ another epoch after replacement. Reexec carries the returned epoch and token. On
 `stale-mailbox-session` ends a subscription as fenced. Store/read worker failures close its socket
 and the current owner reconnects and replays after one second without creating a receipt.
 
+OMP todo observation does not own delivery's lifetime. If the local PTY incarnation is ahead of
+the graph, the channel retains the latest validated todo snapshot while delivery continues. Its
+minute check activates the todo spool and publishes that snapshot once the graph catches up.
+Todo liveness cleanup requires two consecutive terminal or superseded observations; a healthy,
+missing, or failed read resets confirmation, so a single transient reading cannot end the channel.
+
 Already-running seats keep the legacy delivery path when their binary follows a deploy. The new
 transport starts at the next ordinary seat restart; deploys do not force providers to restart.
 The compatibility paths and legacy marketplace entry remain until operations has switched the
