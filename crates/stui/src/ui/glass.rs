@@ -2292,6 +2292,8 @@ impl Ui {
                 }
                 KeyCode::Char('g') if control => self.open_choice(None, Open::Glass),
                 KeyCode::Char('k') if control || command => glasses.palette = None,
+                // Ctrl+Q quits from anywhere, the palette included.
+                KeyCode::Char('q') if control => self.quit = true,
                 // Ctrl (or Alt, or ⌘) and a digit show only that section; the same again shows all.
                 KeyCode::Char(digit @ '1'..='5') if control || alt || command => {
                     let section = digit as usize - '1' as usize;
@@ -3782,6 +3784,15 @@ mod tests {
             Some(shell)
         );
         assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
+    fn ctrl_q_quits_with_the_palette_open() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        assert!(ui.palette_open());
+        ctrl(&mut ui, 'q');
+        assert!(ui.quit);
     }
 
     #[test]
