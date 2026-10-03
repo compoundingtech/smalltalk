@@ -52,5 +52,26 @@ write is stalled. A closed remote stream produces EOF on the connector.
 Reconnect by explicitly acquiring a **new** attachment and opening a new connector; capabilities
 cannot be replayed, and the client does not transparently reconnect or reuse one.
 
+### Foreground observation leases
+
+PEEK streams expire after 60 seconds without selected foreground observation and after
+300 seconds absolute. PTY traffic does not renew them. Use
+`raw_terminal_stream_controlled(&attachment)` to obtain
+`RawTerminalStream { stream, activity }`; clone `activity` and call
+`activity.selected_use().await` only while the terminal is selected in the foreground
+(approximately every 20 seconds). Stop sending controls on deselection or backgrounding.
+The byte-only connector has no automatic renewal and remains idle-expiring.
+
+Rotate before the absolute deadline by acquiring a fresh capability and connector. Send the
+existing PEEK initialization frame and receive fresh GEOMETRY and SCREEN before replacing
+the visible surface; then drop the old connector. Expired streams cannot be extended.
+Selected-use success means the control was sent, not that renewal was acknowledged.
+Revocation or lost authority watches closes existing streams; recover through fresh
+attachment/readiness APIs, never by replaying an old capability.
+
+Paired observations require the pairing issuer's gateway. `pairing.revoke` on another
+member fails without committing, with HTTP 409 `issuer-required` and
+`details.issuer_host_id`. Automatic cross-gateway revocation routing is not provided.
+
 Run `cargo run -p st3-client-codegen -- --check` from the repository root to verify the generated
 models and operation surfaces exactly match the normative schema and operation manifest.

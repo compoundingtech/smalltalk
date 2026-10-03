@@ -373,6 +373,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_restriction_of_original_grant_revokes_forwarded_actor() {
+        let (_root, state, session) = fixture();
+        let local = acquire(&state, &session);
+        let mut binding = local.binding.clone();
+        binding.actor = "client/original".into();
+        binding.grant_subject = Some("custom/client/original".into());
+        let grant = json!({"fields":{"session_actor":"client/original","person_id":"person/alex","scopes":["terminal.read"],"expires_at_unix_ms":client_now_ms()+600_000}});
+        binding.grant_digest = Some(credential_digest(&serde_json::to_string(&grant).unwrap()));
+        let forwarded = Lease::register(&state, &session, "terminal/shell", "host/lease-owner", "incarnation-one", Some(binding), &authorization_epoch(&state, &session).unwrap()).unwrap();
+        assert!(forwarded.check().is_ok());
+        claim(&state, "custom/client/original", "custom.client.pairing-completed", json!({
+            "session_actor":"client/original","person_id":"person/alex","scopes":[],
+            "expires_at_unix_ms":client_now_ms()+600_000
+        }));
+        assert!(forwarded.check().is_err(), "owner restriction must invalidate the original subject/digest");
+    }
+
+    #[tokio::test]
+    async fn non_issuer_pairing_revoke_fails_without_committing() {
+        let (_root, mut state, session) = fixture();
+        let subject = "custom/client/issuer-only";
+        claim(&state, subject, "custom.client.pairing-completed", json!({
+            "device_id":"device/issuer-only",
+            "person_id":"person/alex",
+            "session_actor":"client/issuer-only",
+            "scopes":["terminal.read"],
+            "expires_at_unix_ms":client_now_ms()+600_000
+        }));
+        // The claim keeps its issuer origin while the API runs on another member.
+        state.node = "other-member".into();
+        let snapshot = new_client_snapshot(&state);
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/issuer-only".into(),
+            action_type: "pairing.revoke".into(),
+            idempotency_key: "issuer-only".into(),
+            fence: Fence { snapshot_id: snapshot.id.clone(), ..Default::default() },
+            parameters: json!({"target_id":"device/issuer-only"}),
+        };
+        let error = dispatch_action(&state, &snapshot, &session, &request).await.unwrap_err();
+        assert_eq!(error.code, "issuer-required");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.details.get("issuer_host_id"), Some(&json!("host/lease-owner")));
+        assert!(state.store.claims_for_subject_kind_at(subject, "custom.client.pairing-revoked", None, true, 1).unwrap().claims.is_empty());
+        state.node = "lease-owner".into();
+        dispatch_action(&state, &new_client_snapshot(&state), &session, &request).await.unwrap();
+        assert_eq!(state.store.claims_for_subject_kind_at(subject, "custom.client.pairing-revoked", None, true, 1).unwrap().claims.len(), 1);
+    }
+
+    #[tokio::test]
     async fn an_acquired_capability_cannot_adopt_a_later_principal_epoch() {
         let (_root,state,session) = fixture();
         let acquired = authorization_epoch(&state,&session).unwrap();
