@@ -124,6 +124,40 @@ fn selection_uses_display_columns_in_both_drag_directions() {
 }
 
 #[test]
+fn selection_copies_text_without_the_message_edge_indent_or_fences() {
+    // Nathan, 2026-10-03: a command copied out of a message came with the "▎" edge on every
+    // line.
+    let lines = vec![
+        Line::from("▎ you · 10:02"),
+        Line::from("▎ Run this:"),
+        Line::from("▎ ```sh"),
+        Line::from("▎   mkdir -p ~/.config/demo"),
+        Line::from("▎     touch ~/.config/demo/keys.env"),
+        Line::from("▎ ```"),
+    ];
+    let mut selection = Selection {
+        pane: "session/a".into(),
+        anchor: (2, 0),
+        head: (5, 40),
+    };
+    assert_eq!(
+        selection.text(&lines),
+        "mkdir -p ~/.config/demo\n  touch ~/.config/demo/keys.env"
+    );
+    // Starting inside the edge copies from the text; starting past it copies from there.
+    selection.anchor = (1, 1);
+    selection.head = (1, 40);
+    assert_eq!(selection.text(&lines), "Run this:");
+    selection.anchor = (1, 6);
+    assert_eq!(selection.text(&lines), "this:");
+    // Text that only looks like an edge mid-line stays.
+    let plain = vec![Line::from("a ▎ b")];
+    selection.anchor = (0, 0);
+    selection.head = (0, 9);
+    assert_eq!(selection.text(&plain), "a ▎ b");
+}
+
+#[test]
 fn pane_intents_keep_other_sessions_drafts_and_expansion_independent() {
     let mut state = State::default();
     state

@@ -127,6 +127,9 @@ fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
     Ok((seat, messages))
 }
 
+/// The longest a mailbox stream goes without reading its seat's mailbox in full.
+const MAILBOX_FULL_SNAPSHOT: Duration = Duration::from_secs(60);
+
 async fn stream(state: AppState, fence: Fence, socket: WebSocket) {
     stream_with_reader(state, fence, socket, snapshot).await;
 }
@@ -142,13 +145,44 @@ where
     let mut previous_mailbox = Vec::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let mut dirty = true;
+    // What the last snapshot read, and when the last full snapshot ran. A wake reads the seat's
+    // mailbox again only when something it depends on changed, or a minute has passed.
+    let mut last: Option<(
+        crate::store::MailboxWatermark,
+        Vec<String>,
+        tokio::time::Instant,
+    )> = None;
     loop {
         if dirty {
             changed.borrow_and_update();
+            if let Some((mark, subjects, at)) = last.clone()
+                && at.elapsed() < MAILBOX_FULL_SNAPSHOT
+            {
+                let store = state.store.clone();
+                let binding = fence.clone();
+                let unchanged = tokio::task::spawn_blocking(move || {
+                    store.mailbox_changed_since(&binding, &mark, &subjects)
+                })
+                .await
+                .is_ok_and(|changed| changed.is_ok_and(|changed| !changed));
+                if unchanged {
+                    dirty = false;
+                }
+            }
+        }
+        if dirty {
             let store = state.store.clone();
             let binding = fence.clone();
             let read = read.clone();
-            let result = tokio::task::spawn_blocking(move || read(&store, &binding)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                let mark = store.mailbox_watermark(&binding);
+                (mark, read(&store, &binding))
+            })
+            .await;
+            let (mark, result) = match result {
+                Ok((mark, result)) => (mark.ok(), Ok(result)),
+                Err(error) => (None, Err(error)),
+            };
             let (seat, messages) = match result {
                 Ok(Ok(snapshot)) => snapshot,
                 Ok(Err(error)) => {
@@ -187,6 +221,13 @@ where
                     previous_seat = bytes;
                 }
             }
+            last = mark.map(|mark| {
+                let subjects = messages
+                    .iter()
+                    .map(|message| message.subject.clone())
+                    .collect();
+                (mark, subjects, tokio::time::Instant::now())
+            });
             let bytes = serde_json::to_vec(&messages).unwrap_or_default();
             if fence.component == "delivery" && bytes != previous_mailbox {
                 if send(&mut socket, &Frame::Mailbox { messages })
@@ -603,6 +644,64 @@ mod tests {
         );
         assert!(!root.path().join("resources").exists());
         server.abort();
+    }
+
+    #[test]
+    fn a_mailbox_stream_reads_again_only_for_what_its_snapshot_depends_on() {
+        let store = Store::open_memory("node").unwrap();
+        crate::mailbox::tests::ready(&store, "session-1");
+        let fence = store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        let send = |subject: &str, to: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/eval".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), json!("sent")),
+                        ("from".into(), json!("person/eval")),
+                        ("to".into(), json!(to)),
+                        ("content".into(), json!("A note.")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(subject.into()),
+                })
+                .unwrap();
+        };
+        let mark = store.mailbox_watermark(&fence).unwrap();
+        let mine = vec!["message/mine".to_owned()];
+        // Another seat's mail changes nothing this stream reads.
+        send("message/other", "agent/eval.other");
+        assert!(!store.mailbox_changed_since(&fence, &mark, &[]).unwrap());
+        // Mail to this seat does.
+        send("message/mine", "agent/eval.worker");
+        assert!(store.mailbox_changed_since(&fence, &mark, &[]).unwrap());
+        // So does a lifecycle claim of a message in its last snapshot.
+        let mark = store.mailbox_watermark(&fence).unwrap();
+        assert!(!store.mailbox_changed_since(&fence, &mark, &mine).unwrap());
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/mine".into(),
+                kind: "message.staged".into(),
+                actor: Some("agent/eval.worker".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("staged")),
+                    ("recipient".into(), json!("agent/eval.worker")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("mine-staged".into()),
+            })
+            .unwrap();
+        assert!(store.mailbox_changed_since(&fence, &mark, &mine).unwrap());
+        // And a newer channel taking the seat over.
+        let mark = store.mailbox_watermark(&fence).unwrap();
+        crate::mailbox::tests::ready(&store, "session-2");
+        let _newer = store.bind_mailbox(&Fence::new("agent/eval.worker", "session-2", "delivery"));
+        assert!(store.mailbox_changed_since(&fence, &mark, &mine).unwrap());
     }
 
     #[test]

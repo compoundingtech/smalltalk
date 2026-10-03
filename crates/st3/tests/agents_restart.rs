@@ -81,13 +81,34 @@ impl RuntimeControl for Runtime {
 
 struct Fixture {
     root: tempfile::TempDir,
+    state: AppState,
     store: Arc<Store>,
     runtime: Arc<Runtime>,
     reconciler: Arc<Reconciler<Runtime>>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
+/// Where the fixture's seat is declared.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    TopLevel,
+    /// In the mission body, materialized once per generation.
+    Mission,
+    /// Inside the step it works, materialized on every pass while the step is active.
+    Step,
+}
+
 impl Fixture {
     async fn new(mission: bool) -> (Self, String) {
+        Self::shaped(if mission {
+            Shape::Mission
+        } else {
+            Shape::TopLevel
+        })
+        .await
+    }
+
+    async fn shaped(shape: Shape) -> (Self, String) {
+        let mission = shape != Shape::TopLevel;
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&root.path().join("graph.db"), "restart-test").unwrap());
         let notify = Arc::new(Notify::new());
@@ -109,14 +130,17 @@ impl Fixture {
         }}"#,
             root.path().to_str().unwrap()
         );
-        let source = if mission {
+        let source = match shape {
             // The same seat shape is materialized by a mission rather than a root declaration.
-            format!(
+            Shape::Mission => format!(
                 "version 2\nmission \"example/restart\" state=\"ready\" {{\ngoal \"Exercise a seat restart.\"\n{}\nstep \"work\" {{ assigned-to \"agent/${{ST_MISSION_RUN}}/worker\"; goal \"Keep the run open.\" }}\n}}",
                 member.replace("example/worker", "worker")
-            )
-        } else {
-            format!("version 2\n{member}")
+            ),
+            Shape::Step => format!(
+                "version 2\nmission \"example/restart\" state=\"ready\" {{\ngoal \"Exercise a seat restart.\"\nstep \"work\" {{\nassigned-to \"agent/${{ST_MISSION_RUN}}/worker\"\ngoal \"Keep the run open.\"\n{}\n}}\n}}",
+                member.replace("example/worker", "worker")
+            ),
+            Shape::TopLevel => format!("version 2\n{member}"),
         };
         let intent = st3::parse_intent(&source, "restart-test").unwrap();
         let preview = store
@@ -170,10 +194,8 @@ impl Fixture {
             planner_default: Default::default(),
         };
         let socket = root.path().join("st3.sock");
-        let server =
-            tokio::spawn(
-                async move { st3::api::serve_unix(&socket, st3::api::router(state)).await },
-            );
+        let router = st3::api::router(state.clone());
+        let server = tokio::spawn(async move { st3::api::serve_unix(&socket, router).await });
         for _ in 0..100 {
             if root.path().join("st3.sock").exists() {
                 break;
@@ -183,6 +205,7 @@ impl Fixture {
         (
             Self {
                 root,
+                state,
                 store,
                 runtime,
                 reconciler,
@@ -217,6 +240,21 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+async fn st(socket: &Path, args: &[&str]) -> std::process::Output {
+    let socket = socket.to_owned();
+    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+            .env_remove("ST_AGENT")
+            .env_remove("ST_MISSION_RUN")
+            .args(["--endpoint", socket.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap()
 }
 async fn cli(socket: &Path, subject: &str, actor: &str, timeout: &str) -> std::process::Output {
     let socket = socket.to_owned();
@@ -429,4 +467,316 @@ fn restart_help_explains_seats_and_the_new_incarnation() {
     assert!(
         help.contains("restart") && help.contains("mission seat") && help.contains("incarnation")
     );
+}
+
+fn agent_subjects(store: &Store) -> Vec<String> {
+    store
+        .desired_subjects()
+        .unwrap()
+        .into_iter()
+        .map(|desired| desired.subject)
+        .filter(|subject| subject.starts_with("agent/"))
+        .collect()
+}
+
+fn succeeded(output: &std::process::Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A daemon that starts again keeps no memory of what its runs already declared.
+fn restarted_daemon(fixture: &Fixture) -> Reconciler<Runtime> {
+    Reconciler::new(
+        fixture.store.clone(),
+        fixture.runtime.clone(),
+        "restart-test".into(),
+        Arc::new(Notify::new()),
+    )
+}
+
+async fn stopped_mission_seat_stays_stopped(shape: Shape) {
+    let (fixture, subject) = Fixture::shaped(shape).await;
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+    let socket = fixture.root.path().join("st3.sock");
+    succeeded(
+        &st(
+            &socket,
+            &["agents", "stop", &subject, "--as", "person/avery"],
+        )
+        .await,
+    );
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+    assert_eq!(*fixture.runtime.stops.lock().unwrap(), ["fixture:1"]);
+    let daemon = restarted_daemon(&fixture);
+    for _ in 0..3 {
+        daemon.reconcile_once().unwrap();
+    }
+    assert_eq!(
+        fixture.runtime.starts.lock().unwrap().len(),
+        1,
+        "the seat came back after it was stopped"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .selected_desired_kind(&subject)
+            .unwrap()
+            .as_deref(),
+        Some("stop")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_mission_seat_stays_stopped_when_the_daemon_restarts() {
+    stopped_mission_seat_stays_stopped(Shape::Mission).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_step_seat_stays_stopped() {
+    stopped_mission_seat_stays_stopped(Shape::Step).await;
+}
+
+async fn starts_a_stopped_mission_seat_on_its_own_declaration(shape: Shape) {
+    let (fixture, subject) = Fixture::shaped(shape).await;
+    let socket = fixture.root.path().join("st3.sock");
+    let before = fixture
+        .store
+        .desired_subject_with_writer(&subject)
+        .unwrap()
+        .unwrap()
+        .0;
+    let seats = agent_subjects(&fixture.store);
+    assert_eq!(seats, [subject.clone()]);
+    // Starting a running mission seat changes nothing and says how to relaunch it.
+    let running = succeeded(
+        &st(
+            &socket,
+            &["agents", "start", &subject, "--as", "person/avery"],
+        )
+        .await,
+    );
+    assert!(running.contains("st agents restart"), "{running}");
+    succeeded(
+        &st(
+            &socket,
+            &["agents", "stop", &subject, "--as", "person/avery"],
+        )
+        .await,
+    );
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+    // A mission seat's declaration cannot be patched from the command line.
+    let patched = st(
+        &socket,
+        &[
+            "agents",
+            "start",
+            &subject,
+            "--workspace",
+            "/elsewhere",
+            "--as",
+            "person/avery",
+        ],
+    )
+    .await;
+    assert!(!patched.status.success());
+    assert!(String::from_utf8_lossy(&patched.stderr).contains("mission seat"));
+    // Both accepted spellings of the identity name the same seat.
+    succeeded(
+        &st(
+            &socket,
+            &[
+                "agents",
+                "start",
+                subject.trim_start_matches("agent/"),
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await,
+    );
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+    let after = fixture
+        .store
+        .desired_subject_with_writer(&subject)
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
+    assert_eq!(
+        agent_subjects(&fixture.store),
+        seats,
+        "start created another seat"
+    );
+    let starts = fixture.runtime.starts.lock().unwrap().clone();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[0].workspace, starts[1].workspace);
+    assert_eq!(starts[0].environment, starts[1].environment);
+    // Once started again, the seat is the run's own: a restarted daemon keeps it running.
+    let daemon = restarted_daemon(&fixture);
+    for _ in 0..3 {
+        daemon.reconcile_once().unwrap();
+    }
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starting_a_stopped_mission_seat_restores_its_declaration_and_creates_nothing_else() {
+    starts_a_stopped_mission_seat_on_its_own_declaration(Shape::Mission).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starting_a_stopped_step_seat_restores_its_declaration() {
+    starts_a_stopped_mission_seat_on_its_own_declaration(Shape::Step).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_run_cannot_start_its_seat_again() {
+    let (fixture, subject) = Fixture::new(true).await;
+    let socket = fixture.root.path().join("st3.sock");
+    succeeded(
+        &st(
+            &socket,
+            &["agents", "stop", &subject, "--as", "person/avery"],
+        )
+        .await,
+    );
+    let run = fixture.store.mission_runs().unwrap()[0].subject.clone();
+    fixture
+        .store
+        .set_mission_run_state(
+            run.trim_start_matches("mission-run/"),
+            "cancelled",
+            "terminal",
+            None,
+        )
+        .unwrap();
+    let output = st(
+        &socket,
+        &["agents", "start", &subject, "--as", "person/avery"],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot start again"),
+        "{output:?}"
+    );
+    assert_eq!(agent_subjects(&fixture.store), [subject]);
+}
+
+/// Send a typed client action as a person, the way stui and the phone do, fenced on the seat's
+/// selected declaration.
+async fn client_action(fixture: &Fixture, kind: &str, agent: &str, key: &str) -> Value {
+    use tower::ServiceExt as _;
+    let app = st3::api::router(fixture.state.clone());
+    let read = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/client/machines")
+                .header("x-st3-person", "person/avery")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let read: Value = serde_json::from_slice(
+        &axum::body::to_bytes(read.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let token = fixture
+        .store
+        .selected_desired_token(agent)
+        .unwrap()
+        .unwrap();
+    let action = json!({
+        "api_version": "st3.client.v0",
+        "id": format!("action/{key}"),
+        "type": kind,
+        "idempotency_key": key,
+        "fence": {"snapshot_id": read["snapshot"]["id"], "runtime_desired_revision": token},
+        "parameters": {"agent": agent},
+    });
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/client/actions")
+                .header("x-st3-person", "person/avery")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&action).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(status.is_success(), "{kind}: {status} {value}");
+    value
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_stops_and_starts_a_mission_seat_on_its_own_declaration() {
+    let (fixture, subject) = Fixture::new(true).await;
+    let before = fixture
+        .store
+        .desired_subject_with_writer(&subject)
+        .unwrap()
+        .unwrap()
+        .0;
+    client_action(
+        &fixture,
+        "agent.stop",
+        &subject,
+        "client-stop-mission-seat-1",
+    )
+    .await;
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+    assert_eq!(*fixture.runtime.stops.lock().unwrap(), ["fixture:1"]);
+    let daemon = restarted_daemon(&fixture);
+    daemon.reconcile_once().unwrap();
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+    client_action(
+        &fixture,
+        "agent.start",
+        &subject,
+        "client-start-mission-seat-1",
+    )
+    .await;
+    for _ in 0..3 {
+        daemon.reconcile_once().unwrap();
+    }
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2);
+    let after = fixture
+        .store
+        .desired_subject_with_writer(&subject)
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
+    assert_eq!(agent_subjects(&fixture.store), [subject]);
 }

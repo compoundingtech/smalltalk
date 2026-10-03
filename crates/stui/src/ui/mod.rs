@@ -266,6 +266,8 @@ pub struct Ui {
     effects: Vec<Effect>,
     popover: Option<String>,
     chat: Option<ChatState>,
+    /// st's conversation search for the palette: the query asked and what came back.
+    pub(crate) said: Option<(String, Result<st3_client::ConversationSearch, String>)>,
     /// The named answer chosen on the focused structured request, before Enter sends it.
     answering: Option<usize>,
     /// Voice mode: the speech helper listening for one input.
@@ -367,6 +369,7 @@ impl Ui {
             effects: Vec::new(),
             popover: None,
             chat: None,
+            said: None,
             voice: None,
             answering: None,
             dictated: HashSet::new(),
@@ -2653,6 +2656,17 @@ impl Ui {
         true
     }
 
+    /// Find `query` in an agent's conversation, as `/` does, jumping to the first match.
+    pub(crate) fn find_in(&mut self, agent: &str, query: &str) {
+        self.find = Some(Find {
+            agent: agent.to_owned(),
+            query: query.to_owned(),
+            current: 0,
+            count: Cell::new(0),
+            jump: Cell::new(!query.is_empty()),
+        });
+    }
+
     fn select(&mut self, index: usize) {
         self.answering = None;
         let count = self.ids().len();
@@ -3011,13 +3025,7 @@ impl Ui {
             KeyCode::Char('O') => self.toggle_simple(),
             KeyCode::Char('/') if self.tab == 1 => {
                 if let Some(agent) = self.selected_id() {
-                    self.find = Some(Find {
-                        agent,
-                        query: String::new(),
-                        current: 0,
-                        count: Cell::new(0),
-                        jump: Cell::new(false),
-                    });
+                    self.find_in(&agent, "");
                 }
             }
             KeyCode::Char(letter @ ('r' | 'x')) if self.tab == 1 && self.live => {

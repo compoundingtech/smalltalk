@@ -1012,6 +1012,19 @@ pub struct MissionRunStateMoment {
     pub outcome: Option<MissionRunOutcomeView>,
 }
 
+/// A selected stop and the seat declaration it ended.
+#[derive(Clone, Debug)]
+pub struct EndedDeclaration {
+    /// The selected stop.
+    pub stop: DesiredSubject,
+    /// The stop's claim, the seat's selected desired token.
+    pub token: String,
+    /// Who published the stop; the daemon's own stops record no writer.
+    pub writer: Option<String>,
+    /// The agent declaration the stop ended.
+    pub declaration: DesiredSubject,
+}
+
 /// A kept agent status: the snapshot it answers, the agent projection index it was reduced at,
 /// whether it includes history, and the status.
 type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
@@ -9647,6 +9660,190 @@ impl Store {
         )
     }
 
+    /// The seat declaration that the stop selected for `subject` ended, or `None` when the
+    /// selected declaration is not a stop. A stop that replaced another stop is followed back
+    /// to the declaration they ended; a merge of several is ambiguous and also gives `None`.
+    pub fn declaration_ended_by_stop(&self, subject: &str) -> Result<Option<EndedDeclaration>> {
+        let connection = self.readers.get();
+        let Some((stop, writer)) = connection
+            .query_row(
+                "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                        desired.owner_run, desired.owner_generation, desired.owner_step,
+                        desired.claim_id, claims.actor
+                 FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
+                 WHERE desired.subject = ?1 AND desired.kind = 'stop'",
+                [subject],
+                |row| {
+                    Ok((
+                        (desired_from_row(row)?, row.get::<_, String>(7)?),
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let (stop, token) = stop;
+        let mut claim = claim_by_id_tx(&connection, &token)?;
+        // A seat is stopped and started a few times at most; the bound only guards a cycle.
+        for _ in 0..64 {
+            let Some(current) = claim else {
+                return Ok(None);
+            };
+            let desired: DesiredSubject = serde_json::from_value(current.body)?;
+            if desired.kind == "agent" {
+                return Ok(Some(EndedDeclaration {
+                    stop,
+                    token,
+                    writer,
+                    declaration: desired,
+                }));
+            }
+            let [predecessor] = current.predecessors.as_slice() else {
+                return Ok(None);
+            };
+            if desired.kind != "stop" {
+                return Ok(None);
+            }
+            claim = claim_by_id_tx(&connection, predecessor)?;
+        }
+        Ok(None)
+    }
+
+    /// The subjects among `subjects` that a person or an agent stopped while `generation` of
+    /// `run` declared them. Such a stop holds for the rest of that generation, across daemon
+    /// restarts, until someone starts the seat again; the run does not declare it again.
+    pub fn stopped_by_hand(
+        &self,
+        subjects: &[String],
+        run: &str,
+        generation: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut stopped = BTreeSet::new();
+        for desired in self.desired_subjects_named(subjects)? {
+            // A run's own stop and a generation's retirement record their owner; only a stop
+            // published at the root, as `st agents stop` does, is someone's decision.
+            if desired.kind != "stop"
+                || desired.owner_run.is_some()
+                || desired.owner_generation.is_some()
+            {
+                continue;
+            }
+            let Some(ended) = self.declaration_ended_by_stop(&desired.subject)? else {
+                continue;
+            };
+            if ended.writer.is_some()
+                && ended.declaration.owner_run.as_deref() == Some(run)
+                && ended.declaration.owner_generation.as_deref() == Some(generation)
+            {
+                stopped.insert(desired.subject);
+            }
+        }
+        Ok(stopped)
+    }
+
+    /// Start a stopped mission seat again on the declaration its run gave it. `expected` fences
+    /// the selected stop. A seat its run already declares is returned unchanged, and a run that
+    /// ended or moved to another generation since the stop cannot start it.
+    pub fn start_mission_seat(
+        &self,
+        subject: &str,
+        expected: Option<&str>,
+        actor: &str,
+        idempotency_key: &str,
+    ) -> Result<ApplyResponse, St3Error> {
+        let Some(ended) = self.declaration_ended_by_stop(subject).map_err(internal)? else {
+            return Err(St3Error::new(
+                "seat-not-stopped",
+                format!("`{subject}` is not a stopped seat with one prior declaration"),
+            ));
+        };
+        if let Some(expected) = expected
+            && expected != ended.token
+        {
+            return Err(St3Error::new(
+                "stale-seat-declaration",
+                format!("the selected declaration of `{subject}` changed"),
+            ));
+        }
+        let declaration = ended.declaration;
+        let (Some(owner_run), Some(owner_generation)) = (
+            declaration.owner_run.clone(),
+            declaration.owner_generation.clone(),
+        ) else {
+            return Err(St3Error::new(
+                "seat-not-mission-owned",
+                format!("`{subject}` is not a mission seat"),
+            ));
+        };
+        let run_id = owner_run.strip_prefix("mission-run/").unwrap_or(&owner_run);
+        let (status, phase, generation) = self
+            .readers
+            .get()
+            .query_row(
+                "SELECT status, phase, 'run-generation/' || current_generation_id
+                 FROM mission_runs WHERE id=?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "mission-run-missing",
+                    format!("`{subject}` belongs to `{owner_run}`, which this node does not have"),
+                )
+            })?;
+        if is_terminal_run_state(&status)
+            || !matches!(phase.as_str(), "normal" | "revision-draining")
+        {
+            return Err(St3Error::new(
+                "mission-run-ended",
+                format!("`{owner_run}` is {status} ({phase}); its seats cannot start again"),
+            ));
+        }
+        if owner_generation != generation {
+            return Err(St3Error::new(
+                "mission-generation-moved",
+                format!(
+                    "`{owner_run}` moved to {generation} after `{subject}` stopped; its new generation declares its seats"
+                ),
+            ));
+        }
+        let heads = {
+            let connection = self.readers.get();
+            let transaction = connection.unchecked_transaction().map_err(internal)?;
+            intent_leaves_tx(&transaction, subject).map_err(internal)?
+        };
+        let normalized = json!({ "agent": subject, "start": ended.token });
+        let intent = NormalizedIntent {
+            schema: "st3.v1".into(),
+            source_hash: canonical_hash(&normalized).map_err(internal)?,
+            subjects: BTreeMap::from([(subject.to_owned(), declaration)]),
+            missions: BTreeMap::new(),
+            mission_runs: BTreeMap::new(),
+            planning_sessions: BTreeMap::new(),
+            resource_refreshes: Vec::new(),
+            replica_repairs: Vec::new(),
+            document_refs: BTreeSet::new(),
+            deprecated_syntax: BTreeSet::new(),
+            normalized,
+        };
+        self.apply_as(
+            &intent,
+            &BTreeMap::from([(subject.to_owned(), heads)]),
+            idempotency_key,
+            Some(actor),
+        )
+    }
+
     /// The current desired declaration of `subject` and the actor its claim records. A
     /// declaration from before claims recorded their writer, or the daemon's own, has none.
     pub fn desired_subject_with_writer(
@@ -10035,6 +10232,64 @@ impl Store {
             }
         }
         Ok(records.into_iter().collect())
+    }
+
+    /// Search refreshes only a person's private message texts, using the same endpoint
+    /// indexes as the mailbox. Other fleet writes do not invalidate this source.
+    pub(crate) fn conversation_search_mail_stamp(&self, person: &str, through: u64) -> Result<String> {
+        let connection = self.readers.get();
+        let (count, newest): (u64, u64) = connection.query_row(
+            "WITH sent AS (
+                SELECT store_index FROM claims INDEXED BY claims_message_to_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1 AND store_index<=?2
+                UNION SELECT store_index FROM claims INDEXED BY claims_message_from_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.from')=?1 AND store_index<=?2
+            ) SELECT COUNT(*), COALESCE(MAX(store_index),0) FROM sent",
+            params![person,through],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(format!("{count}:{newest}"))
+    }
+
+    pub(crate) fn conversation_search_timeline_stamp(&self, agent: &str, incarnation: &str, through: u64) -> Result<String> {
+        let connection = self.readers.get();
+        let (local_count, local_newest): (u64,u64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(MAX(id),0) FROM local_observations
+             WHERE subject=?1 AND kind='harness.timeline'
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND after_store_index<=?3", params![agent,incarnation,through],
+            |row| Ok((row.get(0)?,row.get(1)?)))?;
+        let (legacy_count, legacy_newest): (u64,u64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(MAX(store_index),0) FROM claims
+             WHERE subject=?1 AND kind='harness.timeline'
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND store_index<=?3", params![agent,incarnation,through],
+            |row| Ok((row.get(0)?,row.get(1)?)))?;
+        Ok(format!("{local_count}:{local_newest}:{legacy_count}:{legacy_newest}"))
+    }
+
+    pub(crate) fn conversation_search_messages(&self, person: &str, through: u64) -> Result<Vec<MessageView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&canonical_sql(
+            "WITH candidates AS (
+                SELECT id FROM claims INDEXED BY claims_message_to_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1 AND store_index<=?2
+                UNION SELECT id FROM claims INDEXED BY claims_message_from_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.from')=?1 AND store_index<=?2
+            ), ranked AS (
+                SELECT claims.id,claims.batch_id,claims.subject,claims.store_index,claims.accepted_at_unix_ms,
+                    MIN(claims.store_index) OVER (PARTITION BY claims.subject) AS created_index,
+                    ROW_NUMBER() OVER (PARTITION BY claims.subject ORDER BY CANONICAL_ASC(claims)) AS ordinal
+                FROM claims JOIN candidates ON candidates.id=claims.id
+            ) SELECT sent.subject,sent.created_index FROM ranked AS sent
+              WHERE ordinal=1 ORDER BY CANONICAL_DESC(sent) LIMIT 50001"))?;
+        let rows = statement.query_map(params![person,through], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (subject, index) = row?;
+            messages.push(self.message_view_cached(&connection, &subject, index)?);
+        }
+        Ok(messages)
     }
 
     pub fn messages(
@@ -13201,6 +13456,73 @@ impl Store {
 
     pub(crate) fn check_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
         check_mailbox_fence(&self.readers.get(), fence)
+    }
+
+    /// What a mailbox stream's snapshot can depend on, read before the snapshot is taken. A change
+    /// after it to any of that brings a new snapshot; see [`Store::mailbox_changed_since`].
+    pub(crate) fn mailbox_watermark(
+        &self,
+        fence: &crate::mailbox::Fence,
+    ) -> Result<MailboxWatermark, St3Error> {
+        let index = self.index().map_err(internal)?;
+        let connection = self.readers.get();
+        let local = connection
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM local_observations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        Ok(MailboxWatermark {
+            index,
+            local,
+            owner: mailbox_owner_key(&connection, fence)?,
+        })
+    }
+
+    /// Whether anything a mailbox stream's snapshot reads changed after `mark`: a claim or local
+    /// observation of the seat (its declaration, runtime and harness), its channel ownership, a
+    /// message sent to it or newly declared, or a claim of a message in its last snapshot. Every
+    /// graph change wakes every stream, and each used to read the seat's whole mailbox again.
+    pub(crate) fn mailbox_changed_since(
+        &self,
+        fence: &crate::mailbox::Fence,
+        mark: &MailboxWatermark,
+        messages: &[String],
+    ) -> Result<bool, St3Error> {
+        let connection = self.readers.get();
+        let recipient = normalize_message_party(&fence.subject);
+        let bare_recipient = recipient
+            .strip_prefix("agent/")
+            .filter(|suffix| !suffix.contains('/'))
+            .unwrap_or(&recipient)
+            .to_owned();
+        let changed: i64 = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND store_index>?2)
+                     OR EXISTS(SELECT 1 FROM claims INDEXED BY claims_message_to_order_index
+                               WHERE kind='message.sent'
+                                 AND json_extract(body, '$.fields.to') IN (?3, ?4)
+                                 AND store_index>?2)
+                     OR EXISTS(SELECT 1 FROM claims
+                               WHERE subject IN (SELECT value FROM json_each(?5))
+                                 AND store_index>?2)
+                     OR EXISTS(SELECT 1 FROM claims
+                               WHERE kind='intent.desired' AND store_index>?2
+                                 AND subject GLOB 'message/*')
+                     OR EXISTS(SELECT 1 FROM local_observations WHERE subject=?1 AND id>?6)",
+                params![
+                    fence.subject,
+                    mark.index,
+                    recipient,
+                    bare_recipient,
+                    serde_json::to_string(messages).map_err(internal)?,
+                    mark.local,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        Ok(changed != 0 || mailbox_owner_key(&connection, fence)? != mark.owner)
     }
 
     pub fn current_harness(
@@ -17572,6 +17894,31 @@ fn mailbox_harness_ended(
         }
     }
     Ok(true)
+}
+
+/// See [`Store::mailbox_watermark`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MailboxWatermark {
+    index: u64,
+    local: i64,
+    owner: Option<(String, i64, bool)>,
+}
+
+/// The seat channel's current owner, and whether `fence`'s binding still exists.
+fn mailbox_owner_key(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+) -> Result<Option<(String, i64, bool)>, St3Error> {
+    connection
+        .query_row(
+            "SELECT owner.incarnation, owner.epoch,
+                    EXISTS(SELECT 1 FROM local_mailbox_bindings WHERE token=?3)
+             FROM local_mailbox_owners owner WHERE owner.subject=?1 AND owner.component=?2",
+            params![fence.subject, fence.component, fence.token],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(internal)
 }
 
 fn check_mailbox_fence(
@@ -24463,6 +24810,25 @@ fn carried_claim_successor_tx(
              WHERE run_id=?1 AND step_path=?2 AND lease_owner=?3 AND generation_id<>?4
                AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
             params![run_id, step.step, actor, generation_id_from_subject(&step.generation)],
+            step_run_from_row,
+        )
+        .optional()
+}
+
+/// Return the current-generation step that took the place of a superseded step, whoever holds it.
+fn current_generation_successor_tx(
+    connection: &Connection,
+    step: &StepRunView,
+) -> rusqlite::Result<Option<StepRunView>> {
+    let run_id = step.run.strip_prefix("mission-run/").unwrap_or(&step.run);
+    connection
+        .query_row(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+             FROM step_runs
+             WHERE run_id=?1 AND step_path=?2 AND generation_id<>?3
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
+            params![run_id, step.step, generation_id_from_subject(&step.generation)],
             step_run_from_row,
         )
         .optional()

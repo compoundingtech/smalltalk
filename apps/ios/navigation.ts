@@ -18,7 +18,7 @@ export type StackParams = {
   GlassesRoot: undefined;
   /** One space's tabs, grouped by pane. */
   Space: { id: string; title?: string };
-  Conversation: { target: string; sessionId?: string; title?: string };
+  Conversation: { target: string; sessionId?: string; title?: string; find?: string };
   Terminal: { terminalId: string; title?: string };
   /** One conversation entry's text, to select and copy any part of it. */
   SelectText: { text: string; title?: string };

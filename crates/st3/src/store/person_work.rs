@@ -393,9 +393,13 @@ impl Store {
         }
         self.connection.batched(|tx| {
             let structured = canonical_request(input)?;
-            let origin_subject = normalize_step_run(input.step.as_deref().unwrap());
-            let origin = step(tx, &origin_subject).map_err(internal)?
+            let named = step(tx, &normalize_step_run(input.step.as_deref().unwrap())).map_err(internal)?
                 .ok_or_else(|| St3Error::new("missing-step-run", "the asking step does not exist"))?;
+            // A revision moves a step into the run's new generation, and its worker may still
+            // name it by the predecessor subject, as the seat's environment does. Work actions
+            // accept that name; so does an ask, and only the claimant may ask from either.
+            let origin = current_generation_successor_tx(tx, &named).map_err(internal)?.unwrap_or(named);
+            let origin_subject = origin.subject.clone();
             let identity = serde_json::to_string(&(&origin.generation, &origin_subject, origin.attempt, &input.idempotency_key)).map_err(internal)?;
             let hash = hex::encode(Sha256::digest(identity.as_bytes()));
             let subject = format!("step-run/{}/ask-{}", generation_id_from_subject(&origin.generation), &hash[..32]);
@@ -1174,6 +1178,99 @@ schedule "intake" {
             store.step_run(&ask.subject).unwrap().unwrap().status,
             "completed"
         );
+    }
+
+    /// Revise the fixture's run so `prepare` moves into a new generation: carried with its
+    /// claim when only `review` changes, or issued again and claimed anew when `prepare` changes.
+    fn revise_fixture(store: &Store, origin: &StepRunView, prepare_changes: bool) -> StepRunView {
+        let (prepare, review) = if prepare_changes {
+            ("Prepare the release notes too.", "Review the release.")
+        } else {
+            ("Prepare the release.", "Review the release notes.")
+        };
+        let source = format!(
+            r#"version 2
+mission "person-work" state="ready" {{
+  goal "Review the release.";
+  step "prepare" {{ assigned-to "agent/alder.asker"; goal "{prepare}"; }}
+  step "review" {{ assigned-to "person/avery"; goal "{review}"; }}
+}}
+"#
+        );
+        let intent = crate::graph::parse_internal_intent(&source, "alder").unwrap();
+        store.apply_internal(&intent, "person-revision").unwrap();
+        let revised = store
+            .adopt_mission_revision(
+                &origin.run,
+                &intent.missions["person-work"],
+                "person/avery",
+                "the release needs notes",
+                "person-revision",
+            )
+            .unwrap();
+        let moved = revised
+            .steps
+            .iter()
+            .find(|step| step.step == "prepare")
+            .unwrap()
+            .clone();
+        assert_ne!(moved.subject, origin.subject);
+        if prepare_changes {
+            store.set_step_state(&moved.subject, "ready", None).unwrap();
+            store
+                .work_action(
+                    &moved.subject,
+                    "claim",
+                    &crate::model::WorkRequest {
+                        actor: Some("agent/alder.asker".into()),
+                        incarnation: Some("asker-one".into()),
+                        summary: None,
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: "reclaim-prepare".into(),
+                    },
+                )
+                .unwrap();
+        }
+        let moved = store.step_run(&moved.subject).unwrap().unwrap();
+        assert_eq!(moved.claimant.as_deref(), Some("agent/alder.asker"));
+        moved
+    }
+
+    #[test]
+    fn a_worker_asks_from_the_step_a_revision_moved_by_its_old_name() {
+        for prepare_changes in [false, true] {
+            let (store, origin, input) = fixture();
+            let moved = revise_fixture(&store, &origin, prepare_changes);
+            // The worker still names the step it claimed before the revision.
+            assert_eq!(input.step.as_deref(), Some(origin.subject.as_str()));
+            let ask = store
+                .ask_person(&input)
+                .unwrap_or_else(|error| panic!("prepare changes: {prepare_changes}: {error:?}"));
+            let paused = store.step_run(&moved.subject).unwrap().unwrap();
+            assert_eq!(paused.status, "waiting-person");
+            assert_eq!(
+                store.ask_person(&input).unwrap().subject,
+                ask.subject,
+                "a retry is the same ask"
+            );
+            assert!(
+                ask.subject.starts_with(&format!(
+                    "step-run/{}/",
+                    moved.generation.trim_start_matches("run-generation/")
+                )),
+                "{}",
+                ask.subject
+            );
+            // Another seat cannot ask through a step it never held.
+            let mut stranger = input.clone();
+            stranger.actor = "agent/alder.other".into();
+            stranger.idempotency_key = "stranger".into();
+            assert_eq!(
+                store.ask_person(&stranger).unwrap_err().code,
+                "stale-work-ask"
+            );
+        }
     }
 
     #[test]

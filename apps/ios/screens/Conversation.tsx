@@ -60,8 +60,9 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   }, [issue]);
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
   const [pending, setPending] = useState<Pending[]>([]);
-  const [find, setFind] = useState('');
-  const [findOpen, setFinding] = useState(false);
+  // Opened from search ("said in conversations"), the conversation arrives found.
+  const [find, setFind] = useState(route.params.find ?? '');
+  const [findOpen, setFinding] = useState(!!route.params.find);
   const [draft, setDraft] = useState(() => draftCache.current.get(target) ?? '');
   const [away, setAway] = useState(false);
   // Dictation: listening, what is heard so far, the microphone's recent levels for a waveform,

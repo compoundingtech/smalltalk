@@ -356,7 +356,9 @@ wait; a failure or timeout explains why the seat is not running again. `st agent
 agent/example/worker --as person/ada` stops a seat until you apply its file again. It ends every
 process the seat started, including builds and tests that outlived the harness, on hosts with a
 systemd user manager; [Stopping a session](docs/st3/priority.md#stopping-a-session) says what
-other hosts miss.
+other hosts miss. A mission seat you stop stays stopped while its run's generation lasts, across
+daemon restarts, and `st agents start` starts it again on its run's own declaration, creating no
+other seat.
 
 `st agents suspend agent/example/worker --as person/ada` stops a quiet seat and keeps its harness's
 own session; `st agents resume agent/example/worker --as person/ada` brings the seat back on that
@@ -438,6 +440,7 @@ st conversations ls person/ada
 st conversations read MESSAGE --as person/ada
 st conversations thread MESSAGE
 st conversations archive MESSAGE --as person/ada
+st conversations search "release date" --agent agent/example/worker --since 2026-10-01T00:00:00Z
 ```
 
 If a send or reply goes unanswered, st retries once with the same message and idempotency
@@ -449,6 +452,13 @@ for a new message.
 shows one conversation as stui shows it: messages, Small Talk, and tool calls folded to a line
 or two. `--raw` prints every stored entry instead (message boundaries, tool input and output in
 full), and `--json` prints the page.
+
+`conversations search` searches the authenticated person's sent and received messages and
+the normalized transcripts they can view. It returns conversation and entry IDs with short
+excerpts, newest first. Use `--cursor` for older matches, or `--json` for the typed client
+response. The response dates its index and reports incomplete sources, including retained
+history limits and unavailable hosts. See [conversation search](docs/st3/conversation-search.md)
+for freshness, costs, and the embedding API.
 
 ## Bring in sessions st does not own
 

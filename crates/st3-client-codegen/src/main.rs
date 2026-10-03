@@ -208,6 +208,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn document_get(&self, name: &str) -> Result<Envelope<DocumentContent>, ClientError> {{ self.get(&format!(\"/v1/client/documents/content?name={{}}\", percent_encode(name))).await }}"
             )?;
+        } else if id == "conversation.search" {
+            writeln!(
+                out,
+                "    pub async fn conversation_search(&self, text: &str, agent: Option<&str>, since: Option<&str>, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<ConversationSearch>, ClientError> {{ let mut query = vec![format!(\"text={{}}\", percent_encode(text))]; for (name, value) in [(\"agent\", agent), (\"since\", since), (\"cursor\", cursor)] {{ if let Some(value) = value {{ query.push(format!(\"{{name}}={{}}\", percent_encode(value))); }} }} if let Some(limit) = limit {{ query.push(format!(\"limit={{limit}}\")); }} self.get(&format!(\"/v1/client/conversations/search?{{}}\", query.join(\"&\"))).await }}"
+            )?;
         } else if id == "timeline.list" {
             writeln!(
                 out,
@@ -298,6 +303,11 @@ fn swift_operation_methods(
                 | "agent-queue.get"
         ) {
             continue;
+        } else if id == "conversation.search" {
+            writeln!(
+                out,
+                "    public func conversationSearch(text: String, agent: String? = nil, since: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ConversationSearch> {{ var query: [URLQueryItem] = [.init(name: \"text\", value: text)]; for (name, value) in [(\"agent\", agent), (\"since\", since), (\"cursor\", cursor)] {{ if let value {{ query.append(.init(name: name, value: value)) }} }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/conversations/search\", query: query) }}"
+            )?;
         } else if id == "usage.period" {
             writeln!(
                 out,
@@ -989,7 +999,12 @@ fn typescript_operation_methods(
         } else {
             path.to_owned()
         };
-        if id == "events.list" {
+        if id == "conversation.search" {
+            writeln!(
+                out,
+                "    async {method}(text: string, options: {{ agent?: string; since?: string; cursor?: string; limit?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ text, ...options }})); }}"
+            )?;
+        } else if id == "events.list" {
             writeln!(
                 out,
                 "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
