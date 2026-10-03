@@ -569,6 +569,22 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st backup create",
+      "description": "Save a consistent signed claim-log snapshot to a private file",
+      "tests": [
+        "crates/st3/tests/backup.rs::a_live_backup_download_restores_and_leaves_the_daemon_serving_reads"
+      ],
+      "verification": "real CLI downloads paged backup over private Unix socket while reads continue"
+    },
+    {
+      "command": "st backup restore",
+      "description": "Restore a claim-log archive into an empty offline database with a fresh writer",
+      "tests": [
+        "crates/st3/tests/backup.rs::a_live_backup_download_restores_and_leaves_the_daemon_serving_reads"
+      ],
+      "verification": "real CLI restores the downloaded archive and compares all shared graph digests"
+    },
+    {
       "command": "st blobs get",
       "description": "Read one attachment. A member that does not hold it asks the member that took the upload",
       "tests": [

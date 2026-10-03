@@ -407,6 +407,25 @@ impl Store {
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st database {}", path.display()))?;
+        let has_meta: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_meta
+            && let Some(writer) = connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key='backup_restore_writer'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        {
+            anyhow::ensure!(
+                origin == writer,
+                "restored database requires fresh writer `{writer}`; configure node to that identity before starting"
+            );
+        }
         projection_digest::register(&connection)?;
         crate::sqlite::observe(&mut connection);
         connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);

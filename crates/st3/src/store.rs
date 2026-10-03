@@ -87,6 +87,7 @@ pub use smallclaims::store::{
 
 mod accounts;
 mod attention_snapshot;
+mod backup;
 mod checkpoint_rules;
 mod limits;
 mod person_work;

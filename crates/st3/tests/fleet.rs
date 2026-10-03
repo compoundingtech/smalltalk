@@ -2002,6 +2002,11 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
         wait_for_notes(node, &expected, 60, &[&o, &n1, &n2]).await;
     }
 
+    // The baseline predates the backup CLI. Export a private SQLite snapshot of its graph
+    // with the current envelope exporter, then restore the logical file at the current schema.
+    // This is also run by the existing exact fleet-compat CI invocation.
+    backup_baseline_graph(&o, root.path());
+
     // n1 and n2 move to membership while the old build keeps replicating with them.
     n1.stop();
     n1.migrate(&["--anchor"]);
@@ -2034,6 +2039,89 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
         assert_eq!(status["unsigned_envelopes"], 0, "{}: {status}", node.name);
         assert_eq!(status["invalid_records"], 0, "{}: {status}", node.name);
     }
+}
+
+fn backup_baseline_graph(old: &Node, directory: &Path) {
+    let original = old.state_dir().join("claims.sqlite3");
+    let copy = directory.join("baseline-copy.db");
+    let reader = rusqlite::Connection::open_with_flags(
+        &original,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let old_schema: u32 = reader
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    reader
+        .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+        .unwrap();
+    drop(reader);
+    // Capture the baseline's unchanged sync payloads before current code opens or migrates it.
+    let reader =
+        rusqlite::Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let baseline_envelopes = reader
+        .prepare(
+            "SELECT writer,sequence,envelope_hash,previous_hash,accepted_at_unix_ms,payload
+         FROM replica_envelopes WHERE batch_id IS NOT NULL ORDER BY writer,sequence,envelope_hash",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok(st3::model::ReplicaEnvelope {
+                writer: row.get(0)?,
+                sequence: row.get(1)?,
+                hash: row.get(2)?,
+                previous_hash: row.get(3)?,
+                accepted_at_unix_ms: row.get::<_, String>(4)?.parse().unwrap(),
+                payload: row.get(5)?,
+                member_key: None,
+                signature: None,
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    drop(reader);
+    let archive = directory.join("baseline-claims.jsonl");
+    let header = st3::backup::create_from_database(&copy, &archive).unwrap();
+    let source = st3::store::Store::open(&copy, "backup-reader").unwrap();
+    let target = directory.join("baseline-restored.db");
+    let report = st3::backup::restore(&archive, &target).unwrap();
+    let restored = st3::store::Store::open(&target, &report.writer).unwrap();
+    assert!(old_schema <= header.source_schema);
+    assert_eq!(report.graph_digest, header.graph_digest);
+    assert!(report.projections_match);
+    let restored_envelopes = restored
+        .replica_envelopes(
+            baseline_envelopes
+                .iter()
+                .map(|envelope| st3::model::ReplicaEnvelopeId {
+                    writer: envelope.writer.clone(),
+                    sequence: envelope.sequence,
+                    hash: envelope.hash.clone(),
+                })
+                .collect(),
+        )
+        .unwrap();
+    assert!(!baseline_envelopes.is_empty());
+    assert_eq!(
+        serde_json::to_value(restored_envelopes).unwrap(),
+        serde_json::to_value(baseline_envelopes).unwrap()
+    );
+    assert_eq!(
+        source.replication_inventory().unwrap().digest,
+        restored.replication_inventory().unwrap().digest
+    );
+    assert_eq!(
+        source.backup_header().unwrap().tables,
+        restored.backup_header().unwrap().tables
+    );
+    assert!(
+        !restored
+            .claims_for("custom/fleet-test/o-0", None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

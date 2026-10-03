@@ -621,6 +621,17 @@ const PROBES: &[Probe] = &[
     get("GET /v1/status", "/v1/status?subject={seat}"),
     get("GET /v1/desired/{*subject}", "/v1/desired/{seat}"),
     get("GET /v1/events", "/v1/events?limit=100"),
+    // The route streams JSON Lines rather than the JSON document the HTTP probe expects.
+    // Measure the same paged exporter directly, normalizing work by archive bytes.
+    direct("GET /v1/backup", |store, _, _| {
+        let mut archive = Vec::new();
+        store
+            .write_backup(&mut archive)
+            .map_err(|error| error.to_string())?;
+        String::from_utf8(archive)
+            .map(Value::String)
+            .map_err(|error| error.to_string())
+    }),
     get("GET /v1/doctor", "/v1/doctor"),
     get("GET /v1/repair", "/v1/repair"),
     get("GET /v1/replication/status", "/v1/replication/status"),
