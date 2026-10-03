@@ -20876,6 +20876,105 @@ fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() 
     );
 }
 
+/// A document republished all day, such as a probe report, arrives from its writer after this
+/// node's own newer claims (#898). Each binding keeps the earliest claim of its version whatever
+/// order bindings arrive in, so it extends the projection without rebuilding every version, and
+/// the result is the one a replay from nothing gives.
+#[cfg(test)]
+#[test]
+fn a_document_binding_that_arrives_out_of_order_does_not_rebuild_every_version() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let sync = || {
+        let response = source
+            .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.project_replication_backlog().unwrap();
+    };
+    let publish = |version: usize| {
+        source
+            .put_document(
+                "doc/probe-report",
+                format!("An invented probe report, version {version}.").as_bytes(),
+                &source.latest_document_token("doc/probe-report").unwrap(),
+                &format!("probe-report-{version}"),
+            )
+            .unwrap();
+    };
+    for version in 0..40 {
+        publish(version);
+    }
+    sync();
+
+    // The target writes a claim of its own that sorts after the next binding.
+    let accepted_at = source
+        .connection
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT MAX(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as u128
+        + 10;
+    target.set_write_clock_at(accepted_at + 10).unwrap();
+    target
+        .append_claim(&ClaimInput {
+            subject: "custom/target/newer".into(),
+            kind: "custom.target.note".into(),
+            actor: Some("person/tester".into()),
+            fields: BTreeMap::new(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    target.project_replication_backlog().unwrap();
+    source.set_write_clock_at(accepted_at).unwrap();
+    publish(40);
+    FULL_REPLAYS.with(|replays| replays.set(0));
+    BASE_REBUILDS.with(|rebuilds| rebuilds.set(0));
+    sync();
+    assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+    assert_eq!(BASE_REBUILDS.with(std::cell::Cell::get), 0);
+
+    let documents = |store: &Store| {
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .prepare(
+                "SELECT name, hash, created_index, binding_claim_id, binding_key FROM documents
+                 ORDER BY name, hash",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let incremental = documents(&target);
+    assert_eq!(incremental.len(), 41);
+    target.replay_replication_graph().unwrap();
+    assert_eq!(documents(&target), incremental);
+}
+
 fn subscription_condition_matches(condition: &SubscriptionConditionSpec, facts: &Value) -> bool {
     match condition {
         SubscriptionConditionSpec::Field {
@@ -21496,6 +21595,12 @@ fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), 
     reapply_local_work_lease_renewals_tx(transaction)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Desired subjects, documents and missions this thread rebuilt from their own claims.
+    static BASE_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Rebuild one desired subject, document or mission from its own claims in the replay's order.
 fn rebuild_base_aggregate_tx(
     transaction: &Transaction<'_>,
@@ -21508,6 +21613,8 @@ fn rebuild_base_aggregate_tx(
         Aggregate::RunTree(_) => return Ok(()),
     };
     crate::profile::note(&format!("projection: {kind} subject rebuilt"));
+    #[cfg(test)]
+    BASE_REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get() + 1));
     match aggregate {
         Aggregate::Desired(subject) => {
             transaction
@@ -21701,7 +21808,10 @@ fn try_project_simple_replication_tx(
                 .map_err(internal)?;
             // A claim about a run tree not projected yet waits in the claim log: the claim that
             // creates its run or generation rebuilds the tree with it.
-            if (out_of_order || repaired)
+            // A document keeps the earliest binding of each version, whatever order the
+            // bindings arrive in, so only a repair rebuilds one. Rebuilding every version of a
+            // document that is republished all day costs more with each version.
+            if ((out_of_order && claim.kind != "doc.bound") || repaired)
                 && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
             {
                 dirty.insert(aggregate);
