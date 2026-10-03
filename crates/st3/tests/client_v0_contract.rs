@@ -1332,8 +1332,9 @@ async fn daemon_build_identity_is_shared_by_doctor_and_capabilities() {
         capabilities.machine_version.as_deref(),
         Some(version.as_str())
     );
-    let (status, mut doctor) = client_json(app, "/v1/doctor").await;
+    let (status, doctor_envelope) = client_json(app, "/v1/doctor").await;
     assert_eq!(status, StatusCode::OK);
+    let mut doctor = doctor_envelope["value"].clone();
     assert_eq!(doctor["machine_version"], version);
 
     // New clients can still read old servers that have no version field.
