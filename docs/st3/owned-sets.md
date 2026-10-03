@@ -111,6 +111,6 @@ when required, its retirement digest. Client-v0 read routes are `/v1/client/sets
 `/v1/client/sets/NAME`, with optional `?sha=SHA` on the detail route. Rust, Swift and TypeScript
 clients expose the additive `owned-set` resource and set list/detail operations.
 
-An optional [`when-idle` rollout policy](seat-rollout.md) drains changed and retiring native seats
+An optional [`when-idle` rollout policy](owned-seat-cutover.md) drains changed and retiring native seats
 and verifies their original conversation on the replacement. Without it, publication retains its
 immediate runtime behavior.

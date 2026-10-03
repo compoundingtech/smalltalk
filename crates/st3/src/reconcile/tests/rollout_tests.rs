@@ -157,7 +157,7 @@ impl Seat {
                 &input,
                 &options,
                 &format!("publish-{sequence}"),
-                "person/gardener",
+                "person/operator",
             )
             .unwrap();
     }
@@ -178,7 +178,7 @@ impl Seat {
                 &input,
                 &preview.subject_tokens,
                 "mission",
-                Some("person/gardener"),
+                Some("person/operator"),
             )
             .unwrap();
         let run = self
@@ -187,7 +187,7 @@ impl Seat {
                 mission: "garden/work".into(),
                 revision: None,
                 workspace: self.root.path().display().to_string(),
-                requester: Some("person/gardener".into()),
+                requester: Some("person/operator".into()),
                 mode: Some("run".into()),
                 inputs: Default::default(),
                 idempotency_key: "run".into(),
@@ -400,7 +400,7 @@ fn rollout_holds_independent_mail_but_preserves_responses_and_staging_fences() {
             .unwrap()
             .unwrap()
     };
-    let outgoing = mail("question", SUBJECT, "person/gardener", None);
+    let outgoing = mail("question", SUBJECT, "person/operator", None);
     let binding = seat
         .store
         .bind_mailbox(&crate::mailbox::Fence::new(
@@ -409,7 +409,7 @@ fn rollout_holds_independent_mail_but_preserves_responses_and_staging_fences() {
             "delivery",
         ))
         .unwrap();
-    let independent = mail("independent", "person/gardener", SUBJECT, None);
+    let independent = mail("independent", "person/operator", SUBJECT, None);
     seat.publish(
         2,
         "second",
@@ -419,7 +419,7 @@ fn rollout_holds_independent_mail_but_preserves_responses_and_staging_fences() {
     seat.step();
     let response = mail(
         "response",
-        "person/gardener",
+        "person/operator",
         SUBJECT,
         Some(&outgoing.subject),
     );
@@ -635,7 +635,7 @@ fn rollout_retry_after_failed_verification_keeps_the_original_conversation() {
             &token,
             desired.member.as_ref().unwrap(),
             "replacement-1",
-            "person/gardener",
+            "person/operator",
             &policy,
             "retry-failed",
         )
@@ -708,7 +708,7 @@ fn rollout_rechecks_pending_replies_and_the_physical_render_fence() {
             kind: "message.sent".into(),
             actor: Some(SUBJECT.into()),
             fields: serde_json::from_value(
-                json!({"from":SUBJECT,"to":"person/gardener","content":"question","status":"sent"}),
+                json!({"from":SUBJECT,"to":"person/operator","content":"question","status":"sent"}),
             )
             .unwrap(),
             evidence: Vec::new(),
@@ -727,8 +727,8 @@ fn rollout_rechecks_pending_replies_and_the_physical_render_fence() {
     seat.busy(false);
     seat.step();
     assert_eq!(seat.operation().phase, "stopping");
-    seat.store.append_claim(&ClaimInput { subject:"message/answer-at-boundary".into(),kind:"message.sent".into(),actor:Some("person/gardener".into()),
-        fields:serde_json::from_value(json!({"from":"person/gardener","to":SUBJECT,"content":"answer","status":"sent","in_reply_to":"message/question-at-boundary"})).unwrap(),
+    seat.store.append_claim(&ClaimInput { subject:"message/answer-at-boundary".into(),kind:"message.sent".into(),actor:Some("person/operator".into()),
+        fields:serde_json::from_value(json!({"from":"person/operator","to":SUBJECT,"content":"answer","status":"sent","in_reply_to":"message/question-at-boundary"})).unwrap(),
         evidence:Vec::new(),expected_subject:None,idempotency_key:None }).unwrap();
     seat.step();
     assert!(seat.runtime.stops.lock().unwrap().is_empty());
@@ -763,7 +763,7 @@ fn rollout_pending_person_work_can_resume_and_finish_while_new_work_waits() {
         .store
         .ask_person(&crate::model::PersonAskRequest {
             legacy_request: None,
-            person: "person/gardener".into(),
+            person: "person/operator".into(),
             title: "Which bed?".into(),
             reason: "Choose the next bed".into(),
             actor: SUBJECT.into(),
@@ -795,7 +795,7 @@ fn rollout_pending_person_work_can_resume_and_finish_while_new_work_waits() {
         .finish_person_step(
             &crate::model::PersonStepResponse {
                 subject: ask.subject,
-                actor: "person/gardener".into(),
+                actor: "person/operator".into(),
                 summary: "The north bed".into(),
                 evidence: Vec::new(),
                 episode: None,

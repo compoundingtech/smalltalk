@@ -46,7 +46,7 @@ normal reconciliation and restart requests cannot bypass that hold. Retry explic
 desired/incarnation fences:
 
 ```sh
-st agents rollout agent/garden/orchard --deadline 30m --as person/gardener
+st agents rollout agent/garden/orchard --deadline 30m --as person/operator
 ```
 
 `--force-after-deadline` on publication or explicit retry permits interruption of busy work. It
