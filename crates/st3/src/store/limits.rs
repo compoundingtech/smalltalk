@@ -115,8 +115,9 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
             let entry = accounts.entry(key).or_insert_with(|| limit.clone());
             // Keep the last reading even after the account's last seat switches away. Otherwise
             // the exhausted account would immediately look unused to the next pool choice.
+            // A later observation from the same measuring seat also wins an exact timestamp tie.
             if (limit.measured_at_unix_ms, &limit.measured_by)
-                > (entry.measured_at_unix_ms, &entry.measured_by)
+                >= (entry.measured_at_unix_ms, &entry.measured_by)
             {
                 *entry = limit;
             }
