@@ -553,6 +553,16 @@ impl Op {
         acc.response_bytes += bytes as u64;
     }
 
+    /// Measure wall time across async suspension or a move to another thread. Unlike `span`,
+    /// this guard owns its operation and does not read thread-local CPU or SQLite counters.
+    pub fn wall_span(&self, name: &str) -> WallSpan {
+        WallSpan {
+            op: self.0.clone(),
+            name: name.into(),
+            started: Instant::now(),
+        }
+    }
+
     pub fn finish(self) {
         self.0.record("finished");
     }
@@ -639,6 +649,24 @@ pub fn note(note: &str) {
             acc.notes.insert(note.into(), 1);
         }
     });
+}
+
+/// An operation-bound wall-clock span, safe to hold across an await.
+pub struct WallSpan {
+    op: Arc<OpInner>,
+    name: Box<str>,
+    started: Instant,
+}
+
+impl Drop for WallSpan {
+    fn drop(&mut self) {
+        let wall = nanos(self.started.elapsed());
+        let mut acc = self.op.acc.lock().unwrap_or_else(PoisonError::into_inner);
+        let span = acc.spans.entry(std::mem::take(&mut self.name)).or_default();
+        span.count += 1;
+        span.wall_ns += wall;
+        span.max_wall_ns = span.max_wall_ns.max(wall);
+    }
 }
 
 /// Time a named part of this thread's operation until the guard drops.
@@ -1251,5 +1279,22 @@ mod tests {
     #[test]
     fn compact_sql_collapses_whitespace() {
         assert_eq!(compact_sql("SELECT a\n     FROM b"), "SELECT a FROM b");
+    }
+
+    #[test]
+    fn wall_span_records_its_owner_after_moving_threads() {
+        let op = Op(Arc::new(OpInner {
+            label: "async owner".into(),
+            caller: None,
+            started: Instant::now(),
+            acc: Mutex::new(Acc::default()),
+            recorded: AtomicBool::new(false),
+        }));
+        let span = op.wall_span("awaited work");
+        std::thread::spawn(move || drop(span)).join().unwrap();
+        let acc = op.0.acc.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(acc.spans["awaited work"].count, 1);
+        assert_eq!(acc.spans["awaited work"].cpu_ns, 0);
+        assert_eq!(acc.spans["awaited work"].sql_ns, 0);
     }
 }
