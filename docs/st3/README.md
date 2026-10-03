@@ -33,6 +33,8 @@ Use these documents for implementation details:
   stopping a seat ends every process the seat started, and what a host without systemd misses.
 - [Subagents](subagents.md) explains how st records the subagents a seat's harness runs as claims
   on the seat, with a lease, and ends them when their harness, session or seat goes away.
+- [Model accounts](accounts.md) explains how a person declares several Claude and Codex accounts, how a
+  seat binds one or a pool, and how a pooled seat at its limit restarts on another account.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits

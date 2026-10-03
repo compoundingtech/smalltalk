@@ -566,7 +566,7 @@ fn build_registry() -> Registry {
         (
             "account",
             "account/NAME",
-            "An external provider account identity.",
+            "A model account: its provider, owner, plan and where its login lives.",
             false,
         ),
         (
@@ -2738,6 +2738,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "harness.session-file" => &[
             ("harness", required_string()),
+            ("account_ref", string()),
             ("path", string()),
             ("session_id", required_string()),
             ("source_session", string()),
@@ -2808,6 +2809,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("driver", required_string()),
             ("incarnation_id", string()),
             ("account", string()),
+            // The declared account the seat was launched on (`ada/claude`), when it was bound to one.
+            ("account_ref", string()),
             ("plan", string()),
             ("five_hour_percent", number()),
             ("five_hour_resets_at_unix_ms", integer()),

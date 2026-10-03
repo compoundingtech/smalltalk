@@ -11,8 +11,10 @@ import {
   commonSetupSteps,
   linuxRunner,
   linuxRunsOn,
+  linuxStageJob as namespaceStageJob,
   linuxStageRunner,
   linuxStageRunsOn,
+  perfStoresCache,
   pickRunnerJob,
   pickRunnerJobId,
   readOnlyBinaryCaches,
@@ -188,6 +190,24 @@ done`,
         },
       ],
     },
+    // The cost check: SQLite work per daemon request on a small and a ten times larger generated
+    // store. Counts, not timings, so a lightly optimized build only speeds up the generation.
+    // Not part of linux-gate; it must finish before linux-tests does (docs/ci.md). The load test
+    // runs in perf.yml. It runs where the stages run, and skips merge-queue entries, which do not
+    // wait for it, so each queued entry still needs only its required jobs' capacity. A required
+    // perf-cost must run there too.
+    'perf-cost': namespaceStageJob({
+      name: 'perf-cost',
+      stage: 'cost',
+      runsOn: linuxStageRunner,
+      condition: "github.event_name != 'merge_group'",
+      setup: commonSetupSteps,
+      description: 'Run the cost check',
+      command: ['bash', 'scripts/ci-perf', 'cost'],
+      env: { CARGO_PROFILE_DEV_OPT_LEVEL: '1' },
+      extraLogs: '${{ runner.temp }}/perf/',
+      before: [perfStoresCache('cost')],
+    }),
     // st2's transport-isolation cascade tests need a real systemd user manager, which the
     // runner image lacks. A NixOS VM runs this job's prebuilt test binary; it compiles nothing.
     'isolation-vm': {

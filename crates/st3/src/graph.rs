@@ -1540,17 +1540,159 @@ fn validate_account(node: &KdlNode) -> Result<(), St3Error> {
         .ok_or_else(|| St3Error::new("missing-account-body", "an account needs a body"))?;
     reject_unknown_children(
         body,
-        &["provider", "external-account", "auth-type"],
+        &[
+            "provider",
+            "external-account",
+            "auth-type",
+            "owner",
+            "plan",
+            "login",
+        ],
         "account",
         "account",
     )?;
     required_child_string(body, "provider", "account")?;
-    required_child_string(body, "external-account", "account")?;
-    let auth = required_child_string(body, "auth-type", "account")?;
-    if !matches!(auth.as_str(), "subscription" | "api-key") {
+    child_string(body, "external-account")?;
+    if let Some(auth) = child_string(body, "auth-type")?
+        && !matches!(auth.as_str(), "subscription" | "api-key")
+    {
         return Err(St3Error::new(
             "invalid-auth-type",
             format!("invalid account auth type `{auth}`"),
+        ));
+    }
+    if let Some(owner) = child_string(body, "owner")? {
+        if !owner.starts_with("person/") {
+            return Err(St3Error::new(
+                "invalid-account-owner",
+                format!("an account owner is a person, like `person/ada`; got `{owner}`"),
+            ));
+        }
+        validate_name(&owner, true)?;
+    }
+    if let Some(plan) = child_string(body, "plan")?
+        && (plan.trim().is_empty() || plan.len() > 64)
+    {
+        return Err(St3Error::new(
+            "invalid-account-plan",
+            "an account plan is a short nonempty name",
+        ));
+    }
+    // A login is a credential directory, never a credential: its path is all an account holds.
+    let mut hosts = BTreeSet::new();
+    for login in body
+        .nodes()
+        .iter()
+        .filter(|child| child.name().value() == "login")
+    {
+        ensure_only_properties(login, &["host"])?;
+        ensure_no_children(login)?;
+        let path = one_string(login)?;
+        if !(path.starts_with('/') || path.starts_with("~/"))
+            || path.len() > 1024
+            || path.contains('\0')
+        {
+            return Err(St3Error::new(
+                "invalid-account-login",
+                format!(
+                    "an account login is an absolute directory or one under `~/`; got `{path}`"
+                ),
+            ));
+        }
+        let host = property_string(login, "host")?;
+        if let Some(host) = &host {
+            validate_name(host, false)?;
+        }
+        if !hosts.insert(host) {
+            return Err(St3Error::new(
+                "duplicate-account-login",
+                "an account has one login per host, and at most one for every host",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A harness block binds its seat to one account or a pool of its owner's accounts. Only a
+/// harness that st launches with a login directory can bind one.
+fn validate_account_binding(
+    harness: &KdlNode,
+    agent: &KdlDocument,
+    owner: &str,
+) -> Result<(), St3Error> {
+    let Some(body) = harness.children() else {
+        return Ok(());
+    };
+    let account = unique_child(body, "account")?;
+    let pool = unique_child(body, "account-pool")?;
+    if account.is_none() && pool.is_none() {
+        return Ok(());
+    }
+    if account.is_some() && pool.is_some() {
+        return Err(St3Error::new(
+            "account-and-pool",
+            format!("agent `{owner}` binds an account and a pool; choose one"),
+        ));
+    }
+    let provider = one_string_with_children(harness)?;
+    let variable = crate::accounts::login_environment_name(&provider).ok_or_else(|| {
+        St3Error::new(
+            "account-unsupported-harness",
+            format!("harness `{provider}` has no login directory st can select"),
+        )
+    })?;
+    if let Some(account) = account {
+        ensure_no_properties(account)?;
+        ensure_no_children(account)?;
+        validate_name(&one_string(account)?, false)?;
+    }
+    if let Some(pool) = pool {
+        ensure_no_properties(pool)?;
+        ensure_no_children(pool)?;
+        let person = one_string(pool)?;
+        if !person.starts_with("person/") {
+            return Err(St3Error::new(
+                "invalid-account-pool",
+                format!("an account pool names its owner, like `person/ada`; got `{person}`"),
+            ));
+        }
+        validate_name(&person, true)?;
+        // A pooled seat can restart on another account, whose login directory holds none of the
+        // old account's native sessions, so it cannot ask a harness to resume one.
+        if let Some(args) = unique_child(body, "args")? {
+            let resumes = positional_strings(args)?
+                .iter()
+                .take_while(|argument| argument.as_str() != "--")
+                .any(|argument| {
+                    if provider == "codex" {
+                        return matches!(argument.as_str(), "resume" | "fork");
+                    }
+                    matches!(
+                        argument.as_str(),
+                        "-c" | "--continue" | "-r" | "--resume" | "--session-id"
+                    ) || argument.starts_with("--resume=")
+                        || argument.starts_with("--session-id=")
+                });
+            if resumes {
+                return Err(St3Error::new(
+                    "account-pool-resume",
+                    format!(
+                        "agent `{owner}` is bound to a pool and cannot resume a native session: a restart on another account starts fresh, since its work lives in the graph"
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some(env) = unique_child(agent, "env")?
+        && env.children().is_some_and(|map| {
+            map.nodes()
+                .iter()
+                .any(|entry| entry.name().value() == variable)
+        })
+    {
+        return Err(St3Error::new(
+            "account-env-conflict",
+            format!("agent `{owner}` binds an account, so st sets {variable}; remove it from env"),
         ));
     }
     Ok(())
@@ -2708,6 +2850,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         .filter(|node| node.name().value() == "harness")
     {
         validate_driver(driver)?;
+        validate_account_binding(driver, document, owner)?;
     }
     Ok(())
 }
@@ -2990,8 +3133,24 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
         )
     })?;
     let allowed: &[&str] = match provider.as_str() {
-        "claude" => &["model", "effort", "dev-channels", "args", "message"],
-        "codex" | "pi" | "omp" => &["model", "effort", "args", "message"],
+        "claude" => &[
+            "model",
+            "effort",
+            "dev-channels",
+            "args",
+            "message",
+            "account",
+            "account-pool",
+        ],
+        "codex" => &[
+            "model",
+            "effort",
+            "args",
+            "message",
+            "account",
+            "account-pool",
+        ],
+        "pi" | "omp" => &["model", "effort", "args", "message"],
         "opencode" => &["model", "args", "message"],
         _ => return Err(St3Error::new("unknown-driver", "unknown typed driver")),
     };
@@ -5371,6 +5530,115 @@ version 2
             parse_intent(&unknown_field, "node").unwrap_err().code,
             "unknown-child"
         );
+    }
+
+    #[test]
+    fn an_account_declares_an_owner_a_plan_and_a_login_per_host_and_never_a_credential() {
+        let account = |body: &str| {
+            format!("version 2\naccount \"ada/claude\" {{\n  provider \"anthropic\"\n{body}\n}}\n")
+        };
+        let intent = parse_intent(
+            &account(
+                "owner \"person/ada\"\nplan \"max\"\nlogin \"/srv/logins/ada\" host=\"alder\"\nlogin \"~/.claude-ada\"",
+            ),
+            "node",
+        )
+        .unwrap();
+        let declared = crate::accounts::parse_account(
+            "account/ada/claude",
+            &intent.subjects["account/ada/claude"].desired,
+        )
+        .unwrap();
+        assert_eq!(declared.owner.as_deref(), Some("person/ada"));
+        assert_eq!(declared.login_for("alder"), Some("/srv/logins/ada"));
+        assert_eq!(declared.login_for("birch"), Some("~/.claude-ada"));
+
+        for (body, code) in [
+            ("owner \"ada\"", "invalid-account-owner"),
+            ("login \"relative/dir\"", "invalid-account-login"),
+            (
+                "login \"/a\" host=\"alder\"\nlogin \"/b\" host=\"alder\"",
+                "duplicate-account-login",
+            ),
+            ("login \"/a\"\nlogin \"/b\"", "duplicate-account-login"),
+            ("token \"sk-not-a-field\"", "unknown-child"),
+        ] {
+            assert_eq!(
+                parse_intent(&account(body), "node").unwrap_err().code,
+                code,
+                "{body}"
+            );
+        }
+        // A declaration that predates owners and logins still parses.
+        parse_intent(
+            "version 2\naccount \"claude/team-a\" { provider \"anthropic\" }\n",
+            "node",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_harness_binds_an_account_or_a_pool_for_claude_and_codex_only() {
+        let seat = |harness: &str, extra: &str| {
+            format!(
+                "version 2\nagent \"worker\" {{\n  workspace \"/tmp\"\n{extra}\n  harness {harness}\n}}\n"
+            )
+        };
+        for ok in [
+            seat("\"claude\" { account \"ada/claude\" }", ""),
+            seat("\"codex\" { account-pool \"person/ada\" }", ""),
+            seat("\"codex\" { account-pool \"person/ada\"; args \"-c\" \"model=\\\"example\\\"\" }", ""),
+            seat(
+                "\"claude\" { account \"ada/claude\"; args \"--continue\" }",
+                "",
+            ),
+        ] {
+            parse_intent(&ok, "node").unwrap_or_else(|error| panic!("{ok}: {error:?}"));
+        }
+        for (source, code) in [
+            (
+                seat(
+                    "\"claude\" { account \"ada/a\"; account-pool \"person/ada\" }",
+                    "",
+                ),
+                "account-and-pool",
+            ),
+            (
+                seat("\"claude\" { account-pool \"ada\" }", ""),
+                "invalid-account-pool",
+            ),
+            (seat("\"pi\" { account \"ada/a\" }", ""), "unknown-child"),
+            (
+                seat(
+                    "\"codex\" { account \"ada/a\" }",
+                    "env { CODEX_HOME \"/x\" }",
+                ),
+                "account-env-conflict",
+            ),
+            (
+                seat(
+                    "\"claude\" { account-pool \"person/ada\"; args \"--resume\" \"x\" }",
+                    "",
+                ),
+                "account-pool-resume",
+            ),
+            (
+                seat("\"codex\" { account-pool \"person/ada\"; args \"resume\" \"x\" }", ""),
+                "account-pool-resume",
+            ),
+            (
+                seat("\"codex\" { account-pool \"person/ada\"; args \"fork\" \"x\" }", ""),
+                "account-pool-resume",
+            ),
+        ] {
+            assert_eq!(
+                parse_intent(&source, "node").unwrap_err().code,
+                code,
+                "{source}"
+            );
+        }
+        // A seat with no account runs on the harness's default login, and may set its own.
+        parse_intent(&seat("\"codex\" {}", "env { CODEX_HOME \"/x\" }"), "node").unwrap();
     }
 
     #[test]

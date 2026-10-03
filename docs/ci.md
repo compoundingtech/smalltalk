@@ -218,6 +218,63 @@ per-job memory limit; tune those limits from measured runs on the machine.
 `CI_RUN_ID` keeps the messaging-fault evidence under `target/messaging-faults/`, which is
 uploaded with the stage logs.
 
+### Performance gate
+
+Two jobs check the daemon's rules that reads are instant, writes are short, and no query's cost
+grows with the whole store. Neither is part of `linux-gate`; making one required is a decision
+for the repository's owner. Both run `scripts/ci-perf`, and `.config/nextest.toml` keeps their
+tests out of `linux-tests`.
+
+`perf-cost` runs `daemon_cost::` (`crates/st3/tests/daemon_cost.rs`) on every pull request and
+`main` push, on the stages' runner. It skips
+merge-queue entries, which wait only for required checks, so a queued entry needs no more runners
+than before (see [Measured concurrency](#measured-concurrency)); if it becomes required, it must
+run there too. It generates a store at scale 0.01 and one at 0.1 with the
+`daemon_bench` generator, serves each from an in-process daemon, and counts the SQLite work of
+every route: virtual machine steps, steps through a table without an index, sorts and
+auto-index rows, read from each statement's counters as it finishes
+(`smallclaims::sqlite::work`, built only with `test-support`). A request fails when its work at
+the larger scale is more than three times its work at the smaller, after dividing by how much its
+answer grew. It also measures a replication round as the worker runs it (summary, push, receive)
+and a checkpoint trim, per deleted row. Counts do not depend on the machine, so the job builds
+with `opt-level = 1` only to generate the stores faster.
+
+- Every route `api.rs` declares is measured or listed in `NOT_MEASURED` with its reason; a new
+  route fails `the_cost_check_covers_every_route` until it is one or the other.
+- `KNOWN_GROWTH` lists the routes whose work already grew with the store when the check
+  landed, each with a ceiling of half again its measured growth. A listed route fails if it grows
+  past its ceiling, and fails once fixed until it leaves the list.
+- The check failed on both regressions that reached production: the shape of #814 (a correlated
+  canonical-order subquery in the document reads; `GET /v1/documents` went from 84,865 to
+  8,007,288 steps for a store ten times larger) and the foreign-key columns #1103 indexed (a trim's
+  work per deleted row grew 7.3 times, its full-scan steps 9.3 times).
+
+`perf-load` runs `daemon_load::` in a release build, in its own `Performance` workflow
+(`perf.yml`): nightly on `main`, on pull requests that change the daemon or the store, and on
+dispatch. It serves a store the size of a busy host's (scale 1, about 240,000 claims) to the
+request mix and rates that host's daemon reported in its busiest five-minute window (30 requests a
+second: harness events, mailbox pages, claims, desired state, delivery holds, replication rounds,
+renewals, status and work reads, and a person's reads), with the reconciler running and 30
+concurrent seat event long-polls. Quiet polls have a 31-second budget for their intentional
+30-second wait; mailbox WebSockets require authenticated native drivers and are excluded.
+It fails when
+a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
+main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a
+regression is what passes several. Main's successful runs add their report
+(`perf-load-baseline-*` in the Actions cache); a run without any checks only the budgets. It is
+not in Workspace CI because with warm caches it takes as long as `linux-tests`, and twice as long
+when its stores must generate.
+
+Both jobs keep their generated stores in the Actions cache, keyed by the generator and
+`docs/st3/schema.md`, so a store from an older generator is never measured.
+
+Run either locally with `TMPDIR=/var/tmp`; `ST_BENCH_DIR` keeps the generated stores between runs:
+
+```sh
+cargo test -p st3 --test integration daemon_cost:: -- --nocapture --test-threads 1
+ST_LOAD_GATE=1 cargo test --release -p st3 --test integration daemon_load:: -- --nocapture
+```
+
 ## Generated files and existing workflows
 
 All workflow YAML and `.github/repo-settings.json` are generated from neighboring `.genie.ts`
@@ -296,9 +353,11 @@ on 2026-10-01 recorded the workspace limits with `nsc workspace concurrency --ou
 | macOS arm64 | 96 | 224 GiB |
 
 Namespace limits CPU and memory per platform; a workflow run is not a fixed unit of capacity.
-Each Workspace CI group initially starts three 16-vCPU/32-GiB stage jobs and two
-8-vCPU/16-GiB profile jobs: 64 vCPUs and 128 GiB at peak. Five complete groups fit the Linux
-limit, which matches `max_entries_to_build: 5` in both the generated and live main rulesets.
+With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts three
+8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 40 vCPUs and 80 GiB at peak.
+PR and main runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB.
+Five complete merge-queue groups need 200 vCPUs and 400 GiB, within the Linux pool limit;
+`max_entries_to_build` remains 5 in both the generated and live main rulesets.
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
 are available. The `linux-gate` aggregate starts after the three stage jobs finish, so it does
 not add to the initial peak. macOS uses its own pool.

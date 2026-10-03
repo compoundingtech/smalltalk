@@ -187,6 +187,15 @@ pub fn groups<'a>(rows: impl Iterator<Item = &'a UsageRow>, by: By) -> Vec<(Stri
 /// A group as a person reads it: an agent's or mission's name, a step with its mission.
 pub fn label(world: &World, id: &str) -> String {
     if let Some(account) = id.strip_prefix("account/") {
+        // An account a person declared reads by its name; the digest still tells two apart.
+        let declared = world
+            .usage_limits
+            .iter()
+            .find(|limit| limit.account == account)
+            .and_then(|limit| limit.account_ref.as_deref());
+        if let (Some(name), Some((_, digest))) = (declared, account.split_once('/')) {
+            return format!("{name} · {}", &digest[..digest.len().min(8)]);
+        }
         // `claude/<digest>`: the provider, and enough of the digest to tell two apart.
         return match account.split_once('/') {
             Some((driver, "unknown")) => format!("{driver} · account not named"),
@@ -618,6 +627,23 @@ mod tests {
         assert_eq!(By::of("usage/no-mission"), Some(By::Mission));
         assert_eq!(By::of("step-run/atlas-1/compare"), Some(By::Step));
         assert!(label(&world, "step-run/atlas-1/compare").ends_with(" · compare"));
+    }
+
+    #[test]
+    fn an_account_a_person_declared_reads_by_its_name() {
+        let mut world = super::super::demo::world();
+        world.usage_limits[0].account = "claude/0123456789abcdef".into();
+        world.usage_limits[0].account_ref = Some("ada/claude-1".into());
+        world.usage_limits[1].account = "claude/fedcba9876543210".into();
+        assert_eq!(
+            label(&world, "account/claude/0123456789abcdef"),
+            "ada/claude-1 · 01234567"
+        );
+        assert_eq!(
+            label(&world, "account/claude/fedcba9876543210"),
+            "claude · fedcba98",
+            "an account no declaration names keeps the provider and digest"
+        );
     }
 
     #[test]
