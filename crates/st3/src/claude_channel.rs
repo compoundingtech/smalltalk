@@ -16,6 +16,8 @@ struct State {
     fence: Fence,
     attempted: BTreeSet<String>,
     confirmed: BTreeSet<String>,
+    #[serde(default)]
+    attachment_envelopes: BTreeMap<String, String>,
     lines: st_drivers::reexec::LineBuffer,
 }
 #[derive(Default, Deserialize, Serialize)]
@@ -23,6 +25,8 @@ struct Handoffs {
     incarnation: String,
     attempted: BTreeSet<String>,
     confirmed: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    attachment_envelopes: BTreeMap<String, String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -54,6 +58,7 @@ pub async fn run(
             fence: Fence::new(subject, incarnation, "delivery"),
             attempted: ledger.attempted,
             confirmed: ledger.confirmed,
+            attachment_envelopes: ledger.attachment_envelopes,
             ..State::default()
         }
     };
@@ -122,13 +127,17 @@ pub async fn run(
                         if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") { continue; }
                         if !state.attempted.contains(&message.subject)
                             && !prepare_handoff(client, &state.fence, message).await.unwrap_or(false) { continue; }
-                        let envelope = if let Some(envelope) = content.get(&message.subject) { envelope.clone() } else {
+                        let envelope = if let Some(envelope) = state.attachment_envelopes.get(&message.subject).or_else(|| content.get(&message.subject)) {
+                            let envelope = envelope.clone();
+                            transcript.body_available(!content.contains_key(&message.subject) && state.attempted.contains(&message.subject));
+                            content.insert(message.subject.clone(), envelope.clone());
+                            envelope
+                        } else {
                             let Ok(body) = body(client, message).await else { continue; };
-                            // The image files come first: a message that names a file is delivered
-                            // once the file is here, never without it.
-                            let Ok(attachments) = crate::blobs::materialize_for_seat(client, subject, &agent_dir.join("attachments"), message).await else { continue; };
+                            // Missing images are named with their retrieval command, so text still arrives.
+                            let attachments = crate::blobs::materialize_for_seat(client, subject, &agent_dir.join("attachments"), message).await;
                             let envelope = st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_with_attachments(&message.subject, &message.from, &message.to,
-                                message.title.as_deref(), &body, &st_drivers::ding::st3_body_sha256(&body), &attachments), &message.tags);
+                                message.title.as_deref(), &body, &crate::blobs::delivery_body_sha256(message, &body), &attachments), &message.tags);
                             // A body can become available after reexec has already scanned the native
                             // transcript for other messages. Revisit retained proof once for this identity.
                             transcript.body_available(state.attempted.contains(&message.subject));
@@ -139,6 +148,11 @@ pub async fn run(
                         // Before the handoff, persist its stable identity. A broken stdout or channel
                         // restart cannot authorize repeating an uncertain native notification.
                         state.attempted.insert(message.subject.clone());
+                        if !message.attachments.is_empty() {
+                            // Fetch availability may change across reexec. Preserve the exact native
+                            // notification used as receipt proof rather than reconstructing it.
+                            state.attachment_envelopes.insert(message.subject.clone(), envelope.clone());
+                        }
                         save_handoffs(&ledger_path, &state)?;
                         write(&mut stdout, &json!({"jsonrpc":"2.0","method":"notifications/claude/channel",
                             "params":{"content":envelope,"meta":{"from":message.from,"messageId":message.subject,
@@ -176,6 +190,7 @@ pub async fn run(
                     let before = state.attempted.len();
                     state.attempted.retain(|message| active.contains(message));
                     state.confirmed.retain(|message| active.contains(message));
+                    state.attachment_envelopes.retain(|message, _| active.contains(message));
                     content.retain(|message, _| active.contains(message));
                     dirty |= before != state.attempted.len();
                     if dirty { save_handoffs(&ledger_path, &state)?; }
@@ -214,6 +229,7 @@ fn save_handoffs(path: &Path, state: &State) -> Result<()> {
             incarnation: state.fence.incarnation.clone(),
             attempted: state.attempted.clone(),
             confirmed: state.confirmed.clone(),
+            attachment_envelopes: state.attachment_envelopes.clone(),
         },
     )?;
     file.flush()?;
@@ -383,6 +399,59 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    #[test]
+    fn claude_preserves_failed_image_notification_proof_when_fetch_availability_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native-channel-handoffs.json");
+        let failed = st_drivers::ding::AttachmentNotice {
+            path: None,
+            media_type: "image/png".into(),
+            name: Some("snapshot.png".into()),
+            size: 12,
+            unavailable: Some("host unavailable".into()),
+            fetch_command: Some(
+                "st blobs get blob/hash --message message/image -o image.png".into(),
+            ),
+        };
+        let envelope = st_drivers::ding::st3_notification_with_attachments(
+            "message/image",
+            "person/example",
+            "agent/eval.worker",
+            None,
+            "",
+            "hash",
+            std::slice::from_ref(&failed),
+        );
+        let mut state = State {
+            fence: Fence::new("agent/eval.worker", "session-1", "delivery"),
+            ..State::default()
+        };
+        state.attempted.insert("message/image".into());
+        state
+            .attachment_envelopes
+            .insert("message/image".into(), envelope.clone());
+        save_handoffs(&path, &state).unwrap();
+        let handoffs: Handoffs = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let retained = &handoffs.attachment_envelopes["message/image"];
+        let mut available = failed;
+        available.unavailable = None;
+        available.path = Some("/images/snapshot.png".into());
+        let rebuilt = st_drivers::ding::st3_notification_with_attachments(
+            "message/image",
+            "person/example",
+            "agent/eval.worker",
+            None,
+            "",
+            "hash",
+            &[available],
+        );
+        assert_ne!(*retained, rebuilt);
+        let native = json!({"type":"user", "message":{"role":"user", "content":envelope}});
+        assert!(native_receipt(&native, retained));
+        assert!(!native_receipt(&native, &rebuilt));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]

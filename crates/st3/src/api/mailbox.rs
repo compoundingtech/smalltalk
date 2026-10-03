@@ -115,7 +115,7 @@ fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
         .desired_subjects_named(std::slice::from_ref(&binding.subject))?
         .into_iter()
         .next();
-    let messages = if binding.component == "delivery" {
+    let mut messages: Vec<crate::model::MessageView> = if binding.component == "delivery" {
         store
             .messages(Some(&binding.subject), false)?
             .into_iter()
@@ -124,6 +124,9 @@ fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
     } else {
         Vec::new()
     };
+    for message in &mut messages {
+        crate::blobs::annotate_delivery(store, message)?;
+    }
     Ok((seat, messages))
 }
 
@@ -314,6 +317,94 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn image_only_mail_is_announced_on_push_and_legacy_native_polls() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let agent = "agent/eval.worker";
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        state.store.append_claim(&ClaimInput {
+            subject: "message/image-only".into(), kind: "message.sent".into(), actor: Some("person/example".into()),
+            fields: BTreeMap::from([
+                ("from".into(), json!("person/example")), ("to".into(), json!(agent)),
+                ("content".into(), json!("")), ("status".into(), json!("sent")),
+                ("attachments".into(), json!([{"sha256":"a".repeat(64), "media_type":"image/png", "name":"snapshot.png", "size":12, "origin":"host/node"}])),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: Some("image-only".into()),
+        }).unwrap();
+        let fence = state
+            .store
+            .bind_mailbox(&Fence::new(agent, "session-1", "delivery"))
+            .unwrap();
+        let (_, pushed) = snapshot(&state.store, &fence).unwrap();
+        assert!(
+            pushed[0]
+                .content
+                .starts_with("[st attachments: 1 attachments]")
+        );
+        for transport in [
+            "claude-channel",
+            "pi-channel",
+            "omp-channel",
+            "app-server",
+            "opencode-server",
+        ] {
+            let peer = NativeDeliveryPeer {
+                agent: agent.into(),
+                transport,
+                pid: 37,
+                archives_inbox: false,
+            };
+            let Json(polled) = super::super::list_messages(
+                State(state.clone()),
+                Query(MessagesQuery {
+                    to: Some(agent.into()),
+                    include_closed: false,
+                }),
+                Some(Extension(peer.clone())),
+            )
+            .await
+            .unwrap();
+            let Json(page) = super::super::list_messages_page(
+                State(state.clone()),
+                Query(MessagesPageQuery {
+                    to: Some(agent.into()),
+                    include_closed: false,
+                    cursor: None,
+                    limit: None,
+                    delivery: None,
+                }),
+                Some(Extension(peer)),
+            )
+            .await
+            .unwrap();
+            for message in [&polled[0], &page.items[0]] {
+                assert_eq!(message.content, pushed[0].content);
+                assert!(message.content.contains("snapshot.png"));
+                assert!(message.content.contains("st blobs get"));
+            }
+        }
+        let Json(ordinary) = super::super::list_messages(
+            State(state.clone()),
+            Query(MessagesQuery {
+                to: Some(agent.into()),
+                include_closed: false,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ordinary[0].content, "");
+        assert_eq!(
+            state
+                .store
+                .message("message/image-only")
+                .unwrap()
+                .unwrap()
+                .content,
+            ""
+        );
+    }
+
     #[tokio::test]
     async fn every_harness_replays_and_receipts_over_a_real_unix_push_stream_without_files() {
         for transport in [

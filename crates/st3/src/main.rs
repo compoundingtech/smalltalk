@@ -15939,9 +15939,10 @@ fn pi_family_message_frame(
             &message.to,
             message.title.as_deref(),
             body,
-            &st_drivers::ding::st3_body_sha256(body),
+            &st3::blobs::delivery_body_sha256(message, body),
             attachments,
         ), &message.tags),
+        "images": st3::blobs::image_parts(attachments),
         "meta": {
             "from": message.from,
             "messageId": message.subject,
@@ -16279,15 +16280,8 @@ async fn run_pi_channel(
                             }
                         }
                     }
-                    // Files first: a message that names an image is delivered once the image is here.
-                    let attachments = match st3::blobs::materialize_for_seat(client, subject, &catalog.join("attachments"), &message).await {
-                        Ok(attachments) => attachments,
-                        Err(error) => {
-                            state.delivered.remove(&message.subject);
-                            warn_pi_channel(subject, &error, &mut last_warning);
-                            continue;
-                        }
-                    };
+                    // Deliver unavailable-image notices alongside the text.
+                    let attachments = st3::blobs::materialize_for_seat(client, subject, &catalog.join("attachments"), &message).await;
                     let frame = pi_family_message_frame(&message, &body, identity, &attachments);
                     stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
@@ -17923,14 +17917,14 @@ impl NativeMailbox {
                 }
                 if !self.queued.contains_key(&view.subject) {
                     let body = message_content(client, view).await?;
-                    // Files first: a message that names an image is queued once the image is here.
+                    // Available images and unavailable-image notices share the same handoff.
                     let attachments = st3::blobs::materialize_for_seat(
                         client,
                         &self.fence.subject,
                         &agent_dir.join("attachments"),
                         view,
                     )
-                    .await?;
+                    .await;
                     self.queued.insert(
                         view.subject.clone(),
                         native_queued_message(view, body, &attachments),
@@ -17965,7 +17959,7 @@ fn native_queued_message(
         format!(
             "{}{}",
             st_drivers::ding::ST3_SHA256_TAG,
-            st_drivers::ding::st3_body_sha256(&body)
+            st3::blobs::delivery_body_sha256(view, &body)
         ),
     ];
     tags.extend(
@@ -18993,6 +18987,30 @@ mod tests {
             )
         );
         assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("snapshot.png");
+        fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let attachment = st_drivers::ding::AttachmentNotice {
+            path: Some(path.display().to_string()),
+            media_type: "image/png".into(),
+            name: Some("snapshot.png".into()),
+            size: 8,
+            unavailable: None,
+            fetch_command: Some(
+                "st blobs get blob/hash --message message/images -o snapshot.png".into(),
+            ),
+        };
+        let image_only = pi_family_message_frame(&message, "", "run-1/wake.omp-2", &[attachment]);
+        assert!(
+            image_only["content"]
+                .as_str()
+                .unwrap()
+                .contains("1 attachments")
+        );
+        assert_eq!(
+            image_only["images"][0],
+            json!({"type":"image", "data":"iVBORw0KGgo=", "mimeType":"image/png"})
+        );
     }
 
     #[test]

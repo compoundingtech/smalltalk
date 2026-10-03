@@ -227,93 +227,179 @@ impl BlobDir {
     }
 }
 
-/// Write one message's attachments where this seat's harness can open them, fetching each from
-/// the member that took the upload when this machine lacks it. A file that is gone for good
-/// (past its retention window) is reported as such; one that cannot be had yet is an error, so
-/// the caller delivers the message later instead of without its image.
+/// Metadata and a safe, exact CLI retrieval command, even when no file was materialized.
+pub fn attachment_notices(
+    message: &crate::model::MessageView,
+) -> Vec<st_drivers::ding::AttachmentNotice> {
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    message
+        .attachments
+        .iter()
+        .map(|attachment| {
+            let output = format!(
+                "{}.{}",
+                attachment.sha256,
+                file_extension(&attachment.media_type)
+            );
+            st_drivers::ding::AttachmentNotice {
+                path: None,
+                media_type: attachment.media_type.clone(),
+                name: attachment.name.clone(),
+                size: attachment.size,
+                unavailable: None,
+                fetch_command: Some(format!(
+                    "st blobs get {} --message {} -o {}",
+                    quote(&format!("blob/{}", attachment.sha256)),
+                    quote(&message.subject),
+                    quote(&output)
+                )),
+            }
+        })
+        .collect()
+}
+
+/// A transport-only body notice for old drivers. The durable graph message stays unchanged.
+pub fn annotate_delivery(
+    store: &crate::store::Store,
+    message: &mut crate::model::MessageView,
+) -> anyhow::Result<()> {
+    if message.attachments.is_empty() {
+        return Ok(());
+    }
+    let body = if message.content.starts_with("doc/") {
+        let (name, hash) = message
+            .content
+            .rsplit_once('@')
+            .ok_or_else(|| anyhow::anyhow!("invalid message document reference"))?;
+        String::from_utf8(
+            store
+                .get_document(name, hash)?
+                .ok_or_else(|| anyhow::anyhow!("message document is not stored"))?,
+        )?
+    } else {
+        message.content.clone()
+    };
+    // Keep the exact graph-body digest alongside its decorated delivery copy.
+    message
+        .tags
+        .retain(|tag| !tag.starts_with(st_drivers::ding::ST3_SHA256_TAG));
+    message.tags.push(format!(
+        "{}{}",
+        st_drivers::ding::ST3_SHA256_TAG,
+        st_drivers::ding::st3_body_sha256(&body)
+    ));
+    message.content = format!(
+        "{}\n{body}",
+        st_drivers::ding::attachment_summary(&attachment_notices(message))
+    );
+    Ok(())
+}
+
+pub fn delivery_body_sha256(message: &crate::model::MessageView, body: &str) -> String {
+    if !message.attachments.is_empty()
+        && let Some(hash) = message
+            .tags
+            .iter()
+            .find_map(|tag| tag.strip_prefix(st_drivers::ding::ST3_SHA256_TAG))
+            .filter(|hash| is_sha256(hash))
+    {
+        return hash.into();
+    }
+    st_drivers::ding::st3_body_sha256(body)
+}
+
+/// Write each available image locally. Failed files remain visible as notices, with a fetch
+/// command; they do not hold back the text or other images in the same message.
 pub async fn materialize(
     socket: &Path,
     actor: &str,
     directory: &Path,
     message: &crate::model::MessageView,
 ) -> anyhow::Result<Vec<st_drivers::ding::AttachmentNotice>> {
-    let mut notices = Vec::new();
-    if message.attachments.is_empty() {
+    let mut notices = attachment_notices(message);
+    if notices.is_empty() {
         return Ok(notices);
     }
     let files = BlobDir::at(directory.to_path_buf());
-    files.ensure()?;
     files.sweep(DEFAULT_RETENTION);
     let client = st3_client::Client::unix_as(socket, actor);
-    for attachment in &message.attachments {
-        anyhow::ensure!(
-            is_sha256(&attachment.sha256),
-            "a message names an attachment with an invalid hash"
-        );
-        let path = directory.join(format!(
-            "{}.{}",
-            attachment.sha256,
-            file_extension(&attachment.media_type)
-        ));
-        let mut notice = st_drivers::ding::AttachmentNotice {
-            path: Some(path.display().to_string()),
-            media_type: attachment.media_type.clone(),
-            name: attachment.name.clone(),
-            size: attachment.size,
-            unavailable: None,
-        };
-        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() == attachment.size) {
-            touch(&path);
-            notices.push(notice);
-            continue;
-        }
-        match client.blob(&attachment.sha256, Some(&message.subject)).await {
-            Ok(bytes) => {
-                anyhow::ensure!(
-                    hex::encode(Sha256::digest(&bytes)) == attachment.sha256,
-                    "the bytes read for blob/{} do not match its hash",
-                    attachment.sha256
-                );
-                let temporary = directory.join(format!(".{}.{}.part", attachment.sha256, std::process::id()));
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&temporary)?;
-                file.write_all(&bytes)?;
-                file.sync_all()?;
-                fs::rename(&temporary, &path)?;
+    for (attachment, notice) in message.attachments.iter().zip(&mut notices) {
+        let result: anyhow::Result<PathBuf> = async {
+            anyhow::ensure!(is_sha256(&attachment.sha256), "invalid attachment hash");
+            files.ensure()?;
+            let path = directory.join(format!(
+                "{}.{}",
+                attachment.sha256,
+                file_extension(&attachment.media_type)
+            ));
+            if fs::metadata(&path).is_ok_and(|metadata| metadata.len() == attachment.size) {
+                touch(&path);
+                return Ok(path);
             }
-            Err(st3_client::ClientError::Api(
-                st3_client::ErrorCode::BlobExpired | st3_client::ErrorCode::BlobNotFound,
-                _,
-                _,
-            )) => {
-                notice.path = None;
-                notice.unavailable = Some("expired".into());
-            }
-            Err(error) => return Err(error.into()),
+            let bytes = client
+                .blob(&attachment.sha256, Some(&message.subject))
+                .await?;
+            anyhow::ensure!(
+                hex::encode(Sha256::digest(&bytes)) == attachment.sha256,
+                "attachment bytes do not match their hash"
+            );
+            let temporary = directory.join(format!(
+                ".{}.{}.part",
+                attachment.sha256,
+                std::process::id()
+            ));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &path)?;
+            Ok(path)
         }
-        notices.push(notice);
+        .await;
+        match result {
+            Ok(path) => notice.path = Some(path.display().to_string()),
+            Err(error) => notice.unavailable = Some(format!("{error}")),
+        }
     }
     Ok(notices)
 }
 
-/// [`materialize`] for a seat's driver, which reads over the daemon socket its client uses.
+/// [`materialize`] for a native seat. Every attachment gets a notice even on transport failure.
 pub async fn materialize_for_seat(
     client: &crate::client::Client,
     subject: &str,
     directory: &Path,
     message: &crate::model::MessageView,
-) -> anyhow::Result<Vec<st_drivers::ding::AttachmentNotice>> {
+) -> Vec<st_drivers::ding::AttachmentNotice> {
     if message.attachments.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    let socket = client
-        .socket_path()
-        .ok_or_else(|| anyhow::anyhow!("attachments are read over the daemon's Unix socket"))?;
-    materialize(socket, subject, directory, message).await
+    let result = match client.socket_path() {
+        Some(socket) => materialize(socket, subject, directory, message).await,
+        None => Err(anyhow::anyhow!(
+            "attachments are read over the daemon's Unix socket"
+        )),
+    };
+    result.unwrap_or_else(|error| {
+        let mut notices = attachment_notices(message);
+        for notice in &mut notices {
+            notice.unavailable = Some(error.to_string());
+        }
+        notices
+    })
+}
+
+/// Image blocks accepted by the pi-family extension API. No unavailable file becomes an image.
+pub fn image_parts(attachments: &[st_drivers::ding::AttachmentNotice]) -> Vec<serde_json::Value> {
+    use base64::Engine as _;
+    attachments.iter().filter(|attachment| attachment.unavailable.is_none()).filter_map(|attachment| {
+        let bytes = fs::read(attachment.path.as_ref()?).ok()?;
+        Some(serde_json::json!({"type":"image", "data":base64::engine::general_purpose::STANDARD.encode(bytes), "mimeType":attachment.media_type}))
+    }).collect()
 }
 
 fn touch(path: &Path) {
@@ -327,6 +413,127 @@ mod tests {
     use super::*;
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0000";
+
+    fn image_message(body: &str) -> crate::model::MessageView {
+        crate::model::MessageView {
+            subject: "message/image-only".into(),
+            from: "person/example".into(),
+            to: "agent/eval.worker".into(),
+            content: body.into(),
+            status: "sent".into(),
+            title: None,
+            in_reply_to: None,
+            tags: Vec::new(),
+            created_index: 1,
+            attachments: vec![crate::model::MessageAttachment {
+                sha256: hex::encode(Sha256::digest(PNG)),
+                media_type: "image/png".into(),
+                name: Some("snapshot.png".into()),
+                size: PNG.len() as u64,
+                origin: "host/bluey".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn image_only_delivery_is_visible_to_an_old_driver_without_changing_the_graph_body() {
+        for body in [String::new(), "long text ".repeat(200)] {
+            let store = crate::store::Store::open_memory("node").unwrap();
+            let document = store
+                .put_document(
+                    "doc/attachment-body",
+                    body.as_bytes(),
+                    &None,
+                    &format!("body-{}", body.len()),
+                )
+                .unwrap();
+            let mut message = image_message(&format!("doc/attachment-body@{}", document.hash));
+            annotate_delivery(&store, &mut message).unwrap();
+            // A pre-attachment MessageView ignores unknown JSON fields but still reads content.
+            #[derive(serde::Deserialize)]
+            struct OldMessage {
+                content: String,
+            }
+            let old: OldMessage =
+                serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+            let preview = st_drivers::ding::st3_notification_text(
+                &message.subject,
+                &message.from,
+                &message.to,
+                None,
+                &old.content,
+                "digest",
+            );
+            let ping = st_drivers::ding::st3_ping_text(
+                &message.subject,
+                &message.from,
+                None,
+                &old.content,
+            );
+            assert!(preview.contains("1 attachments"), "{preview}");
+            assert!(
+                ping.lines().next().unwrap().contains("1 attachments"),
+                "{ping}"
+            );
+            assert!(preview.contains("snapshot.png"));
+            assert!(preview.contains("st blobs get"));
+            assert!(message.content.ends_with(&body));
+            assert_eq!(
+                delivery_body_sha256(&message, &message.content),
+                st_drivers::ding::st3_body_sha256(&body)
+            );
+            assert_eq!(
+                store
+                    .get_document("doc/attachment-body", &document.hash)
+                    .unwrap()
+                    .unwrap(),
+                body.as_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_attachment_fetch_delivers_a_notice_and_keeps_other_images() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("attachments");
+        fs::create_dir_all(&directory).unwrap();
+        let mut message = image_message("");
+        let first = message.attachments[0].clone();
+        let path = directory.join(format!("{}.png", first.sha256));
+        fs::write(&path, PNG).unwrap();
+        let mut missing = first;
+        missing.sha256 = "0".repeat(64);
+        message.attachments.push(missing);
+        let client = crate::client::Client::unix(root.path().join("absent.sock"));
+        let notices = materialize_for_seat(&client, &message.to, &directory, &message).await;
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0].path.as_deref(), path.to_str());
+        assert!(notices[0].unavailable.is_none());
+        assert!(notices[1].path.is_none());
+        assert!(notices[1].unavailable.is_some());
+        assert!(
+            notices[1]
+                .fetch_command
+                .as_ref()
+                .unwrap()
+                .contains("--message 'message/image-only'")
+        );
+        let envelope = st_drivers::ding::st3_notification_with_attachments(
+            &message.subject,
+            &message.from,
+            &message.to,
+            None,
+            "",
+            "hash",
+            &notices,
+        );
+        assert!(envelope.contains("2 attachments"));
+        assert!(envelope.contains("fetch_command="));
+        assert!(envelope.contains("unavailable="));
+        assert_eq!(image_parts(&notices).len(), 1);
+        let summary = st_drivers::ding::attachment_summary(&notices);
+        assert!(summary.contains("attachment could not be fetched"));
+    }
 
     #[test]
     fn uploads_are_checked_against_their_own_bytes() {

@@ -856,6 +856,37 @@ fn read_http_status(reader: &mut BufReader<TcpStream>) -> Result<u16> {
         .with_context(|| format!("invalid HTTP status line {status_line:?}"))
 }
 
+fn opencode_delivery_payload(
+    message_id: &str,
+    text: &str,
+    attachments: &[ding::AttachmentNotice],
+) -> Value {
+    let mut parts = vec![json!({"type":"text", "text":text})];
+    for attachment in attachments
+        .iter()
+        .filter(|attachment| attachment.unavailable.is_none())
+    {
+        let Some(path) = &attachment.path else {
+            continue;
+        };
+        // The provider runs on this machine. Encode special path bytes as a file URL.
+        let mut url = String::from("file://");
+        for byte in path.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+                url.push(char::from(byte));
+            } else {
+                url.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        let mut part = json!({"type":"file", "mime":attachment.media_type, "url":url});
+        if let Some(name) = &attachment.name {
+            part["filename"] = json!(name);
+        }
+        parts.push(part);
+    }
+    json!({"messageID":message_id, "parts":parts})
+}
+
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1929,7 +1960,13 @@ impl Delivery {
             incarnation: None,
         })?;
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &entry, &text, diagnostics)
+        self.send(
+            client,
+            &entry,
+            &text,
+            &ding::attachment_notices(&head),
+            diagnostics,
+        )
     }
 
     fn reconcile_or_retry(
@@ -1978,7 +2015,13 @@ impl Delivery {
             return Ok(());
         };
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &entry, &text, diagnostics)
+        self.send(
+            client,
+            &entry,
+            &text,
+            &ding::attachment_notices(&head),
+            diagnostics,
+        )
     }
 
     fn send(
@@ -1986,6 +2029,7 @@ impl Delivery {
         client: &Client,
         entry: &delivery_ledger::Entry,
         text: &str,
+        attachments: &[ding::AttachmentNotice],
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
         if matches!(self.control, SessionControl::Graph(_)) && self.control.held(&self.status_path)
@@ -1993,10 +2037,7 @@ impl Delivery {
             return Ok(());
         }
         self.next_attempt = Instant::now() + DELIVERY_RETRY;
-        let payload = json!({
-            "messageID": entry.correlation.value,
-            "parts": [{ "type": "text", "text": text }],
-        });
+        let payload = opencode_delivery_payload(&entry.correlation.value, text, attachments);
         let path = format!("/session/{}/prompt_async", entry.binding);
         let status = match client.post_json(&path, &payload) {
             Ok(status) => status,
@@ -3641,5 +3682,31 @@ mod tests {
         assert_eq!(usage[0]["total_tokens"], 377);
         assert_eq!(usage[0]["cost"], 0.004);
         assert_eq!(record.incarnation_id, "incarnation-1");
+    }
+}
+
+#[cfg(test)]
+mod attachment_delivery_tests {
+    use super::*;
+    #[test]
+    fn available_images_reach_the_prompt_as_file_parts() {
+        let image = ding::AttachmentNotice {
+            path: Some("/images/space #?.png".into()),
+            media_type: "image/png".into(),
+            name: Some("snapshot.png".into()),
+            size: 12,
+            unavailable: None,
+            fetch_command: None,
+        };
+        let mut missing = image.clone();
+        missing.unavailable = Some("expired".into());
+        missing.path = None;
+        let payload =
+            opencode_delivery_payload("message/images", "2 attachments", &[image, missing]);
+        assert_eq!(payload["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            payload["parts"][1],
+            json!({"type":"file", "mime":"image/png", "url":"file:///images/space%20%23%3F.png", "filename":"snapshot.png"})
+        );
     }
 }

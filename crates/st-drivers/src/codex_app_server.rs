@@ -1447,8 +1447,14 @@ impl CodexInboxDelivery {
             &self.config.identity,
             &head,
         );
-        let request =
-            codex_delivery_request(request_id, state.thread_id(), &client_id, &text, &method);
+        let request = codex_delivery_request(
+            request_id,
+            state.thread_id(),
+            &client_id,
+            &text,
+            &method,
+            &ding::attachment_notices(&head),
+        );
         // Durable ownership lands before transport.
         self.ledger.begin(delivery_ledger::Begin {
             filename: filename.clone(),
@@ -1910,12 +1916,24 @@ fn codex_delivery_request(
     client_id: &str,
     text: &str,
     method: &CodexDeliveryMethod,
+    attachments: &[ding::AttachmentNotice],
 ) -> Value {
     let mut params = json!({
         "threadId": thread_id,
         "clientUserMessageId": client_id,
         "input": [{ "type": "text", "text": text, "text_elements": [] }]
     });
+    for attachment in attachments
+        .iter()
+        .filter(|attachment| attachment.unavailable.is_none())
+    {
+        if let Some(path) = &attachment.path {
+            params["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"localImage", "path":path}));
+        }
+    }
     let method_name = match method {
         CodexDeliveryMethod::Start => "turn/start",
         CodexDeliveryMethod::Steer { turn_id } => {
@@ -5925,3 +5943,44 @@ fn terminate_child(child: &mut ProviderProcess) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod attachment_delivery_tests {
+    use super::*;
+    #[test]
+    fn available_images_reach_start_and_steer_as_native_inputs() {
+        let image = ding::AttachmentNotice {
+            path: Some("/images/snapshot.png".into()),
+            media_type: "image/png".into(),
+            name: None,
+            size: 12,
+            unavailable: None,
+            fetch_command: None,
+        };
+        let mut missing = image.clone();
+        missing.path = None;
+        missing.unavailable = Some("expired".into());
+        for method in [
+            CodexDeliveryMethod::Start,
+            CodexDeliveryMethod::Steer {
+                turn_id: "turn/live".into(),
+            },
+        ] {
+            let request = codex_delivery_request(
+                1,
+                "thread/live",
+                "message/images",
+                "2 attachments",
+                &method,
+                &[image.clone(), missing.clone()],
+            );
+            let input = request["params"]["input"].as_array().unwrap();
+            assert_eq!(input.len(), 2);
+            assert_eq!(input[0]["type"], "text");
+            assert_eq!(
+                input[1],
+                json!({"type":"localImage", "path":"/images/snapshot.png"})
+            );
+        }
+    }
+}

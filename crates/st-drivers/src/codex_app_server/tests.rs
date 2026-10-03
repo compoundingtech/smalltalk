@@ -1198,6 +1198,7 @@ fn delivery_request_uses_typed_start_and_exact_turn_steer() {
         "st:client",
         "notice",
         &CodexDeliveryMethod::Start,
+        &[],
     );
     assert_eq!(start["method"], "turn/start");
     assert_eq!(start["params"]["threadId"], "thread-main");
@@ -1214,6 +1215,7 @@ fn delivery_request_uses_typed_start_and_exact_turn_steer() {
         &CodexDeliveryMethod::Steer {
             turn_id: "turn-current".into(),
         },
+        &[],
     );
     assert_eq!(steer["method"], "turn/steer");
     assert_eq!(steer["params"]["expectedTurnId"], "turn-current");
