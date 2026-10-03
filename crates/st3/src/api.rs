@@ -1480,6 +1480,7 @@ async fn client_capabilities(
     let capabilities = client_v0::capabilities(&session);
     Json(json!({
         "kind": "capabilities",
+        "machine_version": st_drivers::version::machine_version(),
         "session_actor": session.actor,
         "transport": session.transport,
         "capabilities": capabilities,
@@ -5975,6 +5976,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         "pass"
     };
     Ok(Json(DoctorReport {
+        machine_version: Some(st_drivers::version::machine_version()),
         status: report_status.into(),
         checks,
         performance: crate::performance::snapshot(),

@@ -142,6 +142,7 @@
       "required": ["kind", "session_actor", "transport", "capabilities", "limits", "event_cursor", "oldest_event_cursor", "schemas"],
       "properties": {
         "kind": { "const": "capabilities" },
+        "machine_version": { "type": "string", "description": "Compile-time build identity of the responding daemon; absent on older servers." },
         "session_actor": { "$ref": "#/$defs/Id" },
         "transport": { "enum": ["unix", "fabric-loopback"] },
         "capabilities": { "type": "array", "items": { "$ref": "#/$defs/Capability" } },

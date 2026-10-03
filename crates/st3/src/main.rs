@@ -64,7 +64,7 @@ use presentation::{
 #[command(
     name = "st",
     bin_name = "st",
-    version,
+    version = st_drivers::version::display_version(),
     about = "Coordinate durable agent work across machines without losing operational truth"
 )]
 struct Cli {
@@ -3811,10 +3811,21 @@ fn main() -> ExitCode {
         print!("{}", cli_help::root_help(true));
         return ExitCode::SUCCESS;
     }
-    let matches = Cli::command()
+    let json_version = arguments.iter().any(|arg| arg == "--json");
+    let matches = match Cli::command()
         .override_help(cli_help::root_help(false))
         .try_get_matches_from(arguments)
-        .unwrap_or_else(|error| exit_usage_error(error));
+    {
+        Ok(matches) => matches,
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayVersion && json_version => {
+            println!(
+                "{}",
+                json!({ "machine_version": st_drivers::version::machine_version() })
+            );
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => exit_usage_error(error),
+    };
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| exit_usage_error(error));
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
@@ -8712,6 +8723,9 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
     if json_output {
         print_value(&report, true)?;
     } else {
+        if let Some(version) = &report.machine_version {
+            println!("daemon\t{version}");
+        }
         for check in &report.checks {
             println!("{}\t{}\t{}", check.status, check.name, check.message);
         }

@@ -43,6 +43,12 @@ sccache. Run tests with `cargo nextest run --workspace --locked`.
 Outside the Nix shell, install mold on Linux and cargo-nextest separately; the
 repository's `.cargo/config.toml` still selects mold for Linux builds.
 
+`st --version` names the source revision and whether the build came from Nix or local source.
+`st --version --json` returns a stable `machine_version` without needing a daemon.
+`st doctor --json` and client capabilities expose the responding daemon's `machine_version`,
+so an installed CLI and a running daemon can be compared. All versions use metadata baked at
+compile time, independent of the caller's directory or environment.
+
 This installs `st3`, the `st` symlink, the `stui` terminal app, `st3-migrate`, and the pinned
 `pty` terminal runtime. The default, `st`, `st3`, and `small-talk` Nix package names all select
 this package. The previous generation is built and tested separately as `.#st2`;
