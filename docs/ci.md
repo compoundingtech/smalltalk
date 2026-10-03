@@ -184,11 +184,14 @@ uploaded with the stage logs.
 
 Two jobs check the daemon's rules that reads are instant, writes are short, and no query's cost
 grows with the whole store. Neither is part of `linux-gate`; making one required is a decision
-for the repository's owner. Both run `scripts/ci-perf` on the stage runners' 16x32 shape, and
-`.config/nextest.toml` keeps their tests out of `linux-tests`.
+for the repository's owner. Both run `scripts/ci-perf`, and `.config/nextest.toml` keeps their
+tests out of `linux-tests`.
 
-`perf-cost` runs `daemon_cost::` (`crates/st3/tests/daemon_cost.rs`) on every pull request, queue
-entry and `main` push. It generates a store at scale 0.01 and one at 0.1 with the
+`perf-cost` runs `daemon_cost::` (`crates/st3/tests/daemon_cost.rs`) on every pull request and
+`main` push, on the profile's 8x16 shape: generating and counting use one core. It skips
+merge-queue entries, which wait only for required checks, so a queued entry still needs 64 vCPUs
+and five still build at once (see [Measured concurrency](#measured-concurrency)); if it becomes
+required, it must run there too. It generates a store at scale 0.01 and one at 0.1 with the
 `daemon_bench` generator, serves each from an in-process daemon, and counts the SQLite work of
 every route: virtual machine steps, steps through a table without an index, sorts and
 auto-index rows, read from each statement's counters as it finishes

@@ -137,10 +137,14 @@ done`,
     // The cost check: SQLite work per daemon request on a small and a ten times larger generated
     // store. Counts, not timings, so a lightly optimized build only speeds up the generation.
     // Not part of linux-gate; it must finish before linux-tests does (docs/ci.md). The load test
-    // runs in perf.yml.
+    // runs in perf.yml. It takes the profile's smaller shape, as its generation and counting run
+    // on one core, and skips merge-queue entries, which do not wait for it, so each queued entry
+    // still needs only its required jobs' capacity. A required perf-cost must run there too.
     'perf-cost': linuxStageJob({
       name: 'perf-cost',
       stage: 'cost',
+      runsOn: linuxRunner,
+      condition: "github.event_name != 'merge_group'",
       setup: commonSetupSteps,
       description: 'Run the cost check',
       command: ['bash', 'scripts/ci-perf', 'cost'],

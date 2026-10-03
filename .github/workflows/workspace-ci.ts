@@ -104,6 +104,8 @@ export const linuxStageJob = ({
   command = ['bash', 'scripts/ci-linux', stage],
   before = [],
   after = [],
+  runsOn = linuxStageRunner,
+  condition,
 }: {
   name: string
   stage: string
@@ -114,9 +116,12 @@ export const linuxStageJob = ({
   command?: string[]
   before?: readonly unknown[]
   after?: readonly unknown[]
+  runsOn?: unknown
+  condition?: string
 }) => ({
   name,
-  'runs-on': linuxStageRunner,
+  ...(condition ? { if: condition } : {}),
+  'runs-on': runsOn,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
   env: { ...buildEnv, ...env },
