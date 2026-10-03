@@ -137,6 +137,17 @@ final class St3ClientTests: XCTestCase {
         XCTAssertEqual(session.timelineCursor, "timeline-cursor/release-agent/9/8")
     }
 
+    func testSearchFixturePreservesResultTargetsAndIncompleteHistory() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/conversation-search.json"))
+        let search = try JSONDecoder().decode(Envelope<ConversationSearch>.self, from: data).value
+        XCTAssertEqual(search.items[0].entryID, "timeline-entry/note")
+        XCTAssertEqual(search.items[0].agentID, "agent/scribe")
+        XCTAssertEqual(search.incompleteSources, ["session/older: truncation"])
+        XCTAssertFalse(search.page.hasMore)
+    }
+
     func testTimelineFixturePreservesEveryTypedBody() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }
