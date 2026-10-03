@@ -348,6 +348,60 @@ struct OpInner {
     caller: Option<Arc<str>>,
     started: Instant,
     acc: Mutex<Acc>,
+    recorded: AtomicBool,
+}
+
+impl OpInner {
+    fn record(&self, completion: &str) {
+        let Some(state) = STATE.get() else {
+            return;
+        };
+        if self.recorded.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let wall = self.started.elapsed();
+        let acc = std::mem::take(&mut *self.acc.lock().unwrap_or_else(PoisonError::into_inner));
+        if wall >= state.slow_after {
+            write_slow(
+                state,
+                &self.label,
+                self.caller.as_deref(),
+                wall,
+                &acc,
+                completion,
+            );
+        }
+        let wall_ns = nanos(wall);
+        {
+            let mut minute = state.minute.lock().unwrap_or_else(PoisonError::into_inner);
+            minute
+                .ops
+                .entry(self.label.clone())
+                .or_default()
+                .merge(Some(wall_ns), &acc);
+            let caller = self.caller.clone().unwrap_or_else(|| "(daemon)".into());
+            let entry = minute
+                .callers
+                .entry((caller, self.label.clone()))
+                .or_default();
+            entry.count += 1;
+            entry.wall_ns += wall_ns;
+            entry.cpu_ns += acc.cpu_ns;
+        }
+        let mut total = state.total.lock().unwrap_or_else(PoisonError::into_inner);
+        let totals = total.entry(self.label.clone()).or_default();
+        totals.merge(Some(wall_ns), &acc);
+        totals.wall_samples.clear();
+    }
+}
+
+impl Drop for OpInner {
+    fn drop(&mut self) {
+        // Canceling an HTTP future does not stop its spawn_blocking workers. Their Op and
+        // Entered guards keep this inner alive until their SQL, spans, writer holds and CPU/I/O
+        // have been recorded. If the request never called finish, retain that work on last drop.
+        self.record("dropped");
+    }
 }
 
 /// Who sent a request: the harness it belongs to, if any, and the command that sent it.
@@ -394,7 +448,8 @@ impl Caller {
     }
 }
 
-/// One request or background pass. Threads that work for it enter it; `finish` records it.
+/// One request or background pass. Threads enter it; `finish` records it. Without `finish`, the
+/// last worker's drop records it, including work that outlived a canceled request.
 #[derive(Clone)]
 pub struct Op(Arc<OpInner>);
 
@@ -443,6 +498,7 @@ impl Op {
                 caller,
                 started: Instant::now(),
                 acc: Mutex::new(Acc::default()),
+                recorded: AtomicBool::new(false),
             }))
         })
     }
@@ -498,35 +554,7 @@ impl Op {
     }
 
     pub fn finish(self) {
-        let Some(state) = STATE.get() else {
-            return;
-        };
-        let wall = self.0.started.elapsed();
-        let acc = std::mem::take(&mut *self.0.acc.lock().unwrap_or_else(PoisonError::into_inner));
-        if wall >= state.slow_after {
-            write_slow(state, &self.0.label, self.0.caller.as_deref(), wall, &acc);
-        }
-        let wall_ns = nanos(wall);
-        {
-            let mut minute = state.minute.lock().unwrap_or_else(PoisonError::into_inner);
-            minute
-                .ops
-                .entry(self.0.label.clone())
-                .or_default()
-                .merge(Some(wall_ns), &acc);
-            let caller = self.0.caller.clone().unwrap_or_else(|| "(daemon)".into());
-            let entry = minute
-                .callers
-                .entry((caller, self.0.label.clone()))
-                .or_default();
-            entry.count += 1;
-            entry.wall_ns += wall_ns;
-            entry.cpu_ns += acc.cpu_ns;
-        }
-        let mut total = state.total.lock().unwrap_or_else(PoisonError::into_inner);
-        let totals = total.entry(self.0.label.clone()).or_default();
-        totals.merge(Some(wall_ns), &acc);
-        totals.wall_samples.clear();
+        self.0.record("finished");
     }
 }
 
@@ -861,12 +889,20 @@ fn acc_json(acc: &Acc, statements: usize) -> Value {
     })
 }
 
-fn write_slow(state: &State, label: &str, caller: Option<&str>, wall: Duration, acc: &Acc) {
+fn write_slow(
+    state: &State,
+    label: &str,
+    caller: Option<&str>,
+    wall: Duration,
+    acc: &Acc,
+    completion: &str,
+) {
     let mut line = json!({
         "at_unix_ms": unix_ms(),
         "label": label,
         "caller": caller,
         "wall_ms": ms(nanos(wall)),
+        "completion": completion,
     });
     if let (Value::Object(line), Value::Object(detail)) = (&mut line, acc_json(acc, 6)) {
         line.extend(detail);
@@ -1118,6 +1154,80 @@ fn flush_minute(state: &State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canceled_operation_records_blocking_writer_work_when_last_worker_exits() {
+        // Profiling is process-global. A child gives this test its own enabled profiler without
+        // changing the accounting of other tests running in parallel.
+        const CHILD: &str = "ST3_PROFILE_CANCELLATION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile::tests::canceled_operation_records_blocking_writer_work_when_last_worker_exits",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ST3_PROFILE_DIR", directory.path())
+                .env("ST3_PROFILE_SLOW_MS", "0")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated cancellation regression failed");
+            return;
+        }
+
+        init_from_env();
+        let state = STATE.get().unwrap();
+        let label = "POST /invented/receive";
+        let request = Op::start(label, None).unwrap();
+        let worker = request.clone();
+        let (acquired, took_writer) = std::sync::mpsc::sync_channel(0);
+        let (release, released) = std::sync::mpsc::sync_channel(0);
+        let thread = std::thread::spawn(move || {
+            let _entered = worker.enter();
+            let writer = writer_acquired(writer_waiting());
+            acquired.send(()).unwrap();
+            released.recv().unwrap();
+            {
+                let _replay = span("projection/heal-replay");
+                sql("SELECT invented", Duration::from_millis(3));
+                note("projection: full replay for a heal");
+            }
+            writer_released(writer);
+            // The entered guard must account for CPU/I/O before the worker's last Op drops.
+        });
+        took_writer.recv().unwrap();
+        drop(request); // The HTTP future was canceled; its blocking worker continues.
+        assert!(!state.total.lock().unwrap().contains_key(label));
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        {
+            let totals = state.total.lock().unwrap();
+            let recorded = totals.get(label).expect("canceled blocking work was lost");
+            assert_eq!(recorded.count, 1);
+            assert_eq!(recorded.acc.writer_hold.count, 1);
+            assert_eq!(recorded.acc.sql.count, 1);
+            assert_eq!(recorded.acc.spans["projection/heal-replay"].count, 1);
+            assert!(recorded.acc.cpu_ns > 0);
+        }
+        let lines = fs::read_to_string(state.dir.join("slow.jsonl")).unwrap();
+        let records = lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["completion"], "dropped");
+
+        let completed = Op::start("GET /invented/completed", None).unwrap();
+        let another_owner = completed.clone();
+        completed.finish();
+        another_owner.finish();
+        assert_eq!(
+            state.total.lock().unwrap()["GET /invented/completed"].count,
+            1
+        );
+    }
 
     #[test]
     fn a_statement_map_folds_past_its_limit() {

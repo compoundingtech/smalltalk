@@ -2309,16 +2309,13 @@ impl Ui {
             return true;
         }
         // The sidebar, while it has the keys.
-        if glasses.sidebar.focused
-            && glasses.sidebar.shown
-            && !self.editing
-            && self.find.is_none()
-            && self.sidebar_key(key)
-        {
+        let sidebar_keys = glasses.sidebar.focused && glasses.sidebar.shown;
+        if sidebar_keys && !self.editing && self.find.is_none() && self.sidebar_key(key) {
             return true;
         }
-        // The conversation that typing reaches, if one has the focus.
-        let conversation = self.composing_agent();
+        // The conversation that typing reaches, if one has the focus: never while the sidebar
+        // has the keys, whose own letters (b and p in Usage) must not type into a tab behind it.
+        let conversation = self.composing_agent().filter(|_| !sidebar_keys);
         let undelivered = self.undelivered().is_some();
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
@@ -3551,6 +3548,26 @@ mod tests {
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+    }
+
+    #[test]
+    fn letters_in_the_sidebar_never_type_into_the_conversation_behind_it() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ctrl(&mut ui, 's');
+        assert!(ui.glasses.as_ref().unwrap().sidebar.focused);
+        // Nathan, 2026-10-03: b in the Usage sidebar typed "b" into the agent's tab.
+        typed(&mut ui, "b");
+        assert!(!ui.editing);
+        assert!(
+            ui.conversation_state
+                .drafts
+                .get("agent/example/atlas/builder")
+                .is_none_or(String::is_empty)
+        );
     }
 
     #[test]
