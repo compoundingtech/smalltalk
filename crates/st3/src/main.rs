@@ -1627,11 +1627,21 @@ enum MissionViewCommand {
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
     /// Publish exact authored mission KDL after preview, once its exec gates pass a check.
+    ///
+    /// Goals, constraints and named documents encode every known rule and decision.
+    /// `depends-on` orders steps; `missions start --after` orders runs without reports.
+    /// A final step assigned to the author, depending on the last real step, reaches the
+    /// author once when work is done. Review gates mark decisions only a person can make.
     Publish(MissionPublishArgs),
     /// Run each exec gate in a mission file once, now, the way a run would, and report its
     /// answer: pass (exit 0), not yet (exit 1), broken (anything else), or unchecked.
     Check(MissionCheckArgs),
     /// Start one run from the current ready mission revision.
+    ///
+    /// Goals, constraints and named documents encode every known rule and decision.
+    /// `depends-on` orders steps; `--after` orders runs without reports.
+    /// A final step assigned to the author, depending on the last real step, reaches the
+    /// author once when work is done. Review gates mark decisions only a person can make.
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
@@ -3344,6 +3354,11 @@ enum WorkCommand {
     /// Publish the exact ready mission produced by one claimed step.
     PublishMission(WorkPublishMissionArgs),
     /// Propose a fenced revision to the mission that owns this work.
+    ///
+    /// Goals, constraints and named documents encode every known rule and decision.
+    /// `depends-on` orders steps; `missions start --after` orders runs without reports.
+    /// A final step assigned to the author, depending on the last real step, reaches the
+    /// author once when work is done. Review gates mark decisions only a person can make.
     Revise(WorkReviseArgs),
     /// Inspect or decide one mission revision proposal and its generations.
     Revision {
