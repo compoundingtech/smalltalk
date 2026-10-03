@@ -2229,12 +2229,16 @@ impl Store {
     /// whether it had to. A start no longer rebuilds it; the daemon checks off the request path
     /// once it serves.
     pub fn repair_operation_projection_drift(&self) -> Result<bool> {
-        if self.operation_projection_drift()?.is_empty() {
+        // Finding the drift reads every operation, on a read connection. Repairing it writes
+        // only the drifted rows: rebuilding the whole table held the only writer for a minute
+        // and more on a populated store, stalling every write behind it.
+        let drift = self.operation_projection_drift()?;
+        if drift.is_empty() {
             return Ok(false);
         }
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
-        rebuild_operations_tx(&transaction)?;
+        repair_operations_tx(&transaction, &drift)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -27041,6 +27045,82 @@ agent "test/empty" { command "true" }
             "{}",
             old.added_since_measured_envelopes
         );
+    }
+
+    /// A start repairs operation rows that drifted (#898). It rewrites only those rows: rebuilding
+    /// the whole table held the only writer for a minute and more on a populated store.
+    #[test]
+    fn an_operation_drift_repair_rewrites_only_the_drifted_rows() {
+        let store = Store::open_memory("node").unwrap();
+        for index in 0..200 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/drift/{index}"),
+                    kind: "custom.drift.note".into(),
+                    actor: Some("person/tester".into()),
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("drift-{index}")),
+                })
+                .unwrap();
+        }
+        let (rows, ids) = {
+            let connection = store.connection.lock().unwrap();
+            let ids = connection
+                .prepare("SELECT id FROM operations ORDER BY id LIMIT 2")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let rows: i64 = connection
+                .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+                .unwrap();
+            (rows, ids)
+        };
+        assert!(rows >= 200, "{rows} operations");
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        // One row changed, one row lost, and one row that no claim backs.
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE operations SET state='conflict' WHERE id=?1",
+                    [&ids[0]],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM operations WHERE id=?1", [&ids[1]])
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO operations(id, request_digest, canonical_claim_id, state)
+                     SELECT 'op/invented-stray', 'digest', canonical_claim_id, 'active'
+                     FROM operations WHERE id=?1",
+                    [&ids[0]],
+                )
+                .unwrap();
+        }
+        assert_eq!(store.operation_projection_drift().unwrap().len(), 3);
+        // Rows written by the repair, besides the ones its triggers write.
+        let operation_rows = || {
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = operation_rows();
+        assert!(store.repair_operation_projection_drift().unwrap());
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        let written = operation_rows() - before;
+        assert!(
+            written <= 3 * 4,
+            "the repair wrote {written} rows for 3 drifted ones"
+        );
+        assert!(!store.repair_operation_projection_drift().unwrap());
     }
 
     #[test]
