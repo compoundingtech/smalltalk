@@ -188,14 +188,13 @@ impl Side {
                 if let Some(object) = body.as_object_mut() {
                     object.remove("evidence");
                 }
-                let text = id(&format!(
+                id(&format!(
                     "{} {} {} {}",
                     change.subject,
                     change.kind,
                     change.actor.unwrap_or_default(),
                     body
-                ));
-                text
+                ))
             })
             .collect::<Vec<_>>();
         claims.sort();
@@ -443,7 +442,7 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
                 incremental.restart(true);
                 "restart".to_owned()
             }
-            8 | 9 | 10 => {
+            8..=10 => {
                 let action = ["claim", "renew", "progress", "complete", "fail", "release"]
                     [draw.below(6) as usize];
                 for side in [&full, &incremental] {
