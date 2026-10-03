@@ -27,6 +27,7 @@ mod hook_telemetry;
 mod human_gates;
 mod idle_budget;
 mod log_diet;
+mod message_send_once;
 mod messaging_faults;
 mod mission_cancellation;
 mod no_st2_seat;

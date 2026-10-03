@@ -2095,7 +2095,8 @@ mod tests {
     #[test]
     fn every_schema_error_code_is_typed_and_round_trips() {
         let schema: serde_json::Value = serde_json::from_str(include_str!("../../../docs/st3/client-v0/schemas/client-v0.schema.json")).unwrap();
-        for raw in schema["$defs"]["ErrorEnvelope"]["properties"]["code"]["enum"].as_array().unwrap() {
+        assert_eq!(schema["$defs"]["ErrorEnvelope"]["properties"]["code"]["$ref"], "#/$defs/ErrorCode");
+        for raw in schema["$defs"]["ErrorCode"]["anyOf"][0]["enum"].as_array().unwrap() {
             let code: ErrorCode = serde_json::from_value(raw.clone()).unwrap();
             assert_ne!(code, ErrorCode::Unknown, "{raw}");
             assert_eq!(serde_json::to_value(code).unwrap(), *raw);

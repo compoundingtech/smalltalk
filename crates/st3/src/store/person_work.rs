@@ -659,37 +659,6 @@ impl Store {
         }).map_err(anyhow::Error::msg)?
     }
 
-    /// A request the daemon itself puts on a person's home, as `actor` (`daemon/NAME`), in a run
-    /// of its own. Every node that asks with the same name and key names the same step, so the
-    /// request appears once. Clients cannot reach this: `ask_person` accepts only agents.
-    pub(crate) fn ask_person_as_daemon(
-        &self,
-        actor: &str,
-        person: &str,
-        title: &str,
-        reason: &str,
-        name: &str,
-        key: &str,
-    ) -> Result<StepRunView, St3Error> {
-        if !actor.starts_with("daemon/")
-            || !person.starts_with("person/")
-            || person.matches('/').count() != 1
-            || title.trim().is_empty()
-            || reason.trim().is_empty()
-            || key.is_empty()
-        {
-            return Err(St3Error::new(
-                "invalid-person-ask",
-                "a daemon ask needs a daemon actor, a person, a title, a reason and a key",
-            ));
-        }
-        self.connection
-            .batched(|tx| {
-                ask_as_daemon_tx(tx, &self.origin, actor, person, title, reason, name, key)
-            })
-            .map_err(internal)?
-    }
-
     /// Brings a person information they asked for. Nothing waits on an update: it stays on the
     /// person's home until they open or read it, and it is refused unless `about` names the
     /// person's own run or step, or their message to the poster.
@@ -2387,55 +2356,4 @@ mission "writer-load" state="ready" {
             "stale-fence"
         );
     }
-}
-
-/// `Store::ask_person_as_daemon` inside a writer transaction the caller already holds, such as a
-/// resource observation that routes an item to a person.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ask_as_daemon_tx(
-    tx: &Transaction<'_>,
-    origin: &str,
-    actor: &str,
-    person: &str,
-    title: &str,
-    reason: &str,
-    name: &str,
-    key: &str,
-) -> Result<StepRunView, St3Error> {
-    let identity = serde_json::to_string(&(actor, name, key)).map_err(internal)?;
-    let hash = hex::encode(Sha256::digest(identity.as_bytes()));
-    let generation = format!("ask-{}", &hash[..32]);
-    let subject = format!("step-run/{generation}/ask");
-    if request(tx, &subject).map_err(internal)?.is_some() {
-        return step(tx, &subject)
-            .map_err(internal)?
-            .ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
-    }
-    let mission_id = format!("person-ask/{}", &hash[..32]);
-    let kdl = format!(
-        "version 2\nmission {mission_id:?} state=\"ready\" {{ goal {title:?}; step \"ask\" {{ assigned-to {person:?}; goal {reason:?}; }} }}"
-    );
-    let mut intent = crate::graph::parse_internal_intent(&kdl, origin)?;
-    let mission = intent
-        .missions
-        .remove(&mission_id)
-        .ok_or_else(|| St3Error::new("internal", "the person mission could not be parsed"))?;
-    let claim = append_claim_tx(
-        tx,
-        origin,
-        &subject,
-        "work.person-asked",
-        Some(actor),
-        &json!({"fields": {"run": format!("mission-run/person-ask/{}", &hash[..32]),
-            "generation": format!("run-generation/{generation}"),
-            "person": person, "title": title, "reason": reason, "key": key,
-            "attempt": 1, "status": "ready", "mission_spec": mission}}),
-        &[],
-        None,
-    )
-    .map_err(claim_append_error)?;
-    project(tx, &claim)?;
-    step(tx, &subject)
-        .map_err(internal)?
-        .ok_or_else(|| St3Error::new("missing-step-run", "the ask could not be projected"))
 }

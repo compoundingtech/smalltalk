@@ -34,6 +34,38 @@ fn fixture(name: &str) -> Value {
 /// Draft 2020-12 unevaluatedProperties closes their union without flattening or duplicating it.
 fn contract_validator(definition: &str) -> jsonschema::Validator {
     let mut schema = json(asset_root().join("schemas/client-v0.schema.json"));
+    // Consumers preserve future cases, but this daemon must emit only declared cases.
+    // Tighten every open enum (`anyOf: [{enum: known}, {type: string}]`) in a test-only copy.
+    fn strict_known_cases(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                let known = object.get("anyOf").and_then(Value::as_array).and_then(|cases| {
+                    if cases.len() == 2 && cases[1]["type"] == "string" {
+                        cases[0].get("enum").cloned()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(known) = known {
+                    object.remove("anyOf");
+                    object.insert("enum".into(), known);
+                }
+                for child in object.values_mut() {
+                    strict_known_cases(child);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    strict_known_cases(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    strict_known_cases(&mut schema);
+    if let Some(cases) = schema["$defs"]["Resource"]["oneOf"].as_array_mut() {
+        cases.retain(|case| case["$ref"] != "#/$defs/UnknownResource");
+    }
     for resource in schema["$defs"].as_object_mut().unwrap().values_mut() {
         if resource["allOf"].as_array().is_some_and(|branches| {
             branches
@@ -43,8 +75,20 @@ fn contract_validator(definition: &str) -> jsonschema::Validator {
             resource["unevaluatedProperties"] = Value::Bool(false);
         }
     }
+    compile_contract_validator(schema, definition)
+}
+
+fn consumer_validator(definition: &str) -> jsonschema::Validator {
+    compile_contract_validator(
+        json(asset_root().join("schemas/client-v0.schema.json")),
+        definition,
+    )
+}
+
+fn compile_contract_validator(mut schema: Value, definition: &str) -> jsonschema::Validator {
     schema.as_object_mut().unwrap().remove("oneOf");
     schema["$ref"] = Value::String(format!("#/$defs/{definition}"));
+    // Unknown x-st-* annotation keywords are ignored by the standard validator.
     jsonschema::options()
         .with_draft(jsonschema::Draft::Draft202012)
         .should_validate_formats(true)
@@ -65,6 +109,202 @@ fn assert_conforms(validator: &jsonschema::Validator, context: &str, value: &Val
             .collect::<Vec<_>>()
             .join("\n");
         panic!("{context} violates client-v0:\n{errors}\n{value}");
+    }
+}
+
+#[test]
+fn consumers_accept_future_enum_cases_but_producers_reject_them() {
+    for (definition, known) in [
+        ("MissionState", "running"),
+        ("MustAct", "you"),
+        ("RunOutcomeStatus", "completed"),
+        ("AgentState", "running"),
+        ("AgentReachability", "reachable"),
+        ("TimelineStatus", "running"),
+        ("ErrorCode", "attention-migrated"),
+    ] {
+        let consumer = consumer_validator(definition);
+        let producer = contract_validator(definition);
+        let known = Value::String(known.into());
+        assert_conforms(&consumer, definition, &known);
+        assert_conforms(&producer, definition, &known);
+        let future = Value::String("future-case".into());
+        assert_conforms(&consumer, definition, &future);
+        assert!(
+            !producer.is_valid(&future),
+            "{definition} producer accepted a future case"
+        );
+        assert!(!consumer.is_valid(&Value::Null), "{definition} accepted null");
+        assert!(
+            !consumer.is_valid(&Value::from(1)),
+            "{definition} accepted a number"
+        );
+    }
+}
+
+#[test]
+fn future_resources_remain_readable_without_bypassing_known_resource_validation() {
+    let consumer = consumer_validator("Resource");
+    let producer = contract_validator("Resource");
+    let mut resource = serde_json::json!({
+        "id": "future-widget/example",
+        "kind": "future-widget",
+        "revision": "r1",
+        "updated_at": "2026-10-01T10:00:00.000Z",
+        "future_payload": {"answer": 42}
+    });
+    assert_conforms(&consumer, "future resource", &resource);
+    assert!(!producer.is_valid(&resource));
+
+    resource["id"] = Value::String("invalid-id".into());
+    assert!(
+        !consumer.is_valid(&resource),
+        "future resources still require valid headers"
+    );
+    resource["id"] = Value::String("mission/example".into());
+    for kind in ["mission", "agent", "glass", "machine"] {
+        resource["kind"] = Value::String(kind.into());
+        assert!(
+            !consumer.is_valid(&resource),
+            "malformed known {kind} must not escape through UnknownResource"
+        );
+    }
+
+    for known in fixture("resources.json").as_array().unwrap() {
+        assert_conforms(&consumer, "known resource", known);
+        assert_conforms(&producer, "known resource", known);
+    }
+    assert_conforms(
+        &consumer_validator("Envelope"),
+        "glass page",
+        &fixture("glasses.json"),
+    );
+    assert_conforms(
+        &contract_validator("Envelope"),
+        "glass page",
+        &fixture("glasses.json"),
+    );
+}
+
+#[test]
+fn future_timeline_types_preserve_payloads_without_weakening_known_bodies() {
+    let consumer = consumer_validator("TimelineEntry");
+    let producer = contract_validator("TimelineEntry");
+    let mut entry = fixture("timeline.json")["value"]["items"][0].clone();
+    assert_conforms(&consumer, "known status entry", &entry);
+    assert_conforms(&producer, "known status entry", &entry);
+    entry["body"]["status"] = Value::String("future-status".into());
+    assert_conforms(&consumer, "future status", &entry);
+    assert!(!producer.is_valid(&entry));
+
+    entry["type"] = Value::String("future-entry".into());
+    entry["body"] = serde_json::json!({"future_payload": [1, true, null]});
+    assert_conforms(&consumer, "future timeline type", &entry);
+    assert!(!producer.is_valid(&entry));
+    entry["type"] = Value::String("content".into());
+    assert!(
+        !consumer.is_valid(&entry),
+        "known content still requires its typed body"
+    );
+}
+
+#[test]
+fn family_references_reject_cross_family_and_malformed_ids() {
+    for (definition, family) in [
+        ("MissionId", "mission"),
+        ("MissionRunId", "mission-run"),
+        ("RunGenerationId", "run-generation"),
+        ("StepRunId", "step-run"),
+        ("AgentId", "agent"),
+        ("HostId", "host"),
+        ("RuntimeId", "runtime"),
+        ("TerminalId", "terminal"),
+        ("SnapshotId", "snapshot"),
+        ("RequestId", "request"),
+        ("TimelineEntryId", "timeline-entry"),
+    ] {
+        for validator in [consumer_validator(definition), contract_validator(definition)] {
+            assert_conforms(
+                &validator,
+                definition,
+                &Value::String(format!("{family}/nested/example")),
+            );
+            for invalid in [
+                "wrong-family/example".to_owned(),
+                format!("{family}/"),
+                format!("{family}/white space"),
+                format!("{family}/line\nbreak"),
+                family.to_owned(),
+            ] {
+                let invalid = Value::String(invalid);
+                assert!(!validator.is_valid(&invalid), "{definition}: {invalid}");
+            }
+        }
+    }
+    for (definition, allowed, rejected) in [
+        (
+            "ActorRef",
+            ["agent/example", "daemon/example", "person/example"],
+            "step/example",
+        ),
+        (
+            "ParticipantRef",
+            ["agent/example", "person/example", "step/example"],
+            "daemon/example",
+        ),
+    ] {
+        for validator in [consumer_validator(definition), contract_validator(definition)] {
+            for valid in &allowed {
+                assert_conforms(&validator, definition, &Value::String((*valid).into()));
+            }
+            assert!(!validator.is_valid(&Value::String(rejected.into())));
+        }
+    }
+}
+
+#[test]
+fn resource_fields_and_generation_map_keys_enforce_family_references() {
+    let resources = fixture("resources.json");
+    for kind in ["mission", "agent"] {
+        let original = resources
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value["kind"] == kind)
+            .unwrap();
+        for validator in [consumer_validator("Resource"), contract_validator("Resource")] {
+            assert_conforms(&validator, kind, original);
+            let mut wrong_id = original.clone();
+            wrong_id["id"] = Value::String("wrong-family/example".into());
+            assert!(
+                !validator.is_valid(&wrong_id),
+                "{kind} accepted a cross-family id"
+            );
+        }
+    }
+    let mission = resources
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["kind"] == "mission")
+        .unwrap();
+    for validator in [consumer_validator("Resource"), contract_validator("Resource")] {
+        for generations in [
+            serde_json::json!({"agent/example": "run-generation/example"}),
+            serde_json::json!({"mission-run/": "run-generation/example"}),
+            serde_json::json!({"mission-run/white space": "run-generation/example"}),
+            serde_json::json!({"mission-run/example": "mission-run/example"}),
+        ] {
+            let mut invalid = mission.clone();
+            invalid["run_generations"] = generations;
+            assert!(
+                !validator.is_valid(&invalid),
+                "invalid run generation map: {invalid}"
+            );
+        }
+        let mut wrong_run = mission.clone();
+        wrong_run["runs"] = serde_json::json!(["agent/example"]);
+        assert!(!validator.is_valid(&wrong_run));
     }
 }
 

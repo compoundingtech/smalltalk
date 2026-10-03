@@ -39,14 +39,14 @@ use crate::model::{
     GateResultRequest, HumanReviewView, IntentInput, LaunchApproveAndStartRequest,
     LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionOption,
     LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
-    LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest,
-    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest, MissionRunRequest,
-    MissionRunView, OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult,
-    PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
-    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
-    ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
+    LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
+    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
+    MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
+    MissionRunRequest, MissionRunView, OperationalRepairApplyRequest, OperationalRepairPlan,
+    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest,
+    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
+    PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
+    ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
     ReplicationHealAnswerRequest, ReplicationHealNextRequest, ReplicationHealStep,
     ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
     ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
@@ -523,6 +523,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/messages/delivery/{*subject}", get(message_delivery))
+        .route("/v1/messages/by-key", get(message_by_key))
         .route("/v1/status", get(status))
         .route("/v1/desired/{*subject}", get(get_desired))
         .route("/v1/events", get(events))
@@ -2790,6 +2791,46 @@ async fn message_delivery(
         Ok(Json(json!({ "id": subject, "from": message.from, "to": message.to,
             "delivery": message_delivery_value(&message.to, &message.status, sent_at, client_now_ms()) })))
     }).await
+}
+
+#[derive(Deserialize)]
+struct MessageKeyQuery {
+    key: String,
+}
+
+/// The message a send's idempotency key landed as, so a client whose send went unanswered can
+/// tell whether it was sent before it sends again. Only a message send or reply answers; any
+/// other key is `message-not-sent`.
+async fn message_by_key(
+    State(state): State<AppState>,
+    Query(query): Query<MessageKeyQuery>,
+) -> Result<Json<MessageSendReceipt>, ApiError> {
+    blocking_api(move || {
+        let not_sent = || ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "message-not-sent".into(),
+            message: format!("no message was sent with idempotency key `{}`", query.key),
+            details: Box::default(),
+        };
+        let claim = state
+            .store
+            .operation_claim(&query.key)
+            .map_err(ApiError::internal)?
+            .filter(|claim| claim.kind == "message.sent")
+            .ok_or_else(not_sent)?;
+        let message = state
+            .store
+            .message(&claim.subject)
+            .map_err(ApiError::internal)?
+            .ok_or_else(not_sent)?;
+        Ok(Json(MessageSendReceipt {
+            message,
+            idempotency_key: query.key.clone(),
+            already_sent: true,
+            sent_at: Some(client_timestamp(claim.accepted_at_unix_ms)),
+        }))
+    })
+    .await
 }
 
 fn launch_session_id(id: &str) -> &str {
@@ -9811,8 +9852,8 @@ async fn post_review(
 async fn send_message(
     State(state): State<AppState>,
     Json(request): Json<MessageSendRequest>,
-) -> Result<Json<MessageView>, ApiError> {
-    blocking_api(move || accept_message(&state, request, None, None)).await
+) -> Result<Json<MessageSendReceipt>, ApiError> {
+    blocking_api(move || accept_message_receipt(&state, request, None, None).map(Json)).await
 }
 
 /// The fields a device signs on a message it sends, in the `fields-v1` format.
@@ -9933,6 +9974,18 @@ fn accept_message(
     session_id: Option<String>,
     device_signature: Option<smallclaims::principal::ClaimSignature>,
 ) -> Result<Json<MessageView>, ApiError> {
+    accept_message_receipt(state, request, session_id, device_signature)
+        .map(|receipt| Json(receipt.message))
+}
+
+/// Accept one message, or find the one its idempotency key already sent. The receipt says which,
+/// so a client that repeats an unanswered send can say that nothing new was sent.
+fn accept_message_receipt(
+    state: &AppState,
+    request: MessageSendRequest,
+    session_id: Option<String>,
+    device_signature: Option<smallclaims::principal::ClaimSignature>,
+) -> Result<MessageSendReceipt, ApiError> {
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
@@ -10020,11 +10073,12 @@ fn accept_message(
         fields,
         evidence: Vec::new(),
         expected_subject: None,
-        idempotency_key: Some(request.idempotency_key),
+        idempotency_key: Some(request.idempotency_key.clone()),
     };
-    let record = match &device_signature {
-        Some(signature) => state.store.append_signed_claim(&input, signature).map(|(claim, _)| claim),
-        None => state.store.append_claim(&input),
+    // A repeated key returns the first claim and says it appended nothing.
+    let (record, appended) = match &device_signature {
+        Some(signature) => state.store.append_signed_claim(&input, signature),
+        None => state.store.append_claim_outcome(&input),
     }
     .map_err(ApiError::bad)?;
     let mut work_wake = is_work_wake(&request.tags);
@@ -10038,18 +10092,23 @@ fn accept_message(
         settle_answered_message(&state.store, parent, &from, &to, &subject, &record.id)?;
     }
     signal_message_changed(state, "message.sent", work_wake);
-    Ok(Json(MessageView {
-        subject,
-        from,
-        to,
-        content: request.content,
-        status: "sent".into(),
-        title: request.title,
-        in_reply_to: request.in_reply_to,
-        tags: request.tags,
-        created_index: record.store_index,
-        attachments,
-    }))
+    Ok(MessageSendReceipt {
+        message: MessageView {
+            subject,
+            from,
+            to,
+            content: request.content,
+            status: "sent".into(),
+            title: request.title,
+            in_reply_to: request.in_reply_to,
+            tags: request.tags,
+            created_index: record.store_index,
+            attachments,
+        },
+        idempotency_key: request.idempotency_key,
+        already_sent: !appended,
+        sent_at: Some(client_timestamp(record.accepted_at_unix_ms)),
+    })
 }
 
 /// A recipient's successful reply is durable evidence that the parent was consumed.
@@ -17670,6 +17729,11 @@ version 2
             assert_eq!(status, StatusCode::OK, "{sent}");
             let (status, repeated) = json_request(app.clone(), "/v1/messages", reply).await;
             assert_eq!(status, StatusCode::OK, "{repeated}");
+            // The repeat is told it found the first reply, not that it sent one.
+            assert_eq!(sent["already_sent"], false, "{sent}");
+            assert_eq!(repeated["already_sent"], true, "{repeated}");
+            assert_eq!(repeated["subject"], sent["subject"]);
+            assert_eq!(repeated["sent_at"], sent["sent_at"]);
             let (_, settled) = get_request(
                 app.clone(),
                 &format!(
