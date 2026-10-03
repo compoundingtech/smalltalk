@@ -518,8 +518,10 @@ pub fn observe(connection: &mut Connection) {
 /// Timings vary from machine to machine; these counts do not.
 #[cfg(any(test, feature = "test-support"))]
 pub mod work {
+    use std::collections::BTreeMap;
     use std::ffi::{c_int, c_uint, c_void};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, PoisonError};
 
     use rusqlite::{Connection, ffi};
 
@@ -567,40 +569,56 @@ pub mod work {
         }
     }
 
-    /// Count `connection`'s statements. SQLite reports each one when it finishes, also when a
-    /// trigger or a foreign-key check did the work inside it.
+    /// Count `connection`'s statements. SQLite reports each one when it starts and when it
+    /// finishes, also when a trigger or a foreign-key check did the work inside it.
     pub(super) fn count(connection: &Connection) {
-        // SAFETY: the callback only reads the finished statement's counters, and the handle
-        // stays valid for the connection's life, which ends the registration with it.
+        // SAFETY: the callback only reads the statement's counters, and the handle stays valid
+        // for the connection's life, which ends the registration with it.
         unsafe {
             ffi::sqlite3_trace_v2(
                 connection.handle(),
-                ffi::SQLITE_TRACE_PROFILE as c_uint,
-                Some(finished),
+                (ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_PROFILE) as c_uint,
+                Some(traced),
                 std::ptr::null_mut(),
             );
         }
     }
 
-    unsafe extern "C" fn finished(
-        _event: c_uint,
+    const COUNTERS: [c_int; 4] = [
+        ffi::SQLITE_STMTSTATUS_VM_STEP,
+        ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP,
+        ffi::SQLITE_STMTSTATUS_SORT,
+        ffi::SQLITE_STMTSTATUS_AUTOINDEX,
+    ];
+
+    /// Each running statement's counters when it started. A statement's counters add up over
+    /// its runs until someone resets them, and tests read them too, so this never resets them.
+    static STARTED: Mutex<BTreeMap<usize, [u64; 4]>> = Mutex::new(BTreeMap::new());
+
+    unsafe extern "C" fn traced(
+        event: c_uint,
         _context: *mut c_void,
         statement: *mut c_void,
-        _elapsed: *mut c_void,
+        _detail: *mut c_void,
     ) -> c_int {
+        let key = statement as usize;
         let statement = statement.cast::<ffi::sqlite3_stmt>();
-        // Reading with the reset flag set leaves a cached statement's counters at zero for its
-        // next run.
-        // SAFETY: SQLite passes the statement that just finished.
-        let take = |counter: c_int| unsafe { ffi::sqlite3_stmt_status(statement, counter, 1) };
-        let add = |total: &AtomicU64, counter: c_int| {
-            total.fetch_add(u64::try_from(take(counter)).unwrap_or(0), Ordering::Relaxed);
-        };
+        // SAFETY: SQLite passes the statement that started or finished.
+        let read = |counter: c_int| unsafe { ffi::sqlite3_stmt_status(statement, counter, 0) };
+        let now = COUNTERS.map(|counter| u64::try_from(read(counter)).unwrap_or(0));
+        let mut started = STARTED.lock().unwrap_or_else(PoisonError::into_inner);
+        if event == ffi::SQLITE_TRACE_STMT as c_uint {
+            // A trigger's start reports the statement again; the first start counts.
+            started.entry(key).or_insert(now);
+            return 0;
+        }
+        let before = started.remove(&key).unwrap_or([0; 4]);
+        let spent = |index: usize| now[index].saturating_sub(before[index]);
         STATEMENTS.fetch_add(1, Ordering::Relaxed);
-        add(&VM_STEPS, ffi::SQLITE_STMTSTATUS_VM_STEP);
-        add(&FULLSCAN_STEPS, ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP);
-        add(&SORTS, ffi::SQLITE_STMTSTATUS_SORT);
-        add(&AUTOINDEX_ROWS, ffi::SQLITE_STMTSTATUS_AUTOINDEX);
+        VM_STEPS.fetch_add(spent(0), Ordering::Relaxed);
+        FULLSCAN_STEPS.fetch_add(spent(1), Ordering::Relaxed);
+        SORTS.fetch_add(spent(2), Ordering::Relaxed);
+        AUTOINDEX_ROWS.fetch_add(spent(3), Ordering::Relaxed);
         0
     }
 }
