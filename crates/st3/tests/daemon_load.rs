@@ -269,17 +269,14 @@ fn worst_of(path: &Path) -> Option<Report> {
     (!reports.is_empty()).then_some(worst)
 }
 
-/// Where this run is more than [`WORSE`] past the baseline. A path with few requests has a p99
-/// that is nearly its maximum, which one slow request moves, so only busy paths compare.
+/// Where any measured path or daemon CPU is more than [`WORSE`] past the baseline.
+/// Main's worst recent reports absorb variation even for infrequently requested paths.
 fn compare(report: &Report, baseline: &Report) -> Vec<String> {
     let mut failures = Vec::new();
     for (name, path) in &report.paths {
         let Some(before) = baseline.paths.get(name) else {
             continue;
         };
-        if path.count < 100 || before.count < 100 {
-            continue;
-        }
         if path.p99_ms > before.p99_ms * WORSE
             && path.p99_ms > before.p99_ms + LATENCY_SLACK.as_secs_f64() * 1e3
         {
@@ -302,6 +299,37 @@ fn compare(report: &Report, baseline: &Report) -> Vec<String> {
         ));
     }
     failures
+}
+
+#[test]
+fn infrequent_reads_still_fail_on_a_baseline_regression() {
+    let path = "person read /v1/client/agents";
+    let mut baseline = Report::default();
+    baseline.paths.insert(
+        path.into(),
+        PathReport {
+            count: 9,
+            p99_ms: 1_000.0,
+            budget_ms: 4_000.0,
+            ..PathReport::default()
+        },
+    );
+    let mut report = Report::default();
+    report.paths.insert(
+        path.into(),
+        PathReport {
+            count: 9,
+            p99_ms: 1_250.0,
+            budget_ms: 4_000.0,
+            ..PathReport::default()
+        },
+    );
+    // The request still passes its absolute budget, but misses the baseline limit.
+    let failures = compare(&report, &baseline);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains(path));
+    report.paths.get_mut(path).unwrap().p99_ms = 1_190.0;
+    assert!(compare(&report, &baseline).is_empty());
 }
 
 fn print(report: &Report) {
