@@ -538,11 +538,22 @@ pub struct StepSpec {
     pub definition_hash: String,
 }
 
+/// How the resource edge was authored. Older stored URI edges predate this discriminator.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceReferenceKind {
+    #[default]
+    Uri,
+    Subject,
+}
+
 /// A named edge to an ordinary resource subject, not a copy of its locator.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeclaredResourceReference {
     pub name: String,
     pub subject: String,
+    #[serde(default)]
+    pub kind: ResourceReferenceKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
