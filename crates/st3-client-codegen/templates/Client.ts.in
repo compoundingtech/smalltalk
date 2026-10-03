@@ -129,7 +129,7 @@ export class St3Client {
         this.baseUrl = options.baseUrl.replace(/\/+$/, '');
         this.credential = options.credential;
         this.client = options.client;
-        this.fetchImpl = options.fetchImpl ?? fetch;
+        this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     }
 
     async capabilities(): Promise<EnvelopeOf<Capabilities>> {
