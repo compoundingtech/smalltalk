@@ -273,6 +273,8 @@ pub struct Ui {
     pub(crate) said: Option<(String, Result<st3_client::ConversationSearch, String>)>,
     /// The named answer chosen on the focused structured request, before Enter sends it.
     answering: Option<usize>,
+    /// A decision's "request changes" answer, chosen: its id goes with the words typed next.
+    changes_answer: Option<String>,
     /// Voice mode: the speech helper listening for one input.
     pub(crate) voice: Option<voice::VoiceState>,
     /// Inputs whose text came from voice; their next message is tagged `dictated`.
@@ -376,6 +378,7 @@ impl Ui {
             said: None,
             voice: None,
             answering: None,
+            changes_answer: None,
             dictated: HashSet::new(),
             details: true,
             kdl: false,
@@ -2640,6 +2643,13 @@ impl Ui {
                 let Some(answer) = request.answers.get(index) else {
                     return true;
                 };
+                // Requesting changes needs the changes in words: write them, then Enter sends both.
+                if answer.outcome.as_deref() == Some("request_changes") {
+                    self.changes_answer = Some(answer.id.clone());
+                    self.editing = true;
+                    self.flash(format!("“{}”: write the changes, then Enter", answer.label));
+                    return true;
+                }
                 if self.live {
                     self.effects.push(Effect::Attention {
                         id,
@@ -2963,7 +2973,10 @@ impl Ui {
                 .get(&key_id)
                 .is_none_or(String::is_empty);
             match key.code {
-                KeyCode::Esc => self.editing = false,
+                KeyCode::Esc => {
+                    self.editing = false;
+                    self.changes_answer = None;
+                }
                 KeyCode::Enter => self.submit(),
                 // Ctrl+R speaks into the input instead of typing.
                 KeyCode::Char('r') if control => self.start_voice(),
@@ -3762,7 +3775,7 @@ impl Ui {
                         id: id.clone(),
                         action: "work.done".into(),
                         reason: Some(draft),
-                        answer: None,
+                        answer: self.changes_answer.take(),
                     }),
                     Some(AttentionKind::Message { from, .. }) => Some(Effect::Reply {
                         id: id.clone(),
