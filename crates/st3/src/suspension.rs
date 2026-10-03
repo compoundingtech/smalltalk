@@ -271,6 +271,7 @@ pub fn continue_session(
     store: &Store,
     subject: &str,
     harness: &str,
+    account: Option<&str>,
 ) -> Result<Option<(String, Option<String>)>> {
     let Some(bound) = store
         .claims_for(subject, Some("harness.session-file"))?
@@ -280,6 +281,11 @@ pub fn continue_session(
     else {
         return Ok(None);
     };
+    // Account directories also hold native sessions. Never carry a transcript between logins;
+    // only a relaunch on the account that bound it may continue it.
+    if field(&bound, "account_ref") != account {
+        return Ok(None);
+    }
     let Some(session) = field(&bound, "session_id").map(str::to_owned) else {
         return Ok(None);
     };

@@ -7293,6 +7293,15 @@ async fn run_usage(client: &Client, args: UsageArgs, json_output: bool) -> Resul
     Ok(())
 }
 
+/// A limits row's account: the declared name beside the provider's label, or the label alone.
+fn account_name(label: &Value, declared: &Value) -> String {
+    let label = label.as_str().unwrap_or("unknown");
+    match declared.as_str() {
+        Some(name) => format!("{name} ({label})"),
+        None => label.to_owned(),
+    }
+}
+
 fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> String {
     use std::fmt::Write as _;
 
@@ -7373,10 +7382,16 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
                 percent(&limit["five_hour_percent"]),
                 time(&limit["weekly_resets_at_unix_ms"]),
                 time(&limit["measured_at_unix_ms"]),
-                limit["account"].as_str().unwrap_or("unknown"),
+                account_name(&limit["account"], &limit["account_ref"]),
             );
         }
     }
+    // A harness bound to a declared account reports that account's name beside the provider's
+    // label, so usage reads against the accounts a person declared.
+    let declared = limits
+        .iter()
+        .filter_map(|limit| Some((limit["account"].as_str()?, limit["account_ref"].as_str()?)))
+        .collect::<BTreeMap<_, _>>();
     let groups = only
         .map(|by| vec![by])
         .unwrap_or_else(|| UsageBy::ALL.to_vec());
@@ -7387,7 +7402,11 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
                 .as_str()
                 .filter(|value| !value.is_empty())
                 .unwrap_or("unknown");
-            totals.entry(label.to_owned()).or_default().push(row);
+            let label = match (by, declared.get(label)) {
+                (UsageBy::Account, Some(name)) => format!("{name} ({label})"),
+                _ => label.to_owned(),
+            };
+            totals.entry(label).or_default().push(row);
         }
         let mut totals = totals
             .into_iter()
@@ -15313,7 +15332,7 @@ impl NativeObservations {
         for event in &events {
             let publisher = ObservationClient {
                 client,
-                event: Some((&self.runtime, event.sequence, &self.dir)),
+                event: Some((&self.runtime, event.sequence, &self.dir, event.payload["account_ref"].as_str())),
             };
             let raw = serde_json::to_vec(&event.payload)?;
             let source_driver = event.payload["harness"]
@@ -15451,7 +15470,7 @@ impl NativeObservations {
 
 struct ObservationClient<'a> {
     client: &'a Client,
-    event: Option<(&'a str, u64, &'a Path)>,
+    event: Option<(&'a str, u64, &'a Path, Option<&'a str>)>,
 }
 impl std::ops::Deref for ObservationClient<'_> {
     type Target = Client;
@@ -15465,7 +15484,13 @@ impl ObservationClient<'_> {
         path: &str,
         claim: &ClaimInput,
     ) -> Result<O> {
-        if let Some((runtime, sequence, dir)) = self.event {
+        let account = match self.event {
+            Some((_, _, _, account)) => account.map(str::to_owned),
+            None => std::env::var("ST3_ACCOUNT").ok(),
+        };
+        let mut claim = claim.clone();
+        bind_observation_account(&mut claim, account.as_deref());
+        if let Some((runtime, sequence, dir, _)) = self.event {
             let slot = format!(
                 "{}:{}",
                 claim.kind,
@@ -15479,7 +15504,7 @@ impl ObservationClient<'_> {
                 dir,
                 sequence,
                 &slot,
-                &serde_json::to_value(claim)?,
+                &serde_json::to_value(&claim)?,
             )?)?;
             self.client
                 .post(
@@ -15492,8 +15517,42 @@ impl ObservationClient<'_> {
                 )
                 .await
         } else {
-            self.client.post(path, claim).await
+            self.client.post(path, &claim).await
         }
+    }
+}
+
+/// Bound accounts have their own accounting identity even when a provider reports only a
+/// generic API-key label or no identity. Unbound seats retain the provider's existing identity.
+fn bind_observation_account(claim: &mut ClaimInput, account: Option<&str>) {
+    if claim.kind == "harness.limits" {
+        claim.fields.remove("account_ref");
+    }
+    let Some(account) = account.filter(|name| !name.is_empty()) else {
+        return;
+    };
+    let Some(driver) = claim.fields.get("driver").and_then(Value::as_str) else {
+        return;
+    };
+    let label = st_drivers::account::account_label(driver, &format!("declared:{account}"));
+    match claim.kind.as_str() {
+        "harness.limits" => {
+            claim
+                .fields
+                .insert("account_ref".into(), Value::String(account.into()));
+            claim.fields.insert("account".into(), Value::String(label));
+        }
+        "harness.usage" => {
+            claim.fields.insert("account".into(), Value::String(label));
+        }
+        "harness.timeline"
+            if claim.fields.get("entry_type").and_then(Value::as_str) == Some("usage") =>
+        {
+            if let Some(Value::Object(body)) = claim.fields.get_mut("body") {
+                body.insert("account".into(), Value::String(label));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -15849,7 +15908,7 @@ async fn publish_harness_timeline(
         // its snapshot index and overwrites attribution on every explicit usage entry.
         let fields = timeline_claim_fields(operation, incarnation);
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
-        let _: ClaimRecord = client
+        let _: ClaimRecord = ObservationClient { client, event: None }
             .post(
                 "/v1/claims",
                 &ClaimInput {
@@ -16041,6 +16100,7 @@ async fn report_native_session(
                 "harness": harness,
                 "session_id": session,
                 "path": path.map(|path| path.to_string_lossy().into_owned()),
+                "account_ref": std::env::var("ST3_ACCOUNT").ok(),
             }),
         )
         .await?;
@@ -16816,6 +16876,7 @@ impl PiFamilyReports {
                         "harness": driver,
                         "session_id": native,
                         "path": path,
+                        "account_ref": std::env::var("ST3_ACCOUNT").ok(),
                     }),
                 )
                 .await;
@@ -18733,6 +18794,9 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
                 for seat in outcome.stopped {
                     eprintln!("st3: limits policy stopped {seat}");
                 }
+                for (seat, account) in outcome.switched {
+                    eprintln!("st3: limits policy restarted {seat} on account {account}");
+                }
             }
             Ok(Err(error)) => eprintln!("st3: limits policy failed: {error}"),
             Err(error) => eprintln!("st3: limits policy stopped: {error}"),
@@ -19135,6 +19199,92 @@ mod tests {
         let by_step = render_usage_report(&report, 24, Some(UsageBy::Step));
         assert_eq!(by_step.matches("USAGE  ").count(), 1);
         assert!(by_step.contains("by step"));
+    }
+
+    #[test]
+    fn declared_accounts_keep_response_spend_and_limits_separate_without_provider_identity() {
+        let store = Store::open_memory("alder").unwrap();
+        let mut labels = Vec::new();
+        for (index, account) in ["ada/one", "ada/two"].into_iter().enumerate() {
+            let subject = format!("agent/example/seat-{index}");
+            let mut claim = ClaimInput {
+                subject: subject.clone(), kind: "harness.timeline".into(), actor: Some(subject),
+                fields: serde_json::from_value(json!({
+                    "operation": "append", "entry_id": format!("response-{index}"), "source_id": format!("response-{index}"),
+                    "sequence": 1, "revision": 1, "role": "system", "entry_type": "usage", "final": true,
+                    "driver": "codex", "incarnation_id": "inc-one", "observed_at_unix_ms": now_ms() as u64,
+                    "body": {"semantics": "response", "model": "example-model", "input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+                })).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            };
+            bind_observation_account(&mut claim, Some(account));
+            labels.push(claim.fields["body"]["account"].clone());
+            let observation = store.append_claim(&claim).unwrap();
+            let rollup = store
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rollup.fields["account"], labels[index]);
+            assert_eq!(rollup.fields["total_tokens"], 12);
+            store.append_claim(&rollup).unwrap();
+
+            claim.kind = "harness.limits".into();
+            claim.fields =
+                serde_json::from_value(json!({"driver": "codex", "weekly_percent": 20 + index,
+                "measured_at_unix_ms": now_ms() as u64}))
+                .unwrap();
+            bind_observation_account(&mut claim, Some(account));
+            assert_eq!(claim.fields["account"], labels[index]);
+            assert_eq!(claim.fields["account_ref"], account);
+            store.append_claim(&claim).unwrap();
+        }
+        assert_ne!(labels[0], labels[1]);
+        assert_eq!(store.account_limits().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_unbound_observation_keeps_the_provider_account() {
+        let mut claim = ClaimInput {
+            subject: "agent/example/seat".into(),
+            kind: "harness.limits".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("driver".into(), json!("claude")),
+                ("account".into(), json!("claude/provider-label")),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        let before = claim.fields.clone();
+        bind_observation_account(&mut claim, None);
+        assert_eq!(claim.fields, before);
+    }
+
+    #[test]
+    fn usage_names_a_declared_account_beside_the_providers_label() {
+        let report = json!({
+            "rows": [
+                {"agent":"agent/a","model":"m","account":"claude/aaaa","host":"host/a","cost_microusd":1000000,"total_tokens":10,"input_tokens":5,"output_tokens":5,"cache_write_tokens":0,"cached_tokens":0,"unpriced_tokens":0},
+                {"agent":"agent/b","model":"m","account":"claude/bbbb","host":"host/a","cost_microusd":1000000,"total_tokens":10,"input_tokens":5,"output_tokens":5,"cache_write_tokens":0,"cached_tokens":0,"unpriced_tokens":0},
+            ],
+            "limits": [
+                {"account": "claude/aaaa", "account_ref": "ada/claude-1", "weekly_percent": 40.0,
+                 "measured_at_unix_ms": 1_799_000_000_000_u64},
+                {"account": "claude/bbbb", "weekly_percent": 10.0,
+                 "measured_at_unix_ms": 1_799_000_000_000_u64},
+            ],
+        });
+        let output = render_usage_report(&report, 24, None);
+        assert!(
+            output.contains("  ada/claude-1 (claude/aaaa)\n"),
+            "{output}"
+        );
+        assert!(output.contains("40%  ?"), "{output}");
+        assert!(
+            output.contains("  claude/bbbb\n"),
+            "an account no declaration names keeps its label: {output}"
+        );
     }
 
     #[test]

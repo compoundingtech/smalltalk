@@ -172,6 +172,7 @@ order from the same admitted claims.
 | `local_latest_slots` | Local observation log | For each `latest` slot this node writes: its last replicated observation and time, and the newest local observation no claim carries yet |
 | `local_usage_seen` | Local deduplication index | Stable provider response IDs from local timeline observations; never replicated |
 | `local_usage_totals` | Local cumulative observation projection | Token buckets from accepted local response observations; never replicated and retained across log trimming |
+| `local_seat_accounts` | Local operational fact | The account chosen for each pooled seat on this node; retained across restarts, never replicated |
 | `revision_proposals` | Projection | `revision-proposal.*` claims |
 | `planning_sessions` | Projection | `planning-session.*` claims |
 | `planning_candidates` | Projection | `planning-session.candidate-submitted` claims |
