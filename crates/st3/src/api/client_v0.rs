@@ -8816,8 +8816,19 @@ mod tests {
         let (status, expired) = read(continuation).await;
         assert_eq!(status, StatusCode::GONE, "{expired}");
         assert_eq!(expired["code"], "page-cursor-expired");
+        // A later observation cannot take a pull request's opener over (#778 rule 5): it keeps
+        // alice and takes the new title.
         let (_, refreshed) = read("/v1/client/resources?opened_by=agent%2Falice".into()).await;
-        assert_eq!(refreshed["value"]["items"], json!([all["value"]["items"][1].clone()]));
+        let items = refreshed["value"]["items"].as_array().unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["resource/github/a", "resource/github/b"]
+        );
+        assert_eq!(items[0]["facts"]["title"], "Reassigned");
+        assert_eq!(items[0]["opened_by"], "agent/alice");
         let (status, invalid) = read("/v1/client/resources?opened_by=person%2Fada".into()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
         assert_eq!(invalid["code"], "validation-failed");
