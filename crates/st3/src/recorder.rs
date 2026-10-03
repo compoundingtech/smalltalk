@@ -639,6 +639,15 @@ fn copy_stdout(
     let bytes = &bytes[..count as usize];
     let mut written = 0;
     while written < bytes.len() {
+        // An interrupted write can consume SIGCHLD too. Recheck before every blocking poll,
+        // not just after poll wakes; try_wait caches the exact status for the enclosing loop.
+        if *signaled {
+            if let Some(process) = child.as_deref_mut() {
+                if process.try_wait()?.is_some() {
+                    child = None;
+                }
+            }
+        }
         // Do not make fd1 nonblocking: its open-file flags belong to the caller too. Poll and
         // write at most PIPE_BUF instead, so an ordinary pipe cannot strand signal forwarding
         // while its consumer has stopped reading.
@@ -656,24 +665,13 @@ fn copy_stdout(
                 *last_line = LastLine::default();
                 return Err(error);
             }
-            // Check the child's status below even when SIGCHLD interrupted poll. Consuming
-            // that wake and polling again first could wait forever on backpressured stdout.
+            // An interrupted poll still drains its wake bytes before retrying the status check.
         }
         *signaled |= forward_signals(signal_read, pid);
         if descriptors[1].revents == 0 {
             if child.is_none() && *signaled {
                 *last_line = LastLine::default();
                 return Err(std::io::ErrorKind::Interrupted.into());
-            }
-            if *signaled {
-                if let Some(child) = child.as_deref_mut() {
-                    if child.try_wait()?.is_some() {
-                        // A caller's terminating signal must still finish a child whose output
-                        // is blocked. try_wait caches the exact status for the enclosing loop.
-                        *last_line = LastLine::default();
-                        return Err(std::io::ErrorKind::Interrupted.into());
-                    }
-                }
             }
             continue;
         }

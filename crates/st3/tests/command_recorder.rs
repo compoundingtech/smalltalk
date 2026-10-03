@@ -862,8 +862,10 @@ fn a_receipt_spool_that_cannot_be_written_changes_nothing() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_terminating_signal_still_finishes_capture_under_stdout_backpressure() {
+    // Use the default action: dash defers a shell trap until its blocked printf completes,
+    // so a trapped fixture would wait on its consumer even without the recorder.
     let fixture = fixture(&format!(
-        "#!/bin/sh\ntrap 'exit 7' TERM\necho $$\nwhile :; do printf '%s' '{}'; done\n",
+        "#!/bin/sh\necho $$\nwhile :; do printf '%s' '{}'; done\n",
         "x".repeat(16_384),
     ));
     let mut child = fixture.recorded("gh").args(["issue", "create"])
@@ -885,7 +887,7 @@ fn a_terminating_signal_still_finishes_capture_under_stdout_backpressure() {
     }
     assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) }, 0);
     let status = wait_within(&mut child, Duration::from_secs(10));
-    assert_eq!(status.code(), Some(7));
-    assert_eq!(fixture.records()[0]["exit_code"], 7);
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert_eq!(fixture.records()[0]["signal"], libc::SIGTERM);
     assert!(fixture.receipts().is_empty());
 }
