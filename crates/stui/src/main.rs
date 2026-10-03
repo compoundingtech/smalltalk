@@ -2163,7 +2163,17 @@ async fn act_on_card(
         attention.header.id.clone(),
         attention.header.revision.clone(),
     );
-    let source = attention.source_id.clone();
+    let source = if action.starts_with("launch.") {
+        attention.launch_id.clone().unwrap_or_else(|| {
+            attention
+                .source_id
+                .strip_prefix("planning-session/")
+                .unwrap_or(&attention.source_id)
+                .to_owned()
+        })
+    } else {
+        attention.source_id.clone()
+    };
     if action.starts_with("launch.") {
         let launch = client.launches_get(&source).await?;
         let Resource::Launch(launch_resource) = launch.value else {
@@ -2271,7 +2281,13 @@ async fn act_on_card(
                 .items
                 .iter()
                 .filter_map(|item| match item {
-                    Resource::LaunchVariant(variant) if variant.preview_token.is_some() => {
+                    Resource::LaunchVariant(variant)
+                        if variant.preview_token.is_some()
+                            && attention
+                                .variant_id
+                                .as_deref()
+                                .is_none_or(|id| id == variant.header.id) =>
+                    {
                         Some(variant)
                     }
                     _ => None,
@@ -4611,6 +4627,8 @@ mod tests {
         client: Client,
         step: String,
         server: tokio::task::JoinHandle<()>,
+        state: st3::api::AppState,
+        socket: std::path::PathBuf,
     }
 
     impl WaitingGate {
@@ -4639,7 +4657,8 @@ mission "release" state="ready" {
         async fn serve(source: &str) -> Self {
             let root = tempfile::tempdir().unwrap();
             let node = "stui-gate";
-            let store = Arc::new(st3::store::Store::open_memory(node).unwrap());
+            let store =
+                Arc::new(st3::store::Store::open(&root.path().join("graph.db"), node).unwrap());
             let intent = st3::graph::parse_intent(source, node).unwrap();
             let planned = store
                 .mission(
@@ -4680,8 +4699,9 @@ mission "release" state="ready" {
             };
             let socket = root.path().join("st3.sock");
             let server_socket = socket.clone();
+            let served_state = state.clone();
             let server = tokio::spawn(async move {
-                st3::api::serve_unix(&server_socket, st3::api::router(state))
+                st3::api::serve_unix(&server_socket, st3::api::router(served_state))
                     .await
                     .unwrap();
             });
@@ -4703,7 +4723,42 @@ mission "release" state="ready" {
                 store,
                 server,
                 _root: root,
+                state,
+                socket,
             }
+        }
+
+        async fn restart(&mut self) {
+            self.server.abort();
+            let _ = (&mut self.server).await;
+            std::fs::remove_file(&self.socket).unwrap();
+            self.store = Arc::new(
+                st3::store::Store::open(&self._root.path().join("graph.db"), "stui-gate").unwrap(),
+            );
+            self.state.store = self.store.clone();
+            self.state.notify = Arc::new(tokio::sync::Notify::new());
+            self.state.event_notify = tokio::sync::watch::channel(0_u64).0;
+            self.reconciler = st3::reconcile::Reconciler::new(
+                self.store.clone(),
+                Arc::new(NoRuntime),
+                "stui-gate".into(),
+                self.state.notify.clone(),
+            );
+            let state = self.state.clone();
+            let socket = self.socket.clone();
+            self.server = tokio::spawn(async move {
+                st3::api::serve_unix(&socket, st3::api::router(state))
+                    .await
+                    .unwrap();
+            });
+            for _ in 0..200 {
+                if self.socket.exists() {
+                    self.client.capabilities().await.unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("restarted stui fixture did not listen");
         }
 
         fn reconcile_until(&self, what: &str, done: impl Fn(&Self) -> bool) {
@@ -4763,10 +4818,89 @@ mission "release" state="ready" {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_review_uses_its_public_launch_and_selected_variant_after_restart() {
+        for action in ["launch.approve", "launch.cancel"] {
+            let mut gate = WaitingGate::start().await;
+            let snapshot = gate.client.capabilities().await.unwrap().snapshot.id;
+            gate.client
+                .launch_create(
+                    "action/ui-launch",
+                    "ui-create-launch",
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    st3_client::LaunchCreateParameters {
+                        title: "Copper launch".into(),
+                        request: "Prepare the copper proof".into(),
+                        target: st3_client::LaunchTarget::NewMission {
+                            mission_id: "mission/example/copper".into(),
+                            workspace: gate._root.path().display().to_string(),
+                        },
+                        provider: None,
+                        model: None,
+                        effort: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let session = gate.store.planning_sessions(true).unwrap().pop().unwrap();
+            let transport = st3::client::Client::unix_as(&gate.socket, "person/avery").unwrap();
+            for variant in ["default", "alternate"] {
+                let _: serde_json::Value = transport.post(&format!("/v1/launches/{}/variants/{variant}/submit", session.id), &st3::model::PlanningCandidateSubmitRequest {
+                    actor: session.planner.clone(), markdown: b"Copper proof".to_vec(),
+                    kdl: b"version 2\nmission \"example/copper\" state=\"ready\" { goal \"Record copper proof.\"; step \"proof\" { agentless } }\n".to_vec(), idempotency_key: format!("ui-submit-{variant}"),
+                }).await.unwrap();
+            }
+            let mut model = Model::default();
+            model.reload(&gate.client).await.unwrap();
+            let card = model
+                .now
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Resource::Attention(card) if card.source_id == session.subject => {
+                        Some(card.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                card.variant_id.as_deref(),
+                Some(format!("launch-variant/{}/default", session.id).as_str())
+            );
+            gate.restart().await;
+            attention_action(
+                &gate.client,
+                "person/avery",
+                &card.header.id,
+                Some(&card),
+                action,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            gate.restart().await;
+            let result = gate.store.planning_session(&session.id).unwrap().unwrap();
+            assert_eq!(
+                result.status,
+                if action == "launch.approve" {
+                    "approved"
+                } else {
+                    "cancelled"
+                }
+            );
+            assert_eq!(result.candidate.unwrap().variant, "default");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn approving_a_gate_asked_again_acts_once_on_its_current_card() {
-        let gate = WaitingGate::start().await;
+        let mut gate = WaitingGate::start().await;
         let seen = gate.card().await.expect("the gate has a card");
         gate.ask_again();
+        gate.restart().await;
         let current = gate.card().await.expect("the gate was asked again");
         assert_ne!(current.header.id, seen.header.id);
 

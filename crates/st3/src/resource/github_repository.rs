@@ -794,6 +794,9 @@ pub(super) async fn observe_at(
     let mut items = BTreeMap::<u64, Item>::new();
     let mut more = false;
     let mut changed_open_pull = false;
+    // The open pull requests the REST reads named. GraphQL must know each one before its answer
+    // stands in, or a new pull request would be recorded without the head a review needs.
+    let mut listed_open_pulls = BTreeSet::new();
 
     if fields
         .iter()
@@ -833,8 +836,10 @@ pub(super) async fn observe_at(
         if !cursor.already_seen("items", listing_digest(&listing)) {
             for issue in &listing.values {
                 let item = listed_item(issue, fields, watermark.as_deref());
-                changed_open_pull |=
-                    item.pull && item.facts.get("state").and_then(Value::as_str) == Some("open");
+                if item.pull && item.facts.get("state").and_then(Value::as_str) == Some("open") {
+                    changed_open_pull = true;
+                    listed_open_pulls.extend(item.facts.get("number").and_then(Value::as_u64));
+                }
                 merge(&mut items, item);
             }
         }
@@ -979,6 +984,7 @@ pub(super) async fn observe_at(
             (owner, repository),
             request.refresh,
             changed_open_pull || !cursor.seen.contains_key("pull-requests"),
+            &listed_open_pulls,
         )
         .await?;
         let digest = hex::encode(Sha256::digest(
@@ -1046,8 +1052,10 @@ pub(super) async fn observe_at(
 /// The repository's open pull requests as GraphQL last answered on this host. GraphQL has no
 /// conditional request, so it is asked again only when `changed` says the REST reads saw an open
 /// pull request change, while a pull request is settling, or once the last answer is old, and
-/// never sooner than a minute after the last read unless `refresh` asks. A change seen within
-/// that minute is remembered, so the first read after it asks.
+/// never sooner than a minute after the last read unless `refresh` asks or the REST reads name
+/// an open pull request (`listed`) the last answer lacks: a new pull request's first record
+/// carries its head, since only a head that differs from a known one asks for a review. A change
+/// seen within that minute is remembered, so the first read after it asks.
 #[allow(clippy::too_many_arguments)]
 async fn open_pull_requests(
     client: &reqwest::Client,
@@ -1058,6 +1066,7 @@ async fn open_pull_requests(
     (owner, repository): (&str, &str),
     refresh: bool,
     changed: bool,
+    listed: &BTreeSet<u64>,
 ) -> Result<Arc<Vec<serde_json::Map<String, Value>>>> {
     let key = format!("{api_base} {locator}");
     let previous = {
@@ -1074,6 +1083,12 @@ async fn open_pull_requests(
     };
     if let Some(previous) = previous.filter(|previous| {
         !refresh
+            && listed.iter().all(|number| {
+                previous
+                    .open
+                    .iter()
+                    .any(|facts| facts.get("number").and_then(Value::as_u64) == Some(*number))
+            })
             && (previous.at.elapsed() < PULL_REQUEST_CHECK_INTERVAL
                 || (!previous.changed
                     && !previous.settling
@@ -2020,6 +2035,62 @@ mod tests {
         assert_eq!(
             item(&rerun.facts, "pull_requests", 2)["required_checks"]["state"],
             "pass"
+        );
+    }
+
+    /// A pull request opened within a minute of the last GraphQL read is read at once: its first
+    /// record carries the head a review needs, which a later read could not give it.
+    #[tokio::test]
+    async fn a_pull_request_the_last_graphql_answer_lacks_is_read_at_once() {
+        let (github, base) = FakeGithub::start().await;
+        github.route("/repos/acme/garden", json!({"id": 7}));
+        github.route(
+            "/repos/acme/garden/issues?state=open&per_page=100",
+            json!([]),
+        );
+        github.open_pull_requests(json!([open_pull(2, &"a".repeat(40), "SUCCESS")]));
+        let first = observe_at(
+            request(&["pull_requests"], None, None),
+            &base,
+            Some("orchid-token"),
+        )
+        .await
+        .unwrap();
+        let since = RepositoryCursor::parse(first.cursor.as_deref())
+            .items_since
+            .unwrap();
+        github.route(
+            &format!(
+                "/repos/acme/garden/issues?state=all&sort=updated&direction=asc&since={since}&per_page=100"
+            ),
+            json!([issue(
+                3,
+                "2026-09-20T00:00:00Z",
+                json!({"pull_request": {"merged_at": null}, "draft": false,
+                "html_url": "https://github.com/acme/garden/pull/3"})
+            )]),
+        );
+        github.open_pull_requests(json!([
+            open_pull(2, &"a".repeat(40), "SUCCESS"),
+            open_pull(3, &"c".repeat(40), "SUCCESS")
+        ]));
+        github.take_requests();
+        let opened = observe_at(
+            request(&["pull_requests"], first.cursor.as_deref(), None),
+            &base,
+            Some("orchid-token"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            github
+                .take_requests()
+                .iter()
+                .any(|request| request.starts_with("POST /graphql"))
+        );
+        assert_eq!(
+            item(&opened.facts, "pull_requests", 3)["head"],
+            "c".repeat(40)
         );
     }
 

@@ -2309,16 +2309,13 @@ impl Ui {
             return true;
         }
         // The sidebar, while it has the keys.
-        if glasses.sidebar.focused
-            && glasses.sidebar.shown
-            && !self.editing
-            && self.find.is_none()
-            && self.sidebar_key(key)
-        {
+        let sidebar_keys = glasses.sidebar.focused && glasses.sidebar.shown;
+        if sidebar_keys && !self.editing && self.find.is_none() && self.sidebar_key(key) {
             return true;
         }
-        // The conversation that typing reaches, if one has the focus.
-        let conversation = self.composing_agent();
+        // The conversation that typing reaches, if one has the focus: never while the sidebar
+        // has the keys, whose own letters (b and p in Usage) must not type into a tab behind it.
+        let conversation = self.composing_agent().filter(|_| !sidebar_keys);
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -2386,6 +2383,16 @@ impl Ui {
             KeyCode::Char('f') if control && conversation.is_some() => {
                 if let Some(agent) = &conversation {
                     self.find_in(agent, "");
+                }
+            }
+            // Ctrl chords work on a Mac, where Option types characters instead (Nathan,
+            // 2026-10-03); the Alt chords stay where Alt is Alt.
+            KeyCode::Char('e') if control && conversation.is_some() => self.toggle_all_tools(),
+            KeyCode::Char('p') if control && conversation.is_some() => self.toggle_simple(),
+            KeyCode::Char('d') if control && conversation.is_some() => self.toggle_details(),
+            KeyCode::Char('r') if control && conversation.is_some() && self.live => {
+                if let Some(entry) = self.undelivered() {
+                    self.effects.push(Effect::Resend { entry });
                 }
             }
             KeyCode::Char('o') if alt && conversation.is_some() => self.toggle_all_tools(),
@@ -3539,6 +3546,26 @@ mod tests {
     }
 
     #[test]
+    fn letters_in_the_sidebar_never_type_into_the_conversation_behind_it() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ctrl(&mut ui, 's');
+        assert!(ui.glasses.as_ref().unwrap().sidebar.focused);
+        // Nathan, 2026-10-03: b in the Usage sidebar typed "b" into the agent's tab.
+        typed(&mut ui, "b");
+        assert!(!ui.editing);
+        assert!(
+            ui.conversation_state
+                .drafts
+                .get("agent/example/atlas/builder")
+                .is_none_or(String::is_empty)
+        );
+    }
+
+    #[test]
     fn tab_moves_between_a_splits_tabs_and_never_switches_what_a_tab_shows() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
@@ -3556,6 +3583,31 @@ mod tests {
         press(&mut ui, KeyCode::BackTab, KeyModifiers::SHIFT);
         assert_eq!(tabs(&ui), (0, 1, both));
         assert!(screen(&ui).contains("Weekly release"));
+    }
+
+    #[test]
+    fn details_are_per_agent_and_ctrl_chords_work_where_option_types() {
+        let mut ui = glass();
+        let atlas = "agent/example/atlas/builder".to_owned();
+        ui.open_in_glass(Pane::Agent(Some(atlas.clone())), Open::Tab);
+        // Nathan, 2026-10-03: hiding one agent's details hid every agent's.
+        ctrl(&mut ui, 'd');
+        assert!(!ui.editing, "a chord, not typing");
+        assert!(ui.details_hidden.contains(&atlas));
+        ui.open_in_glass(Pane::Agent(Some("agent/example/cos".into())), Open::Tab);
+        assert!(!ui.details_hidden.contains("agent/example/cos"));
+        // Ctrl+P is the simplified view and Ctrl+E opens the tool calls, on a Mac too.
+        ui.open_in_glass(Pane::Agent(Some(atlas.clone())), Open::Here);
+        let simple = ui.simple;
+        ctrl(&mut ui, 'p');
+        assert_ne!(ui.simple, simple);
+        let expanded = ui.conversation_state.expanded.clone();
+        ctrl(&mut ui, 'e');
+        assert!(!ui.editing);
+        assert_ne!(
+            ui.conversation_state.expanded, expanded,
+            "ctrl+e opens the tool calls"
+        );
     }
 
     #[test]
@@ -4136,12 +4188,12 @@ mod tests {
         );
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         let shown = screen(&ui);
+        // Nathan, 2026-10-03: a space's footer names only the keys that move around.
         assert!(
-            shown.contains("type message")
-                && shown.contains("alt+i details")
-                && shown.contains("tab tabs"),
-            "the footer names the chords: {shown}"
+            shown.contains("ctrl+k open") && shown.contains("tab tabs") && shown.contains("? help"),
+            "the footer: {shown}"
         );
+        assert!(!shown.contains("q quit"), "{shown}");
         // Leaving the box keeps the draft; the next letter goes on typing into it.
         typed(&mut ui, "!");
         assert!(ui.editing);
@@ -4170,7 +4222,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_owns_the_editing_keys_and_enter_keeps_the_input() {
+    fn typing_owns_the_editing_keys_and_a_send_leaves_the_box() {
         let mut ui = glass();
         ui.open_in_glass(
             Pane::Agent(Some("agent/example/atlas/builder".into())),
@@ -4198,8 +4250,12 @@ mod tests {
         };
         assert_eq!(draft(&ui), "ship it ");
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(ui.editing, "a send keeps the input focused");
+        // Nathan, 2026-10-03: a send leaves the box; the next letter opens it again.
+        assert!(!ui.editing, "a send leaves the box");
         assert_eq!(draft(&ui), "");
+        typed(&mut ui, "a");
+        assert!(ui.editing && draft(&ui) == "a");
+        ctrl(&mut ui, 'u');
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         ctrl(&mut ui, 'w');
         assert_eq!(

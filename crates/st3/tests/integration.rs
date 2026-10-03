@@ -3,6 +3,7 @@
 //! Cargo builds only the targets the manifest names (`autotests = false`), so add a
 //! `mod NAME;` line here or an explicit test target for every new file.
 
+mod action_coverage;
 mod agents_restart;
 mod boot_canaries;
 mod broken_gates;

@@ -12,6 +12,61 @@ use sha2::{Digest as _, Sha256};
 
 pub const SCHEMA_NAME: &str = "st3.v1";
 
+pub const HARNESS_TODO_MAX_PHASES: usize = 16;
+pub const HARNESS_TODO_MAX_TASKS: usize = 100;
+pub const HARNESS_TODO_MAX_PHASE_BYTES: usize = 128;
+pub const HARNESS_TODO_MAX_TEXT_BYTES: usize = 512;
+pub const HARNESS_TODO_MAX_FIELDS_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessTaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTask {
+    pub content: String,
+    pub status: HarnessTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessPhase {
+    pub name: String,
+    pub tasks: Vec<HarnessTask>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTodoTotals {
+    pub pending: u64,
+    pub in_progress: u64,
+    pub completed: u64,
+    pub blocked: u64,
+    #[serde(default)]
+    pub abandoned: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTodoSnapshot {
+    pub harness: String,
+    pub session_id: String,
+    pub incarnation_id: String,
+    pub observed_at: String,
+    pub source_op: String,
+    pub phases: Vec<HarnessPhase>,
+    pub totals: HarnessTodoTotals,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ValueType {
@@ -211,6 +266,8 @@ impl Registry {
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
         output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
+        output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
+        output.push_str("\nOMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.\n");
         output
     }
 
@@ -356,6 +413,9 @@ impl Registry {
                 validate_value(kind, name, value, field)?;
                 self.validate_reference(kind, name, value, field)?;
             }
+        }
+        if kind == "harness.todo.observed" {
+            validate_harness_todo(fields)?;
         }
         if subject_spec.family == "glass" {
             glasses::owner(subject)?;
@@ -975,6 +1035,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
 
     let mut claims = BTreeMap::new();
     let definitions: &[ClaimDefinition<'_>] = &[
+        (
+            "harness.todo.observed",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
         (
             "agent.account",
             &["agent"],
@@ -2222,13 +2291,23 @@ fn claim_retention(kind: &str) -> Retention {
         | "runtime.action.deadline-reached" => Retention::SystemLocal,
         // Other nodes read the current harness state and usage: step readiness is judged on
         // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
-        "harness.observed" | "harness.usage" => Retention::Latest,
+        "harness.observed" | "harness.usage" | "harness.todo.observed" => Retention::Latest,
         _ => Retention::Durable,
     }
 }
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
+        "harness.todo.observed" => &[
+            ("harness", required_string()),
+            ("session_id", required_string()),
+            ("incarnation_id", required_string()),
+            ("observed_at", required_string()),
+            ("source_op", required_string()),
+            ("phases", required_array()),
+            ("totals", required_object()),
+            ("truncated", required_boolean()),
+        ],
         "agent.account" => &[("account", required_reference_to(&["account"]))],
         "attention.requested" => &[
             ("reviewer", required_reference_to(&["person"])),
@@ -3373,9 +3452,226 @@ fn error(code: &'static str, message: impl Into<String>) -> ValidationError {
     }
 }
 
+fn validate_harness_todo(fields: &BTreeMap<String, Value>) -> Result<(), ValidationError> {
+    // Count the actual JSON representation without allocating a serialized copy.
+    struct BoundedWriter(usize);
+    impl std::io::Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > HARNESS_TODO_MAX_FIELDS_BYTES - self.0 {
+                return Err(std::io::Error::other("todo fields exceed 64 KiB"));
+            }
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(BoundedWriter(0), fields)
+        .map_err(|_| error("invalid-harness-todo", "todo fields exceed 64 KiB"))?;
+    let invalid = || error("invalid-harness-todo", "invalid todo shape, bounds or totals");
+    for name in ["harness", "session_id", "incarnation_id", "observed_at", "source_op"] {
+        if fields.get(name).and_then(Value::as_str).is_none_or(str::is_empty) {
+            return Err(invalid());
+        }
+    }
+    let phases = fields.get("phases").and_then(Value::as_array).ok_or_else(invalid)?;
+    if phases.len() > HARNESS_TODO_MAX_PHASES {
+        return Err(invalid());
+    }
+    let statuses = ["pending", "in_progress", "completed", "blocked"];
+    let mut visible = [0_u64; 4];
+    let mut task_count = 0;
+    for phase in phases {
+        let phase = phase.as_object().ok_or_else(invalid)?;
+        if phase.len() != 2
+            || phase.get("name").and_then(Value::as_str)
+                .is_none_or(|name| name.len() > HARNESS_TODO_MAX_PHASE_BYTES)
+        {
+            return Err(invalid());
+        }
+        let tasks = phase.get("tasks").and_then(Value::as_array).ok_or_else(invalid)?;
+        task_count += tasks.len();
+        if task_count > HARNESS_TODO_MAX_TASKS {
+            return Err(invalid());
+        }
+        for task in tasks {
+            let task = task.as_object().ok_or_else(invalid)?;
+            if task.keys().any(|key| !matches!(key.as_str(), "content" | "status" | "blocker"))
+                || task.get("content").and_then(Value::as_str)
+                    .is_none_or(|content| content.len() > HARNESS_TODO_MAX_TEXT_BYTES)
+            {
+                return Err(invalid());
+            }
+            if let Some(blocker) = task.get("blocker")
+                && blocker.as_str().is_none_or(|text| text.len() > HARNESS_TODO_MAX_TEXT_BYTES)
+            {
+                return Err(invalid());
+            }
+            let status = task.get("status").and_then(Value::as_str).ok_or_else(invalid)?;
+            let index = statuses.iter().position(|candidate| *candidate == status).ok_or_else(invalid)?;
+            visible[index] += 1;
+        }
+    }
+    let totals = fields.get("totals").and_then(Value::as_object).ok_or_else(invalid)?;
+    let truncated = fields.get("truncated").and_then(Value::as_bool).ok_or_else(invalid)?;
+    if totals.keys().any(|key| !statuses.contains(&key.as_str()) && key != "abandoned")
+        || totals.get("abandoned").is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err(invalid());
+    }
+    for (index, status) in statuses.iter().enumerate() {
+        let total = totals.get(*status).and_then(Value::as_u64).ok_or_else(invalid)?;
+        if total < visible[index] || (!truncated && total != visible[index]) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn todo_fields() -> BTreeMap<String, Value> {
+        serde_json::from_value(serde_json::json!({
+            "harness": "omp", "session_id": "session", "incarnation_id": "incarnation",
+            "observed_at": "2026-10-03T14:00:00Z", "source_op": "hydrate",
+            "phases": [], "totals": {"pending": 0, "in_progress": 0, "completed": 0, "blocked": 0},
+            "truncated": false
+        })).unwrap()
+    }
+
+    fn validate_todo(fields: &BTreeMap<String, Value>) -> Result<&ClaimSpec, ValidationError> {
+        registry().validate_claim("agent/run/worker", "harness.todo.observed", fields)
+    }
+
+    #[test]
+    fn harness_todo_accepts_known_empty_and_fences_the_writer() {
+        let fields = todo_fields();
+        let spec = registry().validate_public_claim(
+            "agent/run/worker", "harness.todo.observed", &fields, Some("agent/run/worker"),
+        ).unwrap();
+        assert_eq!(spec.retention, Retention::Latest);
+        assert_eq!(spec.cardinality, Cardinality::Append);
+        assert_eq!(registry().validate_public_claim(
+            "agent/run/worker", "harness.todo.observed", &fields, Some("agent/run/other"),
+        ).unwrap_err().code, "claim-write-forbidden");
+        assert!(registry().validate_claim("resource/example", "harness.todo.observed", &fields).is_err());
+    }
+
+    #[test]
+    fn harness_todo_validates_nested_shape_and_full_source_totals() {
+        let mut fields = todo_fields();
+        fields.insert("phases".into(), serde_json::json!([{"name": "", "tasks": [
+            {"content": "work", "status": "blocked", "blocker": "approval"}
+        ]}]));
+        fields.get_mut("totals").unwrap()["blocked"] = Value::from(1);
+        validate_todo(&fields).unwrap();
+        for task in [
+            serde_json::json!({"content": "work", "status": "unknown"}),
+            serde_json::json!({"content": "work", "status": "blocked", "blocker": null}),
+            serde_json::json!({"content": "work", "status": "blocked", "extra": true}),
+            serde_json::json!({"status": "blocked"}),
+        ] {
+            let mut invalid = fields.clone();
+            invalid.get_mut("phases").unwrap()[0]["tasks"][0] = task;
+            assert!(validate_todo(&invalid).is_err());
+        }
+        fields.get_mut("totals").unwrap()["blocked"] = Value::from(2);
+        assert!(validate_todo(&fields).is_err());
+        fields.insert("truncated".into(), Value::Bool(true));
+        validate_todo(&fields).unwrap();
+        fields.get_mut("totals").unwrap()["blocked"] = Value::from(0);
+        assert!(validate_todo(&fields).is_err());
+        for total in [Value::from(-1), Value::from(1.5), Value::Null] {
+            fields.get_mut("totals").unwrap()["blocked"] = total;
+            assert!(validate_todo(&fields).is_err());
+        }
+    }
+
+    #[test]
+    fn harness_todo_counts_abandoned_without_truncating_or_adding_a_task_status() {
+        let mut fields = todo_fields();
+        let old_snapshot: HarnessTodoSnapshot =
+            serde_json::from_value(serde_json::to_value(&fields).unwrap()).unwrap();
+        assert_eq!(old_snapshot.totals.abandoned, 0);
+        fields.get_mut("totals").unwrap()["abandoned"] = Value::from(3);
+        validate_todo(&fields).unwrap();
+        let snapshot: HarnessTodoSnapshot =
+            serde_json::from_value(serde_json::to_value(&fields).unwrap()).unwrap();
+        assert_eq!(snapshot.totals.abandoned, 3);
+        assert!(!snapshot.truncated);
+        for count in [Value::from(-1), Value::from(1.5), Value::Null, Value::from("3")] {
+            let mut invalid = fields.clone();
+            invalid.get_mut("totals").unwrap()["abandoned"] = count;
+            assert!(validate_todo(&invalid).is_err());
+        }
+        let mut unknown = fields.clone();
+        unknown.get_mut("totals").unwrap()["dropped"] = Value::from(3);
+        assert!(validate_todo(&unknown).is_err());
+        fields.get_mut("totals").unwrap().as_object_mut().unwrap().remove("pending");
+        assert!(validate_todo(&fields).is_err());
+        let mut task_status = todo_fields();
+        task_status.insert("phases".into(), serde_json::json!([{"name":"Dropped","tasks":[
+            {"content":"Dropped task","status":"abandoned"}
+        ]}]));
+        assert!(validate_todo(&task_status).is_err());
+    }
+
+    #[test]
+    fn harness_todo_enforces_utf8_collection_and_escaped_size_bounds() {
+        let mut fields = todo_fields();
+        fields.insert("phases".into(), serde_json::json!([{"name": "é".repeat(64), "tasks": [
+            {"content": "é".repeat(256), "status": "pending", "blocker": "é".repeat(256)}
+        ]}]));
+        fields.get_mut("totals").unwrap()["pending"] = Value::from(1);
+        validate_todo(&fields).unwrap();
+        for (key, oversized) in [("content", "é".repeat(257)), ("blocker", "é".repeat(257))] {
+            let mut invalid = fields.clone();
+            invalid.get_mut("phases").unwrap()[0]["tasks"][0][key] = Value::String(oversized);
+            assert!(validate_todo(&invalid).is_err());
+        }
+        let mut invalid = fields.clone();
+        invalid.get_mut("phases").unwrap()[0]["name"] = Value::String("é".repeat(65));
+        assert!(validate_todo(&invalid).is_err());
+        fields.insert("phases".into(), serde_json::json!(
+            vec![serde_json::json!({"name": "", "tasks": []}); 16]
+        ));
+        fields.get_mut("totals").unwrap()["pending"] = Value::from(0);
+        validate_todo(&fields).unwrap();
+        fields.get_mut("phases").unwrap().as_array_mut().unwrap()
+            .push(serde_json::json!({"name": "", "tasks": []}));
+        assert!(validate_todo(&fields).is_err());
+        let task = serde_json::json!({"content": "x", "status": "pending"});
+        fields.insert("phases".into(), serde_json::json!([{"name": "", "tasks": vec![task.clone(); 100]}]));
+        fields.get_mut("totals").unwrap()["pending"] = Value::from(100);
+        validate_todo(&fields).unwrap();
+        fields.get_mut("phases").unwrap()[0]["tasks"].as_array_mut().unwrap().push(task);
+        assert!(validate_todo(&fields).is_err());
+        let escaped = serde_json::json!({"content": "\u{0001}".repeat(512), "status": "pending"});
+        fields.insert("phases".into(), serde_json::json!([{"name": "", "tasks": vec![escaped; 100]}]));
+        // Each string fits its byte bound, but JSON escaping exceeds the fields cap.
+        assert!(validate_todo(&fields).is_err());
+        fields = todo_fields();
+        fields.insert("session_id".into(), Value::String("x".repeat(HARNESS_TODO_MAX_FIELDS_BYTES)));
+        assert!(validate_todo(&fields).is_err());
+    }
+
+    #[test]
+    fn harness_todo_accepts_the_exact_fields_cap_but_not_one_byte_more() {
+        let mut fields = todo_fields();
+        let size = serde_json::to_vec(&fields).unwrap().len();
+        let session_size = fields["session_id"].as_str().unwrap().len();
+        fields.insert("session_id".into(), Value::String(
+            "x".repeat(HARNESS_TODO_MAX_FIELDS_BYTES - size + session_size),
+        ));
+        validate_todo(&fields).unwrap();
+        let mut session = fields["session_id"].as_str().unwrap().to_owned();
+        session.push('x');
+        fields.insert("session_id".into(), Value::String(session));
+        assert!(validate_todo(&fields).is_err());
+    }
 
     #[test]
     fn registry_matches_the_exact_manifests() {
@@ -3496,6 +3792,7 @@ mod tests {
                 "harness.session-file",
                 "harness.telemetry",
                 "harness.timeline",
+                "harness.todo.observed",
                 "harness.usage",
                 "intent.desired",
                 "lane.approved",

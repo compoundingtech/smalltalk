@@ -234,6 +234,39 @@ fn selection_copies_text_without_the_message_edge_indent_or_fences() {
 }
 
 #[test]
+fn copying_wrapped_lines_gives_back_only_the_real_newlines() {
+    // Nathan, 2026-10-03: a line the pane wrapped is one line on the clipboard.
+    let body = "first paragraph is long enough to wrap across several pane lines\nsecond line\n\nhttps://example.com/a/really/long/path/that/cannot/break/at/a/space";
+    let entries = vec![Entry {
+        id: "m".into(),
+        at: "10:00".into(),
+        body: Body::Mail {
+            from: "you".into(),
+            to: "agent".into(),
+            subject: String::new(),
+            body: body.into(),
+            delivered: false,
+            dictated: false,
+            images: Vec::new(),
+        },
+    }];
+    let doc = Cache::default().render(&entries, 30, &HashSet::new(), "", &theme());
+    assert!(doc.lines.len() > 8, "the body wraps at this width");
+    // From the body's first line to the end.
+    let first = doc
+        .lines
+        .iter()
+        .position(|line| text::plain(line).contains("first paragraph"))
+        .unwrap();
+    let selection = Selection {
+        pane: "session/a".into(),
+        anchor: (first, 0),
+        head: (doc.lines.len() - 1, 200),
+    };
+    assert_eq!(selection.text(&doc.lines).trim_end(), body);
+}
+
+#[test]
 fn pane_intents_keep_other_sessions_drafts_and_expansion_independent() {
     let mut state = State::default();
     state

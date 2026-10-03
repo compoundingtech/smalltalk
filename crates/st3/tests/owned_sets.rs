@@ -487,4 +487,39 @@ async fn disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirm
     assert_eq!(orchard["launch_current"], true);
     assert_eq!(orchard["launched_token"], launched_token);
     assert_ne!(orchard["desired_token"], orchard["launched_token"]);
+    for args in [
+        vec!["ls".to_owned()],
+        vec!["show".to_owned(), "garden".to_owned()],
+        vec![
+            "status".to_owned(),
+            "garden".to_owned(),
+            "--sha".to_owned(),
+            format!("{:040x}", 80),
+        ],
+    ] {
+        let socket = root.path().join("amber/st3.sock");
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+                .env_remove("ST_AGENT")
+                .env_remove("ST_MISSION_RUN")
+                .args(["--json", "--endpoint"])
+                .arg(socket)
+                .arg("sets")
+                .args(args)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let selected = value["value"]["items"]
+            .as_array()
+            .map_or(&value["value"], |items| &items[0]);
+        assert_eq!(selected["receipt"]["source"]["sequence"], 80);
+    }
 }

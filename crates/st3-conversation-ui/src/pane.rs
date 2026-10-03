@@ -65,7 +65,7 @@ impl Selection {
     /// message, the indent its body sits at, or the fences it draws around code.
     pub fn text(&self, lines: &[Line<'_>]) -> String {
         let (start, end) = order(self.anchor, self.head);
-        let mut out = Vec::new();
+        let mut out: Vec<String> = Vec::new();
         for line in start.0..=end.0.min(lines.len().saturating_sub(1)) {
             let Some(line_text) = lines.get(line) else {
                 break;
@@ -81,7 +81,16 @@ impl Selection {
             if fence(&piece) {
                 continue;
             }
-            out.push(piece.trim_end().to_owned());
+            let piece = piece.trim_end();
+            // A line drawn only because the one before it wrapped is copied onto that line: the
+            // clipboard gets the real newlines, not the pane's (Nathan, 2026-10-03).
+            match (text::continues(line_text), out.last_mut()) {
+                (Some(join), Some(previous)) if line > start.0 => {
+                    previous.push_str(join);
+                    previous.push_str(piece.trim_start());
+                }
+                _ => out.push(piece.to_owned()),
+            }
         }
         dedent(out).join("\n")
     }

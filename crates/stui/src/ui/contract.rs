@@ -155,6 +155,12 @@ fn files() -> Vec<(&'static str, Value)> {
                 "../../../../fixtures/clients/transcripts/codex.json"
             )),
         ),
+        (
+            "transcripts/deliveries.expected.json",
+            conversation_of(include_str!(
+                "../../../../fixtures/clients/transcripts/deliveries.json"
+            )),
+        ),
     ]
 }
 

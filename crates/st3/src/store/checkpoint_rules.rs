@@ -157,6 +157,7 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         }
         // Limits are read as each seat's newest reading.
         "harness.limits" => Some((Rule::Newest, slot(&[]))),
+        "harness.todo.observed" => Some((Rule::Newest, slot(&[]))),
         // An observer records a resource's complete facts in every observation, so its newest
         // observation replaces the older ones. A repository observer records each item as its
         // own resource, so each item keeps its latest state. A version that a subscription request

@@ -287,7 +287,8 @@ pub struct Ui {
     /// Inputs whose text came from voice; their next message is tagged `dictated`.
     dictated: HashSet<String>,
     /// The agent details pane beside the conversation.
-    details: bool,
+    /// Agents whose details pane is hidden beside their conversation; each agent its own.
+    details_hidden: HashSet<String>,
     /// The Missions tab shows the selected mission's whole declaration.
     kdl: bool,
     /// Agents and Missions list as the graph's path tree instead of grouped by state.
@@ -314,7 +315,8 @@ pub struct Ui {
     /// not change with every commit.
     pub(crate) build: bool,
     /// A pane too narrow for details beside the conversation shows them instead of it.
-    details_here: bool,
+    /// Agents whose narrow pane shows their details in place of the conversation.
+    details_here: HashSet<String>,
     /// Finding text in a conversation.
     find: Option<Find>,
     /// The new agent form, kept while the person looks elsewhere.
@@ -389,7 +391,7 @@ impl Ui {
             answering: None,
             changes_answer: None,
             dictated: HashSet::new(),
-            details: true,
+            details_hidden: HashSet::new(),
             kdl: false,
             tree: false,
             usage_by: usage::By::default(),
@@ -402,7 +404,7 @@ impl Ui {
             snoozed: HashSet::new(),
             glasses: None,
             build: false,
-            details_here: false,
+            details_here: HashSet::new(),
             find: None,
             new_agent: None,
             agent_form: false,
@@ -527,12 +529,19 @@ impl Ui {
         shown.then_some(self.usage_hours)
     }
 
-    /// Details beside the conversation, or in its place when the pane is too narrow for both.
+    /// Details beside the conversation, or in its place when the pane is too narrow for both;
+    /// for the agent shown, not every agent (Nathan, 2026-10-03).
     fn toggle_details(&mut self) {
-        if self.frame.borrow().agent_narrow {
-            self.details_here = !self.details_here;
+        let Some(agent) = self.selected_id() else {
+            return;
+        };
+        let set = if self.frame.borrow().agent_narrow {
+            &mut self.details_here
         } else {
-            self.details = !self.details;
+            &mut self.details_hidden
+        };
+        if !set.remove(&agent) {
+            set.insert(agent);
         }
     }
 
@@ -1126,53 +1135,33 @@ impl Ui {
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
         } else {
-            let mut hints = match &self.glasses {
-                Some(_) if self.split_shown() => vec![
+            // In a space the footer names only the keys that move around (Nathan, 2026-10-03);
+            // each pane's own keys are on the pane and in ? help.
+            if self.glasses.is_some() {
+                vec![
                     ("ctrl+k", "open"),
-                    ("[ ]", "tabs"),
+                    ("tab", "tabs"),
                     ("alt+←→↑↓", "splits"),
                     ("ctrl+w", "close"),
-                ],
-                Some(_) if !self.on_home() => {
-                    vec![("ctrl+k", "open"), ("[ ]", "tabs"), ("ctrl+w", "close")]
-                }
-                Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
-                None => vec![("1-5", "tabs"), ("↑↓", "select")],
-            };
-            // A glass conversation types: its commands are chords.
-            let typing = self.composing_agent().is_some();
-            if typing {
-                for hint in &mut hints {
-                    if hint.0 == "[ ]" {
-                        *hint = ("tab", "tabs");
-                    }
-                }
-            }
-            match self.tab {
-                0 => hints.extend([("keys", "on the card"), ("c", "write")]),
-                1 if typing => hints.extend([
-                    ("type", "message"),
-                    ("alt+i", "details"),
-                    ("alt+o", "tools"),
-                    ("end", "latest"),
-                    ("drag", "select + copy"),
-                ]),
-                1 => hints.extend([
-                    ("c", "message"),
-                    ("i", "details"),
-                    ("o", "expand tools"),
-                    ("end", "latest"),
-                    ("drag", "select + copy"),
-                ]),
-                2 => hints.extend([("n", "new mission"), ("t", "tree"), ("x", "system")]),
-                _ => {}
-            }
-            if typing {
-                hints.extend([("?", "help"), ("ctrl+q", "quit")]);
+                    ("?", "help"),
+                ]
             } else {
+                let mut hints = vec![("1-5", "tabs"), ("↑↓", "select")];
+                match self.tab {
+                    0 => hints.extend([("keys", "on the card"), ("c", "write")]),
+                    1 => hints.extend([
+                        ("c", "message"),
+                        ("i", "details"),
+                        ("o", "expand tools"),
+                        ("end", "latest"),
+                        ("drag", "select + copy"),
+                    ]),
+                    2 => hints.extend([("n", "new mission"), ("t", "tree"), ("x", "system")]),
+                    _ => {}
+                }
                 hints.extend([("?", "help"), ("q", "quit")]);
+                hints
             }
-            hints
         };
         // The build, always at the right edge; the hints give way to it.
         let build = self
@@ -1669,7 +1658,11 @@ impl Ui {
             self.frame.borrow_mut().agent_narrow = narrow;
         }
         // Too narrow for details beside the conversation: `i` shows them in its place.
-        if narrow && self.details_here && !agent.unmanaged && self.composing(&agent.id) {
+        if narrow
+            && self.details_here.contains(&agent.id)
+            && !agent.unmanaged
+            && self.composing(&agent.id)
+        {
             buf.set_stringn(
                 area.x,
                 area.y,
@@ -1697,7 +1690,8 @@ impl Ui {
             );
             return;
         }
-        let area = if self.details && !agent.unmanaged && area.width >= 90 {
+        let details = !self.details_hidden.contains(&agent.id);
+        let area = if details && !agent.unmanaged && area.width >= 90 {
             let side = (area.width / 3).clamp(30, 44);
             let pane = Rect {
                 x: area.x + area.width - side,
@@ -1751,10 +1745,10 @@ impl Ui {
         );
         if !agent.unmanaged && (!narrow || self.composing(&agent.id)) {
             // In a space, letters type: details is a chord.
-            let key = if self.glasses.is_some() { "alt+i" } else { "i" };
+            let key = if self.glasses.is_some() { "ctrl+d" } else { "i" };
             let label = if narrow {
                 format!(" {key} details ")
-            } else if self.details {
+            } else if !self.details_hidden.contains(&agent.id) {
                 format!(" {key} hide details ▸ ")
             } else {
                 format!(" ◂ {key} details ")
@@ -2590,17 +2584,20 @@ impl Ui {
                 ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
                 ("end", "jump to the newest message and follow it"),
                 ("ctrl+f", "find in this conversation"),
-                ("alt+o", "expand or collapse tool output"),
+                ("ctrl+e  alt+o", "expand or collapse tool output"),
                 (
-                    "alt+shift+o",
+                    "ctrl+p  alt+shift+o",
                     "simplified view: tool calls fold to a line (this device)",
                 ),
-                ("alt+i", "the agent's details beside it"),
+                (
+                    "ctrl+d  alt+i",
+                    "this agent's details beside it (ctrl+i too, where the terminal tells it from tab)",
+                ),
                 ("drag", "select text in one pane; release copies it"),
                 ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
                 (
-                    "alt+r  alt+x",
-                    "resend or clear a message that was not sent",
+                    "ctrl+r  alt+x",
+                    "resend or clear a message that was not sent (alt+r resends too)",
                 ),
                 ("ctrl+c", "stop the agent (asks first)"),
                 ("tab  shift+tab", "the next or previous tab"),
@@ -3833,7 +3830,9 @@ impl Ui {
                 draft.push_str(&attach::mention(&images));
             }
         }
-        // The input stays focused after a send; Esc leaves it.
+        // In a space a send leaves the box, since any letter opens it again (Nathan,
+        // 2026-10-03); the classic layout keeps it focused until Esc.
+        let leave_box = self.tab != 1 || self.composing_agent().is_some();
         if self.live {
             let effect = match self.tab {
                 1 => Some(Effect::Send {
@@ -3902,8 +3901,8 @@ impl Ui {
                     self.conversation_state.drafts.remove(&id);
                     self.follow_latest();
                     // An answer on Home is done: the next item opens closed, so it does not
-                    // take the keys (Nathan, 2026-10-02). A conversation keeps its input.
-                    if self.tab != 1 {
+                    // take the keys (Nathan, 2026-10-02).
+                    if leave_box {
                         self.editing = false;
                     }
                     self.flash("Sending…");
@@ -3939,6 +3938,9 @@ impl Ui {
                 }
                 self.conversation_state.drafts.remove(&id);
                 self.follow_latest();
+                if leave_box {
+                    self.editing = false;
+                }
                 self.flash("Sent · demo: nothing left this machine");
             }
             _ => {

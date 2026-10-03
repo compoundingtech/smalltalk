@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use smallclaims::hash::canonical_hash;
 
-use crate::model::{MessageView, St3Error, WatchSpec};
+use crate::model::{MessageView, ObserverSpec, St3Error, WatchSpec};
 
 /// How often the standing observer polls while a watch uses it. An unchanged repository answers
 /// each conditional read with a free 304.
@@ -76,16 +76,7 @@ impl ThreadRef {
             let (owner, repository) = repository.split_once('/').ok_or_else(invalid)?;
             (owner, repository, number)
         };
-        let name = |part: &str| {
-            !part.is_empty()
-                && part.len() <= 100
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-                && part != "."
-                && part != ".."
-        };
-        if !name(owner) || !name(repository) {
+        if !github_name(owner) || !github_name(repository) {
             return Err(invalid());
         }
         let number = number
@@ -107,12 +98,13 @@ impl ThreadRef {
 
     /// The fleet's standing observer of this thread's repository.
     pub fn observer(&self) -> String {
-        format!("observer/github/{}", self.locator())
+        standing_observer(&self.locator())
     }
 
-    /// The repository resource the standing observer records into.
+    /// The repository resource a standing observer records into when no other observer of the
+    /// repository records anywhere.
     pub fn resource(&self) -> String {
-        format!("resource/github/{}", self.locator())
+        default_resource(&self.locator())
     }
 
     /// This seat's watch on this thread.
@@ -132,14 +124,43 @@ impl std::fmt::Display for ThreadRef {
     }
 }
 
-/// Whether an observer is a repository's standing observer, as a watch declares it:
-/// `observer/github/OWNER/REPO` on `resource/github/OWNER/REPO`.
-pub fn is_standing_observer(subject: &str, resource: &str) -> bool {
-    subject
-        .strip_prefix("observer/github/")
-        .is_some_and(|locator| {
-            locator.split('/').count() == 2 && resource == format!("resource/github/{locator}")
-        })
+/// Whether one part of `OWNER/REPO` is a name GitHub allows.
+fn github_name(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= 100
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        && part != "."
+        && part != ".."
+}
+
+/// The fleet's one standing observer of a repository, `observer/github/OWNER/REPO`.
+pub fn standing_observer(locator: &str) -> String {
+    format!("observer/github/{}", locator.to_ascii_lowercase())
+}
+
+/// `resource/github/OWNER/REPO`.
+pub fn default_resource(locator: &str) -> String {
+    format!("resource/github/{}", locator.to_ascii_lowercase())
+}
+
+/// The repository a standing observer's subject names, as `owner/repo`.
+pub fn standing_locator(subject: &str) -> Option<String> {
+    let locator = subject.strip_prefix("observer/github/")?;
+    let (owner, repository) = locator.split_once('/')?;
+    (github_name(owner) && github_name(repository) && locator == locator.to_ascii_lowercase())
+        .then(|| locator.to_owned())
+}
+
+/// Whether an observer is its repository's standing observer: `observer/github/OWNER/REPO`
+/// observing that repository through `github.repository`. A watch or a mission subscription that
+/// names it has it declared; it records into whichever resource the repository's other observers
+/// use, so it may have any resource.
+pub fn is_standing_observer(subject: &str, spec: &ObserverSpec) -> bool {
+    spec.provider == "github.repository"
+        && standing_locator(subject)
+            .is_some_and(|locator| locator.eq_ignore_ascii_case(&spec.locator))
 }
 
 /// The thread a watch subject names, and the seat it belongs to.
@@ -174,21 +195,28 @@ pub fn parse_rfc3339_ms(text: &str) -> Option<u128> {
         .and_then(|at| u128::try_from(at.timestamp_millis()).ok())
 }
 
-/// The declarations that start the repository's standing observer.
-pub fn observer_source(thread: &ThreadRef) -> String {
-    let locator = thread.locator();
+/// The declarations that start a repository's standing observer on `resource`, and the resource
+/// itself when nothing declares it yet.
+pub fn observer_source(locator: &str, resource: &str, declare_resource: bool) -> String {
+    let locator = locator.to_ascii_lowercase();
+    let declaration = if declare_resource {
+        format!(
+            "resource \"{}\" {{ kind \"vcs.repository\" }}\n",
+            resource.trim_start_matches("resource/")
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"version 2
-resource "github/{locator}" {{ kind "vcs.repository" }}
-observer "github/{locator}" {{
+{declaration}observer "github/{locator}" {{
   resource "{resource}"
   provider "github.repository"
   locator "{locator}"
   field "issues"
   every "{WATCH_POLL}"
 }}
-"#,
-        resource = thread.resource(),
+"#
     )
 }
 
@@ -804,6 +832,51 @@ mod tests {
 
     fn entry(kind: &str, id: u64, at: &str) -> Value {
         json!({"kind": kind, "id": id, "author": "fern", "at": at})
+    }
+
+    #[test]
+    fn a_standing_observer_is_named_for_its_repository_and_may_record_anywhere() {
+        assert_eq!(
+            standing_locator("observer/github/acme/garden").as_deref(),
+            Some("acme/garden")
+        );
+        for subject in [
+            "observer/github/acme",
+            "observer/github/acme/garden/extra",
+            "observer/github/Acme/garden",
+            "observer/github/acme/..",
+            "observer/acme/garden",
+        ] {
+            assert_eq!(standing_locator(subject), None, "{subject}");
+        }
+        let spec = |provider: &str, locator: &str| ObserverSpec {
+            resource: "resource/github/acme/st2".into(),
+            provider: provider.into(),
+            locator: locator.into(),
+            fields: Vec::new(),
+            every_ms: None,
+            stopped: false,
+        };
+        assert!(is_standing_observer(
+            "observer/github/acme/garden",
+            &spec("github.repository", "Acme/Garden")
+        ));
+        assert!(!is_standing_observer(
+            "observer/github/acme/garden",
+            &spec("github.repository", "acme/orchard")
+        ));
+        assert!(!is_standing_observer(
+            "observer/github/acme/garden",
+            &spec("github.ref", "acme/garden")
+        ));
+        let source = observer_source("Acme/Garden", "resource/github/acme/st2", false);
+        assert!(source.contains(r#"observer "github/acme/garden""#));
+        assert!(source.contains(r#"resource "resource/github/acme/st2""#));
+        assert!(!source.contains("kind \"vcs.repository\""));
+        assert!(
+            observer_source("acme/garden", "resource/github/acme/garden", true)
+                .contains(r#"resource "github/acme/garden" { kind "vcs.repository" }"#)
+        );
     }
 
     #[test]

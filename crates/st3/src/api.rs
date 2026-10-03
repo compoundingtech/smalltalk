@@ -1877,7 +1877,19 @@ fn client_agent_resources(
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
     let mut items = store.cached_agent_resources(snapshot_index, history, || {
-        client_agent_resources_uncached(store, history, snapshot_index)
+        let mut items = client_agent_resources_uncached(store, history, snapshot_index)?;
+        let subjects = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
+        for item in &mut items {
+            let claims = observations.get(item["id"].as_str().unwrap_or_default());
+            item["todo"] = client_v0::agent_todo_value(
+                claims.and_then(|claims| claims.get("harness.todo.observed")),
+                claims.and_then(|claims| claims.get("harness.session-file")),
+                item["incarnation_id"].as_str(),
+            );
+        }
+        Ok(items)
     })?;
     let local_host = client_host_id(store.origin());
     for item in &mut items {
@@ -7940,12 +7952,9 @@ async fn cancel_planning_session(
 }
 
 fn required_planning_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
-    let id = launch_session_id(id);
-    state
-        .store
-        .planning_session(id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("launch `{id}` does not exist")))
+    // Legacy CLI launch IDs can themselves begin with `launch/`. Resolve the exact stored
+    // ID before treating that prefix as the client resource namespace.
+    client_launch_session(state, id)
 }
 
 fn normalize_planning_reviewer(value: &str) -> String {
