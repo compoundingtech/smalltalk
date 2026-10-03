@@ -2512,7 +2512,8 @@ enum AgentsCommand {
     New(AgentNewArgs),
     /// Preview and apply one KDL file containing durable agent seats.
     Apply(AgentApplyArgs),
-    /// Start a durable seat, patching only explicitly supplied declaration fields.
+    /// Start a durable seat, patching only explicitly supplied declaration fields. A stopped
+    /// mission seat starts again on its run's own declaration.
     Start(AgentStartArgs),
     /// Stop one exact durable seat.
     Stop(AgentStopArgs),
@@ -9535,20 +9536,52 @@ async fn run_agents(
         }
         AgentsCommand::Start(args) => {
             let client = cli_client(endpoint);
-            let (subject, tokens, existing) = agent_start_declaration(&client, &args).await?;
-            let kdl = agent_start_document(&args, existing.as_ref())?;
-            if args.print_kdl {
-                print!("{kdl}");
-                return Ok(());
-            }
-            let response = publish_text_with_expected(
-                &client,
-                kdl,
-                format!("st agents start {}", args.identity),
-                args.actor.clone(),
-                Some((&subject, &tokens)),
-            )
-            .await?;
+            let (subject, tokens, existing, mission) =
+                agent_start_declaration(&client, &args).await?;
+            let response = if let Some(mission) = mission {
+                anyhow::ensure!(
+                    args.harness.is_none()
+                        && args.host.is_none()
+                        && args.workspace.is_none()
+                        && args.model.is_none()
+                        && args.effort.is_none()
+                        && args.arguments.is_empty()
+                        && !args.print_kdl,
+                    "`{subject}` is a mission seat: it starts on its run's declaration; change \
+                     that declaration through its mission"
+                );
+                if let MissionSeatStart::Declared(run) = mission {
+                    println!(
+                        "{subject} is declared by {run}; `st agents restart {subject}` relaunches it"
+                    );
+                    return Ok(());
+                }
+                client
+                    .post::<_, ApplyResponse>(
+                        "/v1/agents/start",
+                        &json!({
+                            "subject": subject,
+                            "actor": args.actor,
+                            "expected": tokens.first(),
+                            "idempotency_key": format!("st-agents-start:{}", uuid::Uuid::now_v7().simple()),
+                        }),
+                    )
+                    .await?
+            } else {
+                let kdl = agent_start_document(&args, existing.as_ref())?;
+                if args.print_kdl {
+                    print!("{kdl}");
+                    return Ok(());
+                }
+                publish_text_with_expected(
+                    &client,
+                    kdl,
+                    format!("st agents start {}", args.identity),
+                    args.actor.clone(),
+                    Some((&subject, &tokens)),
+                )
+                .await?
+            };
             print_value(&response, json_output)?;
             if !json_output
                 && let Some(subject) = response
@@ -9765,10 +9798,23 @@ fn parse_agent_start_identity(identity: &str) -> Result<String, String> {
     Ok(identity.strip_prefix("agent/").unwrap_or(identity).into())
 }
 
+/// What `st agents start` found for a seat its mission run declared.
+enum MissionSeatStart {
+    /// The run still declares it; the run's mission run subject.
+    Declared(String),
+    /// Someone stopped it; the daemon restores the run's declaration.
+    Stopped,
+}
+
 async fn agent_start_declaration(
     client: &Client,
     args: &AgentStartArgs,
-) -> Result<(String, Vec<String>, Option<st3::model::DesiredSubject>)> {
+) -> Result<(
+    String,
+    Vec<String>,
+    Option<st3::model::DesiredSubject>,
+    Option<MissionSeatStart>,
+)> {
     let mut subject = format!("agent/{}", args.identity);
     let mut status = status_for(client, &subject).await?;
     if status
@@ -9790,25 +9836,29 @@ async fn agent_start_declaration(
         status = status_for(client, &subject).await?;
     }
     let Some(current) = status.subjects.iter().find(|item| item.subject == subject) else {
-        return Ok((subject, Vec::new(), None));
+        return Ok((subject, Vec::new(), None, None));
     };
     anyhow::ensure!(
         current.conflicts.is_empty(),
         "`{subject}` has conflicting declarations; resolve them before starting it"
     );
     let Some(token) = &current.desired_token else {
-        return Ok((subject, Vec::new(), None));
+        return Ok((subject, Vec::new(), None, None));
     };
     let mut claim: st3::model::ClaimRecord =
         client.get(&format!("/v1/claims/by-id/{token}")).await?;
     loop {
         let desired: st3::model::DesiredSubject = serde_json::from_value(claim.body)?;
         if desired.kind == "agent" {
-            anyhow::ensure!(
-                desired.owner_run.is_none(),
-                "`{subject}` is mission-owned; change its declaration through its mission"
-            );
-            return Ok((subject, vec![token.clone()], Some(desired)));
+            // A mission seat starts on its run's own declaration, never as a new root seat.
+            let mission = desired.owner_run.clone().map(|run| {
+                if claim.id == *token {
+                    MissionSeatStart::Declared(run)
+                } else {
+                    MissionSeatStart::Stopped
+                }
+            });
+            return Ok((subject, vec![token.clone()], Some(desired), mission));
         }
         anyhow::ensure!(
             desired.kind == "stop" && claim.predecessors.len() == 1,

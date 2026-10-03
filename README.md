@@ -353,7 +353,9 @@ take effect the next time it starts. Use `st agents restart agent/example/worker
 to apply those changes now. Restart preserves the declaration, works for top-level and mission
 seats, and waits for a new running incarnation. `--timeout 2m` changes the default ten-minute
 wait; a failure or timeout explains why the seat is not running again. `st agents stop
-agent/example/worker --as person/ada` stops a seat until you apply its file again.
+agent/example/worker --as person/ada` stops a seat until you apply its file again. A mission
+seat you stop stays stopped while its run's generation lasts, across daemon restarts, and `st
+agents start` starts it again on its run's own declaration, creating no other seat.
 
 `st agents suspend agent/example/worker --as person/ada` stops a quiet seat and keeps its harness's
 own session; `st agents resume agent/example/worker --as person/ada` brings the seat back on that
