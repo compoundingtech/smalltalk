@@ -4128,3 +4128,132 @@ async fn custom_subject_contract_pagination_and_paired_person_reply() {
     .await;
     assert_eq!(status, StatusCode::GONE, "{expired}");
 }
+
+#[tokio::test]
+async fn mission_detail_exposes_current_loop_wake_and_claim_timing() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = r#"version 2
+agent "timing/worker" { workspace "/tmp"; command "true" }
+mission "timing/run" state="ready" {
+  goal "Observe run timing without joining claim history."
+  step "held" { assigned-to "agent/timing/worker" }
+  step "retry" { assigned-to "agent/timing/worker" }
+  step "wake" { assigned-to "agent/timing/worker" }
+  loop "improve" {
+    max-rounds 5
+    round { completion { when "all-steps-exhausted" } }
+  }
+  loop "other" {
+    max-rounds 3
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, state.store.origin()).unwrap();
+    let planned = state.store.mission(&intent, st3::model::IntentInput {
+        kdl: source.into(),
+        source_name: None,
+    }).unwrap();
+    state.store.apply(&intent, &planned.subject_tokens, "timing-definition").unwrap();
+    let run = state.store.create_mission_run(&st3::model::MissionRunRequest {
+        mission: "timing/run".into(),
+        revision: None,
+        workspace: root.path().display().to_string(),
+        requester: Some("person/avery".into()),
+        mode: Some("run".into()),
+        inputs: Default::default(),
+        idempotency_key: "timing-run".into(),
+    }).unwrap();
+    let held = &run.steps.iter().find(|step| step.step == "held").unwrap().subject;
+    let retry = &run.steps.iter().find(|step| step.step == "retry").unwrap().subject;
+    let ready = &run.steps.iter().find(|step| step.step == "wake").unwrap().subject;
+    state.store.set_step_state(ready, "ready", None).unwrap();
+    state.store.set_step_state(held, "ready", None).unwrap();
+    state.store.work_action(held, "claim", &st3::model::WorkRequest {
+        actor: Some("agent/timing/worker".into()),
+        incarnation: Some("timing-worker-one".into()),
+        summary: None,
+        reason: None,
+        evidence: Vec::new(),
+        idempotency_key: "timing-claim".into(),
+    }).unwrap();
+    state.store.set_step_state(retry, "failed", Some("rate limited")).unwrap();
+    assert!(state.store.retry_step(retry, "rate limited", 60_000).unwrap());
+    let improve = run.loops.iter().find(|loop_run| loop_run.path == "improve").unwrap();
+    state.store.append_claim(&st3::model::ClaimInput {
+        subject: improve.subject.clone(),
+        kind: "loop.state".into(),
+        actor: None,
+        fields: std::collections::BTreeMap::from([
+            ("round".into(), Value::from(2)),
+            ("status".into(), Value::from("running")),
+            ("reason".into(), Value::from("waiting for the next round")),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: None,
+    }).unwrap();
+
+    let app = st3::api::router(state.clone());
+    let path = "/v1/client/missions/mission%2Ftiming%2Frun";
+    let (status, response) = client_json(app.clone(), path).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_conforms(&contract_validator("Envelope"), path, &response);
+    let envelope: st3_client::Envelope<st3_client::Resource> =
+        serde_json::from_value(response).unwrap();
+    let st3_client::Resource::Mission(mission) = envelope.value else {
+        panic!("mission detail must be a mission resource");
+    };
+    let detail = &mission.run_details[0];
+    assert_eq!(detail.id, run.subject);
+    let steps = detail.steps.as_ref().unwrap();
+    let step = |name: &str| steps.iter().find(|step| step.path == name).unwrap();
+    assert_eq!(step("improve").loop_round, Some(2));
+    assert_eq!(step("improve").loop_max_rounds, Some(5));
+    assert_eq!(step("improve").loop_reason.as_deref(), Some("waiting for the next round"));
+    assert_eq!(step("other").loop_round, Some(0));
+    assert_eq!(step("other").loop_max_rounds, Some(3));
+    assert_eq!(step("held").loop_round, None);
+    assert_eq!(step("held").state, "claimed");
+    let expiry = chrono::DateTime::parse_from_rfc3339(
+        step("held").claim_expires_at.as_ref().unwrap(),
+    ).unwrap();
+    assert!(expiry > chrono::DateTime::parse_from_rfc3339(&step("held").since).unwrap());
+    assert_eq!(step("retry").claim_expires_at, None);
+    assert_eq!(step("retry").state, "waiting");
+    let next = chrono::DateTime::parse_from_rfc3339(
+        step("retry").next_wake_at.as_ref().unwrap(),
+    ).unwrap();
+    assert!(next > chrono::DateTime::parse_from_rfc3339(&step("retry").since).unwrap());
+    assert_eq!(step("retry").wake_reason.as_deref(), Some("rate limited"));
+    assert_eq!(step("retry").wake, None);
+    assert_eq!(step("wake").next_wake_at, None);
+    let wake = step("wake").wake.as_ref().unwrap();
+    assert_eq!(wake.assignee, "agent/timing/worker");
+    assert_eq!(wake.assignee_state, "unavailable");
+    assert_eq!(wake.attempts, 0);
+    assert_eq!(wake.last_attempt_at, None);
+    assert_eq!(step("improve").wake, None);
+
+    let (status, missing) = client_json(app, "/v1/client/missions/timing/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    let credential = "timing-no-projection-scope";
+    state.store.append_claim(&st3::model::ClaimInput {
+        subject: "custom/client/pairing-timing".into(),
+        kind: "custom.client.pairing-completed".into(),
+        actor: Some("person/avery".into()),
+        fields: std::collections::BTreeMap::from([
+            ("credential_hash".into(), Value::from(hex::encode(Sha256::digest(credential.as_bytes())))),
+            ("person_id".into(), Value::from("person/avery")),
+            ("session_actor".into(), Value::from("person/avery/session/timing")),
+            ("scopes".into(), serde_json::json!([])),
+            ("expires_at_unix_ms".into(), Value::from(4_102_444_800_000_u64)),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: None,
+    }).unwrap();
+    let (status, denied) = client_json_auth(st3::api::fabric_router(state), path, credential).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+}

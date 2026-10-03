@@ -627,6 +627,8 @@ fn validate_surfaces(
         "UsageLimit",
         "LaunchPreview",
         "MissionRunSummary",
+        "MissionStep",
+        "MissionWake",
         "AgentQueue",
         "AgentQueueRun",
         "AgentQueueMove",
