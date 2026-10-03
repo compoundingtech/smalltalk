@@ -148,7 +148,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       nix: { binaryCaches: readOnlyBinaryCaches },
       step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && genie --check'] }),
     }),
-    // Start non-required; add this check to the ruleset only after it passes on main.
+    // Start non-required; apply the staged ruleset change only after this check passes on main.
     'typescript-client': {
       name: 'typescript-client',
       ...afterPickRunner,

@@ -9,12 +9,13 @@ checks for that PR; macOS checks on PRs require the `macos-ci` label.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
-execution. The required checks on `main` are `linux-gate`, `isolation-vm` and `genie-freshness`,
+execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness` and
+`typescript-client` (apply the fourth check only after its first successful main run),
 and `main` lands through GitHub's merge queue (see [Merge queue](#merge-queue)).
 
 Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM and the
 freshness check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
-the three required checks for each queued entry.
+the required checks for each queued entry.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
 head: it tests that head merged with the current base. Strict branch protection also requires
 that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,
@@ -175,7 +176,8 @@ keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scrip
 `bash scripts/ci-typescript-client` runs the client's contract and schema tests with `node --test`,
 the README's strict raw-client and rich-schema typechecks, and `tsc --noEmit -p apps/ios`.
 The iOS project allows explicit TypeScript import extensions for generated-client consumers.
-The job starts non-required; add it to the main ruleset only after a successful main run.
+The job starts non-required. The generated repository settings stage its promotion; an administrator
+must apply that fourth check to the live main ruleset only after a successful main run.
 
 ### macOS
 
@@ -335,14 +337,14 @@ gh pr merge NUMBER --auto
 ```
 
 The queue tests the pull request on top of the current `main` and the entries ahead of it with
-`linux-gate`, `isolation-vm` and `genie-freshness` (these run on the `merge_group` event; see the
+`linux-gate`, `isolation-vm`, `genie-freshness` and `typescript-client` (these run on the `merge_group` event; see the
 trigger in `fleet.yml.genie.ts`) and merges it with a merge commit when they pass. The pull
 request does not need to be rebased onto the latest `main` first. A draft cannot be queued. If a
 queued check fails, the entry leaves the queue and the pull request page says why: fix it and
 queue it again. The merge train (`st lanes join smalltalk`) is retired.
 
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
-by an administrator and never by CI) requires the three checks from GitHub Actions with an empty
+by an administrator and never by CI) requires the four checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
 merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
 up to five merge together, and a check that
