@@ -15795,11 +15795,15 @@ impl NativeObservations {
         }
         self.retry_pending = true;
         // Bound a wake's work so a backlog does not hold back native delivery.
-        let events = st_drivers::harness_events::pending(&self.dir, 64)?;
-        for event in &events {
+        let mut events = st_drivers::harness_events::pending(&self.dir, 64)?;
+        for event in &mut events {
+            // Account binding is outbox metadata, not part of the producer's observation.
+            // Preserve it separately for the accounting claim builders below.
+            let account_ref = event.payload.as_object_mut()
+                .and_then(|fields| fields.remove("account_ref"));
             let publisher = ObservationClient {
                 client,
-                event: Some((&self.runtime, event.sequence, &self.dir, event.payload["account_ref"].as_str())),
+                event: Some((&self.runtime, event.sequence, &self.dir, account_ref.as_ref().and_then(Value::as_str))),
             };
             let raw = serde_json::to_vec(&event.payload)?;
             let source_driver = event.payload["harness"]
@@ -15985,7 +15989,7 @@ impl ObservationClient<'_> {
                     .fields
                     .get("semantics")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
+                    .unwrap_or(if claim.kind == "harness.todo.observed" { "normalized" } else { "" })
             );
             let claim = serde_json::from_value(st_drivers::harness_events::prepare_publication(
                 dir,
@@ -16740,14 +16744,35 @@ fn todo_runtime_has_ended(actual: &Value, incarnation: &str) -> bool {
         || matches!(fields["status"].as_str(), Some("absent" | "stopped" | "exited" | "vanished"))
 }
 
-async fn remove_ended_channel_todo_outbox(
-    client: &Client, subject: &str, incarnation: &str, dir: &Path,
+fn activate_channel_todo_observations(
+    catalog: &Path, subject: &str, state: &mut PiChannelResume,
+) -> Result<NativeObservations> {
+    let dir = prepare_channel_todo_outbox(catalog, subject, &state.incarnation)?;
+    st_drivers::harness_events::enable(&dir, &state.incarnation)?;
+    let observations = NativeObservations::start(&dir, &state.incarnation)?;
+    state.todo_outbox = Some(dir);
+    state.record_pending_todo()?;
+    Ok(observations)
+}
+
+async fn remove_confirmed_ended_channel_todo_outbox(
+    client: &Client, subject: &str, incarnation: &str, dir: &Path, end_seen: &mut bool,
 ) -> Result<bool> {
-    let status: StatusResponse = client.get(&format!(
+    let status: Result<StatusResponse> = client.get(&format!(
         "/v1/status?subject={}", urlencoding::encode(subject),
-    )).await?;
-    if status.subjects.first().and_then(|seat| seat.actual.as_ref())
-        .is_some_and(|actual| todo_runtime_has_ended(actual, incarnation))
+    )).await;
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            *end_seen = false;
+            return Err(error);
+        }
+    };
+    let ended = status.subjects.first().and_then(|seat| seat.actual.as_ref())
+        .is_some_and(|actual| todo_runtime_has_ended(actual, incarnation));
+    let confirmed = ended && *end_seen;
+    *end_seen = ended;
+    if confirmed
     {
         fs::remove_dir_all(dir)?;
         return Ok(true);
@@ -16855,17 +16880,15 @@ async fn run_pi_channel(
     } else {
         None
     };
-    let mut todo_observations = if driver == "omp" && observer.is_none() {
-        anyhow::ensure!(
-            retry_while_daemon_unreachable(subject, || current_agent_incarnation(client, subject))
-                .await?.as_deref() == Some(&incarnation),
-            "todo channel runtime was superseded",
-        );
-        let dir = prepare_channel_todo_outbox(catalog, subject, &incarnation)?;
-        st_drivers::harness_events::enable(&dir, &incarnation)?;
-        state.todo_outbox = Some(dir.clone());
-        Some(NativeObservations::start(&dir, &incarnation)?)
+    let mut todo_observations = if driver == "omp" && observer.is_none()
+        && retry_while_daemon_unreachable(subject, || current_agent_incarnation(client, subject))
+            .await?.as_deref() == Some(&incarnation)
+    {
+        Some(activate_channel_todo_observations(catalog, subject, &mut state)?)
     } else {
+        if driver == "omp" && observer.is_none() {
+            let _ = write_driver_log(subject, "todo publishing suspended until the graph incarnation catches up");
+        }
         state.todo_outbox = None;
         None
     };
@@ -16894,6 +16917,7 @@ async fn run_pi_channel(
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
     let mut checked_todo_minute = None;
+    let mut todo_end_seen = false;
     loop {
         tokio::select! {
             wake = async { match todo_observations.as_mut() {
@@ -16963,8 +16987,8 @@ async fn run_pi_channel(
                             if let Err(error) = observations.drain(client, subject, driver, &mut false).await {
                                 warn_pi_channel(subject, &error, &mut last_warning);
                             }
-                            if let Err(error) = remove_ended_channel_todo_outbox(
-                                client, subject, &incarnation, &observations.dir,
+                            if let Err(error) = remove_confirmed_ended_channel_todo_outbox(
+                                client, subject, &incarnation, &observations.dir, &mut todo_end_seen,
                             ).await {
                                 warn_pi_channel(subject, &error, &mut last_warning);
                             }
@@ -17187,9 +17211,24 @@ async fn run_pi_channel(
                 let minute = unix_minute()?;
                 if checked_todo_minute != Some(minute) {
                     checked_todo_minute = Some(minute);
+                    if driver == "omp" && observer.is_none() && todo_observations.is_none() {
+                        match current_agent_incarnation(client, subject).await {
+                            Ok(current) if current.as_deref() == Some(&incarnation) => {
+                                match activate_channel_todo_observations(catalog, subject, &mut state) {
+                                    Ok(observations) => todo_observations = Some(observations),
+                                    Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                        }
+                    }
+                    if let Err(error) = state.record_pending_todo() {
+                        warn_pi_channel(subject, &error, &mut last_warning);
+                    }
                     if let Some(observations) = todo_observations.as_ref() {
-                        match remove_ended_channel_todo_outbox(
-                            client, subject, &incarnation, &observations.dir,
+                        match remove_confirmed_ended_channel_todo_outbox(
+                            client, subject, &incarnation, &observations.dir, &mut todo_end_seen,
                         ).await {
                             Ok(true) => return Ok(()),
                             Ok(false) => {}
@@ -17218,6 +17257,9 @@ struct PiChannelResume {
     native_session: Option<String>,
     #[serde(default)]
     todo_outbox: Option<PathBuf>,
+    // The latest validated hydration survives graph lag and binary replacement without rebinding.
+    #[serde(default)]
+    todo_pending: Option<Value>,
     delivered: BTreeSet<String>,
     failed_handoffs: BTreeMap<String, u32>,
     #[serde(default)]
@@ -17232,6 +17274,16 @@ struct PiChannelResume {
 }
 
 impl PiChannelResume {
+    fn record_pending_todo(&mut self) -> Result<()> {
+        if let Some(fields) = &self.todo_pending
+            && let Some(dir) = &self.todo_outbox
+        {
+            st_drivers::harness_events::write_channel_todo(dir, &self.incarnation, fields)?;
+            self.todo_pending = None;
+        }
+        Ok(())
+    }
+
     /// Apply one frame from the extension. Returns whether it left a report to publish.
     fn accept_frame(&mut self, line: &str) -> bool {
         let Ok(frame) = serde_json::from_str::<Value>(line) else {
@@ -17244,11 +17296,8 @@ impl PiChannelResume {
                 ) else {
                     return false;
                 };
-                if let Some(dir) = &self.todo_outbox
-                    && let Err(error) = st_drivers::harness_events::write_channel_todo(
-                        dir, &self.incarnation, &json!(fields),
-                    )
-                {
+                self.todo_pending = Some(json!(fields));
+                if let Err(error) = self.record_pending_todo() {
                     tracing::warn!("st omp channel: recording todo failed: {error:#}");
                 }
                 true
@@ -17296,6 +17345,9 @@ impl PiChannelResume {
                     .get("sessionFile")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                if self.native_session.as_deref() != Some(native) {
+                    self.todo_pending = None;
+                }
                 self.pending.native_session = Some((native.to_owned(), path));
                 self.native_session = Some(native.to_owned());
                 true
@@ -19608,6 +19660,75 @@ mod tests {
         assert!(todo_runtime_has_ended(&json!({"incarnation_id":"a","status":"exited"}), "a"));
         assert!(todo_runtime_has_ended(&json!({"incarnation_id":"b","status":"running"}), "a"));
         assert!(!todo_runtime_has_ended(&json!({}), "a"));
+    }
+
+    #[tokio::test]
+    async fn todo_transient_liveness_miss_preserves_spool_until_consecutive_confirmations() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("spool");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("pending"), b"unpublished todo").unwrap();
+        let store = std::sync::Arc::new(Store::open_memory("todo-liveness").unwrap());
+        let observe = |status: &str| {
+            store.append_claim(&ClaimInput {
+                subject: "agent/seat".into(), kind: "runtime.observed".into(), actor: None,
+                fields: serde_json::from_value(json!({
+                    "incarnation_id":"current", "status":status,
+                })).unwrap(),
+                evidence: vec![], expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        let state = st3::api::AppState {
+            store: store.clone(), notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            event_notify: tokio::sync::watch::channel(0).0,
+            node: "todo-liveness".into(), state_dir: root.path().into(),
+            pty_root: root.path().join("pty"), pty_binary: "pty".into(),
+            fleet_id: None, configured_peers: vec![], client_relay: None,
+            native_session_home: None, planner_default: Default::default(),
+        };
+        let path = root.path().join("api.sock");
+        let socket = path.clone();
+        let server = tokio::spawn(async move {
+            st3::api::serve_unix(&socket, st3::api::router(state)).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !path.exists() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let client = Client::unix(&path);
+        let mut end_seen = false;
+        observe("vanished");
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        assert_eq!(fs::read(dir.join("pending")).unwrap(), b"unpublished todo");
+        observe("running");
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        observe("stopped");
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/missing", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        let unavailable = Client::unix(&root.path().join("unavailable.sock"));
+        assert!(remove_confirmed_ended_channel_todo_outbox(
+            &unavailable, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.is_err());
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        assert!(dir.join("pending").exists());
+        assert!(remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        assert!(!dir.exists());
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
