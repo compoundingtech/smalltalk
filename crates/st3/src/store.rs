@@ -1,3 +1,4 @@
+mod glass_heads;
 mod glasses;
 mod resources;
 
@@ -2365,6 +2366,7 @@ impl Store {
         rebuild_operations_tx(&transaction)?;
         rebuild_planning_tx(&transaction)?;
         resources::rebuild(&transaction)?;
+        glass_heads::rebuild(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -17514,6 +17516,9 @@ fn append_claim_tx(
     if kind == "resource.observed" {
         resources::refresh(transaction, subject)?;
     }
+    if matches!(kind, "glass.upserted" | "glass.deleted") {
+        glass_heads::flush(transaction)?;
+    }
     normalize_local_projection_timestamps_tx(
         transaction,
         subject,
@@ -23316,6 +23321,7 @@ fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3
     project_replicated_mission_runs(transaction)?;
     rebuild_planning_tx(transaction).map_err(internal)?;
     resources::rebuild(transaction).map_err(internal)?;
+    glass_heads::rebuild(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -45563,6 +45569,7 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("desired", &[]),
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
+    ("glass_heads", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),

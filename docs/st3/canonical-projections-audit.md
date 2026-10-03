@@ -78,6 +78,22 @@ Mixed storage tables below are classified by their logical shared fields; local 
 
 The temporary tables write_clock, sealed_claims, sealed_envelopes, canonical_index, adopted_envelopes and adopted_claims are Local: clock simulation or checkpoint proof/adoption scratch state. SQLite sqlite_sequence is a local allocation counter. There are no persistent SQL views in the audited schema. Rust actual/subject/message/status/replication snapshot caches and exported mailbox files are Local disposable caches; their shared source selections are not exempt.
 
+## Current glass head projection
+
+`glass_heads` is a shared, rebuildable projection added after the baseline inventory above.
+It stores each private glass's canonical first-upsert key, greatest-upsert key and claim ID,
+plus permanent deletion state. Its complete logical row, including both key byte sequences,
+is covered by projection digests and shuffle/restart/checkpoint comparisons.
+`local_glass_head_pending` and `local_glass_head_dirty` are local disposable work queues.
+
+Normal append processing updates canonical minima/maxima without scanning durable history.
+Canonical metadata corrections replay only affected subjects. Current lists read at most 100
+indexed live heads in creation order; updates cannot reorder quota priority, and retained
+overflow becomes visible when a slot opens. Deleted IDs remain retired.
+Historical snapshot reads retain the claim fold, as do reads while projection work is pending.
+Latest eligibility and pinned-head retrieval share one SQL snapshot so a concurrent append
+cannot leak a later head into an earlier `through` snapshot. Durable glass claims are not pruned.
+
 ## Every store_index order
 
 Locations below refer to the audited commit, so later line-number changes do not invalidate the inventory. Shared rows must move to the canonical helper, including commutative enumerations whose returned ordering is observable. Local rows may retain arrival order only for the purpose stated.
