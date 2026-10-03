@@ -3833,7 +3833,9 @@ impl Ui {
                 draft.push_str(&attach::mention(&images));
             }
         }
-        // The input stays focused after a send; Esc leaves it.
+        // In a space a send leaves the box, since any letter opens it again (Nathan,
+        // 2026-10-03); the classic layout keeps it focused until Esc.
+        let leave_box = self.tab != 1 || self.composing_agent().is_some();
         if self.live {
             let effect = match self.tab {
                 1 => Some(Effect::Send {
@@ -3902,8 +3904,8 @@ impl Ui {
                     self.conversation_state.drafts.remove(&id);
                     self.follow_latest();
                     // An answer on Home is done: the next item opens closed, so it does not
-                    // take the keys (Nathan, 2026-10-02). A conversation keeps its input.
-                    if self.tab != 1 {
+                    // take the keys (Nathan, 2026-10-02).
+                    if leave_box {
                         self.editing = false;
                     }
                     self.flash("Sending…");
@@ -3939,6 +3941,9 @@ impl Ui {
                 }
                 self.conversation_state.drafts.remove(&id);
                 self.follow_latest();
+                if leave_box {
+                    self.editing = false;
+                }
                 self.flash("Sent · demo: nothing left this machine");
             }
             _ => {

@@ -4170,7 +4170,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_owns_the_editing_keys_and_enter_keeps_the_input() {
+    fn typing_owns_the_editing_keys_and_a_send_leaves_the_box() {
         let mut ui = glass();
         ui.open_in_glass(
             Pane::Agent(Some("agent/example/atlas/builder".into())),
@@ -4198,8 +4198,12 @@ mod tests {
         };
         assert_eq!(draft(&ui), "ship it ");
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(ui.editing, "a send keeps the input focused");
+        // Nathan, 2026-10-03: a send leaves the box; the next letter opens it again.
+        assert!(!ui.editing, "a send leaves the box");
         assert_eq!(draft(&ui), "");
+        typed(&mut ui, "a");
+        assert!(ui.editing && draft(&ui) == "a");
+        ctrl(&mut ui, 'u');
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         ctrl(&mut ui, 'w');
         assert_eq!(
