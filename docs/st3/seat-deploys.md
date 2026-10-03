@@ -43,6 +43,9 @@ the graph, the channel retains the latest validated todo snapshot while delivery
 minute check activates the todo spool and publishes that snapshot once the graph catches up.
 Todo liveness cleanup requires two consecutive terminal or superseded observations; a healthy,
 missing, or failed read resets confirmation, so a single transient reading cannot end the channel.
+The drain separates captured account metadata from producer facts, then promotes it only for
+accounting claims. Todo retries use normalized prepared claims; rebuilding a rejected claim
+retires its malformed slot atomically without discarding the underlying pending snapshot.
 
 Already-running seats keep the legacy delivery path when their binary follows a deploy. The new
 transport starts at the next ordinary seat restart; deploys do not force providers to restart.

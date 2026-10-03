@@ -585,7 +585,7 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
         .join(hex::encode(sha2::Sha256::digest(seat.as_bytes())))
         .join(hex::encode(sha2::Sha256::digest(incarnation.as_bytes())));
     wait_until("the native drain binds its spool", Duration::from_secs(10), || {
-        st_drivers::harness_events::enabled(&dir)
+        st_drivers::harness_events::enabled(&dir) && st_drivers::harness_events::pending(&dir, 1).is_ok()
     }).await;
     st_drivers::harness_state::claim(&dir, "drain-accounts", "omp", "account-producer").unwrap();
     let now = st_drivers::message::now_ms();
@@ -602,17 +602,17 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
             "input_tokens":10,"output_tokens":2,"total_tokens":12,
         }), true).unwrap();
     wait_until("limits and usage publish through the native drain", Duration::from_secs(10), || {
-        !daemon.store.claims_for(seat, Some("harness.limits")).unwrap_or_default().is_empty()
-            && daemon.store.claims_for(seat, Some("harness.usage")).unwrap_or_default().iter()
+        !daemon.store.observations_for(seat, "harness.limits").unwrap_or_default().is_empty()
+            && daemon.store.observations_for(seat, "harness.usage").unwrap_or_default().iter()
                 .any(|claim| claim.body.pointer("/fields/semantics").and_then(Value::as_str)
                     == Some("session_cumulative"))
-            && !daemon.store.claims_for(seat, Some("harness.timeline")).unwrap_or_default().is_empty()
+            && !daemon.store.observations_for(seat, "harness.timeline").unwrap_or_default().is_empty()
     }).await;
-    let limits = daemon.store.claims_for(seat, Some("harness.limits")).unwrap().pop().unwrap();
-    let cumulative = daemon.store.claims_for(seat, Some("harness.usage")).unwrap().into_iter()
+    let limits = daemon.store.observations_for(seat, "harness.limits").unwrap().pop().unwrap();
+    let cumulative = daemon.store.observations_for(seat, "harness.usage").unwrap().into_iter()
         .find(|claim| claim.body.pointer("/fields/semantics").and_then(Value::as_str)
             == Some("session_cumulative")).unwrap();
-    let timeline = daemon.store.claims_for(seat, Some("harness.timeline")).unwrap().pop().unwrap();
+    let timeline = daemon.store.observations_for(seat, "harness.timeline").unwrap().pop().unwrap();
     let captured = std::env::var("ST3_ACCOUNT").ok().filter(|account| !account.is_empty());
     let account = captured.as_ref().map(|account| {
         st_drivers::account::account_label("omp", &format!("declared:{account}"))
