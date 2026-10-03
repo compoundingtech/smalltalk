@@ -75,7 +75,8 @@ fn command(program: &str, path: OsString) -> Command {
         .env("PATH", path)
         .env_remove("ST_AGENT")
         .env_remove("ST3_SUBJECT")
-        .env_remove("ST_STEP_RUN");
+        .env_remove("ST_STEP_RUN")
+        .env_remove("ST_MISSION_RUN");
     command
 }
 
@@ -90,6 +91,18 @@ impl Fixture {
 
     fn records(&self) -> Vec<Value> {
         records(&self.log)
+    }
+
+    fn receipts(&self) -> Vec<Value> {
+        fs::read_dir(st3::recorder::receipt_path(&self.root.path().join("state")))
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                assert_eq!(path.extension().unwrap(), "json");
+                assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+            })
+            .collect()
     }
 }
 
@@ -602,4 +615,277 @@ fn a_killed_recorder_takes_the_real_program_with_it() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn create_receipts_preserve_raw_output_and_even_nonzero_exit_status() {
+    for (kind, resource, exit) in [("issue", "issues", "0"), ("pr", "pull", "7")] {
+        let url = format!("https://github.com/owner/repo/{resource}/123");
+        let fixture = fixture(&format!(
+            "#!/bin/sh\nprintf '\\377\\000prefix\\r\\n'\ncat\nprintf '\\n{url}\\n'\nprintf 'diagnostic\\n' >&2\nexit \"$EXIT_WITH\"\n"
+        ));
+        let input = vec![b'x'; 200_000];
+        let run = |mut command: Command| {
+            command.args([kind, "create", "--title", "unchanged"])
+                .env("ST_AGENT", "agent/example/builder")
+                .env("ST3_SUBJECT", "exec/ignored")
+                .env("ST_MISSION_RUN", "raw mission run / value")
+                .env("EXIT_WITH", exit);
+            run_with_input(command, &input)
+        };
+        let recorded = run(fixture.recorded("gh"));
+        let direct = run(fixture.direct("gh"));
+        assert_eq!(recorded.status, direct.status);
+        assert_eq!(recorded.status.code(), Some(exit.parse().unwrap()));
+        assert_eq!(recorded.stdout, direct.stdout);
+        assert_eq!(recorded.stderr, direct.stderr);
+        assert_eq!(fixture.records()[0]["receipt_url"], url);
+        let receipts = fixture.receipts();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["schema"], "st3.recorder.receipt.v1");
+        assert_eq!(receipts[0]["url"], url);
+        assert_eq!(receipts[0]["actor"], "agent/example/builder");
+        assert_eq!(receipts[0]["mission_run"], "raw mission run / value");
+        assert_eq!(receipts[0]["exit_code"], exit.parse::<i32>().unwrap());
+        chrono::DateTime::parse_from_rfc3339(receipts[0]["at"].as_str().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn only_leading_gh_create_arguments_enable_receipts() {
+    let fixture = fixture("#!/bin/sh\nprintf 'https://github.com/owner/repo/issues/123\\n'\n");
+    for (program, arguments) in [
+        ("git", vec!["issue", "create"]),
+        ("gh", vec!["issue", "view"]),
+        ("gh", vec!["pr", "create-other"]),
+        ("gh", vec!["--repo", "owner/repo", "issue", "create"]),
+    ] {
+        let output = fixture.recorded(program).args(arguments).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"https://github.com/owner/repo/issues/123\n");
+    }
+    assert!(fixture.receipts().is_empty());
+    for record in fixture.records() {
+        assert!(record.get("receipt_url").is_none());
+    }
+}
+
+#[test]
+fn a_receipt_requires_an_exact_bounded_final_url_line() {
+    for text in [
+        "",
+        "https://github.com/owner/repo/issues/123\nlater\n",
+        "https://github.com/owner/repo/issues/123\n\n",
+        " https://github.com/owner/repo/issues/123\n",
+        "https://github.com/owner/repo/issues/123 \n",
+        "https://github.com/owner/repo/issues/123?x=1\n",
+        "https://example.com/owner/repo/issues/123\n",
+        "https://github.com/owner/repo/issues/no\n",
+        "https://github.com/owner/repo/issues/0\n",
+        "https://github.com/owner/repo/discussions/123\n",
+        "\x1b[32mhttps://github.com/owner/repo/issues/123\x1b[0m\n",
+    ] {
+        let fixture = fixture("#!/bin/sh\ncat\n");
+        let mut command = fixture.recorded("gh");
+        command.args(["issue", "create"]);
+        let output = run_with_input(command, text.as_bytes());
+        assert_eq!(output.stdout, text.as_bytes());
+        assert!(output.status.success());
+        assert!(fixture.receipts().is_empty(), "{text:?}");
+        assert!(fixture.records()[0].get("receipt_url").is_none(), "{text:?}");
+    }
+    let fixture = fixture("#!/bin/sh\ncat\n");
+    let text = format!("{}https://github.com/owner/repo/issues/123\n", "x".repeat(1024));
+    let mut command = fixture.recorded("gh");
+    command.args(["issue", "create"]);
+    assert_eq!(run_with_input(command, text.as_bytes()).stdout, text.as_bytes());
+    assert!(fixture.receipts().is_empty());
+}
+
+#[test]
+fn a_regular_stdout_file_and_unterminated_url_are_noninteractive() {
+    let url = "https://github.com/owner/repo/pull/42";
+    let fixture = fixture(&format!("#!/bin/sh\nprintf '{url}'\n"));
+    let destination = fixture.root.path().join("stdout");
+    let status = fixture.recorded("gh")
+        .args(["pr", "create"])
+        .env("ST3_SUBJECT", "exec/example/subject")
+        .stdout(fs::File::create(&destination).unwrap())
+        .status().unwrap();
+    assert!(status.success());
+    assert_eq!(fs::read(&destination).unwrap(), url.as_bytes());
+    let receipts = fixture.receipts();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["url"], url);
+    assert_eq!(receipts[0]["actor"], "exec/example/subject");
+    assert!(receipts[0]["mission_run"].is_null());
+}
+
+#[test]
+fn legacy_or_missing_markers_disable_receipt_capture() {
+    for missing in [false, true] {
+        let fixture = fixture("#!/bin/sh\nprintf 'https://github.com/owner/repo/issues/123\\n'\n");
+        let marker_path = fixture.recorder.join("st3-recorder.json");
+        if missing {
+            fs::remove_file(&marker_path).unwrap();
+        } else {
+            let mut marker: Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+            marker.as_object_mut().unwrap().remove("receipts");
+            fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        }
+        let output = fixture.recorded("gh").args(["issue", "create"]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"https://github.com/owner/repo/issues/123\n");
+        assert!(fixture.receipts().is_empty());
+        let records = fixture.records();
+        if missing {
+            assert!(records.is_empty());
+        } else {
+            assert_eq!(records.len(), 1);
+            assert!(records[0].get("receipt_url").is_none());
+        }
+    }
+}
+
+#[test]
+fn captured_stdout_propagates_a_closed_downstream_pipe_to_the_real_program() {
+    let fixture = fixture("#!/bin/sh\nwhile :; do echo line; done\n");
+    let mut statuses = Vec::new();
+    for mut command in [fixture.recorded("gh"), fixture.direct("gh")] {
+        let mut child = command.args(["issue", "create"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut bytes = [0; 64];
+        stdout.read_exact(&mut bytes).unwrap();
+        drop(stdout);
+        statuses.push(wait_within(&mut child, Duration::from_secs(10)));
+    }
+    assert_eq!(statuses[1].signal(), Some(libc::SIGPIPE));
+    assert_eq!(statuses[0], statuses[1]);
+    assert_eq!(fixture.records()[0]["signal"], libc::SIGPIPE);
+    assert!(fixture.receipts().is_empty());
+}
+
+#[test]
+fn captured_stdout_relays_signals_and_publishes_a_signaled_child_receipt() {
+    let fixture = fixture(
+        "#!/bin/sh\ntrap 'printf \"https://github.com/owner/repo/issues/123\\n\"; trap - TERM; kill -TERM $$' TERM\necho ready\nwhile :; do sleep 0.05; done\n",
+    );
+    let mut child = fixture.recorded("gh").args(["issue", "create"])
+        .stdout(Stdio::piped()).spawn().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    assert_eq!(read_line(&mut stdout), "ready");
+    assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) }, 0);
+    let status = wait_within(&mut child, Duration::from_secs(10));
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert_eq!(read_line(&mut stdout), "https://github.com/owner/repo/issues/123");
+    let receipts = fixture.receipts();
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0]["exit_code"].is_null());
+}
+
+#[test]
+fn a_descendant_retaining_stdout_does_not_delay_the_receipt() {
+    let fixture = fixture("#!/bin/sh\nsleep 30 &\necho $! >&2\nprintf 'https://github.com/owner/repo/issues/123\\n'\n");
+    let mut child = fixture.recorded("gh").args(["issue", "create"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let descendant = read_line(&mut child.stderr.take().unwrap()).parse::<i32>().unwrap();
+    let status = wait_within(&mut child, Duration::from_secs(3));
+    assert_eq!(unsafe { libc::kill(descendant, libc::SIGTERM) }, 0);
+    assert!(status.success());
+    let mut stdout = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut stdout).unwrap();
+    assert_eq!(stdout, b"https://github.com/owner/repo/issues/123\n");
+    assert_eq!(fixture.receipts()[0]["url"], "https://github.com/owner/repo/issues/123");
+}
+
+#[test]
+fn receipt_publication_does_not_depend_on_a_writable_command_log() {
+    let fixture = fixture("#!/bin/sh\nprintf 'https://github.com/owner/repo/issues/123\\n'\nexit 9\n");
+    fs::remove_file(&fixture.log).unwrap();
+    fs::create_dir(&fixture.log).unwrap();
+    let output = fixture.recorded("gh").args(["issue", "create"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(output.stdout, b"https://github.com/owner/repo/issues/123\n");
+    assert_eq!(fixture.receipts()[0]["exit_code"], 9);
+}
+
+#[test]
+fn terminal_stdout_stays_interactive_and_does_not_publish_a_receipt() {
+    use std::os::fd::FromRawFd as _;
+
+    let fixture = fixture(
+        "#!/bin/sh\nif test -t 1; then echo interactive; else echo piped; fi\nprintf 'https://github.com/owner/repo/issues/123\\n'\n",
+    );
+    let (mut master, slave) = unsafe {
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            libc::openpty(
+                &mut master, &mut slave, std::ptr::null_mut(),
+                std::ptr::null(), std::ptr::null(),
+            ),
+            0,
+        );
+        libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+        (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave))
+    };
+    let mut child = fixture.recorded("gh").args(["issue", "create"])
+        .stdout(slave).spawn().unwrap();
+    let status = wait_within(&mut child, Duration::from_secs(10));
+    assert!(status.success());
+    assert_eq!(read_line(&mut master).trim_end_matches('\r'), "interactive");
+    assert_eq!(
+        read_line(&mut master).trim_end_matches('\r'),
+        "https://github.com/owner/repo/issues/123",
+    );
+    assert!(fixture.receipts().is_empty());
+    assert!(fixture.records()[0].get("receipt_url").is_none());
+}
+
+#[test]
+fn a_receipt_spool_that_cannot_be_written_changes_nothing() {
+    let fixture = fixture("#!/bin/sh\nprintf 'https://github.com/owner/repo/issues/123\\n'\nexit 17\n");
+    let spool = st3::recorder::receipt_path(&fixture.root.path().join("state"));
+    fs::remove_dir(&spool).unwrap();
+    fs::write(&spool, "not a directory").unwrap();
+    let recorded = fixture.recorded("gh").args(["issue", "create"]).output().unwrap();
+    let direct = fixture.direct("gh").args(["issue", "create"]).output().unwrap();
+    assert_eq!(recorded.status, direct.status);
+    assert_eq!(recorded.status.code(), Some(17));
+    assert_eq!(recorded.stdout, direct.stdout);
+    assert_eq!(recorded.stderr, direct.stderr);
+    assert_eq!(fixture.records()[0]["receipt_url"], "https://github.com/owner/repo/issues/123");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminating_signal_still_finishes_capture_under_stdout_backpressure() {
+    let fixture = fixture(&format!(
+        "#!/bin/sh\ntrap 'exit 7' TERM\necho $$\nwhile :; do printf '%s' '{}'; done\n",
+        "x".repeat(16_384),
+    ));
+    let mut child = fixture.recorded("gh").args(["issue", "create"])
+        .stdout(Stdio::piped()).spawn().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let real_pid = read_line(&mut stdout).parse::<i32>().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting = fs::read_to_string(format!("/proc/{real_pid}/wchan")).unwrap();
+        if waiting.contains("pipe_write") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("the real program did not reach output backpressure");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) }, 0);
+    let status = wait_within(&mut child, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(7));
+    assert_eq!(fixture.records()[0]["exit_code"], 7);
+    assert!(fixture.receipts().is_empty());
 }
