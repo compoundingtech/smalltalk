@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS operations (
     state TEXT NOT NULL CHECK(state IN ('active','conflict'))
 );
 CREATE INDEX IF NOT EXISTS operations_conflict_index ON operations(id) WHERE state='conflict';
+-- Foreign keys are on, so deleting a claim looks for rows that still reference it. Without an
+-- index that look read every operation, 25 ms a claim, and a checkpoint trim that drops a hundred
+-- thousand claims held the writer for an hour.
+CREATE INDEX IF NOT EXISTS operations_canonical_claim_index ON operations(canonical_claim_id);
 
 CREATE TABLE IF NOT EXISTS blobs (
     hash TEXT PRIMARY KEY,
@@ -157,6 +161,7 @@ CREATE TABLE IF NOT EXISTS documents (
     PRIMARY KEY(name, hash)
 );
 CREATE INDEX IF NOT EXISTS document_latest ON documents(name, created_index DESC);
+CREATE INDEX IF NOT EXISTS documents_hash_index ON documents(hash);
 
 -- Local answers to idempotent requests, by operation.
 CREATE TABLE IF NOT EXISTS idempotency (
