@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
-mkdir -p build/headers
+# Match Expo's iOS minimum, including C/assembly dependencies built by cc-rs.
+export IPHONEOS_DEPLOYMENT_TARGET=16.4
+mkdir -p build/headers ios/build
 cp ios/StFabricBridge.h build/headers/
 cat > build/headers/module.modulemap <<'MAP'
 module StFabricRust {
@@ -14,8 +16,8 @@ for target in aarch64-apple-ios aarch64-apple-ios-sim; do
 done
 # Other native projects share this host. Never overlap their xcodebuild process.
 while pgrep -x xcodebuild >/dev/null; do sleep 10; done
-rm -rf build/StFabricRust.xcframework
+rm -rf ios/build/StFabricRust.xcframework
 xcodebuild -create-xcframework \
   -library rust/target/aarch64-apple-ios/release/libst_fabric_bridge.a -headers build/headers \
   -library rust/target/aarch64-apple-ios-sim/release/libst_fabric_bridge.a -headers build/headers \
-  -output build/StFabricRust.xcframework > build/xcframework.log 2>&1
+  -output ios/build/StFabricRust.xcframework > build/xcframework.log 2>&1

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AppState, ScrollView } from 'react-native';
 import * as Crypto from 'expo-crypto';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { API_VERSION, ClientError, St3Client } from '../../../clients/typescript/st3-client';
 import { dialFabric, fabricIdentity, stopFabric } from '../modules/st-fabric';
 import type { FabricProofInput } from '../fabricProof';
@@ -8,6 +9,7 @@ import { Button, Note, Screen, SectionHeader, T } from '../ui';
 
 /** Temporary test client; the ordinary route, bearer and display cache remain untouched. */
 export function FabricProofScreen({ input, onClose }: { input: FabricProofInput; onClose: () => void }) {
+  const insets = useSafeAreaInsets();
   const [node, setNode] = useState(''), [result, setResult] = useState('Starting fabric proof…');
   useEffect(() => {
     let current = true;
@@ -50,7 +52,7 @@ export function FabricProofScreen({ input, onClose }: { input: FabricProofInput;
     return () => { current = false; lifecycle.remove(); void stopFabric(); };
   }, [input]);
 
-  return <Screen><ScrollView contentContainerStyle={{ padding: 16, gap: 12 }}>
+  return <Screen><ScrollView contentContainerStyle={{ padding: 16, paddingTop: insets.top + 16, gap: 12 }}>
     <SectionHeader title="Fabric development proof" />
     <T selectable>{result}</T>
     <T selectable>Phone node: {node || 'unavailable'}</T>

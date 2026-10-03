@@ -14,7 +14,7 @@ npx expo prebuild --platform ios --no-install
 ST3_FABRIC_PROOF=1 npm run pods
 ```
 
-Build Debug for a simulator of your own. On a shared build host, wait until `pgrep -x xcodebuild` finds no process before starting Xcode. Generated static libraries and the device/simulator XCFramework are ignored; do not commit them. To restore the default build, reinstall pods without `ST3_FABRIC_PROOF`.
+Build Debug for a simulator of your own. The script targets iOS 16.4, including its C/assembly dependencies, and writes the XCFramework under `ios/build` inside the pod root. On a shared build host, wait until `pgrep -x xcodebuild` finds no process before starting Xcode. Generated static libraries and the device/simulator XCFramework are ignored; do not commit them. To restore the default build, reinstall pods without `ST3_FABRIC_PROOF`.
 
 ## Isolated proof
 
@@ -52,4 +52,10 @@ FABRIC_BIN=/path/to/fabric cargo test --manifest-path apps/ios/modules/st-fabric
 cargo clippy --manifest-path apps/ios/modules/st-fabric/rust/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
-The independent byte test checks framing and malformed input. The pinned-daemon check verifies unknown-node and missing-grant denial, a half-closed request, and a 5 MiB response that would stall without Acks. Run `npm run typecheck` and `npm test` in `apps/ios` for the app checks.
+The independent byte test checks framing and malformed input. The pinned-daemon check verifies unknown-node and missing-grant denial, a half-closed request, a 5 MiB response that would stall without Acks, and explicit stop delivering EOF to an idle upstream. Run `npm run typecheck` and `npm test` in `apps/ios` for the app checks.
+
+## Recorded simulator result
+
+On 2026-10-04, an iOS 27 simulator running the Debug native app reached a real isolated st member's paired-only Unix gateway through `demo-client/0`. The unchanged TypeScript client first received an unpaired refusal, then completed pairing and received `st3.client.v0` capabilities for a `person/demo` session. The screen reported fabric `0.2.30+8bd9017` and iroh `1.0.2`. The Keychain NodeID remained the same across app relaunches. Only the exact test-service grant was added; it was removed and peers reloaded after verification. The proof closed its endpoint after the response. The isolated daemon's short detached-session TTL bounds forced teardown during setup retries.
+
+Both device and simulator static libraries and their XCFramework built. Rust fixtures, pinned-daemon checks and clippy passed; app typecheck and 32 tests passed. A physical-device run, network migration, relay/NAT behavior and the broader capabilities listed in the protocol document remain to be proved before adopting this carrier.

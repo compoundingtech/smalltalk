@@ -6,13 +6,13 @@ Pod::Spec.new do |s|
   s.author = ''
   s.homepage = 'https://github.com/compoundingtech/smalltalk'
   s.license = 'MIT'
-  s.platforms = { :ios => '15.1' }
+  s.platforms = { :ios => '16.4' }
   s.source = { git: '' }
   s.static_framework = true
   s.dependency 'ExpoModulesCore'
   if ENV['ST3_FABRIC_PROOF'] == '1'
     s.source_files = 'StFabricModule.swift'
-    s.vendored_frameworks = '../build/StFabricRust.xcframework'
+    s.vendored_frameworks = 'build/StFabricRust.xcframework'
     s.frameworks = 'Security', 'SystemConfiguration', 'Network'
     s.libraries = 'resolv'
   else
