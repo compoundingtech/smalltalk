@@ -124,6 +124,7 @@ fn generated_models_decode_every_stream_fixture() {
         screen.value.lines[0].runs[0],
         TerminalRun {
             text: "$ ".into(),
+            cells: Some(2),
             fg: Some(TerminalColor::Palette(2)),
             bold: true,
             ..TerminalRun::default()
