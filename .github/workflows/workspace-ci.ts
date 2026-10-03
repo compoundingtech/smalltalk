@@ -11,6 +11,11 @@ export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x
  * and clippy scale with the CPU count. Cost is not a constraint for this trial.
  */
 export const linuxStageRunner = ['nscloud-ubuntu-24.04-amd64-16x32'] as const
+/**
+ * The cost check's shape: its generation and counting use one core. A shape label rather than the
+ * profile, whose jobs queue behind the profile's own concurrent-runner limit.
+ */
+export const perfCostRunner = ['nscloud-ubuntu-24.04-amd64-8x16'] as const
 export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
 
 /** The public, read-only effect-utils cache supplies genie and other pinned effect-utils packages. */

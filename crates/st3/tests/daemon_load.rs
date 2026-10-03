@@ -248,10 +248,12 @@ fn worst_of(path: &Path) -> Option<Report> {
             into.max_ms = into.max_ms.max(path.max_ms);
         }
     }
-    println!(
-        "comparing with the worst of {} reports of main",
-        reports.len()
-    );
+    if !reports.is_empty() {
+        println!(
+            "comparing with the worst of {} reports of main",
+            reports.len()
+        );
+    }
     (!reports.is_empty()).then_some(worst)
 }
 

@@ -11,6 +11,7 @@ import {
   linuxStageJob,
   linuxStageRunner,
   linuxRunner,
+  perfCostRunner,
   perfStoresCache,
   readOnlyBinaryCaches,
   workspacePreparationSteps,
@@ -54,7 +55,11 @@ export default githubWorkflow({
   // actionlint must know the Namespace shape label the stage jobs use.
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
+    selfHostedRunnerLabels: [
+      ...(defaultActionlintConfig.selfHostedRunnerLabels ?? []),
+      ...linuxStageRunner,
+      ...perfCostRunner,
+    ],
   },
   jobs: {
     // Namespace runners are already authenticated. Manual runs record the platform resource limits
@@ -137,13 +142,13 @@ done`,
     // The cost check: SQLite work per daemon request on a small and a ten times larger generated
     // store. Counts, not timings, so a lightly optimized build only speeds up the generation.
     // Not part of linux-gate; it must finish before linux-tests does (docs/ci.md). The load test
-    // runs in perf.yml. It takes the profile's smaller shape, as its generation and counting run
-    // on one core, and skips merge-queue entries, which do not wait for it, so each queued entry
-    // still needs only its required jobs' capacity. A required perf-cost must run there too.
+    // runs in perf.yml. It takes a smaller shape, as its generation and counting run on one core,
+    // and skips merge-queue entries, which do not wait for it, so each queued entry still needs
+    // only its required jobs' capacity. A required perf-cost must run there too.
     'perf-cost': linuxStageJob({
       name: 'perf-cost',
       stage: 'cost',
-      runsOn: linuxRunner,
+      runsOn: perfCostRunner,
       condition: "github.event_name != 'merge_group'",
       setup: commonSetupSteps,
       description: 'Run the cost check',

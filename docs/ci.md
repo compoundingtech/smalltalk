@@ -188,7 +188,9 @@ for the repository's owner. Both run `scripts/ci-perf`, and `.config/nextest.tom
 tests out of `linux-tests`.
 
 `perf-cost` runs `daemon_cost::` (`crates/st3/tests/daemon_cost.rs`) on every pull request and
-`main` push, on the profile's 8x16 shape: generating and counting use one core. It skips
+`main` push, on the `nscloud-ubuntu-24.04-amd64-8x16` shape: generating and counting use one
+core, and a shape label does not queue behind the profile's concurrent-runner limit, as the
+profile's 8x16 runners did in measurement. It skips
 merge-queue entries, which wait only for required checks, so a queued entry still needs 64 vCPUs
 and five still build at once (see [Measured concurrency](#measured-concurrency)); if it becomes
 required, it must run there too. It generates a store at scale 0.01 and one at 0.1 with the
