@@ -104,6 +104,8 @@ pub struct Limits {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Capabilities {
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_version: Option<String>,
     pub session_actor: String,
     pub transport: TransportKind,
     pub capabilities: Vec<Capability>,

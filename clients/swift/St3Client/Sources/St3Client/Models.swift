@@ -100,8 +100,9 @@ public struct Limits: Codable, Sendable {
     enum CodingKeys: String, CodingKey { case maxGlassBodyBytes = "max_glass_body_bytes", maxGlasses = "max_glasses", maxGlassDepth = "max_glass_depth", maxGlassNodes = "max_glass_nodes", maxPageItems = "max_page_items", maxEventItems = "max_event_items", maxResponseBytes = "max_response_bytes", maxWaitMS = "max_wait_ms" }
 }
 public struct Capabilities: Codable, Sendable {
+    public let machineVersion: String?
     public let kind: String; public let sessionActor: String; public let transport: String; public let capabilities: [Capability]; public let limits: Limits; public let eventCursor: String; public let oldestEventCursor: String; public let schemas: [String]
-    enum CodingKeys: String, CodingKey { case kind, sessionActor = "session_actor", transport, capabilities, limits, eventCursor = "event_cursor", oldestEventCursor = "oldest_event_cursor", schemas }
+    enum CodingKeys: String, CodingKey { case machineVersion = "machine_version", kind, sessionActor = "session_actor", transport, capabilities, limits, eventCursor = "event_cursor", oldestEventCursor = "oldest_event_cursor", schemas }
 }
 
 public struct PageInfo: Codable, Sendable { public let limit: Int; public let hasMore: Bool; public let nextCursor: String?; public let cursorExpiresAt: String?; enum CodingKeys: String, CodingKey { case limit, hasMore = "has_more", nextCursor = "next_cursor", cursorExpiresAt = "cursor_expires_at" } }

@@ -42,6 +42,7 @@ mod seat_queue_perf;
 mod subagent_publisher;
 mod subagents_seat;
 mod terminal_attach;
+mod version;
 
 #[test]
 fn every_test_file_is_built() {

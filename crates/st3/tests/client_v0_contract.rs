@@ -1315,6 +1315,51 @@ async fn client_v0_read_routes_conform_to_the_manifest() {
     assert_eq!(envelope["value"]["limits"]["max_page_items"], 200);
 }
 
+#[tokio::test]
+async fn daemon_build_identity_is_shared_by_doctor_and_capabilities() {
+    let root = tempfile::tempdir().unwrap();
+    let app = st3::api::router(test_state(root.path()));
+    let (status, envelope) = client_json(app.clone(), "/v1/client/capabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    let version = st_drivers::version::machine_version();
+    assert_eq!(envelope["value"]["machine_version"], version);
+    contract_validator("Capabilities")
+        .validate(&envelope["value"])
+        .unwrap();
+    let capabilities: st3_client::Capabilities =
+        serde_json::from_value(envelope["value"].clone()).unwrap();
+    assert_eq!(
+        capabilities.machine_version.as_deref(),
+        Some(version.as_str())
+    );
+    let (status, mut doctor) = client_json(app, "/v1/doctor").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doctor["machine_version"], version);
+
+    // New clients can still read old servers that have no version field.
+    let mut old_capabilities = envelope["value"].clone();
+    old_capabilities
+        .as_object_mut()
+        .unwrap()
+        .remove("machine_version");
+    contract_validator("Capabilities")
+        .validate(&old_capabilities)
+        .unwrap();
+    assert!(
+        serde_json::from_value::<st3_client::Capabilities>(old_capabilities)
+            .unwrap()
+            .machine_version
+            .is_none()
+    );
+    doctor.as_object_mut().unwrap().remove("machine_version");
+    assert!(
+        serde_json::from_value::<st3::model::DoctorReport>(doctor)
+            .unwrap()
+            .machine_version
+            .is_none()
+    );
+}
+
 async fn client_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     let response = app
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
