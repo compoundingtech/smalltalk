@@ -1835,7 +1835,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         if let Some(intake) = intake {
             self.isolate("stage/observers", &daemon, || {
-                self.reconcile_resource_observers(&intake)
+                self.reconcile_resource_observers(&intake, &desired)
             });
             self.isolate("stage/schedules", &daemon, || {
                 self.reconcile_schedules(&intake)
@@ -9975,7 +9975,14 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn reconcile_resource_observers(&self, desired: &[DesiredSubject]) -> Result<()> {
+    /// `agents` is every declaration, so a repository listing can name the agent whose workspace
+    /// has a new pull request's branch checked out; the intake list holds only observers,
+    /// subscriptions, and schedules.
+    fn reconcile_resource_observers(
+        &self,
+        desired: &[DesiredSubject],
+        agents: &[DesiredSubject],
+    ) -> Result<()> {
         let observer_resources = desired
             .iter()
             .filter(|item| item.kind == "observer")
@@ -10005,7 +10012,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         // A repository listing names the agent on this host that opened each new pull request.
         let agent_workspaces = Arc::new(
-            desired
+            agents
                 .iter()
                 .filter(|item| item.kind == "agent")
                 .filter_map(|item| {
@@ -23877,6 +23884,83 @@ observer "repo" {
         );
     }
 
+    /// Answers every observation with one open pull request on `branch`.
+    struct OnePullRequestProvider {
+        branch: String,
+    }
+
+    impl ResourceProvider for OnePullRequestProvider {
+        fn observe(
+            &self,
+            _request: ObservationRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::resource::ProviderObservation {
+                    facts: serde_json::json!({"repository_id": 7, "pull_requests": [{
+                        "number": 7, "head": "a".repeat(40), "branch": self.branch,
+                        "state": "open", "draft": false, "title": "Feature",
+                    }]}),
+                    cursor: Some("one".into()),
+                    next_check_unix_ms: now_ms().saturating_add(60_000),
+                })
+            })
+        }
+    }
+
+    /// A reconcile pass hands the repository observer every agent declaration, so the agent
+    /// whose workspace has a new pull request's branch checked out is named its opener. The
+    /// intake stage once passed only observers, subscriptions, and schedules, and no pull request
+    /// was ever named.
+    #[tokio::test]
+    async fn a_reconcile_pass_names_the_agent_with_a_new_pull_requests_branch() {
+        use crate::checkout::test_support::{git, repository};
+        let root = tempfile::tempdir().unwrap();
+        let clone = repository(root.path());
+        git(&clone, &["checkout", "--quiet", "-b", "agent/feature"]);
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+agent "builder" {{ workspace {:?}; command "true" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "acme/garden"; field "pull_requests" }}"#,
+                clone.display().to_string()
+            ),
+            "watch",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(OnePullRequestProvider {
+            branch: "agent/feature".into(),
+        }));
+        reconciler.reconcile_once().unwrap();
+        let facts = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(actual) = store
+                    .latest_actual_value("resource/repo/pull-request/7")
+                    .unwrap()
+                {
+                    break actual["facts"].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the observation recorded the pull request");
+        assert_eq!(facts["opened_by"], "agent/node.builder");
+    }
+
     /// What a scripted observation answers.
     enum ScriptedObservation {
         Observe,
@@ -24391,7 +24475,10 @@ subscription "b" {{
             calls: calls.clone(),
         }));
         reconciler
-            .reconcile_resource_observers(&store.desired_subjects().unwrap())
+            .reconcile_resource_observers(
+                &store.desired_subjects().unwrap(),
+                &store.desired_subjects().unwrap(),
+            )
             .unwrap();
         for _ in 0..100 {
             if calls.load(Ordering::SeqCst) == 2
