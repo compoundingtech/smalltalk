@@ -589,6 +589,8 @@ pub struct Reconciler<R = NativeRuntime> {
     seat_retention: Mutex<HashMap<String, SeatRetention>>,
     /// The gate runners the last read found, kept until a change they depend on.
     gate_runners: Mutex<Option<Vec<crate::store::MissionGateRunner>>>,
+    /// Why each member failed its last render, kept while render is skipped.
+    render_failures: Mutex<BTreeMap<String, String>>,
     /// The work wake each live agent's last evaluation queued, queued again while it is skipped.
     member_wakes: Mutex<HashMap<String, (String, String, MemberSpec)>>,
     /// How often a skipped member's terminal screen is looked at again for a prompt.
@@ -705,6 +707,7 @@ impl Reconciler<NativeRuntime> {
             seat_retention: Mutex::new(HashMap::new()),
             gate_runners: Mutex::new(None),
             member_wakes: Mutex::new(HashMap::new()),
+            render_failures: Mutex::new(BTreeMap::new()),
             fault_injection: None,
             disk_probe: Some(Arc::new(crate::disk::disk_space)),
             disk_paths: vec![state_dir.to_path_buf()],
@@ -764,6 +767,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             seat_retention: Mutex::new(HashMap::new()),
             gate_runners: Mutex::new(None),
             member_wakes: Mutex::new(HashMap::new()),
+            render_failures: Mutex::new(BTreeMap::new()),
             fault_injection: None,
             disk_probe: None,
             disk_paths: Vec::new(),
@@ -1569,12 +1573,56 @@ impl<R: RuntimeControl> Reconciler<R> {
             .copied()
             .filter(|subject| !member_errors.contains_key(&subject.subject))
             .collect::<Vec<_>>();
+        // A live member is evaluated again when a claim it read, its runtime, its exec state or
+        // its screen changed, when its time came, or when its workspace or render failed.
+        let skip_members = self.skip_unneeded
+            && ptys.is_some()
+            && !self.incremental.take_full_pass("member", now_ms());
+        // Render writes every member's files together (members sharing a repository share its
+        // exclude file), so it runs whole or not at all: when what it read last changed, when a
+        // member will be evaluated, or on a full pass. Otherwise its last failures stand; files
+        // changed on disk are put back by the next full pass.
+        let render_needed = !skip_members
+            || self.incremental.needs("render", now_ms())
+            || renderable.iter().any(|subject| {
+                subject.kind != "stop"
+                    && subject
+                        .member
+                        .as_ref()
+                        .is_some_and(|member| member.host == self.host)
+                    && self
+                        .incremental
+                        .needs(&format!("member:{}", subject.subject), now_ms())
+            });
         // A render panic faults this host's members; stops never render, so they still run.
         let render_span = crate::profile::span("pass/render");
-        let rendered = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            crate::render::apply_all(&self.store, &renderable, &self.host)
-        }))
-        .unwrap_or_else(|panic| {
+        let (rendered, render_reads) = if render_needed {
+            smallclaims::touched::record(|| {
+                std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    crate::render::apply_all(&self.store, &renderable, &self.host)
+                }))
+            })
+        } else {
+            let failed = self
+                .render_failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            (
+                Ok(failed
+                    .into_iter()
+                    .map(|(subject, reason)| (subject, Err(anyhow::anyhow!(reason))))
+                    .collect()),
+                BTreeSet::new(),
+            )
+        };
+        if render_needed {
+            let mut reads = render_reads;
+            // The members it renders come from the desired declarations.
+            reads.insert("kind:intent.desired".to_owned());
+            self.incremental.evaluated("render", reads, None);
+        }
+        let rendered = rendered.unwrap_or_else(|panic| {
             let reason = panic_message(panic.as_ref());
             renderable
                 .iter()
@@ -1598,6 +1646,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .filter(|subject| subject.kind == "agent")
             .map(|subject| subject.subject.as_str())
             .collect::<BTreeSet<_>>();
+        let mut render_failed = BTreeMap::new();
         for (subject, result) in rendered {
             let result = result.and_then(|result| {
                 let mut applied = BTreeMap::new();
@@ -1626,8 +1675,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 Ok(())
             });
             if let Err(error) = result {
+                render_failed.insert(subject.clone(), format!("{error:#}"));
                 member_errors.insert(subject, error);
             }
+        }
+        if render_needed {
+            *self
+                .render_failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = render_failed;
         }
         // A later run can declare the same workspace, so a finished run never removes a
         // checkout that a current member on this host still uses.
@@ -1655,11 +1711,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             && ptys.is_some()
             && !self.incremental.take_full_pass("stop", now_ms());
         let mut stops = BTreeSet::new();
-        // A live member is evaluated again when a claim it read, its runtime, its exec state or
-        // its screen changed, when its time came, or when its workspace or render failed.
-        let skip_members = self.skip_unneeded
-            && ptys.is_some()
-            && !self.incremental.take_full_pass("member", now_ms());
         self.incremental.observe_execs(|runtime_id| {
             self.runtime
                 .observe_exec(runtime_id)
