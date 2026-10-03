@@ -146,6 +146,7 @@ pub(in crate::api) async fn list(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(&state),
+        replicated: None,
     };
     Ok((Extension(snapshot), Json(page)))
 }
