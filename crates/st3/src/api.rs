@@ -2044,6 +2044,7 @@ fn client_agent_resources_uncached(
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|subject| -> anyhow::Result<(String, Value)> {
             let fault = member_faults.get(&subject.subject);
+            let member_faulted = fault.is_some();
             let fields = subject
                 .actual
                 .as_ref()
@@ -2060,6 +2061,14 @@ fn client_agent_resources_uncached(
                 .harness
                 .as_ref()
                 .map(|harness| harness.state.clone());
+            let codex_fault = subject.harness.as_ref().and_then(|harness| {
+                crate::codex_failure::failure_detail(
+                    driver.as_deref().unwrap_or_default(),
+                    &harness.state,
+                    harness.reason.as_deref(),
+                ).map(str::to_owned)
+            });
+            let fault = fault.or(codex_fault.as_ref());
             let last_activity_at = store.agent_last_activity_at(
                 &subject.subject,
                 subject
@@ -2110,6 +2119,7 @@ fn client_agent_resources_uncached(
                 ) => {
                     if subject.harness.as_ref().is_some_and(|harness| {
                         harness.blocked_on.as_deref() == Some("human")
+                            || codex_fault.is_some()
                     }) {
                         "waiting"
                     } else {
@@ -2138,7 +2148,7 @@ fn client_agent_resources_uncached(
                 _ if subject.desired.is_some() => "desired",
                 _ => "stopped",
             };
-            let state = if fault.is_some() { "failed" } else { state };
+            let state = if member_faulted { "failed" } else { state };
             let suspension = crate::suspension::current(store, &subject.subject)?;
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
@@ -18556,6 +18566,146 @@ mission "labelled" state="ready" {
         );
         assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
         assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));
+    }
+
+    #[test]
+    fn codex_turn_causes_reach_agent_faults_and_close_on_recovery_or_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let source = r#"
+version 2
+mission "turn-fault" state="ready" {
+  goal "Observe provider refusals."
+  agent "worker" { workspace "/tmp"; harness "codex" {} }
+  step "queued" { assigned-to "agent/${ST_MISSION_RUN}/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "turn-fault-source")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "turn-fault".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "turn-fault-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let subject = format!("agent/{}/worker", run.id);
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: kind.into(),
+                    actor: Some(subject.clone()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        append(
+            "runtime.observed",
+            json!({"status":"running", "runtime_id":"node.worker", "incarnation_id":"one"}),
+        );
+        for (activity, reason, detail, client_state) in [
+            ("ended", "policy", "cyber policy", "failed"),
+            ("idle", "providerCapacity", "at capacity", "waiting"),
+            ("working", "serverOverloaded", "at capacity", "waiting"),
+            ("ended", "systemError", "could not classify", "failed"),
+        ] {
+            let claim = append(
+                "harness.observed",
+                json!({"driver":"codex", "state":activity,
+                "reason":reason, "incarnation_id":"one", "blocked_on":"none"}),
+            );
+            let agents =
+                client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+            assert_eq!(agents[0]["state"], client_state);
+            assert!(agents[0]["fault"].as_str().unwrap().contains(detail));
+            let faults = store.fault_snapshot(client_now_ms()).unwrap();
+            assert_eq!(faults.len(), 1);
+            assert_eq!(faults[0].item.episode, claim.id);
+            assert_eq!(faults[0].item.subject, subject);
+            assert!(faults[0].item.detail.contains(detail));
+            assert_eq!(
+                store.fault_snapshot(client_now_ms()).unwrap()[0]
+                    .item
+                    .episode,
+                claim.id
+            );
+            store
+                .append_claim(&ClaimInput {
+                    subject: run.steps[0].subject.clone(),
+                    kind: "work.progress".into(),
+                    actor: Some(subject.clone()),
+                    fields: BTreeMap::from([
+                        ("claim_incarnation".into(), json!("one")),
+                        ("summary".into(), json!("A delayed command finished")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            assert_eq!(
+                store
+                    .current_harness(&subject)
+                    .unwrap()
+                    .unwrap()
+                    .reason
+                    .as_deref(),
+                Some(reason),
+                "a work progress record is not a successful model turn"
+            );
+            assert_eq!(
+                store.fault_snapshot(client_now_ms()).unwrap()[0]
+                    .item
+                    .episode,
+                claim.id
+            );
+            append(
+                "harness.observed",
+                json!({"driver":"codex", "state":"idle", "reason":null,
+                "incarnation_id":"one", "blocked_on":"none"}),
+            );
+            assert!(store.fault_snapshot(client_now_ms()).unwrap().is_empty());
+            let agents =
+                client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+            assert!(agents[0]["fault"].is_null());
+            assert_eq!(agents[0]["state"], "running");
+        }
+        append(
+            "harness.observed",
+            json!({"driver":"codex", "state":"ended", "reason":"policy", "incarnation_id":"one"}),
+        );
+        append(
+            "runtime.observed",
+            json!({"status":"running", "runtime_id":"node.worker", "incarnation_id":"two"}),
+        );
+        assert!(
+            store.fault_snapshot(client_now_ms()).unwrap().is_empty(),
+            "a successor never inherits the failed turn"
+        );
+        let agents =
+            client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert!(agents[0]["fault"].is_null());
     }
 
     #[test]
