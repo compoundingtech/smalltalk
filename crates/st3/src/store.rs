@@ -11496,6 +11496,29 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// The URI each named `uri.reference` resource subject declares. An agent or mission keeps
+    /// only typed edges; this resolves them through the ordinary desired resource subjects.
+    pub fn declared_resource_uris<'a>(
+        &self,
+        references: impl IntoIterator<Item = &'a crate::model::DeclaredResourceReference>,
+    ) -> Result<BTreeMap<String, String>> {
+        let subjects = references
+            .into_iter()
+            .map(|reference| reference.subject.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        Ok(self
+            .desired_subjects_named(&subjects)?
+            .into_iter()
+            .filter(|desired| desired.kind == "resource")
+            .filter_map(|desired| {
+                let uri = crate::graph::declared_uri(&desired.desired)?.to_owned();
+                Some((desired.subject, uri))
+            })
+            .collect())
+    }
+
     /// The desired subjects that the runs `owner_runs` own.
     pub fn desired_subjects_for_owner_runs(
         &self,

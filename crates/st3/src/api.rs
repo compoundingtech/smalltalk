@@ -2532,6 +2532,15 @@ fn client_agent_resources_from_status(
             .filter_map(|subject| subject.actual_claim.as_deref())
             .collect::<Vec<_>>(),
     );
+    let declared_resources = status
+        .subjects
+        .iter()
+        .filter_map(|subject| {
+            let references = crate::graph::declared_resources(subject.desired.as_ref()?);
+            (!references.is_empty()).then(|| (subject.subject.clone(), references))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let resource_uris = store.declared_resource_uris(declared_resources.values().flatten())?;
     let queued_steps = work_queues
         .values()
         .flat_map(|queue| {
@@ -2758,6 +2767,10 @@ fn client_agent_resources_from_status(
                     "agent_id": relationship.agent,
                     "reason": relationship.reason
                 })).collect::<Vec<_>>(),
+                "resources": client_declared_resources(
+                    declared_resources.get(&subject.subject).map_or(&[][..], Vec::as_slice),
+                    &resource_uris,
+                ),
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
                 "handoff": handoff,
@@ -2779,6 +2792,25 @@ fn client_agent_resources_from_status(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(agents.into_iter().map(|(_, value)| value).collect())
+}
+
+/// A declaration's resource edges as client-v0 shows them: read-only references to ordinary
+/// resource subjects. `uri` is null while the referenced subject has not arrived.
+pub(crate) fn client_declared_resources(
+    references: &[crate::model::DeclaredResourceReference],
+    uris: &BTreeMap<String, String>,
+) -> Vec<Value> {
+    references
+        .iter()
+        .map(|reference| {
+            json!({
+                "name": reference.name,
+                "subject": reference.subject,
+                "uri": uris.get(&reference.subject),
+                "reason": reference.reason,
+            })
+        })
+        .collect()
 }
 
 fn desired_harness_driver(desired: &Value) -> Option<String> {
@@ -18340,6 +18372,95 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             panic!("an agent resource");
         };
         assert_eq!(typed.subagents.len(), 1);
+    }
+
+    #[test]
+    fn agents_show_their_declared_resources_until_a_declaration_drops_them() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let workspace = root.path().display().to_string();
+        let publish = |key: &str, resources: &str| {
+            let source = format!(
+                "version 2\nagent \"ada/seat\" {{\n  workspace {workspace:?}\n  command \"true\"\n{resources}}}\n"
+            );
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let planned = state
+                .store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .apply(&intent, &planned.subject_tokens, key)
+                .unwrap();
+        };
+        let goal = "x-fractal-goal://orchid/ada%2Fseat";
+        let worktree = "worktree://orchid/workspace/work";
+        publish(
+            "declare",
+            &format!(
+                "  resource \"goal\" uri=\"{goal}\" reason=\"seat goal\"\n  resource \"worktree\" uri=\"{worktree}\"\n"
+            ),
+        );
+        let subject = |uri: &str| format!("resource/uri/{}", hex::encode(Sha256::digest(uri)));
+        let read = || {
+            let agents =
+                client_agent_resources(&state.store, false, "now", state.store.index().unwrap())
+                    .unwrap();
+            agents
+                .into_iter()
+                .find(|agent| agent["id"] == "agent/ada/seat")
+                .unwrap()
+        };
+        let agent = read();
+        assert_eq!(
+            agent["resources"],
+            json!([
+                { "name": "goal", "subject": subject(goal), "uri": goal, "reason": "seat goal" },
+                { "name": "worktree", "subject": subject(worktree), "uri": worktree, "reason": null },
+            ])
+        );
+        let typed: st3_client::Resource = serde_json::from_value(agent).unwrap();
+        let st3_client::Resource::Agent(typed) = typed else {
+            panic!("an agent resource");
+        };
+        assert_eq!(typed.resources[0].uri.as_deref(), Some(goal));
+
+        // The declaration read writes the edges back as the KDL that declared them.
+        let (_, tree) = state
+            .store
+            .agent_declaration("agent/ada/seat", None)
+            .unwrap()
+            .unwrap();
+        let uris = state
+            .store
+            .declared_resource_uris(&crate::graph::declared_resources(&tree))
+            .unwrap();
+        let kdl = crate::graph::render_agent_desired_kdl(&tree, &uris).unwrap();
+        let reparsed = crate::graph::parse_test_intent(&kdl, "node").unwrap();
+        assert_eq!(reparsed.subjects["agent/ada/seat"].desired, tree);
+
+        publish("drop", &format!("  resource \"goal\" uri=\"{goal}\" reason=\"seat goal\"\n"));
+        assert_eq!(
+            read()["resources"],
+            json!([{ "name": "goal", "subject": subject(goal), "uri": goal, "reason": "seat goal" }])
+        );
+        assert_eq!(
+            state
+                .store
+                .selected_desired_kind(&subject(worktree))
+                .unwrap()
+                .as_deref(),
+            Some("resource"),
+            "omission leaves the resource subject in the graph"
+        );
+        publish("none", "");
+        assert_eq!(read()["resources"], json!([]));
     }
 
     #[test]
