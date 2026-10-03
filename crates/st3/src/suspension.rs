@@ -317,6 +317,13 @@ pub fn blockers(store: &Store, subject: &str, incarnation: &str) -> Result<Vec<S
         None => blocking.push("harness-unobserved".into()),
         Some(claim) => {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            // Older OMP drivers reported idle without observing their native jobs.
+            // Their existing `true` is not proof under the upgraded report contract.
+            if fields.get("driver").and_then(Value::as_str) == Some("omp")
+                && fields.get("background_jobs").is_none()
+            {
+                blocking.push("background-jobs-unreported".into());
+            }
             match fields.get("quiescent").and_then(Value::as_bool) {
                 Some(true) => {}
                 Some(false) => {
@@ -442,6 +449,38 @@ mod tests {
 #[cfg(test)]
 mod background_job_tests {
     use super::*;
+
+    #[test]
+    fn legacy_omp_idle_is_unproven_until_the_upgraded_driver_reports_jobs() {
+        let store = Store::open_memory("node").unwrap();
+        for upgraded in [false, true] {
+            let mut fields = std::collections::BTreeMap::from([
+                ("driver".into(), Value::from("omp")),
+                ("state".into(), Value::from("idle")),
+                ("incarnation_id".into(), Value::from("fixture-one")),
+                ("quiescent".into(), Value::from(true)),
+            ]);
+            if upgraded {
+                fields.insert("background_jobs".into(), Value::from(0));
+            }
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: "agent/example".into(),
+                    kind: "harness.observed".into(),
+                    actor: Some("agent/example".into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let blocking = blockers(&store, "agent/example", "fixture-one").unwrap();
+            assert_eq!(
+                blocking.iter().any(|reason| reason == "background-jobs-unreported"),
+                !upgraded
+            );
+        }
+    }
 
     #[test]
     fn omp_idle_requires_a_known_empty_native_job_snapshot() {
