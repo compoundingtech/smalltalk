@@ -61,8 +61,6 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
     ("GET /v1/client/missions/{*id}", 18.0),
     // Checkpoint status walks the sealed set (9.8x).
     ("GET /v1/checkpoint/status", 15.0),
-    // Device inventory reads every principal claim (9.8x).
-    ("GET /v1/client/devices", 15.0),
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
     ("GET /v1/client/runtimes", 6.0),
     ("GET /v1/client/runtimes/{*id}", 14.0),
