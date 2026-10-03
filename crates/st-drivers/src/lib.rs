@@ -68,6 +68,7 @@ pub mod provider_session;
 pub mod push_mailbox;
 pub mod reconcile;
 pub mod reexec;
+pub mod restart_context;
 
 pub mod residency;
 pub mod residency_host;

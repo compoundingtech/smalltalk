@@ -499,6 +499,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/diagnostics/harness", post(post_harness_diagnostic))
         .route("/v1/delivery/hold", get(get_delivery_hold).post(post_delivery_hold))
         .route("/v1/claims", get(list_claims).post(post_claim))
+        .route("/v1/claims/harness-session-binding", post(post_harness_session_binding))
         .route("/v1/usage", get(get_usage))
         .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews", get(list_reviews))
@@ -2134,6 +2135,14 @@ fn client_agent_resources_uncached(
                 .as_deref()
                 .or(runtime_id)
                 .map(|identity| managed_session_id(&subject.subject, identity));
+            let restart_will_resume = match incarnation_id.as_deref() {
+                Some(incarnation) => restart_native_session(
+                    store, &subject.subject, incarnation,
+                    subject.desired.as_ref().and_then(desired_harness_driver).as_deref(),
+                    Some(snapshot_index),
+                )?.is_some(),
+                None => false,
+            };
             let updated_at = subject
                 .harness
                 .as_ref()
@@ -2181,6 +2190,7 @@ fn client_agent_resources_uncached(
                 "silent_since": silent_since.map(client_timestamp),
                 "fault": fault,
                 "incarnation_id": incarnation_id,
+                "restart_will_resume": restart_will_resume,
                 "current_session_id": current_session_id,
                 "current_work_ids": queue.current_work_ids,
                 "active_work_count": queue.active_work_count,
@@ -4708,12 +4718,13 @@ async fn guard_bound_request(
     {
         return Ok(request);
     }
+    let native_binding = path == "/v1/claims/harness-session-binding";
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
         .await
         .map_err(ApiError::internal)?;
     if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-        for key in ["actor", "requester"] {
+        for key in ["actor", "requester"].into_iter().chain(native_binding.then_some("agent")) {
             if let Some(actor) = value.get(key).and_then(Value::as_str)
                 && actor != bound_agent
             {
@@ -8334,12 +8345,24 @@ struct AgentRestartRequest {
     subject: String,
     actor: String,
     idempotency_key: String,
+    incarnation_id: String,
+    #[serde(default)]
+    fresh_context: bool,
+    #[serde(default)]
+    desired_revision: Option<String>,
 }
 
 async fn restart_agent(
     State(state): State<AppState>,
     Json(request): Json<AgentRestartRequest>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
+    request_agent_restart(&state, request).map(Json)
+}
+
+fn request_agent_restart(
+    state: &AppState,
+    request: AgentRestartRequest,
+) -> Result<ClaimRecord, ApiError> {
     let actor = person_or_agent_actor(&request.actor, "invalid-restart-actor")?;
     let subject = if request.subject.starts_with("agent/") {
         request.subject
@@ -8352,7 +8375,7 @@ async fn restart_agent(
         .operation_claim(&key)
         .map_err(ApiError::internal)?
     {
-        return Ok(Json(prior));
+        return Ok(prior);
     }
     if crate::suspension::current(&state.store, &subject)
         .map_err(ApiError::internal)?
@@ -8418,6 +8441,25 @@ async fn restart_agent(
         .and_then(|fields| fields.get("incarnation_id"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    if incarnation.is_empty() || request.incarnation_id != incarnation {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-incarnation",
+            "the seat's runtime incarnation changed",
+        )));
+    }
+    if request.desired_revision.as_deref().is_some_and(|expected| expected != token) {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-revision",
+            "the seat's desired revision changed",
+        )));
+    }
+    let native_session_id = if request.fresh_context {
+        None
+    } else {
+        restart_native_session(
+            &state.store, &subject, incarnation, member.driver.as_deref(), None,
+        ).map_err(ApiError::internal)?
+    };
     let claim = state
         .store
         .append_claim(&ClaimInput {
@@ -8431,14 +8473,49 @@ async fn restart_agent(
                     Value::String(member.runtime_id.clone()),
                 ),
                 ("incarnation_id".into(), Value::String(incarnation.into())),
+                ("native_session_id".into(), json!(native_session_id)),
+                ("fresh_context".into(), Value::Bool(request.fresh_context)),
             ]),
             evidence: vec![token],
             expected_subject: None,
             idempotency_key: Some(key),
         })
         .map_err(ApiError::bad)?;
-    signal_changed(&state);
-    Ok(Json(claim))
+    signal_changed(state);
+    Ok(claim)
+}
+
+/// Only evidence bound to this exact incarnation and supported launch driver can resume.
+fn restart_native_session(
+    store: &Store,
+    subject: &str,
+    incarnation: &str,
+    driver: Option<&str>,
+    snapshot_index: Option<u64>,
+) -> anyhow::Result<Option<String>> {
+    let Some(driver @ ("claude" | "codex" | "omp" | "pi" | "opencode")) = driver else {
+        return Ok(None);
+    };
+    let mut before = snapshot_index.and_then(|index| index.checked_add(1));
+    loop {
+        let page = store.claims_for_subject_kind_at(
+            subject, "harness.session-file", before, true, 64,
+        )?;
+        for claim in page.claims {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            if fields.get("incarnation_id").and_then(Value::as_str) == Some(incarnation)
+                && fields.get("harness").and_then(Value::as_str) == Some(driver)
+            {
+                if fields.get("resume_available").and_then(Value::as_bool) != Some(true) {
+                    return Ok(None);
+                }
+                return Ok(fields.get("session_id").and_then(Value::as_str)
+                    .filter(|id| !id.is_empty()).map(str::to_owned));
+            }
+        }
+        let Some(cursor) = page.next_cursor else { return Ok(None) };
+        before = Some(cursor);
+    }
 }
 
 #[derive(Deserialize)]
@@ -9167,6 +9244,84 @@ async fn post_delivery_hold(
     }
     Ok(Json(claim))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessSessionBindingRequest {
+    agent: String,
+    harness: String,
+    session_id: String,
+    resume_available: bool,
+    path: Option<String>,
+    incarnation_id: String,
+    idempotency_key: String,
+}
+
+/// A managed native wrapper can bind only its own current runtime, never import a session.
+async fn post_harness_session_binding(
+    State(state): State<AppState>,
+    Json(request): Json<HarnessSessionBindingRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    if !request.agent.starts_with("agent/")
+        || request.session_id.is_empty()
+        || request.incarnation_id.is_empty()
+        || !matches!(request.harness.as_str(), "claude" | "codex" | "omp" | "pi" | "opencode")
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-native-session-binding",
+            "a native binding requires an agent, supported harness, session ID and incarnation",
+        )));
+    }
+    let store = state.store.clone();
+    let (claim, appended) = blocking_action(move || {
+        let internal = |error: anyhow::Error| St3Error::new("internal", error.to_string());
+        let status = store.status(Some(&request.agent)).map_err(internal)?;
+        let current = status.subjects.iter().find(|item| item.subject == request.agent)
+            .ok_or_else(|| St3Error::new("missing-agent", "the native binding has no current seat"))?;
+        let incarnation = current.actual.as_ref()
+            .map(|actual| actual.get("fields").unwrap_or(actual))
+            .and_then(|fields| fields.get("incarnation_id")).and_then(Value::as_str);
+        if incarnation != Some(request.incarnation_id.as_str())
+            || current.actual_origin.as_deref() != Some(store.origin())
+        {
+            return Err(St3Error::new(
+                "stale-incarnation", "the native binding does not name this host's current incarnation",
+            ));
+        }
+        let desired = store.desired_subject_with_writer(&request.agent).map_err(internal)?
+            .map(|(desired, _)| desired)
+            .filter(|desired| desired.kind == "agent")
+            .ok_or_else(|| St3Error::new("binding-not-declared", "the seat has no active native declaration"))?;
+        if !current.conflicts.is_empty()
+            || desired.member.as_ref().and_then(|member| member.driver.as_deref())
+                != Some(request.harness.as_str())
+        {
+            return Err(St3Error::new(
+                "binding-driver-mismatch", "the native binding must match the seat's declared harness",
+            ));
+        }
+        store.append_claim_outcome(&ClaimInput {
+            subject: request.agent.clone(),
+            kind: "harness.session-file".into(),
+            actor: Some(request.agent.clone()),
+            fields: BTreeMap::from([
+                ("agent".into(), json!(request.agent)),
+                ("harness".into(), json!(request.harness)),
+                ("session_id".into(), json!(request.session_id)),
+                ("resume_available".into(), json!(request.resume_available)),
+                ("path".into(), json!(request.path)),
+                ("incarnation_id".into(), json!(request.incarnation_id)),
+            ]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: Some(request.idempotency_key),
+        })
+    }).await?;
+    if appended {
+        signal_visible_change(&state);
+    }
+    Ok(Json(claim))
+}
+
 async fn post_claim(
     State(state): State<AppState>,
     Json(request): Json<ClaimInput>,
@@ -19589,6 +19744,85 @@ version 2
             descending["claims"][0]["subject"].as_str(),
             Some("host/two")
         );
+    }
+
+    #[tokio::test]
+    async fn native_session_binding_admits_only_current_own_declared_harness() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let agent = "agent/example/binding";
+        let source = "version 2\nagent \"example/binding\" { workspace \"/tmp\"; harness \"codex\" { effort \"high\"; }; restart \"never\" }\n";
+        let intent = crate::graph::parse_intent(source, &state.node).unwrap();
+        let preview = state.store.mission(&intent, IntentInput {
+            kdl: source.into(), source_name: None,
+        }).unwrap();
+        state.store.apply(&intent, &preview.subject_tokens, "binding-fixture").unwrap();
+        state.store.append_claim(&ClaimInput {
+            subject: agent.into(), kind: "runtime.observed".into(), actor: Some(agent.into()),
+            fields: BTreeMap::from([
+                ("runtime_id".into(), json!("binding-runtime")),
+                ("incarnation_id".into(), json!("current")),
+                ("status".into(), json!("running")),
+            ]),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let app = router(state.clone()).layer(axum::middleware::from_fn(
+            move |request: Request<Body>, next: axum::middleware::Next| async move {
+                match guard_bound_request(request, Some("agent/example/binding")).await {
+                    Ok(request) => next.run(request).await,
+                    Err(error) => error.into_response(),
+                }
+            },
+        ));
+        let binding = json!({
+            "agent": agent, "harness": "codex", "session_id": "exact-thread",
+            "incarnation_id": "current", "path": null, "idempotency_key": "native-binding-current",
+            "resume_available": true,
+        });
+        // The transport guard rejects foreign agents before the router adds its envelope.
+        let mut foreign = binding.clone();
+        foreign["agent"] = json!("agent/foreign");
+        let response = app.clone().oneshot(Request::builder().method("POST")
+            .uri("/v1/claims/harness-session-binding").header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&foreign).unwrap())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        ).unwrap();
+        assert_eq!(body["code"], "foreign-agent-actor");
+        for (field, value, code, expected_status) in [
+            ("incarnation_id", "old", "stale-incarnation", StatusCode::CONFLICT),
+            ("harness", "omp", "binding-driver-mismatch", StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let mut invalid = binding.clone();
+            invalid[field] = json!(value);
+            let (status, body) = json_request(
+                app.clone(), "/v1/claims/harness-session-binding", invalid,
+            ).await;
+            assert_eq!(status, expected_status, "{body}");
+            assert_eq!(body["code"], code);
+        }
+        assert!(state.store.latest_claim(agent, Some("harness.session-file")).unwrap().is_none());
+        let (status, accepted) = json_request(
+            app.clone(), "/v1/claims/harness-session-binding", binding.clone(),
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["actor"], agent);
+        assert_eq!(accepted["body"]["fields"]["session_id"], "exact-thread");
+        assert_eq!(accepted["body"]["fields"]["incarnation_id"], "current");
+        let (status, replay) = json_request(
+            app.clone(), "/v1/claims/harness-session-binding", binding,
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["id"], accepted["id"]);
+        // Imported/requester claims remain unavailable through generic publication.
+        let (status, forbidden) = json_request(app, "/v1/claims", json!({
+            "subject": agent, "kind": "harness.session-file", "actor": agent,
+            "fields": {"harness":"codex", "session_id":"imported", "source_session":"session/import"},
+            "evidence": [], "idempotency_key": "raw-import-forbidden",
+        })).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{forbidden}");
+        assert_eq!(forbidden["code"], "claim-write-forbidden");
     }
 
     #[tokio::test]

@@ -496,6 +496,7 @@ The v0 action discriminators are:
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Agent desired state | `agent.stop`, `agent.start` | snapshot and `runtime_desired_revision`, the agent's selected desired claim ID; no runtime incarnation required |
+| Agent restart | `agent.restart` | snapshot and current `runtime_incarnation`; `runtime_desired_revision` is checked when supplied |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; input and resize also require the screen sequence |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
@@ -519,6 +520,39 @@ use the normal audited action receipt/idempotency key; exact retries return the 
 Rust exposes `agent_stop`/`agent_start`; TypeScript and Swift expose `agentStop`/`agentStart`.
 All generated clients' `Fence` models also carry the desired revision required by
 `runtime.stop` and `runtime.restart`.
+
+`agent.restart` takes `{ "agent": "agent/NAME", "fresh_context": false }`. It uses the same
+authority as agent creation, preserves the person audit actor, and appends a durable
+`runtime.action.requested` restart without changing the declaration. It works for standing
+and mission seats under every restart policy, including `never`. The required incarnation
+fence rejects an old seat observation; an optional desired revision fence also guards
+declaration changes. Exact retries retain the original accepted request and captured session.
+By default it captures the native session ID bound to this exact incarnation before stopping,
+then resumes that conversation. `fresh_context: true` explicitly starts a new conversation.
+The Agent resource's `restart_will_resume` is true only for a supported driver with a current
+native binding whose latest `resume_available` flag is true; false honestly indicates a restart
+without preserved native context. An assigned but unsaved session is not resumable. A newer
+unavailable binding, including `/new` within one incarnation, never revives an older saved session;
+missing availability is conservatively false.
+Supported native launches are Claude and OMP (`--resume` with the exact native session),
+pi and OpenCode (`--session` with the exact native session), and Codex's controlled app-server
+launch (the exact native thread). Explicit fresh context overrides authored continuation,
+fork, and session selectors, and discards Codex's stale binding; ordinary daemon adoption
+and residency do not acquire either restart override. Missing current native evidence makes
+`restart_will_resume` false. Session identity does not require a transcript file path:
+`harness.session-file.path` can be null when the provider only publishes its exact session ID.
+Rust exposes `ActionRequest::agent_restart`; Swift and TypeScript expose `agentRestart`.
+The CLI equivalent is `st agents restart NAME --as person/NAME [--fresh-context]`; it obtains
+the current incarnation and declaration fences before submitting `/v1/agents/restart`.
+
+Managed wrappers publish that evidence through `POST /v1/claims/harness-session-binding`,
+with fields `agent`, `harness`, `session_id`, boolean `resume_available`, nullable `path`,
+`incarnation_id`, and `idempotency_key`.
+The daemon derives the claim actor from the agent, rejects another bound harness's agent,
+and requires the local current runtime incarnation and the declared supported native driver.
+It accepts no import metadata or arbitrary claim fields. The generic `/v1/claims` endpoint
+still rejects requester-owned `harness.session-file` claims; authorized native-session imports
+continue to use `session.import`.
 
 `agent.queue-move` takes `agent_id`, `mission_run_id`, `placement` (`top`, `bottom`, `before`, or
 `after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one

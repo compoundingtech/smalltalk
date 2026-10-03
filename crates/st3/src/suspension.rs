@@ -251,6 +251,11 @@ pub fn bound_session(
         .into_iter()
         .rev()
         .find(|claim| field(claim, "incarnation_id") == Some(incarnation))
+        // A newer unsaved binding supersedes the prior conversation; never resume an
+        // older session after a harness starts a fresh, not-yet-persisted context.
+        .filter(|claim| {
+            claim.body["fields"]["resume_available"].as_bool() != Some(false)
+        })
         .and_then(|claim| {
             Some((
                 field(&claim, "harness")?.to_owned(),
@@ -400,6 +405,53 @@ pub fn annotate_quiescence(fields: &mut std::collections::BTreeMap<String, Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsaved_native_context_cannot_suspend_or_revive_an_older_session() {
+        let store = Store::open_memory("suspension-native-binding").unwrap();
+        let subject = "agent/example/worker";
+        let incarnation = "worker:i1";
+        let bind = |session: &str, availability: Option<bool>| {
+            let mut fields = std::collections::BTreeMap::from([
+                ("harness".into(), Value::from("omp")),
+                ("session_id".into(), Value::from(session)),
+                ("incarnation_id".into(), Value::from(incarnation)),
+            ]);
+            if let Some(available) = availability {
+                fields.insert("resume_available".into(), Value::from(available));
+            }
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.session-file".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        bind("saved", None);
+        assert_eq!(
+            bound_session(&store, subject, incarnation).unwrap(),
+            Some(("omp".into(), "saved".into()))
+        );
+        bind("new-context", Some(false));
+        assert_eq!(bound_session(&store, subject, incarnation).unwrap(), None);
+        assert!(
+            blockers(&store, subject, incarnation)
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker == "native-session-unbound")
+        );
+        bind("new-context", Some(true));
+        assert_eq!(
+            bound_session(&store, subject, incarnation).unwrap(),
+            Some(("omp".into(), "new-context".into()))
+        );
+        assert_eq!(bound_session(&store, subject, "worker:i2").unwrap(), None);
+    }
 
     #[test]
     fn only_an_idle_harness_with_nothing_pending_is_quiescent() {

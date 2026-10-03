@@ -2628,9 +2628,10 @@ fn run_controlled_with_required_resume(
 /// Run the native Codex driver with explicit private state paths.
 ///
 /// The claims-graph runtime uses this entry point without an st2 catalog. The driver keeps the
-/// app-server protocol, delivery receipts, and harness records. Each st3 seat
-/// launch starts a new Codex thread, except a resumed seat's: `resume_thread` names the thread it
-/// suspended on, and the TUI and control connection resume exactly that thread or fail.
+/// app-server protocol, delivery receipts, and harness records. Ordinary launches start a new
+/// thread. A suspended seat supplies `resume_thread`; an audited restart selects its captured
+/// thread or explicitly discards it. The TUI and control connection resume exactly the selected
+/// thread or fail.
 #[allow(clippy::too_many_arguments)]
 pub fn run_controlled_paths(
     driver_root: &Path,
@@ -2646,6 +2647,8 @@ pub fn run_controlled_paths(
         !codex_argv.is_empty(),
         "Codex controlled launch argv is empty"
     );
+    let restart = crate::restart_context::Context::from_env();
+    let codex_argv = restart.apply_argv("codex", codex_argv)?;
     // Install before any protocol preflight child exists, exactly as the catalog entry point does.
     crate::provider_session::install_signal_handler();
     let producer_version = ensure_supported_protocol(&codex_argv[0])?;
@@ -2679,13 +2682,17 @@ pub fn run_controlled_paths(
         &runtime_id,
         false,
     )?;
+    let resume_thread = match restart {
+        crate::restart_context::Context::Ordinary => resume_thread.or(retired),
+        crate::restart_context::Context::Fresh => None,
+        crate::restart_context::Context::Resume(thread) => Some(thread),
+    };
     if let Some(thread) = &resume_thread {
         anyhow::ensure!(
             resume_insertion_index(&codex_argv[1..])?.is_some(),
             "the Codex argv already selects a thread, so it cannot resume {thread}"
         );
     }
-    let resume_thread = resume_thread.or(retired);
     let result = run_controlled_owned(
         driver_root,
         state_dir,
@@ -3152,6 +3159,7 @@ fn spawn_controlled_app_server(
     log: &File,
 ) -> Result<OwnedProcessGroup> {
     let mut command = Command::new(codex);
+    crate::restart_context::remove_launch_environment(&mut command);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -3167,6 +3175,7 @@ const CONTROLLED_TUI_OVERRIDES: [&str; 2] = ["-c", "check_for_update_on_startup=
 
 fn controlled_tui_command(codex: &str, args: &[String]) -> Command {
     let mut command = Command::new(codex);
+    crate::restart_context::remove_launch_environment(&mut command);
     command.args(CONTROLLED_TUI_OVERRIDES).args(args);
     command
 }
@@ -3985,6 +3994,7 @@ fn preflight_hook_trust(
 ) -> Result<Option<HookTrustProjection>> {
     diagnostics.record("hookTrustPreflightStarting", json!({}))?;
     let mut server_command = Command::new(codex);
+    crate::restart_context::remove_launch_environment(&mut server_command);
     server_command
         .args(server_args)
         .stdin(Stdio::null())
@@ -4645,6 +4655,10 @@ fn pump_control(
         let mut subscription_pending = false;
         let mut last_transcript_turn_recovery = None;
         let mut peer_closed = false;
+        // A fresh thread has no rollout before its first turn. Only positive persisted evidence
+        // lets an audited restart resume it.
+        let mut rollout_recorded = false;
+        let mut next_rollout_probe = Instant::now();
         let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
         let mut delivery = delivery
             .map(|config| {
@@ -4686,6 +4700,22 @@ fn pump_control(
         loop {
             if let Some(delivery) = delivery.as_mut() {
                 delivery.sync_safe_fallback_diagnostic();
+            }
+            if !rollout_recorded
+                && let Some(state) = control_state.as_ref()
+                && Instant::now() >= next_rollout_probe
+            {
+                next_rollout_probe = Instant::now() + ROLLOUT_EVIDENCE_PROBE_INTERVAL;
+                match latest_codex_transcript(state.thread_id()) {
+                    Ok(Some(path)) => {
+                        record_rollout_evidence(binding_path, runtime, state.thread_id(), Some(&path))?;
+                        rollout_recorded = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!("st codex: rollout evidence discovery failed: {error:#}")
+                    }
+                }
             }
             if !peer_closed
                 && let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))
@@ -4829,6 +4859,14 @@ fn pump_control(
                         &CodexThreadBinding::new(runtime, thread_id.to_string()),
                     )
                     .context("persisting Codex resume binding")?;
+                    // An accepted resume proves the thread's rollout is persisted.
+                    record_rollout_evidence(
+                        binding_path,
+                        runtime,
+                        thread_id,
+                        latest_codex_transcript(thread_id).ok().flatten().as_deref(),
+                    )?;
+                    rollout_recorded = true;
                     atomic_json(control_state_path, &bound)
                         .context("persisting Codex control state")?;
                     if let Some(delivery) = delivery.as_mut() {
@@ -5119,6 +5157,27 @@ fn latest_codex_transcript(thread_id: &str) -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     latest_codex_transcript_in(&home, thread_id)
+}
+
+/// Beside `binding.json`: the bound thread's persisted rollout, the restart resume evidence.
+pub const ROLLOUT_EVIDENCE_FILE: &str = "rollout.json";
+const ROLLOUT_EVIDENCE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+fn record_rollout_evidence(
+    binding_path: &Path,
+    runtime: &CodexRuntime,
+    thread_id: &str,
+    rollout: Option<&Path>,
+) -> Result<()> {
+    atomic_json(
+        &binding_path.with_file_name(ROLLOUT_EVIDENCE_FILE),
+        &json!({
+            "runtimeIncarnation": runtime.incarnation(),
+            "threadId": thread_id,
+            "path": rollout,
+        }),
+    )
+    .context("persisting Codex rollout evidence")
 }
 
 /// `$CODEX_HOME`, else `~/.codex`.

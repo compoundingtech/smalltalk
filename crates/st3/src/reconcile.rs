@@ -73,6 +73,12 @@ const SEAT_RETENTION_CHECK_MS: u128 = 10_000;
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const DECLARED_CHECKOUT_LIMIT: usize = 4096;
 
+/// Context selection applies only to a person-requested launch, never daemon adoption.
+enum RestartContext<'a> {
+    Resume(&'a str),
+    Fresh,
+}
+
 #[cfg(test)]
 thread_local! {
     static DECLARATION_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1726,6 +1732,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 subject,
                                 member,
                                 "the desired member revision changed",
+                                None,
                             )?;
                             return Ok(());
                         }
@@ -1769,6 +1776,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 subject,
                                 member,
                                 "the desired member revision changed",
+                                None,
                             )?;
                             return Ok(());
                         }
@@ -1821,7 +1829,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             if let Some(error) = blocked.take() {
                                 return Err(error);
                             }
-                            self.perform_start(subject, member, "the desired member is absent")?;
+                            self.perform_start(subject, member, "the desired member is absent", None)?;
                         }
                     }
                 }
@@ -3488,6 +3496,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         subject: &DesiredSubject,
         member: &MemberSpec,
         reason: &str,
+        restart_context: Option<RestartContext<'_>>,
     ) -> Result<()> {
         // A member whose start keeps failing waits between attempts and then parks with one
         // attention request, instead of spawning again on every pass. A gate runner fails its gate.
@@ -3569,15 +3578,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .environment
                 .remove(crate::suspension::RESUME_ENV);
         }
-        // Every other relaunch of a seat continues the native session its harness last bound,
-        // so a restart, a hangup or a changed declaration never loses the conversation.
+        // Ordinary relaunches continue the last native session. An explicit restart
+        // instead uses its captured session or deliberately selects fresh context.
         launch_member
             .environment
             .remove(crate::suspension::CONTINUE_ENV);
         launch_member
             .environment
             .remove(crate::suspension::CONTINUE_PATH_ENV);
-        let continued = if subject.kind == "agent"
+        let continued = if restart_context.is_none()
+            && subject.kind == "agent"
             && !member
                 .environment
                 .contains_key(crate::suspension::RESUME_ENV)
@@ -3596,6 +3606,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .environment
                     .insert(crate::suspension::CONTINUE_PATH_ENV.into(), path);
             }
+        }
+        launch_member.environment.remove("ST3_RESTART_NATIVE_SESSION");
+        launch_member.environment.remove("ST3_RESTART_FRESH_CONTEXT");
+        match restart_context {
+            Some(RestartContext::Resume(session)) => {
+                launch_member
+                    .environment
+                    .insert("ST3_RESTART_NATIVE_SESSION".into(), session.into());
+            }
+            Some(RestartContext::Fresh) => {
+                launch_member
+                    .environment
+                    .insert("ST3_RESTART_FRESH_CONTEXT".into(), "1".into());
+            }
+            None => {}
         }
         launch_member
             .environment
@@ -3959,7 +3984,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .latest_observation(agent, "runtime.action.succeeded")?
                     .map(|claim| claim.id);
                 if let Err(error) =
-                    self.perform_start(subject, &resumed, "a suspended seat was resumed")
+                    self.perform_start(subject, &resumed, "a suspended seat was resumed", None)
                 {
                     return self.fail_suspension(
                         agent,
@@ -4197,6 +4222,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         }
         if let Some(observation) = observation.filter(|item| item.status == "running") {
+            if observation.incarnation_id.as_deref() != Some(previous) {
+                // An unidentifiable process is not permission to issue an unfenced stop.
+                return Ok(true);
+            }
             // Rendering must succeed before we shut down a still-running seat.
             if let Some(error) = blocked {
                 anyhow::bail!("restart blocked: {error:#}");
@@ -4224,7 +4253,17 @@ impl<R: RuntimeControl> Reconciler<R> {
             .store
             .latest_observation(&subject.subject, "runtime.action.succeeded")?
             .map(|claim| claim.id);
-        self.perform_start(subject, member, "an explicit seat restart was requested")?;
+        // Without captured evidence the declared launch runs unchanged, including any authored
+        // resume arguments; only an explicit fresh request strips them.
+        let context = if request.body["fields"]["fresh_context"].as_bool() == Some(true) {
+            Some(RestartContext::Fresh)
+        } else {
+            request.body["fields"]["native_session_id"]
+                .as_str()
+                .filter(|session| !session.is_empty())
+                .map(RestartContext::Resume)
+        };
+        self.perform_start(subject, member, "an explicit seat restart was requested", context)?;
         let after = self
             .store
             .latest_observation(&subject.subject, "runtime.action.succeeded")?
@@ -4275,7 +4314,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&subject.subject);
-                self.perform_start(subject, member, "the prior generation exited")
+                self.perform_start(subject, member, "the prior generation exited", None)
             }
             RestartDecision::Wait { until, reason } => {
                 self.record_once(
@@ -6584,6 +6623,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             },
             &member,
             "the loop metric was requested",
+            None,
         )?;
         self.arm_gate_poll(&member.runtime_id);
         Ok(None)
@@ -10902,7 +10942,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
         // A check that cannot start, such as one whose workspace is missing, cannot answer.
         if let Err(error) =
-            self.perform_start(&desired, &member, "the mechanical gate was requested")
+            self.perform_start(&desired, &member, "the mechanical gate was requested", None)
         {
             let check = check_result(
                 None,
@@ -11426,7 +11466,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             owner_generation: None,
             owner_step: None,
         };
-        self.perform_start(&desired, &member, "the LLM gate was requested")?;
+        self.perform_start(&desired, &member, "the LLM gate was requested", None)?;
         Ok(GateOutcome::Pending)
     }
 
