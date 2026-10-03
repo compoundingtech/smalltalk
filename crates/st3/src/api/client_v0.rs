@@ -5420,8 +5420,11 @@ pub(super) async fn pairing_complete(
         }
         return Err(ApiError::bad(error));
     }
-    // A device with a real key is enrolled: the person's root key grants it as a device key.
-    let chain = match device_signing_key(&device_public_key) {
+    // A device with a real key, paired to send messages, is enrolled: the person's root key
+    // grants it as a device key. A device paired only to read gets no key that speaks for the
+    // person, so a wall display can never sign as them.
+    let signs = scopes.contains(&"control.messages");
+    let chain = match device_signing_key(&device_public_key).filter(|_| signs) {
         Some(key) => {
             let name = begun
                 .body
