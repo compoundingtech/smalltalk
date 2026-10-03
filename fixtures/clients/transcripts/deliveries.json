@@ -1,0 +1,266 @@
+[
+  {
+    "id": "delivery-1",
+    "sequence": 1,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:01:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "Please audit the harbor keys and tell me what still reads the old ones."
+    }
+  },
+  {
+    "id": "delivery-2",
+    "sequence": 2,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:02:00Z",
+    "role": "assistant",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "Starting the audit."
+    }
+  },
+  {
+    "id": "delivery-3",
+    "sequence": 3,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:03:00Z",
+    "role": "user",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "message/aa01",
+      "from": "person/example",
+      "to": "agent/example/quay"
+    }
+  },
+  {
+    "id": "delivery-4",
+    "sequence": 4,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:04:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "how is the audit going?"
+    }
+  },
+  {
+    "id": "delivery-5",
+    "sequence": 5,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:05:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "<channel source=\"plugin:st3-channel:st3\" from=\"person/example\" messageId=\"message/aa01\" threadId=\"message/aa01\">\n<smalltalk-message id=\"aa01\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/aa01\">\nhow is the audit going?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.\n</channel>"
+    }
+  },
+  {
+    "id": "delivery-6",
+    "sequence": 6,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:06:00Z",
+    "role": "user",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "message/aa02",
+      "from": "person/example",
+      "to": "agent/example/quay"
+    }
+  },
+  {
+    "id": "delivery-7",
+    "sequence": 7,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:07:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "is this a watcher"
+    }
+  },
+  {
+    "id": "delivery-8",
+    "sequence": 8,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:08:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "(dictated by voice; it may contain transcription mistakes)\n<smalltalk-message id=\"aa02\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/aa02\">\nis this a watcher\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session."
+    }
+  },
+  {
+    "id": "delivery-9",
+    "sequence": 9,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:09:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "<channel source=\"plugin:st3-channel:st3\" from=\"agent/example/harbor\" messageId=\"message/aa03\">\n<smalltalk-message id=\"aa03\" from=\"agent/example/harbor\" to=\"agent/example/quay\" subject=\"Key audit\" sha256=\"00\" graph=\"message/aa03\">\nKeys rotated &amp; checked.\n</smalltalk-message>\n</channel>"
+    }
+  },
+  {
+    "id": "delivery-10",
+    "sequence": 10,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:10:00Z",
+    "role": "user",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "message/aa04",
+      "from": "agent/example/harbor",
+      "to": "agent/example/quay",
+      "title": "Tide tables"
+    }
+  },
+  {
+    "id": "delivery-11",
+    "sequence": 11,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:11:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "tide tables are ready"
+    }
+  },
+  {
+    "id": "delivery-12",
+    "sequence": 12,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:12:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "<channel source=\"plugin:st3-channel:st3\" from=\"agent/example/harbor\">\n[PING from st3] message/aa04 from agent/example/harbor: Tide tables\n</channel>"
+    }
+  },
+  {
+    "id": "delivery-13",
+    "sequence": 13,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:13:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "<channel source=\"plugin:st3-channel:st3\" from=\"agent/example/harbor\">\nSubject: Berth schedule\nThe berth schedule changed.\n</channel>"
+    }
+  },
+  {
+    "id": "delivery-14",
+    "sequence": 14,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:14:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "[PING from st3] message/aa05 from agent/example/harbor: Crane report\nplease look at the crane report"
+    }
+  },
+  {
+    "id": "delivery-15",
+    "sequence": 15,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:15:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "<command-name>/review</command-name>\n<command-args>42</command-args>"
+    }
+  },
+  {
+    "id": "delivery-16",
+    "sequence": 16,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:16:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "<local-command-stdout>review queued\nall checks green</local-command-stdout>"
+    }
+  },
+  {
+    "id": "delivery-17",
+    "sequence": 17,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:17:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "<turn_aborted>\nThe user interrupted.\n</turn_aborted>"
+    }
+  },
+  {
+    "id": "delivery-18",
+    "sequence": 18,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:18:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "<system-reminder>\nInternal context the person never sees.\n</system-reminder>"
+    }
+  },
+  {
+    "id": "delivery-19",
+    "sequence": 19,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:19:00Z",
+    "role": "user",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "This session is being continued from a previous conversation that ran out of context.\nSummary: the audit found two readers."
+    }
+  },
+  {
+    "id": "delivery-20",
+    "sequence": 20,
+    "revision": 1,
+    "timestamp": "2026-10-03T10:20:00Z",
+    "role": "assistant",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "Two readers still use the old keys; both are fixed."
+    }
+  }
+]

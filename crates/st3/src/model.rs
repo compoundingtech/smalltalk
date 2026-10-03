@@ -938,7 +938,20 @@ pub struct SubscriptionSpec {
     /// (`every "30m"`), and only when something arrived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_every_ms: Option<u64>,
+    /// A seat's watch on one issue or pull request (`delivery "watch"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchSpec>,
     pub stopped: bool,
+}
+
+/// What a watch hears: one item of the observed repository, from when the watch began until its
+/// optional deadline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WatchSpec {
+    pub item: u64,
+    pub since_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_unix_ms: Option<u128>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

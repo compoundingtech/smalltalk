@@ -978,6 +978,20 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_delivery_is_the_mail_and_sts_notes_are_not_the_persons_words() {
+        // Nathan, 2026-10-03: a Codex seat's turn carried st's envelope and its delivery note,
+        // shown as raw XML and as words he typed.
+        let delivery = "(dictated by voice; it may contain transcription mistakes)\n<smalltalk-message id=\"e5\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/e5\">\nis this a watcher?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.";
+        let shown = BTreeSet::from(["message/e5".to_owned()]);
+        assert!(from_harness(true, delivery, &shown).is_empty());
+        let bodies = from_harness(true, delivery, &BTreeSet::new());
+        assert!(
+            matches!(&bodies[..], [Body::Mail { body, .. }] if body == "is this a watcher?"),
+            "{bodies:?}"
+        );
+    }
+
+    #[test]
     fn a_channel_delivery_carrying_an_envelope_is_that_mail_not_a_line() {
         // The Claude channel's delivery: st's envelope, then the delivery notes after it.
         let delivery = "<channel source=\"plugin:st3-channel:st3\" from=\"person/example\" messageId=\"message/c3\">\n<smalltalk-message id=\"c3\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/c3\">\nhow is it going?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.\n</channel>";

@@ -63,6 +63,7 @@ mod client_presence;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
+mod github_watch;
 mod harness_events;
 mod mailbox;
 mod terminal_view;
@@ -633,6 +634,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(cancel_revision_proposal),
         )
         .route("/v1/work/ask", post(ask_person))
+        .route("/v1/github/watch", post(github_watch::watch))
+        .route("/v1/github/unwatch", post(github_watch::unwatch))
+        .route("/v1/github/watches", get(github_watch::watches))
+        .route("/v1/github/comment", post(github_watch::comment))
+        .route("/v1/github/own", post(github_watch::own))
         .route("/v1/work/done", post(done_person_step))
         .route("/v1/work/cancel-ask", post(cancel_person_ask))
         .route("/v1/work", get(list_work))
@@ -4738,6 +4744,7 @@ async fn guard_bound_request(
         "/v1/delivery/hold",
         "/v1/lane-changes",
         "/v1/work/",
+        "/v1/github/",
         "/v1/attention",
         "/v1/launches",
         "/v1/mission-runs/",
@@ -7928,12 +7935,9 @@ async fn cancel_planning_session(
 }
 
 fn required_planning_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
-    let id = launch_session_id(id);
-    state
-        .store
-        .planning_session(id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("launch `{id}` does not exist")))
+    // Legacy CLI launch IDs can themselves begin with `launch/`. Resolve the exact stored
+    // ID before treating that prefix as the client resource namespace.
+    client_launch_session(state, id)
 }
 
 fn normalize_planning_reviewer(value: &str) -> String {

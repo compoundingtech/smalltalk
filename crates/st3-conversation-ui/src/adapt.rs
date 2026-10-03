@@ -429,6 +429,13 @@ fn ping_id(line: &str) -> Option<&str> {
         .filter(|id| id.starts_with("message/"))
 }
 
+/// The lines st adds beside a delivery for the agent (st-drivers `ding`): where the person reads
+/// replies, and that a message was dictated.
+const ST_DELIVERY_NOTES: &[&str] = &[
+    "The person reads replies in st, not in the agent's session.",
+    "(dictated by voice; it may contain transcription mistakes)",
+];
+
 /// `from_harness`, also noting in `delivered` each shown message the harness received: that
 /// message is marked delivered instead of announced again.
 fn harness_bodies(
@@ -605,6 +612,12 @@ fn harness_bodies(
     for tag in CONTEXT_BLOCKS {
         take_blocks(&mut text, tag);
     }
+    // st's own notes beside a delivery tell the agent something; the person never typed them.
+    let text = text
+        .lines()
+        .filter(|line| !ST_DELIVERY_NOTES.contains(&line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
     let rest = clean_message_text(&text);
     if is_user && !rest.is_empty() {
         bodies.insert(0, Body::User(rest));

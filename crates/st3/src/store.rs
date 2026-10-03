@@ -88,6 +88,7 @@ mod checkpoint_rules;
 mod limits;
 mod person_work;
 mod subagents;
+mod watches;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
 pub use limits::{AccountLimit, LIMITS_ACTOR, LimitsOutcome, LimitsPolicy};
 pub use subagents::{
@@ -1713,6 +1714,95 @@ fn listed_head_tx(
         .and_then(|item| item.get("head"))
         .and_then(Value::as_str)
         .map(str::to_owned))
+}
+
+/// How a watch ended, when it did: the `subscription.watch-ended` claim for the watch that began
+/// at its `since`. Watching again begins a new watch.
+pub(crate) fn watch_ended_tx(
+    connection: &Connection,
+    subject: &str,
+    watch: &crate::model::WatchSpec,
+) -> Result<Option<Value>, St3Error> {
+    let since = watch.since_unix_ms.to_string();
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT body FROM claims WHERE subject=?1 AND kind='subscription.watch-ended'",
+        )
+        .map_err(internal)?;
+    let bodies = statement
+        .query_map([subject], |row| row.get::<_, String>(0))
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    Ok(bodies
+        .into_iter()
+        .filter_map(|body| serde_json::from_str::<Value>(&body).ok())
+        .map(|body| body["fields"].clone())
+        .find(|fields| fields.get("since_unix_ms").and_then(Value::as_str) == Some(since.as_str())))
+}
+
+/// End a watch: why, and the final wake that told its seat, if one did. Ending it twice records
+/// nothing more.
+pub(crate) fn end_watch_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    origin: &str,
+    batch_id: Option<&str>,
+    subject: &str,
+    watch: &crate::model::WatchSpec,
+    reason: &str,
+    message: Option<&str>,
+) -> Result<bool, St3Error> {
+    if watch_ended_tx(transaction, subject, watch)?.is_some() {
+        return Ok(false);
+    }
+    let mut fields = json!({
+        "reason": reason,
+        "since_unix_ms": watch.since_unix_ms.to_string(),
+    });
+    if let Some(message) = message {
+        fields["message"] = Value::String(message.to_owned());
+    }
+    append_claim_tx(
+        transaction,
+        origin,
+        subject,
+        "subscription.watch-ended",
+        None,
+        &json!({"fields": fields}),
+        &[],
+        batch_id,
+    )
+    .map_err(claim_append_error)?;
+    Ok(true)
+}
+
+/// The seat that registered a comment or review, by its GitHub ID, never by login.
+pub(crate) fn github_posted_by_tx(
+    connection: &Connection,
+    thread: &crate::github_watch::ThreadRef,
+    entry: &Value,
+) -> Result<Option<String>, St3Error> {
+    let (kind, id) = crate::resource::recent_comment_key(entry);
+    github_post_agent_tx(connection, &thread.locator(), &kind, id)
+}
+
+/// The seat that registered the comment or review `kind` `id` of a repository.
+pub(crate) fn github_post_agent_tx(
+    connection: &Connection,
+    locator: &str,
+    kind: &str,
+    id: u64,
+) -> Result<Option<String>, St3Error> {
+    let subject = crate::github_watch::github_post_subject(locator, kind, id);
+    let body = connection
+        .prepare_cached("SELECT body FROM claims WHERE subject=?1 AND kind='github.posted' LIMIT 1")
+        .map_err(internal)?
+        .query_row([&subject], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(internal)?;
+    Ok(body
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|body| body["fields"]["agent"].as_str().map(str::to_owned)))
 }
 
 /// The live agent that owns a repository item, and why: the agent named as its opener while its
@@ -7280,7 +7370,9 @@ impl Store {
                 && let Some(subscription) = crate::graph::subscription_spec(&desired.desired)
                 && !subscription.stopped
             {
-                if !known(&subscription.observer)? {
+                if crate::github_watch::standing_locator(&subscription.observer).is_none()
+                    && !known(&subscription.observer)?
+                {
                     warnings.push(format!(
                         "subscription `{}` references missing observer `{}`",
                         desired.subject, subscription.observer
@@ -12082,13 +12174,121 @@ impl Store {
                     }
                 }
                 let mut message_subjects = Vec::new();
+                // Each watch on an item this observation changed hears the comments and reviews it
+                // did not know, a move of the required checks into pass or fail, and the close
+                // that ends it, each as one wake. The baseline tells no watch anything.
+                if !baseline {
+                    for (subscription_subject, subscription) in &active_subscriptions {
+                        let Some(watch) = &subscription.watch else {
+                            continue;
+                        };
+                        if !available_subscriptions.contains(subscription_subject)
+                            || watch.until_unix_ms.is_some_and(|until| until <= now_ms())
+                            || watch_ended_tx(transaction, subscription_subject, watch)?.is_some()
+                        {
+                            continue;
+                        }
+                        let Some((_, item_subject, item_claim, item_facts)) =
+                            item_claims.iter().find(|(_, subject, ..)| {
+                                subject.rsplit('/').next().and_then(|number| number.parse().ok())
+                                    == Some(watch.item)
+                            })
+                        else {
+                            continue;
+                        };
+                        let Some((thread, _)) = crate::github_watch::watch_parts(subscription_subject)
+                        else {
+                            continue;
+                        };
+                        let prior = recorded_items
+                            .get(item_subject)
+                            .cloned()
+                            .flatten()
+                            .map(|(facts, _)| facts);
+                        let seen = REPOSITORY_COLLECTIONS
+                            .iter()
+                            .filter_map(|(field, _, _)| current_object.get(*field).and_then(Value::as_array))
+                            .flatten()
+                            .find(|item| item.get("number").and_then(Value::as_u64) == Some(watch.item))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        for event in crate::github_watch::watch_events(
+                            watch,
+                            prior.as_ref(),
+                            &seen,
+                            item_facts,
+                        ) {
+                            let posted_by = match &event {
+                                crate::github_watch::WatchEvent::Comment(entry) => {
+                                    github_posted_by_tx(transaction, &thread, entry)?
+                                }
+                                _ => None,
+                            };
+                            // A seat never wakes for what it posted.
+                            if posted_by.as_deref() == Some(subscription.to.as_str()) {
+                                continue;
+                            }
+                            let wake = crate::github_watch::wake(
+                                subscription_subject,
+                                watch,
+                                &thread,
+                                item_facts,
+                                &event,
+                                item_claim,
+                                posted_by.as_deref(),
+                            )?;
+                            let ended = matches!(event, crate::github_watch::WatchEvent::Ended { .. });
+                            if latest_claim_id_tx(transaction, &wake.subject)
+                                .map_err(internal)?
+                                .is_none()
+                            {
+                                append_claim_tx(
+                                    transaction,
+                                    &self.origin,
+                                    &wake.subject,
+                                    "message.sent",
+                                    None,
+                                    &json!({"fields": {
+                                        "from": format!("daemon/{}", self.origin),
+                                        "to": subscription.to,
+                                        "title": wake.title,
+                                        "content": wake.content,
+                                        "status": "sent",
+                                        "tags": wake.tags,
+                                    }, "evidence": [item_claim]}),
+                                    &[],
+                                    Some(&batch_id),
+                                )
+                                .map_err(claim_append_error)?;
+                                message_subjects.push(wake.subject.clone());
+                            }
+                            if ended {
+                                let merged = matches!(
+                                    event,
+                                    crate::github_watch::WatchEvent::Ended { merged: true }
+                                );
+                                end_watch_tx(
+                                    transaction,
+                                    &self.origin,
+                                    Some(&batch_id),
+                                    subscription_subject,
+                                    watch,
+                                    if merged { "merged" } else { "closed" },
+                                    Some(&wake.subject),
+                                )?;
+                            }
+                        }
+                    }
+                }
                 if !baseline && !changed_fields.is_empty() {
                     let evidence = observation_claim
                         .as_ref()
                         .map(|claim| vec![claim.id.clone()])
                         .unwrap_or_default();
                     for (subscription_subject, subscription) in &active_subscriptions {
-                        if !available_subscriptions.contains(subscription_subject) {
+                        if !available_subscriptions.contains(subscription_subject)
+                            || subscription.watch.is_some()
+                        {
                             continue;
                         }
                         let selected = changed_fields
@@ -16569,6 +16769,7 @@ fn insert_local_observation_tx(
             ).map_err(internal)?;
         }
     }
+    smallclaims::touched::note_wrote(|| format!("{} {}", input.kind, input.subject));
     transaction
         .execute(
             "INSERT INTO local_observations(

@@ -174,3 +174,14 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.equal(rest.length, 0);
   assert.deepEqual([mail.kind, mail.from, mail.text], ['mail', 'person/example', 'how is it <going>?']);
 }
+
+// A Codex seat's turn carries st's envelope and its delivery notes: the mail, never raw XML or
+// words the person typed (Nathan, 2026-10-03).
+{
+  const turn = "(dictated by voice; it may contain transcription mistakes)\n<smalltalk-message id=\"e5\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/e5\">\nis this a watcher?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.";
+  const delivered = new Set();
+  assert.deepEqual(fromHarness(true, turn, new Set(['message/e5']), delivered), []);
+  assert.ok(delivered.has('message/e5'));
+  const bodies = fromHarness(true, turn);
+  assert.deepEqual(bodies.map(body => [body.kind, body.text]), [['mail', 'is this a watcher?']]);
+}

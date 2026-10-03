@@ -4337,6 +4337,10 @@ fn conversation_read_now(
     session_id: &str,
     after: Option<&str>,
 ) -> Result<Value, ApiError> {
+    #[cfg(test)]
+    if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
+        *rebuilds.entry(session_id.to_owned()).or_default() += 1;
+    }
     let snapshot = new_client_snapshot(state);
     let page = timeline_value(
         state,
@@ -4522,12 +4526,56 @@ fn conversation_read_now(
 /// What a conversation read last saw, so a wake-up can tell cheaply whether anything that
 /// concerns the conversation changed: a claim about its agent, Small Talk to or from it, a local
 /// timeline entry, or its native transcript file.
+#[derive(Clone)]
 struct ConversationMark {
     owner: Option<String>,
     transcript: Option<std::path::PathBuf>,
     store_index: u64,
     local_position: u64,
     transcript_seen: Option<(u64, std::time::SystemTime)>,
+}
+
+/// The cursors this member gave out recently, each with its conversation's transcript as it was
+/// then (length and modification time). A long-poll that brings one back can tell, without
+/// rebuilding the timeline, that nothing concerning the conversation changed since: idle polls
+/// rebuilt a 200-entry timeline every time, 275–620 ms of daemon CPU each (idle-cpu findings).
+type TranscriptSeen = Option<(u64, std::time::SystemTime)>;
+type HashMap<K, V> = std::collections::HashMap<K, V>;
+const ISSUED_CURSORS: usize = 4096;
+
+fn issued_cursors()
+-> &'static std::sync::Mutex<(std::collections::VecDeque<String>, HashMap<String, TranscriptSeen>)> {
+    static ISSUED: std::sync::OnceLock<
+        std::sync::Mutex<(std::collections::VecDeque<String>, HashMap<String, TranscriptSeen>)>,
+    > = std::sync::OnceLock::new();
+    ISSUED.get_or_init(Default::default)
+}
+
+fn remember_cursor(cursor: &str, seen: TranscriptSeen) {
+    let Ok(mut issued) = issued_cursors().lock() else {
+        return;
+    };
+    let (order, cursors) = &mut *issued;
+    if cursors.insert(cursor.to_owned(), seen).is_none() {
+        order.push_back(cursor.to_owned());
+        while order.len() > ISSUED_CURSORS {
+            if let Some(oldest) = order.pop_front() {
+                cursors.remove(&oldest);
+            }
+        }
+    }
+}
+
+fn issued_transcript(cursor: &str) -> Option<TranscriptSeen> {
+    issued_cursors().lock().ok()?.1.get(cursor).copied()
+}
+
+/// How many times each session's timeline was rebuilt for a change read, for the budget test.
+#[cfg(test)]
+fn timeline_rebuilds() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static REBUILDS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    REBUILDS.get_or_init(Default::default)
 }
 
 fn transcript_seen(path: Option<&std::path::Path>) -> Option<(u64, std::time::SystemTime)> {
@@ -4628,8 +4676,35 @@ async fn conversation_changes_local(
     let mut changed = state.event_notify.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(30_000));
     let mut mark = ConversationMark::new(state, session_id)?;
+    // A cursor this member gave out, with nothing that concerns the conversation changed since:
+    // there is nothing to read yet, so wait without rebuilding the timeline.
+    let mut quiet = None;
+    if let Some(cursor) = after
+        && let Some(seen) = issued_transcript(cursor)
+        && let Ok((store_index, local_position, _)) =
+            conversation_position(state, session_id, cursor)
+    {
+        let mut since = ConversationMark {
+            store_index,
+            local_position,
+            transcript_seen: seen,
+            ..mark.clone()
+        };
+        if !since.changed(state)? {
+            mark = since;
+            quiet = Some(json!({"kind":"conversation-changes", "session_id":session_id, "items":[], "next_cursor":cursor}));
+        }
+    }
     loop {
-        let value = conversation_read_now(state, session, session_id, after)?;
+        // The transcript as the read below will at least see it, for the cursor it returns.
+        let seen = mark.transcript_seen;
+        let value = match quiet.take() {
+            Some(value) => value,
+            None => conversation_read_now(state, session, session_id, after)?,
+        };
+        if let Some(cursor) = value["next_cursor"].as_str() {
+            remember_cursor(cursor, seen);
+        }
         if !value["items"]
             .as_array()
             .is_some_and(|items| items.is_empty())
@@ -4652,13 +4727,15 @@ async fn conversation_changes_local(
                 let mut value = value;
                 if let Some(cursor) = value["next_cursor"].as_str() {
                     let (_, _, native) = conversation_position(state, session_id, cursor)?;
-                    value["next_cursor"] = Value::String(conversation_cursor(
+                    let next = conversation_cursor(
                         state,
                         session_id,
                         mark.store_index,
                         mark.local_position,
                         native,
-                    ));
+                    );
+                    remember_cursor(&next, mark.transcript_seen);
+                    value["next_cursor"] = Value::String(next);
                 }
                 return Ok(value);
             }
@@ -5410,8 +5487,11 @@ pub(super) async fn pairing_complete(
         }
         return Err(ApiError::bad(error));
     }
-    // A device with a real key is enrolled: the person's root key grants it as a device key.
-    let chain = match device_signing_key(&device_public_key) {
+    // A device with a real key, paired to send messages, is enrolled: the person's root key
+    // grants it as a device key. A device paired only to read gets no key that speaks for the
+    // person, so a wall display can never sign as them.
+    let signs = scopes.contains(&"control.messages");
+    let chain = match device_signing_key(&device_public_key).filter(|_| signs) {
         Some(key) => {
             let name = begun
                 .body
@@ -6906,7 +6986,13 @@ fn validate_work_fence(state: &AppState, target: &str, fence: &Fence) -> Result<
         || fence
             .runtime_incarnation
             .as_deref()
-            .is_some_and(|incarnation| work.claim_incarnation.as_deref() != Some(incarnation))
+            .is_some_and(|incarnation| {
+                // A ready step has no lease incarnation yet. Claim dispatch separately
+                // checks the caller's current runtime before acquiring the lease.
+                work.claim_incarnation
+                    .as_deref()
+                    .is_some_and(|claimed| claimed != incarnation)
+            })
     {
         return Err(stale(format!(
             "the execution fence for `{}` is stale",
@@ -7696,6 +7782,22 @@ async fn dispatch_action(
         | "work.release") => {
             let target = parameter_string(p, "target_id")?;
             validate_work_fence(state, &target, &request.fence)?;
+            if action == "work.claim" {
+                let expected = request
+                    .fence
+                    .runtime_incarnation
+                    .as_deref()
+                    .ok_or_else(|| validation("work claim requires a runtime incarnation fence"))?;
+                let live = state
+                    .store
+                    .current_harness(authority_actor)
+                    .map_err(ApiError::internal)?;
+                if !live.as_ref().is_some_and(|harness| {
+                    harness.incarnation_id == expected && harness.state != "ended"
+                }) {
+                    return Err(stale("the claiming agent's runtime incarnation changed"));
+                }
+            }
             let result = state
                 .store
                 .work_action(
@@ -7804,6 +7906,14 @@ async fn dispatch_action(
                 return Err(stale("the revision proposal generation fence is stale"));
             }
             if decision == "mission.approve-revision" {
+                if request
+                    .fence
+                    .preview_token
+                    .as_deref()
+                    .is_some_and(|preview| proposal.preview_hash.as_deref() != Some(preview))
+                {
+                    return Err(stale("the revision proposal preview fence is stale"));
+                }
                 let result = approve_revision_proposal(
                     State(state.clone()),
                     AxumPath(target),
@@ -11498,6 +11608,102 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .0;
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_conversation_long_polls_never_rebuild_the_timeline() {
+        // Budget (idle-cpu findings, #959): a long-poll whose cursor this member gave out, with
+        // nothing that concerns the conversation changed since, answers without rebuilding the
+        // timeline; only a change pays for a read.
+        let root = tempfile::tempdir().unwrap();
+        let owner = test_state_named(root.path(), "conversation-budget");
+        let agent = "agent/conversation-budget";
+        let incarnation = "conversation-budget-runtime:i1";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("conversation-budget-runtime")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("terminal".into(), json!(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-budget-runtime".into()),
+            })
+            .unwrap();
+        let session_id = managed_session_id(agent, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let rebuilds = || {
+            timeline_rebuilds()
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .copied()
+                .unwrap_or(0)
+        };
+        let baseline = conversation_changes_local(&owner, &session, &session_id, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(rebuilds(), 1, "the first read builds the timeline once");
+        let mut cursor = baseline["next_cursor"].as_str().unwrap().to_owned();
+        // Unrelated commits wake the poll but concern nothing here.
+        for poll in 0..5 {
+            owner
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("agent/someone-else-{poll}"),
+                    kind: "runtime.observed".into(),
+                    actor: Some(format!("agent/someone-else-{poll}")),
+                    fields: BTreeMap::from([("status".into(), json!("running"))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let idle =
+                conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
+                    .await
+                    .unwrap();
+            assert!(idle["items"].as_array().unwrap().is_empty());
+            cursor = idle["next_cursor"].as_str().unwrap().to_owned();
+        }
+        assert_eq!(rebuilds(), 1, "idle long-polls rebuilt the timeline");
+        // A message to the agent is a change: the next poll reads once and brings it.
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/conversation-budget".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/example".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/example")),
+                    ("to".into(), json!(agent)),
+                    ("session_id".into(), json!(session_id)),
+                    ("content".into(), json!("hello")),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-budget-message".into()),
+            })
+            .unwrap();
+        let changed = conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
+            .await
+            .unwrap();
+        assert!(!changed["items"].as_array().unwrap().is_empty(), "{changed}");
+        assert_eq!(rebuilds(), 2);
+        // A cursor this member did not give out (another member's, or one from before a
+        // restart) is read as before.
+        let unknown = conversation_cursor(&owner, &session_id, 0, 0, 0);
+        conversation_changes_local(&owner, &session, &session_id, Some(&unknown), 0)
+            .await
+            .unwrap();
+        assert_eq!(rebuilds(), 3);
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ pub mod gate_check;
 pub mod gate_kinds;
 /// What an `st` command run inside an exec gate reports about itself.
 pub mod gate_report;
+pub mod github_watch;
 pub mod graph;
 pub mod harness_events;
 /// The lifecycle hook set st3 publishes beneath its own state directory.

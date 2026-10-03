@@ -67,6 +67,10 @@ const CHECKOUT_RETRY_MS: u128 = 30_000;
 // are late by at most this much.
 const DEADLINE_SOURCE_RETRY_MS: u128 = 5_000;
 
+// A skipped seat's terminal is looked at again this often for a login or trust prompt. A prompt
+// draws no graph change, and a pass used to read every running seat's screen.
+const SCREEN_POLL_EVERY_MS: u128 = 10_000;
+
 /// When a seat's retention was last checked, why the seat is held (if it is), and what the
 /// check read.
 type SeatRetention = (u128, Option<String>, BTreeSet<String>);
@@ -585,6 +589,12 @@ pub struct Reconciler<R = NativeRuntime> {
     seat_retention: Mutex<HashMap<String, SeatRetention>>,
     /// The gate runners the last read found, kept until a change they depend on.
     gate_runners: Mutex<Option<Vec<crate::store::MissionGateRunner>>>,
+    /// Why each member failed its last render, kept while render is skipped.
+    render_failures: Mutex<BTreeMap<String, String>>,
+    /// The work wake each live agent's last evaluation queued, queued again while it is skipped.
+    member_wakes: Mutex<HashMap<String, (String, String, MemberSpec)>>,
+    /// How often a skipped member's terminal screen is looked at again for a prompt.
+    screen_poll_every_ms: u128,
     fault_injection: Option<Arc<dyn FaultInjection>>,
     /// Reads free space for the disk stage. Without one the stage does nothing.
     disk_probe: Option<DiskProbe>,
@@ -696,6 +706,8 @@ impl Reconciler<NativeRuntime> {
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
             gate_runners: Mutex::new(None),
+            member_wakes: Mutex::new(HashMap::new()),
+            render_failures: Mutex::new(BTreeMap::new()),
             fault_injection: None,
             disk_probe: Some(Arc::new(crate::disk::disk_space)),
             disk_paths: vec![state_dir.to_path_buf()],
@@ -703,6 +715,7 @@ impl Reconciler<NativeRuntime> {
             disk_check_every_ms: DISK_CHECK_EVERY_MS,
             fault_delivery: Mutex::new(None),
             fault_delivery_every_ms: FAULT_DELIVERY_EVERY_MS,
+            screen_poll_every_ms: SCREEN_POLL_EVERY_MS,
             subagent_low_water: Mutex::new(0),
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
@@ -753,6 +766,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
             gate_runners: Mutex::new(None),
+            member_wakes: Mutex::new(HashMap::new()),
+            render_failures: Mutex::new(BTreeMap::new()),
             fault_injection: None,
             disk_probe: None,
             disk_paths: Vec::new(),
@@ -760,6 +775,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             disk_check_every_ms: 0,
             fault_delivery: Mutex::new(None),
             fault_delivery_every_ms: 0,
+            screen_poll_every_ms: 0,
             subagent_low_water: Mutex::new(0),
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
@@ -963,6 +979,128 @@ impl<R: RuntimeControl> Reconciler<R> {
         *low_water = sweep.low_water;
         if let Some(next) = sweep.next_expiry_unix_ms {
             self.arm_restart("stage/subagents", u128::from(next).saturating_add(1));
+        }
+        Ok(())
+    }
+
+    /// Keep each GitHub watch this host declared true to its seat and deadline: stop the
+    /// declaration of a watch that ended, end one whose seat is retired or fresh without a wake,
+    /// end one whose deadline passed with a final wake, and start the standing observer again when
+    /// a running watch has none. A mission's subscription to a standing observer, such as an
+    /// intake's, keeps it running the same way. Stop each standing observer this host declared
+    /// once no running subscription uses it, and look again at the next deadline.
+    pub(crate) fn reconcile_github_watches(&self, desired: &[DesiredSubject]) -> Result<()> {
+        let now = now_ms();
+        let mut next_deadline: Option<u128> = None;
+        let mut used_observers = BTreeSet::new();
+        let observers = desired
+            .iter()
+            .filter(|subject| subject.kind == "observer")
+            .filter_map(|subject| {
+                crate::graph::observer_spec(&subject.desired)
+                    .map(|spec| (subject.subject.clone(), spec))
+            })
+            .collect::<Vec<_>>();
+        let mut ensured = BTreeSet::new();
+        let mut ensure = |locator: String| -> Result<()> {
+            if ensured.insert(locator.clone()) {
+                self.store.ensure_standing_observer(&locator, &observers)?;
+            }
+            Ok(())
+        };
+        let subscriptions = desired
+            .iter()
+            .filter(|subject| subject.kind == "subscription")
+            .filter_map(|subject| {
+                let spec = crate::graph::subscription_spec(&subject.desired)?;
+                (!spec.stopped).then_some((subject, spec))
+            })
+            .collect::<Vec<_>>();
+        for (subject, spec) in &subscriptions {
+            if subject.subject.starts_with("subscription/watch/") {
+                continue;
+            }
+            let Some(locator) = crate::github_watch::standing_locator(&spec.observer) else {
+                continue;
+            };
+            used_observers.insert(spec.observer.clone());
+            if self
+                .store
+                .selected_desired_origin(&subject.subject)?
+                .as_deref()
+                == Some(self.host.as_str())
+            {
+                ensure(locator)?;
+            }
+        }
+        let watches = subscriptions
+            .iter()
+            .filter(|(subject, _)| subject.subject.starts_with("subscription/watch/"))
+            .filter_map(|(subject, spec)| Some((*subject, spec, spec.watch.clone()?)))
+            .collect::<Vec<_>>();
+        for (subject, spec, watch) in watches {
+            let Some((thread, _)) = crate::github_watch::watch_parts(&subject.subject) else {
+                continue;
+            };
+            if self.store.watch_ended(&subject.subject, &watch)?.is_some() {
+                if self
+                    .store
+                    .selected_desired_origin(&subject.subject)?
+                    .as_deref()
+                    == Some(self.host.as_str())
+                {
+                    self.store.stop_watch_declaration(&subject.subject)?;
+                }
+                continue;
+            }
+            if self
+                .store
+                .selected_desired_origin(&subject.subject)?
+                .as_deref()
+                != Some(self.host.as_str())
+            {
+                used_observers.insert(spec.observer.clone());
+                continue;
+            }
+            if self.store.watch_seat_ended(&subject.subject, &spec.to, &watch)? {
+                self.store.end_watch(&subject.subject, "seat-ended", None)?;
+                continue;
+            }
+            if let Some(until) = watch.until_unix_ms {
+                if until <= now {
+                    let wake =
+                        crate::github_watch::deadline_wake(&subject.subject, &watch, &thread)?;
+                    self.store
+                        .end_watch(&subject.subject, "deadline", Some(&wake))?;
+                    continue;
+                }
+                next_deadline = Some(next_deadline.map_or(until, |next| next.min(until)));
+            }
+            used_observers.insert(spec.observer.clone());
+            ensure(thread.locator())?;
+        }
+        for observer in desired.iter().filter(|subject| {
+            subject.kind == "observer"
+                && subject.owner_run.is_none()
+                && subject.subject.starts_with("observer/github/")
+        }) {
+            // Only a standing repository observer is this stage's.
+            let running = crate::graph::observer_spec(&observer.desired).is_some_and(|spec| {
+                !spec.stopped && crate::github_watch::is_standing_observer(&observer.subject, &spec)
+            });
+            if running
+                && !used_observers.contains(&observer.subject)
+                && self
+                    .store
+                    .selected_desired_origin(&observer.subject)?
+                    .as_deref()
+                    == Some(self.host.as_str())
+            {
+                self.store.stop_watch_declaration(&observer.subject)?;
+            }
+        }
+        if let Some(next) = next_deadline {
+            self.arm_restart("stage/github-watches", next.saturating_add(1));
         }
         Ok(())
     }
@@ -1433,6 +1571,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
+        self.recording_writes(|| self.reconcile_pass())
+    }
+
+    fn reconcile_pass(&self) -> Result<()> {
         let observe_span = crate::profile::span("pass/changes");
         self.incremental.observe(&self.store)?;
         drop(observe_span);
@@ -1557,12 +1699,56 @@ impl<R: RuntimeControl> Reconciler<R> {
             .copied()
             .filter(|subject| !member_errors.contains_key(&subject.subject))
             .collect::<Vec<_>>();
+        // A live member is evaluated again when a claim it read, its runtime, its exec state or
+        // its screen changed, when its time came, or when its workspace or render failed.
+        let skip_members = self.skip_unneeded
+            && ptys.is_some()
+            && !self.incremental.take_full_pass("member", now_ms());
+        // Render writes every member's files together (members sharing a repository share its
+        // exclude file), so it runs whole or not at all: when what it read last changed, when a
+        // member will be evaluated, or on a full pass. Otherwise its last failures stand; files
+        // changed on disk are put back by the next full pass.
+        let render_needed = !skip_members
+            || self.incremental.needs("render", now_ms())
+            || renderable.iter().any(|subject| {
+                subject.kind != "stop"
+                    && subject
+                        .member
+                        .as_ref()
+                        .is_some_and(|member| member.host == self.host)
+                    && self
+                        .incremental
+                        .needs(&format!("member:{}", subject.subject), now_ms())
+            });
         // A render panic faults this host's members; stops never render, so they still run.
         let render_span = crate::profile::span("pass/render");
-        let rendered = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            crate::render::apply_all(&self.store, &renderable, &self.host)
-        }))
-        .unwrap_or_else(|panic| {
+        let (rendered, render_reads) = if render_needed {
+            smallclaims::touched::record(|| {
+                std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    crate::render::apply_all(&self.store, &renderable, &self.host)
+                }))
+            })
+        } else {
+            let failed = self
+                .render_failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            (
+                Ok(failed
+                    .into_iter()
+                    .map(|(subject, reason)| (subject, Err(anyhow::anyhow!(reason))))
+                    .collect()),
+                BTreeSet::new(),
+            )
+        };
+        if render_needed {
+            let mut reads = render_reads;
+            // The members it renders come from the desired declarations.
+            reads.insert("kind:intent.desired".to_owned());
+            self.incremental.evaluated("render", reads, None);
+        }
+        let rendered = rendered.unwrap_or_else(|panic| {
             let reason = panic_message(panic.as_ref());
             renderable
                 .iter()
@@ -1586,6 +1772,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .filter(|subject| subject.kind == "agent")
             .map(|subject| subject.subject.as_str())
             .collect::<BTreeSet<_>>();
+        let mut render_failed = BTreeMap::new();
         for (subject, result) in rendered {
             let result = result.and_then(|result| {
                 let mut applied = BTreeMap::new();
@@ -1614,8 +1801,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 Ok(())
             });
             if let Err(error) = result {
+                render_failed.insert(subject.clone(), format!("{error:#}"));
                 member_errors.insert(subject, error);
             }
+        }
+        if render_needed {
+            *self
+                .render_failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = render_failed;
         }
         // A later run can declare the same workspace, so a finished run never removes a
         // checkout that a current member on this host still uses.
@@ -1643,6 +1837,25 @@ impl<R: RuntimeControl> Reconciler<R> {
             && ptys.is_some()
             && !self.incremental.take_full_pass("stop", now_ms());
         let mut stops = BTreeSet::new();
+        self.incremental.observe_execs(|runtime_id| {
+            self.runtime
+                .observe_exec(runtime_id)
+                .ok()
+                .flatten()
+                .map(|observation| observation.status)
+        });
+        self.incremental.poll_values(
+            "screen:",
+            self.screen_poll_every_ms,
+            now_ms(),
+            |runtime_id| {
+                self.runtime
+                    .screen(runtime_id)
+                    .ok()
+                    .map(|screen| screen_digest(&screen))
+            },
+        );
+        let mut members = BTreeSet::new();
         let mut work_message_agents = Vec::new();
         let mut deferred_member_faults = BTreeMap::new();
         let mut diagnostic_errors = Vec::new();
@@ -1673,213 +1886,290 @@ impl<R: RuntimeControl> Reconciler<R> {
             {
                 continue;
             }
-            let result = caught(|| -> Result<()> {
-                // A workspace or render failure blocks only a start or restart. A running member
-                // is still observed, checked, and given its work.
-                let mut blocked = member_errors.remove(&subject.subject);
-                let Some(member) = &subject.member else {
-                    return Ok(());
-                };
-                if member.host != self.host {
-                    return Ok(());
-                }
-                let observed = if member.terminal {
-                    // An unavailable snapshot is unknown, not an empty runtime set, so a terminal
-                    // member is neither started nor judged until the snapshot returns.
-                    let Some(ptys) = ptys.as_ref() else {
-                        return blocked.map_or(Ok(()), Err);
-                    };
-                    ptys.get(&member.runtime_id).cloned()
-                } else {
-                    self.runtime.observe_exec(&member.runtime_id)?
-                };
-                if subject.kind == "agent"
-                    && let Some(suspension) =
-                        crate::suspension::current(&self.store, &subject.subject)?
-                    && suspension.holds_seat()
+            let item = format!("member:{}", subject.subject);
+            members.insert(item.clone());
+            let needed = member_errors.contains_key(&subject.subject)
+                || self.needs_item(&item, !skip_members);
+            if skip_members && !needed {
+                // Its last evaluation stands, the work wake it queued included.
+                if let Some(wake) = self
+                    .member_wakes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&subject.subject)
                 {
-                    return self.reconcile_suspension(
-                        subject,
-                        member,
-                        observed.as_ref(),
-                        blocked,
-                        &suspension,
-                    );
+                    work_message_agents.push(wake.clone());
                 }
-                if self.reconcile_requested_restart(
-                    subject,
-                    member,
-                    observed.as_ref(),
-                    blocked.as_ref(),
-                )? {
-                    return Ok(());
-                }
-                match observed {
-                    Some(observation) if observation.status == "running" => {
-                        self.record_member(subject, &observation, true)?;
-                        if let Some(changes) =
-                            self.declared_launch_changes(subject, member, &observation)?
-                        {
-                            // Rendering must succeed before we shut down a still-running seat.
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
-                            }
-                            self.record_once(
-                                &subject.subject,
-                                "runtime.reconcile-decision",
-                                BTreeMap::from([
-                                    ("decision".into(), Value::String("restart".into())),
-                                    ("reachability".into(), Value::String("reachable".into())),
-                                    (
-                                        "reason".into(),
-                                        Value::String(format!(
-                                            "the declared {} changed",
-                                            changes.join(" and ")
-                                        )),
-                                    ),
-                                ]),
-                            )?;
-                            self.reconcile_runtime_stop(
-                                &subject.subject,
-                                &member.runtime_id,
-                                member.terminal,
-                                observation.incarnation_id.as_deref(),
-                                member.shutdown_timeout_ms,
-                                Some(&observation),
-                            )?;
+                continue;
+            }
+            let queued_before = work_message_agents.len();
+            let cpu_started = crate::incremental::thread_cpu();
+            let wrote_mark = smallclaims::touched::wrote_len();
+            let ((result, due), reads) = smallclaims::touched::record(|| {
+                smallclaims::touched::record_due(|| {
+                    caught(|| -> Result<()> {
+                        // A workspace or render failure blocks only a start or restart. A running member
+                        // is still observed, checked, and given its work.
+                        let mut blocked = member_errors.remove(&subject.subject);
+                        let Some(member) = &subject.member else {
+                            return Ok(());
+                        };
+                        if member.host != self.host {
                             return Ok(());
                         }
-                        self.reconcile_claude_auth_screen(subject, member, &observation)?;
-                        self.reconcile_claude_trust_screen(
+                        let observed = if member.terminal {
+                            smallclaims::touched::note_read(|| {
+                                format!("pty:{}", member.runtime_id)
+                            });
+                            // An unavailable snapshot is unknown, not an empty runtime set, so a terminal
+                            // member is neither started nor judged until the snapshot returns.
+                            let Some(ptys) = ptys.as_ref() else {
+                                return blocked.map_or(Ok(()), Err);
+                            };
+                            ptys.get(&member.runtime_id).cloned()
+                        } else {
+                            smallclaims::touched::note_read(|| {
+                                format!("exec:{}", member.runtime_id)
+                            });
+                            self.runtime.observe_exec(&member.runtime_id)?
+                        };
+                        if subject.kind == "agent"
+                            && let Some(suspension) =
+                                crate::suspension::current(&self.store, &subject.subject)?
+                            && suspension.holds_seat()
+                        {
+                            return self.reconcile_suspension(
+                                subject,
+                                member,
+                                observed.as_ref(),
+                                blocked,
+                                &suspension,
+                            );
+                        }
+                        if self.reconcile_requested_restart(
                             subject,
                             member,
-                            &observation,
-                            now_ms(),
-                        )?;
-                        self.reconcile_driver_readiness(subject, member, &observation, now_ms())?;
-                        if subject.kind == "agent"
-                            && let Some(incarnation) = observation.incarnation_id.as_deref()
-                        {
-                            work_message_agents.push((
-                                subject.subject.clone(),
-                                incarnation.to_owned(),
-                                member.clone(),
-                            ));
-                        }
-                    }
-                    Some(observation)
-                        if matches!(observation.status.as_str(), "exited" | "vanished") =>
-                    {
-                        self.record_member(subject, &observation, false)?;
-                        if !self.member_was_launched_for_selected_desired(&subject.subject)? {
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
-                            }
-                            self.perform_start(
-                                subject,
-                                member,
-                                "the desired member revision changed",
-                            )?;
+                            observed.as_ref(),
+                            blocked.as_ref(),
+                        )? {
                             return Ok(());
                         }
-                        let restart = match member.restart {
-                            RestartType::Always => true,
-                            RestartType::OnFailure => observation.exit_code != Some(0),
-                            RestartType::Never => false,
-                        };
-                        // A trust-prompt recovery stopped this incarnation in order to replace it,
-                        // whatever the member's own exit policy says.
-                        let recovering = self
-                            .claude_trust_recovery_stopped(&subject.subject, &observation)?
-                            || self
-                                .fresh_context_recovery_stopped(&subject.subject, &observation)?;
-                        if (restart || recovering) && member.lifecycle == MemberLifecycle::Service {
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
+                        match observed {
+                            Some(observation) if observation.status == "running" => {
+                                self.record_member(subject, &observation, true)?;
+                                if let Some(changes) =
+                                    self.declared_launch_changes(subject, member, &observation)?
+                                {
+                                    // Rendering must succeed before we shut down a still-running seat.
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.record_once(
+                                        &subject.subject,
+                                        "runtime.reconcile-decision",
+                                        BTreeMap::from([
+                                            ("decision".into(), Value::String("restart".into())),
+                                            (
+                                                "reachability".into(),
+                                                Value::String("reachable".into()),
+                                            ),
+                                            (
+                                                "reason".into(),
+                                                Value::String(format!(
+                                                    "the declared {} changed",
+                                                    changes.join(" and ")
+                                                )),
+                                            ),
+                                        ]),
+                                    )?;
+                                    self.reconcile_runtime_stop(
+                                        &subject.subject,
+                                        &member.runtime_id,
+                                        member.terminal,
+                                        observation.incarnation_id.as_deref(),
+                                        member.shutdown_timeout_ms,
+                                        Some(&observation),
+                                    )?;
+                                    return Ok(());
+                                }
+                                self.reconcile_claude_auth_screen(subject, member, &observation)?;
+                                self.reconcile_claude_trust_screen(
+                                    subject,
+                                    member,
+                                    &observation,
+                                    now_ms(),
+                                )?;
+                                self.reconcile_driver_readiness(
+                                    subject,
+                                    member,
+                                    &observation,
+                                    now_ms(),
+                                )?;
+                                if subject.kind == "agent"
+                                    && let Some(incarnation) = observation.incarnation_id.as_deref()
+                                {
+                                    work_message_agents.push((
+                                        subject.subject.clone(),
+                                        incarnation.to_owned(),
+                                        member.clone(),
+                                    ));
+                                }
                             }
-                            self.reconcile_restart(subject, member, &observation)?;
-                        }
-                    }
-                    Some(observation) => {
-                        self.record_member(subject, &observation, false)?;
-                    }
-                    None if member.lifecycle == MemberLifecycle::AdoptOnly => {
-                        self.record_once(
-                            &subject.subject,
-                            "runtime.observed",
-                            member_fields(member, "absent", None, false),
-                        )?;
-                    }
-                    None => {
-                        let prior = self.store.latest_actual_value(&subject.subject)?;
-                        if prior.is_some()
-                            && !self.member_was_launched_for_selected_desired(&subject.subject)?
-                        {
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
-                            }
-                            self.perform_start(
-                                subject,
-                                member,
-                                "the desired member revision changed",
-                            )?;
-                            return Ok(());
-                        }
-                        if prior.as_ref().is_some_and(|actual| {
-                            matches!(
-                                actual_field(actual, "status").and_then(Value::as_str),
-                                Some(
-                                    "running"
-                                        | "ready"
-                                        | "working"
-                                        | "idle"
-                                        | "starting"
-                                        | "exited"
-                                        | "vanished"
-                                )
-                            )
-                        }) {
-                            let observation = RuntimeObservation {
-                                runtime_id: member.runtime_id.clone(),
-                                terminal: member.terminal,
-                                status: "vanished".into(),
-                                exit_code: prior
-                                    .as_ref()
-                                    .and_then(|actual| actual_field(actual, "exit_code"))
-                                    .and_then(Value::as_i64),
-                                incarnation_id: prior
-                                    .as_ref()
-                                    .and_then(|actual| actual_field(actual, "incarnation_id"))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned),
-                            };
-                            self.record_member(subject, &observation, false)?;
-                            let restart = match member.restart {
-                                RestartType::Always => true,
-                                RestartType::OnFailure => observation.exit_code != Some(0),
-                                RestartType::Never => false,
-                            };
-                            if restart
-                                || self.fresh_context_recovery_stopped(
+                            Some(observation)
+                                if matches!(observation.status.as_str(), "exited" | "vanished") =>
+                            {
+                                self.record_member(subject, &observation, false)?;
+                                if !self
+                                    .member_was_launched_for_selected_desired(&subject.subject)?
+                                {
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.perform_start(
+                                        subject,
+                                        member,
+                                        "the desired member revision changed",
+                                    )?;
+                                    return Ok(());
+                                }
+                                let restart = match member.restart {
+                                    RestartType::Always => true,
+                                    RestartType::OnFailure => observation.exit_code != Some(0),
+                                    RestartType::Never => false,
+                                };
+                                // A trust-prompt recovery stopped this incarnation in order to replace it,
+                                // whatever the member's own exit policy says.
+                                let recovering = self.claude_trust_recovery_stopped(
                                     &subject.subject,
                                     &observation,
-                                )?
-                            {
-                                if let Some(error) = blocked.take() {
-                                    return Err(error);
+                                )? || self.fresh_context_recovery_stopped(
+                                    &subject.subject,
+                                    &observation,
+                                )?;
+                                if (restart || recovering)
+                                    && member.lifecycle == MemberLifecycle::Service
+                                {
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.reconcile_restart(subject, member, &observation)?;
                                 }
-                                self.reconcile_restart(subject, member, &observation)?;
                             }
-                        } else {
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
+                            Some(observation) => {
+                                self.record_member(subject, &observation, false)?;
                             }
-                            self.perform_start(subject, member, "the desired member is absent")?;
+                            None if member.lifecycle == MemberLifecycle::AdoptOnly => {
+                                self.record_once(
+                                    &subject.subject,
+                                    "runtime.observed",
+                                    member_fields(member, "absent", None, false),
+                                )?;
+                            }
+                            None => {
+                                let prior = self.store.latest_actual_value(&subject.subject)?;
+                                if prior.is_some()
+                                    && !self.member_was_launched_for_selected_desired(
+                                        &subject.subject,
+                                    )?
+                                {
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.perform_start(
+                                        subject,
+                                        member,
+                                        "the desired member revision changed",
+                                    )?;
+                                    return Ok(());
+                                }
+                                if prior.as_ref().is_some_and(|actual| {
+                                    matches!(
+                                        actual_field(actual, "status").and_then(Value::as_str),
+                                        Some(
+                                            "running"
+                                                | "ready"
+                                                | "working"
+                                                | "idle"
+                                                | "starting"
+                                                | "exited"
+                                                | "vanished"
+                                        )
+                                    )
+                                }) {
+                                    let observation = RuntimeObservation {
+                                        runtime_id: member.runtime_id.clone(),
+                                        terminal: member.terminal,
+                                        status: "vanished".into(),
+                                        exit_code: prior
+                                            .as_ref()
+                                            .and_then(|actual| actual_field(actual, "exit_code"))
+                                            .and_then(Value::as_i64),
+                                        incarnation_id: prior
+                                            .as_ref()
+                                            .and_then(|actual| {
+                                                actual_field(actual, "incarnation_id")
+                                            })
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned),
+                                    };
+                                    self.record_member(subject, &observation, false)?;
+                                    let restart = match member.restart {
+                                        RestartType::Always => true,
+                                        RestartType::OnFailure => observation.exit_code != Some(0),
+                                        RestartType::Never => false,
+                                    };
+                                    if restart
+                                        || self.fresh_context_recovery_stopped(
+                                            &subject.subject,
+                                            &observation,
+                                        )?
+                                    {
+                                        if let Some(error) = blocked.take() {
+                                            return Err(error);
+                                        }
+                                        self.reconcile_restart(subject, member, &observation)?;
+                                    }
+                                } else {
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.perform_start(
+                                        subject,
+                                        member,
+                                        "the desired member is absent",
+                                    )?;
+                                }
+                            }
                         }
-                    }
-                }
-                blocked.map_or(Ok(()), Err)
+                        blocked.map_or(Ok(()), Err)
+                    })
+                })
             });
+            crate::performance::record_evaluation(
+                "member",
+                needed,
+                crate::incremental::thread_cpu().saturating_sub(cpu_started),
+            );
+            if !needed {
+                let wrote = smallclaims::touched::wrote_since(wrote_mark);
+                if !wrote.is_empty() {
+                    self.incremental_correction("member", &item, &reads, &wrote);
+                }
+            }
+            {
+                let mut wakes = self
+                    .member_wakes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match work_message_agents[queued_before..].last() {
+                    Some(wake) => wakes.insert(subject.subject.clone(), wake.clone()),
+                    None => wakes.remove(&subject.subject),
+                };
+            }
+            // A failed member is evaluated again on the next pass, as before.
+            if result.is_ok() {
+                self.incremental.evaluated(&item, reads, due);
+            }
             // A running agent's member pass also includes deferred work delivery, so its result
             // is recorded with that delivery.
             let deferred = work_message_agents
@@ -1896,6 +2186,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         drop(members_span);
         self.incremental.retain("stop:", &stops);
+        self.incremental.retain("member:", &members);
+        self.member_wakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|subject, _| members.contains(&format!("member:{subject}")));
         // Each later stage runs on its own. A stage that fails records a fault on this daemon and
         // the stages after it still run, so no intake item can hold back mission evaluation, run
         // cleanup, or work delivery on this host.
@@ -1944,6 +2239,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         self.isolate("stage/faults", &daemon, || self.deliver_faults(&desired));
         self.isolate("stage/subagents", &daemon, || self.end_stale_subagents());
+        self.isolate("stage/github-watches", &daemon, || {
+            self.reconcile_github_watches(&desired)
+        });
         self.file_watchers_used
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2078,6 +2376,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_provider_capacity_retries(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.recording_writes(|| self.reconcile_provider_capacity_retries_pass(desired))
+    }
+
+    fn reconcile_provider_capacity_retries_pass(&self, desired: &[DesiredSubject]) -> Result<()> {
         self.incremental.observe(&self.store)?;
         let now = now_ms();
         let skip = self.skip_unneeded && !self.incremental.take_full_pass("capacity", now);
@@ -2410,6 +2712,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    /// A member's terminal screen, read as an input: a later pass looks at it again (see
+    /// [`SCREEN_POLL_EVERY_MS`]) and evaluates the member when it changed.
+    fn member_screen(&self, runtime_id: &str) -> Result<String> {
+        let screen = self.runtime.screen(runtime_id)?;
+        let key = format!("screen:{runtime_id}");
+        smallclaims::touched::note_read(|| key.clone());
+        self.incremental
+            .saw_value(&key, screen_digest(&screen), now_ms());
+        Ok(screen)
+    }
+
     fn reconcile_claude_auth_screen(
         &self,
         subject: &DesiredSubject,
@@ -2425,7 +2738,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
         // Claude's login prompt does not emit a StopFailure hook. The initialized MCP channel
         // remains alive, so hook-only observation incorrectly reports this session as ready.
-        let Ok(screen) = self.runtime.screen(&member.runtime_id) else {
+        let Ok(screen) = self.member_screen(&member.runtime_id) else {
             return Ok(());
         };
         let (fence, key) = self.claude_auth_fence(&subject.subject, incarnation)?;
@@ -2567,7 +2880,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             else {
                 return Ok(());
             };
-            let Ok(screen) = self.runtime.screen(&member.runtime_id) else {
+            let Ok(screen) = self.member_screen(&member.runtime_id) else {
                 return Ok(());
             };
             if !claude_trust_prompt(&screen) {
@@ -2827,13 +3140,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         skip: bool,
         work: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        let needed = self.incremental.needs(item, now_ms());
+        let needed = self.needs_item(item, !skip);
         if skip && !needed {
             return Ok(());
         }
         let cpu_started = crate::incremental::thread_cpu();
-        let writes = smallclaims::touched::writes();
-        let feed_before = (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+        let wrote_mark = smallclaims::touched::wrote_len();
         let ((result, due), reads) =
             smallclaims::touched::record(|| smallclaims::touched::record_due(|| caught(work)));
         crate::performance::record_evaluation(
@@ -2841,17 +3153,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             needed,
             crate::incremental::thread_cpu().saturating_sub(cpu_started),
         );
-        if !needed && smallclaims::touched::writes() > writes {
-            let wrote: Vec<String> = feed_before
-                .and_then(Result::ok)
-                .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
-                .map(|feed| {
-                    feed.changes
-                        .iter()
-                        .map(|change| format!("{} {}", change.kind, change.subject))
-                        .collect()
-                })
-                .unwrap_or_default();
+        if !needed {
+            let wrote = smallclaims::touched::wrote_since(wrote_mark);
             if !wrote.is_empty() {
                 self.incremental_correction(section, item, &reads, &wrote);
             }
@@ -3167,6 +3470,31 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Reconcile a stop. `actual_origin` is the subject's selected actual origin when the caller
     /// already read it in this pass.
+    /// Run `work` with this thread recording the claims it writes, unless an enclosing pass
+    /// already does, so a correction lists only what an item itself wrote.
+    fn recording_writes<T>(&self, work: impl FnOnce() -> T) -> T {
+        if smallclaims::touched::recording_wrote() {
+            work()
+        } else {
+            smallclaims::touched::record_wrote(work).0
+        }
+    }
+
+    /// Whether `item` needs evaluating. When it is evaluated anyway (`evaluated_anyway`: a full
+    /// pass, or skipping off), the change feed is read again first: a write that landed after
+    /// the pass read it, such as a request through the API, is what the evaluation acts on, not
+    /// a change the skipping passes missed.
+    fn needs_item(&self, item: &str, evaluated_anyway: bool) -> bool {
+        if self.incremental.needs(item, now_ms()) {
+            return true;
+        }
+        if !evaluated_anyway {
+            return false;
+        }
+        let _ = self.incremental.observe(&self.store);
+        self.incremental.needs(item, now_ms())
+    }
+
     /// Gate runners, read again only when a request, a runner's stop, or an owner's state
     /// changed, and on each full pass. A full pass that finds the kept list stale although
     /// nothing marked it counts an incremental correction.
@@ -3174,7 +3502,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         const ITEM: &str = "gate-runners";
         let now = now_ms();
         let full = !self.skip_unneeded || self.incremental.take_full_pass(ITEM, now);
-        let needed = self.incremental.needs(ITEM, now);
+        let needed = self.needs_item(ITEM, full);
         let mut kept = self
             .gate_runners
             .lock()
@@ -3207,13 +3535,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         live_workspaces: &BTreeSet<&str>,
         diagnostic_errors: &mut Vec<String>,
     ) {
-        let needed = self.incremental.needs(item, now_ms());
+        let needed = self.needs_item(item, !skip);
         if skip && !needed {
             return;
         }
         let cpu_started = crate::incremental::thread_cpu();
-        let writes = smallclaims::touched::writes();
-        let feed_before = (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+        let wrote_mark = smallclaims::touched::wrote_len();
         let ((outcome, due), reads) = smallclaims::touched::record(|| {
             smallclaims::touched::record_due(|| -> Result<Option<Result<()>>> {
                 // A stop's actual origin is read once here and reused by `reconcile_stop`.
@@ -3242,17 +3569,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             needed,
             crate::incremental::thread_cpu().saturating_sub(cpu_started),
         );
-        if !needed && smallclaims::touched::writes() > writes {
-            let wrote: Vec<String> = feed_before
-                .and_then(Result::ok)
-                .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
-                .map(|feed| {
-                    feed.changes
-                        .iter()
-                        .map(|change| format!("{} {}", change.kind, change.subject))
-                        .collect()
-                })
-                .unwrap_or_default();
+        if !needed {
+            let wrote = smallclaims::touched::wrote_since(wrote_mark);
             if !wrote.is_empty() {
                 self.incremental_correction("stop", item, &reads, &wrote);
             }
@@ -5122,6 +5440,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// Evaluate each active run on its own. A run that fails records a fault on that run, and
     /// every other run, including runs in cleanup, is still evaluated in the same pass.
     fn evaluate_mission_runs(&self) -> Result<()> {
+        self.recording_writes(|| self.evaluate_mission_runs_pass())
+    }
+
+    fn evaluate_mission_runs_pass(&self) -> Result<()> {
         self.incremental.observe(&self.store)?;
         // A gate runner's exit is not a claim: look again at the runners evaluations wait on.
         self.incremental.observe_execs(|runtime_id| {
@@ -5138,7 +5460,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let full = !self.skip_unneeded || self.incremental.take_full_pass("mission-run", now_ms());
         for id in &ids {
             let subject = format!("mission-run/{id}");
-            let needed = self.incremental.needs(&subject, now_ms());
+            let needed = self.needs_item(&subject, full);
             if !full && !needed {
                 // Nothing it read changed and nothing is due. It stays active: keep its caches,
                 // faults and file watchers as its last evaluation left them.
@@ -5157,9 +5479,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 continue;
             }
             let cpu_started = crate::incremental::thread_cpu();
-            let writes = smallclaims::touched::writes();
-            let feed_before =
-                (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+            let wrote_mark = smallclaims::touched::wrote_len();
             let mut due = None;
             let ((evaluated, armed), reads) = smallclaims::touched::record(|| {
                 smallclaims::touched::record_due(|| {
@@ -5184,17 +5504,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 needed,
                 crate::incremental::thread_cpu().saturating_sub(cpu_started),
             );
-            if !needed && smallclaims::touched::writes() > writes {
-                let wrote: Vec<String> = feed_before
-                    .and_then(Result::ok)
-                    .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
-                    .map(|feed| {
-                        feed.changes
-                            .iter()
-                            .map(|change| format!("{} {}", change.kind, change.subject))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+            if !needed {
+                let wrote = smallclaims::touched::wrote_since(wrote_mark);
                 // Rows that are not claims or observations (caches, capabilities) change no
                 // graph state a later pass would have to catch up with.
                 if !wrote.is_empty() {
@@ -8673,7 +8984,25 @@ impl<R: RuntimeControl> Reconciler<R> {
         let response = self
             .store
             .apply_internal(&intent, &format!("materialize:{}", run.generation))?;
-        Ok(response.changed)
+        // A subscription to a repository's standing observer declares it here, before a
+        // superseded generation's own observer of the repository stops, so the standing observer
+        // takes that observer's resource and nothing between their polls goes unobserved.
+        let standing = intent
+            .subjects
+            .values()
+            .filter(|subject| subject.kind == "subscription")
+            .filter_map(|subject| crate::graph::subscription_spec(&subject.desired))
+            .filter(|spec| !spec.stopped)
+            .filter_map(|spec| crate::github_watch::standing_locator(&spec.observer))
+            .collect::<BTreeSet<_>>();
+        let mut changed = response.changed;
+        if !standing.is_empty() {
+            let observers = self.store.repository_observers()?;
+            for locator in standing {
+                changed |= self.store.ensure_standing_observer(&locator, &observers)?;
+            }
+        }
+        Ok(changed)
     }
 
     fn reject_runtime_collisions(
@@ -9961,6 +10290,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_subscription_missions(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.recording_writes(|| self.reconcile_subscription_missions_pass(desired))
+    }
+
+    fn reconcile_subscription_missions_pass(&self, desired: &[DesiredSubject]) -> Result<()> {
         self.incremental.observe(&self.store)?;
         // Read once for every subscription: it lists the whole host's open attention requests.
         let held = self
@@ -10642,6 +10975,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
+        // A repository observer that never recorded anything continues from the observer that
+        // last recorded into its resource, such as the intake observer a standing observer
+        // replaces, so nothing changed between their polls is missed.
+        let cursor = match cursor {
+            None if spec.provider == "github.repository" => self
+                .store
+                .inherited_observer_cursor(&spec.resource, &observer.subject)?,
+            cursor => cursor,
+        };
         let agent_workspaces = agent_workspaces.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -12865,6 +13207,11 @@ fn restart_wake_kind(key: &str) -> &str {
         None if key.starts_with("stage/") || !key.contains('/') => key,
         None => "member",
     }
+}
+
+/// What a polled screen is compared by.
+fn screen_digest(screen: &str) -> String {
+    hex::encode(sha2::Sha256::digest(screen.as_bytes()))
 }
 
 fn deadline_sleep_ms(deadline: u128, now: u128, quiet_pass_started: Option<u128>) -> u64 {
@@ -27170,6 +27517,738 @@ subscription "pulls" { observer "observer/repo"; on "pull_requests"; to "agent/e
         assert_eq!(kept.len(), crate::resource::RECENT_COMMENTS);
         assert_eq!(kept.first().unwrap(), "comment:105");
         assert_eq!(kept.last().unwrap(), "comment:124");
+    }
+
+    /// The observation writes and their watches, on one store: what `record_resource_observation`
+    /// sends each watch of the standing observer.
+    struct WatchFixture {
+        store: Arc<Store>,
+        observer: String,
+        resource: String,
+    }
+
+    impl WatchFixture {
+        fn new() -> Self {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            apply_source(
+                &store,
+                r#"version 2
+agent "example.planner" { workspace "/tmp"; command "true" }
+agent "example.reviewer" { workspace "/tmp"; command "true" }"#,
+                "watch-seats",
+            );
+            let thread = crate::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+            Self {
+                observer: thread.observer(),
+                resource: thread.resource(),
+                store,
+            }
+        }
+
+        fn watch(&self, thread: &str, agent: &str) -> String {
+            let thread = crate::github_watch::ThreadRef::parse(thread).unwrap();
+            self.store.declare_watch(&thread, agent, None).unwrap();
+            thread.watch(agent)
+        }
+
+        fn observe(&self, facts: Value) -> crate::model::ResourceObservationOutcome {
+            let subscriptions = self
+                .store
+                .desired_subjects()
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.kind == "subscription")
+                .filter_map(|item| {
+                    Some((
+                        item.subject.clone(),
+                        crate::graph::subscription_spec(&item.desired)?,
+                    ))
+                })
+                .filter(|(_, spec)| !spec.stopped)
+                .collect::<Vec<_>>();
+            let revision = self
+                .store
+                .selected_desired_revision(&self.observer)
+                .unwrap()
+                .unwrap();
+            self.store
+                .record_resource_observation(
+                    &self.observer,
+                    &revision,
+                    None,
+                    &self.resource,
+                    None,
+                    &facts,
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap()
+        }
+
+        /// The wakes each seat has, oldest first, as their titles.
+        fn wakes(&self, agent: &str) -> Vec<String> {
+            self.store
+                .messages(Some(agent), true)
+                .unwrap()
+                .into_iter()
+                .filter(|message| message.tags.iter().any(|tag| tag == "github-watch"))
+                .map(|message| message.title.unwrap_or_default())
+                .collect()
+        }
+
+        fn reconcile(&self) {
+            let reconciler = Reconciler::new(
+                self.store.clone(),
+                Arc::new(FakeRuntime::default()),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+            reconciler
+                .reconcile_github_watches(&self.store.desired_subjects().unwrap())
+                .unwrap();
+        }
+
+        fn running(&self, subject: &str) -> bool {
+            self.store
+                .desired_subjects_named(&[subject.to_owned()])
+                .unwrap()
+                .into_iter()
+                .next()
+                .is_some_and(|desired| desired.desired["children"][0]["name"] != "stop")
+        }
+    }
+
+    fn watched_pull(number: u64, extra: Value) -> Value {
+        let mut pull = serde_json::json!({
+            "number": number, "title": format!("Pull {number}"),
+            "url": format!("https://github.com/acme/garden/pull/{number}"),
+            "head": "a".repeat(40), "state": "open", "draft": false,
+            "required_checks": {"state": "pending", "source": "rules", "checks": ["build"], "failed": []},
+        });
+        for (name, value) in extra.as_object().unwrap() {
+            pull[name] = value.clone();
+        }
+        pull
+    }
+
+    fn just_now(seconds_ago: i64) -> String {
+        (Utc::now() - chrono::Duration::seconds(seconds_ago))
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    /// A seat's watch wakes it once for each comment and review anyone else posts, once for each
+    /// move of the required checks into pass or fail on the current head, and a last time when
+    /// the pull request merges, which ends that watch only. The baseline and a repeated
+    /// observation wake nobody.
+    #[test]
+    fn a_watch_wakes_once_per_comment_review_and_check_move_and_ends_on_merge() {
+        let fixture = WatchFixture::new();
+        let planner = "agent/example.planner";
+        let reviewer = "agent/example.reviewer";
+        let watch = fixture.watch("acme/garden#12", planner);
+        fixture.watch("acme/garden#13", reviewer);
+        let comment = |id: u64, seconds_ago: i64| serde_json::json!({"kind": "comment", "id": id, "author": "fern", "at": just_now(seconds_ago)});
+
+        // The first observation is the baseline.
+        let baseline = fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [
+            watched_pull(12, serde_json::json!({"recent_comments": [comment(90, 3_600)]})),
+            watched_pull(13, serde_json::json!({})),
+        ]}));
+        assert!(baseline.baseline);
+        assert!(fixture.wakes(planner).is_empty());
+
+        // Two comments in one poll are two wakes.
+        let both = serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [comment(92, 20), comment(91, 30)]}))]});
+        fixture.observe(both.clone());
+        assert_eq!(
+            fixture.wakes(planner),
+            [
+                "@fern commented on acme/garden#12",
+                "@fern commented on acme/garden#12"
+            ]
+        );
+        // The same observation again, and the same comments seen again, wake nobody.
+        fixture.observe(both);
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [comment(91, 30), comment(92, 20)]}))]}));
+        assert_eq!(fixture.wakes(planner).len(), 2);
+        assert!(
+            fixture.wakes(reviewer).is_empty(),
+            "another thread's watch hears nothing"
+        );
+
+        // A review.
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [{"kind": "review", "id": 5001, "author": "moss",
+                "at": just_now(10), "state": "changes_requested"}]}))]}));
+        assert_eq!(
+            fixture.wakes(planner).last().unwrap(),
+            "@moss requested changes on acme/garden#12"
+        );
+
+        // The required checks fail, are rerun, and fail again on the same head: two wakes. A new
+        // head that passes is one more.
+        let checks = |head: &str, state: &str| {
+            serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+                "new": false, "head": head,
+                "required_checks": {"state": state, "source": "rules", "checks": ["build"],
+                    "failed": if state == "fail" { serde_json::json!(["build"]) } else { serde_json::json!([]) }}}))]})
+        };
+        for (head, state) in [
+            ("a", "fail"),
+            ("a", "pending"),
+            ("a", "fail"),
+            ("b", "pending"),
+            ("b", "pass"),
+        ] {
+            fixture.observe(checks(&head.repeat(40), state));
+        }
+        let wakes = fixture.wakes(planner);
+        assert_eq!(
+            wakes[3..],
+            [
+                "Required checks failed on acme/garden#12",
+                "Required checks failed on acme/garden#12",
+                "Required checks passed on acme/garden#12",
+            ]
+        );
+
+        // The merge is the last wake, and ends that watch only.
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [
+            {"number": 12, "state": "closed", "merged": true},
+        ]}));
+        assert_eq!(
+            fixture.wakes(planner).last().unwrap(),
+            "acme/garden#12 merged"
+        );
+        let ended = fixture
+            .store
+            .claims_for(&watch, Some("subscription.watch-ended"))
+            .unwrap();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].body["fields"]["reason"], "merged");
+        let after_merge = fixture.wakes(planner).len();
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [
+            watched_pull(12, serde_json::json!({"new": false, "state": "closed", "merged": true,
+                "recent_comments": [comment(93, 5)]})),
+            watched_pull(13, serde_json::json!({"new": false, "recent_comments": [comment(94, 5)]})),
+        ]}));
+        assert_eq!(
+            fixture.wakes(planner).len(),
+            after_merge,
+            "an ended watch hears nothing"
+        );
+        assert_eq!(
+            fixture.wakes(reviewer),
+            ["@fern commented on acme/garden#13"],
+            "the other seat's watch goes on"
+        );
+        let view = fixture.store.watch_view(&watch).unwrap().unwrap();
+        assert_eq!(view["state"], "ended");
+        assert_eq!(view["ended"], "merged");
+    }
+
+    /// Two seats post as one GitHub login and watch one thread. A comment one seat recorded as
+    /// its own wakes only the other, which hears whose it was; an unrecorded comment from that
+    /// login wakes both, since a person may share it. A wake that reached the poster before its
+    /// record did closes when the record lands.
+    #[test]
+    fn a_seats_own_comment_wakes_only_the_other_seat_by_its_github_id() {
+        let fixture = WatchFixture::new();
+        let planner = "agent/example.planner";
+        let reviewer = "agent/example.reviewer";
+        let thread = crate::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+        fixture.watch("acme/garden#12", planner);
+        fixture.watch("acme/garden#12", reviewer);
+        let by = |id: u64, login: &str, seconds_ago: i64| serde_json::json!({"kind": "comment", "id": id, "author": login, "at": just_now(seconds_ago)});
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({}))]}));
+        fixture
+            .store
+            .record_github_post(
+                planner,
+                &thread,
+                "comment",
+                95,
+                "https://github.com/acme/garden/pull/12#issuecomment-95",
+                "fleet-login",
+            )
+            .unwrap();
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [by(95, "fleet-login", 30), by(96, "fleet-login", 20), by(97, "fern", 10)]}))]}));
+        assert_eq!(
+            fixture.wakes(planner),
+            [
+                "@fleet-login commented on acme/garden#12",
+                "@fern commented on acme/garden#12"
+            ]
+        );
+        assert_eq!(
+            fixture.wakes(reviewer),
+            [
+                "agent/example.planner (as @fleet-login) commented on acme/garden#12",
+                "@fleet-login commented on acme/garden#12",
+                "@fern commented on acme/garden#12",
+            ]
+        );
+
+        // The observing host saw the reviewer's comment before its record arrived.
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [by(98, "fleet-login", 5)]}))]}));
+        let open = |agent: &str| {
+            fixture
+                .store
+                .messages(Some(agent), false)
+                .unwrap()
+                .into_iter()
+                .filter(|message| message.content.contains("#issuecomment-98"))
+                .count()
+        };
+        assert_eq!(open(reviewer), 1);
+        fixture
+            .store
+            .record_github_post(
+                reviewer,
+                &thread,
+                "comment",
+                98,
+                "https://github.com/acme/garden/pull/12#issuecomment-98",
+                "fleet-login",
+            )
+            .unwrap();
+        assert_eq!(open(reviewer), 0, "the record closes the reviewer's wake");
+        assert_eq!(open(planner), 1, "the planner still hears it");
+
+        // The first seat to record an ID keeps it.
+        let refused = fixture
+            .store
+            .record_github_post(planner, &thread, "comment", 98, "", "fleet-login")
+            .unwrap_err();
+        assert_eq!(refused.code, "github-post-registered");
+        fixture
+            .store
+            .record_github_post(reviewer, &thread, "comment", 98, "", "fleet-login")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stopped_seat_keeps_its_watch_and_the_repository_observer() {
+        let fixture = WatchFixture::new();
+        let planner = "agent/example.planner";
+        let watch = fixture.watch("acme/garden#12", planner);
+        apply_source(
+            &fixture.store,
+            "version 2\nstop \"agent/example.planner\"\n",
+            "planner-stops",
+        );
+        fixture.reconcile();
+        assert!(fixture.running(&watch));
+        assert!(fixture.running(&fixture.observer));
+        assert!(fixture.wakes(planner).is_empty());
+
+        apply_source(
+            &fixture.store,
+            "version 2\nagent \"example.planner\" { workspace \"/tmp\"; command \"true\" }",
+            "planner-starts",
+        );
+        fixture.reconcile();
+        assert!(fixture.running(&watch));
+        assert!(fixture.running(&fixture.observer));
+        assert_eq!(
+            fixture.store.watch_view(&watch).unwrap().unwrap()["state"],
+            "active"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_conversation_ends_only_its_existing_watches_silently() {
+        let fixture = WatchFixture::new();
+        let planner = "agent/example.planner";
+        let thread = crate::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+        let watch = fixture.watch("acme/garden#12", planner);
+        let other = fixture.watch("acme/garden#13", "agent/example.reviewer");
+        // This is the reset that prepare_fresh_context records for a new conversation.
+        fixture
+            .store
+            .append_claim(&ClaimInput {
+                subject: planner.into(),
+                kind: "runtime.action.requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("action".into(), serde_json::json!("fresh-context")),
+                    ("operation".into(), serde_json::json!("example/fresh")),
+                    ("incarnation_id".into(), serde_json::json!("old")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some("example-fresh".into()),
+            })
+            .unwrap();
+        // Extending the deadline does not hide a reset since the watch began.
+        fixture
+            .store
+            .declare_watch(&thread, planner, Some(now_ms() + 60_000))
+            .unwrap();
+        fixture.reconcile();
+        assert_eq!(
+            fixture.store.watch_view(&watch).unwrap().unwrap()["ended"],
+            "seat-ended"
+        );
+        assert!(!fixture.running(&watch));
+        assert!(fixture.running(&other) && fixture.running(&fixture.observer));
+        assert!(fixture.wakes(planner).is_empty());
+
+        // A watch declared in the new conversation survives the old reset.
+        fixture.store.declare_watch(&thread, planner, None).unwrap();
+        fixture.reconcile();
+        assert!(fixture.running(&watch));
+        assert_eq!(
+            fixture.store.watch_view(&watch).unwrap().unwrap()["state"],
+            "active"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watch_deadline_wakes_a_stopped_seat_and_the_last_ending_stops_the_observer() {
+        let fixture = WatchFixture::new();
+        let planner = "agent/example.planner";
+        let reviewer = "agent/example.reviewer";
+        let twelve = crate::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+        let planner_watch = fixture.watch("acme/garden#12", planner);
+        let reviewer_watch = fixture.watch("acme/garden#13", reviewer);
+        apply_source(
+            &fixture.store,
+            "version 2\nstop \"agent/example.planner\"\nstop \"agent/example.reviewer\"\n",
+            "watchers-stop",
+        );
+        let (_, watch) = fixture.store.live_watch(&planner_watch).unwrap().unwrap();
+        // Install an elapsed deadline directly so the proof needs no wall-clock sleep.
+        let source = crate::github_watch::watch_source(
+            &twelve,
+            planner,
+            watch.since_unix_ms,
+            Some(now_ms() - 1),
+        );
+        let intent = crate::graph::parse_internal_intent(&source, "node").unwrap();
+        fixture
+            .store
+            .apply_internal(&intent, "elapsed-deadline")
+            .unwrap();
+        fixture.reconcile();
+        assert_eq!(
+            fixture.wakes(planner),
+            ["Your watch on acme/garden#12 reached its deadline"]
+        );
+        assert_eq!(
+            fixture.store.watch_view(&planner_watch).unwrap().unwrap()["ended"],
+            "deadline"
+        );
+        assert!(!fixture.running(&planner_watch));
+        assert!(fixture.running(&reviewer_watch) && fixture.running(&fixture.observer));
+
+        fixture
+            .store
+            .end_watch(&reviewer_watch, "unwatched", None)
+            .unwrap();
+        fixture.reconcile();
+        assert!(!fixture.running(&fixture.observer));
+        fixture.reconcile();
+        assert_eq!(
+            fixture.wakes(planner).len(),
+            1,
+            "the final wake is not repeated"
+        );
+
+        // Watching again starts the observer again.
+        fixture.store.declare_watch(&twelve, planner, None).unwrap();
+        assert!(fixture.running(&fixture.observer) && fixture.running(&planner_watch));
+    }
+
+    /// A watch on a repository that an intake already observes uses the intake's resource, so
+    /// the repository's item facts live in one place and either observer's poll serves both.
+    #[test]
+    fn a_standing_observer_takes_the_resource_a_running_observer_of_its_repository_uses() {
+        let fixture = WatchFixture::new();
+        apply_source(
+            &fixture.store,
+            r#"version 2
+resource "github/acme/old" { kind "vcs.repository" }
+observer "intake" {
+  resource "resource/github/acme/old"; provider "github.repository"; locator "Acme/Garden"
+  field "pull_requests"
+}"#,
+            "intake-observer",
+        );
+        fixture.watch("acme/garden#12", "agent/example.planner");
+        let standing = fixture
+            .store
+            .desired_subjects_named(std::slice::from_ref(&fixture.observer))
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|observer| crate::graph::observer_spec(&observer.desired))
+            .unwrap();
+        assert_eq!(standing.resource, "resource/github/acme/old");
+        assert!(
+            fixture
+                .store
+                .desired_subjects_named(std::slice::from_ref(&fixture.resource))
+                .unwrap()
+                .is_empty(),
+            "the standing observer declares no resource of its own"
+        );
+    }
+
+    /// An intake run revised onto its repository's standing observer keeps its subscriptions,
+    /// and the standing observer takes over the intake observer's resource and cursor: what the
+    /// intake already delivered is not delivered again, and what changed afterwards is delivered
+    /// once. Cancelling the run stops only its own subscriptions, and the standing observer stops
+    /// when nothing uses it; declared again, it keeps the resource.
+    #[test]
+    fn an_intake_revised_onto_the_standing_observer_delivers_each_item_once() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-mission");
+        let intake = |observer: &str, own: &str| {
+            format!(
+                r#"version 2
+resource "github/acme/old" {{ kind "vcs.repository" }}
+resource "retired" {{ kind "human.review" }}
+mission "intake" state="ready" {{
+  goal "Review every new pull request head and triage every new issue."
+  {own}
+  subscription "reviews" {{
+    observer "{observer}"; on "pull_requests"
+    delivery "mission" {{ mission "review"; resource "source"; workspace "/tmp/st3-reviews" }}
+  }}
+  subscription "triage" {{
+    observer "{observer}"; on "issues"
+    delivery "mission" {{ mission "review"; resource "source"; workspace "/tmp/st3-triage" }}
+  }}
+  step "retire" {{
+    agentless
+    gate "retired" {{ field "retired" "resource/retired" "is" "true" }}
+  }}
+}}"#
+            )
+        };
+        apply_source(
+            &store,
+            &intake(
+                "observer/repository",
+                r#"observer "repository" {
+    resource "resource/github/acme/old"; provider "github.repository"; locator "Acme/Garden"
+    field "pull_requests"; field "issues"
+  }"#,
+            ),
+            "intake-first",
+        );
+        let first = store.mission_spec("intake", None).unwrap().unwrap();
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "intake-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let own = format!("observer/{}/repository", run.id);
+        let standing = "observer/github/acme/garden";
+        let resource = "resource/github/acme/old";
+        let reviews = format!("subscription/{}/reviews", run.id);
+        let triage = format!("subscription/{}/triage", run.id);
+        let declared = |subject: &str| {
+            store
+                .desired_subjects_named(&[subject.to_owned()])
+                .unwrap()
+                .into_iter()
+                .next()
+        };
+        let observer = |subject: &str| {
+            declared(subject).and_then(|item| crate::graph::observer_spec(&item.desired))
+        };
+        let subscription = |subject: &str| {
+            declared(subject).and_then(|item| crate::graph::subscription_spec(&item.desired))
+        };
+        let observe = |observer_subject: &str, cursor: &str, pulls: Value, issues: Value| {
+            let desired = store.desired_subjects().unwrap();
+            let resources = desired
+                .iter()
+                .filter_map(|item| {
+                    let spec = crate::graph::observer_spec(&item.desired)?;
+                    (!spec.stopped).then(|| (item.subject.clone(), spec.resource))
+                })
+                .collect::<HashMap<_, _>>();
+            let subscriptions = desired
+                .iter()
+                .filter_map(|item| {
+                    let spec = crate::graph::subscription_spec(&item.desired)?;
+                    (!spec.stopped
+                        && resources.get(&spec.observer).map(String::as_str) == Some(resource))
+                    .then(|| (item.subject.clone(), spec))
+                })
+                .collect::<Vec<_>>();
+            store
+                .record_resource_observation(
+                    observer_subject,
+                    &store.selected_desired_revision(observer_subject).unwrap().unwrap(),
+                    None,
+                    resource,
+                    Some(cursor),
+                    &serde_json::json!({"repository_id": 41, "pull_requests": pulls, "issues": issues}),
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap();
+        };
+        let requested = |subscription: &str| {
+            store
+                .claims_for(subscription, Some("subscription.mission-requested"))
+                .unwrap()
+                .into_iter()
+                .map(|claim| {
+                    claim.body["fields"]["resource"]
+                        .as_str()
+                        .unwrap()
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let pull = |number: u64, head: char| serde_json::json!({"number": number, "head": head.to_string().repeat(40), "state": "open", "draft": false});
+        let issue = |number: u64| serde_json::json!({"number": number, "state": "open"});
+
+        // The intake's own observer: a baseline, then a new head and a new issue.
+        assert!(observer(&own).is_some_and(|spec| !spec.stopped));
+        observe(
+            &own,
+            "c1",
+            serde_json::json!([pull(1, 'a')]),
+            serde_json::json!([issue(2)]),
+        );
+        observe(
+            &own,
+            "c2",
+            serde_json::json!([pull(1, 'b')]),
+            serde_json::json!([issue(3)]),
+        );
+        assert_eq!(requested(&reviews), [1]);
+        assert_eq!(requested(&triage), [3]);
+
+        // The revision moves both subscriptions onto the standing observer, which takes the
+        // intake observer's resource; the intake observer stops.
+        apply_source(&store, &intake(standing, ""), "intake-second");
+        let second = store.mission_spec("intake", None).unwrap().unwrap();
+        store
+            .adopt_mission_revision(
+                &run.id,
+                &second,
+                "person/test",
+                "intake reads the standing observer",
+                "intake-move",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let moved = observer(standing).expect("the revision declares the standing observer");
+        assert!(!moved.stopped);
+        assert_eq!(moved.resource, resource);
+        assert!(declared(standing).unwrap().owner_run.is_none());
+        assert!(observer(&own).is_none_or(|spec| spec.stopped));
+        for subject in [&reviews, &triage] {
+            let spec = subscription(subject).unwrap();
+            assert!(!spec.stopped, "{subject} keeps running");
+            assert_eq!(spec.observer, standing);
+        }
+        assert_eq!(
+            store
+                .inherited_observer_cursor(resource, standing)
+                .unwrap()
+                .as_deref(),
+            Some("c2"),
+            "the standing observer starts where the intake observer left off"
+        );
+
+        // The standing observer sees what the intake observer saw, and what changed since.
+        observe(
+            standing,
+            "c3",
+            serde_json::json!([pull(1, 'b'), pull(4, 'c')]),
+            serde_json::json!([issue(3), issue(5)]),
+        );
+        observe(
+            standing,
+            "c4",
+            serde_json::json!([pull(1, 'd')]),
+            serde_json::json!([]),
+        );
+        observe(
+            standing,
+            "c4",
+            serde_json::json!([pull(1, 'd')]),
+            serde_json::json!([]),
+        );
+        assert_eq!(requested(&reviews), [1, 4, 1]);
+        assert_eq!(requested(&triage), [3, 5]);
+
+        // Another subscription to the standing observer outlives the intake run.
+        apply_source(
+            &store,
+            r#"version 2
+agent "example.watcher" { workspace "/tmp"; command "true" }
+subscription "elsewhere" {
+  observer "observer/github/acme/garden"; on "issues"; to "agent/example.watcher"
+  delivery "message"
+}"#,
+            "elsewhere",
+        );
+        store
+            .request_mission_run_cancellation(&run.id, "intake retired")
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        for subject in [&reviews, &triage] {
+            assert!(
+                subscription(subject).is_none_or(|spec| spec.stopped),
+                "{subject} stops with its run"
+            );
+        }
+        assert!(subscription("subscription/elsewhere").is_some_and(|spec| !spec.stopped));
+        assert!(observer(standing).is_some_and(|spec| !spec.stopped));
+
+        apply_source(
+            &store,
+            "version 2\nsubscription \"elsewhere\" { stop }\n",
+            "elsewhere-stops",
+        );
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            observer(standing).is_some_and(|spec| spec.stopped),
+            "nothing uses the standing observer"
+        );
+        let observers = store.repository_observers().unwrap();
+        assert!(
+            store
+                .ensure_standing_observer("acme/garden", &observers)
+                .unwrap()
+        );
+        assert_eq!(observer(standing).unwrap().resource, resource);
     }
 
     /// The intake pipeline: a new pull request head that a live agent owns reaches that agent as

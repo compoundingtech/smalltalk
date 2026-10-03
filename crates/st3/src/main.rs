@@ -192,6 +192,12 @@ enum Command {
         #[command(subcommand)]
         command: SubjectCommand,
     },
+    /// Watch GitHub issues and pull requests: each comment, review, required-check result and
+    /// close wakes this seat once.
+    Gh {
+        #[command(subcommand)]
+        command: GhCommand,
+    },
     /// Publish one registered typed observation.
     Claim(ClaimArgs),
     /// Report a harness failure as this agent through the authorized diagnostic path.
@@ -2906,6 +2912,95 @@ struct AgentRestartArgs {
     timeout: String,
 }
 
+#[derive(Subcommand)]
+enum GhCommand {
+    /// Watch an issue or pull request. Each new comment or review that this seat did not post,
+    /// each time the required checks on its current head turn pass or fail, and its close or
+    /// merge wake this seat once; the close or merge, or the deadline, ends the watch. Watching
+    /// it again keeps the watch and takes the new deadline.
+    #[command(
+        after_help = "Examples:\n  st gh watch acme/garden#12\n  st gh watch https://github.com/acme/garden/pull/12 --until 4h"
+    )]
+    Watch(GhWatchArgs),
+    /// End this seat's watch on an issue or pull request.
+    Unwatch(GhUnwatchArgs),
+    /// List this seat's watches, running and ended in the last day, or every seat's with --all.
+    Ls(GhLsArgs),
+    /// Post a comment, or a pull request review, as this seat. st records the new comment's
+    /// GitHub ID as this seat's, so it wakes no watch of this seat and other seats' wakes name
+    /// this seat; it also watches the thread unless --no-watch.
+    #[command(
+        after_help = "Examples:\n  st gh comment acme/garden#12 --body 'The seed list is ready.'\n  st gh comment acme/garden#12 --body-file review.md --review request-changes"
+    )]
+    Comment(GhCommentArgs),
+    /// Record a comment or review this seat posted some other way, by its URL, as this seat's.
+    /// A watch that already reported it woke the seat once.
+    Own(GhOwnArgs),
+}
+
+#[derive(Args)]
+struct GhCommentArgs {
+    /// OWNER/REPO#NUMBER, or the issue or pull request URL.
+    thread: String,
+    /// The comment's text.
+    #[arg(
+        long,
+        conflicts_with = "body_file",
+        required_unless_present = "body_file"
+    )]
+    body: Option<String>,
+    /// Read the comment's text from a file, or `-` for standard input.
+    #[arg(long)]
+    body_file: Option<PathBuf>,
+    /// Post a pull request review instead: approve, request-changes or comment.
+    #[arg(long)]
+    review: Option<String>,
+    /// Post without watching the thread.
+    #[arg(long)]
+    no_watch: bool,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+}
+
+#[derive(Args)]
+struct GhOwnArgs {
+    /// The comment's or review's URL: …#issuecomment-ID or …#pullrequestreview-ID.
+    url: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+}
+
+#[derive(Args)]
+struct GhWatchArgs {
+    /// OWNER/REPO#NUMBER, or the issue or pull request URL.
+    thread: String,
+    /// End the watch at this time: a duration such as 4h, or an RFC 3339 time.
+    #[arg(long)]
+    until: Option<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+}
+
+#[derive(Args)]
+struct GhUnwatchArgs {
+    /// OWNER/REPO#NUMBER, or the issue or pull request URL.
+    thread: String,
+    /// The seat whose watch a person ends; a seat ends its own.
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+}
+
+#[derive(Args)]
+struct GhLsArgs {
+    /// Every seat's watches, not only this seat's.
+    #[arg(long)]
+    all: bool,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+}
+
 #[derive(Args)]
 struct ClaimArgs {
     subject: String,
@@ -3867,6 +3962,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Clients => run_clients(&endpoint, cli.json).await,
         Command::Work { command } => run_work(&client, &endpoint, command, cli.json).await,
+        Command::Gh { command } => run_gh(&client, command, cli.json).await,
         Command::Lanes { command } => {
             run_lanes(&client, config.person.as_deref(), command, cli.json).await
         }
@@ -4059,6 +4155,13 @@ fn guard_mutating_cli_actor(
         },
         Command::Claim(args) => args.actor.as_deref(),
         Command::Diagnostic(args) => Some(args.actor.as_str()),
+        Command::Gh { command } => match command {
+            GhCommand::Watch(args) => Some(args.actor.as_str()),
+            GhCommand::Unwatch(args) => Some(args.actor.as_str()),
+            GhCommand::Comment(args) => Some(args.actor.as_str()),
+            GhCommand::Own(args) => Some(args.actor.as_str()),
+            GhCommand::Ls(_) => None,
+        },
         _ => None,
     };
     if let Some(actor) = actor {
@@ -4069,6 +4172,160 @@ fn guard_mutating_cli_actor(
         }
         if let Some(message) = foreign_agent_actor(actor, Some(own), mission_run) {
             anyhow::bail!(message);
+        }
+    }
+    Ok(())
+}
+
+/// One watch as one line: thread, state, deadline or ending, and title.
+fn gh_watch_line(view: &Value, with_agent: bool) -> String {
+    let text = |name: &str| view.get(name).and_then(Value::as_str).unwrap_or_default();
+    let state = match text("state") {
+        "ended" => format!("ended ({})", text("ended")),
+        "degraded" => format!("degraded: {}", text("reason")),
+        state => state.to_owned(),
+    };
+    let until = view
+        .get("until")
+        .and_then(Value::as_str)
+        .map(|until| format!(" until {until}"))
+        .unwrap_or_default();
+    let title = view
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|title| format!(" \"{title}\""))
+        .unwrap_or_default();
+    let agent = if with_agent {
+        format!(" {}", text("agent"))
+    } else {
+        String::new()
+    };
+    format!("{}{agent}  {state}{until}{title}", text("thread"))
+}
+
+async fn run_gh(client: &st3::client::Client, command: GhCommand, json: bool) -> Result<()> {
+    match command {
+        GhCommand::Watch(args) => {
+            let view: Value = client
+                .post(
+                    "/v1/github/watch",
+                    &json!({"actor": args.actor, "thread": args.thread, "until": args.until}),
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&view)?);
+                return Ok(());
+            }
+            let thread = view
+                .get("thread")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            println!("Watching {}", gh_watch_line(&view, false));
+            println!(
+                "Each new comment or review that this seat did not post, each time the required checks on its head turn pass or fail, and its close or merge wake this seat once."
+            );
+            println!("To stop: st gh unwatch {thread}");
+        }
+        GhCommand::Unwatch(args) => {
+            let outcome: Value = client
+                .post(
+                    "/v1/github/unwatch",
+                    &json!({"actor": args.actor, "thread": args.thread, "agent": args.agent}),
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+                return Ok(());
+            }
+            let thread = outcome
+                .get("thread")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let agent = outcome
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if outcome.get("ended") == Some(&Value::Bool(true)) {
+                println!("Ended the watch of {agent} on {thread}.");
+            } else {
+                println!("{agent} has no running watch on {thread}.");
+            }
+        }
+        GhCommand::Comment(args) => {
+            let body = match (args.body, args.body_file) {
+                (Some(body), _) => body,
+                (None, Some(path)) if path.as_os_str() == "-" => {
+                    let mut body = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut body)?;
+                    body
+                }
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?,
+                (None, None) => anyhow::bail!("give the comment's text with --body or --body-file"),
+            };
+            let posted: Value = client
+                .post(
+                    "/v1/github/comment",
+                    &json!({"actor": args.actor, "thread": args.thread, "body": body,
+                        "review": args.review, "watch": !args.no_watch}),
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&posted)?);
+                return Ok(());
+            }
+            let text = |name: &str| posted.get(name).and_then(Value::as_str).unwrap_or_default();
+            println!(
+                "Posted {} {} as this seat's: {}",
+                text("kind"),
+                posted["id"],
+                text("url")
+            );
+            if let Some(watch) = posted.get("watch").filter(|watch| !watch.is_null()) {
+                println!("Watching {}", gh_watch_line(watch, false));
+            }
+        }
+        GhCommand::Own(args) => {
+            let recorded: Value = client
+                .post(
+                    "/v1/github/own",
+                    &json!({"actor": args.actor, "url": args.url}),
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&recorded)?);
+                return Ok(());
+            }
+            println!(
+                "Recorded {} {} on {} as this seat's.",
+                recorded["kind"].as_str().unwrap_or_default(),
+                recorded["id"],
+                recorded["thread"].as_str().unwrap_or_default()
+            );
+        }
+        GhCommand::Ls(args) => {
+            let agent = if args.all {
+                None
+            } else {
+                Some(args.actor.clone().context(
+                    "outside an agent seat, list every seat's watches with --all or name one with --as",
+                )?)
+            };
+            let path = agent.as_deref().map_or_else(
+                || "/v1/github/watches".to_owned(),
+                |agent| format!("/v1/github/watches?agent={}", urlencoding::encode(agent)),
+            );
+            let views: Vec<Value> = client.get(&path).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&views)?);
+                return Ok(());
+            }
+            if views.is_empty() {
+                println!("No watches.");
+            }
+            for view in &views {
+                println!("{}", gh_watch_line(view, agent.is_none()));
+            }
         }
     }
     Ok(())
@@ -19557,6 +19814,22 @@ mod tests {
                 "--reason",
                 "test",
             ],
+            &[
+                "st3",
+                "gh",
+                "watch",
+                "acme/garden#12",
+                "--as",
+                "person/operator",
+            ],
+            &[
+                "st3",
+                "gh",
+                "unwatch",
+                "acme/garden#12",
+                "--as",
+                "agent/peer",
+            ],
         ];
         for arguments in cases {
             let cli = Cli::try_parse_from(*arguments).unwrap();
@@ -21447,6 +21720,42 @@ mod tests {
         assert_eq!(
             normalize_message_subject_in_run("worker", None),
             "agent/worker"
+        );
+    }
+
+    #[test]
+    fn every_offered_cli_command_has_an_action_coverage_row() {
+        fn walk(
+            command: &clap::Command,
+            prefix: &str,
+            output: &mut std::collections::BTreeSet<String>,
+        ) {
+            let children = command
+                .get_subcommands()
+                .filter(|child| !child.is_hide_set() && child.get_name() != "help")
+                .collect::<Vec<_>>();
+            if prefix != "st" && (children.is_empty() || !command.is_subcommand_required_set()) {
+                output.insert(prefix.to_owned());
+            }
+            for child in children {
+                walk(child, &format!("{prefix} {}", child.get_name()), output);
+            }
+        }
+        let mut command = Cli::command();
+        command.build();
+        let mut offered = std::collections::BTreeSet::new();
+        walk(&command, "st", &mut offered);
+        let inventory: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/st3/action-coverage.json")).unwrap();
+        let documented = inventory["cli"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["command"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            offered, documented,
+            "Update the inventory and its end-to-end coverage when the CLI changes"
         );
     }
 
