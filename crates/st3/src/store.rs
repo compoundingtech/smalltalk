@@ -1190,6 +1190,16 @@ struct ChildMissionContext {
     default_selector: Option<WorkSelector>,
 }
 
+fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str) -> Result<Option<String>> {
+    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim|
+        claim.subject == resource && claim.body.pointer("/fields/kind").and_then(Value::as_str) == Some("vcs.ref")) else { return Ok(None); };
+    let Some(current) = latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned()) else { return Ok(None); };
+    let requested_head = requested.body.pointer("/fields/facts/head").and_then(Value::as_str);
+    if let Some((requested, current)) = requested_head.zip(current.get("head").and_then(Value::as_str))
+        && requested != current { return Ok(Some(format!("ref {resource} moved from head {requested} to {current}"))); }
+    Ok(None)
+}
+
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0 || version == 13 || version == 14 || version == 15 {
@@ -3103,7 +3113,7 @@ impl Store {
         &self,
         request: &MissionRunRequest,
     ) -> Result<MissionRunView, St3Error> {
-        self.create_mission_run_inner(request, None, None)
+        self.create_mission_run_inner(request, None, None, None)
     }
 
     pub fn mission_run_subject_for_idempotency_key(&self, idempotency_key: &str) -> String {
@@ -3134,6 +3144,7 @@ impl Store {
                 parent_step_run: normalize_step_run(parent_step_run),
                 default_selector: default_selector.cloned(),
             }),
+            None,
             None,
         )
     }
@@ -3169,7 +3180,18 @@ impl Store {
             parent_step_run: normalize_step_run(schedule),
             default_selector: None,
         });
-        self.create_mission_run_inner(request, child, Some(&subject))
+        self.create_mission_run_inner(request, child, Some(&subject), None)
+    }
+
+    pub fn create_subscription_mission_run(&self, request: &MissionRunRequest,
+        parent: Option<&MissionRunView>, subscription: &str, resource: &str, discovery: &str,
+    ) -> Result<MissionRunView, St3Error> {
+        let child = parent.map(|parent| ChildMissionContext {
+            root_revision: parent.root_revision.clone(),
+            root_run_id: parent.root_mission_run.trim_start_matches("mission-run/").into(),
+            parent_step_run: normalize_step_run(subscription), default_selector: None,
+        });
+        self.create_mission_run_inner(request, child, None, Some((resource, discovery)))
     }
 
     fn create_mission_run_inner(
@@ -3177,6 +3199,7 @@ impl Store {
         request: &MissionRunRequest,
         child: Option<ChildMissionContext>,
         occurrence_subject: Option<&str>,
+        latest_ref: Option<(&str, &str)>,
     ) -> Result<MissionRunView, St3Error> {
         let mission_id = request
             .mission
@@ -3256,6 +3279,10 @@ impl Store {
         }
         let transaction = connection.transaction().map_err(internal)?;
         owned_sets::guard_mission_start(&transaction, mission_id)?;
+        if let Some((resource, discovery)) = latest_ref
+            && let Some(reason) = stale_ref_request_tx(&transaction, resource, discovery).map_err(internal)? {
+            return Err(St3Error::new("stale-ref-head", reason));
+        }
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
         enforce_mission_run_capacity(&transaction, &mission)?;
         let subject = occurrence_subject.map(str::to_owned).unwrap_or_else(|| {
@@ -13078,6 +13105,12 @@ impl Store {
             )));
         }
         Ok(None)
+    }
+
+    /// Unstarted ref deliveries collapse to the latest observed head. Running missions
+    /// retain their pinned discovery and exact CI gate, even when the ref moves again.
+    pub fn stale_ref_request(&self, resource: &str, discovery: &str) -> Result<Option<String>> {
+        stale_ref_request_tx(&self.readers.get(), resource, discovery)
     }
 
     pub fn authoring_review_owner(&self, discovery: &str) -> Result<Option<String>> {
