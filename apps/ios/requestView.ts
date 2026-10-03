@@ -64,3 +64,23 @@ export function spaced(question: string): string {
   }
   return out.join('\n');
 }
+
+type Request = { type: string; custom?: boolean; answers?: { id: string; outcome?: string | null }[] };
+
+/**
+ * The typed answer for a person step, as stui sends it: the named answer chosen (with the words
+ * when it requests changes), or the person's own words where the request takes them. Words
+ * alone on a structured request are refused by st (`answer-required`), which left an answered
+ * item on Home (Nathan, 2026-10-03). A string says why words cannot answer it.
+ */
+export function personAnswer(request: Request | null | undefined, chosen: string | undefined, words: string): { id?: string; text?: string } | undefined | string {
+  const text = words.trim();
+  if (chosen) {
+    const changes = request?.answers?.some(answer => answer.id === chosen && answer.outcome === 'request_changes');
+    return changes ? { id: chosen, text } : { id: chosen };
+  }
+  if (!request) return undefined;
+  if (request.type === 'feedback' || (request.type === 'choice' && request.custom)) return { text };
+  const changes = request.answers?.find(answer => answer.outcome === 'request_changes');
+  return changes ? { id: changes.id, text } : 'This asks you to pick one of its answers.';
+}
