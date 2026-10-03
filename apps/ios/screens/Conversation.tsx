@@ -259,6 +259,19 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     return () => { clearTimeout(typed); clearTimeout(sent); };
   }, [loaded, agent?.id]);
   useEffect(() => { if (devSend) void send(); }, [devSend]);
+  // Debug builds only: scroll back to the oldest entry every few seconds, as a person reading
+  // back would, so a recording can show earlier pages arriving (EXPO_PUBLIC_ST3_TEST_SCROLL_BACK
+  // is how many times).
+  useEffect(() => {
+    let left = __DEV__ ? Number(process.env.EXPO_PUBLIC_ST3_TEST_SCROLL_BACK ?? 0) : 0;
+    if (!left || !loaded) return;
+    const timer = setInterval(() => {
+      if (left-- <= 0) { clearInterval(timer); return; }
+      dragged.current = true;
+      list.current?.scrollToEnd({ animated: false });
+    }, 4_000);
+    return () => clearInterval(timer);
+  }, [loaded]);
   const toggle = useCallback((id: string) => setOpen(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; }), []);
 
   return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={headerHeight}>
