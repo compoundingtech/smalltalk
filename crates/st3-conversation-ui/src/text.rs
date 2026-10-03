@@ -205,6 +205,16 @@ pub fn continues(line: &Line<'_>) -> Option<&'static str> {
     }
 }
 
+impl crate::SelectionLine for Line<'_> {
+    fn plain_text(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(plain(self))
+    }
+
+    fn continuation(&self) -> Option<&str> {
+        continues(self)
+    }
+}
+
 /// `line` drawn after `prefix` (an edge, an indent), still wrapping the line before it if it did.
 pub fn prefixed(prefix: Vec<Span<'static>>, line: Line<'static>) -> Line<'static> {
     let alignment = line.alignment;

@@ -1,3 +1,26 @@
+/// How much of a conversation's tool work shows: every call with its output, or (simplified)
+/// each call on one line and a run of calls on one line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Density {
+    #[default]
+    Full,
+    Simple,
+}
+
+/// The id that opens a run of tool calls starting at `first`, in the expanded set.
+pub fn bundle_id(first: &str) -> String {
+    format!("bundle:{first}")
+}
+
+/// Whether an entry folds until opened: tool calls, and mail the person is not part of.
+pub fn folds(body: &Body) -> bool {
+    match body {
+        Body::Tool { .. } => true,
+        Body::Mail { from, to, .. } => from != "you" && to != "you",
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Hash, serde::Serialize)]
 pub struct Entry {
     pub id: String,
