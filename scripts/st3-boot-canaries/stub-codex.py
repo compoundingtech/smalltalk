@@ -9,6 +9,7 @@ which hid the race between a bound thread and the daemon's mailbox replay. A fas
 that race every time.
 """
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -93,6 +94,23 @@ def listen(path):
     return server
 
 
+def rollouts():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+
+
+def rollout(thread_id):
+    """The thread's rollout file, as Codex names it, if it has one."""
+    return next(rollouts().rglob(f"rollout-*-{thread_id}.jsonl"), None)
+
+
+def record_rollout(thread_id):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    directory = rollouts() / now.strftime("%Y/%m/%d")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"rollout-{now.strftime('%Y-%m-%dT%H-%M-%S')}-{thread_id}.jsonl"
+    path.write_text(json.dumps({"type": "session_meta", "payload": {"id": thread_id, "cwd": os.getcwd()}}) + "\n")
+
+
 class AppServer:
     def __init__(self):
         self.clients = []
@@ -155,16 +173,24 @@ class AppServer:
         if method == "initialize":
             self.send(client, {"id": ident, "result": {"userAgent": "codex-stub"}})
         elif method == "thread/start":
-            self.thread_id = self.thread_id or str(uuid.uuid4())
+            if not self.thread_id:
+                self.thread_id = str(uuid.uuid4())
+                record_rollout(self.thread_id)
+            stubmodel.receipt("thread", id=self.thread_id, resumed=False)
             self.send(client, {"id": ident, "result": {"thread": self.thread()}})
             self.broadcast({"method": "thread/started", "params": {"thread": self.thread()}})
         elif method == "thread/loaded/list":
             self.send(client, {"id": ident, "result": {"data": [self.thread_id] if self.thread_id else []}})
         elif method == "thread/resume":
-            if params.get("threadId") != self.thread_id:
+            # A thread resumes from its rollout, in this server or a later one.
+            requested = params.get("threadId")
+            if requested != self.thread_id and not (requested and rollout(requested)):
                 self.send(client, {"id": ident, "error": {
-                    "code": -32600, "message": f"no rollout found for thread id {params.get('threadId')}"}})
+                    "code": -32600, "message": f"no rollout found for thread id {requested}"}})
             else:
+                if requested != self.thread_id:
+                    stubmodel.receipt("thread", id=requested, resumed=True)
+                self.thread_id = requested
                 self.send(client, {"id": ident, "result": {"thread": self.thread()}})
         elif method == "account/read":
             self.send(client, {"id": ident, "result": {"account": {"type": "apiKey"}}})
@@ -235,7 +261,12 @@ def tui(argv):
 
     call(0, "initialize", {"clientInfo": {"name": "codex-stub", "version": "0"}})
     stream.sendall(frame(json.dumps({"method": "initialized", "params": {}}), True))
-    call(1, "thread/start", {"cwd": os.getcwd()})
+    # `codex --remote URL resume THREAD` opens that thread; otherwise the TUI starts a new one.
+    resume = argv[argv.index("resume") + 1] if "resume" in argv[:-1] else None
+    if resume:
+        call(1, "thread/resume", {"threadId": resume})
+    else:
+        call(1, "thread/start", {"cwd": os.getcwd()})
     stubmodel.receipt("tui-ready")
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     try:

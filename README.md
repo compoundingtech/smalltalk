@@ -355,6 +355,12 @@ seats, and waits for a new running incarnation. `--timeout 2m` changes the defau
 wait; a failure or timeout explains why the seat is not running again. `st agents stop
 agent/example/worker --as person/ada` stops a seat until you apply its file again.
 
+`st agents suspend agent/example/worker --as person/ada` stops a quiet seat and keeps its harness's
+own session; `st agents resume agent/example/worker --as person/ada` brings the seat back on that
+same session and checks it. A seat suspends only when it is idle, with no pending question,
+claimed step, or running subagent. A suspended seat stays declared, is not restarted, and keeps
+its mail until it resumes. [Suspending a seat](docs/st3/suspend.md) has the details.
+
 Human labels are presentation, not launch configuration:
 
 ```sh

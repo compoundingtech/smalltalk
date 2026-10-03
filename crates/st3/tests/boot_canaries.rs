@@ -12,6 +12,8 @@
 //!   observation of the seat is still its dead predecessor, boots a replacement.
 //! - `reexec`: the st binary is replaced and the seat's driver and channels re-exec into it.
 //! - `concurrent`: five seats launch at once.
+//! - `suspend`: a quiet seat suspends and resumes its own native session, and a resume whose
+//!   transcript is gone fails with a typed reason while the seat stays suspended.
 //!
 //! The stand-ins answer instantly where the real providers take seconds. That is the point: a race
 //! between a provider and the daemon that a slow provider hides, a fast one hits every time.
@@ -124,6 +126,10 @@ macro_rules! harness {
             #[test]
             fn five_seats_launching_at_once_all_boot() {
                 super::canary($harness, "concurrent");
+            }
+            #[test]
+            fn a_suspended_seat_resumes_its_own_native_session() {
+                super::canary($harness, "suspend");
             }
         }
     };

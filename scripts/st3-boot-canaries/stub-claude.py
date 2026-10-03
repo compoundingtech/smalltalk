@@ -53,11 +53,19 @@ settings = json.loads(option(argv, "--settings") or "{}")
 mcp = json.loads(option(argv, "--mcp-config") or "{}")
 receipt("started", argv=argv)
 
-session_id = str(uuid.uuid4())
+# `--resume ID` continues that session in this project, as Claude does; Claude refuses an ID with
+# no transcript here.
+resumed = option(argv, "--resume")
+session_id = resumed or str(uuid.uuid4())
 cwd = str(Path.cwd())
 projects = Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
 projects.mkdir(parents=True, exist_ok=True)
 transcript = projects / f"{session_id}.jsonl"
+if resumed and not transcript.is_file():
+    print(f"No conversation found with session ID: {resumed}", file=sys.stderr)
+    receipt("session-missing", session_id=resumed)
+    sys.exit(1)
+receipt("session", session_id=session_id, resumed=bool(resumed))
 
 
 def append(role, text):
@@ -117,7 +125,7 @@ if server:
     receipt("mcp", initialize=json.loads(channel.stdout.readline()))
 receipt("mcp-server", present=bool(server))
 
-hooks("SessionStart", {"source": "startup", "model": "claude-stub-model"})
+hooks("SessionStart", {"source": "resume" if resumed else "startup", "model": "claude-stub-model"})
 append("user", "canary transcript probe")
 append("assistant", "canary transcript answer")
 status_line()

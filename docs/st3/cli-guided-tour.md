@@ -230,6 +230,8 @@ st agents queue --help
 st agents queue move --help
 st agents new --help
 st agents new example --host HOST --print-kdl
+st agents suspend --help
+st agents resume --help
 st machines --help
 st machines
 ```
@@ -247,6 +249,10 @@ this as a mission question rather than an agent one. `agents queue move AGENT RU
 `--bottom`, `--before RUN`, or `--after RUN` is a person-authorized mutation; move only a run we
 agreed to reorder, then confirm the move is listed with its author and time and that a held step
 stayed held.
+
+`agents suspend` is a mutation. Suspend only a seat we agreed to stop. Check that a busy seat is
+refused with its reasons, that a quiet one shows `suspended` with its native session in `agents
+show`, and that `agents resume` reports the same session.
 
 `agents new --print-kdl` shows the seat declaration without applying it. Check that its workspace is
 a new directory below that host's home and that the harness defaults match the fleet's existing

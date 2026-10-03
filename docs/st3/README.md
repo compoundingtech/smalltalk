@@ -19,6 +19,8 @@ Use these documents for implementation details:
 - [Attachments](attachments.md) defines the images a message carries between machines: where the
   bytes live (never in sync), the limits, upload and read, and delivery to a seat.
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
+- [Suspending a seat](suspend.md) explains `st agents suspend` and `resume`: when a seat is quiet
+  enough to stop, and how each harness comes back on its own native session.
 - [Seats across deploys](seat-deploys.md) explains how a running seat's driver and channels follow
   a replaced st binary without ending the provider session, and how st reports a stale message path.
 - [Delivery probes](delivery-probes.md) describes token-free native-channel probes, per-direction

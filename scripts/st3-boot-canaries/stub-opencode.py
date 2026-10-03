@@ -10,15 +10,22 @@ prompt the way a model would: it acts on the message, then reports the assistant
 """
 import json
 import os
+from pathlib import Path
 import queue
 import signal
+import sqlite3
 import sys
 import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import stubmodel
 
-SESSION = "ses_stub"
+# The seat's session: a new one per launch, or the one `--session ID` resumes. Like OpenCode, the
+# stand-in keeps its sessions in opencode.db under its data directory, so a resumed seat finds the
+# session its predecessor made.
+SESSION = None
 # The driver refuses a server whose OpenAPI document lacks any arm it uses.
 DOC = {"openapi": "3.1.0", "info": {"title": "opencode stub"},
        "paths": {"/session/{id}/prompt_async": {"post": {"requestBody": {"messageID": "string"}}},
@@ -68,7 +75,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path in ("/permission", "/question"):
             self.reply(200, [])
         elif path == "/session":
-            self.reply(200, [{"id": SESSION}])
+            self.reply(200, [{"id": SESSION, "time": {"updated": int(time.time() * 1000)}}])
+        elif path.startswith("/session/") and path.count("/") == 2:
+            identifier = path.rsplit("/", 1)[1]
+            self.reply(200, {"id": identifier}) if identifier in sessions() else self.reply(404)
         elif path == "/config/providers":
             self.reply(200, PROVIDERS)
         elif "/message/" in path:
@@ -134,6 +144,23 @@ def answer(identifier, text):
     publish({"type": "session.status", "properties": {"sessionID": SESSION, "status": {"type": "idle"}}})
 
 
+def database():
+    data = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
+    path = Path(data) / "opencode/opencode.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        "CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, directory TEXT, title TEXT,"
+        " time_created INTEGER, time_updated INTEGER);"
+        "CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT, time_updated INTEGER);")
+    return connection
+
+
+def sessions():
+    with database() as connection:
+        return {row[0] for row in connection.execute("SELECT id FROM session")}
+
+
 def option(argv, name):
     for index, argument in enumerate(argv):
         if argument == name and index + 1 < len(argv):
@@ -148,6 +175,21 @@ def main(argv):
         print("1.18.25")
         return 0
     stubmodel.receipt("started", argv=argv)
+    global SESSION
+    requested = option(argv, "--session") or option(argv, "-s")
+    if requested:
+        if requested not in sessions():
+            print(f"Session not found: {requested}", file=sys.stderr)
+            stubmodel.receipt("session-missing", id=requested)
+            return 1
+        SESSION = requested
+    else:
+        SESSION = f"ses_{uuid.uuid4().hex[:24]}"
+        now = int(time.time() * 1000)
+        with database() as connection:
+            connection.execute("INSERT INTO session VALUES (?, ?, ?, ?, ?)",
+                               (SESSION, os.getcwd(), "canary", now, now))
+    stubmodel.receipt("session", id=SESSION, resumed=bool(requested))
     port = int(option(argv, "--port") or 0)
     server = ThreadingHTTPServer((option(argv, "--hostname") or "127.0.0.1", port), Handler)
     server.daemon_threads = True
