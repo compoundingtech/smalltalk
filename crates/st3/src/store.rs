@@ -17324,6 +17324,13 @@ fn work_extension_roots_tx(transaction: &Transaction<'_>) -> Result<(BTreeSet<St
     for subject in subjects {
         if let Some(root) = run_tree_of_tx(transaction, &subject).map_err(anyhow::Error::new)? {
             roots.insert(root);
+            // A generation claim can name the owning run before its creation reaches us.
+            // The reference alone does not establish that the extension was projected.
+            unresolved |= !transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM step_runs WHERE subject=?1)",
+                [&subject],
+                |row| row.get::<_, bool>(0),
+            )?;
         } else {
             unresolved = true;
         }
@@ -17343,12 +17350,12 @@ fn migrate_work_extension_projections_tx(transaction: &Transaction<'_>) -> Resul
     if current {
         return Ok(0);
     }
-    let (roots, unresolved) = work_extension_roots_tx(transaction)?;
+    let (roots, _) = work_extension_roots_tx(transaction)?;
     let rebuilt = roots.len();
     for root in roots {
         rebuild_run_tree_tx(transaction, &root).map_err(anyhow::Error::new)?;
     }
-    if !unresolved {
+    if !work_extension_roots_tx(transaction)?.1 {
         mark_work_extensions_projected_tx(transaction)?;
     }
     Ok(rebuilt)
@@ -33716,6 +33723,38 @@ version 2
         let target = Store::open(&path, "delayed").unwrap();
         receive_and_project(&target, "worker", &first);
         assert!(target.step_run(&step).unwrap().is_none());
+        // The generation reference can arrive before the owning run as well. Knowing the
+        // root's name is insufficient evidence that the extension has been projected.
+        let generation = step
+            .trim_start_matches("step-run/")
+            .split('/')
+            .next()
+            .unwrap();
+        let (run, revision): (String, String) = worker
+            .readers
+            .get()
+            .query_row(
+                "SELECT run_id, revision FROM run_generations WHERE id=?1",
+                [generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        {
+            let mut connection = target.connection.write();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &target.origin,
+                &format!("run-generation/{generation}"),
+                "run-generation.created",
+                None,
+                &json!({"fields": {"run": format!("mission-run/{run}"), "revision": revision}}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
         target
             .connection
             .write()
