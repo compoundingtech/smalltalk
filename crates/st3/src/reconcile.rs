@@ -1762,8 +1762,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let item = format!("member:{}", subject.subject);
             members.insert(item.clone());
-            let needed = self.incremental.needs(&item, now_ms())
-                || member_errors.contains_key(&subject.subject);
+            let needed = member_errors.contains_key(&subject.subject)
+                || self.needs_item(&item, !skip_members);
             if skip_members && !needed {
                 // Its last evaluation stands, the work wake it queued included.
                 if let Some(wake) = self
@@ -3018,7 +3018,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         skip: bool,
         work: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        let needed = self.incremental.needs(item, now_ms());
+        let needed = self.needs_item(item, !skip);
         if skip && !needed {
             return Ok(());
         }
@@ -3358,6 +3358,21 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Reconcile a stop. `actual_origin` is the subject's selected actual origin when the caller
     /// already read it in this pass.
+    /// Whether `item` needs evaluating. When it is evaluated anyway (`evaluated_anyway`: a full
+    /// pass, or skipping off), the change feed is read again first: a write that landed after
+    /// the pass read it, such as a request through the API, is what the evaluation acts on, not
+    /// a change the skipping passes missed.
+    fn needs_item(&self, item: &str, evaluated_anyway: bool) -> bool {
+        if self.incremental.needs(item, now_ms()) {
+            return true;
+        }
+        if !evaluated_anyway {
+            return false;
+        }
+        let _ = self.incremental.observe(&self.store);
+        self.incremental.needs(item, now_ms())
+    }
+
     /// Gate runners, read again only when a request, a runner's stop, or an owner's state
     /// changed, and on each full pass. A full pass that finds the kept list stale although
     /// nothing marked it counts an incremental correction.
@@ -3365,7 +3380,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         const ITEM: &str = "gate-runners";
         let now = now_ms();
         let full = !self.skip_unneeded || self.incremental.take_full_pass(ITEM, now);
-        let needed = self.incremental.needs(ITEM, now);
+        let needed = self.needs_item(ITEM, full);
         let mut kept = self
             .gate_runners
             .lock()
@@ -3398,7 +3413,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         live_workspaces: &BTreeSet<&str>,
         diagnostic_errors: &mut Vec<String>,
     ) {
-        let needed = self.incremental.needs(item, now_ms());
+        let needed = self.needs_item(item, !skip);
         if skip && !needed {
             return;
         }
@@ -5276,7 +5291,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let full = !self.skip_unneeded || self.incremental.take_full_pass("mission-run", now_ms());
         for id in &ids {
             let subject = format!("mission-run/{id}");
-            let needed = self.incremental.needs(&subject, now_ms());
+            let needed = self.needs_item(&subject, full);
             if !full && !needed {
                 // Nothing it read changed and nothing is due. It stays active: keep its caches,
                 // faults and file watchers as its last evaluation left them.
