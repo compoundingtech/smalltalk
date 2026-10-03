@@ -500,16 +500,19 @@ Check that the skill describes st without rules of conduct, that its description
 
 ### 20. `completions` — shell discoverability
 
-Why: generated completion keeps the large but intentional command surface navigable.
+Why: completion keeps the large but intentional command surface navigable, and offers the live
+terminals, agents, missions, and other entities an argument accepts, each with a description
+([spec](cli-completion/spec.md)).
 
 ```sh
 st completions --help
-st completions bash >/dev/null
 st completions zsh >/dev/null
-st completions fish >/dev/null
+COMPLETE=fish st -- st terminals attach ''
+st terminals attach steward
 ```
 
-Check generation, installation guidance, and whether hidden/internal commands remain hidden.
+Check that each stub is printed, that entity candidates carry descriptions, that hidden/internal
+commands remain hidden, and that an ambiguous short name lists its matches.
 
 ## Exit criteria
 

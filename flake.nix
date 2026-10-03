@@ -430,6 +430,10 @@
           test -s ${st3}/share/bash-completion/completions/st.bash
           test -s ${st3}/share/zsh/site-functions/_st
           test -s ${st3}/share/fish/vendor_completions.d/st.fish
+          # Each installed stub calls back into this package's executable, not `st` on PATH.
+          grep -qF '${st3}/bin/st3' ${st3}/share/zsh/site-functions/_st
+          grep -qF '${st3}/bin/st3' ${st3}/share/bash-completion/completions/st.bash
+          grep -qF '${st3}/bin/st3' ${st3}/share/fish/vendor_completions.d/st.fish
           ${st3}/bin/st3-migrate --help > /dev/null
           touch $out
         '';
