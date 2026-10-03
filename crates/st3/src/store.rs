@@ -2386,6 +2386,7 @@ impl Store {
         mission_id: &str,
         revision: Option<&str>,
     ) -> Result<Option<MissionSpec>> {
+        smallclaims::touched::note_read(|| format!("mission/{mission_id}"));
         let connection = self.readers.get();
         let body = if let Some(revision) = revision {
             connection
@@ -3483,8 +3484,13 @@ impl Store {
 
     pub fn mission_run(&self, run: &str) -> Result<Option<MissionRunView>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        smallclaims::touched::note_read(|| format!("mission-run/{run}"));
         let connection = self.readers.get();
-        Ok(mission_run_view_tx(&connection, run).optional()?)
+        let view = mission_run_view_tx(&connection, run).optional()?;
+        if let Some(view) = &view {
+            note_run_view_reads(view);
+        }
+        Ok(view)
     }
 
     /// A run with each step's effective state, and with `summaries` its latest progress and
@@ -3512,6 +3518,7 @@ impl Store {
     /// Read one run's status without hydrating its step history.
     pub fn mission_run_status(&self, run: &str) -> Result<Option<String>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        smallclaims::touched::note_read(|| format!("mission-run/{run}"));
         let connection = self.readers.get();
         Ok(connection
             .query_row(
@@ -4242,6 +4249,7 @@ impl Store {
 
     pub fn mission_run_for_parent_step(&self, step: &str) -> Result<Option<MissionRunView>> {
         let step = normalize_step_run(step);
+        smallclaims::touched::note_read(|| format!("children-of-step:{step}"));
         let connection = self.connection.write();
         let run_id = connection
             .query_row(
@@ -4250,10 +4258,13 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        run_id
+        let view = run_id
             .map(|run_id| mission_run_view_tx(&connection, &run_id))
-            .transpose()
-            .map_err(Into::into)
+            .transpose()?;
+        if let Some(view) = &view {
+            note_run_view_reads(view);
+        }
+        Ok(view)
     }
 
     pub fn adopt_mission_revision(
@@ -5272,7 +5283,42 @@ impl Store {
     /// otherwise idle daemon.
     pub fn mission_run_for_reconcile(&self, id: &str) -> Result<MissionRunView> {
         let connection = self.readers.get();
-        mission_run_view_for_reconcile_tx(&connection, id).map_err(Into::into)
+        let view = mission_run_view_for_reconcile_tx(&connection, id)?;
+        note_run_view_reads(&view);
+        Ok(view)
+    }
+
+    /// What changed after store index `index` and local observation `local`, and the indexes the
+    /// answer reaches: each new claim and local observation as subject, kind, actor and body.
+    pub fn changes_since(&self, index: u64, local: i64) -> Result<ChangeFeed> {
+        let connection = self.readers.get();
+        let (to_index, to_local): (u64, i64) = connection.query_row(
+            "SELECT (SELECT COALESCE(MAX(store_index), 0) FROM claims),
+                    (SELECT COALESCE(MAX(id), 0) FROM local_observations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut changes = connection
+            .prepare_cached(
+                "SELECT subject, kind, actor, body FROM claims
+                 WHERE store_index>?1 AND store_index<=?2",
+            )?
+            .query_map(params![index, to_index], change_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        changes.extend(
+            connection
+                .prepare_cached(
+                    "SELECT subject, kind, actor, body FROM local_observations
+                     WHERE id>?1 AND id<=?2",
+                )?
+                .query_map(params![local, to_local], change_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+        Ok(ChangeFeed {
+            index: to_index,
+            local: to_local,
+            changes,
+        })
     }
 
     /// The faults this host recorded that have not recovered, keyed by subject and scope.
@@ -5510,6 +5556,7 @@ impl Store {
 
     pub fn mission_runs_for_root(&self, root: &str) -> Result<Vec<MissionRunView>> {
         let root = root.strip_prefix("mission-run/").unwrap_or(root);
+        smallclaims::touched::note_read(|| format!("children:mission-run/{root}"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id FROM mission_runs WHERE root_run_id=?1 ORDER BY created_at_unix_ms, id",
@@ -5518,7 +5565,11 @@ impl Store {
             .query_map([root], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
-            .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
+            .map(|id| {
+                let view = mission_run_view_tx(&connection, &id)?;
+                note_run_view_reads(&view);
+                Ok(view)
+            })
             .collect()
     }
 
@@ -9610,6 +9661,7 @@ impl Store {
     }
 
     pub fn desired_subjects(&self) -> Result<Vec<DesiredSubject>> {
+        smallclaims::touched::note_read(|| "kind:intent.desired".to_owned());
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
@@ -9959,6 +10011,9 @@ impl Store {
 
     /// The desired subjects named in `subjects`, by their primary keys.
     pub fn desired_subjects_named(&self, subjects: &[String]) -> Result<Vec<DesiredSubject>> {
+        for subject in subjects {
+            smallclaims::touched::note_read(|| subject.clone());
+        }
         if subjects.is_empty() {
             return Ok(Vec::new());
         }
@@ -10006,6 +10061,7 @@ impl Store {
     }
 
     pub fn desired_subjects_for_owner_run(&self, owner_run: &str) -> Result<Vec<DesiredSubject>> {
+        smallclaims::touched::note_read(|| format!("owned:{owner_run}"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
@@ -10354,6 +10410,10 @@ impl Store {
         recipient: Option<&str>,
         include_closed: bool,
     ) -> Result<Vec<MessageView>> {
+        smallclaims::touched::note_read(|| match recipient {
+            Some(recipient) => format!("mailbox:{recipient}"),
+            None => "kind:message.sent".to_owned(),
+        });
         let through = self.index()?;
         let mut after = None;
         let mut all = Vec::new();
@@ -10671,6 +10731,7 @@ impl Store {
 
     /// Every claim and local observation of `kind` for `subject`, in log order.
     pub fn observations_for(&self, subject: &str, kind: &str) -> Result<Vec<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let mut records = self.claims_for(subject, Some(kind))?;
         let connection = self.readers.get();
         let mut statement = connection.prepare(&format!(
@@ -10686,6 +10747,7 @@ impl Store {
 
     /// The newest claim or local observation of `kind` for `subject`.
     pub fn latest_observation(&self, subject: &str, kind: &str) -> Result<Option<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let claim = self.latest_claim(subject, Some(kind))?;
         let local = {
             let connection = self.readers.get();
@@ -10772,6 +10834,14 @@ impl Store {
     /// an answered request off `pending_human_reviews`.
     pub fn human_review_answer(&self, request: &str) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
+        // An answer is written on the request's subject, its gate operation.
+        smallclaims::touched::note_read(|| {
+            connection
+                .query_row("SELECT subject FROM claims WHERE id=?1", [request], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_default()
+        });
         human_review_answer_tx(&connection, request)
     }
 
@@ -11413,6 +11483,7 @@ impl Store {
     }
 
     pub fn selected_desired_token(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.claim_id))
     }
@@ -11441,16 +11512,19 @@ impl Store {
     }
 
     pub fn selected_desired_revision(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.revision))
     }
 
     pub fn selected_desired_kind(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.kind))
     }
 
     pub fn selected_desired_origin(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         connection
             .query_row(
@@ -13448,6 +13522,7 @@ impl Store {
     }
 
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         // The actual state folds only this subject's append-only claims, so the subject's newest
         // claim identifies it. A write elsewhere in the graph must not make every reconcile pass
@@ -13627,6 +13702,9 @@ impl Store {
         &self,
         subject: &str,
     ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        // Its work claims and progress live on step subjects, written with this agent as actor.
+        smallclaims::touched::note_read(|| subject.to_owned());
+        smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
     }
@@ -13653,6 +13731,7 @@ impl Store {
         else {
             return Ok(false);
         };
+        smallclaims::touched::note_read(|| actor.to_owned());
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
             "SELECT body FROM claims
@@ -17995,6 +18074,43 @@ fn mailbox_harness_ended(
         }
     }
     Ok(true)
+}
+
+/// See [`Store::changes_since`].
+#[derive(Clone, Debug, Default)]
+pub struct ChangeFeed {
+    pub index: u64,
+    pub local: i64,
+    pub changes: Vec<Change>,
+}
+
+/// One new claim or local observation.
+#[derive(Clone, Debug)]
+pub struct Change {
+    pub subject: String,
+    pub kind: String,
+    pub actor: Option<String>,
+    pub body: String,
+}
+
+fn change_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Change> {
+    Ok(Change {
+        subject: row.get(0)?,
+        kind: row.get(1)?,
+        actor: row.get(2)?,
+        body: row.get(3)?,
+    })
+}
+
+/// A run view reads its run, generation and step rows, which change only with claims on those
+/// subjects.
+fn note_run_view_reads(view: &MissionRunView) {
+    smallclaims::touched::note_read(|| view.subject.clone());
+    smallclaims::touched::note_read(|| view.generation.clone());
+    smallclaims::touched::note_read(|| format!("generations:{}", view.subject));
+    for step in &view.steps {
+        smallclaims::touched::note_read(|| step.subject.clone());
+    }
 }
 
 /// See [`Store::mailbox_watermark`].
