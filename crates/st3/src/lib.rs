@@ -11,6 +11,7 @@ pub mod client;
 pub mod config;
 pub mod conversation_search;
 pub mod creation;
+pub mod repositories;
 pub(crate) mod disk;
 /// Answers the hooks an st3 seat's harness runs: `st driver-hook NAME`.
 pub mod delivery_hold;

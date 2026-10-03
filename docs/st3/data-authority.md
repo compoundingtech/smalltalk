@@ -229,3 +229,8 @@ Eval history stays in the immutable claim log.
 A cleanup residue produces `eval.verdict` with `verdict=fail`.
 
 A cleanup infrastructure error produces `eval.verdict` with `verdict=void`.
+
+`workspace.observed` is a latest-only replicated observation written by the owning host during
+agent workspace reconciliation. It carries `host`, `workspace`, and an optional `repository`.
+The reconciler writes only changed values. Repository suggestions combine those observations
+with current checkout declarations; a gateway reads graph evidence and never scans host disks.

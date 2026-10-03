@@ -1249,7 +1249,7 @@ agent "parser" {
 - A new `branch` starts at `base` without upstream tracking. A branch that already exists is checked out as it is.
 - A workspace that already exists is used as it is.
 - When the checkout fails, the agent does not start. st records a `workspace-unavailable` diagnostic and retries after 30 seconds.
-- With `remove-at-run-end=#true`, st removes the worktree after the agent's run ends and its runtime stops. The branch stays in the repository.
+- With `remove-at-run-end=#true`, st removes the worktree after the agent's run ends and its runtime stops. For a top-level seat without an owning run, an explicit stop ends it. The branch stays in the repository.
 - st keeps a worktree that has uncommitted or untracked changes, and records a `checkout-kept` warning. It also keeps a worktree whose workspace a current member still uses.
 
 [`fan-out.kdl`](../../examples/st3/fan-out.kdl) gives three parallel workers one checkout each.

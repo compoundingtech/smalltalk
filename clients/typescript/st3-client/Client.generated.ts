@@ -3,7 +3,7 @@ import { API_VERSION } from './Models.generated';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    SubjectDefinition, UsagePeriod, ClientConnections, CollectionName, CollectionFrame,
+    SubjectDefinition, UsagePeriod, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated';
@@ -332,6 +332,9 @@ export class St3Client {
     getGlass(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`); }
     putGlass(id: string, request: GlassPut, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('PUT', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
     deleteGlass(id: string, request: GlassDelete, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('DELETE', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
+    async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> { return this.get(`/v1/client/hosts/${encodeURIComponent(routedId(id))}/repositories`); }
+    async setsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/sets' + query(options)); }
+    async setsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/sets/${encodeURIComponent(routedId(id))}`); }
     async documentGet(name: string): Promise<EnvelopeOf<DocumentContent>> { return this.get('/v1/client/documents/content' + query({ name })); }
     async subjectDefinition(subject: string, showEnvValues = false): Promise<EnvelopeOf<SubjectDefinition>> { return this.get('/v1/client/subject-definition' + query({ subject, show_env_values: showEnvValues })); }
     async usagePeriod(options: { since_ms?: number; until_ms?: number } = {}): Promise<EnvelopeOf<UsagePeriod>> { return this.get('/v1/client/usage' + query(options)); }

@@ -378,6 +378,17 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    get("GET /v1/client/sets", "/v1/client/sets"),
+    get(
+        "GET /v1/client/sets/{*id}",
+        "/v1/client/sets/bench/cost/fixture",
+    ),
+    post("POST /v1/sets/preview", "/v1/sets/preview", |_, attempt| {
+        owned_set_request(&format!("preview-{attempt}"))
+    }),
+    post("POST /v1/sets/apply", "/v1/sets/apply", |_, attempt| {
+        owned_set_request(&format!("apply-{attempt}"))
+    }),
     // Posting and registration also require GitHub; count their local writes with invented
     // object IDs. The comment probe includes the default watch declaration.
     direct("POST /v1/github/comment", |store, fixture, attempt| {
@@ -466,6 +477,7 @@ const PROBES: &[Probe] = &[
     ),
     get("GET /v1/client/now", "/v1/client/now"),
     get("GET /v1/client/machines", "/v1/client/machines"),
+    get("GET /v1/client/hosts/{*id}", "/v1/client/hosts/local/repositories"),
     get("GET /v1/client/devices", "/v1/client/devices"),
     get("GET /v1/client/attention", "/v1/client/attention"),
     get(
@@ -819,6 +831,22 @@ const PROBES: &[Probe] = &[
         |_, _| json!({}),
     ),
 ];
+
+/// Each write publishes a fresh, fenced member rather than measuring an idempotent retry.
+fn owned_set_request(name: &str) -> Value {
+    let subject = format!("agent/bench/cost/{name}");
+    json!({
+        "intent":{"kdl":format!("version 2\nagent \"bench/cost/{name}\" {{ command \"true\" }}\n")},
+        "options":{
+            "set":format!("bench/cost/{name}"),
+            "source":{"repository":"acme/garden","ref":"refs/heads/main","sha":format!("{:040x}",1),"sequence":1},
+            "expected_set":"absent",
+            "expected_subjects":{subject:[]},
+        },
+        "actor":"person/bench-operator",
+        "idempotency_key":format!("cost-owned-set-{name}"),
+    })
+}
 
 /// The running runtime of the first seat, whose driver publishes the harness events.
 const SEAT_RUNTIME: &str = "cost-seat-0-runtime";
@@ -1182,6 +1210,16 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     let store = Arc::new(Store::open(&database, NODE).unwrap());
     store.bind_fleet(FLEET).ok();
     let peer = Arc::new(Store::open(&peer_database, PEER).unwrap());
+    for (daemon, name) in [(&store, NODE), (&peer, PEER)] {
+        let mut started = claim_input("daemon.started", "cost-owned-set-support", 0, "");
+        started.subject = format!("daemon/{name}");
+        started.fields = serde_json::from_value(json!({
+            "status":"running", "features":{"owned_sets":1},
+        }))
+        .unwrap();
+        daemon.append_claim(&started).unwrap();
+    }
+    sync(&peer, PEER, &store);
     let claims = store.index().unwrap();
 
     let socket = root.join("st3.sock");
@@ -1230,6 +1268,15 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         store.append_claim(&running).unwrap();
     }
     let mut fixture = fixture(&person, &client, subjects).await;
+    client
+        .post::<_, Value>("/v1/sets/apply", &owned_set_request("fixture"))
+        .await
+        .expect("the owned-set read fixture must publish");
+    let selected: Value = person
+        .get("/v1/client/sets/bench/cost/fixture")
+        .await
+        .expect("the owned-set detail probe must read a live fixture");
+    assert_eq!(selected["receipt"]["source"]["sequence"], 1);
 
     let mut costs = BTreeMap::new();
     for probe in PROBES {

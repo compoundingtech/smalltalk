@@ -12,6 +12,7 @@ use crate::doc::{Doc, Target};
 use crate::style::{RULES, Token};
 use crate::theme::{self, Theme};
 use crate::{Body, Entry, ToolState};
+pub use crate::{Density, bundle_id, folds};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::cell::RefCell;
@@ -27,20 +28,6 @@ const COLLAPSED_TOOL_LINES: usize = RULES.tool.collapsed_rows;
 #[derive(Default)]
 pub struct Cache {
     entries: RefCell<HashMap<u64, Rc<Doc>>>,
-}
-
-/// How much of a conversation's tool work shows: every call with its output, or (simplified)
-/// each call on one line and a run of calls on one line.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Density {
-    #[default]
-    Full,
-    Simple,
-}
-
-/// The id that opens a run of tool calls starting at `first`, in the expanded set.
-pub fn bundle_id(first: &str) -> String {
-    format!("bundle:{first}")
 }
 
 impl Cache {
@@ -684,15 +671,6 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
         }
     }
     doc
-}
-
-/// Whether an entry folds until opened: tool calls, and mail the person is not part of.
-pub fn folds(body: &Body) -> bool {
-    match body {
-        Body::Tool { .. } => true,
-        Body::Mail { from, to, .. } => from != "you" && to != "you",
-        _ => false,
-    }
 }
 
 fn fg(token: Token, theme: &Theme) -> Style {

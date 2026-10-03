@@ -14,6 +14,10 @@
     "model": "model",
     "effort": "high",
     "workspace": "/tmp/work",
+    "repo": "/tmp/repository",
+    "base": "origin/main",
+    "branch": "worker",
+    "remove_at_run_end": true,
     "description": "Test seat",
     "message": "--First message\nSecond line"
   }

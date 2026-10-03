@@ -96,6 +96,8 @@ enum Drop {
     },
 }
 
+/// The sidebar's Usage section.
+const USAGE_SECTION: usize = 4;
 /// The sidebar's sections, what the number keys were in the old stui.
 /// The sidebar's sections, by the tab whose list each shows. Home is not one: it opens from
 /// the status line's ⌂ and "need you", over the glass.
@@ -310,7 +312,7 @@ impl Glasses {
     /// focused group first.
     /// Whether usage is on screen: the sidebar's Usage section or a usage tab in front.
     pub(crate) fn shows_usage(&self) -> bool {
-        if self.sidebar.shown && self.sidebar.section == 4 {
+        if self.sidebar.shown && self.sidebar.section == USAGE_SECTION {
             return true;
         }
         let glass = self.glass();
@@ -1501,6 +1503,23 @@ impl Ui {
     }
 
     /// Show the sidebar with the keys, or hide it when it has them (Ctrl+S).
+    /// The top bar's usage slot: the sidebar at Usage, or hidden when Usage already shows.
+    pub(crate) fn toggle_usage(&mut self) {
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        let sidebar = &mut glasses.sidebar;
+        if sidebar.shown && sidebar.section == USAGE_SECTION {
+            sidebar.shown = false;
+            sidebar.focused = false;
+        } else {
+            sidebar.shown = true;
+            sidebar.section = USAGE_SECTION;
+            sidebar.focused = true;
+        }
+        glasses.save();
+    }
+
     pub(crate) fn toggle_sidebar(&mut self) {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
@@ -1945,6 +1964,31 @@ impl Ui {
                 Hit::PaletteSection(3),
             );
         }
+        // Usage beside the fleet: the sidebar's Usage, shown and hidden (Nathan, 2026-10-03).
+        // The fleet's counts end in a space already.
+        let gap = if machines_shown { "· " } else { " · " };
+        spans.push(Span::styled(gap, bar(theme::dim())));
+        let x = area.x + Line::from(spans.clone()).width() as u16;
+        let usage_text = "$ usage";
+        let showing = self.glasses.as_ref().is_some_and(|glasses| {
+            glasses.sidebar.shown && glasses.sidebar.section == USAGE_SECTION
+        });
+        spans.push(Span::styled(
+            usage_text,
+            bar(if showing {
+                theme::strong(theme::YELLOW)
+            } else {
+                theme::fg(theme::YELLOW)
+            }),
+        ));
+        self.hit(
+            Rect {
+                x,
+                width: text::width(usage_text) as u16,
+                ..area
+            },
+            Hit::Usage,
+        );
         buf.set_line(area.x, area.y, &Line::from(spans), area.width);
         // ▢: one space.
         let name = format!(" ▢ {} ▾ ", glass.name);
@@ -2039,7 +2083,14 @@ impl Ui {
     fn pane_title(&self, pane: &Pane) -> String {
         let find = |id: &Option<String>| id.clone().unwrap_or_default();
         match pane {
-            Pane::Terminal(id) if id.starts_with("terminal/") => "shell".into(),
+            // A shell is named by the title its program gives, as a terminal's tab is.
+            Pane::Terminal(id) if id.starts_with("terminal/") => self
+                .terminal
+                .as_ref()
+                .filter(|view| &view.agent == id)
+                .and_then(|view| view.native.as_ref())
+                .and_then(pty::NativeTerminal::title)
+                .unwrap_or_else(|| "shell".into()),
             Pane::Agent(Some(id)) | Pane::Terminal(id) => self
                 .world
                 .agents
@@ -3785,6 +3836,29 @@ mod tests {
     }
 
     #[test]
+    fn the_top_bars_usage_slot_shows_and_hides_the_sidebars_usage() {
+        let mut ui = glass();
+        let shown = screen(&ui);
+        let top = shown.lines().next().unwrap();
+        let column = top[..top.find("$ usage").expect("the top bar has usage")]
+            .chars()
+            .count() as u16;
+        let hit = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .find(|(rect, _)| rect.y == 0 && rect.x <= column && column < rect.x + rect.width)
+            .map(|(_, hit)| hit.clone());
+        assert_eq!(hit, Some(Hit::Usage));
+        ui.click(Hit::Usage);
+        assert!(ui.glasses.as_ref().unwrap().shows_usage());
+        assert!(ui.glasses.as_ref().unwrap().sidebar.focused);
+        ui.click(Hit::Usage);
+        assert!(!ui.glasses.as_ref().unwrap().sidebar.shown);
+    }
+
+    #[test]
     fn a_usage_row_opens_its_spend_in_a_tab_whatever_the_list_groups_by() {
         let mut ui = glass();
         assert_eq!(ui.usage_wanted(), None, "nothing shows usage yet");
@@ -5064,6 +5138,111 @@ mod tests {
         assert_eq!(ui.selected_text().as_deref(), Some("1,204,881 rows"));
         ui.mouse(mouse(MouseEventKind::Up(MouseButton::Left), column + 13));
         assert!(ui.home_open(), "a drag on Home keeps it open");
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text == "Copied 1 line"),
+            "{:?}",
+            ui.flash
+        );
+    }
+
+    #[test]
+    fn a_shell_works_as_a_terminal_ctrl_c_at_once_drag_copies_title_names_the_tab() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use pty_core::protocol::{MessageType, PacketReader, encode_packet};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let mut ui = glass();
+        ui.live = true;
+        let shell = "terminal/example-shell".to_owned();
+        ui.open_in_glass(Pane::Terminal(shell.clone()), Open::Tab);
+        let (stui, mut daemon) = UnixStream::pair().unwrap();
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: shell.clone(),
+            title: "shell".into(),
+            name: "shell".into(),
+            lines: Vec::new(),
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: Some(crate::ui::pty::NativeTerminal::spawn(
+                stui,
+                "example-shell",
+                "one".into(),
+                24,
+                80,
+            )),
+        });
+        let mut reader = PacketReader::new();
+        let mut packets = Vec::new();
+        let mut next = |daemon: &mut UnixStream| {
+            while packets.is_empty() {
+                let mut bytes = [0_u8; 256];
+                let count = daemon.read(&mut bytes).unwrap();
+                packets.extend(reader.feed(&bytes[..count]).unwrap());
+            }
+            packets.remove(0)
+        };
+        assert_eq!(next(&mut daemon).type_, MessageType::Attach);
+        daemon
+            .write_all(&encode_packet(MessageType::Screen, b"$ ls\r\nnotes.txt"))
+            .unwrap();
+        daemon
+            .write_all(&encode_packet(MessageType::Data, b"\x1b]2;vim notes\x07"))
+            .unwrap();
+        let start = std::time::Instant::now();
+        while !screen(&ui).contains("vim notes") {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "{}",
+                screen(&ui)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The person's own cursor stands where the shell's is, in the shape the program asks.
+        let body = ui.terminal_body.get().unwrap();
+        let cursor = ui.terminal_cursor.get().expect("the terminal has the keys");
+        assert_eq!((cursor.x, cursor.y), (body.x + 9, body.y + 1));
+        assert_eq!(
+            ui.cursor_style(),
+            Some(crossterm::cursor::SetCursorStyle::DefaultUserShape),
+            "the person's own shape until the program asks for one"
+        );
+        daemon
+            .write_all(&encode_packet(MessageType::Data, b"\x1b[6 q"))
+            .unwrap();
+        while ui.cursor_style() != Some(crossterm::cursor::SetCursorStyle::SteadyBar) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            screen(&ui);
+        }
+        // Under help the cursor is hidden; help is drawn over the terminal.
+        ui.help = true;
+        screen(&ui);
+        assert_eq!(ui.terminal_cursor.get(), None);
+        ui.help = false;
+        // Ctrl+C reaches the shell at once.
+        ctrl(&mut ui, 'c');
+        let mut packet = next(&mut daemon);
+        while packet.type_ != MessageType::Data {
+            packet = next(&mut daemon);
+        }
+        assert_eq!(packet.payload, b"\x03");
+        // A drag across what the shell printed selects it and copies it on release.
+        let body = ui.terminal_body.get().unwrap();
+        let mouse = |kind, column: u16| MouseEvent {
+            kind,
+            column: body.x + column,
+            row: body.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0));
+        ui.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4));
+        ui.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4));
+        assert_eq!(
+            ui.native_terminal().unwrap().selected().as_deref(),
+            Some("notes")
+        );
         assert!(
             ui.flash
                 .as_ref()

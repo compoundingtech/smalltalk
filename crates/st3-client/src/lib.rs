@@ -1115,6 +1115,41 @@ impl Client {
         )
         .await
     }
+    /// Inspect the publication receipt and current rollout for one source commit.
+    pub async fn sets_status(
+        &self,
+        id: &str,
+        sha: &str,
+    ) -> Result<Envelope<Resource>, ClientError> {
+        self.get(&format!(
+            "/v1/client/sets/{}?sha={}",
+            percent_encode(id),
+            percent_encode(sha)
+        ))
+        .await
+    }
+
+    pub async fn host_repositories(
+        &self,
+        host: &str,
+    ) -> Result<Envelope<HostRepositories>, ClientError> {
+        self.get(&format!(
+            "/v1/client/hosts/{}/repositories",
+            percent_encode(host)
+        ))
+        .await
+    }
+    pub async fn sets_list(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal("sets", cursor, limit, history).await
+    }
+    pub async fn sets_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("sets", id).await
+    }
     pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {
         self.capabilities_internal().await
     }

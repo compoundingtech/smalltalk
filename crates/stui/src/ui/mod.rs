@@ -336,6 +336,14 @@ pub struct Ui {
     pub(crate) terminal_size: Cell<(u16, u16)>,
     /// Where the attached terminal's screen was last drawn, for its mouse.
     terminal_body: Cell<Option<Rect>>,
+    /// Where the attached terminal's cursor is on screen and its shape, when the terminal has
+    /// the keys: the person's own cursor shows it.
+    terminal_cursor: Cell<Option<pty::Cursor>>,
+    /// Whether a drag is selecting in the attached terminal.
+    terminal_selecting: bool,
+    /// The last press in the attached terminal, where and when, and how many in a row: a
+    /// second selects a word, a third a line.
+    terminal_press: Option<(Instant, u16, u16, u8)>,
     /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
     pub(crate) picker: Option<ratatui_image::picker::Picker>,
     /// Each attachment's thumbnail, encoded once so a redraw never sends the image again.
@@ -414,6 +422,9 @@ impl Ui {
             cursor: edit::Cursor::default(),
             terminal_size: Cell::new((24, 80)),
             terminal_body: Cell::new(None),
+            terminal_cursor: Cell::new(None),
+            terminal_selecting: false,
+            terminal_press: None,
             anchors: RefCell::new(HashMap::new()),
             picker: None,
             thumbnails: RefCell::new(HashMap::new()),
@@ -868,6 +879,7 @@ impl Ui {
         let area = frame.area();
         let buf = frame.buffer_mut();
         *self.frame.borrow_mut() = FrameInfo::default();
+        self.terminal_cursor.set(None);
         buf.set_style(area, Style::default().bg(theme::BASE).fg(theme::TEXT));
         if area.width < 20 || area.height < 6 {
             buf.set_stringn(
@@ -906,6 +918,14 @@ impl Ui {
         if self.help {
             self.draw_help(buf, area);
         }
+        if let Some(cursor) = self.terminal_cursor.get() {
+            frame.set_cursor_position((cursor.x, cursor.y));
+        }
+    }
+
+    /// The shape for the person's cursor: the attached terminal's while it has the keys.
+    pub(crate) fn cursor_style(&self) -> Option<crossterm::cursor::SetCursorStyle> {
+        self.terminal_cursor.get().map(|cursor| cursor.style)
     }
 
     /// The sidebar and the main area under the top bar.
@@ -2243,14 +2263,20 @@ impl Ui {
             let status = match (native.ended(), native.attached(), scrolled) {
                 (Some(reason), _, _) => format!("ended: {reason}"),
                 (None, false, _) => "attaching…".into(),
+                (None, true, 0) if self.shell_focused() => {
+                    "drag selects and copies · wheel or shift+pgup scrolls back".into()
+                }
                 (None, true, 0) => {
-                    "ctrl-c twice reaches it · wheel or shift+pgup scrolls back".into()
+                    "ctrl-c twice reaches it · drag selects · wheel scrolls back".into()
                 }
                 (None, true, lines) => format!("↑ {lines} lines back · type to return"),
             };
             let header = Line::from(vec![
                 Span::styled(
-                    format!(" ← Ctrl+\\  {}", view.title),
+                    format!(
+                        " ← Ctrl+\\  {}",
+                        native.title().unwrap_or_else(|| view.title.clone())
+                    ),
                     theme::strong(theme::ACCENT),
                 ),
                 Span::styled(format!("   {status}"), theme::dim()),
@@ -2266,7 +2292,12 @@ impl Ui {
                 .set((body.height.max(1), body.width.max(1)));
             self.terminal_body.set(Some(body));
             native.fit(body.height, body.width);
-            native.draw(buf, body);
+            // The person's own cursor only where nothing is drawn over the terminal.
+            let real = self.terminal_focused()
+                && !self.help
+                && self.popover.is_none()
+                && !self.palette_open();
+            self.terminal_cursor.set(native.draw(buf, body, real));
             return;
         }
         let header = format!(" ← Return · Ctrl+\\   {}", view.title);
@@ -2308,6 +2339,13 @@ impl Ui {
                 cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
             }
         }
+    }
+
+    /// Whether the attached terminal is a shell rather than an agent's.
+    fn shell_focused(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|view| view.agent.starts_with("terminal/"))
     }
 
     /// The attached terminal's direct connection, when it has one.
@@ -2577,6 +2615,7 @@ impl Ui {
                 ("x", "Missions: show st's own missions"),
                 ("n", "Agents: a new agent; Missions: a new mission"),
                 ("y", "confirm what a card asks; Enter never does"),
+                ("x", "Home: dismiss a request, update or message"),
                 (
                     "b p",
                     "Usage: group by agent, mission, step...; change the period",
@@ -2866,7 +2905,9 @@ impl Ui {
                     }
                     self.effects.push(Effect::CloseTerminal);
                 }
-                KeyCode::Char(letter @ ('c' | 'd')) if control => {
+                // An agent's terminal asks twice before Ctrl-C or Ctrl-D reach it, so a reflex
+                // never stops an agent; a shell gets them at once, as in any terminal.
+                KeyCode::Char(letter @ ('c' | 'd')) if control && !self.shell_focused() => {
                     let code = KeyCode::Char(letter);
                     if self.terminal_confirm.is_some_and(|(pending, at)| {
                         pending == code && at.elapsed() < Duration::from_secs(2)
@@ -3295,6 +3336,18 @@ impl Ui {
                     return;
                 };
                 match (kind, key) {
+                    // x dismisses whatever can be dismissed, one key for every kind (Nathan,
+                    // 2026-10-03): a request is closed with word to its asker that there is
+                    // nothing for the person to do, after a y; an update or a message is read.
+                    ("request", 'x') => self.confirm = Some('r'),
+                    ("update", 'x') => self.read_update(),
+                    ("message", 'x') => self.act('m'),
+                    ("fault", 'x') => self.flash(
+                        "A fault clears when the agent that owns it retries or cancels; open it with g",
+                    ),
+                    (word, 'x') => self.flash(format!(
+                        "A {word} waits on your decision, so x cannot dismiss it: answer it with the keys on its card"
+                    )),
                     (_, 'g') => self.go_to_subject(),
                     (_, 't') => self.start_chat(),
                     ("message", 'l') => {
@@ -4116,19 +4169,7 @@ impl Ui {
             }
             return;
         }
-        // A program in the focused terminal that asked for the mouse gets its clicks there.
-        if self.terminal_focused()
-            && let Some(native) = self.native_terminal()
-            && let Some(body) = self.terminal_body.get()
-            && contains(body, mouse.column, mouse.row)
-            && let Some(bytes) = pty::mouse_bytes(
-                mouse,
-                mouse.column - body.x,
-                mouse.row - body.y,
-                native.mode(),
-            )
-        {
-            native.write(bytes);
+        if self.terminal_mouse(mouse) {
             return;
         }
         // A tab dragged to another place or a split's edge.
@@ -4266,6 +4307,85 @@ impl Ui {
         }
     }
 
+    /// The mouse in the focused terminal, as a terminal takes it: a program that asked for the
+    /// mouse gets it, and otherwise a drag selects and copies on release. Shift selects even
+    /// while the program has the mouse. Whether the terminal took it.
+    fn terminal_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !self.terminal_focused() {
+            return false;
+        }
+        let (Some(native), Some(body)) = (self.native_terminal(), self.terminal_body.get()) else {
+            return false;
+        };
+        let inside = contains(body, mouse.column, mouse.row);
+        let (column, row) = (
+            i32::from(mouse.column) - i32::from(body.x),
+            i32::from(mouse.row) - i32::from(body.y),
+        );
+        if inside
+            && !self.terminal_selecting
+            && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+            && let Some(bytes) = pty::mouse_bytes(mouse, column as u16, row as u16, native.mode())
+        {
+            native.write(bytes);
+            return true;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if inside => {
+                let clicks = match self.terminal_press {
+                    Some((at, x, y, clicks))
+                        if at.elapsed() < Duration::from_millis(400)
+                            && (x, y) == (mouse.column, mouse.row) =>
+                    {
+                        clicks % 3 + 1
+                    }
+                    _ => 1,
+                };
+                native.select_from(column as u16, row as u16, clicks);
+                self.terminal_press = Some((Instant::now(), mouse.column, mouse.row, clicks));
+                self.terminal_selecting = true;
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.terminal_selecting => {
+                native.select_to(column, row);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.terminal_selecting => {
+                let copied = native.selected();
+                self.terminal_selecting = false;
+                if let Some(copied) = copied {
+                    let count = copied.lines().count();
+                    copy(&copied);
+                    self.flash(format!(
+                        "Copied {count} line{}",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// What the attached terminal's program asked of its terminal: what it copied goes to the
+    /// person's clipboard, as a terminal would put it there, and its bell shows when the
+    /// person is looking elsewhere.
+    pub(crate) fn terminal_requests(&mut self) {
+        let Some(asked) = self.native_terminal().map(pty::NativeTerminal::asked) else {
+            return;
+        };
+        if let Some(copied) = asked.copied {
+            let count = copied.lines().count().max(1);
+            copy(&copied);
+            self.flash(format!(
+                "The terminal copied {count} line{}",
+                if count == 1 { "" } else { "s" }
+            ));
+        } else if asked.bell && !self.terminal_focused() {
+            self.flash("🔔 The terminal rang its bell");
+        }
+    }
+
     fn click(&mut self, hit: Hit) {
         match hit {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
@@ -4299,6 +4419,7 @@ impl Ui {
                 }
                 self.open_from_sidebar();
             }
+            Hit::Usage => self.toggle_usage(),
             Hit::SidebarSection(section) => {
                 if let Some(glasses) = self.glasses.as_mut() {
                     glasses.sidebar.section = section;
@@ -4754,6 +4875,7 @@ impl Drop for Guard {
         }
         let _ = execute!(
             io::stdout(),
+            crossterm::cursor::SetCursorStyle::DefaultUserShape,
             crossterm::event::DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -5299,9 +5421,9 @@ mod tests {
         // Open, but only just: not read yet.
         ui.read_open_update();
         assert!(ui.effects.is_empty());
-        // r reads it, once.
-        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        // x dismisses it: it is read, once.
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(
             matches!(&ui.effects[..], [Effect::Attention { id, answer: Some(answer), .. }]
                 if id == "attention/update" && answer == "read"),
@@ -5317,6 +5439,97 @@ mod tests {
         ));
         ui.read_open_update();
         assert_eq!(ui.effects.len(), 1);
+    }
+
+    #[test]
+    fn x_dismisses_whatever_on_home_can_be_dismissed() {
+        let mut world = demo::world();
+        if let Load::Ready(items) = &mut world.attention {
+            for item in items.iter_mut() {
+                if item.kind.word() == "message" {
+                    item.actions = vec!["message.read".into()];
+                }
+            }
+            items.insert(
+                0,
+                Attention {
+                    id: "attention/request".into(),
+                    tier: Tier::Stopped,
+                    title: "Which runner should take the release?".into(),
+                    waiting: Some("Planner on lark".into()),
+                    age: "2m".into(),
+                    mission: None,
+                    agent: Some("agent/example/planner".into()),
+                    kind: AttentionKind::Request {
+                        from: "Planner".into(),
+                        from_id: "agent/example/planner".into(),
+                        question: "Name the runner.".into(),
+                        structured: None,
+                    },
+                    actions: vec!["work.done".into()],
+                    related: Vec::new(),
+                    raised_by: None,
+                },
+            );
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let pick = |ui: &mut Ui, kind: &str| {
+            let at = ui
+                .listing(60)
+                .ids
+                .iter()
+                .position(|id| {
+                    ui.world
+                        .attention
+                        .items()
+                        .iter()
+                        .any(|item| &item.id == id && item.kind.word() == kind)
+                })
+                .unwrap_or_else(|| panic!("the demo has a {kind}"));
+            ui.select(at);
+            ui.effects.clear();
+            ui.flash = None;
+            ui.attention_focus().unwrap()
+        };
+        let x = |ui: &mut Ui| ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        // A request asks first, then tells its asker there is nothing to do.
+        let request = pick(&mut ui, "request");
+        x(&mut ui);
+        assert!(ui.effects.is_empty());
+        assert!(
+            frame(&ui, 140, 50)
+                .join("\n")
+                .contains("there is nothing for you to do")
+        );
+        ui.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, action, .. }]
+                if *id == request && action == "work.done"),
+            "{:?}",
+            ui.effects
+        );
+        // A message is marked read.
+        let message = pick(&mut ui, "message");
+        x(&mut ui);
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, action, .. }]
+                if *id == message && action == "message.read"),
+            "{:?}",
+            ui.effects
+        );
+        // A review waits on a decision: x says so and sends nothing.
+        pick(&mut ui, "review");
+        x(&mut ui);
+        assert!(ui.effects.is_empty());
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("x cannot dismiss it")),
+            "{:?}",
+            ui.flash
+        );
     }
 
     #[test]

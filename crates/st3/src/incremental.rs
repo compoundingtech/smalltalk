@@ -72,6 +72,16 @@ pub fn change_keys(change: &Change) -> Vec<String> {
             keys.extend(field("root_mission_run").map(|root| format!("children:{root}")));
             keys.extend(field("parent_step_run").map(|step| format!("children-of-step:{step}")));
         }
+        "owned-set.revised" => {
+            keys.push("kind:intent.desired".into());
+            if let Ok(body) = serde_json::from_str::<Value>(&change.body) {
+                for map in ["members", "retired"] {
+                    if let Some(members) = body["fields"]["body"][map].as_object() {
+                        keys.extend(members.keys().cloned());
+                    }
+                }
+            }
+        }
         "intent.desired" => {
             keys.extend(field("owner_run").map(|run| format!("owned:{run}")));
             keys.extend(field("owner_step").map(|step| format!("owned-step:{step}")));
