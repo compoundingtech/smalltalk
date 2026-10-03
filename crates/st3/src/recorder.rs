@@ -529,7 +529,7 @@ fn relay(
         match child.try_wait() {
             Ok(Some(status)) => {
                 if let Some(stdout) = &stdout {
-                    drain_stdout(stdout.as_raw_fd(), last_line, read_end);
+                    drain_stdout(stdout.as_raw_fd(), last_line, read_end, signaled);
                 }
                 return Outcome::from_status(status);
             }
@@ -567,7 +567,7 @@ fn relay(
     match child.wait() {
         Ok(status) => {
             if let Some(stdout) = &stdout {
-                drain_stdout(stdout.as_raw_fd(), last_line, read_end);
+                drain_stdout(stdout.as_raw_fd(), last_line, read_end, signaled);
             }
             Outcome::from_status(status)
         }
@@ -647,17 +647,24 @@ fn copy_stdout(
             libc::pollfd { fd: signal_read, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: libc::STDOUT_FILENO, events: libc::POLLOUT, revents: 0 },
         ];
-        if unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) } < 0 {
+        // Once a signaled child has been reaped, queued output must not hold its status behind
+        // a stalled consumer. While it is alive, SIGCHLD wakes the ordinary blocking poll.
+        let timeout = if child.is_none() && *signaled { 0 } else { -1 };
+        if unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) } < 0 {
             let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                *signaled |= forward_signals(signal_read, pid);
-                continue;
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                *last_line = LastLine::default();
+                return Err(error);
             }
-            *last_line = LastLine::default();
-            return Err(error);
+            // Check the child's status below even when SIGCHLD interrupted poll. Consuming
+            // that wake and polling again first could wait forever on backpressured stdout.
         }
         *signaled |= forward_signals(signal_read, pid);
         if descriptors[1].revents == 0 {
+            if child.is_none() && *signaled {
+                *last_line = LastLine::default();
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
             if *signaled {
                 if let Some(child) = child.as_deref_mut() {
                     if child.try_wait()?.is_some() {
@@ -698,14 +705,18 @@ fn copy_stdout(
 
 /// Drain only the bytes already queued when the child exits. A descendant retaining or writing
 /// stdout must not keep the recorder alive, nor replace the child's final line later.
-fn drain_stdout(stdout: libc::c_int, last_line: &mut LastLine, signal_read: libc::c_int) {
+fn drain_stdout(
+    stdout: libc::c_int,
+    last_line: &mut LastLine,
+    signal_read: libc::c_int,
+    mut signaled: bool,
+) {
     let mut available: libc::c_int = 0;
     if unsafe { libc::ioctl(stdout, libc::FIONREAD, &mut available) } != 0 {
         *last_line = LastLine::default();
         return;
     }
     let mut remaining = available.max(0) as usize;
-    let mut signaled = false;
     while remaining > 0 {
         match copy_stdout(stdout, remaining, last_line, signal_read, None, &mut signaled) {
             Ok(0) | Err(_) => break,
