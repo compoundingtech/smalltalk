@@ -4912,6 +4912,12 @@ async fn run_up(args: UpArgs) -> Result<()> {
         store.clone(),
         config.observations.clone(),
     ));
+    tokio::spawn(st3::recorder_receipts::run(
+        store.clone(),
+        st3::recorder::receipt_path(&config.state_dir),
+        notify.clone(),
+        event_notify.clone(),
+    ));
     if config.checkpoint.enabled {
         tokio::spawn(run_checkpoints(
             store.clone(),
