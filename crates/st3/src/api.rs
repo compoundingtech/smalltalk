@@ -60,6 +60,7 @@ use crate::store::Store;
 
 mod client_blobs;
 mod client_v0;
+mod owned_sets;
 mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
@@ -234,6 +235,8 @@ impl ApiError {
     fn bad(error: St3Error) -> Self {
         let status = match error.code {
             "stale-subject"
+            | "owned-set-refused"
+            | "set-managed-subject"
             | "missing-subject-token"
             | "stale-document-token"
             | "stale-incarnation"
@@ -314,6 +317,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route("/v1/client/sets", get(owned_sets::list))
+        .route("/v1/client/sets/{*id}", get(owned_sets::get))
         .route("/v1/client/glasses", get(client_v0::glasses_list))
         .route(
             "/v1/client/glasses/{id}",
@@ -447,6 +452,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/intent/mission", post(mission))
         .route("/v1/gate-checks", post(start_gate_check))
         .route("/v1/gate-checks/{id}", get(read_gate_check))
+        .route("/v1/sets/preview", post(owned_sets::preview))
+        .route("/v1/sets/apply", post(owned_sets::apply))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
@@ -4742,6 +4749,7 @@ async fn guard_bound_request(
     }
     if ![
         "/v1/intent/apply",
+        "/v1/sets/",
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
         "/v1/agents/restart",
@@ -4806,6 +4814,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
+        "features": {"owned_sets":1},
     })))
 }
 
@@ -8403,6 +8412,7 @@ async fn restart_agent(
     } else {
         format!("agent/{}", request.subject)
     };
+    state.store.owned_member_guard(&subject).map_err(ApiError::bad)?;
     let key = format!("agent-restart:{subject}:{}", request.idempotency_key);
     if let Some(prior) = state
         .store
@@ -8549,6 +8559,7 @@ fn suspension_target(
     ),
     ApiError,
 > {
+    state.store.owned_member_guard(subject).map_err(ApiError::bad)?;
     let status = state
         .store
         .status(Some(subject))

@@ -94,6 +94,13 @@ const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
 #[derive(Subcommand)]
 enum Command {
+    /// Atomically publish a complete owned set of seats, missions and schedules.
+    Apply(OwnedSetApplyArgs),
+    /// Inspect owned sets and their source publication receipts.
+    Sets {
+        #[command(subcommand)]
+        command: OwnedSetsCommand,
+    },
     /// Start the HTTP API, readers, peers, and reconciler.
     Up(UpArgs),
     /// Understand what needs action now.
@@ -2780,6 +2787,137 @@ struct LaneMarkArgs {
 }
 
 #[derive(Args)]
+struct OwnedSetApplyArgs {
+    #[arg(long)]
+    set: String,
+    /// Complete list of input KDL files; '-' reads stdin once.
+    files: Vec<PathBuf>,
+    #[arg(long)]
+    repository: String,
+    #[arg(long = "ref")]
+    source_ref: String,
+    #[arg(long)]
+    sha: String,
+    #[arg(long)]
+    source_sequence: u64,
+    /// 'absent' for initial creation, otherwise the previous selected set revision.
+    #[arg(long)]
+    expect_set: String,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long = "adopt")]
+    adopt: Vec<String>,
+    #[arg(long)]
+    allow_empty: bool,
+    #[arg(long)]
+    confirm_retire: Option<String>,
+    #[arg(long = "as", env = "ST_AGENT", value_parser = parse_publication_actor)]
+    actor: String,
+}
+
+#[derive(Subcommand)]
+enum OwnedSetsCommand {
+    /// List selected owned sets and their source receipts.
+    Ls,
+    /// Show a set's live membership, retirements and blockers.
+    Show {
+        name: String,
+    },
+    /// Inspect publication and rollout for one source commit.
+    Status {
+        name: String,
+        #[arg(long)]
+        sha: String,
+    },
+}
+
+async fn run_owned_set_apply(
+    client: &Client,
+    args: OwnedSetApplyArgs,
+    json_output: bool,
+) -> Result<()> {
+    use st3::store::owned_sets::{Options, Preview, Request, Source};
+    anyhow::ensure!(
+        !args.files.is_empty() || args.allow_empty,
+        "no input files: intentional empty membership needs --allow-empty"
+    );
+    anyhow::ensure!(
+        args.files.iter().filter(|p| p.as_os_str() == "-").count() <= 1,
+        "stdin may appear only once"
+    );
+    let mut bundle = String::from("version 2\n");
+    for path in &args.files {
+        let (text, _) = read_intent(Some(path))?;
+        let mut doc: kdl::KdlDocument = text
+            .parse()
+            .with_context(|| format!("parse {}", path.display()))?;
+        anyhow::ensure!(
+            doc.nodes()
+                .first()
+                .is_some_and(|n| n.name().value() == "version"
+                    && n.get(0).and_then(|v| v.as_integer()) == Some(2)),
+            "{} must begin with version 2",
+            path.display()
+        );
+        doc.nodes_mut().remove(0);
+        bundle.push_str(&doc.to_string());
+        bundle.push('\n');
+    }
+    let options = Options {
+        set: args.set,
+        source: Source {
+            repository: args.repository,
+            r#ref: args.source_ref,
+            sha: args.sha,
+            sequence: args.source_sequence,
+        },
+        expected_set: args.expect_set,
+        adopt: args.adopt.into_iter().collect(),
+        allow_empty: args.allow_empty,
+        confirm_retire: args.confirm_retire,
+        expected_subjects: Default::default(),
+    };
+    let mut request = Request {
+        intent: IntentInput {
+            kdl: bundle,
+            source_name: Some("owned set input files".into()),
+        },
+        options,
+        actor: args.actor,
+        idempotency_key: uuid::Uuid::now_v7().to_string(),
+    };
+    let preview: Preview = client.post("/v1/sets/preview", &request).await?;
+    if args.dry_run {
+        return print_value(&preview, json_output);
+    }
+    anyhow::ensure!(
+        preview.blockers.is_empty(),
+        "owned set refused: {}",
+        preview.blockers.join("; ")
+    );
+    request.options.expected_subjects = preview.expected_subjects;
+    let response: Value = client.post("/v1/sets/apply", &request).await?;
+    print_value(&response, json_output)
+}
+
+async fn run_owned_sets(
+    endpoint: &Endpoint,
+    command: OwnedSetsCommand,
+    json_output: bool,
+) -> Result<()> {
+    let client = generated_client(endpoint, None)?;
+    match command {
+        OwnedSetsCommand::Ls => {
+            print_value(&client.sets_list(None, None, false).await?, json_output)
+        }
+        OwnedSetsCommand::Show { name } => print_value(&client.sets_get(&name).await?, json_output),
+        OwnedSetsCommand::Status { name, sha } => {
+            print_value(&client.sets_status(&name, &sha).await?, json_output)
+        }
+    }
+}
+
+#[derive(Args)]
 struct AgentApplyArgs {
     /// KDL file to publish; use `-` to read standard input.
     file: PathBuf,
@@ -3916,6 +4054,8 @@ async fn run(cli: Cli) -> Result<()> {
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
     let immediate = Client::new(endpoint.clone());
     match cli.command {
+        Command::Apply(args) => run_owned_set_apply(&client, args, cli.json).await,
+        Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
@@ -4064,6 +4204,7 @@ fn guard_mutating_cli_actor(
         return Ok(());
     };
     let actor = match command {
+        Command::Apply(args) => Some(args.actor.as_str()),
         Command::Missions { command } => match command {
             MissionViewCommand::Publish(args) => Some(args.actor.as_str()),
             MissionViewCommand::Start(args) => Some(args.actor.as_str()),
@@ -4572,6 +4713,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         kind: "daemon.started".into(),
         actor: None,
         fields: BTreeMap::from([
+            ("features".into(), serde_json::json!({"owned_sets":1})),
             ("status".into(), Value::String("running".into())),
             ("pid".into(), Value::from(std::process::id())),
             (

@@ -1659,6 +1659,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         let active = desired.iter().collect::<Vec<_>>();
         let mut member_errors = BTreeMap::new();
         for subject in &active {
+            if self.store.owned_desired_guard(subject).is_err() {
+                continue;
+            }
             if subject.kind == "stop" {
                 continue;
             }
@@ -1698,6 +1701,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .iter()
             .copied()
             .filter(|subject| !member_errors.contains_key(&subject.subject))
+            .filter(|subject| self.store.owned_desired_guard(subject).is_ok())
             .collect::<Vec<_>>();
         // A live member is evaluated again when a claim it read, its runtime, its exec state or
         // its screen changed, when its time came, or when its workspace or render failed.
@@ -1864,6 +1868,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         drop(unreadable_span);
         let members_span = crate::profile::span("pass/members");
         for subject in &active {
+            if self.store.owned_desired_guard(subject).is_err() {
+                continue;
+            }
             if subject.kind == "stop" {
                 let _member_span = crate::profile::span("pass/member stop");
                 let item = format!("stop:{}", subject.subject);
@@ -3599,6 +3606,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         ptys: Option<&HashMap<String, RuntimeObservation>>,
         actual_origin: Option<Option<String>>,
     ) -> Result<()> {
+        self.store.owned_desired_guard(subject)?;
         let Some(actual) = self.store.latest_actual_value(&subject.subject)? else {
             // A stop-only declaration with no observed runtime is already satisfied.
             // Only its declaring host may project that fact. Otherwise every peer
@@ -4067,6 +4075,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         reason: &str,
     ) -> Result<()> {
+        self.store.owned_desired_guard(subject)?;
         // A member whose start keeps failing waits between attempts and then parks with one
         // attention request, instead of spawning again on every pass. A gate runner fails its gate.
         if matches!(subject.kind.as_str(), "agent" | "exec" | "pty")
@@ -4242,9 +4251,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("operation".into(), Value::String(operation.clone())),
             ]),
         )?;
+        self.store.owned_desired_guard(subject)?;
+        // Capture the token before starting; a publication during start must not relabel the launch.
+        let desired_token = self.launch_token(&subject.subject)?;
         if let Err(error) = self.runtime.start(&launch_member) {
             let reason = error.to_string();
-            let desired_token = self.launch_token(&subject.subject)?;
             let prior_failures = self.start_failures(&subject.subject, &desired_token)?;
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
@@ -4271,19 +4282,28 @@ impl<R: RuntimeControl> Reconciler<R> {
             )?;
             return Err(error).context("start member runtime");
         }
-        let desired_token = self.launch_token(&subject.subject)?;
+        let incarnation = if member.terminal {
+            self.runtime.snapshot_ptys().ok().and_then(|items| {
+                items.into_iter().find(|item| item.runtime_id == member.runtime_id)
+            })
+        } else {
+            self.runtime.observe_exec(&member.runtime_id).ok().flatten()
+        }
+        .and_then(|item| item.incarnation_id);
+        let mut fields = BTreeMap::from([
+            ("action".into(), Value::String("start".into())),
+            ("desired_token".into(), Value::String(desired_token)),
+            ("runtime_id".into(), Value::String(member.runtime_id.clone())),
+            ("reason".into(), Value::String(reason.into())),
+        ]);
+        if let Some(incarnation) = incarnation {
+            fields.insert("incarnation_id".into(), Value::String(incarnation));
+        }
         self.store.append_claim(&ClaimInput {
             subject: subject.subject.clone(),
             kind: "runtime.action.succeeded".into(),
             actor: None,
-            fields: BTreeMap::from([
-                ("desired_token".into(), Value::String(desired_token)),
-                (
-                    "runtime_id".into(),
-                    Value::String(member.runtime_id.clone()),
-                ),
-                ("reason".into(), Value::String(reason.into())),
-            ]),
+            fields,
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: None,
@@ -9818,6 +9838,9 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Record this schedule's next occurrence and arm its timer.
     fn reconcile_schedule(&self, schedule: &DesiredSubject) -> Result<()> {
+        self.store
+            .owned_desired_guard(schedule)
+            .map_err(anyhow::Error::new)?;
         let Some(spec) = crate::graph::schedule_spec(&schedule.desired, &self.host) else {
             return Ok(());
         };
@@ -10124,6 +10147,9 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// for a lasting reason is failed so the schedule can fire again. A request that waits for
     /// something this host has not received yet stays pending, and the schedule records why.
     fn reconcile_schedule_work(&self, schedule: &DesiredSubject) -> Result<()> {
+        self.store
+            .owned_desired_guard(schedule)
+            .map_err(anyhow::Error::new)?;
         // Every peer replicates the same requests. Only the host that requested the work starts it.
         let requests = self
             .store
@@ -16294,6 +16320,63 @@ mission "feedback-review" state="ready" {
     #[test]
     fn rejects_an_unstructured_usage_log() {
         assert_eq!(structured_token_usage("the gate finished"), None);
+    }
+
+    #[test]
+    fn a_successful_launch_records_its_action_incarnation_and_desired_token() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        apply_source(
+            &store,
+            &format!(
+                "version 2\nagent \"worker\" {{ workspace {:?}; command \"true\" }}\n",
+                workspace.path().display().to_string()
+            ),
+            "launch-receipt",
+        );
+        let subject = store
+            .desired_subject_with_writer("agent/node.worker")
+            .unwrap()
+            .unwrap()
+            .0;
+        let member = subject.member.as_ref().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let observation = RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: member.terminal,
+            status: "starting".into(),
+            exit_code: None,
+            incarnation_id: Some("launch-1".into()),
+        };
+        runtime.ptys.lock().unwrap().push(observation.clone());
+        runtime
+            .execs
+            .lock()
+            .unwrap()
+            .insert(member.runtime_id.clone(), observation);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime,
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .perform_start(&subject, member, "test launch")
+            .unwrap();
+        let receipt = store
+            .observations_for(&subject.subject, "runtime.action.succeeded")
+            .unwrap()
+            .into_iter()
+            .find(|c| c.body["fields"]["action"] == "start")
+            .unwrap();
+        assert_eq!(receipt.body["fields"]["incarnation_id"], "launch-1");
+        assert_eq!(
+            receipt.body["fields"]["desired_token"].as_str(),
+            store
+                .selected_desired_token(&subject.subject)
+                .unwrap()
+                .as_deref()
+        );
     }
 
     #[test]

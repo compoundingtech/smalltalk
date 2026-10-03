@@ -489,6 +489,14 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st apply",
+      "description": "Publish a complete source-fenced owned set",
+      "tests": [
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+      ],
+      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+    },
+    {
       "command": "st attention approve",
       "description": "Approve one person-owned gate or launch review",
       "tests": [
@@ -1442,6 +1450,30 @@
         "crates/st3/tests/action_coverage.rs::cli_service_install_status_restart_reset_uninstall_use_isolated_manager"
       ],
       "verification": "shared API restart case"
+    },
+    {
+      "command": "st sets ls",
+      "description": "List selected owned sets",
+      "tests": [
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+      ],
+      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+    },
+    {
+      "command": "st sets show",
+      "description": "Show membership, retirement and blockers",
+      "tests": [
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+      ],
+      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+    },
+    {
+      "command": "st sets status",
+      "description": "Inspect rollout for a source commit",
+      "tests": [
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+      ],
+      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
     },
     {
       "command": "st skill",

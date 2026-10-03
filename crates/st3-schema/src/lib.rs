@@ -736,6 +736,12 @@ fn build_registry() -> Registry {
             false,
         ),
         (
+            "owned-set",
+            "owned-set/NAME",
+            "A graph-owned set of declarations with source ordering and omission retirement.",
+            false,
+        ),
+        (
             "planning-session",
             "planning-session/ID",
             "A durable planning session.",
@@ -1118,6 +1124,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Some("documents"),
             true,
             &["doc"],
+        ),
+        (
+            "owned-set.revised",
+            &["owned-set"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("owned-sets"),
+            true,
+            &[],
         ),
         (
             "mission.published",
@@ -2330,6 +2345,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("size", integer()),
             ("executable", boolean()),
         ],
+        "owned-set.revised" => &[
+            ("revision", required_string()),
+            ("body", required_object()),
+        ],
         "mission.published" => &[
             ("revision", string()),
             ("state", string()),
@@ -2622,6 +2641,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("fields", array()),
         ],
         "daemon.started" => &[
+            ("features", object()),
             ("status", required_enum(&["running"])),
             ("pid", integer()),
             ("version", string()),
@@ -3684,6 +3704,7 @@ mod tests {
                 "mission",
                 "mission-run",
                 "observer",
+                "owned-set",
                 "person",
                 "planning-session",
                 "pty",
@@ -3796,6 +3817,7 @@ mod tests {
                 "observer.state",
                 "operational.failure",
                 "operational.recovered",
+                "owned-set.revised",
                 "planning-session.approved",
                 "planning-session.cancelled",
                 "planning-session.candidate-submitted",

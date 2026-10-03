@@ -10,6 +10,10 @@ Every purpose-specific route that applies KDL is an atomic upsert. The daemon fi
 
 Omission has no effect. Removing a declaration from a later file does not stop or delete its existing graph state. Retirement, cancellation, and refresh are explicit declarations.
 
+An explicit [owned set](owned-sets.md), published with `st apply --set NAME`, gives one publisher
+responsibility for a complete membership list. Its successful publication retires omitted members
+with source and revision fences, and requires confirmation for mass retirement.
+
 The removed wrapper keyword is an error. There is no compatibility form.
 
 `st missions publish FILE --as ACTOR` previews and publishes exact authored mission KDL. A person
