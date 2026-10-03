@@ -46,7 +46,7 @@ python3 scripts/check-st-boundary
 start=$SECONDS status=0
 case "$stage" in
   # The nextest --no-run step already compiled the test executables.
-  tests) bash scripts/ci-nextest run --test-threads "$(nproc)" \
+  tests) bash scripts/ci-nextest run --test-threads "${CI_LOCAL_TEST_THREADS:-$(nproc)}" \
     2>&1 | tee "$logs/$stage.log" || status=$? ;;
   clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   fleet-compat) fleet_compat 2>&1 | tee "$logs/$stage.log" || status=$? ;;

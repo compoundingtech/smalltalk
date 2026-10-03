@@ -177,7 +177,43 @@ reusing the fleet's long-lived target lanes and macOS debug-object cleanup polic
 
 Namespace runs these jobs through its GitHub App. If the app loses access to this repository, or
 the profile has no capacity, jobs queue with no matching runner. A queued required check is not
-a pass. Do not silently fall back to hosted or fleet runners.
+a pass. Apart from the ci1 choice below, which is made once per run before any job starts, do not
+fall back to hosted or fleet runners.
+
+### ci1: our own runners, with Namespace as overflow
+
+ci1 is a dedicated machine of ours that runs GitHub self-hosted runners for this repository, with
+warm caches kept on the machine. GitHub has no overflow between runner labels, so `Workspace CI`
+starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
+through the API and picks one pool for the whole run:
+
+- `ci1` when at least `CI1_MIN_IDLE` (default 5, the jobs a run starts at once) runners with that
+  label are online and idle; merge-group runs ask for `ci1-merge`, which a runner reserved for the
+  merge queue also carries, so queued merges never wait behind pull request pushes;
+- Namespace otherwise, exactly as above: when ci1 is busy or offline, when the runner list is
+  unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
+  runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
+
+Every other job's `runs-on` reads `pick-runner`'s output and falls back to its Namespace label when
+the output is empty. The job names and the `linux-gate` aggregate are unchanged; `linux-gate` now
+names its three stages instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
+Two runs that pick at the same moment can both choose ci1; the later run's jobs then wait for
+runners on ci1.
+
+The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-runner` is skipped
+and every run goes to Namespace with no extra job. `on` turns the choice on, and unsetting it turns
+it off again without a pull request. `pick-runner` reads the runners with the
+`CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
+without it every run goes to Namespace.
+
+On ci1 each runner is ephemeral: it takes one job, runs it as its own user in a fresh work directory
+with its own `/tmp`, and nothing the job started outlives it. The runner names a Cargo home in
+`CI_LOCAL_CARGO_HOME`; the stage jobs then skip the `actions/cache` restores and the local Nix
+cache, use that Cargo home, and Cargo keeps its intermediate build files in a per-runner build
+directory, while sccache shares compiled crates between all runners and the Nix store is the
+machine's own. The machine's configuration lives in the private network repository.
+Initial Cargo build and nextest concurrency on ci1 is four threads per runner, with a 14 GiB
+per-job memory limit; tune those limits from measured runs on the machine.
 
 `CI_RUN_ID` keeps the messaging-fault evidence under `target/messaging-faults/`, which is
 uploaded with the stage logs.
@@ -306,7 +342,8 @@ gh api --method POST repos/compoundingtech/smalltalk/actions/runs/RUN_ID/force-c
 gh run rerun RUN_ID
 ```
 
-A queued Namespace job is never a pass. Do not fall back to another runner.
+A queued Namespace job is never a pass. Do not fall back to another runner by hand; only
+`pick-runner` chooses between ci1 and Namespace, before a run's jobs start.
 
 ## Inspect a failure
 
