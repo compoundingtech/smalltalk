@@ -2214,9 +2214,7 @@ impl CodexControlState {
             "systemError"
                 if matches!(
                     self.observed,
-                    CodexObservedState::TerminalError {
-                        reason: CodexTerminalError::SystemError
-                    }
+                    CodexObservedState::TerminalError { .. }
                 ) =>
             {
                 self.observed.clone()
@@ -2450,9 +2448,7 @@ fn observed_from_thread_snapshot(
             "systemError"
                 if matches!(
                     previous,
-                    CodexObservedState::TerminalError {
-                        reason: CodexTerminalError::SystemError
-                    }
+                    CodexObservedState::TerminalError { .. }
                 ) =>
             {
                 previous.clone()

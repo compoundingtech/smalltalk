@@ -6245,6 +6245,11 @@ fn rollout_recovery_keeps_policy_and_capacity_distinct_and_capacity_retryable() 
             panic!("rollout cause must be diagnostic evidence: {word}")
         };
         assert_eq!(failure.reason, diagnostic);
+        state.observe(&json!({"method":"thread/status/changed",
+            "params":{"threadId":"thread-main", "status":{"type":"systemError"}}})).unwrap();
+        delivery.as_mut().unwrap().observe_harness(&state.observed);
+        assert_eq!(observed_record(&agent_dir).reason.as_deref(), Some(expected_reason),
+            "a late generic status cannot replace the recovered cause");
     }
 }
 
