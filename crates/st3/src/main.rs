@@ -64,7 +64,7 @@ use presentation::{
 #[command(
     name = "st",
     bin_name = "st",
-    version,
+    version = st_drivers::version::display_version(),
     about = "Coordinate durable agent work across machines without losing operational truth"
 )]
 struct Cli {
@@ -2027,7 +2027,7 @@ struct PtyStreamArgs {
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     /// The stream capability from `terminals attach-info`; can be set through the environment.
-    #[arg(long, env = "ST3_TERMINAL_CAPABILITY")]
+    #[arg(long, env = "ST3_TERMINAL_CAPABILITY", allow_hyphen_values = true)]
     capability: String,
     #[arg(long)]
     incarnation: Option<String>,
@@ -3816,10 +3816,21 @@ fn main() -> ExitCode {
         print!("{}", cli_help::root_help(true));
         return ExitCode::SUCCESS;
     }
-    let matches = Cli::command()
+    let json_version = arguments.iter().any(|arg| arg == "--json");
+    let matches = match Cli::command()
         .override_help(cli_help::root_help(false))
         .try_get_matches_from(arguments)
-        .unwrap_or_else(|error| exit_usage_error(error));
+    {
+        Ok(matches) => matches,
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayVersion && json_version => {
+            println!(
+                "{}",
+                json!({ "machine_version": st_drivers::version::machine_version() })
+            );
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => exit_usage_error(error),
+    };
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| exit_usage_error(error));
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
@@ -4800,7 +4811,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         notify.clone(),
         event_notify.clone(),
         recorder.map(|installation| installation.directory),
-    )?);
+    )?.with_schedule_peers(state.configured_peers.clone()));
     tokio::spawn(reconciler.supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
@@ -8821,6 +8832,9 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
     if json_output {
         print_value(&report, true)?;
     } else {
+        if let Some(version) = &report.machine_version {
+            println!("daemon\t{version}");
+        }
         for check in &report.checks {
             println!("{}\t{}\t{}", check.status, check.name, check.message);
         }
@@ -22253,6 +22267,34 @@ mod tests {
                 command: PtyCommand::DetachClient(_)
             }
         ));
+    }
+
+    #[test]
+    fn terminal_stream_accepts_capabilities_beginning_with_hyphens() {
+        for capability in ["-test-capability", "--test-capability"] {
+            let stream = Cli::try_parse_from([
+                "st3",
+                "terminals",
+                "stream",
+                "terminal/agent/example/worker",
+                "--capability",
+                capability,
+                "--incarnation",
+                "runtime-1",
+                "--count",
+                "3",
+            ])
+            .unwrap();
+            let Command::Terminals {
+                command: PtyCommand::Stream(args),
+            } = stream.command
+            else {
+                panic!("stream did not parse");
+            };
+            assert_eq!(args.capability, capability);
+            assert_eq!(args.incarnation.as_deref(), Some("runtime-1"));
+            assert_eq!(args.count, Some(3));
+        }
     }
 
     #[test]
