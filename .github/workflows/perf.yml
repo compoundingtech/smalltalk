@@ -26,7 +26,8 @@ concurrency:
 jobs:
   perf-load:
     name: perf-load
-    runs-on: [nscloud-ubuntu-24.04-amd64-16x32]
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
     timeout-minutes: 120
     defaults:
       run:

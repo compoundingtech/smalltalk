@@ -1,5 +1,5 @@
 import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
-import { commonSetupSteps, linuxStageJob, linuxStageRunner, perfStoresCache } from './workspace-ci.ts'
+import { commonSetupSteps, linuxStageJob, perfStoresCache } from './workspace-ci.ts'
 
 const baseline = '${{ runner.temp }}/perf-baseline'
 const onMain = "success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'"
@@ -28,10 +28,7 @@ export default githubWorkflow({
     group: 'perf-${{ github.event.pull_request.number || github.run_id }}',
     'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
   },
-  actionlint: {
-    ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
-  },
+  actionlint: defaultActionlintConfig,
   jobs: {
     // A production-sized generated store under a busy host's request mix, compared with the worst
     // of main's last five reports. Main's successful runs add theirs.

@@ -22,9 +22,10 @@ and the gate has only `contents: read` permission. Forks do not receive publishi
 
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
 `linux-gate` is the single required check: it needs the three jobs and passes only when every one of
-them succeeded (a skipped or cancelled stage fails it). The stage jobs use the Namespace shape
-`nscloud-ubuntu-24.04-amd64-16x32` (16 vCPUs, 32 GB); `genie-freshness`, `isolation-vm` and the
-`linux-gate` aggregate use `namespace-profile-linux-x86-64`. `scripts/ci-linux STAGE` runs one stage:
+them succeeded (a skipped or cancelled stage fails it). Every job, the stages included, uses
+`namespace-profile-linux-x86-64`. The stages ran on the bigger shape
+`nscloud-ubuntu-24.04-amd64-16x32` (16 vCPUs, 32 GB) until 2026-10-03, when that label stopped
+getting runners while the profile's jobs still started. `scripts/ci-linux STAGE` runs one stage:
 
 - `linux-tests`: prepares the provider component fixtures, installs matching rendered st2 hooks,
   builds the selected test executables with dev/test debug info and incremental compilation
@@ -188,12 +189,10 @@ for the repository's owner. Both run `scripts/ci-perf`, and `.config/nextest.tom
 tests out of `linux-tests`.
 
 `perf-cost` runs `daemon_cost::` (`crates/st3/tests/daemon_cost.rs`) on every pull request and
-`main` push, on the `nscloud-ubuntu-24.04-amd64-8x16` shape: generating and counting use one
-core, and a shape label does not queue behind the profile's concurrent-runner limit, as the
-profile's 8x16 runners did in measurement. It skips
-merge-queue entries, which wait only for required checks, so a queued entry still needs 64 vCPUs
-and five still build at once (see [Measured concurrency](#measured-concurrency)); if it becomes
-required, it must run there too. It generates a store at scale 0.01 and one at 0.1 with the
+`main` push, on the stages' runner. It skips
+merge-queue entries, which wait only for required checks, so a queued entry needs no more runners
+than before (see [Measured concurrency](#measured-concurrency)); if it becomes required, it must
+run there too. It generates a store at scale 0.01 and one at 0.1 with the
 `daemon_bench` generator, serves each from an in-process daemon, and counts the SQLite work of
 every route: virtual machine steps, steps through a table without an index, sorts and
 auto-index rows, read from each statement's counters as it finishes
