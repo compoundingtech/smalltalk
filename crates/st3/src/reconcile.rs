@@ -68,7 +68,10 @@ const CHECKOUT_RETRY_MS: u128 = 30_000;
 const DEADLINE_SOURCE_RETRY_MS: u128 = 5_000;
 
 // A seat kept running past its run is checked again this soon for unread mail and other work.
-const SEAT_RETENTION_CHECK_MS: u128 = 10_000;
+// Reading a conversation message does not wake the reconciler, so this check is what lets the
+// stop go ahead; each check is a pass, and at 10 s held seats were a hetz daemon's most frequent
+// wake. A held seat stops at most a minute after its last reason goes.
+const SEAT_RETENTION_CHECK_MS: u128 = 60_000;
 // Run cleanup ends this long after it began even if an owned runtime never reports stopped.
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const DECLARED_CHECKOUT_LIMIT: usize = 4096;
