@@ -357,6 +357,8 @@ pub struct Store {
     /// it instead of building their own.
     pub replication_snapshot_build: Mutex<()>,
     pub replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
+    /// Held while replicated envelopes are admitted; see `validate_replication_backlog`.
+    pub admission: Mutex<()>,
     pub replication_timers: ReplicationTimers,
     /// Admitted replicated claims wait for a projection a catching-up node deferred.
     pub replication_projection_deferred: AtomicBool,
@@ -491,6 +493,7 @@ impl Store {
             replication_snapshot: Mutex::new(None),
             replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
+            admission: Mutex::new(()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_deferred: AtomicBool::new(false),
             last_replication_projection_unix_ms: AtomicU64::new(0),
@@ -2798,6 +2801,10 @@ pub fn full_compact_replication_inventory(
 /// The most envelopes one exchange carries to a peer that does not say how many it takes, and
 /// the most identities one divergent exchange lists beyond its first differing range.
 pub const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
+
+/// Envelopes admitted per writer transaction. Admission takes 2-3 ms per envelope on a populated
+/// store, so a chunk holds the writer for well under a second.
+pub const ADMISSION_CHUNK_ENVELOPES: usize = 256;
 
 /// The most envelopes this build takes in one exchange, which it says in each inventory it
 /// sends. Admission commits once per pass, so a page this size admits well within the peer
@@ -5207,114 +5214,130 @@ impl Store {
     pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
         // Seed and sign local batches first, so local membership claims decide admission.
         self.replication_snapshot()?;
-        let mut connection = self.connection.write();
+        // Admission lends the writer back between chunks, so two must not run at once and
+        // admit the same pending envelopes.
+        let _admitting = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let _timing = time_stage(&self.replication_timers.admission);
-        // Builds before the insertion-order hash fallback rejected genuine claims from
-        // 2026-09-16 as hash mismatches. Check those records once more, once.
-        let retry_hash_mismatches = connection
-            .query_row(
-                "SELECT 1 FROM meta WHERE key='legacy_claim_hash_retried'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_none();
-        let mut statement = connection.prepare(
-            "WITH retry_ids AS (
-                 SELECT writer, sequence, envelope_hash FROM replica_envelopes
-                 WHERE receipt_state='pending'
-                 UNION
-                 SELECT writer, sequence, envelope_hash FROM replica_records
-                 WHERE state='unknown'
-                    OR (state='invalid' AND error_code='invalid-replicated-claim'
-                        AND error_message LIKE '%violates unknown-claim-field:%')
-                    OR (?1 AND state='invalid' AND error_code='claim-hash-mismatch')
-             )
-             SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
-                    envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
-             FROM retry_ids JOIN replica_envelopes AS envelopes
-               ON envelopes.writer=retry_ids.writer AND envelopes.sequence=retry_ids.sequence
-              AND envelopes.envelope_hash=retry_ids.envelope_hash
-             ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash",
-        )?;
-        let envelopes = statement
-            .query_map([retry_hash_mismatches], |row| {
-                Ok(ReplicaEnvelope {
-                    writer: row.get(0)?,
-                    sequence: row.get(1)?,
-                    hash: row.get(2)?,
-                    previous_hash: row.get(3)?,
-                    accepted_at_unix_ms: row.get::<_, String>(4)?.parse().unwrap_or_default(),
-                    payload: row.get(5)?,
-                    member_key: None,
-                    signature: None,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
+        let (retry_hash_mismatches, envelopes) = {
+            let connection = self.connection.write();
+            // Builds before the insertion-order hash fallback rejected genuine claims from
+            // 2026-09-16 as hash mismatches. Check those records once more, once.
+            let retry_hash_mismatches = connection
+                .query_row(
+                    "SELECT 1 FROM meta WHERE key='legacy_claim_hash_retried'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none();
+            let mut statement = connection.prepare(
+                "WITH retry_ids AS (
+                     SELECT writer, sequence, envelope_hash FROM replica_envelopes
+                     WHERE receipt_state='pending'
+                     UNION
+                     SELECT writer, sequence, envelope_hash FROM replica_records
+                     WHERE state='unknown'
+                        OR (state='invalid' AND error_code='invalid-replicated-claim'
+                            AND error_message LIKE '%violates unknown-claim-field:%')
+                        OR (?1 AND state='invalid' AND error_code='claim-hash-mismatch')
+                 )
+                 SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
+                        envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
+                 FROM retry_ids JOIN replica_envelopes AS envelopes
+                   ON envelopes.writer=retry_ids.writer AND envelopes.sequence=retry_ids.sequence
+                  AND envelopes.envelope_hash=retry_ids.envelope_hash
+                 ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash",
+            )?;
+            let envelopes = statement
+                .query_map([retry_hash_mismatches], |row| {
+                    Ok(ReplicaEnvelope {
+                        writer: row.get(0)?,
+                        sequence: row.get(1)?,
+                        hash: row.get(2)?,
+                        previous_hash: row.get(3)?,
+                        accepted_at_unix_ms: row.get::<_, String>(4)?.parse().unwrap_or_default(),
+                        payload: row.get(5)?,
+                        member_key: None,
+                        signature: None,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            (retry_hash_mismatches, envelopes)
+        };
         let mut outcome = ReplicationAdmission::default();
-        let mut membership = fleet_membership_tx(&connection)?;
+        let mut membership = fleet_membership_tx(&self.connection.write())?;
         let mut pending = envelopes;
         // Admitting one envelope can admit a membership claim that decides another envelope,
         // so held envelopes get another pass whenever membership changes.
         loop {
             let mut held = Vec::new();
             let mut membership_changed = false;
-            // One transaction, and so one disk flush, per pass. Each envelope is admitted in its
-            // own savepoint, so an invalid one is rolled back and recorded alone.
-            let mut pass = connection.transaction()?;
-            for envelope in pending {
-                let started = std::time::Instant::now();
-                let hold = fleet_admission_hold(&pass, &membership, &envelope)?;
-                outcome.verify += started.elapsed();
-                if let Some(reason) = hold {
-                    hold_replica_envelope(&pass, &envelope, reason)?;
-                    held.push(envelope);
-                    continue;
-                }
-                let mut savepoint = pass.savepoint()?;
-                let result = validate_and_admit_envelope_tx(
-                    &savepoint,
-                    &envelope,
-                    &*self.runtime,
-                    &mut outcome,
-                );
-                match result {
-                    Ok(()) => {
-                        savepoint.execute(
-                            "DELETE FROM replica_envelope_holds
-                             WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
-                            params![envelope.writer, envelope.sequence, envelope.hash],
-                        )?;
-                        membership_changed |= envelope_carries_fleet_claims(&savepoint, &envelope)?;
-                        savepoint.commit()?;
+            // One transaction, and so one disk flush, per chunk. A catch-up page holds thousands
+            // of envelopes, and admitting them in one transaction held the only writer for
+            // seconds, so every write behind it waited. Between chunks the writer serves what
+            // queued meanwhile. Each envelope is admitted in its own savepoint, so an invalid
+            // one is rolled back and recorded alone.
+            for chunk in pending.chunks(ADMISSION_CHUNK_ENVELOPES) {
+                let mut connection = self.connection.write();
+                let mut pass = connection.transaction()?;
+                for envelope in chunk {
+                    let started = std::time::Instant::now();
+                    let hold = fleet_admission_hold(&pass, &membership, envelope)?;
+                    outcome.verify += started.elapsed();
+                    if let Some(reason) = hold {
+                        hold_replica_envelope(&pass, envelope, reason)?;
+                        held.push(envelope.clone());
+                        continue;
                     }
-                    Err(error) => {
-                        savepoint.rollback()?;
-                        drop(savepoint);
-                        record_invalid_replica_envelope(&pass, &envelope, &error)?;
-                        outcome.invalid += 1;
+                    let mut savepoint = pass.savepoint()?;
+                    let result = validate_and_admit_envelope_tx(
+                        &savepoint,
+                        envelope,
+                        &*self.runtime,
+                        &mut outcome,
+                    );
+                    match result {
+                        Ok(()) => {
+                            savepoint.execute(
+                                "DELETE FROM replica_envelope_holds
+                                 WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+                                params![envelope.writer, envelope.sequence, envelope.hash],
+                            )?;
+                            membership_changed |=
+                                envelope_carries_fleet_claims(&savepoint, envelope)?;
+                            savepoint.commit()?;
+                        }
+                        Err(error) => {
+                            savepoint.rollback()?;
+                            drop(savepoint);
+                            record_invalid_replica_envelope(&pass, envelope, &error)?;
+                            outcome.invalid += 1;
+                        }
                     }
                 }
+                pass.commit()?;
+                #[cfg(any(test, feature = "test-support"))]
+                ADMISSION_TRANSACTIONS.with(|count| count.set(count.get() + 1));
             }
-            pass.commit()?;
             if !membership_changed || held.is_empty() {
                 outcome.held = held.len();
                 break;
             }
-            membership = fleet_membership_tx(&connection)?;
+            membership = fleet_membership_tx(&self.connection.write())?;
             pending = held;
         }
         self.replication_timers
             .verify
             .fetch_add(outcome.verify.as_nanos() as u64, Ordering::Relaxed);
         if retry_hash_mismatches {
-            connection.execute(
+            self.connection.write().execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_claim_hash_retried', ?1)",
                 [now_ms().to_string()],
             )?;
         }
-        drop(connection);
         // Admitted claims, and any change to membership's trust roots, get their verdicts once
         // they are projected: judging here would hold the writer between admission and
         // projection, and a snapshot taken in between would offer an inventory its projections
@@ -6757,6 +6780,8 @@ thread_local! {
     pub static GRAPH_DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Projections this thread replayed from nothing.
     pub static FULL_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Writer transactions this thread admitted replicated envelopes in.
+    pub static ADMISSION_TRANSACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn apply_replication_repair_tx(
