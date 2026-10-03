@@ -3460,12 +3460,31 @@ fn main() -> ExitCode {
     }
     let matches = Cli::command()
         .override_help(cli_help::root_help(false))
-        .get_matches_from(arguments);
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        .try_get_matches_from(arguments)
+        .unwrap_or_else(|error| exit_usage_error(error));
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| exit_usage_error(error));
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
     }
     run_cli(cli)
+}
+
+/// Print a usage error and exit. Inside a gate check the refusal also reaches the gate's
+/// report, so a pipeline that hides st's exit status cannot hide the refusal.
+fn exit_usage_error(error: clap::Error) -> ! {
+    if !matches!(
+        error.kind(),
+        clap::error::ErrorKind::DisplayHelp
+            | clap::error::ErrorKind::DisplayVersion
+            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        let reason = error
+            .kind()
+            .as_str()
+            .unwrap_or("the arguments are not valid");
+        st3::gate_report::note_refusal(reason);
+    }
+    error.exit()
 }
 
 /// `st driver-hook NAME [ARGS]`: answer one harness hook with the payload on stdin.
@@ -3537,6 +3556,9 @@ async fn run_cli(cli: Cli) -> ExitCode {
                 return ExitCode::from(exit.0);
             }
             eprintln!("st: {}", plain_error(&error));
+            if refused_command(&error) {
+                st3::gate_report::note_refusal(&plain_error(&error));
+            }
             let message = error.to_string();
             if daemon_is_unreachable(&error) {
                 ExitCode::from(5)
@@ -3579,6 +3601,53 @@ static DAEMON_WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 fn cli_client(endpoint: &Endpoint) -> Client {
     Client::new(endpoint.clone())
         .with_outage_wait(DAEMON_WAIT.get().copied().unwrap_or_default(), true)
+}
+
+/// Whether st turned the command down, as opposed to answering it. A missing subject, a stale
+/// fence, a wait that timed out, an unreachable or slow daemon and a daemon error are answers or
+/// passing conditions a gate may wait out; a refusal never passes, so it marks a gate broken.
+fn refused_command(error: &anyhow::Error) -> bool {
+    if daemon_is_unreachable(error) || st3::client::daemon_did_not_answer(error) {
+        return false;
+    }
+    // A reader that stopped early, such as `grep -q` on a match, closed the pipe: st answered.
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+    }) {
+        return false;
+    }
+    let message = error.to_string();
+    if message.contains("stale-subject")
+        || message.contains("terminal status selected")
+        || message.contains("wait timed out")
+    {
+        return false;
+    }
+    if let Some(api) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<GeneratedClientError>())
+    {
+        return matches!(
+            api,
+            GeneratedClientError::Api(
+                ClientErrorCode::Forbidden
+                    | ClientErrorCode::UnsupportedCapability
+                    | ClientErrorCode::ValidationFailed
+                    | ClientErrorCode::AttentionMigrated
+                    | ClientErrorCode::UnsupportedMediaType
+                    | ClientErrorCode::BlobTooLarge,
+                _,
+                _
+            )
+        );
+    }
+    match st3::client::http_status(error) {
+        Some(status) => matches!(status, 400 | 401 | 403 | 405 | 413 | 415 | 422),
+        // The command refused its own arguments before it asked the daemon.
+        None => true,
+    }
 }
 
 /// Exit status 5 means the daemon was unreachable, whichever client made the request.
@@ -6226,11 +6295,12 @@ async fn run_now(
         command.push_str(" --all");
     }
     if json_output {
-        print_value(&response, true)
+        print_value(&response, true)?;
     } else {
         print!("{}", render_now_page(&response.value, &command));
-        Ok(())
     }
+    note_partial_page(&response.value);
+    Ok(())
 }
 
 fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
@@ -6456,16 +6526,27 @@ fn print_product_page(
     continuation_command: &str,
 ) -> Result<()> {
     if json_output {
-        return print_value(response, true);
+        print_value(response, true)?;
+    } else {
+        if let Some(sync) = &response.value.sync {
+            print!("{}", render_sync_notice(sync, now_ms()));
+        }
+        print!(
+            "{}",
+            render_product_page(title, &response.value, continuation_command)
+        );
     }
-    if let Some(sync) = &response.value.sync {
-        print!("{}", render_sync_notice(sync, now_ms()));
-    }
-    print!(
-        "{}",
-        render_product_page(title, &response.value, continuation_command)
-    );
+    note_partial_page(&response.value);
     Ok(())
+}
+
+/// Tell a gate check that this command printed only the first part of `page`'s collection. It
+/// runs after the page is printed: a reader that stopped early, such as `grep -q` on a match,
+/// ends the command before it reports a listing whose rest did not matter.
+fn note_partial_page(page: &ClientPage) {
+    if page.page.has_more {
+        st3::gate_report::note_partial_listing(page.items.len());
+    }
 }
 
 async fn run_collection_watch(
@@ -7696,8 +7777,14 @@ async fn list_outcomes(
         );
         page["next_cursor"] = json!(next);
     }
+    let partial = page["has_more"].as_bool().unwrap_or(false);
+    let shown = page["items"].as_array().map_or(0, Vec::len);
     if json_output {
-        return print_value(&page, true);
+        print_value(&page, true)?;
+        if partial {
+            st3::gate_report::note_partial_listing(shown);
+        }
+        return Ok(());
     }
     let items = page["items"].as_array().context("invalid outcome page")?;
     println!("{} OUTCOMES  {}", collection.to_uppercase(), items.len());
@@ -7722,6 +7809,9 @@ async fn list_outcomes(
             .map(|a| format!(" --as {a}"))
             .unwrap_or_default();
         println!("Next: st {collection} ls{actor} --limit {limit} --cursor '{cursor}'");
+    }
+    if partial {
+        st3::gate_report::note_partial_listing(shown);
     }
     Ok(())
 }
@@ -9189,8 +9279,14 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             }
             let response: DocumentListResponse = client.get(&path).await?;
             if json_output {
-                print_value(&response, true)
+                let (partial, shown) = (response.has_more, response.items.len());
+                print_value(&response, true)?;
+                if partial {
+                    st3::gate_report::note_partial_listing(shown);
+                }
+                Ok(())
             } else {
+                let shown = response.items.len();
                 if response.items.is_empty() {
                     println!("No documents.");
                 }
@@ -9215,13 +9311,14 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
                         version.owner.as_deref().unwrap_or("unknown-owner")
                     );
                 }
-                if response.has_more
-                    && let Some(cursor) = response.next_cursor
-                {
-                    println!(
-                        "More document versions are available. Continue with: {}",
-                        document_continuation_command(name.as_deref(), all, limit, &cursor)
-                    );
+                if response.has_more {
+                    if let Some(cursor) = response.next_cursor {
+                        println!(
+                            "More document versions are available. Continue with: {}",
+                            document_continuation_command(name.as_deref(), all, limit, &cursor)
+                        );
+                    }
+                    st3::gate_report::note_partial_listing(shown);
                 }
                 Ok(())
             }
@@ -9257,8 +9354,12 @@ async fn run_import(endpoint: &Endpoint, command: ImportCommand, json_output: bo
                 .sessions_list_native(cursor.as_deref(), Some(limit), all)
                 .await?;
             if json_output {
-                return print_value(&response, true);
+                print_value(&response, true)?;
+                note_partial_page(&response.value);
+                return Ok(());
             }
+            let partial = response.value.page.has_more;
+            let shown = response.value.items.len();
             println!("NATIVE SESSIONS  {}", response.value.items.len());
             if response.value.items.is_empty() {
                 println!("No native harness sessions found.");
@@ -9274,6 +9375,9 @@ async fn run_import(endpoint: &Endpoint, command: ImportCommand, json_output: bo
                 println!(
                     "More sessions are available: st import ls{history} --cursor {cursor} --limit {limit}"
                 );
+            }
+            if partial {
+                st3::gate_report::note_partial_listing(shown);
             }
             Ok(())
         }
@@ -10338,7 +10442,9 @@ async fn run_agent_inspection(
             .await?
     };
     if json_output {
-        return print_value(&response, true);
+        print_value(&response, true)?;
+        note_partial_page(&response.value);
+        return Ok(());
     }
     let mut continuation = if tree {
         "st agents tree".to_owned()
@@ -10358,6 +10464,7 @@ async fn run_agent_inspection(
         "{}",
         render_client_agents(&response.value, tree, args.enrich, &continuation)
     );
+    note_partial_page(&response.value);
     Ok(())
 }
 

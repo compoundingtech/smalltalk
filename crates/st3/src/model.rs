@@ -535,6 +535,12 @@ pub struct GateContext {
     /// The owner's attempt. A later attempt gets its own mechanical and LLM gate results.
     #[serde(default)]
     pub attempt: u32,
+    /// The mission run and generation the gate decides for. A broken gate's attention item names
+    /// them and closes when the generation is replaced.
+    #[serde(default)]
+    pub run: String,
+    #[serde(default)]
+    pub generation: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
