@@ -1015,6 +1015,9 @@ pub(crate) struct MissionGateRunner {
     pub retired: bool,
 }
 
+/// The claims of one idempotency key used for different requests, each as `(subject, writer)`.
+pub type IdempotencyConflict = Vec<(String, String)>;
+
 /// smalltalk's store: the graph store, which it derefs to, and smalltalk's runtime, which
 /// keeps the caches of its projections and plugs its claim kinds into the graph.
 pub struct Store {
@@ -2241,6 +2244,38 @@ impl Store {
         repair_operations_tx(&transaction, &drift)?;
         transaction.commit()?;
         Ok(true)
+    }
+
+    /// Idempotency keys that two requests with different content used, which only members
+    /// that accepted them apart, as during a partition, can produce: how many there are, and up
+    /// to `limit` of them with the subject and writer of each claim. Both claims stand.
+    pub fn idempotency_conflicts(&self, limit: usize) -> Result<(u64, Vec<IdempotencyConflict>)> {
+        let connection = self.readers.get();
+        let count: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE state='conflict'",
+            [],
+            |row| row.get(0),
+        )?;
+        let operations = connection
+            .prepare_cached(
+                "SELECT id FROM operations INDEXED BY operations_conflict_index
+                 WHERE state='conflict' ORDER BY id LIMIT ?1",
+            )?
+            .query_map([limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut claims = connection.prepare_cached(
+            "SELECT subject, origin FROM claims
+             WHERE json_extract(body, '$._operation.id')=?1 ORDER BY subject, origin",
+        )?;
+        let mut conflicts = Vec::new();
+        for operation in operations {
+            conflicts.push(
+                claims
+                    .query_map([&operation], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        Ok((count, conflicts))
     }
 
     pub fn operation_projection_drift(&self) -> Result<Vec<String>> {

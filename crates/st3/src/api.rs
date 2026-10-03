@@ -5687,6 +5687,37 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    match state.store.idempotency_conflicts(5) {
+        Ok((0, _)) => checks.push(DoctorCheck {
+            name: "idempotency-keys".into(),
+            status: "pass".into(),
+            message: "no idempotency key was used for two different requests".into(),
+        }),
+        Ok((count, conflicts)) => checks.push(DoctorCheck {
+            name: "idempotency-keys".into(),
+            status: "warn".into(),
+            message: format!(
+                "{count} idempotency {} used for different requests on different members, as \
+                 members apart during a partition can: each such claim stands, and a retry with \
+                 the key is refused as idempotency-conflict. {}",
+                if count == 1 { "key was" } else { "keys were" },
+                conflicts
+                    .iter()
+                    .map(|claims| claims
+                        .iter()
+                        .map(|(subject, writer)| format!("{subject} by {writer}"))
+                        .collect::<Vec<_>>()
+                        .join(" and "))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        }),
+        Err(error) => checks.push(DoctorCheck {
+            name: "idempotency-keys".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        }),
+    }
     let (recording, message) = crate::recorder::health(&state.state_dir);
     checks.push(DoctorCheck {
         name: "command-recorder".into(),
@@ -14634,6 +14665,71 @@ agent "good" {{ workspace {:?}; command "true" }}
                 .unwrap()
                 .contains("cobalt: refused by that member's Fabric grants")
         );
+    }
+
+    /// Two members apart, as during a partition, can each accept the same idempotency key for
+    /// a different request (#1026). Both claims stand once they meet; doctor says which, and a
+    /// retry with the key is refused instead of answering with either.
+    #[tokio::test]
+    async fn doctor_names_an_idempotency_key_two_members_used_for_different_requests() {
+        const FLEET: &str = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        state.store.bind_fleet(FLEET).unwrap();
+        let note = |text: &str| ClaimInput {
+            subject: "custom/partition/note".into(),
+            kind: "custom.partition.note".into(),
+            actor: Some("person/tester".into()),
+            fields: BTreeMap::from([("text".into(), Value::String(text.into()))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("partition-key".into()),
+        };
+        let app = router(state.clone());
+        let (_, doctor) = get_request(app.clone(), "/v1/doctor").await;
+        let check = |doctor: &Value| {
+            doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == "idempotency-keys")
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(check(&doctor)["status"], "pass");
+
+        state.store.append_claim(&note("written here")).unwrap();
+        let other = Store::open_memory("birch").unwrap();
+        other.bind_fleet(FLEET).unwrap();
+        other.append_claim(&note("written there")).unwrap();
+        let exchange = other
+            .export_replication_exchange(FLEET, &state.store.replication_inventory().unwrap())
+            .unwrap();
+        state
+            .store
+            .receive_replication_exchange("birch", FLEET, &exchange)
+            .unwrap();
+        state.store.validate_replication_backlog().unwrap();
+        state.store.project_replication_backlog().unwrap();
+
+        let (_, doctor) = get_request(app, "/v1/doctor").await;
+        let check = check(&doctor);
+        assert_eq!(check["status"], "warn", "{check}");
+        let message = check["message"].as_str().unwrap();
+        assert!(message.starts_with("1 idempotency key was used"), "{check}");
+        assert!(
+            message.contains("custom/partition/note by birch"),
+            "{check}"
+        );
+        assert!(
+            message.contains(&format!(
+                "custom/partition/note by {}",
+                state.store.origin()
+            )),
+            "{check}"
+        );
+        let retry = state.store.append_claim(&note("written here")).unwrap_err();
+        assert_eq!(retry.code, "idempotency-conflict", "{retry:?}");
     }
 
     #[test]
