@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
+mod terminal_input;
+use terminal_input::{TerminalInputData, TerminalInputs};
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -87,6 +89,10 @@ struct CollectionSubscribe {
     conversation: Option<String>,
     /// Parents the first collection read; falls back to the socket URL's traceparent.
     traceparent: Option<String>,
+    /// `input-open` names the held terminal follow it writes to; `input` carries one batch.
+    follow: Option<String>,
+    seq: Option<u64>,
+    data: Option<TerminalInputData>,
 }
 
 struct CollectionSubscription {
@@ -337,7 +343,7 @@ async fn open_terminal_subscription(
     state: &AppState,
     session: &ClientSession,
     request: &CollectionSubscribe,
-) -> Result<watch::Receiver<TerminalFrame>, ApiError> {
+) -> Result<(watch::Receiver<TerminalFrame>, Option<terminal_input::InputTarget>), ApiError> {
     let id = request
         .terminal
         .as_deref()
@@ -362,10 +368,11 @@ async fn open_terminal_subscription(
         .await
         .map_err(ApiError::internal)??
     };
+    let target = follow.input_target();
     let (sender, receiver) = watch::channel(TerminalFrame::Waiting);
     let state = state.clone();
     tokio::spawn(follow.run(state, TerminalSink::Subscription(sender)));
-    Ok(receiver)
+    Ok((receiver, target))
 }
 
 /// Where a conversation is read: here, or on the host that owns its session.
@@ -657,6 +664,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     let mut changed = state.event_notify.subscribe();
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
+    let mut inputs = TerminalInputs::default();
     let mut conversations = ConversationFollowers::default();
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
@@ -690,12 +698,19 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             if !send_collection(&mut socket, json!({"kind":"error", "message":"invalid collection command"})).await { return; }
                             break 'command;
                         };
+                        if matches!(request.kind.as_str(), "input-open" | "input" | "input-close") {
+                            if let Some(frame) = inputs.command(&state, &session, &request).await
+                                && !send_collection(&mut socket, frame).await { return; }
+                            break 'command;
+                        }
                         if request.kind == "unsubscribe" {
                             if let Some(presence) = &presence { presence.unfollow(&request.id); }
                             subscriptions.remove(&request.id);
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
                             traced.remove(&request.id);
+                            if let Some(frame) = inputs.end_follow(&request.id, None)
+                                && !send_collection(&mut socket, frame).await { return; }
                             break 'command;
                         }
                         let held = subscriptions.contains_key(&request.id) || terminals.contains_key(&request.id) || conversations.0.contains_key(&request.id);
@@ -720,6 +735,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
                         traced.remove(&request.id);
+                        if let Some(frame) = inputs.end_follow(&request.id, None)
+                            && !send_collection(&mut socket, frame).await { return; }
                         if request.collection == "conversation" {
                             let target = request.conversation.as_deref().unwrap_or_default();
                             let opened = conversation_session_id(&state, target).and_then(|session_id| {
@@ -739,8 +756,9 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         }
                         if request.collection == "terminal" {
                             match open_terminal_subscription(&state, &session, &request).await {
-                                Ok(receiver) => {
+                                Ok((receiver, target)) => {
                                     terminals.insert(request.id.clone(), receiver);
+                                    inputs.follow(&request.id, target);
                                 }
                                 Err(error) => {
                                     if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"terminal", "code":error.code, "message":error.message})).await { return; }
@@ -791,19 +809,21 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 continue;
             }
             (id, frame) = next_terminal_frame(&mut terminals), if !command_waiting && !terminals.is_empty() => {
-                let message = match frame {
+                let (message, ended) = match frame {
                     Some(TerminalFrame::Waiting) => continue,
-                    Some(TerminalFrame::Screen(envelope)) => json!({"kind":"screen", "id":id, "collection":"terminal", "snapshot":envelope["snapshot"], "value":envelope["value"]}),
+                    Some(TerminalFrame::Screen(envelope)) => (json!({"kind":"screen", "id":id, "collection":"terminal", "snapshot":envelope["snapshot"], "value":envelope["value"]}), None),
                     Some(TerminalFrame::Ended(error)) => {
                         terminals.remove(&id);
-                        json!({"kind":"error", "id":id, "collection":"terminal", "code":error["code"], "message":error["message"], "retryable":error["retryable"]})
+                        let ended = inputs.end_follow(&id, error["code"].as_str());
+                        (json!({"kind":"error", "id":id, "collection":"terminal", "code":error["code"], "message":error["message"], "retryable":error["retryable"]}), ended)
                     }
                     None => {
                         terminals.remove(&id);
-                        json!({"kind":"error", "id":id, "collection":"terminal", "code":"internal", "message":"the terminal stream stopped"})
+                        (json!({"kind":"error", "id":id, "collection":"terminal", "code":"internal", "message":"the terminal stream stopped"}), inputs.end_follow(&id, None))
                     }
                 };
                 if !send_collection(&mut socket, message).await { return; }
+                if let Some(frame) = ended && !send_collection(&mut socket, frame).await { return; }
                 continue;
             }
         }
@@ -1216,6 +1236,33 @@ pub(super) struct ClientSession {
     pub(super) authority_actor: String,
     pub(super) transport: &'static str,
     scopes: std::collections::BTreeSet<String>,
+    /// The pairing a device credential authenticated with; a long-lived socket rechecks it.
+    pairing: Option<PairedCredential>,
+}
+
+#[derive(Clone, Debug)]
+struct PairedCredential {
+    subject: String,
+    paired_at: u64,
+    expires_at_unix_ms: u128,
+}
+
+/// Whether a pairing was revoked after it completed, or has expired.
+fn pairing_withdrawn(state: &AppState, pairing: &PairedCredential) -> Result<bool, ApiError> {
+    let revoked = state
+        .store
+        .claims_for_subject_kind_at(
+            &pairing.subject,
+            "custom.client.pairing-revoked",
+            None,
+            true,
+            1,
+        )
+        .map_err(ApiError::internal)?
+        .claims
+        .first()
+        .is_some_and(|claim| claim.store_index > pairing.paired_at);
+    Ok(revoked || pairing.expires_at_unix_ms <= client_now_ms())
 }
 
 impl ClientSession {
@@ -1247,6 +1294,7 @@ impl ClientSession {
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
+                pairing: None,
             });
         };
         // Free mode: an agent's local session holds every scope a person's does. Its actions
@@ -1256,6 +1304,7 @@ impl ClientSession {
             authority_actor: person.into(),
             transport: "unix",
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
+            pairing: None,
         })
     }
 
@@ -1265,6 +1314,7 @@ impl ClientSession {
             authority_actor: "client/pairing/completion".into(),
             transport: "fabric-loopback",
             scopes: std::collections::BTreeSet::new(),
+            pairing: None,
         }
     }
 
@@ -1404,26 +1454,17 @@ pub(super) fn authenticate(
     let Some(paired) = paired else {
         return Err(forbidden("the client credential is unknown or expired"));
     };
-    let revoked = state
-        .store
-        .claims_for_subject_kind_at(
-            &paired.subject,
-            "custom.client.pairing-revoked",
-            None,
-            true,
-            1,
-        )
-        .map_err(ApiError::internal)?
-        .claims
-        .first()
-        .is_some_and(|claim| claim.store_index > paired.store_index);
-    let expires_at = paired
-        .body
-        .pointer("/fields/expires_at_unix_ms")
-        .and_then(Value::as_u64)
-        .map(u128::from)
-        .unwrap_or_default();
-    if revoked || expires_at <= client_now_ms() {
+    let pairing = PairedCredential {
+        subject: paired.subject.clone(),
+        paired_at: paired.store_index,
+        expires_at_unix_ms: paired
+            .body
+            .pointer("/fields/expires_at_unix_ms")
+            .and_then(Value::as_u64)
+            .map(u128::from)
+            .unwrap_or_default(),
+    };
+    if pairing_withdrawn(state, &pairing)? {
         return Err(forbidden("the client credential was revoked or expired"));
     }
     let actor = paired
@@ -1451,6 +1492,7 @@ pub(super) fn authenticate(
         authority_actor: authority_actor.into(),
         transport,
         scopes,
+        pairing: Some(pairing),
     };
     if request.method() == axum::http::Method::GET {
         let scope = if request
@@ -14675,6 +14717,7 @@ mission "example/zero-run" state="ready" {
             authority_actor: "person/alex".into(),
             transport: "paired",
             scopes: ["terminal.read".into()].into_iter().collect(),
+            pairing: None,
         };
         let mut remote_request = request.clone();
         remote_request.idempotency_key = "fleet-terminal-attach-device-one".into();
