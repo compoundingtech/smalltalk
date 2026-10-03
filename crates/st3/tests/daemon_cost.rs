@@ -223,6 +223,8 @@ const NOT_MEASURED: &[(&str, &str)] = &[
     ("POST /v1/launches/{id}/revise", "planning session"),
     ("POST /v1/launches/{id}/cancel", "planning session"),
     ("POST /v1/evals", "starts an eval's harnesses"),
+    ("POST /v1/gate-checks", "runs a mission's gate commands in a workspace"),
+    ("GET /v1/gate-checks/{id}", "reads a gate check that POST /v1/gate-checks started"),
     // Writes that need a live runtime or a person's approval the generated store lacks.
     ("POST /v1/agents/rename", "renames a declared agent"),
     ("POST /v1/agents/restart", "restarts a live seat"),
