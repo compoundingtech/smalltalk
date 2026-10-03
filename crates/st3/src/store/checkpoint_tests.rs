@@ -1618,3 +1618,54 @@ fn a_write_queued_during_sealing_runs_before_the_backlog_finishes() {
         ));
     }
 }
+
+/// The harness and guard examples of `docs/st3/checkpoints.md`.
+#[test]
+fn the_documented_examples_drop_what_the_document_says() {
+    let mut sealed = Sealed::default();
+    let states = [
+        "starting", "ready", "working", "idle", "working", "working", "idle", "working", "working",
+    ];
+    let observed = states.map(|state| {
+        sealed.add(
+            "alder",
+            T + 100,
+            draft("harness.observed", AGENT, harness(state, None)),
+        )
+    });
+    let renewals = [1, 2, 3].map(|offset| {
+        sealed.add(
+            "alder",
+            T + 200 + offset,
+            draft(
+                "work.renewed",
+                "step-run/example/build",
+                json!({"attempt": 1, "lease_expires_at_unix_ms": (T + 300 + offset) as u64}),
+            ),
+        )
+    });
+    let diagnostic = |message: &str| {
+        draft(
+            "daemon.diagnostic",
+            "daemon/alder",
+            json!({"code": "slow-request", "message": message}),
+        )
+    };
+    let mut by_person = diagnostic("first");
+    by_person.actor = Some("person/avery");
+    let person = sealed.add("alder", T + 400, by_person);
+    let second = sealed.add("alder", T + 401, diagnostic("second"));
+    let third = sealed.add("alder", T + 402, diagnostic("third"));
+    let plan = plan_drops(&sealed.build());
+    assert_eq!(
+        dropped(&plan),
+        ids([
+            &observed[2],
+            &observed[3],
+            &observed[4],
+            &observed[5],
+            &second
+        ])
+    );
+    let _ = (renewals, person, third);
+}
