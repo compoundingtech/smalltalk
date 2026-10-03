@@ -4136,12 +4136,12 @@ mod tests {
         );
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         let shown = screen(&ui);
+        // Nathan, 2026-10-03: a space's footer names only the keys that move around.
         assert!(
-            shown.contains("type message")
-                && shown.contains("alt+i details")
-                && shown.contains("tab tabs"),
-            "the footer names the chords: {shown}"
+            shown.contains("ctrl+k open") && shown.contains("tab tabs") && shown.contains("? help"),
+            "the footer: {shown}"
         );
+        assert!(!shown.contains("q quit"), "{shown}");
         // Leaving the box keeps the draft; the next letter goes on typing into it.
         typed(&mut ui, "!");
         assert!(ui.editing);

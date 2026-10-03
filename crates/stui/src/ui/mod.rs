@@ -1126,53 +1126,33 @@ impl Ui {
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
         } else {
-            let mut hints = match &self.glasses {
-                Some(_) if self.split_shown() => vec![
+            // In a space the footer names only the keys that move around (Nathan, 2026-10-03);
+            // each pane's own keys are on the pane and in ? help.
+            if self.glasses.is_some() {
+                vec![
                     ("ctrl+k", "open"),
-                    ("[ ]", "tabs"),
+                    ("tab", "tabs"),
                     ("alt+←→↑↓", "splits"),
                     ("ctrl+w", "close"),
-                ],
-                Some(_) if !self.on_home() => {
-                    vec![("ctrl+k", "open"), ("[ ]", "tabs"), ("ctrl+w", "close")]
-                }
-                Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
-                None => vec![("1-5", "tabs"), ("↑↓", "select")],
-            };
-            // A glass conversation types: its commands are chords.
-            let typing = self.composing_agent().is_some();
-            if typing {
-                for hint in &mut hints {
-                    if hint.0 == "[ ]" {
-                        *hint = ("tab", "tabs");
-                    }
-                }
-            }
-            match self.tab {
-                0 => hints.extend([("keys", "on the card"), ("c", "write")]),
-                1 if typing => hints.extend([
-                    ("type", "message"),
-                    ("alt+i", "details"),
-                    ("alt+o", "tools"),
-                    ("end", "latest"),
-                    ("drag", "select + copy"),
-                ]),
-                1 => hints.extend([
-                    ("c", "message"),
-                    ("i", "details"),
-                    ("o", "expand tools"),
-                    ("end", "latest"),
-                    ("drag", "select + copy"),
-                ]),
-                2 => hints.extend([("n", "new mission"), ("t", "tree"), ("x", "system")]),
-                _ => {}
-            }
-            if typing {
-                hints.extend([("?", "help"), ("ctrl+q", "quit")]);
+                    ("?", "help"),
+                ]
             } else {
+                let mut hints = vec![("1-5", "tabs"), ("↑↓", "select")];
+                match self.tab {
+                    0 => hints.extend([("keys", "on the card"), ("c", "write")]),
+                    1 => hints.extend([
+                        ("c", "message"),
+                        ("i", "details"),
+                        ("o", "expand tools"),
+                        ("end", "latest"),
+                        ("drag", "select + copy"),
+                    ]),
+                    2 => hints.extend([("n", "new mission"), ("t", "tree"), ("x", "system")]),
+                    _ => {}
+                }
                 hints.extend([("?", "help"), ("q", "quit")]);
+                hints
             }
-            hints
         };
         // The build, always at the right edge; the hints give way to it.
         let build = self
@@ -2595,7 +2575,10 @@ impl Ui {
                     "alt+shift+o",
                     "simplified view: tool calls fold to a line (this device)",
                 ),
-                ("alt+i", "the agent's details beside it"),
+                (
+                    "alt+i  ctrl+i",
+                    "the agent's details beside it (ctrl+i where the terminal tells it from tab)",
+                ),
                 ("drag", "select text in one pane; release copies it"),
                 ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
                 (
