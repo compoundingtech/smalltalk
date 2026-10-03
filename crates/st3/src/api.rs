@@ -59,6 +59,7 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+mod client_presence;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
@@ -326,6 +327,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/usage", get(client_v0::usage_period))
+        .route("/v1/client/clients", get(client_v0::clients_list))
         .route(
             "/v1/client/subject-definition",
             get(client_v0::subject_definition),
@@ -751,6 +753,8 @@ async fn response_envelope(
         (Ok(None), None)
     };
     if let Ok(Some(session)) = &client_authentication {
+        // The clients connected now: kept in memory, shown by clients.list, never enforced.
+        client_presence::note_request(&state.node, session, request.headers(), client_now_ms());
         request.extensions_mut().insert(session.clone());
     }
     if let Some(snapshot) = &client_snapshot {

@@ -134,6 +134,9 @@ enum Command {
     Activity(ActivityArgs),
     /// Pair, inspect, and revoke client devices.
     Devices(DevicesArgs),
+    /// The clients connected to this member now and those seen in the last few minutes:
+    /// stui, the phone and st itself, with their builds as they report them.
+    Clients,
     /// Claim and update durable mission work.
     Work {
         #[command(subcommand)]
@@ -3532,6 +3535,8 @@ fn main() -> ExitCode {
     if let Some(program) = st3::recorder::invoked_program() {
         st3::recorder::run(program);
     }
+    // What `st clients` lists for this process: its name and build, as reported.
+    st3_client::set_client_name(format!("st {}", st_drivers::version::machine_version()));
     // A seat process asks a replacement binary which resume formats it reads before executing it.
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(st_drivers::reexec::PROBE_SUBCOMMAND))
@@ -3860,6 +3865,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Devices(args) => {
             run_devices(endpoint.clone(), config.person.as_deref(), args, cli.json).await
         }
+        Command::Clients => run_clients(&endpoint, cli.json).await,
         Command::Work { command } => run_work(&client, &endpoint, command, cli.json).await,
         Command::Lanes { command } => {
             run_lanes(&client, config.person.as_deref(), command, cli.json).await
@@ -6735,12 +6741,23 @@ async fn run_devices(
                 .devices_list(cursor.as_deref(), Some(limit), all)
                 .await?;
             let history = if all { " --all" } else { "" };
-            print_product_page(
+            if json_output {
+                return print_product_page("DEVICES", &response, true, "");
+            }
+            // Each device says whether it is connected to this member now, or when it was last
+            // seen, with the build it reported. A daemon without clients.list says nothing.
+            let clients = client.clients_list().await.ok();
+            let rendered = render_product_page(
                 "DEVICES",
-                &response,
-                json_output,
+                &response.value,
                 &format!("st devices --as {person}{history}"),
-            )
+            );
+            print!(
+                "{}",
+                with_device_presence(&rendered, clients.as_ref().map(|found| &found.value), now_ms())
+            );
+            note_partial_page(&response.value);
+            Ok(())
         }
         DevicesCommand::Pair {
             device_name,
@@ -6781,6 +6798,98 @@ async fn run_devices(
             print_client_value(&response, json_output)
         }
     }
+}
+
+async fn run_clients(endpoint: &Endpoint, json_output: bool) -> Result<()> {
+    let client = generated_client(endpoint, None)?;
+    let response = client.clients_list().await?;
+    if json_output {
+        return print_value(&response, true);
+    }
+    print!("{}", render_clients(&response.value, now_ms()));
+    Ok(())
+}
+
+/// How long ago an RFC 3339 instant was, in words: `just now`, `4m ago`, `2h ago`, `3d ago`.
+fn ago(timestamp: &str, now_ms: u128) -> String {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+        return timestamp.to_owned();
+    };
+    let seconds = (now_ms as i64 / 1_000).saturating_sub(then.timestamp()).max(0);
+    match seconds {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{}m ago", seconds / 60),
+        3_600..86_400 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+fn render_clients(found: &st3_client::ClientConnections, now_ms: u128) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("CLIENTS  {} on {}\n", found.items.len(), found.member);
+    for item in &found.items {
+        let who = match (&item.device_name, &item.device_id) {
+            (Some(name), _) => format!("{} ({name})", item.person),
+            (None, Some(device)) => format!("{} ({device})", item.person),
+            (None, None) => item.actor.clone(),
+        };
+        let when = if item.connected {
+            format!("connected now, since {}", ago(&item.since, now_ms))
+        } else {
+            format!("last seen {}", ago(&item.last_seen, now_ms))
+        };
+        let _ = writeln!(
+            out,
+            "{}  {who}  via {}  {when}",
+            item.client.as_deref().unwrap_or("(unnamed client)"),
+            item.via
+        );
+        if !item.follows.is_empty() {
+            let _ = writeln!(out, "  follows: {}", item.follows.join(", "));
+        }
+    }
+    if found.items.is_empty() {
+        out.push_str("No client has reached this member in the last few minutes.\n");
+    }
+    out
+}
+
+/// `rendered` (a devices page) with each device's line saying whether it is connected to this
+/// member now or when it was last seen, and the build it reported.
+fn with_device_presence(
+    rendered: &str,
+    clients: Option<&st3_client::ClientConnections>,
+    now_ms: u128,
+) -> String {
+    let Some(clients) = clients else {
+        return rendered.to_owned();
+    };
+    let mut out = String::new();
+    for line in rendered.lines() {
+        out.push_str(line);
+        let device = line.split_whitespace().next().unwrap_or_default();
+        if device.starts_with("device/")
+            && let Some(item) = clients
+                .items
+                .iter()
+                .find(|item| item.device_id.as_deref() == Some(device))
+        {
+            let when = if item.connected {
+                "connected now".to_owned()
+            } else {
+                format!("last seen {}", ago(&item.last_seen, now_ms))
+            };
+            out.push_str(&format!(
+                "  · {when}{}",
+                item.client
+                    .as_deref()
+                    .map(|client| format!(" · {client}"))
+                    .unwrap_or_default()
+            ));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// The actor of a terminal or client-v0 command: an explicit person or agent, else the harness's
@@ -18945,6 +19054,35 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clients_and_devices_say_who_is_connected_and_when_others_were_seen() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
+            .unwrap()
+            .timestamp_millis() as u128;
+        let found: st3_client::ClientConnections = serde_json::from_value(serde_json::json!({
+            "kind": "client-connections", "member": "host/example",
+            "items": [
+                {"actor": "person/avery/session/0011", "person": "person/avery", "client": "smalltalk-ios 1.0 (42)",
+                 "device_id": "device/001122", "device_name": "Pocket", "member": "host/example", "via": "gateway",
+                 "connected": true, "streams": 1, "since": "2026-10-03T11:58:00Z", "last_seen": "2026-10-03T12:00:00Z",
+                 "follows": ["agents", "conversation:agent/example/harbor"]},
+                {"actor": "person/avery", "person": "person/avery", "client": null, "member": "host/example",
+                 "via": "local", "connected": false, "streams": 0, "since": "2026-10-03T09:00:00Z",
+                 "last_seen": "2026-10-03T11:57:00Z", "follows": []}
+            ]
+        }))
+        .unwrap();
+        let shown = render_clients(&found, now);
+        assert!(shown.contains("CLIENTS  2 on host/example"), "{shown}");
+        assert!(shown.contains("smalltalk-ios 1.0 (42)  person/avery (Pocket)  via gateway  connected now, since 2m ago"), "{shown}");
+        assert!(shown.contains("  follows: agents, conversation:agent/example/harbor"), "{shown}");
+        assert!(shown.contains("(unnamed client)  person/avery  via local  last seen 3m ago"), "{shown}");
+        let devices = "DEVICES\ndevice/001122  active  person/avery/session/0011  scopes 4\n  action: st devices --as person/avery revoke device/001122\n";
+        let marked = with_device_presence(devices, Some(&found), now);
+        assert!(marked.contains("scopes 4  · connected now · smalltalk-ios 1.0 (42)"), "{marked}");
+        assert_eq!(with_device_presence(devices, None, now), devices);
+    }
 
     #[test]
     fn client_api_errors_print_in_plain_words_with_their_code() {

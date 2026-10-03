@@ -2792,6 +2792,8 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
 }
 
 fn main() -> Result<()> {
+    // What `st clients` lists for this stui: its name and build, as reported.
+    st3_client::set_client_name(version::client_name());
     let args = std::env::args().collect::<Vec<_>>();
     if args
         .iter()

@@ -5,6 +5,8 @@ import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
 import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { personAnswer } from './requestView';
+import { clientName } from './clientName';
+import app from './app.json';
 import { isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView } from './sessionView';
 import { base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from './deviceSigning';
 import { createDeviceKey, removeDeviceKey, signWithDeviceKey } from './modules/st-device-key';
@@ -100,9 +102,9 @@ function useAppStore() {
   // Images messages carry, as data URIs, so a conversation scrolled back to does not read them again.
   const imageCache = useRef(new Map<string, Promise<string>>());
   const missionDetailCache = useRef(new Map<string, Mission>());
-  const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch() }) : null, [url, credential]);
+  const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(), client: clientName(app.expo.version) }) : null, [url, credential]);
   // Image bytes go up through Expo's fetch: React Native's cannot send a byte array as a body.
-  const uploader = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(expoFetch as unknown as typeof fetch) }) : null, [url, credential]);
+  const uploader = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(expoFetch as unknown as typeof fetch), client: clientName(app.expo.version) }) : null, [url, credential]);
 
   useEffect(() => { Promise.allSettled([AsyncStorage.getItem(URL_KEY), AsyncStorage.getItem(ORDER_KEY), SecureStore.getItemAsync(CREDENTIAL_KEY), AsyncStorage.getItem(PROJECTION_CACHE_KEY)]).then(([u, o, c, p]) => {
     if (u.status === 'fulfilled' && u.value) { setUrl(u.value); setUrlDraft(u.value); }
@@ -266,7 +268,7 @@ function useAppStore() {
       const gateway = normalizeGatewayUrl(gatewayRaw);
       if (!gateway) return;
       setPairingIssue(''); setBusy(true);
-      try { await completePairing(new St3Client({ baseUrl: gateway }), id, code, gateway); } catch (e) { setPairingIssue(`Pairing failed: ${errorText(e)}`); } finally { setBusy(false); }
+      try { await completePairing(new St3Client({ baseUrl: gateway, client: clientName(app.expo.version) }), id, code, gateway); } catch (e) { setPairingIssue(`Pairing failed: ${errorText(e)}`); } finally { setBusy(false); }
     },
     async forget() {
       await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await SecureStore.deleteItemAsync(SIGNING_KEY); await removeDeviceKey(); await clearCachedProjection();

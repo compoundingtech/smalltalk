@@ -19,6 +19,11 @@ pub fn short(now: u64) -> String {
     }
 }
 
+/// This build as the client header names it: `stui 0.1.0+local.ab12cd3`.
+pub fn client_name() -> String {
+    format!("stui {}", shared::machine_version())
+}
+
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
