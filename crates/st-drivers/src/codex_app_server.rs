@@ -421,7 +421,7 @@ fn codex_turn_outcome(turn: Option<&Value>) -> CodexTurnOutcome {
             if turn
                 .pointer("/error/codexErrorInfo")
                 .and_then(Value::as_str)
-                == Some("usageLimitExceeded")
+                .is_some_and(|word| matches!(word, "usageLimitExceeded" | "serverOverloaded"))
                 || turn
                     .pointer("/error/message")
                     .and_then(Value::as_str)
@@ -1121,6 +1121,12 @@ impl CodexInboxDelivery {
         };
         if observation.blocked_on == BlockedOn::Human
             || observation.reason.as_deref() == Some("providerAuth")
+            || (observation.reason.as_deref() == Some("providerCapacity")
+                && matches!(
+                    error.reason,
+                    driver_diagnostic::Reason::TurnServerOverloaded
+                        | driver_diagnostic::Reason::TurnUnclassified
+                ))
         {
             return observation;
         }
@@ -1205,6 +1211,32 @@ impl CodexInboxDelivery {
                 let status = message
                     .pointer("/params/turn/status")
                     .and_then(Value::as_str);
+                // Secondary subscribers can miss the error notification. The failed result
+                // still carries the typed cause; a terminal result is not an ongoing retry.
+                if status == Some("failed")
+                    && let Some(turn_id) =
+                        message.pointer("/params/turn/id").and_then(Value::as_str)
+                    && let Some(error) = message
+                        .pointer("/params/turn/error")
+                        .filter(|v| v.is_object())
+                {
+                    if error.get("codexErrorInfo").is_none_or(Value::is_null)
+                        && self
+                            .turn_error
+                            .as_ref()
+                            .is_some_and(|standing| standing.turn_id == turn_id)
+                    {
+                        return false;
+                    }
+                    return self.observe_turn_error(
+                        &json!({
+                            "method": "error",
+                            "params": {"threadId": thread_id, "turnId": turn_id,
+                                "willRetry": false, "error": error}
+                        }),
+                        thread_id,
+                    );
+                }
                 if status != Some("completed") {
                     return false;
                 }
@@ -5037,7 +5069,14 @@ fn recover_transcript_turn_if_due(
             reason: CodexHoldReason::SystemError,
             ..
         }
-    );
+    ) || (matches!(
+        state.observed,
+        CodexObservedState::TerminalError {
+            reason: CodexTerminalError::SystemError,
+        }
+    ) && delivery
+        .as_ref()
+        .is_some_and(|delivery| delivery.turn_error.is_none()));
     if last_recovery.is_some_and(|last| last.elapsed() < TRANSCRIPT_TURN_RECOVERY_INTERVAL)
         || (!system_error
             && (!delivery
@@ -5059,15 +5098,14 @@ fn recover_transcript_turn_if_due(
         let Some(path) = latest_codex_transcript(state.thread_id())? else {
             return Ok(());
         };
-        if failed_completed_turn_from_codex_frames(&codex_transcript_tail(&path)?).is_none() {
+        let Some(turn) = failed_completed_turn_from_codex_frames(&codex_transcript_tail(&path)?)
+        else {
             return Ok(());
-        }
+        };
         // Some Codex app-server versions report the terminal thread status but
         // omit turn/completed. The saved task_complete with an error proves the
         // turn ended, so the next inbox delivery can safely start a new turn.
-        state.observed = CodexObservedState::TerminalError {
-            reason: CodexTerminalError::SystemError,
-        };
+        recover_failed_codex_turn(state, delivery, &turn);
         atomic_json(control_state_path, state)
             .context("persisting transcript-recovered Codex system error")?;
         if let Some(delivery) = delivery.as_mut() {
@@ -5246,10 +5284,30 @@ fn active_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
     active
 }
 
-fn failed_completed_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
+fn recover_failed_codex_turn(
+    state: &mut CodexControlState,
+    delivery: &mut Option<CodexInboxDelivery>,
+    turn: &Value,
+) {
+    state.observed = CodexObservedState::TerminalError {
+        reason: CodexTerminalError::SystemError,
+    };
+    state.observe_turn_completed(turn["id"].as_str().unwrap(), codex_turn_outcome(Some(turn)));
+    if let Some(delivery) = delivery.as_mut() {
+        let message = json!({"method": "turn/completed",
+            "params": {"threadId": state.thread_id(), "turn": turn}});
+        delivery.observe_provider_auth(&message, state.thread_id());
+        delivery.observe_turn_error(&message, state.thread_id());
+    }
+}
+
+fn failed_completed_turn_from_codex_frames(frames: &[Value]) -> Option<Value> {
     let mut active = None;
     let mut failed = None;
     for value in frames {
+        if value["type"] != "event_msg" {
+            continue;
+        }
         let event = value.pointer("/payload/type").and_then(Value::as_str);
         let turn_id = value.pointer("/payload/turn_id").and_then(Value::as_str);
         match (event, turn_id) {
@@ -5262,7 +5320,38 @@ fn failed_completed_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
                 failed = value
                     .pointer("/payload/error")
                     .filter(|error| !error.is_null())
-                    .map(|_| turn_id.to_string());
+                    .map(|error| {
+                        // Rollouts use the Rust enum spelling, while the app-server uses
+                        // camelCase. Preserve unknown words as unknown, and never infer a
+                        // cause from user/tool text in the transcript.
+                        let mut error = error.clone();
+                        if let Some(info) = error.get("codex_error_info").cloned() {
+                            let camel = |word: &str| {
+                                let mut parts = word.split('_');
+                                let mut out = parts.next().unwrap_or_default().to_owned();
+                                for part in parts {
+                                    let mut chars = part.chars();
+                                    if let Some(first) = chars.next() {
+                                        out.extend(first.to_uppercase());
+                                        out.extend(chars);
+                                    }
+                                }
+                                out
+                            };
+                            error["codexErrorInfo"] = match info {
+                                Value::String(word) => json!(camel(&word)),
+                                Value::Object(words) => Value::Object(
+                                    words
+                                        .into_iter()
+                                        .map(|(word, value)| (camel(&word), value))
+                                        .collect(),
+                                ),
+                                other => other,
+                            };
+                            error.as_object_mut().unwrap().remove("codex_error_info");
+                        }
+                        json!({"id": turn_id, "status": "failed", "error": error})
+                    });
             }
             (Some("turn_aborted"), Some(turn_id)) if active == Some(turn_id) => {
                 active = None;

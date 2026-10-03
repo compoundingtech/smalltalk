@@ -9,6 +9,7 @@ pub mod boot;
 pub(crate) mod checkout;
 pub mod claude_channel;
 pub mod client;
+pub mod codex_failure;
 pub mod config;
 pub mod conversation_search;
 pub mod creation;
