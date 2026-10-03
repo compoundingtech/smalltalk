@@ -378,6 +378,46 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    // Posting and registration also require GitHub; count their local writes with invented
+    // object IDs. The comment probe includes the default watch declaration.
+    direct("POST /v1/github/comment", |store, fixture, attempt| {
+        let thread = st3::github_watch::ThreadRef::parse(&format!("acme/garden#{}", attempt + 10))
+            .map_err(|error| error.message)?;
+        let agent = &fixture.subjects.seats[0];
+        let id = attempt as u64 + 100;
+        let mut record = store
+            .record_github_post(
+                agent,
+                &thread,
+                "comment",
+                id,
+                &format!(
+                    "https://github.com/acme/garden/issues/{}#issuecomment-{id}",
+                    thread.number
+                ),
+                "garden-bot",
+            )
+            .map_err(|error| error.message)?;
+        record["watch"] = store
+            .declare_watch(&thread, agent, None)
+            .map_err(|error| error.message)?;
+        Ok(record)
+    }),
+    direct("POST /v1/github/own", |store, fixture, attempt| {
+        let thread =
+            st3::github_watch::ThreadRef::parse("acme/garden#12").map_err(|error| error.message)?;
+        let id = attempt as u64 + 200;
+        store
+            .record_github_post(
+                &fixture.subjects.seats[0],
+                &thread,
+                "comment",
+                id,
+                &format!("https://github.com/acme/garden/issues/12#issuecomment-{id}"),
+                "garden-bot",
+            )
+            .map_err(|error| error.message)
+    }),
     // A watch validates the thread with GitHub first; measure its store work directly so the
     // cost check needs neither network access nor a live seat process. Each attempt declares a
     // new watch, and the ending probe ends a different one rather than measuring a replay.
