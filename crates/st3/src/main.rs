@@ -50,7 +50,11 @@ use st3_client::{
 };
 use tokio::sync::{Notify, watch};
 
+use clap_complete::engine::ArgValueCompleter;
+use completion::{Complete, Entity};
+
 mod cli_help;
+mod completion;
 mod presentation;
 
 use presentation::{
@@ -244,7 +248,8 @@ enum Command {
         #[command(subcommand)]
         command: ImportCommand,
     },
-    /// Generate one shell completion script.
+    /// Print one shell's completion stub. On each TAB the stub asks this st executable for
+    /// candidates, including live terminals, agents, missions, and other entities from the daemon.
     Completions(CompletionsArgs),
     /// Answer one built-in gate check, as built-in gates run it: exit 0 to pass, 1 for not yet,
     /// and 3 when the check cannot answer.
@@ -1660,6 +1665,7 @@ enum MissionViewCommand {
     /// Show one seat's current claim and its queued mission runs in order; same as `st agents queue AGENT`.
     Queued {
         /// Exact seat subject or its identity without the `agent/` prefix.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
         agent: String,
     },
     /// Show one subscription's automatic mission request queue.
@@ -1677,6 +1683,7 @@ enum MissionViewCommand {
 
 #[derive(Args)]
 struct MissionShowArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionOrRun)))]
     mission_or_run: String,
     #[arg(long)]
     follow: bool,
@@ -1751,6 +1758,7 @@ enum GateCommand {
 
 #[derive(Args)]
 struct MissionRunStartArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Mission)))]
     mission: String,
     /// Start exactly this published revision, as printed by `missions publish`. A revision
     /// published on another host is awaited briefly while it replicates here.
@@ -1766,6 +1774,7 @@ struct MissionRunStartArgs {
     inputs: Vec<(String, String)>,
     /// Start no work until this mission run completes; fail if it fails or is cancelled.
     #[arg(long, value_name = "RUN")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
     #[arg(long)]
     follow: bool,
@@ -1779,6 +1788,7 @@ struct MissionRunStartArgs {
 #[derive(Args)]
 struct MissionCancelArgs {
     /// Exact mission-run subject to cancel.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     mission_run: String,
     /// Why the run is no longer wanted.
     #[arg(long)]
@@ -1791,6 +1801,7 @@ struct MissionCancelArgs {
 #[derive(Args)]
 struct MissionOutcomeArgs {
     /// Exact mission-run subject of a finished run.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
     mission_run: String,
     /// The outcome the run should show.
     #[arg(value_parser = ["completed", "failed", "cancelled"])]
@@ -1806,6 +1817,7 @@ struct MissionOutcomeArgs {
 #[derive(Args)]
 struct MissionRetireArgs {
     /// Mission to retire, such as `mission/fleet/demo/deploy`.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Mission)))]
     mission: String,
     /// A person, or an agent that may publish the mission.
     #[arg(long = "as", value_parser = parse_publication_actor)]
@@ -2025,11 +2037,13 @@ struct PtyNewArgs {
 
 #[derive(Args)]
 struct PtySubjectArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
 }
 
 #[derive(Args)]
 struct PtyScreenArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     /// Use this concrete person instead of the person configured for trusted local commands.
     #[arg(long = "as", value_parser = parse_actor_subject)]
@@ -2038,6 +2052,7 @@ struct PtyScreenArgs {
 
 #[derive(Args)]
 struct PtyStreamArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
@@ -2053,6 +2068,7 @@ struct PtyStreamArgs {
 
 #[derive(Args)]
 struct PtyClientInputArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     value: String,
     #[arg(long = "as", value_parser = parse_actor_subject)]
@@ -2075,6 +2091,7 @@ struct PtyClientDetachArgs {
 
 #[derive(Args)]
 struct PtyAttachArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     /// Allow an attachment from inside another PTY session.
     #[arg(long)]
@@ -2105,6 +2122,7 @@ struct PtyServeFabricArgs {
 
 #[derive(Args)]
 struct PtySendArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     /// Text typed as one line and followed by Enter a moment later; with --raw the exact bytes,
     /// with --key a key name.
@@ -2119,6 +2137,7 @@ struct PtySendArgs {
 
 #[derive(Args)]
 struct PtySignalArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     #[arg(value_parser = ["interrupt", "hangup", "user-1", "user-2"])]
     signal: String,
@@ -2133,6 +2152,7 @@ struct InspectArgs {
 struct TraceArgs {
     subject: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
     owner_run: Option<String>,
     #[arg(long, default_value_t = 100)]
     limit: usize,
@@ -2160,6 +2180,7 @@ struct NowArgs {
     #[arg(long = "as", value_parser = parse_person_subject)]
     person: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
     owner_run: Option<String>,
     /// Include explicitly historical rows in addition to the actionable default.
     #[arg(long)]
@@ -2610,6 +2631,7 @@ enum AgentsCommand {
     Tree(AgentsArgs),
     /// Show one exact agent, including its owner and operational annotation.
     Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
         subject: String,
         /// Include a historical agent that is absent from the operational default.
         #[arg(long)]
@@ -2696,6 +2718,7 @@ struct AgentQueueArgs {
     command: Option<AgentQueueCommand>,
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(required = true)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     agent: Option<String>,
 }
 
@@ -2713,8 +2736,10 @@ enum AgentQueueCommand {
 ))]
 struct AgentQueueMoveArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     agent: String,
     /// Queued mission run to move.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     run: String,
     /// Put the run first in the seat's queue.
     #[arg(long)]
@@ -2724,9 +2749,11 @@ struct AgentQueueMoveArgs {
     bottom: bool,
     /// Put the run directly before another queued run.
     #[arg(long, value_name = "RUN")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     before: Option<String>,
     /// Put the run directly after another queued run.
     #[arg(long, value_name = "RUN")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
     /// Why the order changed; recorded with the move.
     #[arg(long)]
@@ -2747,6 +2774,7 @@ enum LaneCommand {
     /// Show one lane's entries in order and its recent changes.
     Show {
         /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Lane)))]
         lane: String,
     },
     /// Add an entry at the back of a lane. An entry already in the lane stays where it is.
@@ -2764,6 +2792,7 @@ enum LaneCommand {
 #[derive(Args)]
 struct LaneEntryArgs {
     /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Lane)))]
     lane: String,
     /// The entry subject, or the part after the lane's entry prefix, such as a pull request number.
     entry: String,
@@ -2811,6 +2840,7 @@ struct LaneMoveArgs {
 #[derive(Args)]
 struct LaneMarkArgs {
     /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Lane)))]
     lane: String,
     /// The entry subject, or the part after the lane's entry prefix.
     entry: String,
@@ -2995,6 +3025,7 @@ struct AgentStartArgs {
     #[arg(long, value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
     harness: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Host)))]
     host: Option<String>,
     /// Record permission to start this placement before unreachable source hosts acknowledge exit.
     #[arg(long, conflicts_with = "print_kdl")]
@@ -3028,6 +3059,7 @@ struct AgentNewArgs {
     name: String,
     /// Fleet host that runs the agent; defaults to this host.
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Host)))]
     host: Option<String>,
     #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
     harness: String,
@@ -3073,6 +3105,7 @@ struct AgentNewArgs {
 #[derive(Args)]
 struct AgentStopArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: true })))]
     subject: String,
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
@@ -3300,6 +3333,7 @@ enum AttentionCommand {
     },
     /// Explain one attention item and show the exact available actions.
     Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
         subject: String,
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
@@ -3342,6 +3376,7 @@ struct AttentionRequestArgs {
     until: Option<String>,
     /// Resolve the item on its own once this step ends, instead of the step you have claimed.
     #[arg(long, value_name = "STEP_RUN")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: None })))]
     step: Option<String>,
     /// Only a person closes the item, because nothing st observes can say it is done.
     #[arg(long, conflicts_with_all = ["until", "step"])]
@@ -3350,6 +3385,7 @@ struct AttentionRequestArgs {
 
 #[derive(Args)]
 struct AttentionResolveArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
     subject: String,
     #[arg(long, value_parser = ["resolved", "dismissed"])]
     outcome: String,
@@ -3361,6 +3397,7 @@ struct AttentionResolveArgs {
 
 #[derive(Args)]
 struct AttentionWithdrawArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
     subject: String,
     #[arg(long)]
     reason: String,
@@ -3405,7 +3442,10 @@ enum WorkCommand {
         status: Option<String>,
     },
     /// Explain one work item, its owner, readiness, lease, and evidence.
-    Show { subject: String },
+    Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: None })))]
+        subject: String,
+    },
     /// Acquire one ready work item with the current harness incarnation.
     Claim(WorkActionArgs),
     /// Extend the live lease for work this incarnation still owns.
@@ -3510,6 +3550,7 @@ struct WorkDoneArgs {
 
 #[derive(Args)]
 struct WorkWakeArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: Some("ready") })))]
     subject: String,
     #[arg(long = "as")]
     actor: Option<String>,
@@ -3519,6 +3560,7 @@ struct WorkWakeArgs {
 
 #[derive(Args)]
 struct WorkRetryArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: Some("failed") })))]
     subject: String,
     #[arg(long = "as")]
     actor: Option<String>,
@@ -3529,9 +3571,15 @@ struct WorkRetryArgs {
 #[derive(Subcommand)]
 enum WorkRevisionCommand {
     /// Show the current revision proposal for one mission run.
-    Show { run: String },
+    Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
+        run: String,
+    },
     /// List every immutable generation created for one mission run.
-    Generations { run: String },
+    Generations {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: false })))]
+        run: String,
+    },
     /// Explain one exact generation and its work state.
     Generation { generation: String },
     /// Approve an exact proposal preview and permit its cutover.
@@ -3568,6 +3616,7 @@ struct WorkExtendArgs {
 
 #[derive(Args)]
 struct WorkActionArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: None })))]
     subject: String,
     #[arg(long = "as")]
     actor: Option<String>,
@@ -3583,6 +3632,7 @@ struct WorkActionArgs {
 
 #[derive(Args)]
 struct WorkReviseArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     run: String,
     file: PathBuf,
     #[arg(long = "as")]
@@ -3686,12 +3736,14 @@ enum MessageCommand {
 
 #[derive(Args)]
 struct MessageSendArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     to: String,
     #[arg(short = 'm', long)]
     body: String,
     #[arg(long)]
     subject: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     in_reply_to: Option<String>,
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
@@ -3729,6 +3781,7 @@ struct MessageListArgs {
 #[derive(Args)]
 struct MessageReadArgs {
     #[arg(num_args = 1..)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     references: Vec<String>,
     #[arg(long)]
     raw: bool,
@@ -3740,6 +3793,7 @@ struct MessageReadArgs {
 
 #[derive(Args)]
 struct MessageReplyArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     reference: String,
     #[arg(short = 'm', long)]
     body: String,
@@ -3762,6 +3816,7 @@ struct MessageReplyArgs {
 #[derive(Args)]
 struct MessageArchiveArgs {
     #[arg(num_args = 1..)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     references: Vec<String>,
     #[arg(long = "as")]
     actor: Option<String>,
@@ -3769,6 +3824,7 @@ struct MessageArchiveArgs {
 
 #[derive(Args)]
 struct MessageReferenceArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     reference: String,
     #[arg(long)]
     tree: bool,
@@ -3867,6 +3923,9 @@ fn main() -> ExitCode {
     }
     // What `st clients` lists for this process: its name and build, as reported.
     st3_client::set_client_name(format!("st {}", st_drivers::version::machine_version()));
+    // A shell stub from `st completions` calls back with `COMPLETE=<shell>` on each TAB. Answer
+    // before any config, runtime, or daemon work; this exits when the variable is set.
+    clap_complete::env::CompleteEnv::with_factory(Cli::command).complete();
     // A seat process asks a replacement binary which resume formats it reads before executing it.
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(st_drivers::reexec::PROBE_SUBCOMMAND))
@@ -4380,11 +4439,21 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Import { command } => run_import(&endpoint, command, cli.json).await,
         Command::Completions(args) => {
             let shell = match args.shell {
-                CompletionShell::Bash => clap_complete::Shell::Bash,
-                CompletionShell::Zsh => clap_complete::Shell::Zsh,
-                CompletionShell::Fish => clap_complete::Shell::Fish,
+                CompletionShell::Bash => "bash",
+                CompletionShell::Zsh => "zsh",
+                CompletionShell::Fish => "fish",
             };
-            clap_complete::generate(shell, &mut Cli::command(), "st", &mut std::io::stdout());
+            let completer = std::env::current_exe().context("find this st executable")?;
+            clap_complete::env::Shells::builtins()
+                .completer(shell)
+                .context("clap_complete lacks a built-in shell")?
+                .write_registration(
+                    "COMPLETE",
+                    "st",
+                    "st",
+                    &completer.to_string_lossy(),
+                    &mut std::io::stdout(),
+                )?;
             Ok(())
         }
         Command::Driver(args) => run_driver(&immediate, args, cli.catalog.as_deref()).await,
@@ -5897,7 +5966,15 @@ async fn cancel_mission_run(
     args: MissionCancelArgs,
     json_output: bool,
 ) -> Result<()> {
-    let subject = normalize_member_subject(&args.mission_run, "mission-run");
+    let subject = resolve_member_subject(
+        endpoint,
+        &args.mission_run,
+        "mission-run",
+        Entity::MissionRun {
+            unfinished_only: true,
+        },
+    )
+    .await?;
     let run: MissionRunView = client
         .get(&format!(
             "/v1/mission-runs/{}",
@@ -6523,7 +6600,8 @@ async fn run_pty(
             )
         }
         PtyCommand::Attach(args) => {
-            let subject = normalize_member_subject(&args.subject, "pty");
+            let subject =
+                resolve_member_subject(endpoint, &args.subject, "pty", Entity::Terminal).await?;
             let person = args.person.as_deref().or(configured_person);
             attach_terminal(client, endpoint, pty_root, person, &subject, args.force).await
         }
@@ -6531,7 +6609,8 @@ async fn run_pty(
             unreachable!("handled before any daemon client")
         }
         PtyCommand::Peek(args) => {
-            let subject = normalize_member_subject(&args.subject, "pty");
+            let subject =
+                resolve_member_subject(endpoint, &args.subject, "pty", Entity::Terminal).await?;
             let screen: SessionScreen = client
                 .get(&format!(
                     "/v1/sessions/screen/{}",
@@ -6684,7 +6763,8 @@ async fn run_pty(
             print_client_value(&response, json_output)
         }
         PtyCommand::Send(args) => {
-            let subject = normalize_member_subject(&args.subject, "pty");
+            let subject =
+                resolve_member_subject(endpoint, &args.subject, "pty", Entity::Terminal).await?;
             let incarnation = session_incarnation(client, &subject).await?;
             let mode = if args.raw {
                 SessionInputMode::Raw
@@ -6712,7 +6792,8 @@ async fn run_pty(
             print_value(&response, json_output)
         }
         PtyCommand::Signal(args) => {
-            let subject = normalize_member_subject(&args.subject, "pty");
+            let subject =
+                resolve_member_subject(endpoint, &args.subject, "pty", Entity::Terminal).await?;
             let response: SessionControlResponse = client
                 .post(
                     &format!("/v1/sessions/{}/signal", urlencoding::encode(&subject)),
@@ -10041,6 +10122,50 @@ async fn session_incarnation(client: &Client, subject: &str) -> Result<String> {
         .with_context(|| format!("subject `{subject}` has no live incarnation"))
 }
 
+/// Resolves a short name such as `steward` to one exact subject of `entity` through the
+/// short-name ladder (docs/st3/cli-completion/spec.md). A word the ladder cannot match, or any
+/// word while the daemon does not answer within the deadline, keeps the literal
+/// `<namespace>/<word>` meaning, so commands that work without the daemon still do.
+async fn resolve_member_subject(
+    endpoint: &Endpoint,
+    subject: &str,
+    namespace: &str,
+    entity: Entity,
+) -> Result<String> {
+    let literal = normalize_member_subject(subject, namespace);
+    if subject.contains('/') {
+        return Ok(literal);
+    }
+    let Endpoint::Unix(socket) = endpoint else {
+        return Ok(literal);
+    };
+    let caller = completion::LocalTarget::discover().and_then(|target| target.caller);
+    let client = GeneratedClient::unix(socket).with_outage_wait(Duration::ZERO, false);
+    let listed = tokio::time::timeout(
+        completion::RESOLVE_DEADLINE,
+        completion::candidates(&client, entity, caller.as_deref()),
+    )
+    .await;
+    let Ok(Ok(candidates)) = listed else {
+        return Ok(literal);
+    };
+    match completion::resolve(subject, namespace, &candidates) {
+        completion::Resolution::Subject(subject) => Ok(subject),
+        completion::Resolution::Unmatched => Ok(literal),
+        completion::Resolution::Ambiguous(matches) => {
+            let listing = matches
+                .iter()
+                .map(|candidate| format!("  {}  {}", candidate.subject, candidate.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "`{subject}` matches {} subjects; name one exactly:\n{listing}",
+                matches.len()
+            )
+        }
+    }
+}
+
 fn normalize_member_subject(subject: &str, namespace: &str) -> String {
     // Product terminal IDs include the resource prefix; the private PTY routes and registry
     // tags name their underlying member. `terminals new` returns the public form.
@@ -10998,7 +11123,13 @@ async fn run_agents(
             }
         }
         AgentsCommand::Stop(args) => {
-            let subject = normalize_member_subject(&args.subject, "agent");
+            let subject = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "agent",
+                Entity::Agent { running_only: true },
+            )
+            .await?;
             let kdl = publication_document(kdl_node("stop", [subject.as_str()]));
             if args.print_kdl {
                 print!("{kdl}");
@@ -13083,7 +13214,8 @@ async fn run_attention(
         }
         AttentionCommand::Show { subject, actor } => {
             let actor = configured_human(actor.as_deref(), configured_person, "attention")?;
-            let normalized = normalize_member_subject(&subject, "attention");
+            let normalized =
+                resolve_member_subject(endpoint, &subject, "attention", Entity::Attention).await?;
             let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
             let item = client
                 .get::<Vec<AttentionItemView>>(&path)
