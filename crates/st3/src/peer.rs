@@ -723,7 +723,7 @@ impl ClientRelay {
         let mut last = None;
         let profile = crate::profile::current();
         let route_span = profile.as_ref().map(|op| op.wall_span("raw/route"));
-        let peers = self.next_hops(target, &[self.node.clone()]);
+        let peers = self.next_hops(target, std::slice::from_ref(&self.node));
         drop(route_span);
         for peer in peers.into_iter().filter(|peer| peer.name == target) {
             let result = async {
