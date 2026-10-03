@@ -21731,7 +21731,7 @@ mod tests {
         for change in 0..8 {
             let mut changed = request.clone();
             match change {
-                0 => changed.from = "person/blake".into(),
+                0 => changed.from = "person/blair".into(),
                 1 => changed.to = "agent/example/other".into(),
                 2 => changed.in_reply_to = Some("message/example".into()),
                 3 => changed.title = None,
