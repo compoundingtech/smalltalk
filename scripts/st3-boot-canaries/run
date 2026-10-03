@@ -328,6 +328,19 @@ def driver_processes(node):
     return rows
 
 
+def wait_drained(spools, bound):
+    """Every observation a seat's driver committed to its spool is acknowledged in time."""
+    import sqlite3
+
+    def drained():
+        for database in spools:
+            with sqlite3.connect(database) as connection:
+                if connection.execute("SELECT EXISTS(SELECT 1 FROM events)").fetchone()[0]:
+                    return False
+        return True
+    until(drained, bound, "committed harness observations were not acknowledged")
+
+
 def receipts(node, letter):
     path = node.root / "ws" / f"receipts-{seat_subject(letter).replace('/', '-')}.jsonl"
     rows = []
@@ -417,6 +430,7 @@ def suspend_and_resume(node, seats, harness):
         fail(f"the resumed harness ran {latest}, not session {native} resumed")
     until(lambda: (node.api("/v1/messages/read/" + sent) or {}).get("status") in ("read", "closed"),
           seats.bound, "the resumed seat did not read the message that waited for it")
+    wait_drained(list((node.root / "state/drivers").rglob("st-harness-events.sqlite")), seats.bound)
 
     # A resume that cannot find its session says why, and the seat stays suspended.
     agent = until(suspend, seats.bound, "the resumed seat never suspended again")
@@ -514,14 +528,10 @@ def run(args, root, evidence):
                 fail("fresh native seats used polled harness records: " + str(records))
             if len(spools) != len(letters):
                 fail("a fresh native seat has no durable observation spool")
-            import sqlite3
-            def drained():
-                for database in spools:
-                    with sqlite3.connect(database) as connection:
-                        if connection.execute("SELECT EXISTS(SELECT 1 FROM events)").fetchone()[0]:
-                            return False
-                return True
-            until(drained, args.bound, "committed harness observations were not acknowledged")
+            # A suspended seat has no driver to acknowledge what its last one committed while it
+            # stopped; `suspend` checks its spool while the resumed seat runs.
+            if args.scenario != "suspend":
+                wait_drained(spools, args.bound)
         return {"verdict": "pass", "harness": args.harness, "scenario": args.scenario,
                 "seconds_to_boot": seats.timings, "catalog_files": len(catalogs_after),
                 "harness_record_files": len(records), "observation_spools": len(spools)}
