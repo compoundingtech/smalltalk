@@ -25,7 +25,7 @@ const RUNTIME_ID: &str = "example-worker";
 const CREATED_AT: &str = "2026-09-29T08:00:00.000Z";
 const SCREEN: &[u8] = b"the worker's screen";
 
-fn state(root: &Path) -> AppState {
+pub(crate) fn state(root: &Path) -> AppState {
     AppState {
         store: Arc::new(Store::open_memory("attach-node").unwrap()),
         notify: Arc::new(Notify::new()),
@@ -287,7 +287,7 @@ async fn configured_attach(root: &Path, daemon_wait: &str) -> (Output, u32, Dura
     (output, pid, started.elapsed())
 }
 
-async fn serve_unix(state: AppState, socket: &Path) -> tokio::task::JoinHandle<()> {
+pub(crate) async fn serve_unix(state: AppState, socket: &Path) -> tokio::task::JoinHandle<()> {
     let server_socket = socket.to_path_buf();
     let server = tokio::spawn(async move {
         let _ = st3::api::serve_unix(&server_socket, st3::api::router(state)).await;
@@ -470,13 +470,13 @@ async fn a_terminal_on_this_host_attaches_while_its_daemon_never_answers() {
 }
 
 /// A daemon that takes every connection and never answers.
-struct SilentDaemon {
+pub(crate) struct SilentDaemon {
     stop: Arc<std::sync::atomic::AtomicBool>,
     accepting: std::thread::JoinHandle<usize>,
 }
 
 impl SilentDaemon {
-    fn unix(socket: &Path) -> Self {
+    pub(crate) fn unix(socket: &Path) -> Self {
         let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         Self::serve(move || {
@@ -516,7 +516,7 @@ impl SilentDaemon {
     }
 
     /// Stop accepting; returns how many connections it took.
-    fn stop(self) -> usize {
+    pub(crate) fn stop(self) -> usize {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.accepting.join().unwrap()
     }

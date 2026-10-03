@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap_complete::engine::{CompletionCandidate, ValueCompleter};
-use st3_client::{Client, ClientError, Resource};
+use st3_client::{Client, ClientError, Envelope, Page, Resource};
 
 /// All daemon calls of one completion request, joins included, finish within this deadline.
 pub const DEADLINE: Duration = Duration::from_millis(300);
@@ -20,6 +20,11 @@ pub const DEADLINE: Duration = Duration::from_millis(300);
 pub const RESOLVE_DEADLINE: Duration = Duration::from_secs(2);
 
 const LIST_LIMIT: usize = 200;
+/// A join only enriches candidates, so it gets less than the whole deadline and is dropped when
+/// it runs out; the primary list still answers.
+const JOIN_DEADLINE: Duration = Duration::from_millis(200);
+/// Pages are followed until this many items; the deadline still bounds the whole request.
+const MAX_ITEMS: usize = 5_000;
 const DESCRIPTION_WIDTH: usize = 96;
 
 /// The entity kind an argument names, with the filter its command accepts.
@@ -35,8 +40,8 @@ pub enum Entity {
     MissionRun { unfinished_only: bool },
     /// Current missions and their runs, for commands that accept either.
     MissionOrRun,
-    /// Current mission steps; `state` keeps only steps in that state, such as `ready`.
-    Work { state: Option<&'static str> },
+    /// Current mission steps, filtered by what the command can act on.
+    Work(WorkFilter),
     /// Open attention items.
     Attention,
     /// Unarchived messages in the caller's mailbox.
@@ -45,6 +50,34 @@ pub enum Entity {
     Lane,
     /// Fleet hosts.
     Host,
+    /// Planner-backed launch sessions.
+    Launch,
+    /// Active paired devices of the configured person.
+    Device,
+    /// Resource subscriptions that request missions.
+    Subscription,
+    /// Normalized harness sessions that have a conversation timeline.
+    Session,
+    /// Native harness sessions st does not manage yet; `importable_only` keeps ones `import run`
+    /// accepts.
+    NativeSession { importable_only: bool },
+    /// Persons: the configured person and the persons current attention items and devices name.
+    Person,
+    /// Persons and agents that can act: the caller, the configured person, and current agents.
+    Actor,
+}
+
+/// Which mission steps a work command accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkFilter {
+    /// Every current step.
+    Any,
+    /// Steps another seat or person could claim or wake.
+    Ready,
+    /// Failed steps that can be retried.
+    Failed,
+    /// Claimed steps; in an agent seat, only the ones this seat holds.
+    Claimed,
 }
 
 /// One entity a person can pick: its exact subject and a one-line description.
@@ -76,42 +109,56 @@ impl ValueCompleter for Complete {
 
 /// Lists candidates on a private current-thread runtime, bounded by [`DEADLINE`].
 fn fetch_blocking(entity: Entity) -> Option<Vec<Candidate>> {
-    let target = LocalTarget::discover()?;
+    let target = LocalTarget::discover(&completion_words())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
     runtime
-        .block_on(async {
-            tokio::time::timeout(
-                DEADLINE,
-                candidates(&target.client(), entity, target.caller.as_deref()),
-            )
-            .await
-        })
+        .block_on(async { tokio::time::timeout(deadline(), candidates(&target, entity)).await })
         .ok()?
         .ok()
 }
 
-/// The trusted local endpoint and caller identity, resolved the way ordinary commands do.
+/// [`DEADLINE`], unless `ST3_COMPLETION_DEADLINE_MS` names another bound in milliseconds, as tests
+/// against a debug daemon on a loaded host do.
+fn deadline() -> Duration {
+    std::env::var("ST3_COMPLETION_DEADLINE_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+        .map_or(DEADLINE, Duration::from_millis)
+}
+
+/// The command line being completed: clap_complete passes it after `--`.
+fn completion_words() -> Vec<String> {
+    std::env::args()
+        .skip_while(|word| word != "--")
+        .skip(1)
+        .collect()
+}
+
+/// The trusted local endpoint and identities, resolved the way ordinary commands do.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalTarget {
     pub socket: PathBuf,
     /// `ST_AGENT` in a seat, otherwise the configured person.
     pub caller: Option<String>,
+    /// `person` in the st config.
+    pub person: Option<String>,
 }
 
 impl LocalTarget {
-    pub fn discover() -> Option<Self> {
+    /// `--endpoint` in `words` wins over `ST3_ENDPOINT`, which wins over the configured socket.
+    /// A non-Unix endpoint yields `None`: client-v0 lists need the trusted local socket.
+    pub fn discover(words: &[String]) -> Option<Self> {
         let config = st3::config::Config::load_unvalidated(None).ok()?;
-        let socket = match std::env::var("ST3_ENDPOINT")
-            .ok()
-            .map(st3::client::Endpoint::parse)
-        {
+        let endpoint = endpoint_word(words).or_else(|| std::env::var("ST3_ENDPOINT").ok());
+        let socket = match endpoint.map(st3::client::Endpoint::parse) {
             Some(st3::client::Endpoint::Unix(socket)) => socket,
             Some(_) => return None,
             None => config.socket,
         };
-        let caller = std::env::var("ST_AGENT")
+        let agent = std::env::var("ST_AGENT")
             .ok()
             .filter(|agent| !agent.is_empty())
             .map(|agent| {
@@ -120,9 +167,12 @@ impl LocalTarget {
                 } else {
                     format!("agent/{agent}")
                 }
-            })
-            .or(config.person);
-        Some(Self { socket, caller })
+            });
+        Some(Self {
+            socket,
+            caller: agent.or_else(|| config.person.clone()),
+            person: config.person,
+        })
     }
 
     /// A client that fails at once while the daemon is unreachable.
@@ -131,73 +181,249 @@ impl LocalTarget {
     }
 }
 
+/// The value of the last `--endpoint VALUE` or `--endpoint=VALUE` before the word being completed.
+fn endpoint_word(words: &[String]) -> Option<String> {
+    let typed = words.split_last().map_or(words, |(_, typed)| typed);
+    let mut found = None;
+    let mut words = typed.iter();
+    while let Some(word) = words.next() {
+        if word == "--endpoint" {
+            found = words.next().cloned();
+        } else if let Some(value) = word.strip_prefix("--endpoint=") {
+            found = Some(value.to_owned());
+        }
+    }
+    found
+}
+
+/// Follows a collection's pages until it ends or [`MAX_ITEMS`] are read.
+async fn all_items<F, Fut>(mut page: F) -> Result<Vec<Resource>, ClientError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Envelope<Page>, ClientError>>,
+{
+    let mut items = Vec::new();
+    let mut cursor = None;
+    loop {
+        let response = page(cursor.take()).await?.value;
+        items.extend(response.items);
+        match response.page.next_cursor {
+            Some(next) if response.page.has_more && items.len() < MAX_ITEMS => cursor = Some(next),
+            _ => return Ok(items),
+        }
+    }
+}
+
+/// Everything one entity kind needs from the daemon.
+#[derive(Debug, Default)]
+pub struct Listed {
+    pub items: Vec<Resource>,
+    /// Agents joined into terminal and actor descriptions.
+    pub agents: Vec<Resource>,
+    /// Devices joined into person candidates.
+    pub devices: Vec<Resource>,
+}
+
 /// Current entities of one kind, filtered for the command, with curated descriptions.
 pub async fn candidates(
-    client: &Client,
+    target: &LocalTarget,
     entity: Entity,
-    caller: Option<&str>,
 ) -> Result<Vec<Candidate>, ClientError> {
-    let now = chrono::Utc::now();
-    let items = |page: st3_client::Envelope<st3_client::Page>| page.value.items;
-    let found = match entity {
+    let listed = list(target, entity).await?;
+    Ok(select(entity, &listed, target, chrono::Utc::now()))
+}
+
+async fn joined<F: std::future::Future<Output = Result<Vec<Resource>, ClientError>>>(
+    join: F,
+) -> Vec<Resource> {
+    tokio::time::timeout(JOIN_DEADLINE, join)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+}
+
+async fn list(target: &LocalTarget, entity: Entity) -> Result<Listed, ClientError> {
+    let client = &target.client();
+    let agents = || {
+        all_items(|cursor| async move {
+            client
+                .agents_list(cursor.as_deref(), Some(LIST_LIMIT), false)
+                .await
+        })
+    };
+    let devices = || async {
+        let Some(person) = &target.person else {
+            return Ok(Vec::new());
+        };
+        let client =
+            &Client::unix_as(&target.socket, person).with_outage_wait(Duration::ZERO, false);
+        all_items(|cursor| async move {
+            client
+                .devices_list(cursor.as_deref(), Some(LIST_LIMIT), false)
+                .await
+        })
+        .await
+    };
+    macro_rules! items {
+        ($method:ident $(, $argument:expr)*) => {
+            all_items(|cursor| async move {
+                client.$method($($argument,)* cursor.as_deref(), Some(LIST_LIMIT), false).await
+            })
+            .await?
+        };
+    }
+    let mut listed = Listed::default();
+    match entity {
         Entity::Terminal => {
             let (terminals, agents) = tokio::join!(
-                client.terminals_list(None, Some(LIST_LIMIT), false),
-                client.agents_list(None, Some(LIST_LIMIT), false),
+                all_items(|cursor| async move {
+                    client
+                        .terminals_list(cursor.as_deref(), Some(LIST_LIMIT), false)
+                        .await
+                }),
+                joined(agents()),
             );
+            listed.items = terminals?;
             // The agent join adds harness and activity; a terminal still completes without it.
-            let agents = agents.map(items).unwrap_or_default();
-            items(terminals?)
-                .into_iter()
-                .filter_map(|item| match item {
-                    Resource::Runtime(runtime) if runtime.state == "running" => {
-                        let agent = agents.iter().find_map(|agent| match agent {
-                            Resource::Agent(agent) if agent.header.id == runtime.owner_id => {
-                                Some(agent)
-                            }
-                            _ => None,
-                        });
-                        let mut parts = vec![
-                            runtime.state.clone(),
-                            short_host(&runtime.owner_host_id).to_owned(),
-                        ];
-                        if let Some(agent) = agent {
-                            parts.extend(agent.driver.clone());
-                            parts.extend(agent.harness_state.clone());
-                            parts.extend(agent_work(agent));
-                        }
-                        parts.extend(
-                            since(&runtime.header.updated_at, now).map(|age| format!("up {age}")),
-                        );
-                        Some(Candidate::new(runtime.owner_id, parts))
-                    }
-                    _ => None,
-                })
-                .collect()
+            listed.agents = agents;
         }
-        Entity::Agent { running_only } => {
-            items(client.agents_list(None, Some(LIST_LIMIT), false).await?)
-                .into_iter()
-                .filter_map(|item| match item {
-                    Resource::Agent(agent) if !running_only || agent.state == "running" => {
-                        let mut parts = vec![agent.state.clone()];
-                        parts.extend(agent.host_id.as_deref().map(short_host).map(str::to_owned));
-                        parts.extend(agent.driver.clone());
-                        parts.extend(agent.harness_state.clone());
-                        parts.extend(agent_work(&agent));
-                        Some(Candidate::new(agent.header.id, parts))
-                    }
-                    _ => None,
-                })
-                .collect()
-        }
+        Entity::Agent { .. } => listed.items = agents().await?,
+        Entity::Actor => listed.agents = joined(agents()).await,
         Entity::Mission | Entity::MissionRun { .. } | Entity::MissionOrRun => {
-            let missions = items(client.missions_list(None, Some(LIST_LIMIT), false).await?);
-            let mut found = Vec::new();
-            for item in missions {
-                let Resource::Mission(mission) = item else {
-                    continue;
-                };
+            listed.items = items!(missions_list)
+        }
+        Entity::Work(_) => listed.items = items!(work_list),
+        Entity::Attention => listed.items = items!(attention_list),
+        Entity::Message => {
+            if let Some(caller) = target.caller.as_deref() {
+                listed.items = items!(messages_list_for_recipient, caller);
+            }
+        }
+        Entity::Lane => listed.items = items!(lanes_list),
+        Entity::Host => listed.items = items!(machines_list),
+        Entity::Launch => listed.items = items!(launches_list),
+        Entity::Device => listed.items = devices().await?,
+        Entity::Subscription => listed.items = items!(subscriptions_list),
+        Entity::Session => {
+            // Conversation views are scoped to a person, as `conversations sessions` is.
+            if let Some(person) = &target.person {
+                let client = &Client::unix_as(&target.socket, person)
+                    .with_outage_wait(Duration::ZERO, false);
+                listed.items = all_items(|cursor| async move {
+                    client
+                        .sessions_list(cursor.as_deref(), Some(LIST_LIMIT), false)
+                        .await
+                })
+                .await?;
+            }
+        }
+        Entity::NativeSession { .. } => listed.items = items!(sessions_list_native),
+        Entity::Person => {
+            let (attention, devices) = tokio::join!(
+                joined(all_items(|cursor| async move {
+                    client
+                        .attention_list(cursor.as_deref(), Some(LIST_LIMIT), false)
+                        .await
+                })),
+                joined(devices()),
+            );
+            listed.items = attention;
+            listed.devices = devices;
+        }
+    }
+    Ok(listed)
+}
+
+/// Filters and describes listed entities for one argument. Pure, so tests can drive it.
+pub fn select(
+    entity: Entity,
+    listed: &Listed,
+    target: &LocalTarget,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Candidate> {
+    let agent_by_id = |id: &str| {
+        listed.agents.iter().find_map(|agent| match agent {
+            Resource::Agent(agent) if agent.header.id == id => Some(agent),
+            _ => None,
+        })
+    };
+    let mut found = Vec::new();
+    match entity {
+        Entity::Person | Entity::Actor => {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut push = |subject: &str, parts: Vec<String>| {
+                if seen.insert(subject.to_owned()) {
+                    found.push(Candidate::new(subject.to_owned(), parts));
+                }
+            };
+            if let Some(person) = &target.person {
+                push(person, vec!["configured person".into()]);
+            }
+            if entity == Entity::Actor {
+                if let Some(caller) = target
+                    .caller
+                    .as_deref()
+                    .filter(|caller| caller.starts_with("agent/"))
+                {
+                    push(caller, vec!["this seat".into()]);
+                }
+                for agent in &listed.agents {
+                    if let Resource::Agent(agent) = agent {
+                        push(&agent.header.id, agent_parts(agent));
+                    }
+                }
+            } else {
+                for item in listed.items.iter().chain(&listed.devices) {
+                    match item {
+                        Resource::Attention(attention) => {
+                            push(&attention.person_id, vec!["has attention items".into()])
+                        }
+                        Resource::Device(device) => {
+                            push(&device.person_id, vec!["has paired devices".into()])
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return found;
+        }
+        _ => {}
+    }
+    for item in &listed.items {
+        let candidate = match (entity, item) {
+            (Entity::Terminal, Resource::Runtime(runtime)) if runtime.state == "running" => {
+                let mut parts = vec![
+                    runtime.state.clone(),
+                    short_host(&runtime.owner_host_id).to_owned(),
+                ];
+                if let Some(agent) = agent_by_id(&runtime.owner_id) {
+                    parts.extend(agent.driver.clone());
+                    parts.extend(agent.harness_state.clone());
+                    parts.extend(agent_work(agent));
+                }
+                // An incarnation is `PID:STARTED_AT`; `updated_at` moves with every observation.
+                let started = runtime
+                    .incarnation_id
+                    .as_deref()
+                    .and_then(|incarnation| incarnation.split_once(':'))
+                    .map(|(_, at)| at);
+                parts.extend(
+                    started
+                        .and_then(|at| since(at, now))
+                        .map(|age| format!("up {age}")),
+                );
+                Candidate::new(runtime.owner_id.clone(), parts)
+            }
+            (Entity::Agent { running_only }, Resource::Agent(agent))
+                if !running_only || agent.state == "running" =>
+            {
+                Candidate::new(agent.header.id.clone(), agent_parts(agent))
+            }
+            (
+                Entity::Mission | Entity::MissionRun { .. } | Entity::MissionOrRun,
+                Resource::Mission(mission),
+            ) => {
                 if matches!(entity, Entity::Mission | Entity::MissionOrRun) {
                     let mut parts = vec![mission.title.clone(), mission.state.clone()];
                     if let Some(active) = mission.active_runs.filter(|active| *active > 0) {
@@ -205,121 +431,170 @@ pub async fn candidates(
                     }
                     found.push(Candidate::new(mission.header.id.clone(), parts));
                 }
-                if matches!(entity, Entity::Mission) {
-                    continue;
-                }
-                let unfinished_only = matches!(
-                    entity,
-                    Entity::MissionRun {
-                        unfinished_only: true
+                if entity != Entity::Mission {
+                    let unfinished_only = entity
+                        == (Entity::MissionRun {
+                            unfinished_only: true,
+                        });
+                    for run in &mission.run_details {
+                        if unfinished_only && (run.outcome.is_some() || run.phase == "terminal") {
+                            continue;
+                        }
+                        let mut parts =
+                            vec![mission.title.clone(), run.status.clone(), run.phase.clone()];
+                        parts.extend(
+                            run.current_steps
+                                .first()
+                                .and_then(|step| step.get("path").and_then(|path| path.as_str()))
+                                .map(|path| format!("step {path}")),
+                        );
+                        parts.extend(since(&run.state_since, now));
+                        found.push(Candidate::new(run.id.clone(), parts));
                     }
-                );
-                for run in &mission.run_details {
-                    if unfinished_only && (run.outcome.is_some() || run.phase == "terminal") {
-                        continue;
-                    }
-                    let mut parts =
-                        vec![mission.title.clone(), run.status.clone(), run.phase.clone()];
-                    parts.extend(
-                        run.current_steps
-                            .first()
-                            .and_then(|step| step.get("path").and_then(|path| path.as_str()))
-                            .map(|path| format!("step {path}")),
-                    );
-                    parts.extend(since(&run.state_since, now));
-                    found.push(Candidate::new(run.id.clone(), parts));
                 }
+                continue;
             }
-            found
+            (Entity::Work(filter), Resource::Work(work))
+                if work_accepts(filter, work, target.caller.as_deref()) =>
+            {
+                let mut parts = vec![
+                    work.title.clone().unwrap_or_else(|| work.path.clone()),
+                    work.state.clone(),
+                ];
+                parts.push(
+                    work.mission_id
+                        .clone()
+                        .unwrap_or_else(|| work.mission_run_id.clone()),
+                );
+                parts.extend(work.claimant.clone().or_else(|| work.assigned_to.clone()));
+                Candidate::new(work.header.id.clone(), parts)
+            }
+            (Entity::Attention, Resource::Attention(attention)) if attention.state == "open" => {
+                let mut parts = vec![quote(&attention.title), attention.priority.clone()];
+                parts.extend(attention.requester_id.clone());
+                parts.extend(since(&attention.requested_at, now));
+                Candidate::new(attention.header.id.clone(), parts)
+            }
+            (Entity::Message, Resource::Message(message)) if message.state != "archived" => {
+                let title = message.title.clone().unwrap_or_else(|| {
+                    message
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                });
+                let mut parts = vec![format!("from {}", message.from), quote(&title)];
+                parts.extend(since(&message.sent_at, now));
+                Candidate::new(message.header.id.clone(), parts)
+            }
+            (Entity::Lane, Resource::Lane(lane)) => Candidate::new(
+                lane.header.id.clone(),
+                vec![
+                    lane.name.clone(),
+                    lane.state.clone(),
+                    plural(lane.entries.len(), "entry"),
+                ],
+            ),
+            (Entity::Host, Resource::Machine(machine)) => Candidate::new(
+                machine.host_id.clone(),
+                vec![
+                    machine.state.clone(),
+                    plural(machine.runtime_ids.len(), "runtime"),
+                ],
+            ),
+            (Entity::Launch, Resource::Launch(launch)) => Candidate::new(
+                launch.header.id.clone(),
+                vec![
+                    quote(&launch.title),
+                    launch.phase.clone(),
+                    launch.planner.clone(),
+                    plural(launch.variants.len(), "variant"),
+                ],
+            ),
+            (Entity::Device, Resource::Device(device)) if device.state == "active" => {
+                let mut parts = vec![
+                    device.name.clone().unwrap_or_default(),
+                    device.state.clone(),
+                ];
+                parts.push(plural(device.scopes.len(), "scope"));
+                parts.push(format!(
+                    "expires {}",
+                    device.expires_at.get(..10).unwrap_or(&device.expires_at)
+                ));
+                Candidate::new(device.header.id.clone(), parts)
+            }
+            (Entity::Subscription, Resource::Subscription(subscription)) => {
+                let mut parts = vec![
+                    subscription.state.clone(),
+                    format!("on {}", subscription.spec.observer),
+                ];
+                parts.extend(
+                    subscription
+                        .spec
+                        .mission
+                        .clone()
+                        .map(|mission| format!("starts {mission}")),
+                );
+                Candidate::new(subscription.header.id.clone(), parts)
+            }
+            (Entity::Session, Resource::Session(session)) => {
+                let mut parts = vec![session.owner_id.clone(), session.state.clone()];
+                parts.extend(
+                    since(&session.started_at, now).map(|age| format!("started {age} ago")),
+                );
+                Candidate::new(session.header.id.clone(), parts)
+            }
+            (Entity::NativeSession { importable_only }, Resource::Session(session))
+                if session.extra.get("managed") == Some(&serde_json::Value::Bool(false))
+                    && (!importable_only
+                        || session.extra.get("importable")
+                            == Some(&serde_json::Value::Bool(true))) =>
+            {
+                let text = |key: &str| {
+                    session
+                        .extra
+                        .get(key)
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                };
+                let mut parts = vec![session.state.clone()];
+                parts.extend(text("harness"));
+                parts.extend(text("workspace"));
+                parts.extend(
+                    since(&session.started_at, now).map(|age| format!("started {age} ago")),
+                );
+                Candidate::new(session.header.id.clone(), parts)
+            }
+            _ => continue,
+        };
+        found.push(candidate);
+    }
+    found
+}
+
+fn work_accepts(filter: WorkFilter, work: &st3_client::Work, caller: Option<&str>) -> bool {
+    match filter {
+        WorkFilter::Any => true,
+        WorkFilter::Ready => work.state == "ready",
+        WorkFilter::Failed => work.state == "failed",
+        WorkFilter::Claimed => {
+            work.state == "claimed"
+                && match caller.filter(|caller| caller.starts_with("agent/")) {
+                    Some(seat) => work.claimant.as_deref() == Some(seat),
+                    None => true,
+                }
         }
-        Entity::Work { state } => items(client.work_list(None, Some(LIST_LIMIT), false).await?)
-            .into_iter()
-            .filter_map(|item| match item {
-                Resource::Work(work) if state.is_none_or(|state| work.state == state) => {
-                    let mut parts = vec![
-                        work.title.clone().unwrap_or_else(|| work.path.clone()),
-                        work.state.clone(),
-                    ];
-                    parts.push(
-                        work.mission_id
-                            .clone()
-                            .unwrap_or(work.mission_run_id.clone()),
-                    );
-                    parts.extend(work.claimant.clone().or(work.assigned_to.clone()));
-                    Some(Candidate::new(work.header.id, parts))
-                }
-                _ => None,
-            })
-            .collect(),
-        Entity::Attention => items(client.attention_list(None, Some(LIST_LIMIT), false).await?)
-            .into_iter()
-            .filter_map(|item| match item {
-                Resource::Attention(attention) if attention.state == "open" => {
-                    let mut parts = vec![quote(&attention.title), attention.priority.clone()];
-                    parts.extend(attention.requester_id.clone());
-                    parts.extend(since(&attention.requested_at, now));
-                    Some(Candidate::new(attention.header.id, parts))
-                }
-                _ => None,
-            })
-            .collect(),
-        Entity::Message => {
-            let Some(caller) = caller else {
-                return Ok(Vec::new());
-            };
-            items(
-                client
-                    .messages_list_for_recipient(caller, None, Some(LIST_LIMIT), false)
-                    .await?,
-            )
-            .into_iter()
-            .filter_map(|item| match item {
-                Resource::Message(message) if message.state != "archived" => {
-                    let title = message.title.clone().unwrap_or_else(|| {
-                        message
-                            .content
-                            .lines()
-                            .next()
-                            .unwrap_or_default()
-                            .to_owned()
-                    });
-                    let mut parts = vec![format!("from {}", message.from), quote(&title)];
-                    parts.extend(since(&message.sent_at, now));
-                    Some(Candidate::new(message.header.id, parts))
-                }
-                _ => None,
-            })
-            .collect()
-        }
-        Entity::Lane => items(client.lanes_list(None, Some(LIST_LIMIT), false).await?)
-            .into_iter()
-            .filter_map(|item| match item {
-                Resource::Lane(lane) => {
-                    let parts = vec![
-                        lane.name.clone(),
-                        lane.state.clone(),
-                        plural(lane.entries.len(), "entry"),
-                    ];
-                    Some(Candidate::new(lane.header.id, parts))
-                }
-                _ => None,
-            })
-            .collect(),
-        Entity::Host => items(client.machines_list(None, Some(LIST_LIMIT), false).await?)
-            .into_iter()
-            .filter_map(|item| match item {
-                Resource::Machine(machine) => {
-                    let parts = vec![
-                        machine.state.clone(),
-                        plural(machine.runtime_ids.len(), "runtime"),
-                    ];
-                    Some(Candidate::new(machine.host_id, parts))
-                }
-                _ => None,
-            })
-            .collect(),
-    };
-    Ok(found)
+    }
+}
+
+fn agent_parts(agent: &st3_client::Agent) -> Vec<String> {
+    let mut parts = vec![agent.state.clone()];
+    parts.extend(agent.host_id.as_deref().map(short_host).map(str::to_owned));
+    parts.extend(agent.driver.clone());
+    parts.extend(agent.harness_state.clone());
+    parts.extend(agent_work(agent));
+    parts
 }
 
 impl Candidate {
@@ -503,6 +778,207 @@ mod tests {
         assert!(candidate.description.starts_with("running · two lines · x"));
         assert_eq!(candidate.description.chars().count(), DESCRIPTION_WIDTH);
         assert!(candidate.description.ends_with('…'));
+    }
+
+    fn fixture(kind: &str, edit: impl FnOnce(&mut serde_json::Value)) -> Resource {
+        let all: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/fixtures/resources.json"
+        ))
+        .unwrap();
+        let mut item = all.into_iter().find(|item| item["kind"] == kind).unwrap();
+        edit(&mut item);
+        serde_json::from_value(item).unwrap()
+    }
+
+    fn target(caller: Option<&str>) -> LocalTarget {
+        LocalTarget {
+            socket: "/nonexistent".into(),
+            caller: caller.map(str::to_owned),
+            person: Some("person/johannes".into()),
+        }
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+            .unwrap()
+            .to_utc()
+    }
+
+    #[test]
+    fn terminals_join_agents_and_age_from_the_incarnation() {
+        let listed = Listed {
+            items: vec![
+                fixture("runtime", |item| {
+                    item["incarnation_id"] = "42:2026-09-30T10:00:00Z".into();
+                    item["updated_at"] = "2026-09-30T11:59:00Z".into();
+                }),
+                fixture("runtime", |item| item["state"] = "stopped".into()),
+            ],
+            agents: vec![fixture("agent", |item| {
+                item["id"] = "agent/release".into();
+                item["driver"] = "omp".into();
+                item["harness_state"] = "idle".into();
+            })],
+            devices: vec![],
+        };
+        let found = select(Entity::Terminal, &listed, &target(None), now());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].subject, "agent/release");
+        assert!(
+            found[0].description.contains("omp · idle"),
+            "{}",
+            found[0].description
+        );
+        assert!(
+            found[0].description.ends_with("up 2h"),
+            "{}",
+            found[0].description
+        );
+    }
+
+    #[test]
+    fn work_filters_follow_the_command() {
+        let work = |state: &str, claimant: Option<&str>| {
+            fixture("work", |item| {
+                item["state"] = state.into();
+                item["claimant"] = claimant.into();
+                item["id"] = format!("step-run/{state}-{}", claimant.unwrap_or("none")).into();
+            })
+        };
+        let listed = Listed {
+            items: vec![
+                work("ready", None),
+                work("failed", None),
+                work("claimed", Some("agent/me")),
+                work("claimed", Some("agent/other")),
+            ],
+            ..Listed::default()
+        };
+        let subjects = |filter, caller| {
+            select(Entity::Work(filter), &listed, &target(caller), now())
+                .into_iter()
+                .map(|candidate| candidate.subject)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(subjects(WorkFilter::Ready, None), ["step-run/ready-none"]);
+        assert_eq!(subjects(WorkFilter::Failed, None), ["step-run/failed-none"]);
+        assert_eq!(
+            subjects(WorkFilter::Claimed, Some("agent/me")),
+            ["step-run/claimed-agent/me"]
+        );
+        assert_eq!(
+            subjects(WorkFilter::Claimed, Some("person/johannes")).len(),
+            2
+        );
+        assert_eq!(subjects(WorkFilter::Any, None).len(), 4);
+    }
+
+    #[test]
+    fn native_sessions_keep_only_unmanaged_and_importable() {
+        let session = |id: &str, managed: bool, importable: bool| {
+            fixture("session", |item| {
+                item["id"] = id.into();
+                item["managed"] = managed.into();
+                item["importable"] = importable.into();
+                item["harness"] = "claude".into();
+            })
+        };
+        let listed = Listed {
+            items: vec![
+                session("session/managed", true, true),
+                session("session/saved", false, false),
+                session("session/live", false, true),
+            ],
+            ..Listed::default()
+        };
+        let subjects = |importable_only| {
+            select(
+                Entity::NativeSession { importable_only },
+                &listed,
+                &target(None),
+                now(),
+            )
+            .into_iter()
+            .map(|candidate| candidate.subject)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(subjects(false), ["session/saved", "session/live"]);
+        assert_eq!(subjects(true), ["session/live"]);
+    }
+
+    #[test]
+    fn people_and_actors_are_deduplicated() {
+        let listed = Listed {
+            items: vec![
+                fixture("attention", |item| {
+                    item["person_id"] = "person/johannes".into()
+                }),
+                fixture("attention", |item| {
+                    item["person_id"] = "person/nathan".into()
+                }),
+            ],
+            agents: vec![fixture("agent", |item| item["id"] = "agent/me".into())],
+            devices: vec![fixture("device", |item| {
+                item["person_id"] = "person/nathan".into()
+            })],
+        };
+        let subjects = |entity| {
+            select(entity, &listed, &target(Some("agent/me")), now())
+                .into_iter()
+                .map(|candidate| candidate.subject)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            subjects(Entity::Person),
+            ["person/johannes", "person/nathan"]
+        );
+        assert_eq!(subjects(Entity::Actor), ["person/johannes", "agent/me"]);
+    }
+
+    #[tokio::test]
+    async fn pages_are_followed_to_the_end() {
+        let cursors = std::cell::RefCell::new(Vec::new());
+        let items = all_items(|cursor: Option<String>| {
+            let next = match cursor.as_deref() {
+                None => Some("second"),
+                Some("second") => Some("third"),
+                _ => None,
+            };
+            cursors.borrow_mut().push(cursor);
+            let page = serde_json::json!({
+                "api_version": "st3.client.v0",
+                "request_id": "request/test",
+                "snapshot": {"id": "snapshot/t", "host_id": "host/t", "store_index": 0,
+                             "projection_version": "v0", "created_at": "2026-09-30T12:00:00Z"},
+                "value": {"kind": "page", "collection": "lanes", "items": [],
+                          "page": {"limit": 1, "has_more": next.is_some(), "next_cursor": next}},
+            });
+            async move { Ok(serde_json::from_value(page).unwrap()) }
+        })
+        .await
+        .unwrap();
+        assert!(items.is_empty());
+        assert_eq!(
+            cursors.into_inner(),
+            [None, Some("second".to_owned()), Some("third".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_typed_endpoint_wins() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            endpoint_word(&words("st --endpoint /a.sock terminals attach x")).as_deref(),
+            Some("/a.sock")
+        );
+        assert_eq!(
+            endpoint_word(&words("st --endpoint=/b.sock agents stop x")).as_deref(),
+            Some("/b.sock")
+        );
+        assert_eq!(
+            endpoint_word(&words("st terminals attach --endpoint")),
+            None
+        );
     }
 
     #[test]

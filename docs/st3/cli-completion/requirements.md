@@ -25,9 +25,10 @@
 
 ### Must offer the real choices
 
-- **R01 Live entity candidates:** An argument that names an st entity (terminal, agent, mission,
-  mission run, work step, attention item, message, lane, fleet host) completes to the current
-  entities of that kind.
+- **R01 Live entity candidates:** An argument that names an st entity of a kind the client API
+  lists (for example terminal, agent, mission, mission run, work step, attention item, message,
+  lane, fleet host, launch, device, subscription, session, person) completes to every current
+  entity of that kind.
 - **R02 Command-relevant candidates:** Each argument offers only entities its command accepts. For
   example, `st terminals attach` offers running terminals, `st agents stop` offers running agents,
   and `st work retry` offers failed steps.

@@ -51,7 +51,7 @@ use st3_client::{
 use tokio::sync::{Notify, watch};
 
 use clap_complete::engine::ArgValueCompleter;
-use completion::{Complete, Entity};
+use completion::{Complete, Entity, WorkFilter};
 
 mod cli_help;
 mod completion;
@@ -308,6 +308,7 @@ enum FleetInvitesCommand {
         invite: String,
         #[arg(long)]
         reason: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -384,6 +385,7 @@ struct FleetInviteArgs {
     /// Write the code to a new 0600 file instead of printing it.
     #[arg(long)]
     code_file: Option<PathBuf>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -943,6 +945,7 @@ struct FleetRemoveArgs {
     name: String,
     #[arg(long)]
     reason: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -964,6 +967,7 @@ struct FleetLeaveArgs {
     /// How long to wait for a member to hold everything this machine wrote.
     #[arg(long, default_value = "10m")]
     wait: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -988,6 +992,7 @@ struct UninstallArgs {
     /// Never touch service managers; the daemon and worker must already be stopped.
     #[arg(long)]
     no_service: bool,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -1639,6 +1644,7 @@ enum MissionViewCommand {
     },
     /// Show one subscription's automatic mission request queue.
     Requests {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Subscription)))]
         subscription: String,
         /// Include started, cancelled, and failed requests.
         #[arg(long)]
@@ -1666,6 +1672,7 @@ struct MissionPublishArgs {
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
     /// Complete person or agent subject authoring the publication.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// The workspace a run would use, where publish first checks each exec gate.
@@ -1747,6 +1754,7 @@ struct MissionRunStartArgs {
     after: Option<String>,
     #[arg(long)]
     follow: bool,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// Print the exact mission-run KDL without publishing it.
@@ -1763,6 +1771,7 @@ struct MissionCancelArgs {
     #[arg(long)]
     reason: String,
     /// Person or authorized agent carried over the trusted local Unix boundary.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -1779,6 +1788,7 @@ struct MissionOutcomeArgs {
     #[arg(long)]
     reason: String,
     /// A person, or an agent that requested the run or may revise its mission.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -1789,6 +1799,7 @@ struct MissionRetireArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Mission)))]
     mission: String,
     /// A person, or an agent that may publish the mission.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -1802,6 +1813,7 @@ struct PlanningStartArgs {
     request: Option<PathBuf>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     requester: String,
     #[arg(long, value_parser = ["codex", "claude", "pi", "omp", "opencode"])]
@@ -1817,11 +1829,13 @@ struct PlanningStartArgs {
 
 #[derive(Args)]
 struct PlanningSessionArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
 }
 
 #[derive(Args)]
 struct PlanningPreviewArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     #[arg(long)]
     variant: Option<String>,
@@ -1829,6 +1843,7 @@ struct PlanningPreviewArgs {
 
 #[derive(Args)]
 struct PlanningSubmitArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     #[arg(long, default_value = "default")]
     variant: String,
@@ -1836,12 +1851,14 @@ struct PlanningSubmitArgs {
     markdown: PathBuf,
     #[arg(long)]
     kdl: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
 }
 
 #[derive(Args)]
 struct PlanningCompareArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     left: String,
     right: String,
@@ -1849,8 +1866,10 @@ struct PlanningCompareArgs {
 
 #[derive(Args)]
 struct PlanningProposeArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     variant: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
@@ -1859,8 +1878,10 @@ struct PlanningProposeArgs {
 
 #[derive(Args)]
 struct PlanningReviseArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     feedback: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     /// Print the feedback KDL without storing the feedback or publishing it.
@@ -1870,37 +1891,44 @@ struct PlanningReviseArgs {
 
 #[derive(Args)]
 struct PlanningApproveArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     preview_hash: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct LaunchApproveAndStartArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     preview_hash: String,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct LaunchRunArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct LaunchQuestionArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     question: String,
     #[arg(long = "type", value_parser = parse_launch_decision_type)]
@@ -1908,12 +1936,14 @@ struct LaunchQuestionArgs {
     /// Structured JSON option: {"id":"stable-id","label":"Label","description":"optional"}.
     #[arg(long = "option", value_parser = parse_launch_decision_option)]
     options: Vec<LaunchDecisionOption>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
 }
 
 #[derive(Args)]
 struct LaunchAnswerArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
     decision: String,
     /// Structured JSON response such as {"type":"multiple-choice","value":["a","b"]}.
@@ -1923,13 +1953,16 @@ struct LaunchAnswerArgs {
     explanation: Option<String>,
     #[arg(long, default_value_t = 1)]
     expected_revision: u32,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct PlanningCancelArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Launch)))]
     session: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     #[arg(long)]
@@ -1995,11 +2028,13 @@ struct PtyNewArgs {
     /// Display name; defaults to a generated name.
     name: Option<String>,
     #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Host)))]
     host: Option<String>,
     /// Absolute directory on the selected host. Locally defaults to the caller's directory;
     /// remotely defaults to the daemon's directory.
     #[arg(long)]
     cwd: Option<PathBuf>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
@@ -2015,6 +2050,7 @@ struct PtyScreenArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     /// Use this concrete person instead of the person configured for trusted local commands.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
@@ -2023,6 +2059,7 @@ struct PtyScreenArgs {
 struct PtyStreamArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     /// The stream capability from `terminals attach-info`; can be set through the environment.
@@ -2040,6 +2077,7 @@ struct PtyClientInputArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Terminal)))]
     subject: String,
     value: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     #[arg(long, conflicts_with = "key")]
@@ -2054,6 +2092,7 @@ struct PtyClientDetachArgs {
     /// Runtime incarnation returned by `terminals attach-info`.
     #[arg(long)]
     incarnation: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
@@ -2067,6 +2106,7 @@ struct PtyAttachArgs {
     force: bool,
     /// The person attaching to a terminal another fleet host owns; defaults to `person` in the st
     /// config. A terminal on this host needs no person.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
@@ -2135,6 +2175,7 @@ struct TraceArgs {
 struct WaitArgs {
     subject: String,
     /// Interrupt the wait for this exact agent's messages or newly ready work.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long = "for", default_value = "ready")]
@@ -2146,6 +2187,7 @@ struct WaitArgs {
 #[derive(Args)]
 struct NowArgs {
     /// Use this concrete person instead of the person configured for trusted local commands.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     #[arg(long = "as", value_parser = parse_person_subject)]
     person: Option<String>,
     #[arg(long)]
@@ -2247,6 +2289,7 @@ enum DevicesCommand {
     },
     /// Revoke one paired device.
     Revoke {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Device)))]
         device: String,
         #[arg(long)]
         reason: Option<String>,
@@ -2256,6 +2299,7 @@ enum DevicesCommand {
 #[derive(Args)]
 struct DevicesArgs {
     /// Concrete human authority carried over the trusted local Unix boundary.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     #[arg(long = "as", value_parser = parse_person_subject, global = true)]
     person: Option<String>,
     /// Include expired and revoked device history.
@@ -2405,6 +2449,7 @@ enum ReplicationCommand {
         replacement_claim: String,
         #[arg(long)]
         reason: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: String,
         #[arg(long)]
@@ -2435,6 +2480,7 @@ enum CheckpointCommand {
         #[arg(long)]
         reason: String,
         /// The person excusing it.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2445,6 +2491,7 @@ enum CheckpointCommand {
         #[arg(long)]
         reason: String,
         /// The person resuming.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2460,6 +2507,7 @@ enum BlobCommand {
         #[arg(long)]
         media_type: Option<String>,
         /// Who uploads; defaults to ST_AGENT, then the configured person.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2474,6 +2522,7 @@ enum BlobCommand {
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Who reads; defaults to ST_AGENT, then the configured person.
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2484,6 +2533,7 @@ enum DocCommand {
     /// Store a regular file as one immutable named document version.
     Put {
         file: PathBuf,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         name: String,
     },
@@ -2519,6 +2569,7 @@ enum RuleCommand {
     },
     /// Set the lockdown rules, each in audit mode until you enforce it.
     Lockdown {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
         /// An agent that may still start agents, such as agent/example/planner. Repeatable.
@@ -2530,6 +2581,7 @@ enum RuleCommand {
         name: String,
         #[arg(value_parser = ["off", "audit", "enforce"])]
         mode: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
@@ -2548,10 +2600,15 @@ enum ImportCommand {
         limit: usize,
     },
     /// Show the exact native identity, workspace, process fence, and importability.
-    Show { session: String },
+    Show {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::NativeSession { importable_only: false })))]
+        session: String,
+    },
     /// Stop an exactly identified running harness and resume it in a durable st mission.
     Run {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::NativeSession { importable_only: true })))]
         session: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         person: String,
     },
@@ -2628,6 +2685,7 @@ enum AgentsCommand {
 
 #[derive(Args)]
 struct AgentHoldArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     subject: String,
     /// Hold new native handoffs for this duration, such as 15m.
     #[arg(long = "for", conflicts_with = "release")]
@@ -2636,12 +2694,14 @@ struct AgentHoldArgs {
     release: bool,
     #[arg(long)]
     reason: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
 
 #[derive(Args)]
 struct AgentRenameArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     subject: String,
     #[arg(
         required_unless_present = "clear",
@@ -2652,6 +2712,7 @@ struct AgentRenameArgs {
     /// Restore the subject-derived presentation label.
     #[arg(long)]
     clear: bool,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -2705,6 +2766,7 @@ struct AgentQueueMoveArgs {
     reason: Option<String>,
     /// Person or agent making the move; defaults to `person` in the st config. Any agent may move
     /// any seat's queue, its own included.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_queue_move_actor)]
     actor: Option<String>,
 }
@@ -2746,6 +2808,7 @@ struct LaneEntryArgs {
     reason: Option<String>,
     /// Person or agent making the change. A harness acts as its own seat (`ST_AGENT`); otherwise
     /// this defaults to `person` in the st config.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_queue_move_actor)]
     actor: Option<String>,
 }
@@ -2799,6 +2862,7 @@ struct LaneMarkArgs {
     #[arg(long)]
     head: Option<String>,
     /// Person or agent recording the status. A harness acts as its own seat (`ST_AGENT`).
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_queue_move_actor)]
     actor: Option<String>,
 }
@@ -2808,6 +2872,7 @@ struct AgentApplyArgs {
     /// KDL file to publish; use `-` to read standard input.
     file: PathBuf,
     /// Complete person or agent subject authoring the publication.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
@@ -2837,6 +2902,7 @@ struct AgentStartArgs {
     /// Replace typed-harness extra arguments; refused for existing command/argv seats.
     #[arg(long = "arg")]
     arguments: Vec<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// Read the daemon's declaration and print the effective seat KDL without publishing it.
@@ -2881,6 +2947,7 @@ struct AgentNewArgs {
     #[arg(long, default_value = "10m")]
     timeout: String,
     /// Person or agent publishing the declaration; defaults to `person` in the st config.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: Option<String>,
 }
@@ -2890,6 +2957,7 @@ struct AgentStopArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: true })))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// Print the exact stop KDL without publishing it.
@@ -2901,7 +2969,9 @@ struct AgentStopArgs {
 struct AgentSuspendArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(value_parser = parse_agent_start_identity)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: true })))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// Why the seat is suspended, recorded with the request.
@@ -2916,7 +2986,9 @@ struct AgentSuspendArgs {
 struct AgentResumeArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(value_parser = parse_agent_start_identity)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// How long to wait for the seat to resume its native session.
@@ -2928,7 +3000,9 @@ struct AgentResumeArgs {
 struct AgentRestartArgs {
     /// Exact seat subject or its identity without the `agent/` prefix.
     #[arg(value_parser = parse_agent_start_identity)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
     /// How long to wait for a new running incarnation.
@@ -2955,6 +3029,7 @@ struct ClaimArgs {
 
 #[derive(Args)]
 struct HarnessDiagnosticArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
     #[arg(long)]
@@ -2989,6 +3064,7 @@ enum SchemaCommand {
 #[derive(Args)]
 struct SubscriptionRequestArgs {
     request: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     #[arg(long)]
@@ -3002,6 +3078,7 @@ enum AttentionCommand {
         /// Follow current collection changes.
         #[arg(long, conflicts_with_all = ["all", "cursor"])]
         watch: bool,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
         /// Include resolved and historical attention.
@@ -3017,6 +3094,7 @@ enum AttentionCommand {
     Show {
         #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
         subject: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
     },
@@ -3037,6 +3115,7 @@ enum AttentionCommand {
 #[derive(Args)]
 struct AttentionRequestArgs {
     #[arg(long = "for", value_parser = parse_person_subject)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     reviewer: String,
     #[arg(long)]
     title: String,
@@ -3048,6 +3127,7 @@ struct AttentionRequestArgs {
     /// item on its own.
     #[arg(long = "target")]
     targets: Vec<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
@@ -3058,7 +3138,7 @@ struct AttentionRequestArgs {
     until: Option<String>,
     /// Resolve the item on its own once this step ends, instead of the step you have claimed.
     #[arg(long, value_name = "STEP_RUN")]
-    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: None })))]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     step: Option<String>,
     /// Only a person closes the item, because nothing st observes can say it is done.
     #[arg(long, conflicts_with_all = ["until", "step"])]
@@ -3073,6 +3153,7 @@ struct AttentionResolveArgs {
     outcome: String,
     #[arg(long)]
     reason: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
@@ -3083,6 +3164,7 @@ struct AttentionWithdrawArgs {
     subject: String,
     #[arg(long)]
     reason: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
 }
@@ -3102,6 +3184,7 @@ enum WorkCommand {
         /// Follow current collection changes.
         #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
         #[arg(long)]
@@ -3123,22 +3206,28 @@ enum WorkCommand {
     },
     /// Explain one work item, its owner, readiness, lease, and evidence.
     Show {
-        #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: None })))]
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
         subject: String,
     },
     /// Acquire one ready work item with the current harness incarnation.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Ready))))))]
     Claim(WorkActionArgs),
     /// Extend the live lease for work this incarnation still owns.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Renew(WorkActionArgs),
     /// Record a material progress update without changing ownership.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Progress(WorkActionArgs),
     /// Add time to the execution budget of claimed work that ran out of it.
     Extend(WorkExtendArgs),
     /// Finish claimed work and attach its durable evidence.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Complete(WorkActionArgs),
     /// Fail claimed work with an actionable reason and evidence.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Fail(WorkActionArgs),
     /// Give claimed work back so another eligible agent can take it.
+    #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Release(WorkActionArgs),
     /// Wake one ready assignee through its supported harness driver.
     Wake(WorkWakeArgs),
@@ -3158,6 +3247,7 @@ enum WorkCommand {
 #[derive(Args)]
 struct WorkAskArgs {
     #[arg(long = "for")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     person: String,
     #[arg(long)]
     title: String,
@@ -3169,9 +3259,11 @@ struct WorkAskArgs {
     #[arg(long, value_name = "FILE", long_help = STRUCTURED_REQUEST_HELP)]
     request: Option<PathBuf>,
     #[arg(long, conflicts_with = "new_run")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     step: Option<String>,
     #[arg(long, conflicts_with = "step")]
     new_run: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", env = "ST_AGENT")]
     actor: String,
     #[arg(long, env = "ST3_INCARNATION")]
@@ -3183,6 +3275,7 @@ struct WorkAskArgs {
 #[derive(Args)]
 struct WorkUpdateArgs {
     #[arg(long = "for")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     person: String,
     /// Where the person asked for this: their own mission run or step run, or their message to
     /// you. An update about anything else is refused.
@@ -3193,6 +3286,7 @@ struct WorkUpdateArgs {
     /// The information itself.
     #[arg(long)]
     body: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", env = "ST_AGENT")]
     actor: String,
     #[arg(long)]
@@ -3201,7 +3295,9 @@ struct WorkUpdateArgs {
 
 #[derive(Args)]
 struct WorkDoneArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: String,
     /// The response in words. A structured answer derives it when omitted.
@@ -3223,8 +3319,9 @@ struct WorkDoneArgs {
 
 #[derive(Args)]
 struct WorkWakeArgs {
-    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: Some("ready") })))]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Ready))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, default_value = "manual wake requested")]
@@ -3233,8 +3330,9 @@ struct WorkWakeArgs {
 
 #[derive(Args)]
 struct WorkRetryArgs {
-    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: Some("failed") })))]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Failed))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
@@ -3259,12 +3357,14 @@ enum WorkRevisionCommand {
     Approve {
         proposal: String,
         preview_hash: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
     },
     /// Cancel a pending revision proposal without changing the live generation.
     Cancel {
         proposal: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as")]
         actor: Option<String>,
         #[arg(long)]
@@ -3274,7 +3374,9 @@ enum WorkRevisionCommand {
 
 #[derive(Args)]
 struct WorkExtendArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, env = "ST3_INCARNATION")]
@@ -3289,8 +3391,9 @@ struct WorkExtendArgs {
 
 #[derive(Args)]
 struct WorkActionArgs {
-    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work { state: None })))]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     subject: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, env = "ST3_INCARNATION")]
@@ -3308,6 +3411,7 @@ struct WorkReviseArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     run: String,
     file: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
@@ -3319,8 +3423,10 @@ struct WorkReviseArgs {
 
 #[derive(Args)]
 struct WorkPublishMissionArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))]
     subject: String,
     file: PathBuf,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, env = "ST3_INCARNATION")]
@@ -3332,9 +3438,11 @@ enum MessageCommand {
     /// Search readable messages and normalized agent transcripts, newest first.
     Search {
         text: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long)]
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
         agent: Option<String>,
         /// Include entries at or after this RFC3339 timestamp.
         #[arg(long)]
@@ -3362,6 +3470,7 @@ enum MessageCommand {
     Thread(MessageReferenceArgs),
     /// List normalized harness sessions available for native conversation views.
     Sessions {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long)]
@@ -3374,7 +3483,9 @@ enum MessageCommand {
     /// Show one conversation as stui shows it: messages, folded tools, Small Talk. `--raw`
     /// prints every normalized entry (ids, message boundaries, tool JSON); `--json` the page.
     Timeline {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Session)))]
         session: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long, default_value_t = 100)]
@@ -3391,7 +3502,9 @@ enum MessageCommand {
     },
     /// Follow the visible normalized conversation; JSON output is one entry per line.
     Follow {
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Session)))]
         session: String,
+        #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long, default_value_t = 100)]
@@ -3415,6 +3528,7 @@ struct MessageSendArgs {
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
     #[arg(long = "from", alias = "as")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     from: String,
     /// Attach an image (PNG, JPEG, GIF or WebP, at most 10 MiB, up to 4). It is uploaded to this
     /// member and fetched by the machine that reads or delivers the message.
@@ -3433,8 +3547,10 @@ struct MessageSendArgs {
 #[derive(Args)]
 struct MessageListArgs {
     /// Mailbox identity; defaults to the non-empty ST_AGENT value.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     identity: Option<String>,
     /// The same mailbox identity, spelled like `conversations read --as`.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", conflicts_with = "identity")]
     actor: Option<String>,
     #[arg(long)]
@@ -3442,6 +3558,7 @@ struct MessageListArgs {
     #[arg(long)]
     count: bool,
     #[arg(long = "from")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     sender: Option<String>,
 }
 
@@ -3454,6 +3571,7 @@ struct MessageReadArgs {
     raw: bool,
     #[arg(long)]
     archive: bool,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -3467,6 +3585,7 @@ struct MessageReplyArgs {
     #[arg(long)]
     subject: Option<String>,
     #[arg(long = "from", alias = "as")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     from: String,
     /// Attach an image (PNG, JPEG, GIF or WebP, at most 10 MiB, up to 4).
     #[arg(long = "attach", value_name = "FILE")]
@@ -3485,6 +3604,7 @@ struct MessageArchiveArgs {
     #[arg(num_args = 1..)]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     references: Vec<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -3513,6 +3633,7 @@ struct ReviewArgs {
     target: String,
     #[arg(long)]
     reason: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
@@ -3524,6 +3645,7 @@ struct FeedbackReviewArgs {
     target: String,
     #[arg(long)]
     reason: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
@@ -9374,11 +9496,15 @@ async fn resolve_member_subject(
     let Endpoint::Unix(socket) = endpoint else {
         return Ok(literal);
     };
-    let caller = completion::LocalTarget::discover().and_then(|target| target.caller);
-    let client = GeneratedClient::unix(socket).with_outage_wait(Duration::ZERO, false);
+    let discovered = completion::LocalTarget::discover(&[]);
+    let target = completion::LocalTarget {
+        socket: socket.clone(),
+        caller: discovered.as_ref().and_then(|target| target.caller.clone()),
+        person: discovered.and_then(|target| target.person),
+    };
     let listed = tokio::time::timeout(
         completion::RESOLVE_DEADLINE,
-        completion::candidates(&client, entity, caller.as_deref()),
+        completion::candidates(&target, entity),
     )
     .await;
     let Ok(Ok(candidates)) = listed else {
