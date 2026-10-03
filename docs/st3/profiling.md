@@ -37,6 +37,12 @@ It writes three files:
 
 Work on a thread that runs no named operation appears as `(unlabeled THREAD)`.
 
+A slow record's `completion` is `finished` when the request or task explicitly finished its
+profile. If its owner exits without finishing, including a canceled HTTP request, the last
+worker records it with `completion: dropped`. That record includes blocking work that continued
+after cancellation, and its wall time ends when the last worker exits. It does not prove that a
+response reached the caller. Work still running when the daemon stops has no completion record.
+
 SQLite reports a statement's time from its first step to its reset, at millisecond resolution. A
 query whose rows the caller processes one at a time includes that processing, so the outer query
 of a nested loop looks slow. Statement times from concurrent operations overlap.
