@@ -217,7 +217,8 @@ pub(crate) struct TerminalView {
 /// The entry at the top of a pane read back, how far into it, and the top it gave.
 struct Anchor {
     entry: String,
-    offset: usize,
+    /// Lines from the entry's start to the top; negative when the top is above it.
+    offset: isize,
     top: usize,
 }
 
@@ -2034,21 +2035,27 @@ impl Ui {
                 && anchor.top == state.top
                 && let Some((_, start)) = doc.entries.iter().find(|(id, _)| *id == anchor.entry)
             {
-                state.top = start + anchor.offset;
+                state.top = start.saturating_add_signed(anchor.offset);
             }
             state.reconcile(total, height);
-            match doc
-                .entries
-                .iter()
+            // The note about earlier entries stays first while they load above it, so the
+            // place is kept by the first entry read instead.
+            let entries = || {
+                doc.entries
+                    .iter()
+                    .filter(|(id, _)| id != live::HISTORY_NOTE)
+            };
+            match entries()
                 .rev()
                 .find(|(_, start)| *start <= state.top)
+                .or_else(|| entries().next())
             {
                 Some((entry, start)) if !state.follow => {
                     anchors.insert(
                         key.to_owned(),
                         Anchor {
                             entry: entry.clone(),
-                            offset: state.top - start,
+                            offset: state.top as isize - *start as isize,
                             top: state.top,
                         },
                     );
@@ -5556,6 +5563,76 @@ mod tests {
                 .join("\n")
                 .contains("a reply arrives below")
         );
+    }
+
+    #[test]
+    fn earlier_entries_loaded_above_keep_what_was_being_read_in_place() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let id = ui.selected_id().unwrap();
+        let Some(Load::Ready(entries)) = ui.world.conversations.get_mut(&id) else {
+            panic!("the demo agent has a conversation")
+        };
+        entries.insert(
+            0,
+            Entry {
+                id: live::HISTORY_NOTE.into(),
+                at: String::new(),
+                body: Body::Event("Scroll up for earlier entries".into()),
+            },
+        );
+        let first = entries[1].id.clone();
+        frame(&ui, 120, 30);
+        let pane = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key.starts_with("chat:"))
+            .map(|pane| pane.rect)
+            .unwrap();
+        // Up to the very top, where the earlier entries are asked for.
+        for _ in 0..40 {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: pane.x + 2,
+                row: pane.y + 2,
+                modifiers: KeyModifiers::NONE,
+            });
+            frame(&ui, 120, 30);
+        }
+        assert!(ui.take_older_wanted().contains(&id));
+        let shown = |ui: &Ui| {
+            frame(ui, 120, 30)[usize::from(pane.y) + 1..usize::from(pane.y) + 8]
+                .iter()
+                .map(|line| {
+                    line.chars()
+                        .take(usize::from(pane.x + pane.width) - 2)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = shown(&ui);
+        assert!(before.join("\n").contains("Scroll up for earlier"));
+        // A page of earlier entries arrives under the note, above what was read.
+        let Some(Load::Ready(entries)) = ui.world.conversations.get_mut(&id) else {
+            panic!("the demo agent has a conversation")
+        };
+        for index in 0..20 {
+            entries.insert(
+                1,
+                Entry {
+                    id: format!("earlier-{index}"),
+                    at: "08:00".into(),
+                    body: Body::Assistant(format!("an earlier entry {index}")),
+                },
+            );
+        }
+        assert_ne!(entries[1].id, first);
+        let after = shown(&ui);
+        // What was below the note is where it was; the earlier entries are above, to scroll to.
+        assert_eq!(after[1..], before[1..], "{after:#?}");
+        assert!(!after.join("\n").contains("Scroll up for earlier"));
     }
 
     #[test]
