@@ -2387,6 +2387,10 @@ impl Ui {
             KeyCode::Char('[') if quiet && key.modifiers.is_empty() => {
                 self.show_tab((current + tabs - 1) % tabs)
             }
+            // Tab and Shift+Tab are tab keys here too. Left to the old layout, Tab switched its
+            // section (Home, Agents…) under the focused conversation (Nathan, 2026-10-03).
+            KeyCode::Tab if quiet => self.show_tab((current + 1) % tabs),
+            KeyCode::BackTab if quiet => self.show_tab((current + tabs - 1) % tabs),
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if alt => {
                 self.move_focus(key.code)
             }
@@ -3488,6 +3492,26 @@ mod tests {
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+    }
+
+    #[test]
+    fn tab_moves_between_a_splits_tabs_and_never_switches_what_a_tab_shows() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "atlas builder");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        ctrl(&mut ui, 't');
+        typed(&mut ui, "weekly release");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        let both = vec![vec![ATLAS.to_owned(), WEEKLY.to_owned()]];
+        assert_eq!(tabs(&ui), (0, 1, both.clone()));
+        // Nathan, 2026-10-03: Tab in a conversation tab changed it to his Home items.
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(tabs(&ui), (0, 0, both.clone()));
+        assert!(screen(&ui).contains("Atlas Builder"));
+        press(&mut ui, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(tabs(&ui), (0, 1, both));
+        assert!(screen(&ui).contains("Weekly release"));
     }
 
     #[test]
