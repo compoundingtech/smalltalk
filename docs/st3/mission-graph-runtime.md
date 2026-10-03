@@ -1332,7 +1332,9 @@ Use `st agents apply FILE --as person/NAME` for authored KDL or `st agents start
 convenience. `st agents new NAME --host HOST --attach` declares a new seat with the fleet's
 harness defaults, waits until its harness is ready, and attaches from any fleet host.
 `--print-kdl` prints the exact declaration. `st agents stop SUBJECT` publishes an explicit root
-stop.
+stop. On a seat a mission run declared, that stop holds for the rest of the run's generation: the
+run does not materialize the seat again, even after a daemon restart, and `st agents start SUBJECT`
+restores the run's own declaration.
 
 For `agents start`, `example/cos/standing/cos` and `agent/example/cos/standing/cos` both name
 `agent/example/cos/standing/cos`. Pass an identity or its complete `agent/` subject, never a

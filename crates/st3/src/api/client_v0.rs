@@ -7847,6 +7847,26 @@ async fn dispatch_action(
             if request.fence.runtime_desired_revision.as_deref() != Some(token.as_str()) {
                 return Err(stale("the agent desired revision changed"));
             }
+            // A mission seat stops like any other, and starts again on its run's declaration.
+            if action == "agent.start"
+                && state
+                    .store
+                    .declaration_ended_by_stop(&agent)
+                    .map_err(ApiError::internal)?
+                    .is_some_and(|ended| ended.declaration.owner_run.is_some())
+            {
+                state
+                    .store
+                    .start_mission_seat(
+                        &agent,
+                        Some(&token),
+                        authority_actor,
+                        &format!("{}:mission-seat-start", request.idempotency_key),
+                    )
+                    .map_err(ApiError::bad)?;
+                signal_changed(state);
+                return Ok(vec![agent]);
+            }
             let mut claim = state
                 .store
                 .claim_by_id(&token)
@@ -7856,9 +7876,9 @@ async fn dispatch_action(
                 let desired: crate::model::DesiredSubject =
                     serde_json::from_value(claim.body).map_err(ApiError::internal)?;
                 if desired.kind == "agent" {
-                    if desired.owner_run.is_some() {
+                    if action == "agent.start" && desired.owner_run.is_some() {
                         return Err(validation(
-                            "mission-owned agents must be changed through their mission",
+                            "its mission run already declares this agent; restart relaunches it",
                         ));
                     }
                     break desired;

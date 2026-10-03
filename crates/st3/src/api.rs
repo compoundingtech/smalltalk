@@ -445,6 +445,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
+        .route("/v1/agents/start", post(start_mission_seat))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
         .route("/v1/agents/native-session", post(report_native_session))
@@ -4664,6 +4665,7 @@ async fn guard_bound_request(
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
         "/v1/agents/restart",
+        "/v1/agents/start",
         "/v1/agents/suspend",
         "/v1/agents/resume",
         "/v1/agents/native-session",
@@ -8361,6 +8363,36 @@ async fn restart_agent(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(claim))
+}
+
+#[derive(Deserialize)]
+struct MissionSeatStartRequest {
+    subject: String,
+    actor: String,
+    /// The selected stop the caller read, when it read one.
+    #[serde(default)]
+    expected: Option<String>,
+    idempotency_key: String,
+}
+
+/// Start a stopped mission seat on the declaration its run gave it, as `st agents start` does.
+async fn start_mission_seat(
+    State(state): State<AppState>,
+    Json(request): Json<MissionSeatStartRequest>,
+) -> Result<Json<ApplyResponse>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "invalid-start-actor")?;
+    let subject = agent_subject(request.subject);
+    let response = state
+        .store
+        .start_mission_seat(
+            &subject,
+            request.expected.as_deref(),
+            &actor,
+            &format!("agent-start:{subject}:{}", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -12805,6 +12837,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
             "/v1/agents/restart",
+            "/v1/agents/start",
             "/v1/agents/suspend",
             "/v1/agents/resume",
             "/v1/agents/native-session",
