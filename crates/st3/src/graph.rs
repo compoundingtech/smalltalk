@@ -750,18 +750,20 @@ pub(crate) fn planning_planner_subject(session: &str) -> String {
 /// one URI shares one subject. The owner keeps only the typed edge to that subject.
 pub(crate) fn parse_declared_resource(
     node: &KdlNode,
-) -> Result<(crate::model::DeclaredResourceReference, DesiredSubject), St3Error> {
+) -> Result<(crate::model::DeclaredResourceReference, Option<DesiredSubject>), St3Error> {
     reject_type(node)?;
-    ensure_only_properties(node, &["uri", "reason"])?;
+    ensure_only_properties(node, &["uri", "subject", "reason"])?;
     ensure_no_children(node)?;
     let name = one_string(node)?;
     validate_name(&name, false)?;
-    let uri = property_string(node, "uri")?.ok_or_else(|| {
-        St3Error::new(
-            "missing-resource-uri",
-            format!("resource `{name}` needs uri=\"...\""),
-        )
-    })?;
+    let uri = property_string(node, "uri")?;
+    let subject = property_string(node, "subject")?;
+    if uri.is_some() == subject.is_some() {
+        return Err(St3Error::new(
+            "invalid-resource-reference",
+            format!("resource `{name}` needs exactly one of uri=\"...\" or subject=\"resource/...\""),
+        ));
+    }
     let reason = property_string(node, "reason")?;
     if reason.as_deref().is_some_and(|reason| reason.trim().is_empty()) {
         return Err(St3Error::new(
@@ -769,6 +771,22 @@ pub(crate) fn parse_declared_resource(
             format!("resource `{name}` has an empty reason"),
         ));
     }
+    if let Some(subject) = subject {
+        let local = subject.strip_prefix("resource/").ok_or_else(|| {
+            St3Error::new("invalid-resource-subject", "a resource reference subject must start with resource/")
+        })?;
+        validate_name(local, false)?;
+        return Ok((
+            crate::model::DeclaredResourceReference {
+                name,
+                subject,
+                kind: crate::model::ResourceReferenceKind::Subject,
+                reason,
+            },
+            None,
+        ));
+    }
+    let uri = uri.expect("exactly one locator was validated");
     validate_resource_uri(&uri)?;
     let local = uri_reference_name(&uri);
     let mut kind = KdlNode::new("kind");
@@ -785,9 +803,10 @@ pub(crate) fn parse_declared_resource(
         crate::model::DeclaredResourceReference {
             name,
             subject: subject.clone(),
+            kind: crate::model::ResourceReferenceKind::Uri,
             reason,
         },
-        DesiredSubject {
+        Some(DesiredSubject {
             subject,
             kind: "resource".into(),
             desired: canonical_node(&resource)?,
@@ -796,7 +815,7 @@ pub(crate) fn parse_declared_resource(
             owner_run: None,
             owner_generation: None,
             owner_step: None,
-        },
+        }),
     ))
 }
 
@@ -853,15 +872,18 @@ fn collect_mission_resources(node: &KdlNode, context: &mut ParseContext) -> Resu
     for child in node.children().iter().flat_map(|children| children.nodes()) {
         if is_resource_reference(child) {
             let (_, resource) = parse_declared_resource(child)?;
-            insert_declared_resource(context, resource)?;
+            if let Some(resource) = resource {
+                insert_declared_resource(context, resource)?;
+            }
         }
     }
     Ok(())
 }
 
-/// `resource "NAME" uri="..."` names a resource; `resource "PATH" { kind ... }` declares one.
+/// A resource child with a locator names an edge rather than declaring a body.
 pub(crate) fn is_resource_reference(node: &KdlNode) -> bool {
-    node.name().value() == "resource" && node.get("uri").is_some()
+    node.name().value() == "resource"
+        && (node.get("uri").is_some() || node.get("subject").is_some())
 }
 
 /// The typed resource edges an agent declaration names, in authored order.
@@ -1516,7 +1538,9 @@ fn parse_agent(
                 format!("agent `{subject}` repeats resource `{}`", reference.name),
             ));
         }
-        insert_declared_resource(context, resource)?;
+        if let Some(resource) = resource {
+            insert_declared_resource(context, resource)?;
+        }
         references.push(reference);
     }
     if let Some(children) = desired.get_mut("children").and_then(Value::as_array_mut) {
@@ -1699,14 +1723,20 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
         }
         _ => namespaced(kind, &name),
     };
+    let desired = canonical_node(node)?;
+    let owner_run = if kind == "resource" && declared_uri(&desired).is_some() {
+        None
+    } else {
+        context.owner_run.clone()
+    };
     insert_subject(
         context,
         DesiredSubject {
             subject,
             kind: kind.into(),
-            desired: canonical_node(node)?,
+            desired,
             member: None,
-            owner_run: context.owner_run.clone(),
+            owner_run,
             owner_generation: None,
             owner_step: None,
         },
@@ -5006,8 +5036,8 @@ pub fn render_agent_desired_kdl(
     Ok(document.to_string())
 }
 
-/// An agent declaration with each resource edge written back as the `resource` child it was
-/// authored as. Every named subject must be resolved in `uris`.
+/// Render URI edges with their locator when available; otherwise preserve the edge as `subject=`.
+/// Explicit subject edges remain subject edges even when their resource has a URI.
 pub fn render_agent_node(
     desired: &Value,
     uris: &BTreeMap<String, String>,
@@ -5025,20 +5055,15 @@ pub fn render_agent_node(
     }
     let mut body = node.children().cloned().unwrap_or_default();
     for reference in references {
-        let uri = uris.get(&reference.subject).ok_or_else(|| {
-            St3Error::new(
-                "unresolved-resource",
-                format!(
-                    "resource `{}` names `{}`, which has no URI declaration here",
-                    reference.name, reference.subject
-                ),
-            )
-        })?;
+        let uri = (reference.kind == crate::model::ResourceReferenceKind::Uri)
+            .then(|| uris.get(&reference.subject))
+            .flatten();
         let mut child = KdlNode::new("resource");
         child.entries_mut().push(kdl::KdlEntry::new(reference.name));
-        child
-            .entries_mut()
-            .push(kdl::KdlEntry::new_prop("uri", uri.as_str()));
+        child.entries_mut().push(match uri {
+            Some(uri) => kdl::KdlEntry::new_prop("uri", uri.as_str()),
+            None => kdl::KdlEntry::new_prop("subject", reference.subject),
+        });
         if let Some(reason) = reference.reason {
             child
                 .entries_mut()
@@ -5683,7 +5708,7 @@ agent "ada/two" {{
         let one = &parsed.subjects["agent/ada/one"].desired;
         assert_eq!(
             one["resources"],
-            json!([{ "name": "goal", "subject": subject, "reason": "seat goal" }])
+            json!([{ "name": "goal", "subject": subject, "kind": "uri", "reason": "seat goal" }])
         );
         assert!(
             one["children"]
@@ -5743,7 +5768,46 @@ agent "ada/two" {{
         let repeated = "version 2\nagent \"ada/seat\" {\n  command \"true\"\n  resource \"r\" uri=\"a:1\"\n  resource \"r\" uri=\"a:2\"\n}\n";
         assert_eq!(parse_intent(repeated, "node").unwrap_err().code, "duplicate-resource-name");
         let missing = "version 2\nagent \"ada/seat\" {\n  command \"true\"\n  resource \"r\" reason=\"why\"\n}\n";
-        assert_eq!(parse_intent(missing, "node").unwrap_err().code, "missing-resource-uri");
+        assert_eq!(parse_intent(missing, "node").unwrap_err().code, "invalid-resource-reference");
+    }
+
+    #[test]
+    fn missing_uri_declarations_render_as_reparseable_subject_edges() {
+        let parsed = parse_intent(
+            "version 2\nagent \"ada/seat\" {\n command \"true\"\n resource \"goal\" uri=\"urn:goal:release\" reason=\"release goal\"\n}\n",
+            "node",
+        ).unwrap();
+        let desired = &parsed.subjects["agent/ada/seat"].desired;
+        let edge = &declared_resources(desired)[0];
+        let rendered = render_agent_desired_kdl(desired, &BTreeMap::new()).unwrap();
+        let reparsed = parse_intent(&rendered, "node").unwrap();
+        let reread = declared_resources(&reparsed.subjects["agent/ada/seat"].desired);
+        assert_eq!(reread[0].subject, edge.subject);
+        assert_eq!(reread[0].name, edge.name);
+        assert_eq!(reread[0].reason, edge.reason);
+        assert_eq!(reread[0].kind, crate::model::ResourceReferenceKind::Subject);
+        assert!(!reparsed.subjects.contains_key(&edge.subject));
+    }
+
+    #[test]
+    fn explicit_subject_edges_round_trip_without_declaring_resources() {
+        let source = "version 2\nagent \"ada/seat\" {\n command \"true\"\n resource \"tracker\" subject=\"resource/github/example/issue/1\" reason=\"tracking\"\n}\nmission \"ada/release\" state=\"ready\" {\n goal \"Release.\"\n resource \"tracker\" subject=\"resource/github/example/issue/1\"\n}\n";
+        let parsed = parse_intent(source, "node").unwrap();
+        assert!(!parsed.subjects.contains_key("resource/github/example/issue/1"));
+        let mission = &parsed.missions["ada/release"];
+        assert_eq!(mission.resources[0].subject, "resource/github/example/issue/1");
+        assert_eq!(mission.resources[0].kind, crate::model::ResourceReferenceKind::Subject);
+        assert!(mission.declarations_kdl.is_none());
+        let desired = &parsed.subjects["agent/ada/seat"].desired;
+        let uris = BTreeMap::from([("resource/github/example/issue/1".to_owned(), "https://example.com/issue/1".to_owned())]);
+        let rendered = render_agent_desired_kdl(desired, &uris).unwrap();
+        let reparsed = parse_intent(&rendered, "node").unwrap();
+        assert_eq!(&reparsed.subjects["agent/ada/seat"].desired, desired);
+        assert_eq!(declared_resources(desired)[0].kind, crate::model::ResourceReferenceKind::Subject);
+        for locator in ["subject=\"agent/ada/seat\"", "subject=\"resource/\"", "uri=\"urn:goal:x\" subject=\"resource/github/x\""] {
+            let invalid = format!("version 2\nagent \"ada/seat\" {{\n command \"true\"\n resource \"r\" {locator}\n}}\n");
+            assert!(parse_intent(&invalid, "node").is_err());
+        }
     }
 
     #[test]

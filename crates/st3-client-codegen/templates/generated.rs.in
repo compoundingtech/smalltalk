@@ -988,13 +988,29 @@ pub struct AgentHandoff {
     pub overridden_sources: Vec<String>,
     pub desired_token: String,
 }
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceReferenceKind {
+    Uri,
+    Subject,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceReferenceResolution {
+    Resolved,
+    Unresolved,
+    NotApplicable,
+}
 /// A named, read-only edge from a seat or mission declaration to an ordinary resource subject.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DeclaredResource {
     pub name: String,
-    /// `resource/uri/SHA256` of the exact URI; one URI is one subject.
+    /// The ordinary graph resource subject targeted by this edge.
     pub subject: String,
-    /// The exact absolute URI; `None` while the subject has not reached this host.
+    pub kind: ResourceReferenceKind,
+    pub resolution: ResourceReferenceResolution,
+    /// Present only for resolved URI references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,

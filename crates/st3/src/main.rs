@@ -2364,6 +2364,9 @@ struct SubjectShowArgs {
     /// Print the current managed agent declaration as canonical KDL v2.
     #[arg(long)]
     kdl: bool,
+    /// Show the seats and missions that name this resource.
+    #[arg(long, conflicts_with = "kdl")]
+    references: bool,
     /// Include literal environment values in the KDL output.
     #[arg(long, requires = "kdl")]
     show_env_values: bool,
@@ -8890,6 +8893,27 @@ async fn follow_conversation(
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
     match command {
         SubjectCommand::Show(args) => {
+            if args.references {
+                let references: Vec<Value> = client
+                    .get(&format!("/v1/resource-references/{}", args.subject))
+                    .await?;
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&references)?);
+                } else {
+                    for reference in references {
+                        print!(
+                            "{} · {}",
+                            reference["owner"].as_str().unwrap_or_default(),
+                            reference["name"].as_str().unwrap_or_default(),
+                        );
+                        if let Some(reason) = reference["reason"].as_str() {
+                            print!(" · {reason}");
+                        }
+                        println!();
+                    }
+                }
+                return Ok(());
+            }
             if args.kdl {
                 anyhow::ensure!(
                     args.subject.starts_with("agent/"),
