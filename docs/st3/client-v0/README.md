@@ -917,7 +917,11 @@ contains the hyperlink `uri`. Generated Rust, Swift, and TypeScript models prese
 When the terminal's runtime incarnation changes or its process exits, the server sends one
 `stale-fence` error envelope and closes the stream, with the error code as the close reason. Other
 failures end the same way with their own code. A client reconnects with a fresh `terminal.attach`,
-and its first message is again the current screen. Input and resize remain fenced typed actions.
+and its first message is again the current screen. Resize remains a fenced typed action. Input is
+either the fenced `terminal.input` action, one screen-sequence fence per call, or an ordered input
+session opened on a terminal followed through the collection socket
+([collections.md](collections.md#terminal-input)): `terminal.control` is checked once at open, and
+each batch carries a sequence instead of a screen fence. Input sessions reach owner-local terminals.
 
 A gateway relays a terminal that another host owns through bounded owner long polls:
 `GET /v1/client/terminals/{id}/screen?after=REVISION&wait_ms=N` returns as soon as the screen's
