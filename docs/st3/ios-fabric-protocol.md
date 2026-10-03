@@ -76,7 +76,9 @@ new server-side Rust service is needed.
 Illustrative member commands, with host-local paths and a real public ID supplied
 only at setup time, through the member’s owner after the real-device pairing
 plan has been agreed. An isolated dev daemon with a throwaway `FABRIC_HOME` can
-exercise the protocol before live provisioning:
+exercise the protocol before live provisioning. Prove it against that isolated
+daemon first, then arrange the one member exposure and phone grant; remove the
+phone grant after the proof:
 
 ```sh
 fabric expose demo-client/0 --socket /path/to/private/st3-client.sock --ephemeral
@@ -304,8 +306,10 @@ Two existing policies need narrow, development-only integration:
 
 - [`gatewayUrl.ts`](../../apps/ios/gatewayUrl.ts) currently accepts HTTPS or HTTP
   for Tailscale/private-LAN hosts and rejects `http://127.0.0.1`. Select the native
-  adapter’s returned URL through a separate development transport path; do not
-  turn the ordinary gateway input into unrestricted HTTP.
+  adapter’s returned URL through a separate development transport path. Accept
+  only the exact address of the currently running native bridge; a user-typed
+  loopback URL or a stale saved port must never select or pair with another local
+  listener. Keep the ordinary gateway input’s existing HTTP policy.
 - [`app.json`](../../apps/ios/app.json) declares ATS exceptions for tailnet/LAN
   ranges and `.local`, with no explicit loopback exception. Have the iOS builder
   verify actual loopback HTTP **and** WebSocket behavior in the development build
