@@ -146,9 +146,9 @@ jobs:
       - name: Install matching rendered hooks
         shell: bash
         run: nix develop -c cargo run --locked -p st2 -- hooks install
-      - name: Build workspace tests first (no debug info)
+      - name: Build selected test targets first (no debug info)
         shell: bash
-        run: nix develop -c cargo nextest run --workspace --locked --profile ci --no-run
+        run: nix develop -c bash scripts/ci-nextest run --no-run
       - name: Summarize tested revision
         run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
       - name: Run nextest

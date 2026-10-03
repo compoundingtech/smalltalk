@@ -15,6 +15,8 @@ final-status-level = "flaky"
 # supervisor tests, and st-drivers' catalog, resync and resource-profile supervisor modules.
 # `transport_isolation` needs real systemd user scopes; the isolation-vm job runs it in a
 # NixOS VM. See docs/ci.md.
+# scripts/ci-nextest also omits entirely excluded st2 targets from Cargo's build selection;
+# keep its retained target list in sync when changing the binary-level exclusions below.
 default-filter = '''
 not (
   (package(=st2) and (
