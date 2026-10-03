@@ -12,6 +12,7 @@ mod owned_sets_tests;
 mod resources;
 mod rollouts;
 mod seat_status;
+mod resource_references;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -8010,11 +8011,12 @@ impl Store {
         for (subject, desired) in &intent.subjects {
             let current = desired_row_at(&connection, subject, at_index).map_err(internal)?;
             let revision = desired_revision(desired);
+            let unchanged = desired_matches(current.as_ref(), desired, &revision)?;
             tokens.insert(
                 subject.clone(),
                 intent_leaves_at(&connection, subject, at_index).map_err(internal)?,
             );
-            if current.as_ref().is_some_and(|row| row.revision == revision) {
+            if unchanged {
                 continue;
             }
             changes.push(SubjectChange {
@@ -8494,11 +8496,11 @@ impl Store {
                 }
                 let desired_changed = intent.subjects.iter().any(|(subject, desired)| {
                     current_desired_row_tx(transaction, subject)
-                        .map(|current| {
-                            current
-                                .as_ref()
-                                .is_none_or(|row| row.revision != desired_revision(desired))
+                        .map_err(internal)
+                        .and_then(|current| {
+                            desired_matches(current.as_ref(), desired, &desired_revision(desired))
                         })
+                        .map(|unchanged| !unchanged)
                         .unwrap_or(true)
                 });
                 let missions_changed = intent.missions.values().any(|mission| {
@@ -8694,8 +8696,9 @@ impl Store {
                 for (subject, desired) in &intent.subjects {
                     let revision = desired_revision(desired);
                     let current = current_desired_row_tx(transaction, subject).map_err(internal)?;
-                    if current.as_ref().is_some_and(|row| row.revision == revision)
-                        && !owned_plan.as_ref().is_some_and(|p| p.materialize.contains(subject)) {
+                    if desired_matches(current.as_ref(), desired, &revision)?
+                        && (crate::graph::declared_uri(&desired.desired).is_some()
+                            || !owned_plan.as_ref().is_some_and(|p| p.materialize.contains(subject))) {
                         tokens.insert(
                             subject.clone(),
                             intent_leaves_tx(transaction, subject).map_err(internal)?,
@@ -10834,6 +10837,22 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Incoming named edges, using the target index rather than scanning declaration bodies.
+    pub fn declared_resource_referrers(&self, subject: &str) -> Result<Vec<Value>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT owner, name, reason FROM declared_resource_edges WHERE target=?1 ORDER BY owner, name",
+        )?;
+        let rows = statement.query_map([subject], |row| {
+            Ok(json!({
+                "owner": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "reason": row.get::<_, Option<String>>(2)?,
+            }))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// The URI each named `uri.reference` resource subject declares. An agent or mission keeps
     /// only typed edges; this resolves them through the ordinary desired resource subjects.
     pub fn declared_resource_uris<'a>(
@@ -11064,7 +11083,7 @@ impl Store {
         );
         transaction.execute(
             "DELETE FROM desired
-             WHERE owner_run IN (
+             WHERE subject NOT LIKE 'resource/uri/%' AND owner_run IN (
                SELECT 'mission-run/' || id FROM mission_runs WHERE root_run_id=?1
              )",
             [run_id],
@@ -11075,7 +11094,7 @@ impl Store {
                  FROM desired
                  JOIN mission_runs
                    ON desired.owner_run='mission-run/' || mission_runs.id
-                 WHERE mission_runs.root_run_id=?1
+                 WHERE mission_runs.root_run_id=?1 AND desired.subject NOT LIKE 'resource/uri/%'
                  ORDER BY desired.subject",
             )?;
             statement
@@ -11089,7 +11108,10 @@ impl Store {
     pub fn discard_desired_owned_by(&self, owner_run: &str) -> Result<usize> {
         let connection = self.connection.write();
         connection
-            .execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])
+            .execute(
+                "DELETE FROM desired WHERE owner_run=?1 AND subject NOT LIKE 'resource/uri/%'",
+                [owner_run],
+            )
             .map_err(Into::into)
     }
 
@@ -17285,6 +17307,7 @@ fn desired_row_at(
     }
     selected
         .map(|(revision, claim_id, desired)| {
+            let shared_uri = desired.subject.starts_with("resource/uri/");
             Ok(DesiredRow {
                 kind: desired.kind,
                 revision,
@@ -17294,8 +17317,8 @@ fn desired_row_at(
                     .member
                     .map(|member| canonical_serialized_json_text(&member))
                     .transpose()?,
-                owner_run: desired.owner_run,
-                owner_generation: desired.owner_generation,
+                owner_run: if shared_uri { None } else { desired.owner_run },
+                owner_generation: if shared_uri { None } else { desired.owner_generation },
             })
         })
         .transpose()
@@ -17324,6 +17347,42 @@ fn current_desired_row_tx(
         )
         .optional()
         .map_err(Into::into)
+}
+
+/// URI subjects are content-addressed shared facts, not mutable run declarations. Comparing
+/// their body also preserves the original claim when an older writer stamped run ownership.
+fn desired_matches(
+    current: Option<&DesiredRow>,
+    desired: &DesiredSubject,
+    revision: &str,
+) -> Result<bool, St3Error> {
+    if desired.kind == "resource"
+        && crate::graph::declared_uri(&desired.desired).is_some()
+        && (desired.owner_run.is_some()
+            || desired.owner_generation.is_some()
+            || desired.owner_step.is_some())
+    {
+        return Err(St3Error::new(
+            "run-owned-uri-resource",
+            format!("shared URI resource `{}` cannot be run-owned", desired.subject),
+        ));
+    }
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    if desired.subject.starts_with("resource/uri/") {
+        if current.kind == desired.kind
+            && current.body == canonical_json_text(&desired.desired).map_err(internal)?
+            && desired.member.is_none()
+        {
+            return Ok(true);
+        }
+        return Err(St3Error::new(
+            "immutable-uri-resource",
+            format!("shared URI resource `{}` cannot be changed", desired.subject),
+        ));
+    }
+    Ok(current.revision == revision)
 }
 
 fn desired_revision(desired: &DesiredSubject) -> String {
@@ -18832,12 +18891,13 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     Ok(lineage)
 }
 
-/// Two agent declarations that differ only in their human label share one launch.
+/// Human labels and declared resource edges do not change an agent's launch.
 fn presentation_only_change(previous: &Value, next: &Value) -> bool {
     let parse = |body: &Value| {
         let mut desired = serde_json::from_value::<DesiredSubject>(body.clone()).ok()?;
         (desired.kind == "agent").then_some(())?;
         desired.set_display_name(None).ok()?;
+        desired.desired.as_object_mut()?.remove("resources");
         Some(desired)
     };
     matches!((parse(previous), parse(next)), (Some(previous), Some(next)) if previous == next)
@@ -26222,7 +26282,11 @@ fn select_replicated_desired(
     }
     transaction
         .execute(
-            "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+               CASE WHEN ?1 LIKE 'resource/uri/%' THEN NULL ELSE ?7 END,
+               CASE WHEN ?1 LIKE 'resource/uri/%' THEN NULL ELSE ?8 END,
+               CASE WHEN ?1 LIKE 'resource/uri/%' THEN NULL ELSE ?9 END)
              ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, owner_run=excluded.owner_run, owner_generation=excluded.owner_generation, owner_step=excluded.owner_step",
             params![
                 claim.subject,
@@ -26278,7 +26342,10 @@ fn select_desired_repair_tx(
     let desired = serde_json::from_value::<DesiredSubject>(replacement.body.clone())?;
     transaction.execute(
         "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+           CASE WHEN ?1 LIKE 'resource/uri/%' THEN NULL ELSE ?7 END,
+           CASE WHEN ?1 LIKE 'resource/uri/%' THEN NULL ELSE ?8 END,
+           CASE WHEN ?1 LIKE 'resource/uri/%' THEN NULL ELSE ?9 END)
          ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision,
             claim_id=excluded.claim_id, body=excluded.body, member=excluded.member,
             owner_run=excluded.owner_run, owner_generation=excluded.owner_generation,
@@ -33197,6 +33264,188 @@ agent "worker" { workspace "/eval/child"; command "true"; restart "never" }
             desired.owner_run.as_deref() != Some(root.subject.as_str())
                 && desired.owner_run.as_deref() != Some(child.subject.as_str())
         }));
+    }
+
+    #[test]
+    fn cleanup_preserves_legacy_run_owned_uri_resources_for_other_seats() {
+        for mode in ["run", "eval"] {
+            let store = Store::open_memory("node").unwrap();
+            publish_mission(
+                &store,
+                r#"
+version 2
+mission "legacy-resource" state="ready" timeout="1m" {
+  goal "Dispose of one run without deleting another seat's URI."
+  step "work" { agentless }
+}
+"#,
+                "publish-legacy-resource-mission",
+            );
+            let run = store.create_mission_run(&MissionRunRequest {
+                mission: "legacy-resource".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some(mode.into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "legacy-resource-run".into(),
+            }).unwrap();
+            let reader = parse_intent(
+                r#"version 2
+agent "shared/reader" {
+  workspace "/tmp"
+  command "true"
+  resource "issue" uri="https://github.com/example/project/issues/42"
+}
+"#,
+                "node",
+            ).unwrap();
+            store.apply_internal(&reader, "legacy-reader").unwrap();
+            let references = crate::graph::declared_resources(&reader.subjects["agent/shared/reader"].desired);
+            let resource = &references[0].subject;
+            let mut legacy = reader.subjects[resource].clone();
+            legacy.owner_run = Some(run.subject.clone());
+            legacy.owner_generation = Some(run.generation.clone());
+            legacy.owner_step = Some(run.steps[0].subject.clone());
+            // Seed the persisted projection produced by the old materializer. The shared
+            // body's content and original claim must survive, not be replaced during cleanup.
+            store.connection.write().execute(
+                "UPDATE desired SET owner_run=?1, owner_generation=?2, owner_step=?3, revision=?4
+                 WHERE subject=?5",
+                params![
+                    legacy.owner_run, legacy.owner_generation, legacy.owner_step,
+                    desired_revision(&legacy), resource,
+                ],
+            ).unwrap();
+            let original = store.claims_for(resource, Some("intent.desired")).unwrap();
+            assert!(!store.apply_internal(&reader, "legacy-reader-again").unwrap().changed);
+            if mode == "eval" {
+                assert!(store.retire_eval_owned_desired(&run.subject).unwrap().is_empty());
+            } else {
+                store.discard_desired_owned_by(&run.subject).unwrap();
+            }
+            let uris = store.declared_resource_uris(&references).unwrap();
+            assert_eq!(
+                uris.get(resource).map(String::as_str),
+                Some("https://github.com/example/project/issues/42"),
+            );
+            assert_eq!(
+                store.claims_for(resource, Some("intent.desired")).unwrap()
+                    .iter().map(|claim| &claim.id).collect::<Vec<_>>(),
+                original.iter().map(|claim| &claim.id).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn replicated_uri_resources_never_restore_legacy_run_ownership() {
+        let source = Store::open_memory("source").unwrap();
+        let reader = parse_intent(
+            r#"version 2
+agent "shared/reader" {
+  workspace "/tmp"
+  command "true"
+  resource "issue" uri="https://github.com/example/project/issues/42"
+}
+"#,
+            "source",
+        ).unwrap();
+        source.apply_internal(&reader, "replicated-uri-reader").unwrap();
+        let references = crate::graph::declared_resources(&reader.subjects["agent/shared/reader"].desired);
+        let resource = &references[0].subject;
+        let original = source.claims_for(resource, Some("intent.desired")).unwrap().remove(0);
+        let owner = "mission-run/legacy";
+        let mut legacy = reader.subjects[resource].clone();
+        legacy.owner_run = Some(owner.into());
+        legacy.owner_generation = Some("run-generation/legacy".into());
+        legacy.owner_step = Some("step-run/legacy/work".into());
+        // Author a valid historical claim through the durable append primitive, as the old
+        // materializer did, rather than bypassing replication admission with forged bytes.
+        let legacy_claim = {
+            let mut connection = source.connection.write();
+            let transaction = connection.transaction().unwrap();
+            let claim = append_claim_tx(
+                &transaction,
+                &source.origin,
+                resource,
+                "intent.desired",
+                Some("daemon/legacy"),
+                &serde_json::to_value(&legacy).unwrap(),
+                &[original.id],
+                None,
+            ).unwrap();
+            select_replicated_desired(&transaction, &claim, &legacy).unwrap();
+            transaction.commit().unwrap();
+            claim
+        };
+        let replica = Store::open_memory("replica").unwrap();
+        receive_and_project(
+            &replica,
+            "source",
+            &exchange_from(&source, &replica.replication_inventory().unwrap()),
+        );
+        for replay in [false, true] {
+            if replay {
+                let mut connection = replica.connection.write();
+                let transaction = connection.transaction().unwrap();
+                replay_graph_from_nothing_tx(&transaction).unwrap();
+                transaction.commit().unwrap();
+            }
+            let shared = replica.desired_subjects_named(std::slice::from_ref(resource)).unwrap();
+            assert_eq!(shared[0].owner_run, None);
+            assert_eq!(shared[0].owner_generation, None);
+            assert_eq!(shared[0].owner_step, None);
+            assert!(replica.desired_subjects_for_owner_run(owner).unwrap().is_empty());
+            assert!(replica.status_at(Some(resource), Some(owner), Some(replica.index().unwrap()))
+                .unwrap().subjects.is_empty());
+            assert_eq!(
+                replica.declared_resource_uris(&references).unwrap()[resource],
+                "https://github.com/example/project/issues/42",
+            );
+            assert_eq!(replica.claim_by_id(&legacy_claim.id).unwrap().unwrap().body, legacy_claim.body);
+        }
+    }
+
+    #[test]
+    fn a_shared_uri_resource_cannot_be_redeclared_with_a_different_kind() {
+        let store = Store::open_memory("node").unwrap();
+        let reader = parse_intent(
+            r#"version 2
+agent "shared/reader" {
+  workspace "/tmp"
+  command "true"
+  resource "issue" uri="https://github.com/example/project/issues/42"
+}
+"#,
+            "node",
+        ).unwrap();
+        store.apply_internal(&reader, "immutable-uri-reader").unwrap();
+        let references = crate::graph::declared_resources(&reader.subjects["agent/shared/reader"].desired);
+        let replacement = parse_intent(
+            &format!(
+                "version 2\nresource {:?} {{ kind \"custom.test.issue\" }}\n",
+                references[0].subject.strip_prefix("resource/").unwrap(),
+            ),
+            "node",
+        ).unwrap();
+        let planned = store.mission(
+            &replacement,
+            IntentInput { kdl: String::new(), source_name: None },
+        ).unwrap_err();
+        assert_eq!(planned.code, "immutable-uri-resource");
+        let tokens = BTreeMap::from([(
+            references[0].subject.clone(),
+            store.claims_for(&references[0].subject, Some("intent.desired")).unwrap()
+                .into_iter().map(|claim| claim.id).collect::<Vec<_>>(),
+        )]);
+        assert_eq!(
+            store.apply(&replacement, &tokens, "replace-uri-kind").unwrap_err().code,
+            "immutable-uri-resource",
+        );
+        assert_eq!(
+            store.declared_resource_uris(&references).unwrap()[&references[0].subject],
+            "https://github.com/example/project/issues/42",
+        );
     }
 
     #[test]
