@@ -1179,6 +1179,9 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             } else if *table == "desired" && column == "member" {
                 // The host index parses this JSON during UPDATE, before digest comparison.
                 "json_set(COALESCE(member,'{}'), '$.host', COALESCE(json_extract(member,'$.host'),'')||'-changed')".to_owned()
+            } else if *table == "desired" && column == "body" {
+                // Declaration-edge triggers read this JSON during the same update.
+                "(json_set(body,'$.__audit_digest_change',1)||'')".to_owned()
             } else if kind == "INTEGER" {
                 format!("COALESCE({column},0)+1")
             } else if kind == "BLOB" {
