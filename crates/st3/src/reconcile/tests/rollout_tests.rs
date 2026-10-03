@@ -771,7 +771,9 @@ fn rollout_rechecks_pending_replies_and_the_physical_render_fence() {
 
 #[test]
 fn rollout_pending_person_work_can_resume_and_finish_while_new_work_waits() {
-    for retire in [false, true] {
+    for (retire, answered_before_drain) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
         let seat = Seat::new();
         let run = seat.work();
         let request = |key: &str| crate::model::WorkRequest {
@@ -806,6 +808,25 @@ fn rollout_pending_person_work_can_resume_and_finish_while_new_work_waits() {
             Some(Policy::when_idle(1_800_000, false)),
             retire,
         );
+        let answer = || {
+            seat.store
+                .finish_person_step(
+                    &crate::model::PersonStepResponse {
+                        subject: ask.subject.clone(),
+                        actor: "person/operator".into(),
+                        summary: "The north bed".into(),
+                        evidence: Vec::new(),
+                        episode: None,
+                        answer: None,
+                        idempotency_key: "north".into(),
+                    },
+                    false,
+                )
+                .unwrap();
+        };
+        if answered_before_drain {
+            answer();
+        }
         seat.store.reconcile_person_asks().unwrap();
         seat.step();
         seat.store.reconcile_person_asks().unwrap();
@@ -819,20 +840,11 @@ fn rollout_pending_person_work_can_resume_and_finish_while_new_work_waits() {
                 .iter()
                 .any(|b| b == "pending-person-work")
         );
-        seat.store
-            .finish_person_step(
-                &crate::model::PersonStepResponse {
-                    subject: ask.subject,
-                    actor: "person/operator".into(),
-                    summary: "The north bed".into(),
-                    evidence: Vec::new(),
-                    episode: None,
-                    answer: None,
-                    idempotency_key: "north".into(),
-                },
-                false,
-            )
-            .unwrap();
+        if !answered_before_drain {
+            answer();
+        }
+        seat.step();
+        assert_eq!(seat.operation().phase, "draining");
         seat.store
             .work_action(&run.steps[0].subject, "claim", &request("resume"))
             .unwrap();

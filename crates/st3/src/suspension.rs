@@ -393,13 +393,20 @@ pub fn annotate_quiescence(fields: &mut std::collections::BTreeMap<String, Value
             .unwrap_or_default()
             .to_owned()
     };
-    let (quiescent, blocking) = harness_quiescence(
+    let (_, mut blocking) = harness_quiescence(
         &text("state"),
         &text("blocked_on"),
         &text("ask"),
         &text("input_buffer"),
     );
-    fields.insert("quiescent".into(), Value::Bool(quiescent));
+    if fields.get("driver").and_then(Value::as_str) == Some("omp") {
+        match fields.get("background_jobs").and_then(Value::as_u64) {
+            Some(0) => {}
+            Some(_) => blocking.push("background-jobs-running"),
+            None => blocking.push("background-jobs-unreported"),
+        }
+    }
+    fields.insert("quiescent".into(), Value::Bool(blocking.is_empty()));
     fields.insert(
         "blocking".into(),
         Value::Array(blocking.into_iter().map(Value::from).collect()),
@@ -429,5 +436,22 @@ mod tests {
             harness_quiescence("indeterminate", "none", "none", "empty"),
             (false, vec!["harness-indeterminate"])
         );
+    }
+}
+
+#[cfg(test)]
+mod background_job_tests {
+    use super::*;
+
+    #[test]
+    fn omp_idle_requires_a_known_empty_native_job_snapshot() {
+        for (jobs, reason) in [(Value::from(1), Some("background-jobs-running")), (Value::Null, Some("background-jobs-unreported")), (Value::from(0), None)] {
+            let mut fields = std::collections::BTreeMap::from([
+                ("driver".into(), Value::from("omp")), ("state".into(), Value::from("idle")), ("background_jobs".into(), jobs),
+            ]);
+            annotate_quiescence(&mut fields);
+            assert_eq!(fields["quiescent"], reason.is_none());
+            assert_eq!(fields["blocking"], reason.map_or_else(|| serde_json::json!([]), |reason| serde_json::json!([reason])));
+        }
     }
 }

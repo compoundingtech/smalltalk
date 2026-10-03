@@ -74,7 +74,6 @@ fn operation(connection: &Connection, subject: &str) -> Result<Option<Operation>
     };
     operation.id = request.id.clone();
     operation.requested_by = request.actor.clone();
-    operation.requested_at_unix_ms = request.accepted_at_unix_ms;
     // The initial request can carry a positively stopped predecessor after supersession.
     for claim in claims.iter().filter(|c| {
         c.origin == request.origin
@@ -166,6 +165,10 @@ pub(super) fn retiring_ask_live(
     let Some(subject) = ask.actor.as_deref() else {
         return Ok(false);
     };
+    let retiring: bool = connection.query_row(
+        "SELECT kind='stop' FROM desired WHERE subject=?1", [subject], |row| row.get(0),
+    ).optional().map_err(internal)?.unwrap_or(false);
+    if !retiring { return Ok(false); }
     let Some(selected) = selection(connection, subject)? else {
         return Ok(false);
     };
@@ -345,7 +348,7 @@ impl Store {
             let now = now_ms();
             let mut asks = tx.prepare_cached("SELECT step.subject,step.attempt FROM step_runs step
                 JOIN claims ask ON json_extract(ask.body,'$.fields.origin_step')=step.subject
-                WHERE step.status='waiting-person' AND ask.kind='work.person-asked' AND ask.actor=?1
+                WHERE step.status IN ('waiting-person','ready') AND ask.kind='work.person-asked' AND ask.actor=?1
                     AND json_extract(ask.body,'$.fields.origin_attempt')=step.attempt").map_err(internal)?;
             let allowed_work = asks.query_map([subject],|row|Ok((row.get::<_,String>(0)?,row.get::<_,u32>(1)?))).map_err(internal)?
                 .collect::<Result<BTreeMap<_,_>,_>>().map_err(internal)?;

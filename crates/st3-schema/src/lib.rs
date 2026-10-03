@@ -2862,6 +2862,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
                     "indeterminate",
                 ]),
             ),
+            ("background_jobs", integer()),
             ("driver", string()),
             ("reason", string()),
             ("incarnation_id", string()),

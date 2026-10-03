@@ -27,7 +27,8 @@ original incarnation and an absolute deadline. Its phases are `draining`, `stopp
 graph while it drains. Existing work can renew, report and complete. Replies and the continuation
 of a pending person ask remain deliverable. A driver acknowledgment, its typed quiescence report,
 native-session binding, pending deliveries, claimed work and running subagents all participate in
-the idle boundary.
+the idle boundary. OMP also reports its native async-job count: live background jobs block
+cutover, and an unavailable count remains unproven rather than idle.
 
 Replacement renders are prepared without changing the live configuration during drain. Signals
 retain the original incarnation fence, and replacement launch waits for positive exit evidence.

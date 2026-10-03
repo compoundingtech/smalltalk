@@ -16322,6 +16322,7 @@ async fn publish_harness_activity(
             Value::String(observed.blocked_on.as_str().into()),
         ),
         ("ask".into(), Value::String(observed.ask.as_str().into())),
+        ("background_jobs".into(), observed.background_jobs.map(Value::from).unwrap_or(Value::Null)),
         (
             "input_buffer".into(),
             Value::String(observed.input_buffer.as_str().into()),
@@ -17575,6 +17576,7 @@ impl PiChannelResume {
                 };
                 self.frame_sequence = self.frame_sequence.saturating_add(1);
                 self.pending.state = Some((status.to_owned(), self.frame_sequence));
+                self.pending.background_jobs = frame.get("backgroundJobs").and_then(Value::as_u64);
                 self.pending.blocked_on = frame
                     .get("blockedOn")
                     .and_then(Value::as_str)
@@ -17684,6 +17686,8 @@ struct PiFamilyReports {
     #[serde(default)]
     blocked_on: Option<String>,
     #[serde(default)]
+    background_jobs: Option<u64>,
+    #[serde(default)]
     ask: Option<String>,
     #[serde(default)]
     reason: Option<String>,
@@ -17740,6 +17744,7 @@ impl PiFamilyReports {
                                     .map(Value::String)
                                     .unwrap_or(Value::Null),
                             ),
+                            ("background_jobs".into(), self.background_jobs.map(Value::from).unwrap_or(Value::Null)),
                             ("input_buffer".into(), Value::Null),
                             ("exit".into(), Value::Null),
                         ])),

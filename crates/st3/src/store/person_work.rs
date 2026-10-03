@@ -266,11 +266,14 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
     // A daemon asks for its own policy, not for a seat, so no declaration fences it. An update
     // waits for nobody, so it stays until the person reads it, even after its poster stops.
     let unfenced = requester.starts_with("daemon/") || is_update(ask);
-    let retiring = !unfenced && super::rollouts::retiring_ask_live(connection, ask)?;
     if !matches!(view.status.as_str(), "pending" | "ready")
         || !run_live(connection, &view.run, Some(&view.generation), false)?
-        || (!unfenced && !retiring && !declaration_live(connection, requester)?)
     {
+        return Ok(false);
+    }
+    let requester_live = unfenced || declaration_live(connection, requester)?;
+    let retiring = !requester_live && super::rollouts::retiring_ask_live(connection, ask)?;
+    if !requester_live && !retiring {
         return Ok(false);
     }
     if unfenced {

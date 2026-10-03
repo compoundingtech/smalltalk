@@ -177,7 +177,7 @@ pub fn blockers(store: &Store, subject: &str, operation: &Operation) -> Result<V
         blockers.push("drain-unacknowledged".into());
     }
     if store.work_for_reconcile(subject)?.iter().any(|step| {
-        step.status == "waiting-person"
+        matches!(step.status.as_str(), "waiting-person" | "ready")
             && operation.allowed_work.get(&step.subject) == Some(&step.attempt)
     }) {
         blockers.push("pending-person-work".into());
