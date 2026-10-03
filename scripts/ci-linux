@@ -39,6 +39,10 @@ clippy_and_codegen() {
   cargo run --locked -p st3-client-codegen -- --check
 }
 
+# Guard current products before any stage can report success.
+python3 scripts/check-st-boundary-test
+python3 scripts/check-st-boundary
+
 start=$SECONDS status=0
 case "$stage" in
   # The nextest --no-run step already compiled the test executables.

@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Mutation proofs: each forbidden surface must fail the same guard used by CI/evals."""
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+sys.dont_write_bytecode = True
+from st_boundary import fresh_seat_findings, launch_findings
+
+HERE = Path(__file__).resolve().parent
+
+
+class BoundaryCheck(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="boundary-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        for name in ("st3", "stui", "st-drivers", "st2"):
+            crate = self.root / "crates" / name
+            (crate / "src").mkdir(parents=True)
+            (crate / "src/lib.rs").write_text("pub fn fixture() {}\n")
+            (crate / "Cargo.toml").write_text(f'[package]\nname="{name}"\nversion="0.1.0"\nedition="2024"\n')
+        (self.root / "Cargo.toml").write_text('[workspace]\nresolver="3"\nmembers=["crates/*"]\n')
+        # Keep CLI's --locked contract even for a synthetic workspace.
+        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=self.root, check=True,
+                       capture_output=True)
+        for directory in ("state", "home", "pty"):
+            (self.root / directory).mkdir()
+        self.processes = [(123, "/bin/st driver claude", ["ST_AGENT=agent/example/worker"])]
+
+    def check_sources(self):
+        return subprocess.run([sys.executable, str(HERE / "check-st-boundary"), "--root", str(self.root)],
+                              capture_output=True, text=True)
+
+    def test_neutral_workspace_passes_cli(self):
+        self.assertEqual(self.check_sources().returncode, 0)
+        self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
+
+    def test_each_product_import_fails_cli(self):
+        for crate in ("st3", "stui"):
+            path = self.root / "crates" / crate / "src/lib.rs"
+            for spelling in ("use st2::hooks;", "use r#st2 \n ::hooks;", "extern crate st2 as legacy;"):
+                with self.subTest(crate=crate, spelling=spelling):
+                    path.write_text(spelling)
+                    result = self.check_sources()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("st2 import", result.stderr)
+            path.write_text("pub fn fixture() {}")
+
+    def test_renamed_and_indirect_dependency_fail_cli(self):
+        for product in ("st3", "stui"):
+            manifest = self.root / "crates" / product / "Cargo.toml"
+            original = manifest.read_text()
+            manifest.write_text(original + '\n[dependencies]\nlegacy={package="st2",path="../st2"}\n')
+            result = self.check_sources()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"{product} -> st2", result.stderr)
+            manifest.write_text(original + '\n[dependencies]\nst-drivers={path="../st-drivers"}\n')
+            shared = self.root / "crates/st-drivers/Cargo.toml"
+            shared_original = shared.read_text()
+            shared.write_text(shared_original + '\n[dependencies]\nlegacy={package="st2",path="../st2",optional=true}\n')
+            result = self.check_sources()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"{product} -> st-drivers -> st2", result.stderr)
+            shared.write_text(shared_original)
+            manifest.write_text(original)
+
+    def test_every_st2_environment_name_fails(self):
+        for name in ("ST2_CLAUDE_SESSION", "ST2_PI_CHANNEL_SESSION", "ST2_UNKNOWN"):
+            with self.subTest(name=name):
+                rows = [(123, "/bin/st", [f"{name}="])]
+                self.assertTrue(any("legacy environment" in error
+                                    for error in fresh_seat_findings(self.root, rows)))
+
+    def test_program_and_any_legacy_path_component_fail(self):
+        for value in ("st2 up", "/bin/st2 up", "/state/st2/hooks", "/state/st2-codex/socket",
+                      "/state/cache.st2/session", "/state/ST2/session"):
+            with self.subTest(value=value):
+                self.assertTrue(list(launch_findings(value, [])))
+                self.assertTrue(list(launch_findings("/bin/st", ["ST_HOOKS=" + value])))
+        self.assertFalse(list(launch_findings('/bin/st --settings {"st2-channel@st2":false}', [])))
+
+    def test_generated_path_and_record_and_schema_fail(self):
+        for path, value in (("state/st2-events/record", "neutral"),
+                            ("state/drivers/record.json", '{"schema":"st2.harness-state.v1"}'),
+                            ("state/drivers/record.json", '{"label":"st2-provider"}'),
+                            ("home/.claude.json.st2trust.lock", "neutral"),
+                            ("pty/seat.log", "st2-driver warning"),
+                            ("daemon.log", "WARN st2-hook: fixture")):
+            with self.subTest(path=path):
+                output = self.root / path
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(value)
+                self.assertTrue(list(fresh_seat_findings(self.root, self.processes)))
+                output.unlink()
+                # Remove the forbidden directory too, so the next mutation starts clean.
+                if "st2" in output.parent.name:
+                    output.parent.rmdir()
+                self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
+
+    def test_a_neutral_symlink_to_a_legacy_path_fails(self):
+        link = self.root / "state/neutral"
+        link.symlink_to("/example/st2-state/session")
+        self.assertTrue(any("symlink target" in error for error in
+                            fresh_seat_findings(self.root, self.processes)))
+
+    def test_live_sqlite_wal_schema_and_record_fail(self):
+        database = self.root / "state/events.sqlite"
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE snapshots(body BLOB)")
+            connection.commit()
+            self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
+            for body in (b'{"schema":"st2.harness-state.v1"}', b'{"label":"st2-provider"}'):
+                connection.execute("INSERT INTO snapshots VALUES (?)", (body,))
+                connection.commit()
+                self.assertTrue(any("SQLite record" in error for error in
+                                    fresh_seat_findings(self.root, self.processes)))
+                connection.execute("DELETE FROM snapshots")
+                connection.commit()
+            connection.execute('CREATE TABLE "st2-records" (value TEXT)')
+            connection.commit()
+            self.assertTrue(any("SQLite schema" in error for error in
+                                fresh_seat_findings(self.root, self.processes)))
+
+    def test_opaque_envelope_does_not_mask_semantic_claims(self):
+        database = self.root / "state/claims.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE replica_envelopes(payload BLOB)")
+            connection.execute("INSERT INTO replica_envelopes VALUES ('randomBase64st2Letters')")
+            connection.execute("CREATE TABLE claims(body TEXT)")
+            connection.execute("INSERT INTO claims VALUES (?)", ('{"schema":"st.harness-state.v1"}',))
+            connection.commit()
+            self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
+            connection.execute("UPDATE claims SET body=?", ('{"schema":"st2.harness-state.v1"}',))
+            connection.commit()
+            self.assertTrue(list(fresh_seat_findings(self.root, self.processes)))
+
+    def test_missing_process_evidence_fails(self):
+        self.assertIn("no fresh seat processes inspected", list(fresh_seat_findings(self.root, [])))
+
+
+if __name__ == "__main__":
+    unittest.main()

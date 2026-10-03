@@ -121,6 +121,26 @@ handoff. Namespace workflows use this script from the checkout and land through 
 queue. Provider fixtures, rendered hooks, workspace Clippy and the isolation archive keep their
 existing scope.
 
+### Current-product boundary
+
+Every required Linux stage runs `scripts/check-st-boundary-test` and
+`scripts/check-st-boundary`. The source guard rejects `st2::` imports and `extern crate st2`
+in st3/stui, plus direct, renamed or indirect workspace dependencies on st2 (including
+optional and target-specific dependencies). st2 remains independently buildable/testable.
+
+The Claude no-st2 seat eval and all five harness boot canaries inspect fresh seat processes
+for `ST2_*` exports and st2 program/path references. They also inspect generated state, home
+and PTY paths, text records, SQLite schemas/semantic rows and logs for st2 labels. Fixtures use
+neutral identities and payloads, so authored text cannot hide an owned label. Base64 replication
+payloads/signatures are opaque; their stored semantic claims are checked separately. Historical
+binary-upgrade canaries retain predecessor records and are outside this fresh-generation rule.
+The mutation suite injects every prohibited category and requires rejection; source/dependency
+mutations also exercise the guard's CLI exit status.
+
+Fresh trust writes use `.st-trust.lock` and `.st-trust.<pid>` staging files. If a historical
+trust lock already exists, the new writer also holds it without replacing or creating it;
+both generations continue to coordinate with Claude's own config lock.
+
 ### Isolation VM
 
 `tests/transport_isolation.rs` proves that a task st2 starts in its own systemd user scope
