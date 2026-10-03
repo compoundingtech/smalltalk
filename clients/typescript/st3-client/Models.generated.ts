@@ -856,15 +856,32 @@ export type MissionStep = {
   attempt: number;
   blocked_reason?: string | null;
   blockers?: Array<Id>;
+  claim_expires_at?: (Timestamp | null);
   claimant?: (AgentId | null);
   constraints?: Array<string>;
   goals?: Array<string>;
   id: Id;
   last_progress?: string | null;
+  loop_max_rounds?: number | null;
+  loop_reason?: string | null;
+  loop_round?: number | null;
+  next_wake_at?: (Timestamp | null);
   path: string;
   since: Timestamp;
   state: WorkState;
   title?: string | null;
+  wake?: (MissionWake | null);
+  wake_reason?: string | null;
+};
+
+export type MissionWake = {
+  acknowledged_by?: string | null;
+  assignee: AgentId;
+  assignee_state: string;
+  attempts: number;
+  failure?: string | null;
+  incarnation_id: string;
+  last_attempt_at?: (Timestamp | null);
 };
 
 export type MustAct = ("you" | "agent" | "system" | "blocked" | "nobody" | string);

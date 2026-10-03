@@ -1425,7 +1425,9 @@ pub(super) fn mission_resources(
     history: bool,
     selected_id: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
-    mission_resources_filtered(store, snapshot_index, history, selected_id, None)
+    store.read_snapshot(|_| {
+        mission_resources_filtered(store, snapshot_index, history, selected_id, None)
+    })
 }
 
 /// Collection cards keep only three run headers, regardless of a mission's history size.
@@ -1662,13 +1664,20 @@ fn mission_resources_filtered(
                 .iter()
                 .filter(|run| !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"))
                 .count();
+            let latest_finished = runs.iter().rev().find(|run| {
+                matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+            });
             let run_details = runs
                 .iter()
                 .map(|header| {
-                    // A detail shows each step's effective state and latest progress, and none of
-                    // the timing and wake history a work view reads for every step.
-                    let run = if selected_id.is_some() {
-                        store.with_step_states(header.clone(), true)?
+                    // Enrich open runs and only the newest finished run, on the header snapshot.
+                    let run = if selected_id.is_some()
+                        && (!matches!(header.status.as_str(), "completed" | "failed" | "cancelled")
+                            || latest_finished.is_some_and(|run| run.subject == header.subject))
+                    {
+                        store.mission_run(&header.id)?.ok_or_else(|| {
+                            anyhow::anyhow!("mission run {} disappeared during detail read", header.id)
+                        })?
                     } else {
                         header.clone()
                     };
@@ -1754,6 +1763,23 @@ fn mission_resources_filtered(
                         run.steps
                             .iter()
                             .map(|step| {
+                                let loop_run = run.loops.iter().find(|loop_run| {
+                                    loop_run.step_run == step.subject
+                                });
+                                let wake = step.wake.as_ref().filter(|_| {
+                                    !matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+                                        && !matches!(step.status.as_str(), "completed" | "failed" | "cancelled" | "skipped")
+                                }).map(|wake| {
+                                    json!({
+                                        "assignee": wake.assignee,
+                                        "assignee_state": wake.assignee_state,
+                                        "incarnation_id": wake.incarnation_id,
+                                        "attempts": wake.attempts,
+                                        "last_attempt_at": wake.last_attempt_at_unix_ms.map(client_timestamp),
+                                        "acknowledged_by": wake.acknowledged_by,
+                                        "failure": wake.failure,
+                                    })
+                                });
                                 json!({
                                     "id": step.subject,
                                     "path": step.step,
@@ -1769,6 +1795,14 @@ fn mission_resources_filtered(
                                     "blockers": step.blockers,
                                     "goals": step.goals,
                                     "constraints": step.constraints,
+                                    "loop_round": loop_run.map(|loop_run| loop_run.round),
+                                    "loop_max_rounds": loop_run.map(|loop_run| loop_run.max_rounds),
+                                    "loop_reason": loop_run.and_then(|loop_run| loop_run.reason.as_deref()),
+                                    "next_wake_at": step.not_before_unix_ms.map(client_timestamp),
+                                    "wake_reason": step.blocked_reason.as_deref().filter(|_| step.not_before_unix_ms.is_some())
+                                        .or_else(|| step.wake.as_ref().and_then(|wake| wake.failure.as_deref())),
+                                    "wake": wake,
+                                    "claim_expires_at": step.claim_expires_at_unix_ms.map(client_timestamp),
                                 })
                             })
                             .collect::<Vec<_>>()
@@ -11163,11 +11197,9 @@ mission "example/looped" state="ready" {
         );
     }
 
-    /// A mission detail and the missions tree show each step's state and latest progress
-    /// without reading the timing, wake and definition history a work view reads for every
-    /// step: they enrich no step, and they show what the enriched runs show.
+    /// A mission detail and the missions tree agree on effective step state and progress.
     #[test]
-    fn mission_detail_and_the_tree_read_no_step_history() {
+    fn mission_detail_and_the_tree_show_effective_steps() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "steps-node");
         let publish = |source: &str, key: &str| {
@@ -11260,11 +11292,9 @@ mission "example/steps" state="ready" {
         }
         let index = state.store.index().unwrap();
 
-        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
         let detail =
             mission_resources(&state.store, index, true, Some("mission/example/steps")).unwrap();
         let tree = missions_tree_value(&state.store, "now", index).unwrap();
-        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 0);
 
         let shown = |run: &crate::model::MissionRunView| {
             run.steps
