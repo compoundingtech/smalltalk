@@ -69,6 +69,7 @@ mod mailbox;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
+pub(crate) use client_v0::raw_terminal::{Lease as RawTerminalLease, LeaseBinding as RawTerminalLeaseBinding, ORIGIN_HEADER as RAW_ORIGIN_HEADER};
 
 #[derive(Clone)]
 pub struct AppState {

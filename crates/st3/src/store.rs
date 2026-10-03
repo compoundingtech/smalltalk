@@ -247,6 +247,10 @@ WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT N
 -- of other kinds plan as they did.
 CREATE INDEX IF NOT EXISTS claims_runtime_subject_index ON claims(subject, store_index)
 WHERE kind='runtime.observed';
+-- An already-open raw stream revalidates the original paired actor, never a full graph scan.
+CREATE INDEX IF NOT EXISTS claims_client_pairing_actor_index
+ON claims(json_extract(body, '$.fields.session_actor'))
+WHERE kind='custom.client.pairing-completed';
 -- A runtime incarnation's claims about a subject by acceptance time, so when a session began
 -- and last changed are two seeks instead of a read of every claim the subject has. The
 -- expression is INCARNATION_OF_CLAIM, which queries repeat so the planner uses this index.
