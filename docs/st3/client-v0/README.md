@@ -58,6 +58,24 @@ subagent is part of its agent, not a resource of its own, and has no actions. Th
 per request, so a lease that runs out leaves it at the next read without a new claim. A daemon
 older than the field omits it; clients read a missing list as empty.
 
+### Declared resources
+
+An agent's or mission's `resources` lists the resources its current declaration names, in authored
+order: each has its `name`, the `subject` of the ordinary `uri.reference` resource it points to,
+the exact `uri`, and a nullable `reason`. A mission's list comes from its current published
+revision. The owner stores typed edges, while the shared smallclaims subject stores the immutable
+URI. Its ID is `resource/uri/` followed by the lowercase hex SHA-256 of the exact URI's bytes;
+different owners naming that URI resolve to the same subject.
+
+The list is read-only; change it by reapplying the seat declaration or publishing a new mission
+revision (see [declared resources](../kdl-lifecycle.md#declared-resources)). Removing an edge does
+not delete its subject or other owners' references. `uri` is null while the referenced subject
+has not reached the host; the edge still retains its `name`, `subject`, and `reason`. A daemon
+older than the field omits it; clients read a missing list as empty.
+
+These declared references are distinct from `GET /v1/client/resources`, which lists resource
+observations. Declaring a URI does not fetch it, create an observation, or start an observer.
+
 ## Boundary and transport
 
 The client API is a projection and command gateway, not a graph replica. Its version is

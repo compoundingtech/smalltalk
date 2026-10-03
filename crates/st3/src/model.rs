@@ -516,12 +516,23 @@ pub struct StepSpec {
     pub definition_hash: String,
 }
 
+/// A named edge to an ordinary resource subject, not a copy of its locator.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeclaredResourceReference {
+    pub name: String,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MissionSpec {
     pub id: String,
     pub subject: String,
     pub state: MissionState,
     pub revision: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<DeclaredResourceReference>,
     #[serde(default)]
     pub inputs: BTreeMap<String, MissionInputSpec>,
     #[serde(default = "default_mission_run_limit")]

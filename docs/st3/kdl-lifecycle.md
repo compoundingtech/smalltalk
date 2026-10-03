@@ -214,6 +214,50 @@ and waits for a new running incarnation, even when the declaration says `restart
 and an inspection command. Restart requires an active seat declaration; start a stopped
 seat first.
 
+## Declared resources
+
+A seat or a top-level mission names the resources it works with as `resource` children:
+
+```kdl
+version 2
+
+agent "ada/client" {
+  harness "omp"
+  resource "goal" uri="agent-goal://orchid/ada%2Fclient" reason="seat goal"
+  resource "worktree" uri="worktree://orchid/workspace/client"
+}
+
+mission "ada/release" state="ready" {
+  goal "Release the client."
+  resource "tracker" uri="https://github.com/compoundingtech/smalltalk/issues/752"
+  step "ship" {
+    agentless
+    goal "Ship it."
+  }
+}
+```
+
+Each name is unique within its declaration. `uri` is an absolute URI of any scheme, up to 4096
+bytes, and is kept byte for byte; st does not open it or start an observer. Use percent escapes
+for whitespace and non-ASCII characters. `reason` is optional and, when present, must not be blank.
+These `resource` children accept no child block.
+
+A named resource is an ordinary addressable smallclaims subject in the graph, not a list kept
+beside it. The publication declares `resource/uri/SHA256`, where `SHA256` is the lowercase hex
+SHA-256 of the exact URI's bytes, of kind `uri.reference` with an immutable `uri`. There is no URI
+normalization: spelling differences, including percent-escape case, produce different subjects.
+Every declaration of the same exact URI shares one subject, regardless of its local name or
+reason, and no run owns it. The seat or mission stores only typed edges `{name, subject, reason?}`;
+the URI lives on the referenced subject. Client v0 resolves these edges and shows them read-only
+as `resources` on agents and missions; `st subject show AGENT --kdl` writes them back as
+`resource` children.
+
+Reapplying a seat declaration or publishing a new mission revision replaces that owner's edge
+list. Omitting a resource drops its edge, not the shared subject or another owner's references.
+Changing a resource's URI points the edge at a different subject; it does not mutate the old
+subject's URI. A nested or loop mission body cannot name resources, because only a published
+top-level mission declares them.
+
 ## Ordered queue authoring
 
 Use `queue` when source order is an intentional one-at-a-time workflow.
