@@ -362,8 +362,9 @@ pub struct Store {
     /// Serializes projection passes while they lend the writer back between chunks.
     pub projection: Mutex<()>,
     pub replication_timers: ReplicationTimers,
-    /// Admitted replicated claims wait for a projection a catching-up node deferred.
-    pub replication_projection_deferred: AtomicBool,
+    /// Low bit means deferred; each new deferral advances the generation by two so an
+    /// older projection pass cannot clear a newer admission or catch-up deferral.
+    replication_projection_state: AtomicU64,
     /// When this process last projected replicated claims, in Unix milliseconds.
     pub last_replication_projection_unix_ms: AtomicU64,
     /// The heals this node asks its peers, and when it last replayed its graph for one.
@@ -498,7 +499,7 @@ impl Store {
             admission: Mutex::new(()),
             projection: Mutex::new(()),
             replication_timers: ReplicationTimers::default(),
-            replication_projection_deferred: AtomicBool::new(false),
+            replication_projection_state: AtomicU64::new(0),
             last_replication_projection_unix_ms: AtomicU64::new(0),
             heal: Mutex::default(),
             member_key: std::sync::RwLock::new(None),
@@ -5343,6 +5344,9 @@ impl Store {
                         }
                     }
                 }
+                if outcome.changed {
+                    self.defer_replication_projection();
+                }
                 pass.commit()?;
                 #[cfg(any(test, feature = "test-support"))]
                 ADMISSION_TRANSACTIONS.with(|count| count.set(count.get() + 1));
@@ -5385,8 +5389,7 @@ impl Store {
                 .load(Ordering::Acquire),
         );
         if since < CATCH_UP_PROJECTION_INTERVAL_MS && self.replication_catching_up() {
-            self.replication_projection_deferred
-                .store(true, Ordering::Release);
+            self.defer_replication_projection();
             return Ok(None);
         }
         self.project_replication_backlog().map(Some)
@@ -5394,7 +5397,15 @@ impl Store {
 
     /// Whether admitted replicated claims wait for a deferred projection.
     pub fn replication_projection_deferred(&self) -> bool {
-        self.replication_projection_deferred.load(Ordering::Acquire)
+        self.replication_projection_state.load(Ordering::Acquire) & 1 != 0
+    }
+
+    fn defer_replication_projection(&self) {
+        let _ = self.replication_projection_state.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |state| Some(state.wrapping_add(2) | 1),
+        );
     }
 
     /// Replay the graph from nothing now, as a heal does when two nodes project different graphs
@@ -5421,23 +5432,32 @@ impl Store {
     }
 
     pub fn project_replication_backlog(&self) -> Result<bool> {
-        self.project_replication_backlog_chunks(|| {})
+        self.project_replication_backlog_chunks(|| {}, || {})
     }
 
     /// Exercise reads and queued writes between committed projection chunks.
     #[cfg(any(test, feature = "test-support"))]
     pub fn project_replication_backlog_with_yield(&self, between: impl FnMut()) -> Result<bool> {
-        self.project_replication_backlog_chunks(between)
+        self.project_replication_backlog_chunks(between, || {})
     }
 
-    fn project_replication_backlog_chunks(&self, mut between: impl FnMut()) -> Result<bool> {
+    /// Force an admission or deferral after the final index read, before clearing its state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn project_replication_backlog_before_clear(&self, before_clear: impl FnMut()) -> Result<bool> {
+        self.project_replication_backlog_chunks(|| {}, before_clear)
+    }
+
+    fn project_replication_backlog_chunks(
+        &self,
+        mut between: impl FnMut(),
+        mut before_clear: impl FnMut(),
+    ) -> Result<bool> {
         let _projecting = self
             .projection
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let _timing = time_stage(&self.replication_timers.projection);
-        self.replication_projection_deferred
-            .store(true, Ordering::Release);
+        self.defer_replication_projection();
         self.last_replication_projection_unix_ms
             .store(now_ms() as u64, Ordering::Release);
         // Finish the backlog observed at entry. New receives can admit more between chunks;
@@ -5526,6 +5546,11 @@ impl Store {
                     params![through, now_ms().to_string()],
                 )?;
                     transaction.commit()?;
+                    // Snapshot while admission is excluded by the writer. Admission marks
+                    // deferred before its commit, so sampling during one could otherwise
+                    // mistake its not-yet-committed claims for an empty backlog.
+                    let projection_state =
+                        self.replication_projection_state.load(Ordering::Acquire);
                     drop(connection);
                     // Readers may have cached the preceding prefix at the same admitted store
                     // index. Its projection changed even when no additional claim arrived.
@@ -5540,8 +5565,18 @@ impl Store {
                     if self.verdicts_due.swap(false, Ordering::AcqRel) {
                         self.judge_claims(true)?;
                     }
-                    self.replication_projection_deferred
-                        .store(through < self.index()?, Ordering::Release);
+                    // Admission and catch-up deferral can run after this index read. Clear
+                    // only the generation observed before it; a newer deferral must survive.
+                    let pending = through < self.index()?;
+                    before_clear();
+                    if !pending {
+                        let _ = self.replication_projection_state.compare_exchange(
+                            projection_state,
+                            projection_state & !1,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
                     return Ok(true);
                 }
                 Err(error) => {

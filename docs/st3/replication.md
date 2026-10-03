@@ -457,7 +457,9 @@ as long as the whole graph takes.
 
 Incremental catch-up projection commits at most 128 newly admitted claims per transaction and
 returns the writer between chunks, so queued messages and lease renewals can run. Each commit
-records the frontier actually projected. Sync comparisons remain deferred until the pass has
+records the frontier actually projected. Admissions and catch-up deferrals advance a generation;
+the final pass clears only the generation it observed while holding the writer, so it cannot
+overwrite a newer deferral. Sync comparisons remain deferred until the pass has
 reached its starting backlog and no later admitted claims remain. A dirty aggregate still
 rebuilds from its complete canonical history; the chunk limit does not bound that history or a
 fallback replay. The regression interleaves local writes with committed prefixes and checks the

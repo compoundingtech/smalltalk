@@ -21686,6 +21686,67 @@ fn a_large_page_is_admitted_in_chunks_that_release_the_writer() {
 
 #[cfg(test)]
 #[test]
+fn catch_up_projection_cannot_clear_an_admission_deferred_after_its_index_read() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    for index in 0..1_800 {
+        source
+            .put_document(
+                &format!("doc/late-admission/{index}"),
+                b"An invented late admission.",
+                &None,
+                &format!("late-admission-{index}"),
+            )
+            .unwrap();
+    }
+    assert!(
+        target
+            .project_replication_backlog_before_clear(|| {
+                // Pass A has already observed no pending claims. Admit a new page and defer
+                // pass B before A tries to clear that observation, deterministically.
+                let mut inventory = target.replication_inventory().unwrap();
+                inventory.accepts = None;
+                let exchange = source
+                    .export_replication_exchange(FLEET, &inventory)
+                    .unwrap();
+                target
+                    .receive_replication_exchange("source", FLEET, &exchange)
+                    .unwrap();
+                assert!(target.validate_replication_backlog().unwrap().changed);
+                assert!(target.replication_catching_up());
+                assert_eq!(
+                    target
+                        .project_replication_backlog_unless_catching_up()
+                        .unwrap(),
+                    None
+                );
+                assert!(target.replication_projection_deferred());
+            })
+            .unwrap()
+    );
+    assert!(target.projected_through() < target.index().unwrap());
+    assert!(
+        target.replication_projection_deferred(),
+        "an older projection cleared the newer admission's deferral"
+    );
+    target
+        .last_replication_projection_unix_ms
+        .store(0, Ordering::Release);
+    assert_eq!(
+        target
+            .project_replication_backlog_unless_catching_up()
+            .unwrap(),
+        Some(true)
+    );
+    assert!(!target.replication_projection_deferred());
+    assert_eq!(target.projected_through(), target.index().unwrap());
+}
+
+#[cfg(test)]
+#[test]
 fn catch_up_projection_commits_frontiers_and_serves_writes_between_them() {
     const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
     let source = Store::open_memory("source").unwrap();
