@@ -16,5 +16,8 @@
 # Assembled by the `pi-extension-types` check from pinned tarballs; never committed.
 crates/st-drivers/hooks/typecheck/node_modules/
 
+# Local TypeScript client test dependencies.
+clients/typescript/st3-client/node_modules/
+
 # Pinned flake input made available to the CI generators by the devShell.
 /repos/

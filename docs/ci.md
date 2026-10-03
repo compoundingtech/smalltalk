@@ -23,7 +23,7 @@ and the gate has only `contents: read` permission. Forks do not receive publishi
 The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
 `linux-gate` is the single required check: it needs the three jobs and passes only when every one of
 them succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
-`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm` and the `linux-gate`
+`nscloud-ubuntu-24.04-amd64-8x16`; `genie-freshness`, `isolation-vm`, `typescript-client` and the `linux-gate`
 aggregate use `namespace-profile-linux-x86-64`. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
@@ -165,6 +165,18 @@ image does not boot. They run in a NixOS VM (`nix/transport-isolation-vm.nix`) i
 The VM requires all three tests to run and pass, with no isolation opt-out. The job summary
 records the KVM probe and each phase's elapsed time.
 
+### TypeScript client
+
+`typescript-client` runs on every PR, merge-group entry and main push. It installs Node 24.18.0
+(the workspace uses Node 24), TypeScript 6.0.3 from the iOS lockfile and the client's pinned
+`effect@4.0.0-rc.118` development dependency. Both `node_modules` directories are cached together,
+keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
+
+`bash scripts/ci-typescript-client` runs the client's contract and schema tests with `node --test`,
+the README's strict raw-client and rich-schema typechecks, and `tsc --noEmit -p apps/ios`.
+The iOS project allows explicit TypeScript import extensions for generated-client consumers.
+The job starts non-required; add it to the main ruleset only after a successful main run.
+
 ### macOS
 
 The non-required `macos-ci` job uses `namespace-profile-macos-arm64` and runs on PR events while
@@ -187,7 +199,7 @@ warm caches kept on the machine. GitHub has no overflow between runner labels, s
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
 through the API and picks one pool for the whole run:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 5, the jobs a run starts at once) runners with that
+- `ci1` when at least `CI1_MIN_IDLE` (default 6, the jobs a run starts at once) runners with that
   label are online and idle; merge-group runs ask for `ci1-merge`, which a runner reserved for the
   merge queue also carries, so queued merges never wait behind pull request pushes;
 - Namespace otherwise, exactly as above: when ci1 is busy or offline, when the runner list is
@@ -360,9 +372,9 @@ on 2026-10-01 recorded the workspace limits with `nsc workspace concurrency --ou
 
 Namespace limits CPU and memory per platform; a workflow run is not a fixed unit of capacity.
 With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts three
-8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 40 vCPUs and 80 GiB at peak.
-PR and main runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB.
-Five complete merge-queue groups need 200 vCPUs and 400 GiB, within the Linux pool limit;
+8-vCPU/16-GiB stage jobs and three 8-vCPU/16-GiB profile jobs: 48 vCPUs and 96 GiB at peak.
+PR and main runs also start `perf-cost`, taking their initial peak to 56 vCPUs and 112 GiB.
+Five complete merge-queue groups need 240 vCPUs and 480 GiB, within the Linux pool limit;
 `max_entries_to_build` remains 5 in both the generated and live main rulesets.
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
 are available. The `linux-gate` aggregate starts after the three stage jobs finish, so it does

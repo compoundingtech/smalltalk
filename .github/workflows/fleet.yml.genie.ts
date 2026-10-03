@@ -148,6 +148,34 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       nix: { binaryCaches: readOnlyBinaryCaches },
       step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && genie --check'] }),
     }),
+    // Start non-required; add this check to the ruleset only after it passes on main.
+    'typescript-client': {
+      name: 'typescript-client',
+      ...afterPickRunner,
+      'runs-on': linuxRunsOn,
+      'timeout-minutes': 10,
+      defaults: { run: { shell: 'bash' } },
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+        // Node 24, as in the workspace shell; schema tests use its native TypeScript loading.
+        { uses: 'actions/setup-node@v4', with: { 'node-version': '24.18.0' } },
+        {
+          name: 'Cache the locked TypeScript and Effect toolchain',
+          id: 'typescript-cache',
+          uses: 'actions/cache@v4',
+          with: {
+            path: 'apps/ios/node_modules\nclients/typescript/st3-client/node_modules',
+            key: "typescript-client-${{ runner.os }}-node24.18.0-${{ hashFiles('apps/ios/package-lock.json', 'clients/typescript/st3-client/package-lock.json') }}",
+          },
+        },
+        {
+          name: 'Install locked dependencies',
+          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
+          run: 'npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund\nnpm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund',
+        },
+        { name: 'Run client contracts, schemas and strict typechecks', run: 'bash scripts/ci-typescript-client' },
+      ],
+    },
     // The Linux gate runs as three jobs on separate runners, each with its own caches.
     // `linux-gate` below is the single required check that collects them.
     'linux-tests': linuxStageJob({

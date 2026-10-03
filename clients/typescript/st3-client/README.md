@@ -6,6 +6,9 @@ The client uses standard `fetch`, so callers can supply a fetch implementation a
 
 Run the local contract checks with:
 
+CI installs the locked iOS and client development dependencies and runs all the commands below,
+plus the iOS project typecheck, with `bash scripts/ci-typescript-client`.
+
 ```sh
 cargo run -p st3-client-codegen -- --check
 apps/ios/node_modules/.bin/tsc --strict --noEmit --target ES2020 --module esnext --moduleResolution bundler --lib es2020,dom clients/typescript/st3-client/index.ts clients/typescript/st3-client/types.test.ts

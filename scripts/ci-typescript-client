@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+tsc=apps/ios/node_modules/.bin/tsc
+client=clients/typescript/st3-client
+
+node --test "$client/contract.test.cjs" "$client/schema.test.cjs"
+"$tsc" --strict --noEmit --allowImportingTsExtensions --target ES2020 --module esnext --moduleResolution bundler --lib es2020,dom "$client/index.ts" "$client/types.test.ts"
+"$tsc" --strict --exactOptionalPropertyTypes --noEmit --target ES2024 --module esnext --moduleResolution bundler --lib esnext,dom "$client/Schema.generated.ts"
+"$tsc" --noEmit -p apps/ios

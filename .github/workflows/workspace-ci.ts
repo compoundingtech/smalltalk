@@ -28,8 +28,8 @@ export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-a
  */
 export const pickRunnerJobId = 'pick-runner'
 
-/** Jobs a run starts at once (three Linux stages, isolation-vm, genie-freshness): ci1 needs this many idle. */
-const ci1JobsAtOnce = 5
+/** Jobs a run starts at once (three stages, isolation-vm, genie-freshness, typescript-client). */
+const ci1JobsAtOnce = 6
 
 export const pickRunnerJob = {
   name: pickRunnerJobId,
