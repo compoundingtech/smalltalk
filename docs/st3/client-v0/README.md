@@ -1053,3 +1053,30 @@ Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and S
 Messages tagged `dictated` carry a delivery-only line explaining that voice transcription may
 contain mistakes. The stored text and body digest stay unchanged. Timeline message bodies carry
 the message's optional `tags` array so clients can mark dictation without inspecting its text.
+
+### Work reports and evidence
+
+`Work` and a mission detail's embedded `MissionStep` carry optional `progress_report` and
+`completion_report` objects. Each is the latest report with nonempty summary or evidence for its kind in the step's
+current attempt, with `claim_id` (the immutable originating claim hash), `attempt`, `at` (the
+claim's acceptance time), `summary`, and `evidence`. Reports remain available on exact and
+historical detail reads after the step and its owner finish. `last_progress` remains the
+latest nonempty progress summary for compatibility; it is never replaced with the completion
+result. Evidence-only reports use an empty summary string and do not erase the legacy summary.
+
+A completion report means the worker submitted that result. It does not mean verification
+passed, or that a queued PR merged: use the step's state and the actual report text. Retries
+clear both displayed reports until the new attempt reports. Superseded generations retain
+reports on their own historical step IDs; reports from earlier attempts stay in subject
+history and are not presented as current results. There are at most two reports per step,
+not an unbounded report-history array; existing collection pagination and response bounds
+apply.
+
+Each evidence item has `kind` and the unchanged `reference`: `document` for an immutable
+`doc/...@HASH`, `external` for HTTP(S) links, `claim` for claim hashes, `subject` for known
+graph subject prefixes, and `unknown` otherwise. Classification describes a reference's
+shape, without validating its existence or granting authority. Empty evidence is `[]`.
+Clients must retain unknown references and must not turn them into executable actions.
+`st work show` and `st missions show` display progress and completion separately, with
+copyable `st documents get` or subject-detail commands for navigable references. External
+links are printed as links. `st subject history STEP` remains the full audit view.

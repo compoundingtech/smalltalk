@@ -857,11 +857,13 @@ export type MissionStep = {
   blocked_reason?: string | null;
   blockers?: Array<Id>;
   claimant?: (AgentId | null);
+  completion_report?: (WorkReport | null);
   constraints?: Array<string>;
   goals?: Array<string>;
   id: Id;
   last_progress?: string | null;
   path: string;
+  progress_report?: (WorkReport | null);
   since: Timestamp;
   state: WorkState;
   title?: string | null;
@@ -1612,6 +1614,7 @@ export type Work = ResourceHeader & {
   claim_expires_at_unix_ms?: number | null;
   claim_incarnation?: string | null;
   claimant?: (Id | null);
+  completion_report?: (WorkReport | null);
   constraints: Array<string>;
   definition_id: Revision;
   execution_elapsed_ms?: number;
@@ -1625,11 +1628,17 @@ export type Work = ResourceHeader & {
   mission_run_id: Id;
   path: string;
   person_answers?: Array<PersonAnswerRecord>;
+  progress_report?: (WorkReport | null);
   readiness_epoch: number;
   state: WorkState;
   timeout_ms?: number | null;
   title?: string | null;
   usage?: (UsageSummary | null);
+};
+
+export type WorkEvidence = {
+  kind: "document" | "external" | "claim" | "subject" | "unknown";
+  reference: string;
 };
 
 export type WorkLabel = {
@@ -1641,6 +1650,14 @@ export type WorkLabel = {
   since: Timestamp;
   state: WorkState;
   title?: string | null;
+};
+
+export type WorkReport = {
+  at: Timestamp;
+  attempt: number;
+  claim_id: Revision;
+  evidence: Array<WorkEvidence>;
+  summary: string;
 };
 
 export type WorkState = "waiting-person" | "waiting" | "ready" | "claimed" | "blocked" | "verifying" | "completed" | "failed" | "cancelled";

@@ -1284,6 +1284,23 @@ export const MissionRunOutcome = /*#__PURE__*/ (() => Schema.Struct({
 export type MissionRunOutcome = typeof MissionRunOutcome.Type
 export type MissionRunOutcomeEncoded = typeof MissionRunOutcome.Encoded
 
+export const WorkEvidence = /*#__PURE__*/ (() => Schema.Struct({
+  "kind": Schema.Literals(["document","external","claim","subject","unknown"]),
+  "reference": Schema.String
+}).annotate({ identifier: "WorkEvidence" }))()
+export type WorkEvidence = typeof WorkEvidence.Type
+export type WorkEvidenceEncoded = typeof WorkEvidence.Encoded
+
+export const WorkReport = /*#__PURE__*/ (() => Schema.Struct({
+  "at": Timestamp,
+  "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "claim_id": Revision,
+  "evidence": Schema.Array(WorkEvidence),
+  "summary": Schema.String
+}).annotate({ identifier: "WorkReport" }))()
+export type WorkReport = typeof WorkReport.Type
+export type WorkReportEncoded = typeof WorkReport.Encoded
+
 export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "agentless": optionalKey(Schema.Boolean),
   "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
@@ -1291,11 +1308,13 @@ export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "blocked_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "blockers": optionalKey(Schema.Array(Id)),
   "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
+  "completion_report": Schema.OptionFromOptionalNullOr(WorkReport, NULL_NONE),
   "constraints": optionalKey(Schema.Array(Schema.String)),
   "goals": optionalKey(Schema.Array(Schema.String)),
   "id": Id,
   "last_progress": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "path": Schema.String,
+  "progress_report": Schema.OptionFromOptionalNullOr(WorkReport, NULL_NONE),
   "since": Timestamp,
   "state": WorkState,
   "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
@@ -1525,6 +1544,7 @@ export const Work = /*#__PURE__*/ (() => Schema.Struct({
   "claim_expires_at_unix_ms": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.DateTimeUtcFromMillis.check(epochRange))), NULL_NONE),
   "claim_incarnation": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "claimant": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
+  "completion_report": Schema.OptionFromOptionalNullOr(WorkReport, NULL_NONE),
   "constraints": Schema.Array(Schema.String),
   "definition_id": Revision,
   "execution_elapsed_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.Duration.check(durationMillisRange), wholeUnits(1)))),
@@ -1542,6 +1562,7 @@ export const Work = /*#__PURE__*/ (() => Schema.Struct({
   "path": Schema.String,
   /** Responses to the asks this attempt made, or a person ask's own response. */
   "person_answers": optionalKey(Schema.Array(PersonAnswerRecord)).annotate({ description: "Responses to the asks this attempt made, or a person ask's own response." }),
+  "progress_report": Schema.OptionFromOptionalNullOr(WorkReport, NULL_NONE),
   "readiness_epoch": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "revision": Revision,
   "state": WorkState,
