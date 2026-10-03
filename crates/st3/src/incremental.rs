@@ -18,9 +18,10 @@ use serde_json::Value;
 
 use crate::store::{Change, Store};
 
-#[derive(Default)]
+/// Shared, so a file watcher or timer can mark what it changed.
+#[derive(Clone, Default)]
 pub struct Incremental {
-    state: Mutex<State>,
+    state: std::sync::Arc<Mutex<State>>,
 }
 
 #[derive(Default)]
@@ -32,7 +33,12 @@ struct State {
     readers: HashMap<String, BTreeSet<String>>,
     /// The last status seen for each exec runtime an item waits on (`exec:` keys).
     execs: HashMap<String, Option<String>>,
+    /// When the last full pass ran.
+    last_full: Option<u128>,
 }
+
+/// How often a pass evaluates every item even when nothing marked them, counting what it corrects.
+pub const FULL_PASS_INTERVAL_MS: u128 = 60_000;
 
 struct Item {
     reads: BTreeSet<String>,
@@ -98,6 +104,49 @@ impl Incremental {
             }
         }
         Ok(())
+    }
+
+    /// Mark the items that read `key`, for a change that is not a claim, such as a watched file.
+    pub fn touch(&self, key: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let readers = state.readers.get(key).cloned().unwrap_or_default();
+        for item in readers {
+            if let Some(item) = state.items.get_mut(&item) {
+                item.dirty = true;
+            }
+        }
+    }
+
+    /// Whether this pass must evaluate every item: the first since a start, or the first after
+    /// [`FULL_PASS_INTERVAL_MS`]. Records it as the last full pass.
+    pub fn take_full_pass(&self, now: u128) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = state
+            .last_full
+            .is_none_or(|last| now.saturating_sub(last) >= FULL_PASS_INTERVAL_MS);
+        if due {
+            state.last_full = Some(now);
+        }
+        due
+    }
+
+    /// What `item`'s last evaluation read.
+    pub fn reads_of(&self, item: &str) -> BTreeSet<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .items
+            .get(item)
+            .map(|item| item.reads.clone())
+            .unwrap_or_default()
     }
 
     /// Look again at every exec runtime an item read (`exec:{runtime}`), and mark the items that
