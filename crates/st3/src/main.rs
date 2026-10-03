@@ -16715,7 +16715,8 @@ async fn run_pi_channel(
     };
     let mut todo_observations = if driver == "omp" && observer.is_none() {
         anyhow::ensure!(
-            current_agent_incarnation(client, subject).await?.as_deref() == Some(&incarnation),
+            retry_while_daemon_unreachable(subject, || current_agent_incarnation(client, subject))
+                .await?.as_deref() == Some(&incarnation),
             "todo channel runtime was superseded",
         );
         let dir = prepare_channel_todo_outbox(catalog, subject, &incarnation)?;
