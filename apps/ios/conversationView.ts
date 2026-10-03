@@ -253,7 +253,7 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
   const delivered = new Set<string>();
   let mail: Record<string, unknown> | undefined;
   const push = (entry: Entry, id: string, body: Body) => stamped.push({ id, at: clock(entry.timestamp), timestamp: entry.timestamp, body });
-  // Entries arrive in st's order (applyConversation keeps them by sequence).
+  // Entries arrive in st's order (applyConversation keeps them by time, then sequence).
   for (const entry of timeline) {
     const body = record(entry.body);
     if (entry.type === 'message') {

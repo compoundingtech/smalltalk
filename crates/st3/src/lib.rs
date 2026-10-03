@@ -17,6 +17,8 @@ pub mod driver_hook;
 pub mod environment;
 pub(crate) mod external_sessions;
 pub mod fleet;
+/// What an `st` command run inside an exec gate reports about itself.
+pub mod gate_report;
 pub mod graph;
 pub mod harness_events;
 /// The lifecycle hook set st3 publishes beneath its own state directory.

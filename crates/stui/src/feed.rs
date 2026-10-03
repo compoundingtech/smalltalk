@@ -97,6 +97,8 @@ pub enum Update {
     /// earlier entry is gone; otherwise they are new or revised entries, matched by ID.
     Conversation {
         target: String,
+        /// The session the entries belong to: earlier pages are read from its timeline.
+        session_id: String,
         replace: bool,
         has_more: bool,
         items: Vec<TimelineEntry>,
@@ -438,10 +440,10 @@ async fn connected(
                             return Ended::Dropped(error.to_string());
                         }
                     }
-                    CollectionEvent::Conversation { id, replace, items, has_more, .. } => {
+                    CollectionEvent::Conversation { id, session_id, replace, items, has_more } => {
                         let Some(current) = conversing.iter_mut().find(|current| current.id == id) else { continue };
                         current.failures = 0;
-                        if updates.send(Update::Conversation { target: current.target.clone(), replace, has_more, items }).is_err() {
+                        if updates.send(Update::Conversation { target: current.target.clone(), session_id, replace, has_more, items }).is_err() {
                             return Ended::Closed;
                         }
                     }
