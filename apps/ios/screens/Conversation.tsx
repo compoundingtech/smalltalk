@@ -1,5 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { FlatList, Keyboard, KeyboardAvoidingView, Platform, Pressable, StyleSheet, TextInput, View } from 'react-native';
+import { ActionSheetIOS, FlatList, Image, Keyboard, KeyboardAvoidingView, Platform, Pressable, StyleSheet, TextInput, View } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
+import * as Clipboard from 'expo-clipboard';
 import { useFocusEffect } from '@react-navigation/native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -8,7 +10,8 @@ import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
 import { tokenColor, type ConversationRules } from '../conversationStyle';
-import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
+import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry, type MailImage } from '../conversationView';
+import { addImages, fromDataUri, MAX_IMAGES, megabytes, picked, type Picked } from '../images';
 import { rememberBounded } from '../boundedCache';
 import { simplify, type SimpleRow } from '../conversationSimple';
 import { dictationAvailable, startDictation } from '../modules/st-dictation';
@@ -24,7 +27,7 @@ const RULES: ConversationRules = rules;
 const c = tokenColor;
 
 const empty: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1 };
-type Pending = { id: string; text: string; at: string; failed?: string };
+type Pending = { id: string; text: string; at: string; failed?: string; images?: number };
 type Row = { kind: 'entry'; entry: ConversationEntry } | Exclude<SimpleRow, { kind: 'entry' }> | { kind: 'pending'; pending: Pending } | { kind: 'older' };
 
 function nowClock() {
@@ -66,6 +69,9 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   // and whether the draft came from dictation (it is sent tagged so, as it may hold mistakes).
   const [listening, setListening] = useState(false), [heard, setHeard] = useState(''), [levels, setLevels] = useState<number[]>([]);
   const [dictated, setDictated] = useState(false);
+  // Images to send with the next message, picked or pasted, and why any were refused.
+  const [images, setImages] = useState<Picked[]>([]);
+  const [imageIssue, setImageIssue] = useState('');
   const stopListening = useRef<(() => Promise<string>) | null>(null);
   const box = useRef<TextInput>(null);
   /** Empty the message box. Clearing it natively too lets it shrink back to one line; with the
@@ -167,18 +173,41 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   async function send(spoken?: string) {
     // Words sent straight from dictation (its send button) skip the box.
     const text = (spoken ?? draft).trim();
-    if (!agent || !text) return;
-    const item: Pending = { id: `pending-${Date.now()}`, text, at: nowClock() };
+    const sending = images;
+    if (!agent || (!text && !sending.length)) return;
+    const item: Pending = { id: `pending-${Date.now()}`, text, at: nowClock(), ...(sending.length ? { images: sending.length } : {}) };
     setPending(previous => [...previous, item]);
     if (spoken === undefined) emptyBox();
+    setImages([]); setImageIssue('');
     // To the newest, where the message appears: animated from nearby, a jump from far up, since an
     // animation across the whole conversation reads as the list scrolling everything again.
     list.current?.scrollToOffset({ offset: 0, animated: offset.current < 1200 });
     const tags = dictated || spoken !== undefined ? ['dictated'] : undefined;
     setDictated(false);
-    const failed = await actions.send(agent.id, text, agent.current_session_id ?? undefined, tags);
+    const failed = await actions.send(agent.id, text, agent.current_session_id ?? undefined, tags, sending);
+    // Images that did not go stay ready to send again.
+    if (failed && sending.length) setImages(previous => addImages(sending, previous).images);
     if (failed) setPending(previous => previous.map(candidate => candidate.id === item.id ? { ...candidate, failed } : candidate));
     else setTimeout(() => setPending(previous => previous.filter(candidate => candidate.id !== item.id)), 60_000);
+  }
+  // An image from the photo library or the clipboard, for the next message.
+  function attach() {
+    const pick = async () => {
+      const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsMultipleSelection: true, selectionLimit: Math.max(1, MAX_IMAGES - images.length), base64: true, quality: 0.85 });
+      if (result.canceled) return;
+      const more = result.assets.map(asset => asset.base64 ? picked(asset.base64, asset.mimeType ?? 'image/jpeg', asset.fileName ?? undefined) : `${asset.fileName ?? 'That image'} could not be read.`);
+      const next = addImages(images, more);
+      setImages(next.images); setImageIssue(next.refused);
+    };
+    const paste = async () => {
+      const image = await Clipboard.getImageAsync({ format: 'png' });
+      const next = addImages(images, [image ? fromDataUri(image.data, 'Pasted image') : 'The clipboard holds no image.']);
+      setImages(next.images); setImageIssue(next.refused);
+    };
+    ActionSheetIOS.showActionSheetWithOptions({ options: ['Photo library', 'Paste image', 'Cancel'], cancelButtonIndex: 2 }, index => {
+      if (index === 0) void pick().catch(error => setImageIssue(String(error instanceof Error ? error.message : error)));
+      if (index === 1) void paste().catch(error => setImageIssue(String(error instanceof Error ? error.message : error)));
+    });
   }
   async function listen() {
     setHeard(''); setLevels([]);
@@ -255,8 +284,19 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
         <Button label="done" color={theme.subtext0} onPress={() => void finishListening('edit')} />
         <Button label="send" disabled={!canSend} onPress={() => void finishListening('send')} />
       </View>
-    </View> : agent ? <View style={[styles.composer, { paddingBottom: bottom }]}>
-      <T color={theme.accent} style={styles.prompt}>›</T>
+    </View> : agent ? <View>
+    {images.length || imageIssue ? <View style={styles.tray}>
+      {images.map(image => <View key={image.key}>
+        <Image source={{ uri: `data:${image.mediaType};base64,${image.base64}` }} style={styles.thumb} accessibilityLabel={image.name ?? 'image to send'} />
+        <Pressable accessibilityRole="button" accessibilityLabel={`Remove ${image.name ?? 'image'}`} hitSlop={8} onPress={() => setImages(previous => previous.filter(other => other.key !== image.key))} style={styles.unthumb}><T bold color={theme.text}>✕</T></Pressable>
+        <T dim style={{ fontSize: 10 }}>{megabytes(image.bytes)}</T>
+      </View>)}
+      {imageIssue ? <T color={theme.waiting} style={{ flex: 1 }}>{imageIssue}</T> : null}
+    </View> : null}
+    <View style={[styles.composer, { paddingBottom: bottom }]}>
+      <Pressable accessibilityRole="button" accessibilityLabel="Attach an image" hitSlop={8} onPress={attach} disabled={images.length >= MAX_IMAGES} style={styles.prompt}>
+        <T color={images.length >= MAX_IMAGES ? theme.overlay0 : theme.accent} style={{ fontSize: 18 }}>＋</T>
+      </Pressable>
       {/* The microphone sits inside the box, at its right edge, over the text's padding. */}
       <View style={{ flex: 1 }}>
         <Field
@@ -273,7 +313,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
           <T style={{ fontSize: 17 }}>🎙</T>
         </Pressable> : null}
       </View>
-      <Button label="send" disabled={!canSend || !draft.trim()} onPress={() => void send()} style={styles.send} />
+      <Button label="send" disabled={!canSend || (!draft.trim() && !images.length)} onPress={() => void send()} style={styles.send} />
+    </View>
     </View> : session ? <View style={[styles.composer, { paddingBottom: bottom }]}><T dim>{session.managed === false ? 'not started by st · read only' : 'this session has ended · read only'}</T></View> : null}
   </KeyboardAvoidingView>;
 }
@@ -297,7 +338,7 @@ function AgentStrip({ agent, onMission }: { agent: NonNullable<ReturnType<typeof
 const PendingView = memo(function PendingView({ pending }: { pending: Pending }) {
   const rule = RULES.pending;
   return <View style={[styles.entry, styles.barred, { borderLeftColor: c(pending.failed ? rule.failed : rule.sending_edge) }]}>
-    <T color={c(pending.failed ? rule.failed : rule.sending.color)}>{pending.failed ? `you · not sent: ${pending.failed}` : rule.sending.text}<T dim>  {pending.at}</T></T>
+    <T color={c(pending.failed ? rule.failed : rule.sending.color)}>{pending.failed ? `you · not sent: ${pending.failed}` : rule.sending.text}<T dim>  {pending.at}{pending.images ? `  🖼 ${pending.images}` : ''}</T></T>
     <Markdown selectable={false} text={pending.text} color={c(rule.text)} />
   </View>;
 });
@@ -393,7 +434,7 @@ const MailView = memo(function MailView({ entry, body, open, onToggle, brief = f
     const lines = body.text.split('\n').map(line => line.trim()).filter(Boolean);
     return <Pressable accessibilityRole="button" accessibilityState={{ expanded: false }} onPress={() => onToggle(entry.id)}
       style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }]}>
-      <T numberOfLines={1}><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T color={c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}</T>
+      <T numberOfLines={1}><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T color={c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}{body.images ? <T dim>  🖼 {body.images.length}</T> : null}</T>
       <T numberOfLines={1} color={c(look.text)}>{lines[0] ?? ''}{lines.length > 1 ? ' …' : ''}</T>
     </Pressable>;
   }
@@ -403,13 +444,35 @@ const MailView = memo(function MailView({ entry, body, open, onToggle, brief = f
     <View style={long && !open ? { maxHeight: limit, overflow: 'hidden' } : null}>
       {/* Measured at its full height and never shrunk by the fold: a measurement the fold could
           change would fold and unfold the mail in a loop. */}
-      <View style={{ flexShrink: 0 }} onLayout={event => { const next = event.nativeEvent.layout.height; setHeight(previous => Math.max(previous, next)); }}><Markdown selectable={false} text={body.text} color={c(look.text)} /></View>
+      <View style={{ flexShrink: 0 }} onLayout={event => { const next = event.nativeEvent.layout.height; setHeight(previous => Math.max(previous, next)); }}>{body.text ? <Markdown selectable={false} text={body.text} color={c(look.text)} /> : null}</View>
     </View>
+    {body.images ? <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>{body.images.map(image => <MailImageView key={image.sha256} image={image} />)}</View> : null}
     {long ? <T color={c(RULES.tool.collapse.color)}>{open ? `  ${RULES.tool.collapse.text}` : '  … more · tap to show'}</T> : null}
   </Pressable>;
 });
 
+// An image a message carries, read from st when shown. Its box keeps one size while it loads,
+// so the conversation does not move under the reader.
+function MailImageView({ image }: { image: MailImage }) {
+  const { actions } = useStore();
+  const [uri, setUri] = useState<string | null>(null), [failed, setFailed] = useState('');
+  useEffect(() => {
+    let live = true;
+    actions.image(image).then(next => { if (live) setUri(next); }, error => { if (live) setFailed(error instanceof Error ? error.message : String(error)); });
+    return () => { live = false; };
+  }, [image.sha256]); // eslint-disable-line react-hooks/exhaustive-deps
+  const label = `${image.name ?? 'image'} · ${megabytes(image.size)}`;
+  return <View style={styles.mailImage} accessibilityLabel={label}>
+    {uri ? <Image source={{ uri }} style={StyleSheet.absoluteFill} resizeMode="contain" />
+      : <T dim style={{ fontSize: 11, padding: 6 }}>{failed ? `🖼 ${label}\n${failed}` : `🖼 ${label}…`}</T>}
+  </View>;
+}
+
 const styles = StyleSheet.create({
+  tray: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 10, paddingTop: 8, backgroundColor: theme.mantle, borderTopColor: theme.surface0, borderTopWidth: StyleSheet.hairlineWidth * 2 },
+  thumb: { width: 56, height: 56, borderRadius: 6, backgroundColor: theme.surface0 },
+  unthumb: { position: 'absolute', top: -6, right: -6, width: 20, height: 20, borderRadius: 10, backgroundColor: theme.surface1, alignItems: 'center', justifyContent: 'center' },
+  mailImage: { width: 200, height: 150, borderRadius: 6, overflow: 'hidden', backgroundColor: theme.surface0 },
   screen: { flex: 1, backgroundColor: theme.base },
   strip: { paddingHorizontal: 12, paddingVertical: 6, borderBottomColor: theme.surface0, borderBottomWidth: StyleSheet.hairlineWidth * 2, backgroundColor: theme.base },
   entry: { paddingHorizontal: 12, paddingVertical: 6 },

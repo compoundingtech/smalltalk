@@ -442,6 +442,24 @@ st documents put --help
 Use an existing reference for `get`; exercise `put` only in disposable state. Check hash visibility,
 version history, exact-byte retrieval, and safe output behavior.
 
+### 17a. `blobs` — images a message carries
+
+Why: a screenshot must reach a seat on another machine without entering sync.
+
+```sh
+st blobs --help
+st blobs put --help
+st blobs put screenshot.png --as person/NAME
+st blobs get --help
+st conversations send --help
+```
+
+`put` keeps a PNG, JPEG, GIF or WebP image of at most 10 MiB on this member and prints
+`blob/<sha256>`. `conversations send --attach FILE` uploads and attaches in one step, and
+`conversations read` lists each attachment with the `blobs get` command that reads it. Exercise
+`get` with the `--message` that carries the image. Check that an image over 10 MiB, a text file
+named `.png`, and a fifth attachment are refused in words.
+
 ### 18. `diagnostic` — an agent's authorized harness-failure path
 
 Why: a worker needs one typed way to report that its own harness failed; ordinary conversation text

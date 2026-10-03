@@ -146,6 +146,7 @@ mod tests {
             in_reply_to: None,
             tags: Vec::new(),
             created_index: 7,
+            attachments: Vec::new(),
         };
         export_messages(directory.path(), &[message.clone()]).unwrap();
         assert!(
@@ -184,6 +185,7 @@ mod tests {
             in_reply_to: None,
             tags: Vec::new(),
             created_index: 8,
+            attachments: Vec::new(),
         };
         export_messages(directory.path(), &[message]).unwrap();
         assert!(

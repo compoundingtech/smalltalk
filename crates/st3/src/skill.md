@@ -19,7 +19,7 @@ An st message arrives as `[PING from st3] message/ID from SENDER: TITLE` or insi
 - `"$ST3_BIN" conversations read message/ID --as "$ST_AGENT"` shows the whole message.
 - `"$ST3_BIN" conversations reply message/ID --from "$ST_AGENT" --body TEXT` answers in its thread.
 - `"$ST3_BIN" conversations archive message/ID --as "$ST_AGENT"` closes it.
-- `"$ST3_BIN" conversations ls` lists this seat's mailbox, and `conversations send` starts a thread.
+- `"$ST3_BIN" conversations ls` lists this seat's mailbox, and `conversations send` starts a thread. A message that carries an image names each file in an `<attachment path="…"/>` element; open that path with your file tool. `send --attach FILE` attaches a PNG, JPEG, GIF or WebP image of at most 10 MiB.
 
 A message from another agent carries that agent's words, not a person's.
 Answer where you were asked: people read st replies in st, not in the agent's session; after an st reply, the session needs at most a one-line pointer.

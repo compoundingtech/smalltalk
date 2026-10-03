@@ -29,6 +29,7 @@ use crate::archive::hydrate_eval;
 use crate::graph::{parse_intent, resolve_document_references};
 #[cfg(test)]
 use crate::model::AttentionRequest;
+use crate::model::ClientReplicated;
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
@@ -57,9 +58,11 @@ use crate::model::{
 use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
+mod client_blobs;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
+mod harness_events;
 mod mailbox;
 mod terminal_view;
 
@@ -411,6 +414,12 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::collection_stream),
         )
         .route("/v1/client/actions", post(client_v0::action))
+        .route(
+            "/v1/client/blobs",
+            post(client_blobs::upload).layer(DefaultBodyLimit::max(client_blobs::UPLOAD_BODY_LIMIT)),
+        )
+        .route("/v1/client/blobs/{id}", get(client_blobs::get))
+        .route("/v1/client/blobs/{id}/chunk", get(client_blobs::chunk))
         .route("/v1/client/pairings", post(client_v0::pairing_begin))
         .route(
             "/v1/client/pairings/{id}/complete",
@@ -501,6 +510,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/page", get(list_messages_page))
         .route("/v1/mailbox", get(mailbox::subscribe))
+        .route("/v1/harness-events", post(harness_events::publish))
         .route("/v1/mailbox/bind", post(mailbox::bind))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
@@ -1060,7 +1070,14 @@ fn client_error_code(code: Option<&str>) -> String {
         | "remote-unavailable"
         | "terminal-unavailable"
         | "terminal-ended"
+        | "blob-too-large"
+        | "unsupported-media-type"
+        | "blob-content-mismatch"
+        | "blob-quota-exceeded"
+        | "blob-not-found"
+        | "blob-expired"
         | "internal" => code.unwrap_or("internal").to_owned(),
+        "too-many-attachments" | "invalid-blob-reference" => "validation-failed".into(),
         "launch-review-not-authorized"
         | "wrong-message-recipient"
         | "lane-approval-denied"
@@ -1298,6 +1315,7 @@ fn client_page_read(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(state),
+        replicated: None,
     })
 }
 
@@ -2590,6 +2608,19 @@ fn client_attention_resources_with_previews(
     Ok(items)
 }
 
+/// A message's attachment as clients see it. `blob` names it in `message.send` and
+/// `GET /v1/client/blobs/{sha256}`; read it with the message that carries it.
+fn client_attachment(attachment: &crate::model::MessageAttachment) -> Value {
+    json!({
+        "blob": format!("blob/{}", attachment.sha256),
+        "sha256": attachment.sha256,
+        "media_type": attachment.media_type,
+        "name": attachment.name,
+        "size": attachment.size,
+        "origin": attachment.origin,
+    })
+}
+
 fn client_message_resources(
     store: &Store,
     person: Option<&str>,
@@ -2652,6 +2683,7 @@ fn client_message_resources(
             "session_id": session_id,
             "in_reply_to": message.in_reply_to,
             "tags": message.tags,
+            "attachments": message.attachments.iter().map(client_attachment).collect::<Vec<_>>(),
             "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
         }));
     }
@@ -3409,6 +3441,7 @@ async fn client_work_history(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(state),
+        replicated: None,
     };
     Ok((Extension(snapshot), Json(page)))
 }
@@ -3623,6 +3656,14 @@ fn remote_unavailable(host: &str) -> ApiError {
     }
 }
 
+/// A read that is not sent for a stated reason, in the shape of an unreachable owner.
+fn remote_unavailable_because(host: &str, reason: &str, message: &str) -> ApiError {
+    let mut error = remote_unavailable(host);
+    error.details.insert("reason".into(), reason.into());
+    error.message = message.into();
+    error
+}
+
 /// How many nodes the furthest route a read tried handed it to, from the attempts it records.
 fn attempt_hops(attempts: Option<&Value>) -> u64 {
     attempts.and_then(Value::as_array).map_or(0, |attempts| {
@@ -3731,7 +3772,44 @@ async fn client_messages(
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
     let (history, actor) = (query.history, query.actor.clone());
-    client_snapshot_page(
+    // An agent another host owns is listed by that host: its messages can reach this node late,
+    // and a list that shows only what has arrived reads as empty while the replica lags.
+    let owner = match actor.as_deref() {
+        Some(actor) => remote_agent_owner(&state, actor).await?,
+        None => None,
+    };
+    let mut replicated = None;
+    if let (Some(owner), Some(actor)) = (owner.as_deref(), actor.as_deref()) {
+        match relayed_messages_page(&state, &session, owner, actor, &query).await {
+            Ok(mut page) => {
+                page.replicated = Some(ClientReplicated {
+                    owner_host_id: owner.to_owned(),
+                    source: "owner".into(),
+                    complete: true,
+                    state: "current".into(),
+                    reason: None,
+                });
+                return Ok((Extension(snapshot), Json(page)));
+            }
+            Err(error) if error.code == "remote-unavailable" => {
+                let lagging = client_sync_notice(&state)
+                    .is_some_and(|notice| notice.peers.iter().any(|peer| peer.host_id == owner));
+                replicated = Some(ClientReplicated {
+                    owner_host_id: owner.to_owned(),
+                    source: "replica".into(),
+                    complete: false,
+                    state: if lagging { "lagging" } else { "unverified" }.into(),
+                    reason: error
+                        .details
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let (snapshot, Json(mut page)) = client_snapshot_page(
         &state,
         snapshot,
         "messages",
@@ -3741,6 +3819,67 @@ async fn client_messages(
         },
     )
     .await
+    .map(|(Extension(snapshot), page)| (snapshot, page))?;
+    page.replicated = replicated;
+    Ok((Extension(snapshot), Json(page)))
+}
+
+/// The host that owns `actor`'s runtime, when that is another host.
+async fn remote_agent_owner(state: &AppState, actor: &str) -> Result<Option<String>, ApiError> {
+    if !actor.starts_with("agent/") {
+        return Ok(None);
+    }
+    let (store, subject) = (state.store.clone(), actor.to_owned());
+    let origin = blocking_store(move || {
+        Ok(store
+            .status(Some(&subject))?
+            .subjects
+            .first()
+            .and_then(|subject| subject.actual_origin.clone()))
+    })
+    .await?;
+    Ok(origin
+        .filter(|origin| origin != state.store.origin())
+        .map(|origin| client_host_id(&origin)))
+}
+
+/// One page of an agent's messages as its owner lists them.
+async fn relayed_messages_page(
+    state: &AppState,
+    session: &client_v0::ClientSession,
+    owner: &str,
+    actor: &str,
+    query: &ClientListQuery,
+) -> Result<ClientResourcePage, ApiError> {
+    if !client_v0::acting_party(session) {
+        return Err(remote_unavailable_because(
+            owner,
+            "not-relayed",
+            "a remote agent's messages are relayed only for a concrete person or agent",
+        ));
+    }
+    let relay = state
+        .client_relay
+        .as_ref()
+        .filter(|relay| relay.reaches(owner))
+        .ok_or_else(|| remote_unavailable(owner))?;
+    let value = relay
+        .read(
+            owner,
+            &crate::peer::ClientReadRequest {
+                authority_actor: session.authority_actor.clone(),
+                relay: None,
+                request: crate::peer::ClientReadOperation::Messages {
+                    actor: actor.to_owned(),
+                    history: query.history,
+                    limit: query.limit.map(|limit| limit.clamp(1, 200)),
+                    cursor: query.cursor.clone(),
+                },
+            },
+        )
+        .await
+        .map_err(|error| remote_read_error(owner, error))?;
+    serde_json::from_value(value).map_err(ApiError::internal)
 }
 
 async fn client_messages_detail(
@@ -3993,6 +4132,7 @@ async fn client_history(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(&state),
+        replicated: None,
     }))
 }
 
@@ -5544,6 +5684,37 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }
         Err(error) => checks.push(DoctorCheck {
             name: "replication".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        }),
+    }
+    match state.store.idempotency_conflicts(5) {
+        Ok((0, _)) => checks.push(DoctorCheck {
+            name: "idempotency-keys".into(),
+            status: "pass".into(),
+            message: "no idempotency key was used for two different requests".into(),
+        }),
+        Ok((count, conflicts)) => checks.push(DoctorCheck {
+            name: "idempotency-keys".into(),
+            status: "warn".into(),
+            message: format!(
+                "{count} idempotency {} used for different requests on different members, as \
+                 members apart during a partition can: each such claim stands, and a retry with \
+                 the key is refused as idempotency-conflict. {}",
+                if count == 1 { "key was" } else { "keys were" },
+                conflicts
+                    .iter()
+                    .map(|claims| claims
+                        .iter()
+                        .map(|(subject, writer)| format!("{subject} by {writer}"))
+                        .collect::<Vec<_>>()
+                        .join(" and "))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        }),
+        Err(error) => checks.push(DoctorCheck {
+            name: "idempotency-keys".into(),
             status: "fail".into(),
             message: error.to_string(),
         }),
@@ -8544,6 +8715,17 @@ async fn post_claim(
     let kind = request.kind.clone();
     let (response, appended) =
         blocking_action(move || store.append_client_claim_outcome(&request)).await?;
+    finish_claim_publication(&state, &kind, response, appended).await
+}
+
+// Both claim transports must publish response-usage rollups, even on replay after the original
+// observation committed but a later step failed. Keep visibility wakes identical as well.
+async fn finish_claim_publication(
+    state: &AppState,
+    kind: &str,
+    response: ClaimRecord,
+    appended: bool,
+) -> Result<Json<ClaimRecord>, ApiError> {
     // Publish only the cumulative buckets. The response detail and turn ID remain local.
     let store = state.store.clone();
     let rollup_response = response.clone();
@@ -8554,14 +8736,14 @@ async fn post_claim(
         let (_, updated) =
             blocking_action(move || store.append_client_claim_outcome(&rollup)).await?;
         if updated {
-            signal_visible_change(&state);
+            signal_visible_change(state);
         }
     }
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
-            signal_local_change(&state);
+            signal_local_change(state);
         } else if kind == "harness.usage" || kind == "subagent.renewed" {
-            signal_visible_change(&state);
+            signal_visible_change(state);
         } else if kind.starts_with("message.") {
             let store = state.store.clone();
             let subject = response.subject.clone();
@@ -8571,9 +8753,9 @@ async fn post_claim(
                 .ok()
                 .flatten()
                 .is_none_or(|message| is_work_wake(&message.tags));
-            signal_message_changed(&state, &kind, work_wake);
+            signal_message_changed(state, kind, work_wake);
         } else {
-            signal_claim_changed(&state, &kind);
+            signal_claim_changed(state, kind);
         }
     }
     Ok(Json(response))
@@ -9199,7 +9381,7 @@ fn accept_message(
     session_id: Option<String>,
     device_signature: Option<smallclaims::principal::ClaimSignature>,
 ) -> Result<Json<MessageView>, ApiError> {
-    if request.content.trim().is_empty() {
+    if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
             "a message needs nonempty content",
@@ -9238,6 +9420,7 @@ fn accept_message(
     }
     let from = normalize_message_party(&request.from);
     let to = normalize_message_party(&request.to);
+    let attachments = client_blobs::resolve_attachments(state, &from, &request.attachments)?;
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()))[..16].to_owned();
     let subject = format!("message/{id}");
     let mut fields = BTreeMap::from([
@@ -9268,6 +9451,12 @@ fn accept_message(
     ]);
     if let Some(session_id) = session_id {
         fields.insert("session_id".into(), Value::String(session_id));
+    }
+    if !attachments.is_empty() {
+        fields.insert(
+            "attachments".into(),
+            serde_json::to_value(&attachments).map_err(ApiError::internal)?,
+        );
     }
     if let Some(signature) = &device_signature {
         check_device_signature(state, signature, &request, &subject, &from, &fields)?;
@@ -9307,6 +9496,7 @@ fn accept_message(
         in_reply_to: request.in_reply_to,
         tags: request.tags,
         created_index: record.store_index,
+        attachments,
     }))
 }
 
@@ -9548,8 +9738,8 @@ async fn post_message_claim(
                 fields.insert("runtime_id".into(), Value::String(runtime_id));
             }
         }
-        let record = store
-            .append_claim(&ClaimInput {
+        let (record, appended) = store
+            .append_claim_outcome(&ClaimInput {
                 subject,
                 kind: kind.into(),
                 actor: Some(actor),
@@ -9559,11 +9749,15 @@ async fn post_message_claim(
                 idempotency_key: Some(request.idempotency_key),
             })
             .map_err(ApiError::bad)?;
-        Ok((record, is_work_wake(&message.tags)))
+        Ok((record, appended, is_work_wake(&message.tags)))
     })
     .await?;
-    let (record, work_wake) = record;
-    signal_message_changed(&state, kind, work_wake);
+    let (record, appended, work_wake) = record;
+    // An idempotent repeat or an already-settled transition changes nothing a reader can see.
+    // Signalling it anyway re-reads every subscribed seat's mailbox (#1085).
+    if appended {
+        signal_message_changed(&state, kind, work_wake);
+    }
     Ok(Json(record))
 }
 
@@ -14044,6 +14238,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 title: None,
                 in_reply_to: None,
                 tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                attachments: Vec::new(),
             })
             .unwrap()
         };
@@ -14072,6 +14267,22 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "a conversation message's lifecycle woke the reconciler"
         );
         assert!(events.has_changed().unwrap());
+        events.borrow_and_update();
+        // A repeat, or a transition the message has already passed, changes nothing a reader
+        // can see and wakes no reader (#1085).
+        for (lifecycle, key) in [("delivered", "talk-delivered"), ("staged", "talk-staged")] {
+            let (status, claim) = json_request(
+                app.clone(),
+                &format!("/v1/messages/{id}/claims"),
+                json!({"lifecycle": lifecycle, "actor": "agent/receiver", "idempotency_key": key}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{claim}");
+            assert!(
+                !events.has_changed().unwrap(),
+                "a no-op {lifecycle} woke readers"
+            );
+        }
         // A work wake does.
         let (status, sent) = json_request(
             app.clone(),
@@ -14455,6 +14666,71 @@ agent "good" {{ workspace {:?}; command "true" }}
                 .unwrap()
                 .contains("cobalt: refused by that member's Fabric grants")
         );
+    }
+
+    /// Two members apart, as during a partition, can each accept the same idempotency key for
+    /// a different request (#1026). Both claims stand once they meet; doctor says which, and a
+    /// retry with the key is refused instead of answering with either.
+    #[tokio::test]
+    async fn doctor_names_an_idempotency_key_two_members_used_for_different_requests() {
+        const FLEET: &str = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        state.store.bind_fleet(FLEET).unwrap();
+        let note = |text: &str| ClaimInput {
+            subject: "custom/partition/note".into(),
+            kind: "custom.partition.note".into(),
+            actor: Some("person/tester".into()),
+            fields: BTreeMap::from([("text".into(), Value::String(text.into()))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("partition-key".into()),
+        };
+        let app = router(state.clone());
+        let (_, doctor) = get_request(app.clone(), "/v1/doctor").await;
+        let check = |doctor: &Value| {
+            doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == "idempotency-keys")
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(check(&doctor)["status"], "pass");
+
+        state.store.append_claim(&note("written here")).unwrap();
+        let other = Store::open_memory("birch").unwrap();
+        other.bind_fleet(FLEET).unwrap();
+        other.append_claim(&note("written there")).unwrap();
+        let exchange = other
+            .export_replication_exchange(FLEET, &state.store.replication_inventory().unwrap())
+            .unwrap();
+        state
+            .store
+            .receive_replication_exchange("birch", FLEET, &exchange)
+            .unwrap();
+        state.store.validate_replication_backlog().unwrap();
+        state.store.project_replication_backlog().unwrap();
+
+        let (_, doctor) = get_request(app, "/v1/doctor").await;
+        let check = check(&doctor);
+        assert_eq!(check["status"], "warn", "{check}");
+        let message = check["message"].as_str().unwrap();
+        assert!(message.starts_with("1 idempotency key was used"), "{check}");
+        assert!(
+            message.contains("custom/partition/note by birch"),
+            "{check}"
+        );
+        assert!(
+            message.contains(&format!(
+                "custom/partition/note by {}",
+                state.store.origin()
+            )),
+            "{check}"
+        );
+        let retry = state.store.append_claim(&note("written here")).unwrap_err();
+        assert_eq!(retry.code, "idempotency-conflict", "{retry:?}");
     }
 
     #[test]
@@ -16616,6 +16892,7 @@ version 2
                 title: None,
                 in_reply_to: None,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap(),
         )
@@ -16639,6 +16916,7 @@ version 2
                 title: Some("Mission step ready".into()),
                 in_reply_to: None,
                 tags: vec!["st3-work:step-run/run/build@1@1@incarnation".into()],
+                attachments: Vec::new(),
             })
             .unwrap(),
         )
@@ -16663,6 +16941,7 @@ version 2
                 title: None,
                 in_reply_to: None,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap(),
         )
@@ -16693,6 +16972,7 @@ version 2
                     title: None,
                     in_reply_to: None,
                     tags: Vec::new(),
+                    attachments: Vec::new(),
                 })
                 .unwrap(),
             )
@@ -16729,6 +17009,7 @@ version 2
                 title: None,
                 in_reply_to: Some(subject.into()),
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap();
             let (status, sent) = json_request(app.clone(), "/v1/messages", reply.clone()).await;
@@ -16763,6 +17044,7 @@ version 2
                 title: None,
                 in_reply_to: parent,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap()
         };
@@ -16811,6 +17093,7 @@ version 2
                 title: None,
                 in_reply_to: None,
                 tags: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap(),
         )
@@ -19511,5 +19794,96 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, exact) = get_request(app, "/v1/messages/read/message%2Fpage-204").await;
         assert_eq!(status, StatusCode::OK, "{exact}");
         assert_eq!(exact["content"], "body 204");
+    }
+    #[tokio::test]
+    async fn harness_event_endpoint_requires_this_native_seats_local_peer_and_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let subject = "agent/example/event-api";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("incarnation_id".into(), json!("runtime-a")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let request = json!({"runtime_incarnation":"runtime-a", "sequence":1,
+            "claim":{"subject":subject,"kind":"harness.observed","actor":subject,
+                "fields":{"state":"idle","driver":"claude","incarnation_id":"runtime-a"},
+                "evidence":[],"idempotency_key":"fixture-event"}});
+        let app = router(state);
+        let (status, _) = json_request(app.clone(), "/v1/harness-events", request.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let peer = NativeDeliveryPeer {
+            agent: "agent/example/foreign".into(),
+            transport: "claude-channel",
+            pid: 7,
+            archives_inbox: true,
+        };
+        let (status, _) = json_request(
+            app.clone().layer(Extension(peer)),
+            "/v1/harness-events",
+            request.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let peer = NativeDeliveryPeer {
+            agent: subject.into(),
+            transport: "claude-channel",
+            pid: 7,
+            archives_inbox: true,
+        };
+        let app = app.layer(Extension(peer));
+        let (status, first) =
+            json_request(app.clone(), "/v1/harness-events", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let (status, replay) =
+            json_request(app.clone(), "/v1/harness-events", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(first["body"]["fields"], replay["body"]["fields"]);
+        let mut usage = request.clone();
+        usage["sequence"] = json!(2);
+        usage["claim"]["kind"] = json!("harness.timeline");
+        usage["claim"]["fields"] = json!({
+            "operation":"append", "entry_id":"response-a", "source_id":"source/response-a",
+            "sequence":1, "revision":1, "role":"system", "entry_type":"usage", "final":true,
+            "driver":"claude", "incarnation_id":"runtime-a", "observed_at_unix_ms":1,
+            "body":{"semantics":"response", "driver":"claude", "model":"fixture-model",
+                "input_tokens":10, "output_tokens":5, "cached_tokens":2, "total_tokens":17}
+        });
+        usage["claim"]["fields"]["observed_at_unix_ms"] = json!(client_now_ms() as u64);
+        for _ in 0..2 {
+            let (status, body) =
+                json_request(app.clone(), "/v1/harness-events", usage.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, rollup) = get_request(
+            app.clone(),
+            &format!("/v1/usage?since_ms=0&until_ms={}", client_now_ms() + 60_000),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rollup}");
+        assert_eq!(
+            rollup["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["total_tokens"].as_u64().unwrap_or(0))
+                .sum::<u64>(),
+            17,
+            "{rollup}"
+        );
+        let mut stale = request;
+        stale["runtime_incarnation"] = json!("retired-runtime");
+        let (status, body) = json_request(app, "/v1/harness-events", stale).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
 }

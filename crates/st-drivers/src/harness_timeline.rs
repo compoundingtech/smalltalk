@@ -1,10 +1,10 @@
 //! Durable, harness-neutral conversation events produced by native drivers.
 //!
 //! The harness adapters see richer protocol events than st3's supervisor. They normalize those
-//! events here, into a bounded append/replace/finalize log beside the other harness records. st3
-//! polls the log and publishes each operation as an idempotent `harness.timeline` claim. Keeping
-//! the record in st2 has two important properties: a daemon restart cannot lose an event that the
-//! harness already reported, and no client API needs to understand a provider transcript format.
+//! events here into append/replace/finalize operations. Fresh st seats commit each operation to
+//! the st-owned event outbox; legacy adopted providers and st2 retain a bounded record log. Both
+//! transports preserve reported events across daemon restarts and keep provider transcript
+//! formats out of the client API.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -181,22 +181,35 @@ impl Writer {
         )?;
         let lock = open(&self.lock_path, Open::Create)?;
         let _held = FileLock::hold_blocking(lock, Mode::Exclusive)?;
-        let mut record = read(&self.path)
-            .filter(|record| {
-                record.driver == self.driver && record.incarnation_id == self.incarnation_id
-            })
-            .unwrap_or_else(|| Record {
-                schema: crate::contracts::schema_for_session(
-                    self.path.parent().unwrap(),
-                    &self.incarnation_id,
-                    SCHEMA,
-                ),
-                driver: self.driver.clone(),
-                incarnation_id: self.incarnation_id.clone(),
-                next_sequence: 1,
-                operations: Vec::new(),
-            });
+        let event_dir = self.path.parent().unwrap();
+        let event_transport = crate::harness_events::enabled(event_dir);
+        let source_key = pseudonym("source", &source_id);
+        let mut record = if event_transport {
+            Some(crate::harness_events::timeline_for_write(
+                event_dir,
+                &self.driver,
+                &self.incarnation_id,
+                &source_key,
+            )?)
+        } else {
+            read(&self.path)
+        }
+        .filter(|record| {
+            record.driver == self.driver && record.incarnation_id == self.incarnation_id
+        })
+        .unwrap_or_else(|| Record {
+            schema: crate::contracts::schema_for_session(
+                self.path.parent().unwrap(),
+                &self.incarnation_id,
+                SCHEMA,
+            ),
+            driver: self.driver.clone(),
+            incarnation_id: self.incarnation_id.clone(),
+            next_sequence: 1,
+            operations: Vec::new(),
+        });
 
+        let prior_operations = record.operations.len();
         anyhow::ensure!(
             matches!(
                 self.driver.as_str(),
@@ -305,6 +318,13 @@ impl Writer {
                 observed_at_unix_ms,
             );
         }
+        if event_transport {
+            return crate::harness_events::write_timeline(
+                event_dir,
+                &record,
+                &record.operations[prior_operations..],
+            );
+        }
         let mut bytes = compact_to_bounds(&mut record)?;
         bytes.push(b'\n');
         fsatomic::replace(
@@ -356,6 +376,11 @@ pub fn timeline_path(agent_dir: &Path) -> PathBuf {
 }
 
 pub fn read(path: &Path) -> Option<Record> {
+    if let Some(dir) = path.parent()
+        && crate::harness_events::enabled(dir)
+    {
+        return crate::harness_events::read_timeline(dir).ok().flatten();
+    }
     let metadata = fs::metadata(path).ok()?;
     if metadata.len() > MAX_RECORD_BYTES {
         return None;

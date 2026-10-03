@@ -65,6 +65,11 @@ scripts/install                  # into ~/.local/bin
 scripts/install --bin-dir DIR    # or anywhere else
 ```
 
+When pkg-config cannot find the artifact, Cargo builds `libghostty-vt` from the pinned Ghostty
+source instead, which needs Zig 0.15.2 on `PATH`. On macOS, the vendored
+[`libghostty-vt-sys`](vendor/libghostty-vt-sys/README.md) build script lets Zig 0.15.2 link against
+the macOS 26.5 and 27 SDKs.
+
 The script builds and installs `st3`, `stui`, and `st3-migrate`, and makes `st` a symlink to
 the installed `st3`. `st` is never a separate build. On macOS, both tools live in a fixed app bundle; see [macOS installation and signing](docs/st3/macos-installation.md). A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 

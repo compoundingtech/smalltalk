@@ -107,6 +107,21 @@ pub enum ClientReadOperation {
     AgentWorkspace {
         identity: String,
     },
+    /// Up to 512 KiB of an attachment from `offset`, from the member that took the upload. The
+    /// answer is base64 in JSON with the file's size; the reader asks again until it has it all.
+    Blob {
+        sha256: String,
+        message: String,
+        offset: u64,
+    },
+    /// The messages to and from one agent, as the host that owns the agent lists them.
+    Messages {
+        actor: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        history: bool,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1056,6 +1071,22 @@ async fn receive_client_read(
                 };
                 Ok(serde_json::to_value(result.value)?)
             }
+            ClientReadOperation::Messages {
+                actor,
+                history,
+                limit,
+                cursor,
+            } => {
+                anyhow::ensure!(
+                    limit.is_none_or(|limit| (1..=200).contains(&limit)),
+                    "the messages limit is invalid"
+                );
+                let page = client
+                    .messages_list_for_peer(&actor, cursor.as_deref(), limit, history)
+                    .await?
+                    .value;
+                Ok(serde_json::to_value(page)?)
+            }
             ClientReadOperation::AgentWorkspace { identity } => {
                 let workspace =
                     crate::config::default_agent_workspace(&identity).map_err(|error| {
@@ -1066,6 +1097,18 @@ async fn receive_client_read(
                         )
                     })?;
                 Ok(serde_json::json!({ "workspace": workspace }))
+            }
+            ClientReadOperation::Blob {
+                sha256,
+                message,
+                offset,
+            } => {
+                // Only this member's own files: it is the one the claim names.
+                let chunk = client
+                    .blob_chunk(&sha256, Some(&message), offset, true)
+                    .await?
+                    .value;
+                Ok(serde_json::to_value(chunk)?)
             }
         }
     }
@@ -1101,8 +1144,10 @@ async fn receive_client_read(
                         Some(st3_client::ClientError::Api(code, message, details)) => {
                             let status = match code {
                                 st3_client::ErrorCode::PageCursorExpired
-                                | st3_client::ErrorCode::CursorGap => StatusCode::GONE,
-                                st3_client::ErrorCode::NotFound => StatusCode::NOT_FOUND,
+                                | st3_client::ErrorCode::CursorGap
+                                | st3_client::ErrorCode::BlobExpired => StatusCode::GONE,
+                                st3_client::ErrorCode::NotFound
+                                | st3_client::ErrorCode::BlobNotFound => StatusCode::NOT_FOUND,
                                 st3_client::ErrorCode::StaleFence => StatusCode::CONFLICT,
                                 _ => StatusCode::UNPROCESSABLE_ENTITY,
                             };
@@ -1922,6 +1967,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_attachment_travels_from_the_member_that_took_it_and_never_through_sync() {
+        use crate::blobs::BlobDir;
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let app_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let owner = app_state(owner_root.path(), "owner-node");
+        let mut gateway = app_state(gateway_root.path(), "gateway-node");
+        let gateway_store = gateway.store.clone();
+        let owner_store = owner.store.clone();
+        let owner_socket = owner_root.path().join("st3.sock");
+        let main_socket = owner_socket.clone();
+        let owner_app = crate::api::router(owner);
+        tokio::spawn(async move { crate::api::serve_unix(&main_socket, owner_app).await });
+        let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "gateway-node".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "owner-node".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_app = crate::api::router(gateway);
+        let gateway_socket = gateway_root.path().join("st3.sock");
+        let serving = gateway_socket.clone();
+        let served = gateway_app.clone();
+        tokio::spawn(async move { crate::api::serve_unix(&serving, served).await });
+
+        for _ in 0..100 {
+            if owner_socket.exists() && gateway_socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Pasted on the owner, 1.3 MiB: three relayed chunks.
+        let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
+        image.extend((0..1_300_000_u32).map(|index| (index % 251) as u8));
+        let hash = hex::encode(Sha256::digest(&image));
+        let uploaded = st3_client::Client::unix_as(&owner_socket, "person/avery")
+            .upload_blob(image.clone(), "image/png")
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(uploaded.blob, format!("blob/{hash}"));
+        let message = crate::client::Client::unix(&owner_socket)
+            .send_message(&crate::model::MessageSendRequest {
+                idempotency_key: "pasted-image".into(),
+                from: "person/avery".into(),
+                to: "agent/gateway-node.seat".into(),
+                content: "look at this".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                attachments: vec![crate::model::AttachmentInput {
+                    blob: uploaded.blob.clone(),
+                    media_type: "image/png".into(),
+                    name: Some("paste.png".into()),
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(message.attachments[0].origin, "host/owner-node");
+
+        // Sync carries the claim to the gateway; the bytes are not part of it.
+        for claim in owner_store.claims_for(&message.subject, Some("message.sent")).unwrap() {
+            gateway_store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: message.subject.clone(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/avery".into()),
+                    fields: claim.body["fields"]
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                        .into_iter()
+                        .collect(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some("pasted-image".into()),
+                })
+                .unwrap();
+        }
+        assert!(!BlobDir::under(gateway_root.path()).path(&hash).exists());
+
+        let read = |person: &'static str, message: String| {
+            let app = gateway_app.clone();
+            let hash = hash.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(format!("/v1/client/blobs/{hash}?message={message}"))
+                            .header("x-st3-person", person)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                (status, to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            }
+        };
+        // A seat on the gateway gets the file written where its harness can open it.
+        let seat_files = gateway_root.path().join("seat/attachments");
+        let delivered = gateway_store.message(&message.subject).unwrap().unwrap();
+        let notices = crate::blobs::materialize(
+            &gateway_socket,
+            "agent/gateway-node.seat",
+            &seat_files,
+            &delivered,
+        )
+        .await
+        .unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].name.as_deref(), Some("paste.png"));
+        assert_eq!(fs::read(notices[0].path.as_deref().unwrap()).unwrap(), image);
+        assert!(notices[0].path.as_deref().unwrap().ends_with(&format!("{hash}.png")));
+        fs::remove_file(BlobDir::under(gateway_root.path()).path(&hash)).unwrap();
+        let (status, bytes) = read("person/avery", message.subject.clone()).await;
+        assert!(status.is_success(), "{}", String::from_utf8_lossy(&bytes[..bytes.len().min(300)]));
+        assert_eq!(bytes.as_ref(), image.as_slice());
+        assert_eq!(
+            BlobDir::under(gateway_root.path()).read(&hash).unwrap().unwrap(),
+            image,
+            "the gateway keeps a copy for its own readers"
+        );
+        // The gateway's graph holds a reference, never the bytes.
+        assert!(gateway_store.get_blob(&hash).unwrap().is_none());
+
+        // When the owner's copy is gone and the gateway's too, the read says so.
+        fs::remove_file(BlobDir::under(owner_root.path()).path(&hash)).unwrap();
+        fs::remove_file(BlobDir::under(gateway_root.path()).path(&hash)).unwrap();
+        let (status, bytes) = read("person/avery", message.subject.clone()).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["code"], "blob-expired");
+        // An owner that cannot be reached is a different answer.
+        let message_elsewhere = {
+            let mut fields = owner_store
+                .claims_for(&message.subject, Some("message.sent"))
+                .unwrap()[0]
+                .body["fields"]
+                .clone();
+            fields["attachments"][0]["origin"] = "host/offline-node".into();
+            gateway_store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: "message/offline".into(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/avery".into()),
+                    fields: fields.as_object().unwrap().clone().into_iter().collect(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some("pasted-image-elsewhere".into()),
+                })
+                .unwrap()
+                .subject
+        };
+        let (status, bytes) = read("person/avery", message_elsewhere).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["code"], "remote-unavailable");
+    }
+
+    #[tokio::test]
     async fn a_read_reaches_an_owner_through_a_peer_that_can_dial_it() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         // A chain of isolated daemons: the gateway dials only the relay, and only the relay
@@ -2168,9 +2396,161 @@ mod tests {
         assert_eq!(provenance.via, "host/chain-relay");
         assert!(!provenance.direct);
         assert_eq!(provenance.transport, "http");
-        assert_eq!(provenance.capability_ttl_s, 60);
+        assert_eq!(provenance.capability_ttl_s, 300);
         assert_eq!(provenance.fence_conflicts, 0);
         assert!(screen.facts.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_gateway_lists_a_remote_agents_messages_from_its_owner_and_says_when_it_cannot() {
+        let roots = [(); 2].map(|()| tempfile::tempdir().unwrap());
+        let make_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let mut gateway = make_state(roots[0].path(), "lag-gateway");
+        let owner = make_state(roots[1].path(), "lag-owner");
+        let agent = "agent/lag-worker";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String("lag-runtime".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("lag-runtime:i1".into()),
+                    ),
+                    ("status".into(), Value::String("running".into())),
+                    ("terminal".into(), Value::Bool(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("lag-worker-running".into()),
+            })
+            .unwrap();
+        gateway
+            .store
+            .import_replication("lag-owner", &owner.store.export_replication(0).unwrap())
+            .unwrap();
+        // The message reaches the owner, and has not replicated to the gateway yet.
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/lag-first".into(),
+                kind: "message.sent".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("from".into(), Value::String(agent.into())),
+                    ("to".into(), Value::String("person/avery".into())),
+                    (
+                        "content".into(),
+                        Value::String("done, ready for review".into()),
+                    ),
+                    ("status".into(), Value::String("sent".into())),
+                    ("title".into(), Value::String("done".into())),
+                    ("in_reply_to".into(), Value::Null),
+                    ("tags".into(), Value::Array(Vec::new())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("lag-first".into()),
+            })
+            .unwrap();
+
+        let secret = roots[0].path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let sockets = roots.each_ref().map(|root| root.path().join("st3.sock"));
+        let peer = PeerState::new(
+            MainBackend::new(sockets[1].clone()),
+            "lag-owner".into(),
+            FleetAuth::test("fleet-test", &[7; 32]),
+            FleetContext::legacy(BTreeSet::from(["lag-gateway".into()])),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = tokio::spawn(async move {
+            axum::serve(listener, peer_router(peer, smalltalk_routes())).await
+        });
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "lag-gateway".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "lag-owner".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        for (socket, state) in sockets.iter().zip([gateway, owner]) {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                crate::api::serve_unix(&socket, crate::api::router(state)).await
+            });
+        }
+        for socket in &sockets {
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let client = st3_client::Client::unix_as(&sockets[0], "person/avery");
+        let page = client
+            .messages_list_for_peer(agent, None, Some(20), false)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(page.items.len(), 1, "the owner's list reaches the gateway");
+        let replicated = page
+            .replicated
+            .expect("a remote agent's list says where it came from");
+        assert_eq!(replicated.owner_host_id, "host/lag-owner");
+        assert_eq!(replicated.source, "owner");
+        assert!(replicated.complete);
+        assert_eq!(replicated.state, "current");
+
+        // With the owner out of reach the gateway shows what it has and says the list may be
+        // missing items; it never passes an empty replica off as the whole list.
+        worker.abort();
+        let _ = worker.await;
+        let page = client
+            .messages_list_for_peer(agent, None, Some(20), false)
+            .await
+            .unwrap()
+            .value;
+        assert!(page.items.is_empty());
+        let replicated = page
+            .replicated
+            .expect("a replica says it is not the owner's list");
+        assert_eq!(replicated.source, "replica");
+        assert!(!replicated.complete);
+        assert_eq!(replicated.state, "unverified");
+        assert!(replicated.reason.is_some(), "{replicated:?}");
+
+        // An agent on this host, or any list that names no remote agent, carries no notice.
+        let page = client
+            .messages_list_for_recipient("person/avery", None, Some(20), false)
+            .await
+            .unwrap()
+            .value;
+        assert!(page.replicated.is_none());
     }
 
     #[tokio::test]
@@ -2353,6 +2733,113 @@ mod tests {
                 &links(&[("a", "c")])
             ),
             names(&["c"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_followed_conversation_says_why_while_its_owner_cannot_be_reached() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let make_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let owner = make_state(owner_root.path(), "conversation-owner");
+        let mut gateway = make_state(gateway_root.path(), "conversation-gateway");
+        let agent = "agent/conversation-peer";
+        let incarnation = "conversation-runtime:i1";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    (
+                        "runtime_id".into(),
+                        serde_json::json!("conversation-runtime"),
+                    ),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("status".into(), serde_json::json!("running")),
+                    ("terminal".into(), serde_json::json!(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-runtime".into()),
+            })
+            .unwrap();
+        gateway
+            .store
+            .import_replication(
+                "conversation-owner",
+                &owner.store.export_replication(0).unwrap(),
+            )
+            .unwrap();
+        // The owner is a configured peer, but nothing answers at its address.
+        let address = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "conversation-gateway".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "conversation-owner".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_socket = gateway_root.path().join("st3.sock");
+        let served_gateway = gateway_socket.clone();
+        tokio::spawn(async move {
+            crate::api::serve_unix(&served_gateway, crate::api::router(gateway)).await
+        });
+        for _ in 0..200 {
+            if tokio::net::UnixStream::connect(&gateway_socket)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = st3_client::Client::unix_as(&gateway_socket, "person/example");
+        let mut stream = client.collection_stream().await.unwrap();
+        stream
+            .subscribe_conversation("conversation", agent)
+            .await
+            .unwrap();
+        // The subscription stays (st retries it) and says why, so a client showing its last
+        // copy can say that copy is stale.
+        let event = tokio::time::timeout(Duration::from_secs(20), stream.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let st3_client::CollectionEvent::Resync { id, code, message } = event else {
+            panic!("expected a resync, got {event:?}");
+        };
+        assert_eq!(id, "conversation");
+        assert_eq!(code, Some(st3_client::ErrorCode::RemoteUnavailable));
+        assert!(
+            message.is_some_and(|message| message.contains("conversation-owner")),
+            "the message names the owner"
         );
     }
 

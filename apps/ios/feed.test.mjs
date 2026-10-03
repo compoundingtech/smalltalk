@@ -172,6 +172,27 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
 }
 
 {
+  // st keeps the subscription while the owner's host is away and says why: the copy shown is
+  // stale, and the phone does not ask again itself.
+  const { client, sockets } = fakeClient();
+  const { handlers } = watch();
+  const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [5]);
+  await settle();
+  const issues = [];
+  feed.followConversation('agent/example/worker', { onEntries: () => {}, onIssue: issue => issues.push(issue) });
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [{ id: 'entry/1' }] });
+  const before = sockets[0].sent.length;
+  sockets[0].frame({ kind: 'resync', id: 'conversation', collection: 'conversation', retryable: true, code: 'remote-unavailable', message: 'owner host/two is temporarily unavailable; cached data remains usable' });
+  assert.equal(issues.at(-1), 'two cannot be reached right now · trying again');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(sockets[0].sent.length, before, 'st retries; the phone does not');
+  // Once st reaches it again, the issue clears.
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [{ id: 'entry/2' }] });
+  assert.equal(issues.at(-1), '');
+  feed.close();
+}
+
+{
   // st keeps no start for this transcript: the phone says st's reason once and stops asking.
   const { client, sockets } = fakeClient();
   const { handlers } = watch();

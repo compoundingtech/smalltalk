@@ -4333,9 +4333,10 @@ mod tests {
         assert!(screen(&ui).contains("▣ 1 image"), "{}", screen(&ui));
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
         let sent = std::mem::take(&mut ui.effects);
+        // The image goes to st with the message (#1078), not as a path in its text.
         assert!(
-            matches!(&sent[..], [Effect::Send { text, .. }]
-                if text == &format!("first line\nsecond line\n\n[image: {}]", image.display())),
+            matches!(&sent[..], [Effect::Send { text, images, .. }]
+                if text == "first line\nsecond line" && images == &[image.clone()]),
             "{sent:?}"
         );
         assert!(

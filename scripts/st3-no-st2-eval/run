@@ -16,22 +16,22 @@ import argparse
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import signal
+import sqlite3
+import sys
 import subprocess
 import tempfile
 import time
 import urllib.parse
 
 HERE = Path(__file__).resolve().parent
-SUBJECT = "agent/eval/no-st2"
+sys.path.insert(0, str(HERE.parent))
+sys.dont_write_bytecode = True
+from st_boundary import fresh_seat_findings
 
+SUBJECT = "agent/eval/native-seat"
 
-def st2_surface(text):
-    """Whether text runs an `st2` program or names st2's state (mirrors st3::hooks)."""
-    tokens = re.split(r"[\s\"'();|&`=:]+", text)
-    return any(token == "st2" or token.endswith("/st2") for token in tokens) or "/st2/" in text
 
 
 class Node:
@@ -63,7 +63,7 @@ class Node:
         profile = f"export PATH='{self.path}'\n"
         for name in (".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshenv"):
             (root / "home" / name).write_text(profile)
-        (root / "config.toml").write_text(f'''node = "nost2"
+        (root / "config.toml").write_text(f'''node = "native"
 person = "person/eval"
 state_dir = "{root / 'state'}"
 pty_root = "{root / 'pty'}"
@@ -190,8 +190,8 @@ def run(args, root, evidence):
         node.start()
         seats = root / "seats.kdl"
         seats.write_text(f'''version 2
-agent "no-st2" {{
-  identity "eval/no-st2"
+agent "native-seat" {{
+  identity "eval/native-seat"
   workspace "{root / 'ws'}"
   restart "always"
   harness "claude" {{}}
@@ -216,7 +216,7 @@ agent "no-st2" {{
 
         def timeline():
             page = node.api("/v1/client/sessions/" + urllib.parse.quote(SUBJECT, safe="/") + "/timeline")
-            return page if page and "no-st2 transcript probe" in json.dumps(page) else None
+            return page if page and "native-seat transcript probe" in json.dumps(page) else None
         page = until(timeline, 60, "the client API timeline never showed the native transcript")
         (evidence / "timeline.json").write_text(json.dumps(page, indent=2))
         checks["timeline_items"] = len(page.get("items", []))
@@ -230,7 +230,7 @@ agent "no-st2" {{
             fail(f"the status line failed: {lines[-3:]}")
 
         sent = json.loads(node.cli("conversations", "send", SUBJECT, "--from", "person/eval",
-                                   "--subject", "no-st2 probe", "--body", "reply-token:no-st2", "--json"))
+                                   "--subject", "native-seat probe", "--body", "reply-token:native-seat", "--json"))
         message = sent["subject"]
         checks["message"] = message
 
@@ -257,28 +257,32 @@ agent "no-st2" {{
         checks["seat_processes"] = len(processes)
         if not any(" driver-hook " in argv or "claude-mcp" in argv for _, argv, _ in processes) and not processes:
             fail("no seat process was found")
-        for pid, argv, environ in processes:
-            legacy = [value.split("=", 1)[0] for value in environ if value.startswith("ST2_")]
-            if legacy:
-                fail(f"fresh seat process {pid} exports legacy environment names: {legacy}")
-            for text in [argv, *environ]:
-                if st2_surface(text):
-                    fail(f"seat process {pid} ({argv[:120]}) reaches st2: {text[:300]}")
+        violations = list(fresh_seat_findings(root, processes))
+        checks["st_boundary_findings"] = violations
+        if violations:
+            fail("fresh seat boundary: " + "; ".join(violations))
         hook_set = [value for _, _, environ in processes for value in environ if value.startswith("ST_HOOKS=")]
         checks["st_hooks"] = sorted(set(hook_set))
         if not hook_set or not all(value.startswith(f"ST_HOOKS={root / 'state/hooks/sets/sha256-'}")
                                    for value in hook_set):
             fail(f"ST_HOOKS is not st3's set: {hook_set}")
-        checks["record_schemas"] = {}
+        checks["harness_record_files"] = []
         for name in ("harness-state", "harness-context", "harness-timeline"):
             paths = list((root / "state").rglob(name))
-            if not paths:
-                fail(f"the fresh seat wrote no {name} record")
-            for path in paths:
-                schema = json.loads(path.read_text())["schema"]
-                if schema != f"st.{name}.v1":
-                    fail(f"fresh {name} record has legacy or unsupported schema {schema!r}")
-                checks["record_schemas"][name] = schema
+            if paths:
+                fail(f"the fresh seat used polled {name} records")
+        spools = list((root / "state/drivers").rglob("st-harness-events.sqlite"))
+        if len(spools) != 1:
+            fail("the fresh seat has no unique st-owned observation outbox")
+        with sqlite3.connect(spools[0]) as connection:
+            snapshots = connection.execute("SELECT kind,body FROM snapshots").fetchall()
+            checks["snapshot_schemas"] = {kind: json.loads(body)["schema"] for kind, body in snapshots}
+            for name in ("harness-state", "harness-context"):
+                if checks["snapshot_schemas"].get(name) != f"st.{name}.v1":
+                    fail(f"fresh {name} snapshot has legacy or unsupported schema")
+            checks["timeline_operations"] = connection.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
+            if not checks["timeline_operations"]:
+                fail("the fresh seat committed no timeline operations")
         status_files = [str(path.relative_to(root)) for path in (root / "state").rglob("status")]
         checks["legacy_status_files"] = status_files
         if status_files:
@@ -298,7 +302,7 @@ agent "no-st2" {{
         if node.daemon and node.daemon.poll() is None:
             (evidence / "trace.jsonl").write_text(
                 node.cli("trace", "show", SUBJECT, "--json", "--limit", "500", check=False))
-            terminal = subprocess.run(["pty", "peek", "--plain", "--full", "eval.no-st2"],
+            terminal = subprocess.run(["pty", "peek", "--plain", "--full", "eval.native-seat"],
                                       env={**node.env, "PTY_ROOT": str(root / "pty")},
                                       capture_output=True, text=True)
             (evidence / "terminal.txt").write_text(terminal.stdout + terminal.stderr)
@@ -318,7 +322,7 @@ def main():
     args.binary = args.binary.resolve()
     args.evidence.mkdir(parents=True, exist_ok=True)
     # Short, private paths: Unix socket paths are limited to about 100 bytes.
-    root = Path(tempfile.mkdtemp(prefix="nst2-", dir="/tmp"))
+    root = Path(tempfile.mkdtemp(prefix="native-", dir="/tmp"))
     try:
         result = run(args, root, args.evidence)
     finally:
