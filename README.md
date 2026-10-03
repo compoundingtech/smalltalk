@@ -21,8 +21,11 @@ Its broad name is intentional; initially it contains only stui's mission model (
 `missions::adapt` borrows typed mission and agent projections plus unresolved, actor-filtered
 attention. Callers supply the current time and display policies explicitly; collection loading,
 clocks and application naming remain outside the crate. Mission precedence, queue/keep-open
-rules, outcomes and rich step details retain stui's existing behavior. Shared widgets and other
-UI models are separate follow-up work, not part of this mission extraction.
+rules, outcomes and rich step details retain stui's existing behavior.
+Adapted steps retain their stable step-run `id` and claimant-or-assignee `seat` (absent for
+agentless steps), so consumers can select duplicate paths across open runs and navigate to
+the actual execution seat without reconstructing identity from display labels.
+Shared widgets and other UI models are separate follow-up work, not part of this mission extraction.
 
 ## Install
 
