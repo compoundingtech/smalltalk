@@ -13,12 +13,12 @@
     "title": "release",
     "modes": {
       "alternate_screen": false, "application_cursor": false, "application_keypad": false,
-      "bracketed_paste": true, "focus_events": false, "mouse_tracking": "none", "mouse_encoding": "default"
+      "bracketed_paste": true, "focus_events": false, "mouse_tracking": "none", "mouse_encoding": "default", "kitty_keyboard": 1
     },
     "lines": [
-      { "row": 0, "text": "$ cargo build", "runs": [{ "text": "$ ", "fg": 2, "bold": true }, { "text": "cargo build" }], "redacted": false, "truncated": false },
-      { "row": 1, "text": "Finished", "runs": [{ "text": "Finished", "fg": "#5fd75f" }, { "text": "  ", "bg": 236 }], "redacted": false, "truncated": false },
-      { "row": 2, "text": "$", "runs": [{ "text": "$", "fg": 2, "bold": true }], "redacted": false, "truncated": false }
+      { "row": 0, "text": "$ cargo build", "runs": [{ "text": "$ ", "cells": 2, "fg": 2, "bold": true }, { "text": "cargo build", "cells": 11 }], "wrapped": false, "redacted": false, "truncated": false },
+      { "row": 1, "text": "Finished", "runs": [{ "text": "Finished", "cells": 8, "fg": "#5fd75f", "strikethrough": true, "link": { "uri": "https://doc.rust-lang.org/cargo/" } }, { "text": "  ", "cells": 2, "bg": 236 }], "wrapped": false, "redacted": false, "truncated": false },
+      { "row": 2, "text": "$", "runs": [{ "text": "$", "cells": 1, "fg": 2, "bold": true }], "wrapped": false, "redacted": false, "truncated": false }
     ],
     "next_sequence": 41, "truncated": false,
     "facts": {

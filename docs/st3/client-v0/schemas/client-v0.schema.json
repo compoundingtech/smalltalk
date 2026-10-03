@@ -1835,6 +1835,7 @@
         "row": { "type": "integer", "minimum": 0 },
         "text": { "type": "string" },
         "runs": { "type": "array", "items": { "$ref": "#/$defs/TerminalRun" } },
+        "wrapped": { "type": "boolean", "description": "Whether this line continues onto the next terminal row through automatic wrapping." },
         "redacted": { "type": "boolean" },
         "truncated": { "type": "boolean" }
       }
@@ -1845,13 +1846,24 @@
       "required": ["text"],
       "properties": {
         "text": { "type": "string", "minLength": 1 },
+        "cells": { "type": "integer", "minimum": 0, "description": "Number of terminal display cells occupied by the run, which may differ from its text length." },
         "fg": { "$ref": "#/$defs/TerminalColor" },
         "bg": { "$ref": "#/$defs/TerminalColor" },
         "bold": { "const": true },
         "dim": { "const": true },
         "italic": { "const": true },
         "underline": { "const": true },
-        "inverse": { "const": true }
+        "inverse": { "const": true },
+        "strikethrough": { "const": true, "description": "Present when the run uses strikethrough styling." },
+        "link": { "$ref": "#/$defs/TerminalLink", "description": "Hyperlink associated with the run." }
+      }
+    },
+    "TerminalLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri"],
+      "properties": {
+        "uri": { "type": "string", "minLength": 1, "description": "Hyperlink destination emitted by the terminal." }
       }
     },
     "TerminalColor": {
@@ -1871,7 +1883,8 @@
         "bracketed_paste": { "type": "boolean" },
         "focus_events": { "type": "boolean" },
         "mouse_tracking": { "enum": ["none", "click", "drag", "motion"] },
-        "mouse_encoding": { "enum": ["default", "utf8", "sgr"] }
+        "mouse_encoding": { "enum": ["default", "utf8", "sgr"] },
+        "kitty_keyboard": { "type": "integer", "minimum": 0, "description": "Active Kitty keyboard protocol enhancement flags as a bitmask." }
       }
     },
     "TerminalScreen": {
