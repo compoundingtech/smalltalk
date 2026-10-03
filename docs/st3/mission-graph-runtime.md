@@ -794,6 +794,26 @@ gate fails that step, as it did before.
 A gate in a loop's `until` answers each round: not yet ends the round without a pass, and a broken
 gate holds the loop for a revision.
 
+#### Check a gate before you publish it
+
+`st missions check FILE` runs each exec gate in the file once, now, on this host, with the
+environment and `ST_GATE_REPORT` a run gives it, and prints each answer: pass, not yet, broken, or
+unchecked. `--workspace DIR` (the current directory by default) stands for the run's workspace,
+and the other run variables name the check. Gates run one at a time, in the order the file
+declares them. A gate declared for another host, or whose workspace does not exist yet, is
+unchecked; check it where it will run. The command exits 1 when a gate is broken. A check runs
+each command for real, so a gate with side effects has them when it is checked, too.
+
+```sh
+st missions check release.kdl --workspace ~/src/app
+```
+
+`st missions publish` runs the same check first and refuses a mission with a broken gate, printing
+each gate's answer and the end of a broken check's output. Not yet does not stop a publication:
+before the work exists, most gates should say not yet. `--workspace` names the workspace for the
+check. `--no-gate-check` publishes without it, for a gate whose check cannot run before its run,
+such as one that waits on a lock the run takes.
+
 Each check records its result on the gate's `gate.result` subject. The result's `verdict` is
 `pass`, `fail` for not yet, or `error` for broken, so every fleet build can read it; its
 `value.answer` is `pass`, `not-yet`, or `broken`, with `check`, `exit_code`, `host`, `output`, and

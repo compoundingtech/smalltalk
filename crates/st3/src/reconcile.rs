@@ -47,8 +47,8 @@ const GATE_POLL_PASS_INTERVAL: Duration = Duration::from_secs(60);
 const GATE_RECHECK_BASE_MS: u128 = 60_000;
 const GATE_RECHECK_MAX_MS: u128 = 15 * 60_000;
 /// How much of a gate check's output its result and attention item keep, from the end.
-const GATE_OUTPUT_LINES: usize = 40;
-const GATE_OUTPUT_BYTES: usize = 4_000;
+pub(crate) const GATE_OUTPUT_LINES: usize = 40;
+pub(crate) const GATE_OUTPUT_BYTES: usize = 4_000;
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
 // A new harness can spend longer than the retry sequence reading its boot
 // contract before it claims work. Keep the quick delivery retries, but do not
@@ -277,6 +277,20 @@ impl NativeRuntime {
     }
 }
 
+/// The environment a started process gets: `declared` over the account's captured login-shell
+/// environment, with the st3 executable's directory and then the command recorder first on PATH.
+/// Members and `st missions check` both launch with it.
+pub(crate) fn member_environment(
+    declared: &BTreeMap<String, String>,
+    executable: &Path,
+    recorder: Option<&Path>,
+) -> Result<BTreeMap<String, String>> {
+    let mut environment =
+        st_runtime::overlay_environment(crate::environment::snapshot()?, declared, executable)?;
+    record_member_commands(&mut environment, recorder)?;
+    Ok(environment)
+}
+
 /// Puts the recorder directory first on a member's PATH, after the declaration and the st3
 /// executable directory are applied, so no authored PATH can place a program before it.
 fn record_member_commands(
@@ -372,12 +386,8 @@ impl RuntimeControl for NativeRuntime {
 
     fn start(&self, member: &MemberSpec) -> Result<()> {
         let executable = launch_executable()?;
-        let mut environment = st_runtime::overlay_environment(
-            crate::environment::snapshot()?,
-            &member.environment,
-            &executable,
-        )?;
-        record_member_commands(&mut environment, self.recorder.as_deref())?;
+        let environment =
+            member_environment(&member.environment, &executable, self.recorder.as_deref())?;
         let mut launch = st_runtime::Launch::from(&member.launch);
         match &mut launch {
             st_runtime::Launch::Shell(source) => {
@@ -10661,30 +10671,11 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Record one finished exec gate check on the gate's result subject and answer for it.
     fn record_gate_check(&self, stage: &GateContext, check: GateCheck<'_>) -> Result<GateOutcome> {
-        let broken = if let Some(reason) = check.start_failure.clone() {
-            Some(reason)
-        } else if !check.calls.is_empty() {
-            Some(format!(
-                "an st call in its check was refused or read part of a listing: {}",
-                check.calls.join("; ")
-            ))
-        } else {
-            match check.exit_code {
-                Some(0 | 1) => None,
-                Some(127) => Some(
-                    "its check exited 127, the shell's status for a command it did not find; an exec gate exits 0 to pass and 1 for not yet"
-                        .into(),
-                ),
-                Some(code) if code > 128 => Some(format!(
-                    "its check exited {code}, as a process killed by signal {} does; an exec gate exits 0 to pass and 1 for not yet",
-                    code - 128
-                )),
-                Some(code) => Some(format!(
-                    "its check exited {code}; an exec gate exits 0 to pass and 1 for not yet"
-                )),
-                None => Some("its check ended without an exit status: something killed it".into()),
-            }
-        };
+        let broken = exec_check_broken(
+            check.exit_code,
+            &check.calls,
+            check.start_failure.as_deref(),
+        );
         let (answer, reason) = match (&broken, check.exit_code) {
             (Some(reason), _) => (
                 "broken",
@@ -11748,7 +11739,7 @@ fn run_variables(
     variables
 }
 
-fn expand_gate(
+pub(crate) fn expand_gate(
     gate: &mut GateSpec,
     variables: &BTreeMap<String, String>,
     run_workspace: &str,
@@ -12684,7 +12675,7 @@ fn gate_result_reason(result: &crate::model::ClaimRecord, default: &str) -> Stri
 }
 
 /// The last `lines` lines of `output`, at most `bytes` long, cut at a character boundary.
-fn output_tail(output: &str, lines: usize, bytes: usize) -> String {
+pub(crate) fn output_tail(output: &str, lines: usize, bytes: usize) -> String {
     let trimmed = output.trim_end();
     let start = trimmed
         .char_indices()
@@ -12704,12 +12695,45 @@ fn output_tail(output: &str, lines: usize, bytes: usize) -> String {
 }
 
 /// `ms` in the largest whole unit a person reads at a glance: `90s`, `10m`, `2h`.
-fn render_duration_ms(ms: u64) -> String {
+pub(crate) fn render_duration_ms(ms: u64) -> String {
     match ms {
         ms if ms >= 3_600_000 && ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
         ms if ms >= 60_000 && ms % 60_000 == 0 => format!("{}m", ms / 60_000),
         ms if ms % 1_000 == 0 => format!("{}s", ms / 1_000),
         ms => format!("{ms}ms"),
+    }
+}
+
+/// Why an exec gate check that ended this way cannot answer, or `None` when its exit status is an
+/// answer: 0 passes and 1 is not yet. `start_failure` says why it never ran to an exit.
+pub(crate) fn exec_check_broken(
+    exit_code: Option<i64>,
+    calls: &[String],
+    start_failure: Option<&str>,
+) -> Option<String> {
+    if let Some(reason) = start_failure {
+        return Some(reason.to_owned());
+    }
+    if !calls.is_empty() {
+        return Some(format!(
+            "an st call in its check was refused or read part of a listing: {}",
+            calls.join("; ")
+        ));
+    }
+    match exit_code {
+        Some(0 | 1) => None,
+        Some(127) => Some(
+            "its check exited 127, the shell's status for a command it did not find; an exec gate exits 0 to pass and 1 for not yet"
+                .into(),
+        ),
+        Some(code) if code > 128 => Some(format!(
+            "its check exited {code}, as a process killed by signal {} does; an exec gate exits 0 to pass and 1 for not yet",
+            code - 128
+        )),
+        Some(code) => Some(format!(
+            "its check exited {code}; an exec gate exits 0 to pass and 1 for not yet"
+        )),
+        None => Some("its check ended without an exit status: something killed it".into()),
     }
 }
 

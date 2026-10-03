@@ -443,6 +443,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/schema", get(schema))
         .route("/v1/intent/mission", post(mission))
+        .route("/v1/gate-checks", post(start_gate_check))
+        .route("/v1/gate-checks/{id}", get(read_gate_check))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
@@ -8146,6 +8148,60 @@ async fn mission(
         .warnings
         .extend(ignored_authority_warnings(&intent, &state.node).map_err(ApiError::bad)?);
     Ok(Json(response))
+}
+
+/// Start running each exec gate of a mission file once, the way a run would: `st missions check`.
+/// The answer lists every gate; poll `GET /v1/gate-checks/{id}` until it is finished.
+async fn start_gate_check(
+    State(state): State<AppState>,
+    Json(request): Json<crate::model::GateCheckRequest>,
+) -> Result<Json<crate::model::GateCheckView>, ApiError> {
+    let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
+    // Check the commands a publication would store: document names pinned to their versions.
+    let intent = state
+        .store
+        .document_bindings_at(&initial.document_refs, None)
+        .ok()
+        .and_then(|bindings| resolve_document_references(&request.intent.kdl, &bindings).ok())
+        .and_then(|resolved| parse_intent(&resolved, &state.node).ok())
+        .unwrap_or(initial);
+    let workspace = std::path::Path::new(&request.workspace);
+    if !workspace.is_absolute() {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-check-workspace",
+            "a gate check's workspace must be an absolute path",
+        )));
+    }
+    let (node, state_dir, pty_root) = (state.node, state.state_dir, state.pty_root);
+    let view = tokio::task::spawn_blocking(move || {
+        crate::gate_check::start(
+            crate::gate_check::CheckHost {
+                node: &node,
+                state_dir: &state_dir,
+                pty_root: &pty_root,
+            },
+            &intent,
+            &request.workspace,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow::anyhow!(error)))?
+    .map_err(ApiError::internal)?;
+    Ok(Json(view))
+}
+
+async fn read_gate_check(
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<crate::model::GateCheckView>, ApiError> {
+    tokio::task::spawn_blocking(move || crate::gate_check::poll(&id))
+        .await
+        .map_err(|error| ApiError::internal(anyhow::anyhow!(error)))?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "no such gate check: it started over an hour ago or the daemon restarted",
+            )
+        })
 }
 
 /// One preview warning for each agent the publication declares, directly or inside a mission,

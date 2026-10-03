@@ -1613,8 +1613,11 @@ enum MissionViewCommand {
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
-    /// Publish exact authored mission KDL after preview.
+    /// Publish exact authored mission KDL after preview, once its exec gates pass a check.
     Publish(MissionPublishArgs),
+    /// Run each exec gate in a mission file once, now, the way a run would, and report its
+    /// answer: pass (exit 0), not yet (exit 1), broken (anything else), or unchecked.
+    Check(MissionCheckArgs),
     /// Start one run from the current ready mission revision.
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
@@ -1658,6 +1661,22 @@ struct MissionPublishArgs {
     /// Complete person or agent subject authoring the publication.
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
+    /// The workspace a run would use, where publish first checks each exec gate.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Publish without first running each exec gate once to refuse a broken one.
+    #[arg(long)]
+    no_gate_check: bool,
+}
+
+#[derive(Args)]
+struct MissionCheckArgs {
+    /// KDL file to check; use `-` to read standard input.
+    file: PathBuf,
+    /// The workspace a run would use: `${ST_WORKSPACE}` and relative gate workspaces stand for
+    /// it.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -4322,6 +4341,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         native_session_home: std::env::var_os("HOME").map(PathBuf::from),
         planner_default: config.planner.clone(),
     };
+    st3::gate_check::set_endpoint(config.socket.display().to_string());
     let reconciler = Arc::new(Reconciler::native(
         store.clone(),
         &config.state_dir,
@@ -4974,6 +4994,7 @@ async fn run_mission_view(
             Ok(())
         }
         MissionViewCommand::Publish(args) => publish_mission_file(client, args, json_output).await,
+        MissionViewCommand::Check(args) => check_mission_file(client, args, json_output).await,
         MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
         MissionViewCommand::Cancel(args) => {
             cancel_mission_run(client, endpoint, args, json_output).await
@@ -5019,6 +5040,9 @@ async fn publish_mission_file(
         mission.blockers.join("; ")
     );
     warn_ignored_authority(&mission);
+    if !args.no_gate_check {
+        check_before_publish(client, &intent, &args.workspace).await?;
+    }
     let resolved = mission.resolved_intent;
     let response: ApplyResponse = client
         .post(
@@ -5039,6 +5063,160 @@ async fn publish_mission_file(
         .map(|(subject, revision)| json!({"subject": subject, "revision": revision}))
         .collect();
     print_value(&value, json_output)
+}
+
+/// Run each exec gate once before a publication and refuse it when one is broken.
+async fn check_before_publish(
+    client: &Client,
+    intent: &IntentInput,
+    workspace: &Path,
+) -> Result<()> {
+    let mut announced = false;
+    let checked = run_gate_check(client, intent, workspace, |view, item| {
+        if !announced {
+            eprintln!("{}", gate_check_heading(view));
+            announced = true;
+        }
+        eprint!("{}", render_gate_check_item(item));
+    })
+    .await?;
+    let Some(view) = checked else {
+        eprintln!("st: this st daemon cannot check exec gates; publishing without the check");
+        return Ok(());
+    };
+    let broken = view
+        .gates
+        .iter()
+        .filter(|item| item.answer == "broken")
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        broken.is_empty(),
+        "{} exec gate{} cannot answer as written, so st did not publish: {}. Correct {}, or publish with --no-gate-check",
+        broken.len(),
+        if broken.len() == 1 { "" } else { "s" },
+        broken
+            .iter()
+            .map(|item| format!(
+                "`{}` ({})",
+                item.gate,
+                item.reason.as_deref().unwrap_or("broken")
+            ))
+            .collect::<Vec<_>>()
+            .join("; "),
+        if broken.len() == 1 { "it" } else { "them" }
+    );
+    Ok(())
+}
+
+/// `st missions check FILE`: exit status 1 when a gate is broken.
+async fn check_mission_file(
+    client: &Client,
+    args: MissionCheckArgs,
+    json_output: bool,
+) -> Result<()> {
+    let (kdl, source_name) = read_intent(Some(&args.file))?;
+    let intent = IntentInput { kdl, source_name };
+    let mut announced = false;
+    let checked = run_gate_check(client, &intent, &args.workspace, |view, item| {
+        if json_output {
+            return;
+        }
+        if !announced {
+            println!("{}", gate_check_heading(view));
+            announced = true;
+        }
+        print!("{}", render_gate_check_item(item));
+    })
+    .await?;
+    let view = checked.context("this st daemon cannot check exec gates; update it")?;
+    if json_output {
+        print_value(&view, true)?;
+    } else if view.gates.is_empty() {
+        println!("No exec gates to check.");
+    }
+    if view.gates.iter().any(|item| item.answer == "broken") {
+        return Err(CommandExit(1).into());
+    }
+    Ok(())
+}
+
+/// Run each exec gate of `intent` once on the daemon and wait for every answer, handing each one
+/// to `report` as it arrives. `None` when the daemon predates gate checks.
+async fn run_gate_check(
+    client: &Client,
+    intent: &IntentInput,
+    workspace: &Path,
+    mut report: impl FnMut(&st3::model::GateCheckView, &st3::model::GateCheckItemView),
+) -> Result<Option<st3::model::GateCheckView>> {
+    let workspace = std::path::absolute(workspace)
+        .with_context(|| format!("resolve the workspace {}", workspace.display()))?;
+    let request = st3::model::GateCheckRequest {
+        intent: intent.clone(),
+        workspace: workspace.display().to_string(),
+    };
+    let mut view: st3::model::GateCheckView = match client.post("/v1/gate-checks", &request).await {
+        Ok(view) => view,
+        Err(error) if matches!(st3::client::http_status(&error), Some(404 | 405)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut reported = 0;
+    loop {
+        while let Some(item) = view.gates.get(reported) {
+            if matches!(item.answer.as_str(), "waiting" | "running") {
+                break;
+            }
+            report(&view, item);
+            reported += 1;
+        }
+        if view.finished {
+            return Ok(Some(view));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        view = client
+            .get(&format!(
+                "/v1/gate-checks/{}",
+                urlencoding::encode(&view.id)
+            ))
+            .await?;
+    }
+}
+
+fn gate_check_heading(view: &st3::model::GateCheckView) -> String {
+    format!(
+        "Checking {} exec gate{} on {}, one at a time:",
+        view.gates.len(),
+        if view.gates.len() == 1 { "" } else { "s" },
+        view.host
+    )
+}
+
+/// One gate's answer: its label, owner and name, why it is broken or unchecked, and the end of a
+/// broken check's output.
+fn render_gate_check_item(item: &st3::model::GateCheckItemView) -> String {
+    use std::fmt::Write as _;
+    let label = match item.answer.as_str() {
+        "not-yet" => "not yet",
+        answer => answer,
+    };
+    let mut output = format!("  {label:<9}  {} · {}", item.owner, item.gate);
+    if let Some(code) = item.exit_code {
+        let _ = write!(output, " · exit {code}");
+    }
+    if item.elapsed_ms >= 1_000 {
+        let _ = write!(output, " · {:.1}s", item.elapsed_ms as f64 / 1_000.0);
+    }
+    output.push('\n');
+    if let Some(reason) = &item.reason {
+        let _ = writeln!(output, "             {reason}");
+    }
+    if item.answer == "broken" {
+        for line in item.output.lines() {
+            let _ = writeln!(output, "             | {line}");
+        }
+    }
+    output
 }
 
 async fn cancel_mission_run(
@@ -22891,6 +23069,8 @@ mission "review" state="ready" {
                 file,
                 at_index: None,
                 actor: "person/test".into(),
+                workspace: root.to_owned(),
+                no_gate_check: false,
             },
             true,
         )
