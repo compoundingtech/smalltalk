@@ -133,6 +133,12 @@ function pingId(text: string): string | undefined {
  * A delivery of mail the stream already shows (`shown`) is not announced again: its id goes in
  * `delivered`, and the mail itself says it arrived.
  */
+/** The lines st adds beside a delivery for the agent (st-drivers `ding`). */
+const ST_DELIVERY_NOTES = [
+  "The person reads replies in st, not in the agent's session.",
+  '(dictated by voice; it may contain transcription mistakes)',
+];
+
 export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<string> = new Set(), delivered: Set<string> = new Set()): Body[] {
   // A harness that ran out of context continues from a summary written as the person's turn: the
   // agent's own notes, kilobytes long. One folded line that opens like a tool call, as stui shows it.
@@ -145,6 +151,17 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
   for (const block of takeBlocks(text, 'task-notification')) {
     bodies.push({ kind: 'event', tone: 'quiet', text: `background task ${field(block, 'status') ?? 'update'}: ${shorten(field(block, 'summary') ?? '', 90)}` });
   }
+  // st's own envelope, as Codex and the pi family receive it: the mail, or a delivery of mail the
+  // stream already shows (Nathan, 2026-10-03: raw XML in a Codex seat's conversation).
+  const enveloped = new Set<string>();
+  const envelopeHeads = [...text.value.matchAll(/<smalltalk-message\b[^>]*>/g)].map(match => match[0]);
+  takeBlocks(text, 'smalltalk-message').forEach((block, index) => {
+    const head = envelopeHeads[index] ?? '';
+    const graph = attribute(head, 'graph');
+    if (graph) enveloped.add(graph);
+    if (graph && shown.has(graph)) { delivered.add(graph); return; }
+    bodies.push({ kind: 'mail', from: attribute(head, 'from') ?? 'someone', to: attribute(head, 'to') ?? '', subject: attribute(head, 'subject') ?? '', text: cleanMessageText(unescapeXml(block)).trim() });
+  });
   const channelHeads = [...text.value.matchAll(/<channel\b[^>]*>/g)].map(match => match[0]);
   const senders = channelHeads.map(head => attribute(head, 'from') ?? 'someone');
   takeBlocks(text, 'channel').forEach((block, index) => {
@@ -153,6 +170,8 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     const envelope = /<smalltalk-message\b[^>]*>/.exec(block)?.[0];
     const id = pingId(block) ?? attribute(channelHeads[index] ?? '', 'messageId') ?? (envelope ? attribute(envelope, 'graph') : undefined);
     if (id && shown.has(id)) { delivered.add(id); return; }
+    // Its envelope was read above: that is the mail; the rest is the delivery's own notes.
+    if (id && enveloped.has(id)) return;
     // Mail the stream does not show reads as that mail, never as the delivery's other lines
     // (Nathan, 2026-10-03: "delivered to the agent: The person reads replies in st…").
     if (envelope) {
@@ -179,6 +198,8 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     if (answers.length) bodies.push({ kind: 'user', text: answers.join('\n') });
   }
   for (const tag of CONTEXT_BLOCKS) takeBlocks(text, tag);
+  // st's own notes beside a delivery tell the agent something; the person never typed them.
+  text.value = text.value.split('\n').filter(line => !ST_DELIVERY_NOTES.includes(line.trim())).join('\n');
   const rest = cleanMessageText(text.value);
   if (isUser && rest) bodies.unshift({ kind: 'user', text: rest });
   return bodies;
