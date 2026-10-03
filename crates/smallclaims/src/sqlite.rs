@@ -13,9 +13,23 @@ use rusqlite::{Connection, OpenFlags, Transaction};
 
 use crate::store::current_index;
 
-/// Read connections a store keeps open between reads; more open while more reads run at once.
-/// Each caches up to 8 MiB of pages.
-pub const IDLE_READ_CONNECTIONS: usize = 32;
+/// Read connections a store keeps between reads; more open while more reads run at once.
+/// Each caches up to 8 MiB of pages. Opening a connection also parses the database schema
+/// (`sqlite3Init`), which under the daemon's read pattern cost more CPU than the reads
+/// themselves (issue #946: 55% of daemon CPU was `ReadPool::get` reopening connections the
+/// pool had just closed), so the pool keeps every connection it opened, up to this many.
+pub const MAX_READ_CONNECTIONS: usize = 128;
+
+/// `MAX_READ_CONNECTIONS`, or `SMALLCLAIMS_MAX_READ_CONNECTIONS` when that parses.
+pub fn max_read_connections() -> usize {
+    static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("SMALLCLAIMS_MAX_READ_CONNECTIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(MAX_READ_CONNECTIONS)
+    });
+    *MAX
+}
 
 /// Prepared statements each connection keeps. The default of 16 is fewer than the cached
 /// statements one status reduction alone runs, so they evicted each other and were planned anew
@@ -369,8 +383,8 @@ impl Drop for WriterGuard<'_> {
 
 /// Read connections. A read takes an idle connection, or opens another when every one is busy,
 /// so a read never waits for another read to finish: the pool holds as many connections as reads
-/// ever ran at once, keeps up to `IDLE_READ_CONNECTIONS` of them between reads, and closes them
-/// with the store. Reads see the last committed state and, in WAL mode, never wait for the writer.
+/// ever ran at once and keeps them all, up to `max_read_connections()`, closing the rest with
+/// the store. Reads see the last committed state and, in WAL mode, never wait for the writer.
 pub struct ReadPool {
     pub idle: Mutex<Vec<Connection>>,
     /// Wakes a read waiting for an idle connection, which happens only when the operating system
@@ -493,10 +507,11 @@ impl ReadPool {
         }
     }
 
-    /// Keep `connection` for the next read, or close it when enough are idle already.
+    /// Keep `connection` for the next read, or close it when the pool already holds
+    /// `max_read_connections()` of them.
     pub fn release(&self, connection: Connection) {
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-        if idle.len() < IDLE_READ_CONNECTIONS {
+        if idle.len() < max_read_connections() {
             idle.push(connection);
             self.returned.notify_one();
         }
@@ -662,6 +677,8 @@ pub mod work {
 }
 
 pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {
+    #[cfg(any(test, feature = "test-support"))]
+    READ_CONNECTIONS_OPENED.fetch_add(1, Ordering::Relaxed);
     let flags = if shared_memory {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
     } else {
@@ -684,4 +701,44 @@ pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connecti
 thread_local! {
     /// SQLite statements this thread ran, so a test can see how a read's work grows.
     pub static STATEMENTS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Read connections opened since the process started, so a test can see that the pool reuses
+/// them instead of reopening (`#946`).
+#[cfg(any(test, feature = "test-support"))]
+pub static READ_CONNECTIONS_OPENED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_bursts_of_reads_reuse_connections_instead_of_opening_new_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        // A read-only open needs the file to exist.
+        rusqlite::Connection::open(&path).unwrap();
+        let pool = ReadPool::new(&path, false).unwrap();
+        let opened = || READ_CONNECTIONS_OPENED.load(Ordering::Relaxed);
+        let before = opened();
+        let burst = |pool: &ReadPool| {
+            let guards: Vec<_> = (0..8).map(|_| pool.get()).collect();
+            drop(guards);
+        };
+        burst(&pool);
+        // The first burst needed one connection per concurrent read (the pool's opening
+        // connection covered the first); the second reused all of them. Opening a connection
+        // parses the schema, which is what most of the #946 daemon CPU was.
+        assert_eq!(opened() - before, 7);
+        assert_eq!(
+            pool.idle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+            8
+        );
+        burst(&pool);
+        assert_eq!(opened() - before, 7);
+    }
 }
