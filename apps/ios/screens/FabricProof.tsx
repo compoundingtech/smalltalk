@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AppState, ScrollView } from 'react-native';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, St3Client } from '../../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client } from '../../../clients/typescript/st3-client';
 import { dialFabric, fabricIdentity, stopFabric } from '../modules/st-fabric';
 import type { FabricProofInput } from '../fabricProof';
 import { Button, Note, Screen, SectionHeader, T } from '../ui';
@@ -23,12 +23,21 @@ export function FabricProofScreen({ input, onClose }: { input: FabricProofInput;
         }
         const bridge = await dialFabric(input.node, input.service, input.address);
         if (!current) { await stopFabric(); return; }
+        const unpaired = new St3Client({ baseUrl: bridge.url });
+        let refused = false;
+        try { await unpaired.capabilities(); }
+        catch (error) {
+          if (error instanceof ClientError && (error.status === 401 || error.status === 403)) refused = true;
+          else throw error;
+        }
+        if (!refused) throw new Error('Test gateway accepted an unpaired client');
+        if (!current) return;
         const publicKey = Array.from(Crypto.getRandomBytes(32), byte => byte.toString(16).padStart(2, '0')).join('');
-        const pairing = await new St3Client({ baseUrl: bridge.url }).completePairing(input.id, { api_version: API_VERSION, code: input.code, device_public_key: publicKey });
+        const pairing = await unpaired.completePairing(input.id, { api_version: API_VERSION, code: input.code, device_public_key: publicKey });
         if (!current) return;
         const client = new St3Client({ baseUrl: bridge.url, credential: () => pairing.value.credential });
         const caps = await client.capabilities();
-        if (current) setResult(`Capabilities received\nAPI: ${caps.api_version}\nActor: ${caps.value.session_actor}\nFabric: ${bridge.fabricVersion}\nIroh: ${bridge.irohVersion}`);
+        if (current) setResult(`Capabilities received\nUnpaired client: refused\nAPI: ${caps.api_version}\nActor: ${caps.value.session_actor}\nFabric: ${bridge.fabricVersion}\nIroh: ${bridge.irohVersion}`);
       } catch (error) {
         // Native errors omit host-local target paths; never log the pairing link or credential.
         if (current) setResult(error instanceof Error ? error.message : 'Fabric proof failed');
