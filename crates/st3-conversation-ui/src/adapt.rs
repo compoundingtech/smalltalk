@@ -454,6 +454,9 @@ fn harness_bodies(
         }];
     }
     let mut bodies = Vec::new();
+    // The messages whose st envelope this prompt carries: a channel delivery around one of them
+    // is that message, already read or shown, never a line of its own.
+    let mut enveloped = BTreeSet::new();
     // st's own envelope, as codex and the pi family receive it.
     let envelopes = heads(&text, "smalltalk-message");
     for (block, head) in take_blocks(&mut text, "smalltalk-message")
@@ -463,6 +466,7 @@ fn harness_bodies(
         let from = attribute(&head, "from").unwrap_or_default();
         let subject = attribute(&head, "subject").unwrap_or_default();
         let graph = attribute(&head, "graph").unwrap_or_default();
+        enveloped.insert(graph.clone());
         if shown.contains(&graph) {
             delivered.insert(graph);
             continue;
@@ -493,20 +497,31 @@ fn harness_bodies(
             .and_then(|rest| rest.split('"').next())
             .unwrap_or("someone")
             .to_owned();
-        deliveries.push(sender);
+        deliveries.push((sender, attribute(&head, "messageId")));
         from = start + 1;
     }
-    for (block, sender) in take_blocks(&mut text, "channel")
+    for (block, (sender, message_id)) in take_blocks(&mut text, "channel")
         .into_iter()
         .zip(deliveries)
     {
-        // A delivery of mail the stream shows marks that mail delivered; its PING line inside
-        // is the same delivery, not another.
-        if let Some(id) = block.lines().find_map(ping_id)
-            && shown.contains(id)
-        {
-            delivered.insert(id.to_owned());
-            continue;
+        // A delivery of mail the stream shows marks that mail delivered; its PING line inside,
+        // or the message the channel names (`messageId`), is the same delivery, not another.
+        let id = block
+            .lines()
+            .find_map(ping_id)
+            .map(str::to_owned)
+            .or(message_id);
+        if let Some(id) = id {
+            if shown.contains(&id) {
+                delivered.insert(id);
+                continue;
+            }
+            // Its st envelope was read above: that is the mail, and what is left of the block
+            // is the delivery's own notes (Nathan, 2026-10-03: "delivered to the agent: The
+            // person reads replies in st…").
+            if enveloped.contains(&id) {
+                continue;
+            }
         }
         let subject = block
             .lines()

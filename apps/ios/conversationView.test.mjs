@@ -161,3 +161,16 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.equal(summary.body.title, 'context summary · the conversation was compacted');
   assert.ok(!summary.body.output.some(line => line.includes('<artifact')));
 }
+
+// A channel delivery carrying st's envelope is that mail: marked delivered when the stream shows
+// it, the mail itself when not, never "delivered to the agent: The person reads replies…"
+// (Nathan, 2026-10-03).
+{
+  const delivery = '<channel source="plugin:st3-channel:st3" from="person/example" messageId="message/c3">\n<smalltalk-message id="c3" from="person/example" to="agent/example/quay" subject="(no subject)" sha256="00" graph="message/c3">\nhow is it &lt;going&gt;?\n</smalltalk-message>\nThe person reads replies in st, not in the agent\'s session.\n</channel>';
+  const delivered = new Set();
+  assert.deepEqual(fromHarness(true, delivery, new Set(['message/c3']), delivered), []);
+  assert.ok(delivered.has('message/c3'));
+  const [mail, ...rest] = fromHarness(true, delivery);
+  assert.equal(rest.length, 0);
+  assert.deepEqual([mail.kind, mail.from, mail.text], ['mail', 'person/example', 'how is it <going>?']);
+}

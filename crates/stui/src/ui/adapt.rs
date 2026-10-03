@@ -903,6 +903,23 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_delivery_carrying_an_envelope_is_that_mail_not_a_line() {
+        // The Claude channel's delivery: st's envelope, then the delivery notes after it.
+        let delivery = "<channel source=\"plugin:st3-channel:st3\" from=\"person/example\" messageId=\"message/c3\">\n<smalltalk-message id=\"c3\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/c3\">\nhow is it going?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.\n</channel>";
+        // Shown in the stream already: marked delivered, no line (Nathan, 2026-10-03).
+        let shown = BTreeSet::from(["message/c3".to_owned()]);
+        let bodies = from_harness(true, delivery, &shown);
+        assert!(bodies.is_empty(), "{bodies:?}");
+        // Not shown: it is the mail itself, never "delivered to the agent: The person reads…".
+        let bodies = from_harness(true, delivery, &BTreeSet::new());
+        assert!(
+            matches!(&bodies[..], [Body::Mail { from, body, .. }]
+                if from == "person/example" && body == "how is it going?"),
+            "{bodies:?}"
+        );
+    }
+
+    #[test]
     fn the_persons_mail_says_when_the_agent_has_it_and_its_delivery_is_not_a_line() {
         let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
             {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
