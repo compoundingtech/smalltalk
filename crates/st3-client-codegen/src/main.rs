@@ -243,6 +243,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn agent_declaration_get(&self, id: &str, revision: Option<&str>, show_env_values: bool) -> Result<Envelope<AgentDeclaration>, ClientError> {{ let path = format!(\"/v1/client/agent-declarations/{{}}?show_env_values={{show_env_values}}\", percent_encode(id)); let path = if let Some(revision) = revision {{ format!(\"{{path}}&revision={{}}\", percent_encode(revision)) }} else {{ path }}; self.get(&path).await }}"
             )?;
+        } else if id == "resources.list" {
+            writeln!(
+                out,
+                "    pub async fn resources_list(&self, filters: &ResourcesFilter, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<ResourcesPage>, ClientError> {{ let values = [(\"opened_by\", filters.opened_by.as_deref()), (\"kind\", filters.kind.as_deref()), (\"subject_prefix\", filters.subject_prefix.as_deref())]; let mut filters = [(\"\", \"\"); 3]; let mut count = 0; for (name, value) in values {{ if let Some(value) = value {{ filters[count] = (name, value); count += 1; }} }} self.list_internal_with_filters(\"resources\", cursor, limit, false, &filters[..count]).await }}"
+            )?;
         } else if id.ends_with(".get") {
             let collection = path
                 .trim_start_matches("/v1/client/")
@@ -327,6 +332,11 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func subjectDefinition(subject: String, showEnvValues: Bool = false) async throws -> Envelope<SubjectDefinition> {{ try await get(\"v1/client/subject-definition\", query: [.init(name: \"subject\", value: subject), .init(name: \"show_env_values\", value: showEnvValues ? \"true\" : \"false\")]) }}"
+            )?;
+        } else if id == "resources.list" {
+            writeln!(
+                out,
+                "    public func resourcesList(filters: ResourcesFilter = .init(), cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ResourcesPage> {{ var query: [URLQueryItem] = []; if let openedBy = filters.openedBy {{ query.append(.init(name: \"opened_by\", value: openedBy)) }}; if let kind = filters.kind {{ query.append(.init(name: \"kind\", value: kind)) }}; if let subjectPrefix = filters.subjectPrefix {{ query.append(.init(name: \"subject_prefix\", value: subjectPrefix)) }}; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/resources\", query: query) }}"
             )?;
         } else if id.ends_with(".get") {
             let collection = path
@@ -489,6 +499,9 @@ fn validate_surfaces(
         }
     }
     for definition in [
+        "ResourceObservation",
+        "ResourcesFilter",
+        "ResourcesPage",
         "AttentionTargetState",
         "DocumentContent",
         "AgentDeclaration",
@@ -1018,6 +1031,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
+            )?;
+        } else if id == "resources.list" {
+            writeln!(
+                out,
+                "    async resourcesList(filters: ResourcesFilter = {{}}, options: PageOptions = {{}}): Promise<EnvelopeOf<ResourcesPage>> {{ return this.get('{route}' + query({{ ...filters, ...options }})); }}"
             )?;
         } else if id == "agent-declaration.get" {
             writeln!(

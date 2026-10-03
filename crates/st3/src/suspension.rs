@@ -29,6 +29,13 @@ use serde_json::Value;
 pub const RESUME_ENV: &str = "ST3_NATIVE_RESUME_SESSION";
 /// The diagnostic code a driver records when it cannot relaunch the named native session.
 pub const RESUME_UNAVAILABLE_CODE: &str = "native-resume-unavailable";
+/// The environment variable that names the native session a relaunched driver continues when
+/// it can. Unlike [`RESUME_ENV`], a driver that cannot continue it starts a new session.
+pub const CONTINUE_ENV: &str = "ST3_NATIVE_CONTINUE_SESSION";
+/// Where the harness kept that session, when its driver reported a path.
+pub const CONTINUE_PATH_ENV: &str = "ST3_NATIVE_CONTINUE_PATH";
+/// The diagnostic code a driver records when it starts a new session instead of continuing.
+pub const CONTINUE_UNAVAILABLE_CODE: &str = "native-continue-unavailable";
 /// How long a resumed driver may take to bind its native session before the resume fails.
 pub const VERIFY_TIMEOUT_MS: u128 = 180_000;
 
@@ -250,6 +257,45 @@ pub fn bound_session(
                 field(&claim, "session_id")?.to_owned(),
             ))
         }))
+}
+
+/// The key of the diagnostic a driver records once when it cannot continue `session`.
+pub fn continue_unavailable_key(subject: &str, session: &str) -> String {
+    format!("{CONTINUE_UNAVAILABLE_CODE}:{subject}:{session}")
+}
+
+/// The native session a relaunch of `subject` on `harness` continues, with its path: the last
+/// one the seat's driver bound for that harness. A seat relaunched for a fresh context since,
+/// or whose driver could not continue that session before, starts a new one.
+pub fn continue_session(
+    store: &Store,
+    subject: &str,
+    harness: &str,
+) -> Result<Option<(String, Option<String>)>> {
+    let Some(bound) = store
+        .claims_for(subject, Some("harness.session-file"))?
+        .into_iter()
+        .rev()
+        .find(|claim| field(claim, "harness") == Some(harness))
+    else {
+        return Ok(None);
+    };
+    let Some(session) = field(&bound, "session_id").map(str::to_owned) else {
+        return Ok(None);
+    };
+    let fresh_since = store
+        .claims_for(subject, Some("runtime.action.requested"))?
+        .iter()
+        .any(|claim| {
+            claim.store_index > bound.store_index && field(claim, "action") == Some("fresh-context")
+        });
+    let refused = store
+        .operation_claim(&continue_unavailable_key(subject, &session))?
+        .is_some();
+    if fresh_since || refused {
+        return Ok(None);
+    }
+    Ok(Some((session, field(&bound, "path").map(str::to_owned))))
 }
 
 /// Why `subject`'s running `incarnation` cannot be suspended now; empty when it can.

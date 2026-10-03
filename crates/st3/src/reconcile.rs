@@ -243,6 +243,9 @@ pub trait RuntimeControl: Send + Sync + 'static {
     fn screen(&self, runtime_id: &str) -> Result<String>;
     fn send_key(&self, runtime_id: &str, key: &str) -> Result<()>;
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>>;
+    /// Ends, without waiting, what a runtime that is not running left in its work scope: a build
+    /// or test its harness started that outlived it.
+    fn end_leftovers(&self, _runtime_id: &str, _terminal: bool) {}
 }
 
 pub struct NativeRuntime {
@@ -495,6 +498,14 @@ impl RuntimeControl for NativeRuntime {
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
         self.exec.read_log(runtime_id)
     }
+
+    fn end_leftovers(&self, runtime_id: &str, terminal: bool) {
+        if terminal {
+            self.pty.end_leftovers_later(runtime_id);
+        } else {
+            self.exec.end_leftovers_later(runtime_id);
+        }
+    }
 }
 
 /// A test hook that fails one item of a reconcile pass where the reconciler takes it up.
@@ -535,6 +546,9 @@ pub struct Reconciler<R = NativeRuntime> {
     /// index of the subject's newest declaration it was read from.
     declared_checkouts: Mutex<HashMap<String, (u64, Option<(Checkout, String)>)>>,
     materialized_mission_generations: Mutex<BTreeSet<String>>,
+    /// Each running seat's incarnation and the member it was launched from, read once per
+    /// incarnation, so a pass compares the declared launch without reading the store.
+    launched_members: Mutex<HashMap<String, (String, Option<MemberSpec>)>>,
     retired_predecessor_generations: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     mission_declaration_parses: std::sync::atomic::AtomicUsize,
@@ -648,6 +662,7 @@ impl Reconciler<NativeRuntime> {
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
+            launched_members: Mutex::new(HashMap::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
@@ -700,6 +715,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
+            launched_members: Mutex::new(HashMap::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
@@ -1626,6 +1642,38 @@ impl<R: RuntimeControl> Reconciler<R> {
                 match observed {
                     Some(observation) if observation.status == "running" => {
                         self.record_member(subject, &observation, true)?;
+                        if let Some(changes) =
+                            self.declared_launch_changes(subject, member, &observation)?
+                        {
+                            // Rendering must succeed before we shut down a still-running seat.
+                            if let Some(error) = blocked.take() {
+                                return Err(error);
+                            }
+                            self.record_once(
+                                &subject.subject,
+                                "runtime.reconcile-decision",
+                                BTreeMap::from([
+                                    ("decision".into(), Value::String("restart".into())),
+                                    ("reachability".into(), Value::String("reachable".into())),
+                                    (
+                                        "reason".into(),
+                                        Value::String(format!(
+                                            "the declared {} changed",
+                                            changes.join(" and ")
+                                        )),
+                                    ),
+                                ]),
+                            )?;
+                            self.reconcile_runtime_stop(
+                                &subject.subject,
+                                &member.runtime_id,
+                                member.terminal,
+                                observation.incarnation_id.as_deref(),
+                                member.shutdown_timeout_ms,
+                                Some(&observation),
+                            )?;
+                            return Ok(());
+                        }
                         self.reconcile_claude_auth_screen(subject, member, &observation)?;
                         self.reconcile_claude_trust_screen(
                             subject,
@@ -2874,6 +2922,60 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Whether the latest launch was for the selected declaration, or for a revision it only
     /// relabels. Older launches do not count: after A → B → A the seat runs A again.
+    /// What a running seat's declaration changed about how it launches since its running
+    /// incarnation started, when that matters: its host, workspace, harness, terminal, command,
+    /// model or arguments. A seat st did not launch, or whose launch it no longer has, has
+    /// nothing to compare and keeps running.
+    fn declared_launch_changes(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: &RuntimeObservation,
+    ) -> Result<Option<Vec<&'static str>>> {
+        if subject.kind != "agent" || member.lifecycle != MemberLifecycle::Service {
+            return Ok(None);
+        }
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(None);
+        };
+        let mut launched = self
+            .launched_members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let launched = match launched.get(&subject.subject) {
+            Some((known, launched)) if known == incarnation => launched.clone(),
+            _ => {
+                // The latest start this node made launched the running incarnation; an adopted
+                // runtime it did not start has none, or an older one it then outlived.
+                let read = self
+                    .store
+                    .observations_for(&subject.subject, "runtime.action.succeeded")?
+                    .iter()
+                    .rev()
+                    .find_map(|claim| {
+                        claim
+                            .body
+                            .pointer("/fields/desired_token")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .map(|token| self.store.claim_by_id(&token))
+                    .transpose()?
+                    .flatten()
+                    .and_then(|claim| serde_json::from_value::<DesiredSubject>(claim.body).ok())
+                    .and_then(|desired| desired.member);
+                launched.insert(
+                    subject.subject.clone(),
+                    (incarnation.to_owned(), read.clone()),
+                );
+                read
+            }
+        };
+        Ok(launched
+            .map(|launched| member.launch_changes(&launched))
+            .filter(|changes| !changes.is_empty()))
+    }
+
     fn member_was_launched_for_selected_desired(&self, subject: &str) -> Result<bool> {
         let lineage = self.store.launch_lineage(subject)?;
         Ok(self
@@ -3222,6 +3324,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         }
         if observation.is_none_or(|observation| observation.status != "running") {
+            // A harness that ended before the stop, or a stop that could not finish, can leave
+            // processes in the runtime's work scope. They end with it.
+            self.runtime.end_leftovers(runtime_id, terminal);
             self.record_once(
                 subject,
                 "runtime.observed",
@@ -3441,6 +3546,34 @@ impl<R: RuntimeControl> Reconciler<R> {
             launch_member
                 .environment
                 .remove(crate::suspension::RESUME_ENV);
+        }
+        // Every other relaunch of a seat continues the native session its harness last bound,
+        // so a restart, a hangup or a changed declaration never loses the conversation.
+        launch_member
+            .environment
+            .remove(crate::suspension::CONTINUE_ENV);
+        launch_member
+            .environment
+            .remove(crate::suspension::CONTINUE_PATH_ENV);
+        let continued = if subject.kind == "agent"
+            && !member
+                .environment
+                .contains_key(crate::suspension::RESUME_ENV)
+            && let Some(harness) = member.driver.as_deref()
+        {
+            crate::suspension::continue_session(&self.store, &subject.subject, harness)?
+        } else {
+            None
+        };
+        if let Some((session, path)) = continued {
+            launch_member
+                .environment
+                .insert(crate::suspension::CONTINUE_ENV.into(), session);
+            if let Some(path) = path {
+                launch_member
+                    .environment
+                    .insert(crate::suspension::CONTINUE_PATH_ENV.into(), path);
+            }
         }
         launch_member
             .environment
@@ -5839,24 +5972,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             );
         }
         if loop_spec.for_each.is_some() {
-            return self.evaluate_for_each_loop(
-                run,
-                step,
-                view,
-                loop_spec,
-                &loop_subject,
-                &variables,
-            );
+            return self.evaluate_for_each_loop(run, view, loop_spec, &loop_subject, &variables);
         }
         if loop_spec.candidates.is_some() {
-            return self.evaluate_candidate_loop(
-                run,
-                step,
-                view,
-                loop_spec,
-                &loop_subject,
-                &variables,
-            );
+            return self.evaluate_candidate_loop(run, view, loop_spec, &loop_subject, &variables);
         }
         let dispatch = self.loop_dispatch_count(&loop_subject, view.attempt, None, None)?;
         let base_key = format!("loop-round:{}:{}", view.subject, view.attempt);
@@ -5989,7 +6108,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             "completed" => {
                 let metrics = match self.evaluate_loop_metrics(
                     run,
-                    step,
                     view,
                     loop_spec,
                     &loop_subject,
@@ -6072,7 +6190,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         run,
                         &loop_subject,
                         &loop_spec.id,
-                        &step.spec.definition_hash,
+                        &view.definition_hash,
                         view.attempt,
                         gate,
                         &variables,
@@ -6155,7 +6273,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn evaluate_loop_metrics(
         &self,
         run: &MissionRunView,
-        step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
         loop_spec: &LoopSpec,
         loop_subject: &str,
@@ -6176,7 +6293,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         run,
                         loop_subject,
                         &loop_spec.id,
-                        &step.spec.definition_hash,
+                        &view.definition_hash,
                         view.attempt,
                         gate,
                         variables,
@@ -6587,7 +6704,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn evaluate_for_each_loop(
         &self,
         run: &MissionRunView,
-        step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
         loop_spec: &LoopSpec,
         loop_subject: &str,
@@ -6718,7 +6834,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                         variables.insert("ST_LOOP_ITEM_ID".into(), id.into());
                         let metrics = match self.evaluate_loop_metrics(
                             run,
-                            step,
                             &item_view,
                             loop_spec,
                             &format!("{loop_subject}/item/{id}"),
@@ -6821,7 +6936,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn evaluate_candidate_loop(
         &self,
         run: &MissionRunView,
-        step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
         loop_spec: &LoopSpec,
         loop_subject: &str,
@@ -6914,7 +7028,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                         variables.insert("candidate.index".into(), candidate.to_string());
                         let metrics = match self.evaluate_loop_metrics(
                             run,
-                            step,
                             view,
                             loop_spec,
                             &format!(
@@ -8525,8 +8638,19 @@ impl<R: RuntimeControl> Reconciler<R> {
             attempt,
             run: run.subject.clone(),
             generation: run.generation.clone(),
+            eval: run.mode == "eval",
         };
-        self.evaluate_gate(&stage, &gate)
+        let outcome = self.evaluate_gate(&stage, &gate)?;
+        // An eval's judges decide its verdict and nobody revises an eval run, so there an exec
+        // gate that says not yet or is broken fails its boundary, as every status but 0 did.
+        Ok(match outcome {
+            GateOutcome::NotYet if stage.eval => GateOutcome::Fail(format!(
+                "exec gate `{}` exited 1",
+                crate::graph::gate_name(&gate)
+            )),
+            GateOutcome::Broken(reason) if stage.eval => GateOutcome::Fail(reason),
+            outcome => outcome,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8597,21 +8721,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &request_hash[..24]
             )),
         })?;
-        let decision = self.store.latest_claim(&operation, Some("gate.result"))?;
+        // The reviewer's answer, read by the rule that takes an answered review off the
+        // reviewers' list: a later result on the operation (another actor's, an unbound one)
+        // cannot hide it and leave a gate nobody can answer.
+        let decision = self.store.human_review_answer(&request.id)?;
         match decision.as_ref().and_then(|claim| {
-            (claim.actor.as_deref() == Some(reviewer)
-                && claim
-                    .body
-                    .pointer("/fields/request")
-                    .and_then(Value::as_str)
-                    == Some(request.id.as_str()))
-            .then(|| {
-                claim
-                    .body
-                    .pointer("/fields/verdict")
-                    .and_then(Value::as_str)
-            })
-            .flatten()
+            claim
+                .body
+                .pointer("/fields/verdict")
+                .and_then(Value::as_str)
         }) {
             Some("pass") => Ok(GateOutcome::Pass),
             Some("feedback") if mode == "feedback" => {
@@ -10750,7 +10868,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         result_subject: &str,
         result: &crate::model::ClaimRecord,
     ) -> Result<()> {
-        if stage.run.is_empty() {
+        // An eval run fails on a broken gate instead; see `evaluate_context_gate`.
+        if stage.run.is_empty() || stage.eval {
             return Ok(());
         }
         let episode = format!("gate-broken:{}:{result_subject}", stage.generation);
@@ -12931,6 +13050,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         screen: Mutex<String>,
         screens: Mutex<HashMap<String, String>>,
         keys: Mutex<Vec<String>>,
+        leftovers: Mutex<Vec<(String, bool)>>,
     }
 
     impl RuntimeControl for FakeRuntime {
@@ -13007,6 +13127,12 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         }
         fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
             Ok(self.logs.lock().unwrap().get(runtime_id).cloned())
+        }
+        fn end_leftovers(&self, runtime_id: &str, terminal: bool) {
+            self.leftovers
+                .lock()
+                .unwrap()
+                .push((runtime_id.into(), terminal));
         }
     }
 
@@ -13178,6 +13304,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             attempt: 1,
             run: "mission-run/test".into(),
             generation: "run-generation/test".into(),
+            eval: false,
         };
 
         assert!(matches!(
@@ -15130,6 +15257,80 @@ version 2
         );
     }
 
+    /// The reviewers' list and the gate read the same answer: once the reviewer has answered a
+    /// request, a later result on the same operation (another actor's, an unbound one) neither
+    /// hides that answer from the gate nor puts the review back on the list.
+    #[test]
+    fn a_later_result_does_not_hide_the_reviewers_answer_from_the_gate() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+mission "review" state="ready" {
+  goal "Complete mission review."
+  step "approval" {
+    agentless
+    gate "human-review" type="human" { reviewer "person/alex" }
+  }
+}
+"#,
+            "review-later-result",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "review".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "review-later-result-run".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].subject.clone();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let request = store
+            .gate_request_for_owner(&step)
+            .unwrap()
+            .expect("the human review was not requested");
+        let result = |actor: &str, key: &str| ClaimInput {
+            subject: request.subject.clone(),
+            kind: "gate.result".into(),
+            actor: Some(actor.into()),
+            fields: BTreeMap::from([
+                ("verdict".into(), Value::String("pass".into())),
+                ("request".into(), Value::String(request.id.clone())),
+            ]),
+            evidence: vec![request.id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(key.into()),
+        };
+        store
+            .append_claim(&result("person/alex", "the-reviewer"))
+            .unwrap();
+        store
+            .append_claim(&result("person/someone-else", "someone-else"))
+            .unwrap();
+        assert!(
+            store.pending_human_reviews(None).unwrap().is_empty(),
+            "the reviewer answered"
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.step_run(&step).unwrap().unwrap().status,
+            "completed",
+            "the gate waited on an answer the reviewer can no longer give"
+        );
+    }
+
     #[test]
     fn feedback_review_retries_with_written_goals_and_messages_the_worker() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -16838,6 +17039,59 @@ mission "proof" state="ready" {{
     }
 
     #[test]
+    fn an_eval_run_still_fails_on_an_exec_gate_that_does_not_pass() {
+        // An eval's judges decide its verdict, and nobody revises an eval run.
+        for code in [1, 7] {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            publish_as(
+                &store,
+                &exec_gate_mission("bash ./judges/no-skip.sh", ".").replace(
+                    "mission \"proof\" state=\"ready\" {",
+                    "mission \"proof\" state=\"ready\" timeout=\"10m\" {",
+                ),
+                "eval-source",
+                "person/pat",
+            );
+            let run = store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: "proof".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/requester".into()),
+                    mode: Some("eval".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: "eval-run".into(),
+                })
+                .unwrap();
+            let runtime = Arc::new(FakeRuntime::default());
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+            for _ in 0..4 {
+                reconciler.reconcile_once().unwrap();
+            }
+            let runner = gate_runners(&runtime)
+                .pop()
+                .expect("the gate did not start");
+            exit_gate_runner(&runtime, &runner, Some(code), "missing command dispatch\n");
+            for _ in 0..4 {
+                reconciler.reconcile_once().unwrap();
+            }
+            let current = store.mission_run(&run.id).unwrap().unwrap();
+            assert_eq!(step_of(&current, "verify").status, "failed", "{code}");
+            assert!(
+                store
+                    .attention_items(Some("person/pat"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn an_exec_gate_that_cannot_start_or_outlives_its_time_limit_is_broken() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         publish_as(
@@ -18332,6 +18586,65 @@ agent "worker" {
     }
 
     #[test]
+    fn a_stop_ends_what_an_ended_harness_left_running() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+            version 2
+
+              agent "worker" {
+                command "sleep 60"
+              }
+
+        "#,
+            "leftover-run",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: "node.worker".into(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("generation-one".into()),
+        });
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        // The harness exits on its own, and its session's record removes itself. A build it
+        // started can still run.
+        runtime.ptys.lock().unwrap().clear();
+        apply_source(
+            &store,
+            r#"version 2
+ stop "agent/node.worker" "#,
+            "leftover-stop",
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        assert_eq!(
+            &*runtime.leftovers.lock().unwrap(),
+            &[("node.worker".to_owned(), true)]
+        );
+        assert_eq!(
+            actual_field(
+                &store
+                    .latest_actual_value("agent/node.worker")
+                    .unwrap()
+                    .unwrap(),
+                "status"
+            ),
+            Some(&Value::String("stopped".into()))
+        );
+    }
+
+    #[test]
     fn stop_does_not_kill_a_replacement_incarnation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let running_source = r#"
@@ -19619,6 +19932,7 @@ schedule "unready" {{
             attempt,
             run: "mission-run/window".into(),
             generation: "run-generation/generation".into(),
+            eval: false,
         };
         let definition = serde_json::json!({"type": "mechanical", "command": "/usr/bin/true"});
         let first = gate_result_subject(&stage(1), "open", &definition).unwrap();

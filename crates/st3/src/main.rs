@@ -2534,7 +2534,11 @@ enum AgentsCommand {
     /// Start a durable seat, patching only explicitly supplied declaration fields. A stopped
     /// mission seat starts again on its run's own declaration.
     Start(AgentStartArgs),
-    /// Stop one exact durable seat.
+    /// Stop one exact durable seat and every process it started.
+    ///
+    /// The seat's builds and tests end with it, even those that left its harness's process tree.
+    /// A host without a systemd user manager ends only the harness's process tree and process
+    /// groups; docs/st3/priority.md says what else keeps running there.
     Stop(AgentStopArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
     Restart(AgentRestartArgs),
@@ -3390,6 +3394,8 @@ struct MessageReferenceArgs {
 
 #[derive(Args)]
 struct ReviewArgs {
+    /// The gate to answer: its `attention/...` ID from `st attention ls`, or the step, mission
+    /// or loop run (`step-run/...`, `mission-run/...`, `loop-run/...`) that owns it.
     target: String,
     #[arg(long)]
     reason: Option<String>,
@@ -3399,6 +3405,8 @@ struct ReviewArgs {
 
 #[derive(Args)]
 struct FeedbackReviewArgs {
+    /// The feedback gate to answer: its `attention/...` ID from `st attention ls`, or the
+    /// step run that owns it.
     target: String,
     #[arg(long)]
     reason: String,
@@ -13898,44 +13906,59 @@ async fn run_st2_native_driver(
         )
     })
     .await?;
-    // A resumed seat relaunches its harness on the session it suspended on, or not at all.
-    let argv = match st3::native_resume::requested() {
-        None => argv,
-        Some(session) => {
-            let selected = match driver {
-                "claude" => st3::native_resume::claude_argv(
-                    argv,
-                    &session,
-                    &std::env::current_dir()?,
-                    st3::native_resume::claude_home().as_deref(),
-                ),
-                "pi" | "omp" => st3::native_resume::pi_family_argv(
-                    driver,
-                    argv,
-                    &paths.session_dir.join("provider-sessions"),
-                    &session,
-                ),
-                "opencode" => st3::native_resume::opencode_argv(
-                    argv,
-                    &session,
-                    st3::native_resume::opencode_data_dir().as_deref(),
-                ),
-                _ => unreachable!("the native driver was checked"),
-            };
-            match selected {
-                Ok(argv) => argv,
-                Err(refusal) => {
-                    return Err(refuse_native_resume(
-                        client,
-                        subject,
-                        &incarnation,
-                        driver,
-                        refusal,
-                    )
-                    .await);
-                }
+    let select = |argv: Vec<String>, session: &str| -> Result<_> {
+        Ok(match driver {
+            "claude" => st3::native_resume::claude_argv(
+                argv,
+                session,
+                &std::env::current_dir()?,
+                st3::native_resume::claude_home().as_deref(),
+            ),
+            "pi" | "omp" => st3::native_resume::pi_family_argv(
+                driver,
+                argv,
+                &paths.session_dir.join("provider-sessions"),
+                session,
+            ),
+            "opencode" => st3::native_resume::opencode_argv(
+                argv,
+                session,
+                st3::native_resume::opencode_data_dir().as_deref(),
+            ),
+            _ => unreachable!("the native driver was checked"),
+        })
+    };
+    // A resumed seat relaunches its harness on the session it suspended on, or not at all. Any
+    // other relaunch continues the seat's last session when the harness can, or starts anew.
+    let argv = if let Some(session) = st3::native_resume::requested() {
+        match select(argv, &session)? {
+            Ok(argv) => argv,
+            Err(refusal) => {
+                return Err(
+                    refuse_native_resume(client, subject, &incarnation, driver, refusal).await,
+                );
             }
         }
+    } else if let Some((session, path)) = st3::native_resume::continued() {
+        if driver == "claude" {
+            // A seat whose workspace changed finds its transcript under the earlier one.
+            let _ = st3::native_resume::claude_carry_transcript(
+                &session,
+                &std::env::current_dir()?,
+                st3::native_resume::claude_home().as_deref(),
+                path.as_deref(),
+            );
+        }
+        match select(argv.clone(), &session)? {
+            Ok(argv) => argv,
+            Err(refusal) => {
+                skip_native_continue(client, subject, &incarnation, driver, &session, refusal)
+                    .await;
+                argv
+            }
+        }
+    } else {
+        argv
     };
     if driver == "opencode" {
         // The predecessor's bound session is not this launch's, and the driver reports this file.
@@ -15636,6 +15659,56 @@ async fn refuse_native_resume(
     )
 }
 
+/// The driver cannot continue the seat's last native session, so the harness starts a new one.
+/// Record why once for that session, so later relaunches start anew without trying it again.
+async fn skip_native_continue(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    driver: &str,
+    session: &str,
+    refusal: st3::native_resume::Refusal,
+) {
+    let _ = write_driver_log(
+        subject,
+        &json!({"type":"native_continue_skipped","driver":driver,"session":session,"code":refusal.code,"reason":refusal.reason}).to_string(),
+    );
+    let diagnostic = ClaimInput {
+        subject: subject.into(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(subject.into()),
+        fields: BTreeMap::from([
+            ("severity".into(), Value::String("warning".into())),
+            ("status".into(), Value::String(refusal.code.into())),
+            (
+                "code".into(),
+                Value::String(st3::suspension::CONTINUE_UNAVAILABLE_CODE.into()),
+            ),
+            (
+                "reason".into(),
+                Value::String(format!(
+                    "{driver} started a new session instead of continuing {session}: {}",
+                    refusal.reason
+                )),
+            ),
+            ("incarnation_id".into(), Value::String(incarnation.into())),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(st3::suspension::continue_unavailable_key(subject, session)),
+    };
+    if let Err(error) = retry_while_daemon_unreachable(subject, || {
+        client.post::<_, ClaimRecord>("/v1/claims", &diagnostic)
+    })
+    .await
+    {
+        let _ = write_driver_log(
+            subject,
+            &json!({"type":"native_continue_skip_unrecorded","error":format!("{error:#}")}).to_string(),
+        );
+    }
+}
+
 /// Report the native session the harness bound for this incarnation, once per session.
 async fn report_native_session(
     client: &Client,
@@ -16644,6 +16717,13 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     .await
 }
 
+/// The Codex thread a relaunch continues, unless the seat declares its own thread selection.
+fn codex_continued_thread(argv: &[String]) -> Option<String> {
+    st3::native_resume::continued()
+        .map(|(thread, _)| thread)
+        .filter(|thread| st3::native_resume::codex_check(argv, thread).is_ok())
+}
+
 fn spawn_codex_provider(
     paths: &NativePaths,
     state_dir: &Path,
@@ -16654,17 +16734,21 @@ fn spawn_codex_provider(
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
     tokio::task::spawn_blocking(move || match start {
-        // A resumed seat's launch environment names the thread it suspended on.
-        ProviderStart::Launch(_) => st_drivers::codex_app_server::run_controlled_paths(
-            &paths.driver_root,
-            &state_dir,
-            &paths.agent_dir,
-            paths.identity,
-            paths.runtime_id,
-            argv,
-            paths.delivery_gate,
-            st3::native_resume::requested(),
-        ),
+        // A resumed seat's launch environment names the thread it suspended on, and any other
+        // relaunch the thread it continues.
+        ProviderStart::Launch(_) => {
+            let thread = st3::native_resume::requested().or_else(|| codex_continued_thread(&argv));
+            st_drivers::codex_app_server::run_controlled_paths(
+                &paths.driver_root,
+                &state_dir,
+                &paths.agent_dir,
+                paths.identity,
+                paths.runtime_id,
+                argv,
+                paths.delivery_gate,
+                thread,
+            )
+        }
         ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
             tui_pid,
             server_pid,
@@ -16739,6 +16823,10 @@ async fn drive_codex_native(
     if matches!(start, ProviderStart::Adopt(_)) {
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
+    // The thread this launch continues; a refusal of it ends the wrapper before it binds.
+    let continued = matches!(start, ProviderStart::Launch(_))
+        .then(|| codex_continued_thread(&argv))
+        .flatten();
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
     let mut reported_session = None;
     // The Codex control pump keeps the subagent ledger; this driver records it on the seat.
@@ -16802,6 +16890,21 @@ async fn drive_codex_native(
                         reason: reason.chars().take(2_000).collect(),
                     };
                     let _ = refuse_native_resume(client, subject, &incarnation, "codex", refusal).await;
+                } else if reported_session.is_none()
+                    && let Some(thread) = &continued
+                {
+                    // The next relaunch starts a new thread instead of trying this one again.
+                    let reason = match &outcome {
+                        Err(error) => format!("{error:#}"),
+                        Ok(()) => st_drivers::harness_state::read(&harness_state_path, None)
+                            .and_then(|observed| observed.reason)
+                            .unwrap_or_else(|| "Codex ended before it bound the continued thread".into()),
+                    };
+                    let refusal = st3::native_resume::Refusal {
+                        code: "harness-refused",
+                        reason: reason.chars().take(2_000).collect(),
+                    };
+                    skip_native_continue(client, subject, &incarnation, "codex", thread, refusal).await;
                 }
                 if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);

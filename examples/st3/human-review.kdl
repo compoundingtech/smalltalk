@@ -32,7 +32,7 @@ mission "example/release" state="ready" {
     agentless
     depends-on { step "prepare" completed }
     gate "the pushed branch has release notes" {
-      exec "git fetch --quiet origin release-notes && git cat-file -e FETCH_HEAD:RELEASE-NOTES.md"
+      exec "git fetch --quiet origin release-notes 2>/dev/null || exit 1; git cat-file -e FETCH_HEAD:RELEASE-NOTES.md 2>/dev/null || exit 1"
       host "local"
       workspace "${ST_WORKSPACE}"
       time-limit "2m"

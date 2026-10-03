@@ -137,23 +137,46 @@ pub(super) fn run_live(
     generation: Option<&str>,
     failure: bool,
 ) -> Result<bool> {
+    Ok(run_liveness(connection, run, generation, failure)?.is_ok())
+}
+
+/// Whether `run` still matters, or why not: it and each run above it exist, are open and on
+/// the generation their parent step belongs to, each parent step is still open, and a
+/// subscription or schedule that delivered it still runs. `failure` keeps a failed run or
+/// parent step live, for the fault that names it.
+pub(super) fn run_liveness(
+    connection: &Connection,
+    run: &str,
+    generation: Option<&str>,
+    failure: bool,
+) -> Result<std::result::Result<(), String>> {
     let mut run = run.strip_prefix("mission-run/").unwrap_or(run).to_owned();
     let mut expected_generation = generation.map(str::to_owned);
     let mut seen = BTreeSet::new();
     loop {
         if !seen.insert(run.clone()) {
-            return Ok(false);
+            return Ok(Err(format!(
+                "mission run `mission-run/{run}` is its own ancestor"
+            )));
         }
         let header = mission_run_header_tx(connection, &run).optional()?;
         let Some(header) = header else {
-            return Ok(false);
+            return Ok(Err(format!("mission run `mission-run/{run}` is gone")));
         };
-        if expected_generation
+        if let Some(expected) = expected_generation
             .as_ref()
-            .is_some_and(|g| g != &header.generation)
-            || (is_terminal_run_state(&header.status) && !(failure && header.status == "failed"))
+            .filter(|expected| *expected != &header.generation)
         {
-            return Ok(false);
+            return Ok(Err(format!(
+                "mission run `{}` moved on from {expected} to {}",
+                header.subject, header.generation
+            )));
+        }
+        if is_terminal_run_state(&header.status) && !(failure && header.status == "failed") {
+            return Ok(Err(format!(
+                "mission run `{}` is {}",
+                header.subject, header.status
+            )));
         }
         if let Some(parent) = header.parent_step_run.as_deref() {
             let Some(parent) = step(connection, parent)? else {
@@ -161,21 +184,25 @@ pub(super) fn run_live(
                 // normalized with a step-run prefix. They do not create a synthetic work step.
                 let subject = parent.strip_prefix("step-run/").unwrap_or(parent);
                 let Some(owner) = current_desired_row(connection, subject)? else {
-                    return Ok(false);
+                    return Ok(Err(format!("`{subject}`, which started it, is gone")));
                 };
                 let body: Value = serde_json::from_str(&owner.body)?;
-                if !matches!(owner.kind.as_str(), "subscription" | "schedule")
-                    || body
-                        .get("children")
-                        .and_then(Value::as_array)
-                        .is_some_and(|children| {
-                            children.len() == 1 && children[0]["name"] == "stop"
-                        })
+                if !matches!(owner.kind.as_str(), "subscription" | "schedule") {
+                    return Ok(Err(format!(
+                        "`{subject}`, which started it, is not a step, subscription or schedule"
+                    )));
+                }
+                if body
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .is_some_and(|children| children.len() == 1 && children[0]["name"] == "stop")
                 {
-                    return Ok(false);
+                    return Ok(Err(format!("`{subject}`, which started it, is stopped")));
                 }
                 let Some(owner_run) = owner.owner_run else {
-                    return Ok(false);
+                    return Ok(Err(format!(
+                        "`{subject}`, which started it, has no owning run"
+                    )));
                 };
                 let owner_header =
                     mission_run_header_tx(connection, owner_run.trim_start_matches("mission-run/"))
@@ -183,7 +210,9 @@ pub(super) fn run_live(
                 if owner_header
                     .is_none_or(|owner| owner.root_mission_run != header.root_mission_run)
                 {
-                    return Ok(false);
+                    return Ok(Err(format!(
+                        "`{subject}`, which started it, now belongs to another run"
+                    )));
                 }
                 run = owner_run.trim_start_matches("mission-run/").into();
                 expected_generation = owner.owner_generation;
@@ -192,7 +221,10 @@ pub(super) fn run_live(
             if matches!(parent.status.as_str(), "completed" | "cancelled")
                 || (parent.status == "failed" && !failure)
             {
-                return Ok(false);
+                return Ok(Err(format!(
+                    "its parent step `{}` is {}",
+                    parent.subject, parent.status
+                )));
             }
             run = parent.run.trim_start_matches("mission-run/").into();
             expected_generation = Some(parent.generation);
@@ -202,9 +234,22 @@ pub(super) fn run_live(
                 header.root_mission_run.trim_start_matches("mission-run/"),
             )
             .optional()?;
-            return Ok(root.is_some_and(|root| {
-                !is_terminal_run_state(&root.status) || (failure && root.status == "failed")
-            }));
+            return Ok(match root {
+                None => Err(format!(
+                    "its root mission run `{}` is gone",
+                    header.root_mission_run
+                )),
+                Some(root)
+                    if is_terminal_run_state(&root.status)
+                        && !(failure && root.status == "failed") =>
+                {
+                    Err(format!(
+                        "its root mission run `{}` is {}",
+                        root.subject, root.status
+                    ))
+                }
+                Some(_) => Ok(()),
+            });
         }
     }
 }
