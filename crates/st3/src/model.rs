@@ -2462,6 +2462,26 @@ pub struct WorkExtendRequest {
     pub idempotency_key: String,
 }
 
+/// One-shot repair of current person-bound work; this never aliases identities or rewrites history.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PersonRenameRequest {
+    pub old_person: String,
+    pub new_person: String,
+    pub actor: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PersonRenameReport {
+    pub old_person: String,
+    pub new_person: String,
+    pub reassigned_steps: Vec<String>,
+    pub reassigned_reviews: Vec<String>,
+    pub run_requesters: Vec<String>,
+    pub missions_to_republish: Vec<String>,
+    pub namespace_notice: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PersonAskRequest {
     #[serde(skip)]

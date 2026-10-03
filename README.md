@@ -195,6 +195,20 @@ st conversations ls person/ada
 `st attention ls` prints; `reject` and `request-changes` also take `--reason TEXT`. A gate
 that no longer waits says why: who answered it, or what changed since it asked.
 
+After changing a person identity, repair its current inbox once:
+
+```sh
+st persons rename person/ada person/robin --as person/robin \
+  --idempotency-key ada-person-repair
+```
+
+This atomically reassigns open person steps and pending human reviews without changing their
+episodes, original requests, or historical actors. Retrying the same key and request returns
+the original report. It is not an alias: newly published work still uses its declared person.
+The report lists live run requesters and published mission reviewer references that need
+manual republishing; it does not rewrite those declarations. Client-derived custom/person
+namespaces, including private glasses and terminals, are not moved automatically.
+
 `st --help` and `st help` open with the main uses, then group commands for everyday use, agent
 seats, and running a machine or fleet. `st help --all` also lists plumbing commands.
 Use `st help agents new` to open a command's full help.

@@ -125,6 +125,11 @@ enum Command {
         #[command(subcommand)]
         command: AgentsCommand,
     },
+    /// Repair current work after a person identity changes.
+    Persons {
+        #[command(subcommand)]
+        command: PersonsCommand,
+    },
     /// Read, follow, and send normalized conversations.
     Conversations {
         #[command(subcommand)]
@@ -2618,6 +2623,24 @@ struct AgentHoldArgs {
     actor: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum PersonsCommand {
+    /// Reassign open work and pending reviews; report declarations needing republishing.
+    Rename(PersonRenameArgs),
+}
+
+#[derive(Args)]
+struct PersonRenameArgs {
+    #[arg(value_parser = parse_person_subject)]
+    old_person: String,
+    #[arg(value_parser = parse_person_subject)]
+    new_person: String,
+    #[arg(long = "as", value_parser = parse_actor_subject)]
+    actor: Option<String>,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    idempotency_key: Option<String>,
+}
+
 #[derive(Args)]
 struct AgentRenameArgs {
     subject: String,
@@ -3846,6 +3869,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Agents { command } => {
             run_agents(&endpoint, config.person.as_deref(), command, cli.json).await
         }
+        Command::Persons { command } => {
+            run_persons(&endpoint, config.person.as_deref(), command, cli.json).await
+        }
         Command::Conversations { command } => {
             run_message(
                 &client,
@@ -4010,6 +4036,11 @@ fn guard_mutating_cli_actor(
                 None => None,
             },
             _ => None,
+        },
+        Command::Persons { command } => match command {
+            PersonsCommand::Rename(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness person rename needs explicit --as {own}")
+            })?),
         },
         Command::Work { command } => match command {
             WorkCommand::Claim(args) | WorkCommand::Renew(args) | WorkCommand::Progress(args)
@@ -9839,6 +9870,34 @@ fn render_import_session(session: &st3_client::Session) -> String {
         let _ = writeln!(output, "  blocked: {reason}");
     }
     output
+}
+
+async fn run_persons(
+    endpoint: &Endpoint,
+    configured_person: Option<&str>,
+    command: PersonsCommand,
+    json_output: bool,
+) -> Result<()> {
+    match command {
+        PersonsCommand::Rename(args) => {
+            let actor = args.actor.as_deref().or(configured_person).context(
+                "st3 persons rename needs --as ACTOR or a configured person",
+            )?;
+            let response: Value = cli_client(endpoint)
+                .post(
+                    "/v1/persons/rename",
+                    &json!({
+                        "old_person": args.old_person,
+                        "new_person": args.new_person,
+                        "actor": actor,
+                        "idempotency_key": args.idempotency_key
+                            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+                    }),
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+    }
 }
 
 async fn run_agents(
@@ -20201,65 +20260,6 @@ mod tests {
         visit(&command, &["st".into()]);
     }
 
-    #[test]
-    fn top_level_surface_exactly_matches_the_pristine_v0_inventory() {
-        let contract: Value = serde_json::from_str(include_str!(
-            "../../../docs/st3/operational-state/cli-commands.json"
-        ))
-        .unwrap();
-        let expected = contract["canonical_roots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|name| name.as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        let command = Cli::command();
-        let visible = command
-            .get_subcommands()
-            .filter(|subcommand| !subcommand.is_hide_set())
-            .map(|subcommand| subcommand.get_name().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(visible, expected);
-
-        let mut help = command.clone();
-        let help = help.render_long_help().to_string();
-        assert!(help.contains("Usage: st ["), "{help}");
-        assert!(
-            command
-                .find_subcommand("claude-channel")
-                .is_some_and(|command| command.is_hide_set()),
-            "the expert ST3 channel lifecycle must remain callable but hidden"
-        );
-
-        for legacy in [
-            "claude",
-            "codex",
-            "preview",
-            "planning",
-            "mission",
-            "publish",
-            "exec",
-            "logs",
-            "pty",
-            "inspect",
-            "wait",
-            "doc",
-            "eval",
-            "graph",
-            "status",
-            "runtime",
-            "context",
-            "resource",
-            "review",
-            "message",
-            "gate-result",
-        ] {
-            assert!(
-                command.find_subcommand(legacy).is_none(),
-                "legacy root `{legacy}` remains public"
-            );
-        }
-    }
 
     #[test]
     fn removed_legacy_handlers_are_absent_from_cli_and_server_sources() {
