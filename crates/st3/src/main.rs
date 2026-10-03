@@ -2514,7 +2514,11 @@ enum AgentsCommand {
     Apply(AgentApplyArgs),
     /// Start a durable seat, patching only explicitly supplied declaration fields.
     Start(AgentStartArgs),
-    /// Stop one exact durable seat.
+    /// Stop one exact durable seat and every process it started.
+    ///
+    /// The seat's builds and tests end with it, even those that left its harness's process tree.
+    /// A host without a systemd user manager ends only the harness's process tree and process
+    /// groups; docs/st3/priority.md says what else keeps running there.
     Stop(AgentStopArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
     Restart(AgentRestartArgs),

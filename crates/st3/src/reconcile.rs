@@ -236,6 +236,9 @@ pub trait RuntimeControl: Send + Sync + 'static {
     fn screen(&self, runtime_id: &str) -> Result<String>;
     fn send_key(&self, runtime_id: &str, key: &str) -> Result<()>;
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>>;
+    /// Ends, without waiting, what a runtime that is not running left in its work scope: a build
+    /// or test its harness started that outlived it.
+    fn end_leftovers(&self, _runtime_id: &str, _terminal: bool) {}
 }
 
 pub struct NativeRuntime {
@@ -477,6 +480,14 @@ impl RuntimeControl for NativeRuntime {
 
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
         self.exec.read_log(runtime_id)
+    }
+
+    fn end_leftovers(&self, runtime_id: &str, terminal: bool) {
+        if terminal {
+            self.pty.end_leftovers_later(runtime_id);
+        } else {
+            self.exec.end_leftovers_later(runtime_id);
+        }
     }
 }
 
@@ -3196,6 +3207,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         }
         if observation.is_none_or(|observation| observation.status != "running") {
+            // A harness that ended before the stop, or a stop that could not finish, can leave
+            // processes in the runtime's work scope. They end with it.
+            self.runtime.end_leftovers(runtime_id, terminal);
             self.record_once(
                 subject,
                 "runtime.observed",
@@ -12380,6 +12394,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         screen: Mutex<String>,
         screens: Mutex<HashMap<String, String>>,
         keys: Mutex<Vec<String>>,
+        leftovers: Mutex<Vec<(String, bool)>>,
     }
 
     impl RuntimeControl for FakeRuntime {
@@ -12456,6 +12471,12 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         }
         fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
             Ok(self.logs.lock().unwrap().get(runtime_id).cloned())
+        }
+        fn end_leftovers(&self, runtime_id: &str, terminal: bool) {
+            self.leftovers
+                .lock()
+                .unwrap()
+                .push((runtime_id.into(), terminal));
         }
     }
 
@@ -17245,6 +17266,65 @@ agent "worker" {
             runtime.kills.lock().unwrap().len(),
             1,
             "the local kill record fences a second kill"
+        );
+    }
+
+    #[test]
+    fn a_stop_ends_what_an_ended_harness_left_running() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+            version 2
+
+              agent "worker" {
+                command "sleep 60"
+              }
+
+        "#,
+            "leftover-run",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: "node.worker".into(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("generation-one".into()),
+        });
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        // The harness exits on its own, and its session's record removes itself. A build it
+        // started can still run.
+        runtime.ptys.lock().unwrap().clear();
+        apply_source(
+            &store,
+            r#"version 2
+ stop "agent/node.worker" "#,
+            "leftover-stop",
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        assert_eq!(
+            &*runtime.leftovers.lock().unwrap(),
+            &[("node.worker".to_owned(), true)]
+        );
+        assert_eq!(
+            actual_field(
+                &store
+                    .latest_actual_value("agent/node.worker")
+                    .unwrap()
+                    .unwrap(),
+                "status"
+            ),
+            Some(&Value::String("stopped".into()))
         );
     }
 
