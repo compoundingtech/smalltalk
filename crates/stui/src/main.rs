@@ -2013,6 +2013,18 @@ async fn act_on_attention(
     }
     let (source, kind) = source.expect("a review names its source");
     match current_card(client, actor, &source, &kind).await? {
+        // The person answers what they read: a card that now says something else, such as a
+        // new attempt's work, is shown again instead of answered on their behalf.
+        Some(card)
+            if seen.is_some_and(|seen| {
+                matches!(&card.value, Resource::Attention(now) if (&now.title, &now.detail, &now.what, &now.because)
+                    != (&seen.title, &seen.detail, &seen.what, &seen.because))
+            }) =>
+        {
+            Err(anyhow::anyhow!(
+                "This review changed since you read it; read it again before you answer"
+            ))
+        }
         Some(card) => act_on_card(client, actor, card, action, reason, answer).await,
         // The person reads why, not the stale fence that found it out.
         None => Err(anyhow::anyhow!(no_longer_asked(client, &source).await)),
@@ -4704,6 +4716,33 @@ mission "release" state="ready" {
         .expect("the approval did not reach the current card");
         assert!(outcome.starts_with("Approve"), "{outcome}");
         gate.reconcile_until("the step completed", |gate| gate.status() == "completed");
+    }
+
+    /// st asked the gate again with something the person has not read: the approval is not
+    /// carried over to it, and the card is shown again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_review_that_changed_since_it_was_read_is_shown_again_not_answered() {
+        let gate = WaitingGate::start().await;
+        let mut seen = gate.card().await.expect("the gate has a card");
+        gate.ask_again();
+        seen.detail = "what the person read before the step changed".into();
+        let error = attention_action(
+            &gate.client,
+            "person/avery",
+            &seen.header.id,
+            Some(&seen),
+            "review.approve",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a changed review was answered unread");
+        assert!(error.to_string().contains("changed since you read it"), "{error}");
+        for _ in 0..3 {
+            gate.reconciler.reconcile_once().unwrap();
+        }
+        assert_ne!(gate.status(), "completed");
+        assert!(gate.card().await.is_some(), "the review is still asked");
     }
 
     /// The card was read, then st asked the gate again before the approval arrived: st refuses
