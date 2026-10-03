@@ -83,7 +83,10 @@ impl CommitObservers {
             }),
             completed: Condvar::new(),
         });
-        let mut callbacks = self.callbacks.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut callbacks = self
+            .callbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         Arc::make_mut(&mut callbacks).push(callback.clone());
         self.active.store(true, Ordering::Release);
         CommitObserver {
