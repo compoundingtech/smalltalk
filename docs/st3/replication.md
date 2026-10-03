@@ -455,6 +455,16 @@ The graph is replayed from nothing only in these cases:
 A rebuilt part costs what its own history costs, while a replay holds the store's only writer for
 as long as the whole graph takes.
 
+Incremental catch-up projection commits at most 128 newly admitted claims per transaction and
+returns the writer between chunks, so queued messages and lease renewals can run. Each commit
+records the frontier actually projected. Admissions and catch-up deferrals advance a generation;
+the final pass clears only the generation it observed while holding the writer, so it cannot
+overwrite a newer deferral. Sync comparisons remain deferred until the pass has
+reached its starting backlog and no later admitted claims remain. A dirty aggregate still
+rebuilds from its complete canonical history; the chunk limit does not bound that history or a
+fallback replay. The regression interleaves local writes with committed prefixes and checks the
+final graph against canonical replay.
+
 The first start of a build with this rule replays from nothing once. A run that this node created
 could show as over in its old graph while its claims say it runs. Starting that work again long
 after anyone expected it would surprise people, so the node writes the claims that end the run as
