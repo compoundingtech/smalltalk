@@ -38,20 +38,32 @@ summarize_load() {
 start=$SECONDS status=0
 case "$stage" in
   cost)
+    rm -f "$out/cost.json"
     # One cargo invocation builds and runs: a second one reruns a vendored build script and
     # recompiles st3. The counts do not depend on the build's speed, so the job's lightly
     # optimized build only makes the stores generate faster. The counts are the whole
     # process's, so nothing else may run beside the check.
     ST_COST_REPORT="$out/cost.json" cargo test -p st3 --test integration --locked daemon_cost:: \
       -- --nocapture --test-threads 1 2>&1 | tee "$out/cost.log" || status=$?
-    [ -f "$out/cost.json" ] && summarize_cost "$out/cost.json"
+    if [ -s "$out/cost.json" ]; then
+      summarize_cost "$out/cost.json"
+    else
+      echo "::error::cost check produced no measurement report"
+      status=1
+    fi
     ;;
   load)
+    rm -f "$out/load.json"
     # Main's last reports, newest first; the test compares with the worst of them.
     ST_LOAD_GATE=1 ST_LOAD_REPORT="$out/load.json" ST_LOAD_BASELINE="$RUNNER_TEMP/perf-baseline" \
       cargo test --release -p st3 --test integration --locked daemon_load:: -- --nocapture \
       2>&1 | tee "$out/load.log" || status=$?
-    [ -f "$out/load.json" ] && summarize_load "$out/load.json"
+    if [ -s "$out/load.json" ]; then
+      summarize_load "$out/load.json"
+    else
+      echo "::error::load test produced no measurement report"
+      status=1
+    fi
     ;;
   *) echo "unknown stage: $stage" >&2; exit 2 ;;
 esac

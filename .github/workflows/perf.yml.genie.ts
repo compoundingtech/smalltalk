@@ -16,6 +16,8 @@ export default githubWorkflow({
         'crates/smallclaims/**',
         'crates/st3/src/**',
         'crates/st3/tests/daemon_*.rs',
+        'crates/st3/Cargo.toml',
+        'Cargo.toml',
         'Cargo.lock',
         'scripts/ci-perf',
         '.github/workflows/perf.yml',

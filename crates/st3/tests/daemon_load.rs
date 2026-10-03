@@ -203,7 +203,8 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
     }
     let requests = report.paths.values().map(|path| path.count).sum::<usize>();
     let failed = report.failed.values().sum::<usize>();
-    if failed * 100 > requests {
+    // A rare path's timeout must not disappear inside an overall error allowance.
+    if failed > 0 {
         failures.push(format!(
             "{failed} of {requests} requests failed: {:?}",
             report.failed
