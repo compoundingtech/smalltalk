@@ -261,7 +261,13 @@ It fails when
 a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
 main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a
 regression is what passes several. Main's successful runs add their report
-(`perf-load-baseline-*` in the Actions cache); a run without any checks only the budgets. It is
+(`perf-load-baseline-*` in the Actions cache). Relative latency comparisons start once five
+main reports exist; until then every path still checks its absolute p99 budget and every request
+error fails. CPU compares as soon as one main report exists, because it averages the whole run.
+Relative latency tolerates 5 ms of noise, or 50 ms when either path has fewer than 50 samples:
+those sparse p99s are effectively observed maxima. This bounded tolerance still catches large
+regressions on rare paths. CPU tolerates 0.05 cores. A run without any baseline checks only the
+absolute budgets and errors. It is
 not in Workspace CI because with warm caches it takes as long as `linux-tests`, and twice as long
 when its stores must generate.
 

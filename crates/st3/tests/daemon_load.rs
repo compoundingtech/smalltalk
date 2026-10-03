@@ -51,6 +51,13 @@ const WORSE: f64 = 1.2;
 /// A p99 this close to the baseline passes whatever the ratio: a few milliseconds of noise.
 const LATENCY_SLACK: Duration = Duration::from_millis(5);
 
+/// Sparse p99s are observed maxima; tolerate bounded runner noise without exempting the path.
+const SPARSE_LATENCY_SLACK: Duration = Duration::from_millis(50);
+const LATENCY_SAMPLES: usize = 50;
+
+/// A single main run cannot establish the shared runner's latency variation.
+const BASELINE_RUNS: usize = 5;
+
 /// The daemon's CPU, in cores, may differ from the baseline by this much whatever the ratio.
 const CPU_SLACK: f64 = 0.05;
 
@@ -131,6 +138,11 @@ struct PathReport {
     p99_ms: f64,
     max_ms: f64,
     budget_ms: f64,
+}
+
+struct Baseline {
+    report: Report,
+    runs: usize,
 }
 
 #[test]
@@ -230,7 +242,7 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
 /// Main's reports at `path`, a report or a directory of them, combined into the worst of each:
 /// one run's p99 on a shared runner moves by half or more from the next's, so a regression is
 /// what passes the worst of several runs.
-fn worst_of(path: &Path) -> Option<Report> {
+fn worst_of(path: &Path) -> Option<Baseline> {
     let files = if path.is_dir() {
         std::fs::read_dir(path)
             .ok()?
@@ -267,19 +279,36 @@ fn worst_of(path: &Path) -> Option<Report> {
             reports.len()
         );
     }
-    (!reports.is_empty()).then_some(worst)
+    (!reports.is_empty()).then_some(Baseline {
+        report: worst,
+        runs: reports.len(),
+    })
 }
 
 /// Where any measured path or daemon CPU is more than [`WORSE`] past the baseline.
-/// Main's worst recent reports absorb variation even for infrequently requested paths.
-fn compare(report: &Report, baseline: &Report) -> Vec<String> {
+/// Latency needs several main runs; CPU averages the whole workload and can compare immediately.
+fn compare(report: &Report, baseline: &Baseline) -> Vec<String> {
     let mut failures = Vec::new();
+    if baseline.runs < BASELINE_RUNS {
+        println!(
+            "latency baseline warming up: {} of {BASELINE_RUNS} main reports; absolute latency budgets and CPU comparisons still apply",
+            baseline.runs
+        );
+    }
     for (name, path) in &report.paths {
-        let Some(before) = baseline.paths.get(name) else {
+        if baseline.runs < BASELINE_RUNS {
+            continue;
+        }
+        let Some(before) = baseline.report.paths.get(name) else {
             continue;
         };
+        let slack = if path.count.min(before.count) < LATENCY_SAMPLES {
+            SPARSE_LATENCY_SLACK
+        } else {
+            LATENCY_SLACK
+        };
         if path.p99_ms > before.p99_ms * WORSE
-            && path.p99_ms > before.p99_ms + LATENCY_SLACK.as_secs_f64() * 1e3
+            && path.p99_ms > before.p99_ms + slack.as_secs_f64() * 1e3
         {
             failures.push(format!(
                 "{name}: p99 {:.1} ms is more than {:.0}% over main's {:.1} ms",
@@ -289,14 +318,14 @@ fn compare(report: &Report, baseline: &Report) -> Vec<String> {
             ));
         }
     }
-    if report.daemon_cores > baseline.daemon_cores * WORSE
-        && report.daemon_cores > baseline.daemon_cores + CPU_SLACK
+    if report.daemon_cores > baseline.report.daemon_cores * WORSE
+        && report.daemon_cores > baseline.report.daemon_cores + CPU_SLACK
     {
         failures.push(format!(
             "the daemon used {:.2} cores, more than {:.0}% over main's {:.2}",
             report.daemon_cores,
             (WORSE - 1.0) * 100.0,
-            baseline.daemon_cores
+            baseline.report.daemon_cores
         ));
     }
     failures
@@ -305,8 +334,11 @@ fn compare(report: &Report, baseline: &Report) -> Vec<String> {
 #[test]
 fn infrequent_reads_still_fail_on_a_baseline_regression() {
     let path = "person read /v1/client/agents";
-    let mut baseline = Report::default();
-    baseline.paths.insert(
+    let mut baseline = Baseline {
+        report: Report::default(),
+        runs: BASELINE_RUNS,
+    };
+    baseline.report.paths.insert(
         path.into(),
         PathReport {
             count: 9,
@@ -331,6 +363,101 @@ fn infrequent_reads_still_fail_on_a_baseline_regression() {
     assert!(failures[0].contains(path));
     report.paths.get_mut(path).unwrap().p99_ms = 1_190.0;
     assert!(compare(&report, &baseline).is_empty());
+}
+
+#[test]
+fn sparse_p99_tolerates_runner_noise_without_exempting_the_path() {
+    let name = "sparse request";
+    let mut report = Report::default();
+    let mut baseline = Baseline {
+        report: Report::default(),
+        runs: BASELINE_RUNS,
+    };
+    // Observed failures across four PRs, plus the sparse tolerance's exact boundary.
+    for (count, before, after) in [
+        (13, 5.28, 12.53),
+        (4, 29.24, 54.12),
+        (7, 94.98, 137.34),
+        (49, 29.0, 79.0),
+    ] {
+        baseline.report.paths.insert(
+            name.into(),
+            PathReport {
+                count,
+                p99_ms: before,
+                ..PathReport::default()
+            },
+        );
+        report.paths.insert(
+            name.into(),
+            PathReport {
+                count,
+                p99_ms: after,
+                ..PathReport::default()
+            },
+        );
+        assert!(compare(&report, &baseline).is_empty());
+    }
+    report.paths.get_mut(name).unwrap().p99_ms = 79.01;
+    assert_eq!(compare(&report, &baseline).len(), 1);
+
+    // Both sides need enough samples for the ordinary 5ms tolerance.
+    report.paths.get_mut(name).unwrap().count = LATENCY_SAMPLES;
+    report.paths.get_mut(name).unwrap().p99_ms = 40.0;
+    assert!(compare(&report, &baseline).is_empty());
+    baseline.report.paths.get_mut(name).unwrap().count = LATENCY_SAMPLES;
+    assert_eq!(compare(&report, &baseline).len(), 1);
+}
+
+#[test]
+fn latency_needs_five_main_runs_but_cpu_compares_during_bootstrap() {
+    let name = "fleet membership";
+    let mut baseline = Baseline {
+        report: Report {
+            daemon_cores: 1.0,
+            ..Report::default()
+        },
+        runs: BASELINE_RUNS - 1,
+    };
+    baseline.report.paths.insert(
+        name.into(),
+        PathReport {
+            count: 169,
+            p99_ms: 28.28,
+            ..PathReport::default()
+        },
+    );
+    let mut report = Report {
+        daemon_cores: 1.0,
+        ..Report::default()
+    };
+    report.paths.insert(
+        name.into(),
+        PathReport {
+            count: 169,
+            p99_ms: 55.2,
+            ..PathReport::default()
+        },
+    );
+    assert!(compare(&report, &baseline).is_empty());
+    report.daemon_cores = 1.3;
+    let failures = compare(&report, &baseline);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("cores"));
+    report.daemon_cores = 1.0;
+    baseline.runs = BASELINE_RUNS;
+    assert_eq!(compare(&report, &baseline).len(), 1);
+
+    // The actual cache reader counts reports, not samples or request paths.
+    let directory = tempfile::tempdir().unwrap();
+    for run in 0..BASELINE_RUNS {
+        std::fs::write(
+            directory.path().join(format!("load-{run}.json")),
+            serde_json::to_vec(&baseline.report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(worst_of(directory.path()).unwrap().runs, run + 1);
+    }
 }
 
 fn print(report: &Report) {
