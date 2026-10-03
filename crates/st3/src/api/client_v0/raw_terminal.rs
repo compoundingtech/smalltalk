@@ -35,7 +35,10 @@ fn authorize(session: &ClientSession, mode: st3_client::RawTerminalMode) -> Resu
     Ok(())
 }
 
-pub(super) fn authorization_epoch(state: &AppState, session: &ClientSession) -> Result<String, ApiError> {
+pub(super) fn authorization_epoch(
+    state: &AppState,
+    session: &ClientSession,
+) -> Result<String, ApiError> {
     lease::authorization_epoch(state, session)
 }
 
@@ -78,7 +81,14 @@ pub(crate) async fn attachment(
                 ("session_actor".into(), json!(session.actor)),
                 ("person_id".into(), json!(session.authority_actor)),
                 ("raw_mode".into(), json!(mode_name(request.mode))),
-                ("raw_authorization_epoch".into(), if request.mode == st3_client::RawTerminalMode::Peek { json!(authorization_epoch(&state, &session)?) } else { Value::Null }),
+                (
+                    "raw_authorization_epoch".into(),
+                    if request.mode == st3_client::RawTerminalMode::Peek {
+                        json!(authorization_epoch(&state, &session)?)
+                    } else {
+                        Value::Null
+                    },
+                ),
                 (
                     "capability_hash".into(),
                     json!(credential_digest(&capability)),
@@ -150,15 +160,32 @@ pub(crate) async fn stream(
         Some(capabilities[0]),
         Some(mode_name(query.mode)),
     )?;
-    let origin = headers.get(ORIGIN_HEADER).map(|header| {
-        if session.transport != "unix" || query.mode != st3_client::RawTerminalMode::Peek {
-            return Err(forbidden("raw origin bindings require a trusted Unix PEEK route"));
-        }
-        serde_json::from_slice::<LeaseBinding>(header.as_bytes()).map_err(ApiError::internal)
-    }).transpose()?;
-    let lease = (query.mode == st3_client::RawTerminalMode::Peek).then(|| {
-        Lease::register(&state, &session, &client_detail_id("terminal", &id), &live.owner_host_id, &query.incarnation, origin, acquisition_epoch.as_deref().ok_or_else(|| forbidden("raw PEEK capability has no authorization epoch"))?)
-    }).transpose()?;
+    let origin = headers
+        .get(ORIGIN_HEADER)
+        .map(|header| {
+            if session.transport != "unix" || query.mode != st3_client::RawTerminalMode::Peek {
+                return Err(forbidden(
+                    "raw origin bindings require a trusted Unix PEEK route",
+                ));
+            }
+            serde_json::from_slice::<LeaseBinding>(header.as_bytes()).map_err(ApiError::internal)
+        })
+        .transpose()?;
+    let lease = (query.mode == st3_client::RawTerminalMode::Peek)
+        .then(|| {
+            Lease::register(
+                &state,
+                &session,
+                &client_detail_id("terminal", &id),
+                &live.owner_host_id,
+                &query.incarnation,
+                origin,
+                acquisition_epoch
+                    .as_deref()
+                    .ok_or_else(|| forbidden("raw PEEK capability has no authorization epoch"))?,
+            )
+        })
+        .transpose()?;
     // Open and fence before HTTP upgrade: a stale owner incarnation is a refusal, not a blank pane.
     let (transport, control) = if live.owner_host_id == client_host_id(&state.node) {
         let terminal = crate::model::LocalTerminal {
@@ -171,7 +198,10 @@ pub(crate) async fn stream(
             .await
             .map_err(|error| stale(error.to_string()))?;
         stream.set_nonblocking(true).map_err(ApiError::internal)?;
-        (UnixStream::from_std(stream).map_err(ApiError::internal)?, None)
+        (
+            UnixStream::from_std(stream).map_err(ApiError::internal)?,
+            None,
+        )
     } else {
         let (transport, control) = state
             .client_relay
@@ -190,7 +220,9 @@ pub(crate) async fn stream(
         (transport, Some(control))
     };
     if let Some(lease) = &lease {
-        lease.revalidate().map_err(|error| stale(error.to_string()))?;
+        lease
+            .revalidate()
+            .map_err(|error| stale(error.to_string()))?;
     }
     Ok(websocket
         .protocols([SUBPROTOCOL])
@@ -215,26 +247,47 @@ pub(crate) async fn splice(
         while let Some(Ok(message)) = source.next().await {
             match message {
                 axum::extract::ws::Message::Text(text) => {
-                    let Some(lease) = &lease else { break; };
-                    let Ok(message) = serde_json::from_str::<lease::Control>(&text) else { break; };
+                    let Some(lease) = &lease else {
+                        break;
+                    };
+                    let Ok(message) = serde_json::from_str::<lease::Control>(&text) else {
+                        break;
+                    };
                     let result = match message {
                         lease::Control::SelectedUse { sequence } => {
                             let result = lease.selected_use(sequence);
                             if result.is_ok() {
                                 if let Some(control) = &control {
-                                    if control.send(json!({"type":"selected-use","sequence":sequence})).await.is_err() { break; }
+                                    if control
+                                        .send(json!({"type":"selected-use","sequence":sequence}))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
                             }
                             result
                         }
-                        lease::Control::AuthorityProof { lease_id, watcher_epoch, sequence }
-                            if lease.owner_side() && lease_id == lease.binding.lease_id => lease.proof(&watcher_epoch, sequence),
+                        lease::Control::AuthorityProof {
+                            lease_id,
+                            watcher_epoch,
+                            sequence,
+                        } if lease.owner_side() && lease_id == lease.binding.lease_id => {
+                            lease.proof(&watcher_epoch, sequence)
+                        }
                         _ => break,
                     };
-                    if result.is_err() { break; }
+                    if result.is_err() {
+                        break;
+                    }
                 }
                 axum::extract::ws::Message::Binary(bytes) => {
-                    if lease.as_ref().is_some_and(|lease| lease.check().is_err() || lease.owner_side() && !lease.has_proof()) { break; }
+                    if lease.as_ref().is_some_and(|lease| {
+                        lease.check().is_err() || lease.owner_side() && !lease.has_proof()
+                    }) {
+                        break;
+                    }
                     if gate.write(&mut writer, &bytes).await.is_err() {
                         break;
                     }
@@ -271,7 +324,11 @@ pub(crate) async fn splice(
         }
     };
     let expired = async {
-        if let Some(lease) = &lease { lease.expired().await; } else { std::future::pending::<()>().await; }
+        if let Some(lease) = &lease {
+            lease.expired().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     };
     tokio::select! { biased; () = expired => {}, () = upload => {}, () = download => {} }
 }

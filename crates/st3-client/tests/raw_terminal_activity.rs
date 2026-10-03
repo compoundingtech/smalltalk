@@ -37,7 +37,10 @@ async fn selected_use_is_sequenced_out_of_band_and_server_text_becomes_eof() {
             )
             .await
             .unwrap();
-            websocket.send(Message::Binary(output.as_slice().into())).await.unwrap();
+            websocket
+                .send(Message::Binary(output.as_slice().into()))
+                .await
+                .unwrap();
             let mut received = Vec::new();
             while received.len() < upload.len() {
                 let Message::Binary(bytes) = websocket.next().await.unwrap().unwrap() else {
@@ -57,9 +60,14 @@ async fn selected_use_is_sequenced_out_of_band_and_server_text_becomes_eof() {
                 );
             }
             close_requested.await.unwrap();
-            websocket.send(Message::Text(
-                json!({"type": "error", "code": "lease_expired"}).to_string().into(),
-            )).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({"type": "error", "code": "lease_expired"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
             // Keep the server socket open until the client closes in response to text.
             // That makes EOF proof of the SDK boundary rather than server socket teardown.
             while let Some(message) = websocket.next().await {

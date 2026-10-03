@@ -4506,7 +4506,10 @@ impl Store {
     pub fn expire_blob_uploads(&self, ttl_ms: u64) -> Result<usize> {
         let cutoff = (now_ms() as u64).saturating_sub(ttl_ms);
         let connection = self.connection.write();
-        Ok(connection.execute("DELETE FROM local_blob_uploads WHERE uploaded_ms<?1", [cutoff])?)
+        Ok(connection.execute(
+            "DELETE FROM local_blob_uploads WHERE uploaded_ms<?1",
+            [cutoff],
+        )?)
     }
 
     pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
@@ -5460,7 +5463,10 @@ impl Store {
 
     /// Force an admission or deferral after the final index read, before clearing its state.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn project_replication_backlog_before_clear(&self, before_clear: impl FnMut()) -> Result<bool> {
+    pub fn project_replication_backlog_before_clear(
+        &self,
+        before_clear: impl FnMut(),
+    ) -> Result<bool> {
         self.project_replication_backlog_chunks(|| {}, before_clear)
     }
 

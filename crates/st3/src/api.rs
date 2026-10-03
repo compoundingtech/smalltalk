@@ -60,16 +60,19 @@ use crate::store::Store;
 
 mod client_blobs;
 mod client_v0;
-mod owned_sets;
 mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
 mod mailbox;
+mod owned_sets;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
-pub(crate) use client_v0::raw_terminal::{Lease as RawTerminalLease, LeaseBinding as RawTerminalLeaseBinding, ORIGIN_HEADER as RAW_ORIGIN_HEADER};
+pub(crate) use client_v0::raw_terminal::{
+    Lease as RawTerminalLease, LeaseBinding as RawTerminalLeaseBinding,
+    ORIGIN_HEADER as RAW_ORIGIN_HEADER,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -385,7 +388,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
         .route("/v1/client/history/{*id}", get(client_history_detail))
-        .route("/v1/client/conversations/search", get(client_v0::search::search))
+        .route(
+            "/v1/client/conversations/search",
+            get(client_v0::search::search),
+        )
         .route("/v1/client/sessions", get(client_sessions))
         .route("/v1/client/sessions/{*id}", get(client_sessions_detail))
         .route(
@@ -425,7 +431,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/actions", post(client_v0::action))
         .route(
             "/v1/client/blobs",
-            post(client_blobs::upload).layer(DefaultBodyLimit::max(client_blobs::UPLOAD_BODY_LIMIT)),
+            post(client_blobs::upload)
+                .layer(DefaultBodyLimit::max(client_blobs::UPLOAD_BODY_LIMIT)),
         )
         .route("/v1/client/blobs/{id}", get(client_blobs::get))
         .route("/v1/client/blobs/{id}/chunk", get(client_blobs::chunk))
@@ -507,7 +514,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/rules/set", post(set_rule))
         .route("/v1/documents/content", get(get_document))
         .route("/v1/diagnostics/harness", post(post_harness_diagnostic))
-        .route("/v1/delivery/hold", get(get_delivery_hold).post(post_delivery_hold))
+        .route(
+            "/v1/delivery/hold",
+            get(get_delivery_hold).post(post_delivery_hold),
+        )
         .route("/v1/claims", get(list_claims).post(post_claim))
         .route("/v1/usage", get(get_usage))
         .route("/v1/claims/by-id/{id}", get(get_claim))
@@ -1148,7 +1158,10 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unexpected-lane-anchor"
         | "invalid-lane-anchor"
         | "invalid-lane-state"
-        | "invalid-lane-change" | "glass-limit" | "glass-deleted" | "invalid-glass-base" => "validation-failed".into(),
+        | "invalid-lane-change"
+        | "glass-limit"
+        | "glass-deleted"
+        | "invalid-glass-base" => "validation-failed".into(),
         // A retry of a request whose claim a checkpoint dropped cannot be answered again.
         "claim-checkpointed" => "idempotency-conflict".into(),
         _ => "internal".into(),
@@ -1881,7 +1894,9 @@ fn client_agent_resources(
 ) -> anyhow::Result<Vec<Value>> {
     let mut items = store.cached_agent_resources(snapshot_index, history, || {
         let mut items = client_agent_resources_uncached(store, history, snapshot_index)?;
-        let subjects = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
+        let subjects = items
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(str::to_owned))
             .collect::<Vec<_>>();
         let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
         for item in &mut items {
@@ -4041,7 +4056,11 @@ async fn client_launches_detail(
 }
 
 fn client_launch_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
-    if let Some(session) = state.store.planning_session(id).map_err(ApiError::internal)? {
+    if let Some(session) = state
+        .store
+        .planning_session(id)
+        .map_err(ApiError::internal)?
+    {
         return Ok(session);
     }
     state
@@ -4848,12 +4867,15 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     let mut report = tokio::task::spawn_blocking(move || {
         // This node's claims are signed as their batches are sealed; seal and judge them so
         // the signature counts cover everything written so far.
-        state.store.replication_snapshot().map_err(ApiError::internal)?;
+        state
+            .store
+            .replication_snapshot()
+            .map_err(ApiError::internal)?;
         doctor_report(&state)
     })
-        .await
-        .map_err(ApiError::internal)??
-        .0;
+    .await
+    .map_err(ApiError::internal)??
+    .0;
     if let Some(build_tools) = build_tools {
         report.checks.push(build_tools_check(
             &build_tools.await.map_err(ApiError::internal)?,
@@ -8474,7 +8496,10 @@ async fn restart_agent(
     } else {
         format!("agent/{}", request.subject)
     };
-    state.store.owned_member_guard(&subject).map_err(ApiError::bad)?;
+    state
+        .store
+        .owned_member_guard(&subject)
+        .map_err(ApiError::bad)?;
     let key = format!("agent-restart:{subject}:{}", request.idempotency_key);
     if let Some(prior) = state
         .store
@@ -8621,7 +8646,10 @@ fn suspension_target(
     ),
     ApiError,
 > {
-    state.store.owned_member_guard(subject).map_err(ApiError::bad)?;
+    state
+        .store
+        .owned_member_guard(subject)
+        .map_err(ApiError::bad)?;
     let status = state
         .store
         .status(Some(subject))
@@ -8940,14 +8968,16 @@ async fn rename_agent(
     };
     if !request.actor.starts_with("person/") {
         normalized_agent_actor(&request.actor).ok_or_else(|| {
-            ApiError::bad(St3Error::new("invalid-rename-actor", "rename needs a person or agent actor"))
+            ApiError::bad(St3Error::new(
+                "invalid-rename-actor",
+                "rename needs a person or agent actor",
+            ))
         })?;
     }
-    let response = state.store.rename_agent(
-        &subject,
-        request.name.as_deref(),
-        &request.idempotency_key,
-    ).map_err(ApiError::bad)?;
+    let response = state
+        .store
+        .rename_agent(&subject, request.name.as_deref(), &request.idempotency_key)
+        .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -13653,7 +13683,10 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             assert_eq!(peer.agent, "agent/eval.worker");
             assert_eq!(peer.transport, format!("{driver}-channel"));
             assert!(!peer.archives_inbox);
-            assert!(native_delivery_identity(37, &args, &[]).is_none(), "argv alone cannot authorize a seat");
+            assert!(
+                native_delivery_identity(37, &args, &[]).is_none(),
+                "argv alone cannot authorize a seat"
+            );
         }
     }
 
@@ -13871,7 +13904,10 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 let response = app.oneshot(request).await.unwrap();
                 let status = response.status();
                 let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-                (status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                )
             }
         };
         // Inside its namespace nothing is logged; outside, the write proceeds and is logged.
@@ -13902,7 +13938,13 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let (status, refused) = publish("doc/team/api/later").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
         assert_eq!(refused["code"], "rule-denied", "{refused}");
-        assert!(state.store.claims_for("doc/team/api/later", None).unwrap().is_empty());
+        assert!(
+            state
+                .store
+                .claims_for("doc/team/api/later", None)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(publish("doc/team/web/later").await.0, StatusCode::OK);
 
         // Only a person sets rules.
@@ -18869,10 +18911,13 @@ mission "agent-human" state="ready" {
             observe_harness(activity);
             assert_eq!(agent()["state"], "waiting", "{activity}");
         }
-        append("harness.observed", json!({
-            "state": "working", "driver": "omp", "incarnation_id": "human-1",
-            "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
-        }));
+        append(
+            "harness.observed",
+            json!({
+                "state": "working", "driver": "omp", "incarnation_id": "human-1",
+                "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+            }),
+        );
         let answered: st3_client::Agent = serde_json::from_value(agent()).unwrap();
         assert_eq!(answered.state, "running");
         assert_eq!(answered.harness_state.as_deref(), Some("working"));
@@ -18893,23 +18938,35 @@ mission "agent-human" state="ready" {
         observe_runtime("starting");
         assert_eq!(agent()["state"], "starting");
         observe_runtime("running");
-        append("runtime.reconcile-decision", json!({
-            "key": "member-reconcile", "decision": "member-fault", "reason": "Cannot reconcile seat",
-        }));
+        append(
+            "runtime.reconcile-decision",
+            json!({
+                "key": "member-reconcile", "decision": "member-fault", "reason": "Cannot reconcile seat",
+            }),
+        );
         assert_eq!(agent()["state"], "failed");
-        append("runtime.reconcile-decision", json!({
-            "key": "member-reconcile", "decision": "member-started",
-        }));
-        append("runtime.observed", json!({
-            "status": "running", "runtime_id": "node.worker", "incarnation_id": "human-2",
-        }));
+        append(
+            "runtime.reconcile-decision",
+            json!({
+                "key": "member-reconcile", "decision": "member-started",
+            }),
+        );
+        append(
+            "runtime.observed",
+            json!({
+                "status": "running", "runtime_id": "node.worker", "incarnation_id": "human-2",
+            }),
+        );
         // Before a new incarnation's first observation, the previous ask is fenced out.
         assert_eq!(agent()["state"], "starting", "{}", agent());
         assert!(agent()["blocked_on"].is_null());
-        append("harness.observed", json!({
-            "state": "idle", "driver": "omp", "incarnation_id": "human-2",
-            "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
-        }));
+        append(
+            "harness.observed",
+            json!({
+                "state": "idle", "driver": "omp", "incarnation_id": "human-2",
+                "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+            }),
+        );
         observe_harness("working");
         let resumed: st3_client::Agent = serde_json::from_value(agent()).unwrap();
         assert_eq!(resumed.state, "running");
@@ -19390,28 +19447,70 @@ agent "test/target" { workspace "."; command "true"; name "Initial seat" }
 "#;
         let request = apply_request(&state, source, "person/test", "rename-fixture");
         let _ = apply(State(state.clone()), Json(request)).await.unwrap();
-        let original = state.store.desired_subject_with_writer("agent/test/target").unwrap().unwrap();
-        let initial = client_agent_resources(&state.store, false, "before", state.store.index().unwrap()).unwrap();
-        assert_eq!(initial.iter().find(|agent| agent["id"] == "agent/test/target").unwrap()["name"], "Initial seat");
+        let original = state
+            .store
+            .desired_subject_with_writer("agent/test/target")
+            .unwrap()
+            .unwrap();
+        let initial =
+            client_agent_resources(&state.store, false, "before", state.store.index().unwrap())
+                .unwrap();
+        assert_eq!(
+            initial
+                .iter()
+                .find(|agent| agent["id"] == "agent/test/target")
+                .unwrap()["name"],
+            "Initial seat"
+        );
         let app = router(state.clone());
-        let (status, _) = json_request(app.clone(), "/v1/agents/rename", json!({
-            "subject": "test/target", "name": "Denied", "actor": "daemon/test",
-            "idempotency_key": "invalid-actor",
-        })).await;
+        let (status, _) = json_request(
+            app.clone(),
+            "/v1/agents/rename",
+            json!({
+                "subject": "test/target", "name": "Denied", "actor": "daemon/test",
+                "idempotency_key": "invalid-actor",
+            }),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(state.store.desired_subject_with_writer("agent/test/target").unwrap().unwrap(), original);
+        assert_eq!(
+            state
+                .store
+                .desired_subject_with_writer("agent/test/target")
+                .unwrap()
+                .unwrap(),
+            original
+        );
         for (name, key) in [(Some("Renamed seat"), "rename"), (None, "clear")] {
-            let (status, body) = json_request(app.clone(), "/v1/agents/rename", json!({
-                "subject": "test/target", "name": name, "actor": "agent/test/ungranted",
-                "idempotency_key": key,
-            })).await;
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/agents/rename",
+                json!({
+                    "subject": "test/target", "name": name, "actor": "agent/test/ungranted",
+                    "idempotency_key": key,
+                }),
+            )
+            .await;
             assert_eq!(status, StatusCode::OK, "{body}");
-            let (mut desired, writer) = state.store.desired_subject_with_writer("agent/test/target").unwrap().unwrap();
-            let agents = client_agent_resources(&state.store, false, "after", state.store.index().unwrap()).unwrap();
-            assert_eq!(agents.iter().find(|agent| agent["id"] == "agent/test/target").unwrap()["name"],
-                name.unwrap_or("test/target"));
+            let (mut desired, writer) = state
+                .store
+                .desired_subject_with_writer("agent/test/target")
+                .unwrap()
+                .unwrap();
+            let agents =
+                client_agent_resources(&state.store, false, "after", state.store.index().unwrap())
+                    .unwrap();
+            assert_eq!(
+                agents
+                    .iter()
+                    .find(|agent| agent["id"] == "agent/test/target")
+                    .unwrap()["name"],
+                name.unwrap_or("test/target")
+            );
             assert_eq!(writer, original.1);
-            desired.set_display_name(original.0.member.as_ref().unwrap().display_name.as_deref()).unwrap();
+            desired
+                .set_display_name(original.0.member.as_ref().unwrap().display_name.as_deref())
+                .unwrap();
             assert_eq!(desired, original.0);
         }
     }

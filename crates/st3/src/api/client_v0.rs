@@ -62,9 +62,13 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
-    if collection == "glasses" { return !kind.starts_with("glass."); }
-    matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
-        || (kind == "harness.usage" && collection != "agents")
+    if collection == "glasses" {
+        return !kind.starts_with("glass.");
+    }
+    matches!(
+        kind,
+        "daemon.diagnostic" | "transport.observed" | "workspace.observed"
+    ) || (kind == "harness.usage" && collection != "agents")
 }
 
 pub(super) async fn collection_stream(
@@ -905,7 +909,10 @@ pub(super) async fn subject_definition(
         let store = state.store.clone();
         store.read_snapshot(|index| {
             let status = store.status_at(Some(&subject), None, Some(index))?;
-            let Some(status) = status.subjects.into_iter().find(|item| item.subject == subject)
+            let Some(status) = status
+                .subjects
+                .into_iter()
+                .find(|item| item.subject == subject)
             else {
                 return Ok(None);
             };
@@ -916,9 +923,11 @@ pub(super) async fn subject_definition(
                 crate::graph::redact_agent_env_values(&mut desired);
             }
             let kdl = crate::graph::render_agent_desired_kdl(&desired)?;
-            let revision = status.desired_revision
+            let revision = status
+                .desired_revision
                 .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired revision"))?;
-            let token = status.desired_token
+            let token = status
+                .desired_token
                 .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired token"))?;
             let value = json!({
                 "kind": "subject-definition",
@@ -931,12 +940,18 @@ pub(super) async fn subject_definition(
             });
             Ok(Some((client_snapshot_at(&state, index), value)))
         })
-    }).await?;
-    let (snapshot, value) = result.ok_or_else(|| ApiError::not_found(
-        format!("subject `{}` has no applied definition", query.subject),
-    ))?;
+    })
+    .await?;
+    let (snapshot, value) = result.ok_or_else(|| {
+        ApiError::not_found(format!(
+            "subject `{}` has no applied definition",
+            query.subject
+        ))
+    })?;
     // Reserve space for the snapshot and response envelope. Definitions are never truncated.
-    if serde_json::to_vec(&value).map_err(ApiError::internal)?.len()
+    if serde_json::to_vec(&value)
+        .map_err(ApiError::internal)?
+        .len()
         > CLIENT_MAX_RESPONSE_BYTES - 4096
     {
         return Err(ApiError::bad(St3Error::new(
@@ -4550,10 +4565,15 @@ type TranscriptSeen = Option<(u64, std::time::SystemTime)>;
 type HashMap<K, V> = std::collections::HashMap<K, V>;
 const ISSUED_CURSORS: usize = 4096;
 
-fn issued_cursors()
--> &'static std::sync::Mutex<(std::collections::VecDeque<String>, HashMap<String, TranscriptSeen>)> {
+fn issued_cursors() -> &'static std::sync::Mutex<(
+    std::collections::VecDeque<String>,
+    HashMap<String, TranscriptSeen>,
+)> {
     static ISSUED: std::sync::OnceLock<
-        std::sync::Mutex<(std::collections::VecDeque<String>, HashMap<String, TranscriptSeen>)>,
+        std::sync::Mutex<(
+            std::collections::VecDeque<String>,
+            HashMap<String, TranscriptSeen>,
+        )>,
     > = std::sync::OnceLock::new();
     ISSUED.get_or_init(Default::default)
 }
@@ -4699,7 +4719,9 @@ async fn conversation_changes_local(
         };
         if !since.changed(state)? {
             mark = since;
-            quiet = Some(json!({"kind":"conversation-changes", "session_id":session_id, "items":[], "next_cursor":cursor}));
+            quiet = Some(
+                json!({"kind":"conversation-changes", "session_id":session_id, "items":[], "next_cursor":cursor}),
+            );
         }
     }
     loop {
@@ -6420,7 +6442,8 @@ fn consume_terminal_attachment(
     incarnation: &str,
     capability: Option<&str>,
 ) -> Result<(), ApiError> {
-    consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None).map(|_| ())
+    consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
+        .map(|_| ())
 }
 
 fn consume_terminal_attachment_mode(
@@ -6458,9 +6481,9 @@ fn consume_terminal_attachment_mode(
         .max_by_key(|claim| claim.store_index)
         .ok_or_else(|| ApiError::internal("the terminal attachment has no head"))?;
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
-    let raw_live = raw_mode.map(|_| {
-        remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation)
-    }).transpose()?;
+    let raw_live = raw_mode
+        .map(|_| remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation))
+        .transpose()?;
     let valid = latest.id == attached.id
         && attached.origin == state.store.origin()
         && field("session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
@@ -6517,7 +6540,9 @@ fn consume_terminal_attachment_mode(
         })
         .map_err(|_| forbidden("the terminal stream capability was already consumed"))?;
     signal_changed(state);
-    Ok(field("raw_authorization_epoch").and_then(Value::as_str).map(str::to_owned))
+    Ok(field("raw_authorization_epoch")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 fn detach_terminal_attachment(
@@ -7555,8 +7580,14 @@ async fn dispatch_action(
                     from: authority_actor.clone(),
                     to,
                     // An attachment may travel alone; text is then optional.
-                    content: if p.get("attachments").is_some_and(|value| value.as_array().is_some_and(|list| !list.is_empty())) {
-                        p.get("content").and_then(Value::as_str).unwrap_or_default().to_owned()
+                    content: if p
+                        .get("attachments")
+                        .is_some_and(|value| value.as_array().is_some_and(|list| !list.is_empty()))
+                    {
+                        p.get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned()
                     } else {
                         parameter_string(p, "content")?
                     },
@@ -8337,8 +8368,13 @@ async fn dispatch_action(
                 return Err(ApiError {
                     status: StatusCode::CONFLICT,
                     code: "issuer-required".into(),
-                    message: format!("pairing revocation must run on its authoritative issuer {issuer}"),
-                    details: Box::new(serde_json::Map::from_iter([("issuer_host_id".into(), Value::String(issuer))])),
+                    message: format!(
+                        "pairing revocation must run on its authoritative issuer {issuer}"
+                    ),
+                    details: Box::new(serde_json::Map::from_iter([(
+                        "issuer_host_id".into(),
+                        Value::String(issuer),
+                    )])),
                 });
             }
             state
@@ -8354,8 +8390,16 @@ async fn dispatch_action(
                 })
                 .map_err(ApiError::bad)?;
             // A revoked device's key signs nothing more, on every member.
-            let field = |name: &str| paired.body.pointer(&format!("/fields/{name}")).and_then(Value::as_str);
-            if let (Some(key), Some(person)) = (field("device_public_key").and_then(device_signing_key), field("person_id")) {
+            let field = |name: &str| {
+                paired
+                    .body
+                    .pointer(&format!("/fields/{name}"))
+                    .and_then(Value::as_str)
+            };
+            if let (Some(key), Some(person)) = (
+                field("device_public_key").and_then(device_signing_key),
+                field("person_id"),
+            ) {
                 state
                     .store
                     .revoke_device_key(person, key, &format!("pairing of {device} revoked"))
@@ -8774,22 +8818,49 @@ mod tests {
         let state = test_state(root.path());
         let subject = "agent/todo-worker";
         let append = |kind: &str, fields: Value| {
-            state.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
-                fields: fields.as_object().unwrap().iter()
-                    .map(|(key, value)| (key.clone(), value.clone())).collect(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap()
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: fields
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        assert!(agent_todo(&state.store, subject, Some("one"), state.store.index().unwrap()).unwrap().is_null());
-        append("runtime.observed", json!({
-            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
-        }));
-        append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/session"
-        }));
+        assert!(
+            agent_todo(
+                &state.store,
+                subject,
+                Some("one"),
+                state.store.index().unwrap()
+            )
+            .unwrap()
+            .is_null()
+        );
+        append(
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+            }),
+        );
+        append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/session"
+            }),
+        );
         let before = state.store.index().unwrap();
-        let cached = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        let cached =
+            client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
         assert!(cached.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
         let snapshot = json!({
             "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
@@ -8800,31 +8871,60 @@ mod tests {
         let first = append("harness.todo.observed", snapshot.clone());
         assert!(crate::store::local_observation_position(&first).is_none());
         assert!(state.store.index().unwrap() > before);
-        let old = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        let old =
+            client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
         assert!(old.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
-        let refreshed = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", first.store_index).unwrap();
-        assert_eq!(refreshed.iter().find(|agent| agent["id"] == subject).unwrap()["todo"]["snapshot"], snapshot);
-        let first_value = agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
+        let refreshed = client_agent_resources(
+            &state.store,
+            true,
+            "2026-10-03T09:00:00Z",
+            first.store_index,
+        )
+        .unwrap();
+        assert_eq!(
+            refreshed
+                .iter()
+                .find(|agent| agent["id"] == subject)
+                .unwrap()["todo"]["snapshot"],
+            snapshot
+        );
+        let first_value =
+            agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
         assert_eq!(first_value["snapshot"], snapshot);
         assert_eq!(first_value["claim_id"], first.id);
         assert_eq!(first_value["stale"], false);
-        assert_eq!(agent_todo(&state.store, subject, Some("two"), first.store_index).unwrap()["stale"], true);
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("two"), first.store_index).unwrap()["stale"],
+            true
+        );
         let mut empty = snapshot;
         empty["phases"] = json!([]);
         empty["totals"]["blocked"] = json!(0);
         empty["truncated"] = json!(true);
-        append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/fence"
-        }));
+        append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/fence"
+            }),
+        );
         let second = append("harness.todo.observed", empty.clone());
         let latest = agent_todo(&state.store, subject, Some("one"), second.store_index).unwrap();
         assert_eq!(latest["snapshot"], empty);
         assert_eq!(latest["claim_id"], second.id);
-        assert_eq!(agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"], first.id);
-        let changed = append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
-        }));
-        assert_eq!(agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"], true);
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"],
+            first.id
+        );
+        let changed = append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
+            }),
+        );
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"],
+            true
+        );
     }
 
     #[test]
@@ -8833,30 +8933,49 @@ mod tests {
         let state = test_state(root.path());
         let subject = "agent/malformed-todo";
         let append = |kind: &str, fields: Value| {
-            state.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
-                fields: serde_json::from_value(fields).unwrap(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap()
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        append("runtime.observed", json!({
-            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
-        }));
-        let claim = append("harness.todo.observed", json!({
-            "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
-            "observed_at":"2026-10-03T09:00:00Z", "source_op":"clear",
-            "phases":[], "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
-            "truncated":false
-        }));
+        append(
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+            }),
+        );
+        let claim = append(
+            "harness.todo.observed",
+            json!({
+                "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
+                "observed_at":"2026-10-03T09:00:00Z", "source_op":"clear",
+                "phases":[], "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
+                "truncated":false
+            }),
+        );
         // Simulate an older or corrupt replicated record beyond the typed writer boundary.
         let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
-        connection.execute(
-            "UPDATE claims SET body=json_set(body, '$.fields.unrecognized', 1) WHERE id=?1",
-            [&claim.id],
-        ).unwrap();
+        connection
+            .execute(
+                "UPDATE claims SET body=json_set(body, '$.fields.unrecognized', 1) WHERE id=?1",
+                [&claim.id],
+            )
+            .unwrap();
         let items = client_agent_resources(
-            &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
-        ).unwrap();
+            &state.store,
+            true,
+            "2026-10-03T09:00:00Z",
+            state.store.index().unwrap(),
+        )
+        .unwrap();
         assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
     }
 
@@ -9005,19 +9124,30 @@ mod tests {
         assert_eq!(document.nodes()[1].name().value(), "agent");
         let node = &document.nodes()[1].children().unwrap().nodes()[0];
         assert_eq!(node.name().value(), "name with spaces");
-        let values = node.entries().iter().filter(|entry| entry.name().is_none())
-            .map(|entry| entry.value().clone()).collect::<Vec<_>>();
-        assert_eq!(values, vec![
-            kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
-            kdl::KdlValue::Integer(i128::from(i64::MIN)),
-            kdl::KdlValue::Integer(i128::from(i64::MAX)),
-            kdl::KdlValue::Float(1.0),
-            kdl::KdlValue::Float(1.25),
-            kdl::KdlValue::Bool(true),
-            kdl::KdlValue::Bool(false),
-            kdl::KdlValue::Null,
-        ]);
-        let property = node.entries().iter().find(|entry| entry.name().is_some()).unwrap();
+        let values = node
+            .entries()
+            .iter()
+            .filter(|entry| entry.name().is_none())
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
+                kdl::KdlValue::Integer(i128::from(i64::MIN)),
+                kdl::KdlValue::Integer(i128::from(i64::MAX)),
+                kdl::KdlValue::Float(1.0),
+                kdl::KdlValue::Float(1.25),
+                kdl::KdlValue::Bool(true),
+                kdl::KdlValue::Bool(false),
+                kdl::KdlValue::Null,
+            ]
+        );
+        let property = node
+            .entries()
+            .iter()
+            .find(|entry| entry.name().is_some())
+            .unwrap();
         assert_eq!(property.name().unwrap().value(), "property with spaces");
         assert_eq!(property.value(), &kdl::KdlValue::String("\"\\\nλ".into()));
         let child = &node.children().unwrap().nodes()[0];
@@ -9035,10 +9165,19 @@ mod tests {
         let state = test_state(root.path());
         let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
         image.extend([7; 32]);
-        let hash = crate::blobs::BlobDir::under(root.path()).put(&image).unwrap();
+        let hash = crate::blobs::BlobDir::under(root.path())
+            .put(&image)
+            .unwrap();
         state
             .store
-            .record_blob_upload("person/alex", &hash, "image/png", image.len() as u64, 1 << 20, 60_000)
+            .record_blob_upload(
+                "person/alex",
+                &hash,
+                "image/png",
+                image.len() as u64,
+                1 << 20,
+                60_000,
+            )
             .unwrap();
         let sent = accept_message(
             &state,
@@ -9107,72 +9246,142 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
         let observe = |subject: &str, kind: &str, facts: Value| {
-            state.store.append_client_claim(&crate::model::ClaimInput {
-                subject: subject.into(),
-                kind: "resource.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("kind".into(), json!(kind)), ("facts".into(), facts)]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            }).unwrap();
+            state
+                .store
+                .append_client_claim(&crate::model::ClaimInput {
+                    subject: subject.into(),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("kind".into(), json!(kind)), ("facts".into(), facts)]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
         };
-        observe("resource/github/a", "vcs.pull-request", json!({"title":"Old", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
-        observe("resource/github/b", "vcs.pull-request", json!({"title":"Second", "opened_by":"agent/alice", "opened_by_run":"mission-run/two"}));
-        observe("resource/github/c", "vcs.pull-request", json!({"title":"Other", "opened_by":"agent/bob"}));
-        observe("resource/repository", "vcs.repository", json!({"url":"https://example.org/repository"}));
-        observe("resource/github/a", "vcs.pull-request", json!({"title":"New", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
+        observe(
+            "resource/github/a",
+            "vcs.pull-request",
+            json!({"title":"Old", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}),
+        );
+        observe(
+            "resource/github/b",
+            "vcs.pull-request",
+            json!({"title":"Second", "opened_by":"agent/alice", "opened_by_run":"mission-run/two"}),
+        );
+        observe(
+            "resource/github/c",
+            "vcs.pull-request",
+            json!({"title":"Other", "opened_by":"agent/bob"}),
+        );
+        observe(
+            "resource/repository",
+            "vcs.repository",
+            json!({"url":"https://example.org/repository"}),
+        );
+        observe(
+            "resource/github/a",
+            "vcs.pull-request",
+            json!({"title":"New", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}),
+        );
         let app = super::super::router(state.clone());
         let read = |uri: String| {
             let app = app.clone();
             async move {
-                let response = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
                 let status = response.status();
-                let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+                let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
                 (status, serde_json::from_slice::<Value>(&body).unwrap())
             }
         };
         let (status, all) = read("/v1/client/resources".into()).await;
         assert_eq!(status, StatusCode::OK, "{all}");
-        assert_eq!(all["value"]["items"].as_array().unwrap().iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(),
-            ["resource/github/a", "resource/github/b", "resource/github/c", "resource/repository"]);
+        assert_eq!(
+            all["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "resource/github/a",
+                "resource/github/b",
+                "resource/github/c",
+                "resource/repository"
+            ]
+        );
         assert_eq!(all["value"]["items"][0]["facts"]["title"], "New");
         assert_eq!(all["value"]["items"][0]["opened_by"], "agent/alice");
         assert_eq!(all["value"]["items"][0]["opened_by_run"], "mission-run/one");
-        chrono::DateTime::parse_from_rfc3339(all["value"]["items"][0]["observed_at"].as_str().unwrap()).unwrap();
+        chrono::DateTime::parse_from_rfc3339(
+            all["value"]["items"][0]["observed_at"].as_str().unwrap(),
+        )
+        .unwrap();
         assert_eq!(all["value"]["items"][3]["opened_by"], Value::Null);
-        let (status, run) = read("/v1/client/resources?opened_by=mission-run%2Fone&kind=vcs.pull-request".into()).await;
+        let (status, run) =
+            read("/v1/client/resources?opened_by=mission-run%2Fone&kind=vcs.pull-request".into())
+                .await;
         assert_eq!(status, StatusCode::OK, "{run}");
-        assert_eq!(run["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        assert_eq!(
+            run["value"]["items"],
+            json!([all["value"]["items"][0].clone()])
+        );
         let (status, repository) = read("/v1/client/resources?kind=vcs.repository".into()).await;
         assert_eq!(status, StatusCode::OK, "{repository}");
-        assert_eq!(repository["value"]["items"], json!([all["value"]["items"][3].clone()]));
+        assert_eq!(
+            repository["value"]["items"],
+            json!([all["value"]["items"][3].clone()])
+        );
         let filters = "opened_by=agent%2Falice&kind=vcs.pull-request&subject_prefix=resource%2Fgithub%2F&limit=1";
         let (status, first) = read(format!("/v1/client/resources?{filters}")).await;
         assert_eq!(status, StatusCode::OK, "{first}");
-        assert_eq!(first["value"]["filters"], json!({"opened_by":"agent/alice", "kind":"vcs.pull-request", "subject_prefix":"resource/github/"}));
-        assert_eq!(first["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        assert_eq!(
+            first["value"]["filters"],
+            json!({"opened_by":"agent/alice", "kind":"vcs.pull-request", "subject_prefix":"resource/github/"})
+        );
+        assert_eq!(
+            first["value"]["items"],
+            json!([all["value"]["items"][0].clone()])
+        );
         assert_eq!(first["value"]["page"]["has_more"], true);
         let cursor = urlencoding::encode(first["value"]["page"]["next_cursor"].as_str().unwrap());
         let continuation = format!("/v1/client/resources?{filters}&cursor={cursor}");
-        state.store.append_claim(&ClaimInput {
-            subject: "custom/test/unrelated".into(),
-            kind: "custom.test.marker".into(),
-            actor: None,
-            fields: BTreeMap::new(),
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: None,
-        }).unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/unrelated".into(),
+                kind: "custom.test.marker".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         let (status, second) = read(continuation.clone()).await;
         assert_eq!(status, StatusCode::OK, "{second}");
         assert_eq!(second["snapshot"], first["snapshot"]);
-        assert_eq!(second["value"]["items"], json!([all["value"]["items"][1].clone()]));
+        assert_eq!(
+            second["value"]["items"],
+            json!([all["value"]["items"][1].clone()])
+        );
         assert_eq!(second["value"]["page"]["has_more"], false);
-        let (status, changed_filter) = read(format!("/v1/client/resources?opened_by=agent%2Fbob&cursor={cursor}")).await;
+        let (status, changed_filter) = read(format!(
+            "/v1/client/resources?opened_by=agent%2Fbob&cursor={cursor}"
+        ))
+        .await;
         assert_eq!(status, StatusCode::GONE, "{changed_filter}");
         assert_eq!(changed_filter["code"], "page-cursor-expired");
-        observe("resource/github/a", "vcs.pull-request", json!({"title":"Reassigned", "opened_by":"agent/bob"}));
+        observe(
+            "resource/github/a",
+            "vcs.pull-request",
+            json!({"title":"Reassigned", "opened_by":"agent/bob"}),
+        );
         let (status, expired) = read(continuation).await;
         assert_eq!(status, StatusCode::GONE, "{expired}");
         assert_eq!(expired["code"], "page-cursor-expired");
@@ -9200,26 +9409,45 @@ mod tests {
         let state = test_state(root.path());
         let credential = "resources-reader";
         let app = super::super::fabric_router(state.clone());
-        for (scopes, expected) in [(json!([]), StatusCode::FORBIDDEN), (json!(["read.projections"]), StatusCode::OK)] {
-            state.store.append_claim(&ClaimInput {
-                subject: "custom/client/resources-reader".into(),
-                kind: "custom.client.pairing-completed".into(),
-                actor: Some("person/ada".into()),
-                fields: BTreeMap::from([
-                    ("credential_hash".into(), json!(credential_digest(credential))),
-                    ("session_actor".into(), json!("client/resources-reader")),
-                    ("person_id".into(), json!("person/ada")),
-                    ("scopes".into(), scopes),
-                    ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 60_000)),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            }).unwrap();
-            let response = app.clone().oneshot(Request::builder()
-                .uri("/v1/client/resources")
-                .header(AUTHORIZATION, format!("Bearer {credential}"))
-                .body(Body::empty()).unwrap()).await.unwrap();
+        for (scopes, expected) in [
+            (json!([]), StatusCode::FORBIDDEN),
+            (json!(["read.projections"]), StatusCode::OK),
+        ] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "custom/client/resources-reader".into(),
+                    kind: "custom.client.pairing-completed".into(),
+                    actor: Some("person/ada".into()),
+                    fields: BTreeMap::from([
+                        (
+                            "credential_hash".into(),
+                            json!(credential_digest(credential)),
+                        ),
+                        ("session_actor".into(), json!("client/resources-reader")),
+                        ("person_id".into(), json!("person/ada")),
+                        ("scopes".into(), scopes),
+                        (
+                            "expires_at_unix_ms".into(),
+                            json!(client_now_ms() as u64 + 60_000),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/client/resources")
+                        .header(AUTHORIZATION, format!("Bearer {credential}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), expected);
         }
     }
@@ -11837,10 +12065,9 @@ mission "example/zero-run" state="ready" {
                     idempotency_key: None,
                 })
                 .unwrap();
-            let idle =
-                conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
-                    .await
-                    .unwrap();
+            let idle = conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
+                .await
+                .unwrap();
             assert!(idle["items"].as_array().unwrap().is_empty());
             cursor = idle["next_cursor"].as_str().unwrap().to_owned();
         }
@@ -11867,7 +12094,10 @@ mission "example/zero-run" state="ready" {
         let changed = conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
             .await
             .unwrap();
-        assert!(!changed["items"].as_array().unwrap().is_empty(), "{changed}");
+        assert!(
+            !changed["items"].as_array().unwrap().is_empty(),
+            "{changed}"
+        );
         assert_eq!(rebuilds(), 2);
         // A cursor this member did not give out (another member's, or one from before a
         // restart) is read as before.
@@ -13708,8 +13938,8 @@ mission "example/zero-run" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let mut state = test_state(root.path());
         state.pty_binary = pty.clone();
-        let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
-            .with_binary(pty.to_string_lossy());
+        let runtime =
+            st_runtime::PtyRuntime::new(state.pty_root.clone()).with_binary(pty.to_string_lossy());
         struct Cleanup(st_runtime::PtyRuntime);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -14399,7 +14629,10 @@ async fn glass_write(
     .map_err(|error| {
         let is_idempotency = matches!(error.code, "idempotency-mismatch" | "idempotency-conflict");
         let mut error = ApiError::bad(error);
-        if is_idempotency { error.code = "idempotency-conflict".into(); error.status = StatusCode::CONFLICT; }
+        if is_idempotency {
+            error.code = "idempotency-conflict".into();
+            error.status = StatusCode::CONFLICT;
+        }
         error
     })?;
     signal_changed(&state);
