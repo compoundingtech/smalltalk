@@ -76,6 +76,7 @@ the setup.
 
 | Task | Example |
 | --- | --- |
+| Land a pull request, then wait for main's CI, a cargo test target and a handoff document with built-in gates | [`land-and-verify.kdl`](land-and-verify.kdl) |
 | Wait for a pull request's GitHub checks to pass | [`wait-for-green-checks.kdl`](wait-for-green-checks.kdl) |
 | Repeat a fix until the pushed branch passes its tests | [`loop-until-green.kdl`](loop-until-green.kdl), [`test-pushed-branch.sh`](test-pushed-branch.sh) |
 | Wait until a time | [`wait-until-time.kdl`](wait-until-time.kdl) |
@@ -101,13 +102,19 @@ the setup.
 
 ## Gates that work
 
+Prefer a built-in gate to a command: `document`, `merged`, `ci-passed`, and `cargo-test` answer
+what gates shelled out for most; see [`land-and-verify.kdl`](land-and-verify.kdl). Check a
+mission's gates before you publish it with `st missions check FILE`.
+
 Gates run through `sh -c` with the daemon's login environment and the command recorder first on `PATH`:
 
 - Call `git` by name so its calls appear in the recorder log.
 - `${NAME}` is an st variable; write shell variables as plain `$NAME`, or `$${NAME}` for braces.
 - A gate on files checks the committed, pushed tree, not an agent's working tree.
-- A gate result is cached by its definition and step attempt. A loop's `until` gate puts
-  `${loop.round}` in its command so each round checks again.
+- An exec gate exits 0 to pass and 1 for not yet; any other status breaks it and holds its step
+  for a revision. Not yet checks again on its own.
+- A gate's pass or broken result is kept by its definition and step attempt. A loop's `until` gate
+  puts `${loop.round}` in its command so each round checks again.
 - A graph predicate that is false stays pending; `every` passes on an empty list.
 
 [`WRITE-A-GATE-THAT-WORKS.md`](WRITE-A-GATE-THAT-WORKS.md) explains each rule.

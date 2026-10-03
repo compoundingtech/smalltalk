@@ -137,23 +137,46 @@ pub(super) fn run_live(
     generation: Option<&str>,
     failure: bool,
 ) -> Result<bool> {
+    Ok(run_liveness(connection, run, generation, failure)?.is_ok())
+}
+
+/// Whether `run` still matters, or why not: it and each run above it exist, are open and on
+/// the generation their parent step belongs to, each parent step is still open, and a
+/// subscription or schedule that delivered it still runs. `failure` keeps a failed run or
+/// parent step live, for the fault that names it.
+pub(super) fn run_liveness(
+    connection: &Connection,
+    run: &str,
+    generation: Option<&str>,
+    failure: bool,
+) -> Result<std::result::Result<(), String>> {
     let mut run = run.strip_prefix("mission-run/").unwrap_or(run).to_owned();
     let mut expected_generation = generation.map(str::to_owned);
     let mut seen = BTreeSet::new();
     loop {
         if !seen.insert(run.clone()) {
-            return Ok(false);
+            return Ok(Err(format!(
+                "mission run `mission-run/{run}` is its own ancestor"
+            )));
         }
         let header = mission_run_header_tx(connection, &run).optional()?;
         let Some(header) = header else {
-            return Ok(false);
+            return Ok(Err(format!("mission run `mission-run/{run}` is gone")));
         };
-        if expected_generation
+        if let Some(expected) = expected_generation
             .as_ref()
-            .is_some_and(|g| g != &header.generation)
-            || (is_terminal_run_state(&header.status) && !(failure && header.status == "failed"))
+            .filter(|expected| *expected != &header.generation)
         {
-            return Ok(false);
+            return Ok(Err(format!(
+                "mission run `{}` moved on from {expected} to {}",
+                header.subject, header.generation
+            )));
+        }
+        if is_terminal_run_state(&header.status) && !(failure && header.status == "failed") {
+            return Ok(Err(format!(
+                "mission run `{}` is {}",
+                header.subject, header.status
+            )));
         }
         if let Some(parent) = header.parent_step_run.as_deref() {
             let Some(parent) = step(connection, parent)? else {
@@ -161,21 +184,25 @@ pub(super) fn run_live(
                 // normalized with a step-run prefix. They do not create a synthetic work step.
                 let subject = parent.strip_prefix("step-run/").unwrap_or(parent);
                 let Some(owner) = current_desired_row(connection, subject)? else {
-                    return Ok(false);
+                    return Ok(Err(format!("`{subject}`, which started it, is gone")));
                 };
                 let body: Value = serde_json::from_str(&owner.body)?;
-                if !matches!(owner.kind.as_str(), "subscription" | "schedule")
-                    || body
-                        .get("children")
-                        .and_then(Value::as_array)
-                        .is_some_and(|children| {
-                            children.len() == 1 && children[0]["name"] == "stop"
-                        })
+                if !matches!(owner.kind.as_str(), "subscription" | "schedule") {
+                    return Ok(Err(format!(
+                        "`{subject}`, which started it, is not a step, subscription or schedule"
+                    )));
+                }
+                if body
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .is_some_and(|children| children.len() == 1 && children[0]["name"] == "stop")
                 {
-                    return Ok(false);
+                    return Ok(Err(format!("`{subject}`, which started it, is stopped")));
                 }
                 let Some(owner_run) = owner.owner_run else {
-                    return Ok(false);
+                    return Ok(Err(format!(
+                        "`{subject}`, which started it, has no owning run"
+                    )));
                 };
                 let owner_header =
                     mission_run_header_tx(connection, owner_run.trim_start_matches("mission-run/"))
@@ -183,7 +210,9 @@ pub(super) fn run_live(
                 if owner_header
                     .is_none_or(|owner| owner.root_mission_run != header.root_mission_run)
                 {
-                    return Ok(false);
+                    return Ok(Err(format!(
+                        "`{subject}`, which started it, now belongs to another run"
+                    )));
                 }
                 run = owner_run.trim_start_matches("mission-run/").into();
                 expected_generation = owner.owner_generation;
@@ -192,7 +221,10 @@ pub(super) fn run_live(
             if matches!(parent.status.as_str(), "completed" | "cancelled")
                 || (parent.status == "failed" && !failure)
             {
-                return Ok(false);
+                return Ok(Err(format!(
+                    "its parent step `{}` is {}",
+                    parent.subject, parent.status
+                )));
             }
             run = parent.run.trim_start_matches("mission-run/").into();
             expected_generation = Some(parent.generation);
@@ -202,9 +234,22 @@ pub(super) fn run_live(
                 header.root_mission_run.trim_start_matches("mission-run/"),
             )
             .optional()?;
-            return Ok(root.is_some_and(|root| {
-                !is_terminal_run_state(&root.status) || (failure && root.status == "failed")
-            }));
+            return Ok(match root {
+                None => Err(format!(
+                    "its root mission run `{}` is gone",
+                    header.root_mission_run
+                )),
+                Some(root)
+                    if is_terminal_run_state(&root.status)
+                        && !(failure && root.status == "failed") =>
+                {
+                    Err(format!(
+                        "its root mission run `{}` is {}",
+                        root.subject, root.status
+                    ))
+                }
+                Some(_) => Ok(()),
+            });
         }
     }
 }
@@ -323,6 +368,11 @@ pub(super) fn enrich_responses(
           json_extract(request.body,'$.fields.origin_step')=?1 FROM claims resolution JOIN claims request
         ON request.subject=resolution.subject AND request.kind='work.person-asked'
         WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
+          -- Only asks this step made, or the step's own ask: an index walk, not every answer.
+          AND resolution.subject IN (
+            SELECT subject FROM claims WHERE kind='work.person-asked'
+              AND json_extract(body,'$.fields.origin_step')=?1
+            UNION SELECT ?1)
           AND ((json_extract(request.body,'$.fields.origin_step')=?1
                 AND json_extract(request.body,'$.fields.origin_attempt')=?2)
             OR (resolution.subject=?1 AND json_extract(resolution.body,'$.fields.attempt')=?2))
@@ -607,37 +657,6 @@ impl Store {
             }
             Ok(changed)
         }).map_err(anyhow::Error::msg)?
-    }
-
-    /// A request the daemon itself puts on a person's home, as `actor` (`daemon/NAME`), in a run
-    /// of its own. Every node that asks with the same name and key names the same step, so the
-    /// request appears once. Clients cannot reach this: `ask_person` accepts only agents.
-    pub(crate) fn ask_person_as_daemon(
-        &self,
-        actor: &str,
-        person: &str,
-        title: &str,
-        reason: &str,
-        name: &str,
-        key: &str,
-    ) -> Result<StepRunView, St3Error> {
-        if !actor.starts_with("daemon/")
-            || !person.starts_with("person/")
-            || person.matches('/').count() != 1
-            || title.trim().is_empty()
-            || reason.trim().is_empty()
-            || key.is_empty()
-        {
-            return Err(St3Error::new(
-                "invalid-person-ask",
-                "a daemon ask needs a daemon actor, a person, a title, a reason and a key",
-            ));
-        }
-        self.connection
-            .batched(|tx| {
-                ask_as_daemon_tx(tx, &self.origin, actor, person, title, reason, name, key)
-            })
-            .map_err(internal)?
     }
 
     /// Brings a person information they asked for. Nothing waits on an update: it stays on the
@@ -2337,55 +2356,4 @@ mission "writer-load" state="ready" {
             "stale-fence"
         );
     }
-}
-
-/// `Store::ask_person_as_daemon` inside a writer transaction the caller already holds, such as a
-/// resource observation that routes an item to a person.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ask_as_daemon_tx(
-    tx: &Transaction<'_>,
-    origin: &str,
-    actor: &str,
-    person: &str,
-    title: &str,
-    reason: &str,
-    name: &str,
-    key: &str,
-) -> Result<StepRunView, St3Error> {
-    let identity = serde_json::to_string(&(actor, name, key)).map_err(internal)?;
-    let hash = hex::encode(Sha256::digest(identity.as_bytes()));
-    let generation = format!("ask-{}", &hash[..32]);
-    let subject = format!("step-run/{generation}/ask");
-    if request(tx, &subject).map_err(internal)?.is_some() {
-        return step(tx, &subject)
-            .map_err(internal)?
-            .ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
-    }
-    let mission_id = format!("person-ask/{}", &hash[..32]);
-    let kdl = format!(
-        "version 2\nmission {mission_id:?} state=\"ready\" {{ goal {title:?}; step \"ask\" {{ assigned-to {person:?}; goal {reason:?}; }} }}"
-    );
-    let mut intent = crate::graph::parse_internal_intent(&kdl, origin)?;
-    let mission = intent
-        .missions
-        .remove(&mission_id)
-        .ok_or_else(|| St3Error::new("internal", "the person mission could not be parsed"))?;
-    let claim = append_claim_tx(
-        tx,
-        origin,
-        &subject,
-        "work.person-asked",
-        Some(actor),
-        &json!({"fields": {"run": format!("mission-run/person-ask/{}", &hash[..32]),
-            "generation": format!("run-generation/{generation}"),
-            "person": person, "title": title, "reason": reason, "key": key,
-            "attempt": 1, "status": "ready", "mission_spec": mission}}),
-        &[],
-        None,
-    )
-    .map_err(claim_append_error)?;
-    project(tx, &claim)?;
-    step(tx, &subject)
-        .map_err(internal)?
-        .ok_or_else(|| St3Error::new("missing-step-run", "the ask could not be projected"))
 }

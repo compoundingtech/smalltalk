@@ -17,7 +17,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 #[cfg(test)]
 use crate::model::ApiResponse;
 use crate::model::{
-    ApiErrorResponse, AttachRequest, Attachment, LocalTerminal, MessageSendRequest, MessageView,
+    ApiErrorResponse, AttachRequest, Attachment, LocalTerminal, MessageSendReceipt,
+    MessageSendRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -258,30 +259,57 @@ impl Client {
         self.request("POST", path, Some(body)).await
     }
 
-    /// Send a message, retrying one unanswered request with the same idempotency key
-    /// and body. Keep this request for later retries if both attempts go unconfirmed.
-    pub async fn send_message(&self, request: &MessageSendRequest) -> Result<MessageView> {
+    /// Send a message, retrying one unanswered request with the same idempotency key and body.
+    /// The receipt says whether the key had already sent it. If both attempts go unanswered the
+    /// error is a [`MessageSendUnconfirmed`]: keep this request for a later retry, and ask
+    /// [`Client::sent_message`] whether it landed.
+    pub async fn send_message(&self, request: &MessageSendRequest) -> Result<MessageSendReceipt> {
         anyhow::ensure!(
             !request.idempotency_key.trim().is_empty(),
             "a message send needs a nonempty idempotency key"
         );
         for attempt in 0..2 {
-            match self.post("/v1/messages", request).await {
-                Ok(message) => return Ok(message),
+            match self
+                .post::<_, MessageSendReceipt>("/v1/messages", request)
+                .await
+            {
+                Ok(mut receipt) => {
+                    // An older daemon answers with the bare message.
+                    if receipt.idempotency_key.is_empty() {
+                        receipt.idempotency_key = request.idempotency_key.clone();
+                    }
+                    return Ok(receipt);
+                }
                 Err(error) if daemon_did_not_answer(&error) => {
                     if attempt == 0 {
                         continue;
                     }
-                    anyhow::bail!(
-                        "st did not answer; the message may have been sent. Retry with the same recipient, sender, body and options, and --idempotency-key {:?}. Delivery is unconfirmed: {}",
-                        request.idempotency_key,
-                        error
-                    );
+                    return Err(MessageSendUnconfirmed {
+                        idempotency_key: request.idempotency_key.clone(),
+                        reason: error.to_string(),
+                    }
+                    .into());
                 }
                 Err(error) => return Err(error),
             }
         }
         unreachable!("the bounded message retry loop always returns")
+    }
+
+    /// The message a send's idempotency key landed as, or `None` when nothing was sent with it.
+    /// A daemon from before this lookup fails it with a bare 404.
+    pub async fn sent_message(&self, idempotency_key: &str) -> Result<Option<MessageSendReceipt>> {
+        match self
+            .get(&format!(
+                "/v1/messages/by-key?key={}",
+                urlencoding::encode(idempotency_key)
+            ))
+            .await
+        {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(error) if api_error_code(&error) == Some("message-not-sent") => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn request<I: Serialize, O: DeserializeOwned>(
@@ -1077,6 +1105,33 @@ impl fmt::Display for DaemonDeadline {
 
 impl std::error::Error for DaemonDeadline {}
 
+/// A message send st never answered, so it may or may not have been sent. The same request with
+/// the same key sends it at most once.
+#[derive(Debug)]
+pub struct MessageSendUnconfirmed {
+    pub idempotency_key: String,
+    reason: String,
+}
+
+impl MessageSendUnconfirmed {
+    /// Why the last attempt went unanswered.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl fmt::Display for MessageSendUnconfirmed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "st did not answer; the message may have been sent. Retry with the same recipient, sender, body and options, and --idempotency-key {:?}. Delivery is unconfirmed: {}",
+            self.idempotency_key, self.reason
+        )
+    }
+}
+
+impl std::error::Error for MessageSendUnconfirmed {}
+
 /// Whether an API call failed because the daemon did not answer: it was unreachable, or it took
 /// the request and ran out of time. A refusal is an answer.
 pub fn daemon_did_not_answer(error: &anyhow::Error) -> bool {
@@ -1354,16 +1409,30 @@ mod tests {
         };
         let mut client = fast_client(Endpoint::Unix(socket));
         client.deadlines.request = Duration::from_millis(200);
-        let message = client.send_message(&request).await.unwrap();
+        let receipt = client.send_message(&request).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // The daemon says the retry found the message the first attempt sent.
+        assert!(receipt.already_sent);
+        assert_eq!(receipt.idempotency_key, request.idempotency_key);
+        let message = receipt.message;
         let stored = store.messages(Some("agent/example/worker"), true).unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(message.subject, stored[0].subject);
         assert_eq!(message.created_index, stored[0].created_index);
         // A later command retaining the key receives the same durable result as well.
         let replay = client.send_message(&request).await.unwrap();
-        assert_eq!(replay.subject, message.subject);
-        assert_eq!(replay.created_index, message.created_index);
+        assert!(replay.already_sent);
+        assert_eq!(replay.sent_at, receipt.sent_at);
+        assert_eq!(replay.message.subject, message.subject);
+        assert_eq!(replay.message.created_index, message.created_index);
+        let found = client
+            .sent_message(&request.idempotency_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.message.subject, message.subject);
+        assert_eq!(found.sent_at, receipt.sent_at);
+        assert!(client.sent_message("never-sent").await.unwrap().is_none());
         assert_eq!(store.messages(None, true).unwrap().len(), 1);
         // A reused key never silently changes the original message.
         let mut changed = request;

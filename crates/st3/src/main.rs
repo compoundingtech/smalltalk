@@ -22,12 +22,12 @@ use st3::model::{
     DocumentPutRequest, DocumentVersion, EvalStatus, EventRecord, IntentInput,
     LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
     LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
-    LaunchStartRequest, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
-    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest, MissionRunView,
-    MissionSpec, MissionState, OperationalRepairApplyRequest, OperationalRepairPlan,
-    OperationalRepairResult, PersonAskRequest, PersonStepResponse, PlannerSpec,
-    PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    LaunchStartRequest, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
+    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
+    MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
+    MissionRunView, MissionSpec, MissionState, OperationalRepairApplyRequest,
+    OperationalRepairPlan, OperationalRepairResult, PersonAskRequest, PersonStepResponse,
+    PlannerSpec, PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
     PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest,
     ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
     RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
@@ -225,6 +225,12 @@ enum Command {
     },
     /// Generate one shell completion script.
     Completions(CompletionsArgs),
+    /// Answer one built-in gate check, as built-in gates run it: exit 0 to pass, 1 for not yet,
+    /// and 3 when the check cannot answer.
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
+    },
     /// Print the st agent skill bundled in this binary, or install it for each harness.
     Skill(SkillArgs),
     #[command(hide = true)]
@@ -1607,8 +1613,11 @@ enum MissionViewCommand {
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
-    /// Publish exact authored mission KDL after preview.
+    /// Publish exact authored mission KDL after preview, once its exec gates pass a check.
     Publish(MissionPublishArgs),
+    /// Run each exec gate in a mission file once, now, the way a run would, and report its
+    /// answer: pass (exit 0), not yet (exit 1), broken (anything else), or unchecked.
+    Check(MissionCheckArgs),
     /// Start one run from the current ready mission revision.
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
@@ -1652,6 +1661,61 @@ struct MissionPublishArgs {
     /// Complete person or agent subject authoring the publication.
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
+    /// The workspace a run would use, where publish first checks each exec gate.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Publish without first running each exec gate once to refuse a broken one.
+    #[arg(long)]
+    no_gate_check: bool,
+}
+
+#[derive(Args)]
+struct MissionCheckArgs {
+    /// KDL file to check; use `-` to read standard input.
+    file: PathBuf,
+    /// The workspace a run would use: `${ST_WORKSPACE}` and relative gate workspaces stand for
+    /// it.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// A mission input value for the check, as `missions start` takes it. A gate that reads an
+    /// input without one is unchecked.
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
+}
+
+#[derive(Subcommand)]
+enum GateCommand {
+    /// Whether a pull request has merged; one that closed unmerged cannot pass.
+    Merged {
+        /// OWNER/REPO#NUMBER.
+        pull_request: String,
+    },
+    /// Whether the check run or commit status named CHECK passed on a commit or branch head.
+    CiPassed {
+        check: String,
+        /// OWNER/REPO.
+        #[arg(long)]
+        repo: String,
+        /// A commit SHA or a branch name.
+        #[arg(long = "ref")]
+        reference: String,
+    },
+    /// Whether a cargo test target passes at a ref, built in a worktree st keeps between checks.
+    CargoTest {
+        /// The test target, as `cargo test --test TARGET` names it.
+        target: String,
+        #[arg(long)]
+        package: String,
+        /// The ref to test; its remote is fetched first.
+        #[arg(long = "ref", default_value = "origin/main")]
+        reference: String,
+        /// The repository, or a directory inside it.
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        /// The worktree to build in; st keeps one beneath its state directory by default.
+        #[arg(long)]
+        worktree: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
@@ -2515,7 +2579,11 @@ enum AgentsCommand {
     /// Start a durable seat, patching only explicitly supplied declaration fields. A stopped
     /// mission seat starts again on its run's own declaration.
     Start(AgentStartArgs),
-    /// Stop one exact durable seat.
+    /// Stop one exact durable seat and every process it started.
+    ///
+    /// The seat's builds and tests end with it, even those that left its harness's process tree.
+    /// A host without a systemd user manager ends only the harness's process tree and process
+    /// groups; docs/st3/priority.md says what else keeps running there.
     Stop(AgentStopArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
     Restart(AgentRestartArgs),
@@ -3231,8 +3299,9 @@ enum MessageCommand {
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
-    /// Show delivery and read progress without changing the message lifecycle.
-    Status(MessageReferenceArgs),
+    /// Show delivery and read progress without changing the message lifecycle, or whether an
+    /// unconfirmed send landed.
+    Status(MessageStatusArgs),
     /// Read exact messages and optionally mark them read or archived.
     Read(MessageReadArgs),
     /// Reply to one canonical message ID while preserving its thread.
@@ -3302,7 +3371,9 @@ struct MessageSendArgs {
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
-    /// Reuse this key with the same message when retrying an unconfirmed send.
+    /// Name this message for retries. Without it the key comes from the sender, recipient, words
+    /// and attachments, so running the same command again within the hour (or the next) reports
+    /// the message already sent instead of sending it twice.
     #[arg(long)]
     idempotency_key: Option<String>,
 }
@@ -3349,7 +3420,8 @@ struct MessageReplyArgs {
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
-    /// Reuse this key with the same message when retrying an unconfirmed send.
+    /// Name this reply for retries. Without it the key comes from the sender, the message
+    /// replied to, the words and attachments, as for `send`.
     #[arg(long)]
     idempotency_key: Option<String>,
 }
@@ -3370,7 +3442,18 @@ struct MessageReferenceArgs {
 }
 
 #[derive(Args)]
+struct MessageStatusArgs {
+    #[arg(required_unless_present = "idempotency_key")]
+    reference: Option<String>,
+    /// Whether a send or reply that st did not confirm landed, by the key its error printed.
+    #[arg(long, conflicts_with = "reference")]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
 struct ReviewArgs {
+    /// The gate to answer: its `attention/...` ID from `st attention ls`, or the step, mission
+    /// or loop run (`step-run/...`, `mission-run/...`, `loop-run/...`) that owns it.
     target: String,
     #[arg(long)]
     reason: Option<String>,
@@ -3380,6 +3463,8 @@ struct ReviewArgs {
 
 #[derive(Args)]
 struct FeedbackReviewArgs {
+    /// The feedback gate to answer: its `attention/...` ID from `st attention ls`, or the
+    /// step run that owns it.
     target: String,
     #[arg(long)]
     reason: String,
@@ -3477,12 +3562,31 @@ fn main() -> ExitCode {
     }
     let matches = Cli::command()
         .override_help(cli_help::root_help(false))
-        .get_matches_from(arguments);
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        .try_get_matches_from(arguments)
+        .unwrap_or_else(|error| exit_usage_error(error));
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| exit_usage_error(error));
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
     }
     run_cli(cli)
+}
+
+/// Print a usage error and exit. Inside a gate check the refusal also reaches the gate's
+/// report, so a pipeline that hides st's exit status cannot hide the refusal.
+fn exit_usage_error(error: clap::Error) -> ! {
+    if !matches!(
+        error.kind(),
+        clap::error::ErrorKind::DisplayHelp
+            | clap::error::ErrorKind::DisplayVersion
+            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        let reason = error
+            .kind()
+            .as_str()
+            .unwrap_or("the arguments are not valid");
+        st3::gate_report::note_refusal(reason);
+    }
+    error.exit()
 }
 
 /// `st driver-hook NAME [ARGS]`: answer one harness hook with the payload on stdin.
@@ -3554,6 +3658,9 @@ async fn run_cli(cli: Cli) -> ExitCode {
                 return ExitCode::from(exit.0);
             }
             eprintln!("st: {}", plain_error(&error));
+            if refused_command(&error) {
+                st3::gate_report::note_refusal(&plain_error(&error));
+            }
             let message = error.to_string();
             if daemon_is_unreachable(&error) {
                 ExitCode::from(5)
@@ -3596,6 +3703,53 @@ static DAEMON_WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 fn cli_client(endpoint: &Endpoint) -> Client {
     Client::new(endpoint.clone())
         .with_outage_wait(DAEMON_WAIT.get().copied().unwrap_or_default(), true)
+}
+
+/// Whether st turned the command down, as opposed to answering it. A missing subject, a stale
+/// fence, a wait that timed out, an unreachable or slow daemon and a daemon error are answers or
+/// passing conditions a gate may wait out; a refusal never passes, so it marks a gate broken.
+fn refused_command(error: &anyhow::Error) -> bool {
+    if daemon_is_unreachable(error) || st3::client::daemon_did_not_answer(error) {
+        return false;
+    }
+    // A reader that stopped early, such as `grep -q` on a match, closed the pipe: st answered.
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+    }) {
+        return false;
+    }
+    let message = error.to_string();
+    if message.contains("stale-subject")
+        || message.contains("terminal status selected")
+        || message.contains("wait timed out")
+    {
+        return false;
+    }
+    if let Some(api) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<GeneratedClientError>())
+    {
+        return matches!(
+            api,
+            GeneratedClientError::Api(
+                ClientErrorCode::Forbidden
+                    | ClientErrorCode::UnsupportedCapability
+                    | ClientErrorCode::ValidationFailed
+                    | ClientErrorCode::AttentionMigrated
+                    | ClientErrorCode::UnsupportedMediaType
+                    | ClientErrorCode::BlobTooLarge,
+                _,
+                _
+            )
+        );
+    }
+    match st3::client::http_status(error) {
+        Some(status) => matches!(status, 400 | 401 | 403 | 405 | 413 | 415 | 422),
+        // The command refused its own arguments before it asked the daemon.
+        None => true,
+    }
 }
 
 /// Exit status 5 means the daemon was unreachable, whichever client made the request.
@@ -3761,6 +3915,45 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Driver(args) => run_driver(&immediate, args, cli.catalog.as_deref()).await,
+        Command::Gate { command } => run_gate(command).await,
+    }
+}
+
+/// `st gate KIND`: print the answer and exit with the status an exec gate reads.
+async fn run_gate(command: GateCommand) -> Result<()> {
+    use st3::resource::github_gates;
+    let answer = match command {
+        GateCommand::Merged { pull_request } => {
+            github_gates::pull_request_merged(&pull_request).await
+        }
+        GateCommand::CiPassed {
+            check,
+            repo,
+            reference,
+        } => github_gates::check_passed(&repo, &reference, &check).await,
+        GateCommand::CargoTest {
+            target,
+            package,
+            reference,
+            repository,
+            worktree,
+        } => {
+            tokio::task::spawn_blocking(move || {
+                st3::gate_kinds::cargo_test(&st3::gate_kinds::CargoTest {
+                    target: &target,
+                    package: &package,
+                    reference: &reference,
+                    repository: &repository,
+                    worktree: worktree.as_deref(),
+                })
+            })
+            .await?
+        }
+    };
+    println!("{}", answer.describe());
+    match answer.exit_code() {
+        0 => Ok(()),
+        code => Err(CommandExit(code).into()),
     }
 }
 
@@ -4173,6 +4366,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         native_session_home: std::env::var_os("HOME").map(PathBuf::from),
         planner_default: config.planner.clone(),
     };
+    st3::gate_check::set_endpoint(config.socket.display().to_string());
     let reconciler = Arc::new(Reconciler::native(
         store.clone(),
         &config.state_dir,
@@ -4207,12 +4401,11 @@ async fn run_up(args: UpArgs) -> Result<()> {
             st3::store::LimitsPolicy {
                 stop_at_weekly_percent: config.limits.stop_at_weekly_percent,
                 keep: config.limits.keep.iter().cloned().collect(),
-                person: config
+                notify: config
                     .limits
-                    .ask
+                    .notify
                     .clone()
-                    .or_else(|| config.person.clone())
-                    .expect("the daemon validated its limits person"),
+                    .expect("the daemon validated its limits operations agent"),
                 fresh_ms: config
                     .limits
                     .fresh_ms()
@@ -4825,6 +5018,7 @@ async fn run_mission_view(
             Ok(())
         }
         MissionViewCommand::Publish(args) => publish_mission_file(client, args, json_output).await,
+        MissionViewCommand::Check(args) => check_mission_file(client, args, json_output).await,
         MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
         MissionViewCommand::Cancel(args) => {
             cancel_mission_run(client, endpoint, args, json_output).await
@@ -4870,6 +5064,9 @@ async fn publish_mission_file(
         mission.blockers.join("; ")
     );
     warn_ignored_authority(&mission);
+    if !args.no_gate_check {
+        check_before_publish(client, &intent, &args.workspace).await?;
+    }
     let resolved = mission.resolved_intent;
     let response: ApplyResponse = client
         .post(
@@ -4890,6 +5087,168 @@ async fn publish_mission_file(
         .map(|(subject, revision)| json!({"subject": subject, "revision": revision}))
         .collect();
     print_value(&value, json_output)
+}
+
+/// Run each exec gate once before a publication and refuse it when one is broken.
+async fn check_before_publish(
+    client: &Client,
+    intent: &IntentInput,
+    workspace: &Path,
+) -> Result<()> {
+    let mut announced = false;
+    let checked = run_gate_check(client, intent, workspace, &[], |view, item| {
+        if !announced {
+            eprintln!("{}", gate_check_heading(view));
+            announced = true;
+        }
+        eprint!("{}", render_gate_check_item(item));
+    })
+    .await?;
+    let Some(view) = checked else {
+        eprintln!("st: this st daemon cannot check exec gates; publishing without the check");
+        return Ok(());
+    };
+    let broken = view
+        .gates
+        .iter()
+        .filter(|item| item.answer == "broken")
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        broken.is_empty(),
+        "{} exec gate{} cannot answer as written, so st did not publish: {}. Correct {}, or publish with --no-gate-check",
+        broken.len(),
+        if broken.len() == 1 { "" } else { "s" },
+        broken
+            .iter()
+            .map(|item| format!(
+                "`{}` ({})",
+                item.gate,
+                item.reason.as_deref().unwrap_or("broken")
+            ))
+            .collect::<Vec<_>>()
+            .join("; "),
+        if broken.len() == 1 { "it" } else { "them" }
+    );
+    Ok(())
+}
+
+/// `st missions check FILE`: exit status 1 when a gate is broken.
+async fn check_mission_file(
+    client: &Client,
+    args: MissionCheckArgs,
+    json_output: bool,
+) -> Result<()> {
+    let (kdl, source_name) = read_intent(Some(&args.file))?;
+    let intent = IntentInput { kdl, source_name };
+    let mut announced = false;
+    let checked = run_gate_check(
+        client,
+        &intent,
+        &args.workspace,
+        &args.inputs,
+        |view, item| {
+            if json_output {
+                return;
+            }
+            if !announced {
+                println!("{}", gate_check_heading(view));
+                announced = true;
+            }
+            print!("{}", render_gate_check_item(item));
+        },
+    )
+    .await?;
+    let view = checked.context("this st daemon cannot check exec gates; update it")?;
+    if json_output {
+        print_value(&view, true)?;
+    } else if view.gates.is_empty() {
+        println!("No exec gates to check.");
+    }
+    if view.gates.iter().any(|item| item.answer == "broken") {
+        return Err(CommandExit(1).into());
+    }
+    Ok(())
+}
+
+/// Run each exec gate of `intent` once on the daemon and wait for every answer, handing each one
+/// to `report` as it arrives. `None` when the daemon predates gate checks.
+async fn run_gate_check(
+    client: &Client,
+    intent: &IntentInput,
+    workspace: &Path,
+    inputs: &[(String, String)],
+    mut report: impl FnMut(&st3::model::GateCheckView, &st3::model::GateCheckItemView),
+) -> Result<Option<st3::model::GateCheckView>> {
+    let workspace = std::path::absolute(workspace)
+        .with_context(|| format!("resolve the workspace {}", workspace.display()))?;
+    let request = st3::model::GateCheckRequest {
+        intent: intent.clone(),
+        workspace: workspace.display().to_string(),
+        inputs: inputs.iter().cloned().collect(),
+    };
+    let mut view: st3::model::GateCheckView = match client.post("/v1/gate-checks", &request).await {
+        Ok(view) => view,
+        Err(error) if matches!(st3::client::http_status(&error), Some(404 | 405)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut reported = 0;
+    loop {
+        while let Some(item) = view.gates.get(reported) {
+            if matches!(item.answer.as_str(), "waiting" | "running") {
+                break;
+            }
+            report(&view, item);
+            reported += 1;
+        }
+        if view.finished {
+            return Ok(Some(view));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        view = client
+            .get(&format!(
+                "/v1/gate-checks/{}",
+                urlencoding::encode(&view.id)
+            ))
+            .await?;
+    }
+}
+
+fn gate_check_heading(view: &st3::model::GateCheckView) -> String {
+    format!(
+        "Checking {} exec gate{} on {}, one at a time:",
+        view.gates.len(),
+        if view.gates.len() == 1 { "" } else { "s" },
+        view.host
+    )
+}
+
+/// One gate's answer: its label, owner and name, why it is broken or unchecked, and the end of a
+/// broken check's output.
+fn render_gate_check_item(item: &st3::model::GateCheckItemView) -> String {
+    use std::fmt::Write as _;
+    let label = match item.answer.as_str() {
+        "not-yet" => "not yet",
+        answer => answer,
+    };
+    let mut output = format!("  {label:<9}  {} · {}", item.owner, item.gate);
+    if let Some(code) = item.exit_code {
+        let _ = write!(output, " · exit {code}");
+    }
+    if item.elapsed_ms >= 1_000 {
+        let _ = write!(output, " · {:.1}s", item.elapsed_ms as f64 / 1_000.0);
+    }
+    output.push('\n');
+    if let Some(reason) = &item.reason {
+        let _ = writeln!(output, "             {reason}");
+    }
+    if item.answer == "broken" {
+        for line in item.output.lines() {
+            let _ = writeln!(output, "             | {line}");
+        }
+    }
+    output
 }
 
 async fn cancel_mission_run(
@@ -6243,11 +6602,12 @@ async fn run_now(
         command.push_str(" --all");
     }
     if json_output {
-        print_value(&response, true)
+        print_value(&response, true)?;
     } else {
         print!("{}", render_now_page(&response.value, &command));
-        Ok(())
     }
+    note_partial_page(&response.value);
+    Ok(())
 }
 
 fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
@@ -6473,16 +6833,27 @@ fn print_product_page(
     continuation_command: &str,
 ) -> Result<()> {
     if json_output {
-        return print_value(response, true);
+        print_value(response, true)?;
+    } else {
+        if let Some(sync) = &response.value.sync {
+            print!("{}", render_sync_notice(sync, now_ms()));
+        }
+        print!(
+            "{}",
+            render_product_page(title, &response.value, continuation_command)
+        );
     }
-    if let Some(sync) = &response.value.sync {
-        print!("{}", render_sync_notice(sync, now_ms()));
-    }
-    print!(
-        "{}",
-        render_product_page(title, &response.value, continuation_command)
-    );
+    note_partial_page(&response.value);
     Ok(())
+}
+
+/// Tell a gate check that this command printed only the first part of `page`'s collection. It
+/// runs after the page is printed: a reader that stopped early, such as `grep -q` on a match,
+/// ends the command before it reports a listing whose rest did not matter.
+fn note_partial_page(page: &ClientPage) {
+    if page.page.has_more {
+        st3::gate_report::note_partial_listing(page.items.len());
+    }
 }
 
 async fn run_collection_watch(
@@ -6650,12 +7021,7 @@ fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms:
 /// Active and finished runs apart, so a mission with one live run and five old ones does not
 /// read as six runs. A daemon that does not report active runs gets the plain total.
 fn render_mission_runs(mission: &st3_client::Mission) -> String {
-    let total = mission
-        .extra
-        .get("total_runs")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(mission.runs.len());
+    let total = mission.total_runs.unwrap_or(mission.runs.len());
     let plural = |count: usize| if count == 1 { "" } else { "s" };
     let Some(active) = mission.active_runs.map(|active| active.min(total)) else {
         return format!("{total} run{}", plural(total));
@@ -6737,7 +7103,7 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                 if let Some(usage) = &item.usage {
                     let _ = writeln!(output, "  usage {}", render_usage(usage));
                 }
-                if item.extra.get("runs_truncated").and_then(Value::as_bool) == Some(true) {
+                if item.runs_truncated {
                     let _ = writeln!(output, "  inspect: st missions show {}", item.header.id);
                 } else if let Some(run) = item.runs.last() {
                     let _ = writeln!(output, "  inspect: st missions show {run}");
@@ -7713,8 +8079,14 @@ async fn list_outcomes(
         );
         page["next_cursor"] = json!(next);
     }
+    let partial = page["has_more"].as_bool().unwrap_or(false);
+    let shown = page["items"].as_array().map_or(0, Vec::len);
     if json_output {
-        return print_value(&page, true);
+        print_value(&page, true)?;
+        if partial {
+            st3::gate_report::note_partial_listing(shown);
+        }
+        return Ok(());
     }
     let items = page["items"].as_array().context("invalid outcome page")?;
     println!("{} OUTCOMES  {}", collection.to_uppercase(), items.len());
@@ -7739,6 +8111,9 @@ async fn list_outcomes(
             .map(|a| format!(" --as {a}"))
             .unwrap_or_default();
         println!("Next: st {collection} ls{actor} --limit {limit} --cursor '{cursor}'");
+    }
+    if partial {
+        st3::gate_report::note_partial_listing(shown);
     }
     Ok(())
 }
@@ -7831,6 +8206,41 @@ fn render_performance(view: &Value) -> String {
                 let _ = write!(out, "  {kind}");
             }
             out.push('\n');
+        }
+    }
+    if let Some(corrections) = view["incremental_corrections"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        let _ = writeln!(
+            out,
+            "INCREMENTAL CORRECTIONS  count · item (writes an incremental pass would have missed; each is a bug)"
+        );
+        for row in corrections {
+            let _ = writeln!(
+                out,
+                "  {}  {}",
+                row["count"],
+                row["item"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    if let Some(evaluations) = view["incremental_evaluations"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        let _ = writeln!(
+            out,
+            "RECONCILE EVALUATIONS  count · CPU ms · item · whether an incremental pass would run it"
+        );
+        for row in evaluations {
+            let _ = writeln!(
+                out,
+                "  {}  {:.1}  {}",
+                row["count"],
+                row["cpu_ms"].as_f64().unwrap_or(0.0),
+                row["item"].as_str().unwrap_or("?")
+            );
         }
     }
     if let Some(wakes) = view["reconciler_wakes"].as_array() {
@@ -9206,8 +9616,14 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             }
             let response: DocumentListResponse = client.get(&path).await?;
             if json_output {
-                print_value(&response, true)
+                let (partial, shown) = (response.has_more, response.items.len());
+                print_value(&response, true)?;
+                if partial {
+                    st3::gate_report::note_partial_listing(shown);
+                }
+                Ok(())
             } else {
+                let shown = response.items.len();
                 if response.items.is_empty() {
                     println!("No documents.");
                 }
@@ -9232,13 +9648,14 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
                         version.owner.as_deref().unwrap_or("unknown-owner")
                     );
                 }
-                if response.has_more
-                    && let Some(cursor) = response.next_cursor
-                {
-                    println!(
-                        "More document versions are available. Continue with: {}",
-                        document_continuation_command(name.as_deref(), all, limit, &cursor)
-                    );
+                if response.has_more {
+                    if let Some(cursor) = response.next_cursor {
+                        println!(
+                            "More document versions are available. Continue with: {}",
+                            document_continuation_command(name.as_deref(), all, limit, &cursor)
+                        );
+                    }
+                    st3::gate_report::note_partial_listing(shown);
                 }
                 Ok(())
             }
@@ -9274,8 +9691,12 @@ async fn run_import(endpoint: &Endpoint, command: ImportCommand, json_output: bo
                 .sessions_list_native(cursor.as_deref(), Some(limit), all)
                 .await?;
             if json_output {
-                return print_value(&response, true);
+                print_value(&response, true)?;
+                note_partial_page(&response.value);
+                return Ok(());
             }
+            let partial = response.value.page.has_more;
+            let shown = response.value.items.len();
             println!("NATIVE SESSIONS  {}", response.value.items.len());
             if response.value.items.is_empty() {
                 println!("No native harness sessions found.");
@@ -9291,6 +9712,9 @@ async fn run_import(endpoint: &Endpoint, command: ImportCommand, json_output: bo
                 println!(
                     "More sessions are available: st import ls{history} --cursor {cursor} --limit {limit}"
                 );
+            }
+            if partial {
+                st3::gate_report::note_partial_listing(shown);
             }
             Ok(())
         }
@@ -10404,7 +10828,9 @@ async fn run_agent_inspection(
             .await?
     };
     if json_output {
-        return print_value(&response, true);
+        print_value(&response, true)?;
+        note_partial_page(&response.value);
+        return Ok(());
     }
     let mut continuation = if tree {
         "st agents tree".to_owned()
@@ -10424,6 +10850,7 @@ async fn run_agent_inspection(
         "{}",
         render_client_agents(&response.value, tree, args.enrich, &continuation)
     );
+    note_partial_page(&response.value);
     Ok(())
 }
 
@@ -12622,44 +13049,33 @@ async fn run_message(
                 let from = blob_actor(Some(args.from.clone()), None)?;
                 upload_attachments(endpoint, &from, &args.attach).await?
             };
-            let Some(message) = send_message(client, args, attachments).await? else {
+            let Some(receipt) = send_message(client, args, attachments).await? else {
                 return Ok(());
             };
-            sync_message_projection(client).await?;
-            if json_output {
-                print_value(&message, true)
-            } else {
-                println!("{}", message.subject);
-                Ok(())
+            // The message has landed. A projection that misses it catches up on the next command;
+            // failing here would invite a resend of a message that was sent.
+            if let Err(error) = sync_message_projection(client).await {
+                eprintln!(
+                    "st: {} was sent (idempotency key {}), but the message projection was not refreshed: {}",
+                    receipt.message.subject,
+                    receipt.idempotency_key,
+                    plain_error(&error)
+                );
             }
+            print_message_receipt(&receipt, json_output)
         }
         MessageCommand::Status(args) => {
-            let value: Value = client
-                .get(&format!(
-                    "/v1/messages/delivery/{}",
-                    urlencoding::encode(&args.reference)
-                ))
-                .await?;
+            if let Some(key) = args.idempotency_key {
+                return print_message_key_status(client, &key, json_output).await;
+            }
+            let reference = args
+                .reference
+                .context("conversations status needs a message or --idempotency-key")?;
+            let value = message_delivery(client, &reference).await?;
             if json_output {
                 print_value(&value, true)
             } else {
-                println!(
-                    "{} · {} → {}",
-                    value["id"].as_str().unwrap_or("message"),
-                    value["from"].as_str().unwrap_or("sender"),
-                    value["to"].as_str().unwrap_or("recipient")
-                );
-                println!(
-                    "{} · {}",
-                    value
-                        .pointer("/delivery/phase")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                    value
-                        .pointer("/delivery/reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                );
+                print_message_delivery(&value);
                 Ok(())
             }
         }
@@ -12783,7 +13199,7 @@ async fn run_message(
                 let from = blob_actor(Some(args.from.clone()), None)?;
                 upload_attachments(endpoint, &from, &args.attach).await?
             };
-            let message = send_message(
+            let receipt = send_message(
                 client,
                 MessageSendArgs {
                     to: recipient,
@@ -12801,15 +13217,10 @@ async fn run_message(
                 attachments,
             )
             .await?;
-            let Some(message) = message else {
+            let Some(receipt) = receipt else {
                 return Ok(());
             };
-            if json_output {
-                print_value(&message, true)
-            } else {
-                println!("{}", message.subject);
-                Ok(())
-            }
+            print_message_receipt(&receipt, json_output)
         }
         MessageCommand::Archive(args) => {
             let actor = args
@@ -12984,7 +13395,7 @@ async fn send_message(
     client: &Client,
     args: MessageSendArgs,
     attachments: Vec<st3::model::AttachmentInput>,
-) -> Result<Option<MessageView>> {
+) -> Result<Option<MessageSendReceipt>> {
     let id = uuid::Uuid::now_v7().simple().to_string();
     let mission_id = format!("message/{id}");
     reject_foreign_agent_actor(&args.from)?;
@@ -13004,21 +13415,212 @@ async fn send_message(
         print!("{kdl}");
         return Ok(None);
     }
-    client
-        .send_message(&MessageSendRequest {
-            idempotency_key: args
-                .idempotency_key
-                .unwrap_or_else(|| format!("st3-message-send:{id}")),
-            from,
-            to,
-            content: args.body,
-            title: args.subject,
-            in_reply_to: args.in_reply_to,
-            tags: args.tags,
-            attachments,
+    let mut request = MessageSendRequest {
+        idempotency_key: String::new(),
+        from,
+        to,
+        content: args.body,
+        title: args.subject,
+        in_reply_to: args.in_reply_to,
+        tags: args.tags,
+        attachments,
+    };
+    request.idempotency_key = match args.idempotency_key {
+        Some(key) => key,
+        None => {
+            let incarnation = std::env::var("ST3_INCARNATION")
+                .ok()
+                .filter(|incarnation| !incarnation.is_empty());
+            let hour = message_key_hour();
+            let key = derived_message_key(&request, incarnation.as_deref(), hour);
+            // A send whose answer was lost just before the hour turned landed under the
+            // previous hour's key.
+            if let Some(previous) = hour.checked_sub(1) {
+                let previous = derived_message_key(&request, incarnation.as_deref(), previous);
+                match client.sent_message(&previous).await {
+                    Ok(Some(receipt)) => return Ok(Some(receipt)),
+                    Ok(None) => {}
+                    // A daemon from before the lookup has no such route. Its sends still repeat
+                    // only within the hour.
+                    Err(error) if st3::client::http_status(&error) == Some(404) => {}
+                    // A busy daemon still takes the send: only a send whose answer was lost in
+                    // the hour's last moments could repeat, and refusing every send is worse.
+                    Err(error) => eprintln!(
+                        "st: could not check the previous hour for this message ({}); sending it with idempotency key {key}",
+                        plain_error(&error)
+                    ),
+                }
+            }
+            key
+        }
+    };
+    match client.send_message(&request).await {
+        Ok(receipt) => Ok(Some(receipt)),
+        Err(error) => Err(message_send_error(error, &request.idempotency_key)),
+    }
+}
+
+/// The prefix of a key a send derives from its message. The version changes with what goes in.
+const DERIVED_MESSAGE_KEY_PREFIX: &str = "st3-message:v1:";
+
+/// The UTC hour a derived message key belongs to. `ST3_MESSAGE_KEY_HOUR` stands in for the
+/// clock, so a test can send an hour later without waiting one.
+fn message_key_hour() -> u64 {
+    std::env::var("ST3_MESSAGE_KEY_HOUR")
+        .ok()
+        .and_then(|hour| hour.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                / 3600
         })
+}
+
+/// A send without `--idempotency-key` is named by what it sends: the sender, recipient, the
+/// message it answers, title, words, tags and attachments, the seat incarnation that sends it,
+/// and the hour. Running the same command again in that hour names the same message, so the
+/// daemon returns it instead of sending a second; the same words a few hours later are new.
+fn derived_message_key(
+    request: &MessageSendRequest,
+    incarnation: Option<&str>,
+    hour: u64,
+) -> String {
+    let attachments = request
+        .attachments
+        .iter()
+        .map(|attachment| json!([attachment.blob, attachment.media_type, attachment.name]))
+        .collect::<Vec<_>>();
+    let canonical = json!([
+        DERIVED_MESSAGE_KEY_PREFIX,
+        request.from,
+        request.to,
+        request.in_reply_to,
+        request.title,
+        request.content,
+        request.tags,
+        attachments,
+        incarnation,
+        hour,
+    ]);
+    let digest = hex::encode(Sha256::digest(canonical.to_string().as_bytes()));
+    format!("{DERIVED_MESSAGE_KEY_PREFIX}{}", &digest[..32])
+}
+
+/// Say what a failed send means for the sender: its key, how to tell whether it landed, and that
+/// running the same command again sends it at most once.
+fn message_send_error(error: anyhow::Error, key: &str) -> anyhow::Error {
+    let check = format!(
+        "st conversations status --idempotency-key {}",
+        shell_word(key)
+    );
+    let unconfirmed = format!(
+        "st did not confirm the message, so it may or may not have been sent. Check with `{check}`; running the same command again is safe and sends it at most once"
+    );
+    if let Some(error) = error.downcast_ref::<st3::client::MessageSendUnconfirmed>() {
+        return anyhow::anyhow!("{unconfirmed}. st did not answer: {}", error.reason());
+    }
+    // A refusal is an answer: the daemon wrote nothing for this key.
+    if st3::client::http_status(&error).is_some_and(|status| (400..500).contains(&status)) {
+        return error.context(format!("st refused the message (idempotency key {key})"));
+    }
+    error.context(unconfirmed)
+}
+
+/// `value` as one shell word.
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/@%+=,".contains(&byte))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
+/// A send's result. The human form prints the message alone on stdout, as for a new message,
+/// and says on stderr when the message had already been sent.
+fn print_message_receipt(receipt: &MessageSendReceipt, json_output: bool) -> Result<()> {
+    if json_output {
+        return print_value(receipt, true);
+    }
+    if receipt.already_sent {
+        eprintln!(
+            "st: {} was already sent{} (idempotency key {}); nothing new was sent",
+            receipt.message.subject,
+            receipt
+                .sent_at
+                .as_deref()
+                .map(|sent_at| format!(" at {sent_at}"))
+                .unwrap_or_default(),
+            receipt.idempotency_key
+        );
+    }
+    println!("{}", receipt.message.subject);
+    Ok(())
+}
+
+async fn message_delivery(client: &Client, reference: &str) -> Result<Value> {
+    client
+        .get(&format!(
+            "/v1/messages/delivery/{}",
+            urlencoding::encode(reference)
+        ))
         .await
-        .map(Some)
+}
+
+fn print_message_delivery(value: &Value) {
+    println!(
+        "{} · {} → {}",
+        value["id"].as_str().unwrap_or("message"),
+        value["from"].as_str().unwrap_or("sender"),
+        value["to"].as_str().unwrap_or("recipient")
+    );
+    println!(
+        "{} · {}",
+        value
+            .pointer("/delivery/phase")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        value
+            .pointer("/delivery/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    );
+}
+
+/// Whether a send or reply with this idempotency key landed, and if so its delivery.
+async fn print_message_key_status(client: &Client, key: &str, json_output: bool) -> Result<()> {
+    let receipt = client
+        .sent_message(key)
+        .await
+        .with_context(|| format!("look up the message sent with idempotency key {key}"))?;
+    let Some(receipt) = receipt else {
+        if json_output {
+            return print_value(&json!({"idempotency_key": key, "landed": false}), true);
+        }
+        println!(
+            "not landed · no message was sent with idempotency key {key}; sending it again sends it once"
+        );
+        return Ok(());
+    };
+    let mut value = message_delivery(client, &receipt.message.subject).await?;
+    if json_output {
+        value["idempotency_key"] = json!(key);
+        value["landed"] = json!(true);
+        value["sent_at"] = json!(receipt.sent_at);
+        return print_value(&value, true);
+    }
+    println!(
+        "landed · {} at {}",
+        receipt.message.subject,
+        receipt.sent_at.as_deref().unwrap_or("an unknown time")
+    );
+    print_message_delivery(&value);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13613,44 +14215,59 @@ async fn run_st2_native_driver(
         )
     })
     .await?;
-    // A resumed seat relaunches its harness on the session it suspended on, or not at all.
-    let argv = match st3::native_resume::requested() {
-        None => argv,
-        Some(session) => {
-            let selected = match driver {
-                "claude" => st3::native_resume::claude_argv(
-                    argv,
-                    &session,
-                    &std::env::current_dir()?,
-                    st3::native_resume::claude_home().as_deref(),
-                ),
-                "pi" | "omp" => st3::native_resume::pi_family_argv(
-                    driver,
-                    argv,
-                    &paths.session_dir.join("provider-sessions"),
-                    &session,
-                ),
-                "opencode" => st3::native_resume::opencode_argv(
-                    argv,
-                    &session,
-                    st3::native_resume::opencode_data_dir().as_deref(),
-                ),
-                _ => unreachable!("the native driver was checked"),
-            };
-            match selected {
-                Ok(argv) => argv,
-                Err(refusal) => {
-                    return Err(refuse_native_resume(
-                        client,
-                        subject,
-                        &incarnation,
-                        driver,
-                        refusal,
-                    )
-                    .await);
-                }
+    let select = |argv: Vec<String>, session: &str| -> Result<_> {
+        Ok(match driver {
+            "claude" => st3::native_resume::claude_argv(
+                argv,
+                session,
+                &std::env::current_dir()?,
+                st3::native_resume::claude_home().as_deref(),
+            ),
+            "pi" | "omp" => st3::native_resume::pi_family_argv(
+                driver,
+                argv,
+                &paths.session_dir.join("provider-sessions"),
+                session,
+            ),
+            "opencode" => st3::native_resume::opencode_argv(
+                argv,
+                session,
+                st3::native_resume::opencode_data_dir().as_deref(),
+            ),
+            _ => unreachable!("the native driver was checked"),
+        })
+    };
+    // A resumed seat relaunches its harness on the session it suspended on, or not at all. Any
+    // other relaunch continues the seat's last session when the harness can, or starts anew.
+    let argv = if let Some(session) = st3::native_resume::requested() {
+        match select(argv, &session)? {
+            Ok(argv) => argv,
+            Err(refusal) => {
+                return Err(
+                    refuse_native_resume(client, subject, &incarnation, driver, refusal).await,
+                );
             }
         }
+    } else if let Some((session, path)) = st3::native_resume::continued() {
+        if driver == "claude" {
+            // A seat whose workspace changed finds its transcript under the earlier one.
+            let _ = st3::native_resume::claude_carry_transcript(
+                &session,
+                &std::env::current_dir()?,
+                st3::native_resume::claude_home().as_deref(),
+                path.as_deref(),
+            );
+        }
+        match select(argv.clone(), &session)? {
+            Ok(argv) => argv,
+            Err(refusal) => {
+                skip_native_continue(client, subject, &incarnation, driver, &session, refusal)
+                    .await;
+                argv
+            }
+        }
+    } else {
+        argv
     };
     if driver == "opencode" {
         // The predecessor's bound session is not this launch's, and the driver reports this file.
@@ -15351,6 +15968,56 @@ async fn refuse_native_resume(
     )
 }
 
+/// The driver cannot continue the seat's last native session, so the harness starts a new one.
+/// Record why once for that session, so later relaunches start anew without trying it again.
+async fn skip_native_continue(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    driver: &str,
+    session: &str,
+    refusal: st3::native_resume::Refusal,
+) {
+    let _ = write_driver_log(
+        subject,
+        &json!({"type":"native_continue_skipped","driver":driver,"session":session,"code":refusal.code,"reason":refusal.reason}).to_string(),
+    );
+    let diagnostic = ClaimInput {
+        subject: subject.into(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(subject.into()),
+        fields: BTreeMap::from([
+            ("severity".into(), Value::String("warning".into())),
+            ("status".into(), Value::String(refusal.code.into())),
+            (
+                "code".into(),
+                Value::String(st3::suspension::CONTINUE_UNAVAILABLE_CODE.into()),
+            ),
+            (
+                "reason".into(),
+                Value::String(format!(
+                    "{driver} started a new session instead of continuing {session}: {}",
+                    refusal.reason
+                )),
+            ),
+            ("incarnation_id".into(), Value::String(incarnation.into())),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(st3::suspension::continue_unavailable_key(subject, session)),
+    };
+    if let Err(error) = retry_while_daemon_unreachable(subject, || {
+        client.post::<_, ClaimRecord>("/v1/claims", &diagnostic)
+    })
+    .await
+    {
+        let _ = write_driver_log(
+            subject,
+            &json!({"type":"native_continue_skip_unrecorded","error":format!("{error:#}")}).to_string(),
+        );
+    }
+}
+
 /// Report the native session the harness bound for this incarnation, once per session.
 async fn report_native_session(
     client: &Client,
@@ -16359,6 +17026,13 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     .await
 }
 
+/// The Codex thread a relaunch continues, unless the seat declares its own thread selection.
+fn codex_continued_thread(argv: &[String]) -> Option<String> {
+    st3::native_resume::continued()
+        .map(|(thread, _)| thread)
+        .filter(|thread| st3::native_resume::codex_check(argv, thread).is_ok())
+}
+
 fn spawn_codex_provider(
     paths: &NativePaths,
     state_dir: &Path,
@@ -16369,17 +17043,21 @@ fn spawn_codex_provider(
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
     tokio::task::spawn_blocking(move || match start {
-        // A resumed seat's launch environment names the thread it suspended on.
-        ProviderStart::Launch(_) => st_drivers::codex_app_server::run_controlled_paths(
-            &paths.driver_root,
-            &state_dir,
-            &paths.agent_dir,
-            paths.identity,
-            paths.runtime_id,
-            argv,
-            paths.delivery_gate,
-            st3::native_resume::requested(),
-        ),
+        // A resumed seat's launch environment names the thread it suspended on, and any other
+        // relaunch the thread it continues.
+        ProviderStart::Launch(_) => {
+            let thread = st3::native_resume::requested().or_else(|| codex_continued_thread(&argv));
+            st_drivers::codex_app_server::run_controlled_paths(
+                &paths.driver_root,
+                &state_dir,
+                &paths.agent_dir,
+                paths.identity,
+                paths.runtime_id,
+                argv,
+                paths.delivery_gate,
+                thread,
+            )
+        }
         ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
             tui_pid,
             server_pid,
@@ -16454,6 +17132,10 @@ async fn drive_codex_native(
     if matches!(start, ProviderStart::Adopt(_)) {
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
+    // The thread this launch continues; a refusal of it ends the wrapper before it binds.
+    let continued = matches!(start, ProviderStart::Launch(_))
+        .then(|| codex_continued_thread(&argv))
+        .flatten();
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
     let mut reported_session = None;
     // The Codex control pump keeps the subagent ledger; this driver records it on the seat.
@@ -16517,6 +17199,21 @@ async fn drive_codex_native(
                         reason: reason.chars().take(2_000).collect(),
                     };
                     let _ = refuse_native_resume(client, subject, &incarnation, "codex", refusal).await;
+                } else if reported_session.is_none()
+                    && let Some(thread) = &continued
+                {
+                    // The next relaunch starts a new thread instead of trying this one again.
+                    let reason = match &outcome {
+                        Err(error) => format!("{error:#}"),
+                        Ok(()) => st_drivers::harness_state::read(&harness_state_path, None)
+                            .and_then(|observed| observed.reason)
+                            .unwrap_or_else(|| "Codex ended before it bound the continued thread".into()),
+                    };
+                    let refusal = st3::native_resume::Refusal {
+                        code: "harness-refused",
+                        reason: reason.chars().take(2_000).collect(),
+                    };
+                    skip_native_continue(client, subject, &incarnation, "codex", thread, refusal).await;
                 }
                 if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
@@ -18019,7 +18716,7 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
 /// Trim the local observation log at startup and then once an hour. Local observations
 /// never replicate, so this never changes what any peer holds.
 /// Apply this node's `[limits]` policy every two minutes: stop the seats it hosts on an account
-/// past its weekly limit, and ask the policy's person once per weekly window.
+/// past its weekly limit, and notify operations once per weekly window.
 async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPolicy) {
     const LIMITS_INTERVAL: Duration = Duration::from_secs(2 * 60);
     loop {
@@ -19848,6 +20545,11 @@ mod tests {
         assert_eq!(render(Some(0), 1), "1 finished run");
         assert_eq!(render(Some(0), 0), "0 runs");
         assert_eq!(render(None, 6), "6 runs");
+        // A bounded recent-run window must not replace the daemon's complete run count.
+        mission.total_runs = Some(100);
+        mission.active_runs = Some(1);
+        mission.runs.truncate(2);
+        assert_eq!(render_mission_runs(mission), "1 active · 99 finished");
     }
 
     #[test]
@@ -19902,7 +20604,6 @@ mod tests {
             reasons: vec!["requester-retired".into()],
             owner_generation: None,
             runtime_incarnation: None,
-            runtime_desired_revision: None,
         });
         let rendered = render_product_page("NOW", &page, "st now");
         assert!(
@@ -20973,6 +21674,85 @@ mod tests {
             panic!("reply did not parse");
         };
         assert_eq!(reply.idempotency_key.as_deref(), Some("retry-a-reply"));
+
+        let status = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "status",
+            "--idempotency-key",
+            "retry-a-send",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Status(status),
+        } = status.command
+        else {
+            panic!("status did not parse");
+        };
+        assert_eq!(status.idempotency_key.as_deref(), Some("retry-a-send"));
+        assert!(status.reference.is_none());
+        assert!(Cli::try_parse_from(["st3", "conversations", "status"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "conversations",
+                "status",
+                "message/example",
+                "--idempotency-key",
+                "retry-a-send",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_derived_message_key_names_one_message_in_one_hour() {
+        let request = MessageSendRequest {
+            idempotency_key: String::new(),
+            from: "person/avery".into(),
+            to: "agent/example/worker".into(),
+            content: "The merge train is live.".into(),
+            title: Some("Merge train".into()),
+            in_reply_to: None,
+            tags: Vec::new(),
+            attachments: Vec::new(),
+        };
+        let key = derived_message_key(&request, None, 490_000);
+        // The key never changes between builds: a retry after an upgrade finds the first send.
+        assert_eq!(key, "st3-message:v1:31bd263335cbfc5fa34d30ccafe56f43");
+        assert_eq!(key, derived_message_key(&request.clone(), None, 490_000));
+        assert_ne!(key, derived_message_key(&request, None, 490_001));
+        assert_ne!(
+            key,
+            derived_message_key(&request, Some("incarnation/2"), 490_000)
+        );
+        let mut changes = Vec::new();
+        for change in 0..8 {
+            let mut changed = request.clone();
+            match change {
+                0 => changed.from = "person/blair".into(),
+                1 => changed.to = "agent/example/other".into(),
+                2 => changed.in_reply_to = Some("message/example".into()),
+                3 => changed.title = None,
+                4 => changed.content = "The merge train is paused.".into(),
+                5 => changed.tags = vec!["work".into()],
+                6 => {
+                    changed.attachments = vec![st3::model::AttachmentInput {
+                        blob: format!("blob/{}", "a".repeat(64)),
+                        media_type: "image/png".into(),
+                        name: None,
+                    }]
+                }
+                _ => changed.idempotency_key = "ignored".into(),
+            }
+            changes.push(derived_message_key(&changed, None, 490_000));
+        }
+        // Everything the message carries names it; the key field it fills does not.
+        assert!(changes[..7].iter().all(|changed| *changed != key));
+        assert_eq!(changes[7], key);
+
+        assert_eq!(shell_word("st3-message:v1:0f"), "st3-message:v1:0f");
+        assert_eq!(shell_word("it's mine"), r"'it'\''s mine'");
     }
 
     #[test]
@@ -22704,6 +23484,8 @@ mission "review" state="ready" {
                 file,
                 at_index: None,
                 actor: "person/test".into(),
+                workspace: root.to_owned(),
+                no_gate_check: false,
             },
             true,
         )

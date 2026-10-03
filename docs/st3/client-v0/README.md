@@ -13,6 +13,20 @@ local Unix socket and authenticated paired HTTP over Tailscale or optional Fabri
 clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
 
+`ResourceHeader.operational` describes current versus historical state, actionability, reasons,
+and optional owner-generation/runtime-incarnation identities. Work also exposes `agentless`,
+claim expiry, execution start/elapsed time, and timeout in milliseconds. These fields are optional
+for older servers; an absent expiry/start/timeout and an explicit null both mean no value.
+Mission visualization and message `reply_to` may likewise be null. Agent reachability includes
+`reachable` and `indeterminate`; machines use the `machine` resource kind.
+Mission cards also declare total runs, per-state run counts, and whether their recent-run window
+is truncated. Sessions expose their optional runtime incarnation. Clients need not infer these
+fields from untyped excess-property bags.
+
+The collections socket's `CollectionCommand` and `CollectionFrame` definitions live in the same
+schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
+command/frame definitions, and subscription bound; see [collections](collections.md).
+
 ### Agent activity and human blocking
 
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,
@@ -174,6 +188,7 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Missions | `/missions`, `/missions/{id}` | updated time descending, ID |
 | Work | `/work`, `/work/{id}` | ready first, readiness epoch, path, ID |
 | Agents | `/agents`, `/agents/{id}` | presentation name, ID |
+| Resource observations | `/resources` (list only) | resource subject ID |
 | Runtimes | `/runtimes`, `/runtimes/{id}` | owning agent, runtime kind, ID |
 | Lanes | `/lanes`, `/lanes/{id}` | open lanes first, ID |
 | Operations | `/operations`, `/operations/{id}` | severity descending, component, ID |
@@ -203,6 +218,42 @@ until the page omits the notice.
 IDs are stable opaque strings with a type prefix. Renames change labels, not IDs. A detail response
 uses the same representation as its list item plus its documented detail fields. Deletion is
 represented by an event tombstone; an ID is never reused.
+
+### Resource observations
+
+`GET /v1/client/resources` lists the latest `resource.observed` claim for each resource subject,
+in canonical replicated claim order, not arrival order. It requires `read.projections`, including
+for paired devices. The rebuildable indexed projection serves bounded SQL pages rather than
+scanning the claim log.
+
+Filters are conjunctive and optional:
+
+- `opened_by=agent/...` matches `facts.opened_by`; `opened_by=mission-run/...` matches
+  `facts.opened_by_run`. Other subject types are rejected.
+- `kind=vcs.pull-request` matches the resource vocabulary kind, not the claim kind.
+- `subject_prefix=resource/github/...` matches a literal subject prefix.
+- `limit` and opaque `cursor` use the negotiated page limits. Repeat the same filters when
+  continuing a page.
+
+Each item contains `id` (resource subject), `kind` (resource vocabulary), `facts` (the latest
+observation's complete facts), `observed_at` (RFC 3339 UTC time at which the latest observation's
+claim was accepted), and nullable `opened_by` / `opened_by_run` copied from those facts. Older facts
+are not merged into a later observation, so clearing or changing attribution removes the old
+filter match.
+
+The response uses the normal `st3.client.v0` envelope and snapshot, with
+`value: {kind: "page", collection: "resources", filters, items, page, sync?}`.
+`page` contains `limit`, `has_more`, `next_cursor`, and `cursor_expires_at`. Pages retain the first
+snapshot while the resource projection is unchanged; unrelated claims do not invalidate them.
+A resource projection change or expiry returns `page-cursor-expired` (HTTP 410), and the client
+restarts pagination. The cursor is bound to its filters and page size.
+
+Rust exposes `Client::resources_list` with `ResourcesFilter` and a typed resource-observation page;
+Swift and TypeScript expose `resourcesList` with equivalent typed filters and items. Resource
+observations are distinct from operational resources: their `kind` is an open resource-vocabulary
+string, not the operational resource union's discriminator. This list route does not add a
+`resources` subscription to `st3.client.collections.v0`.
+
 
 ### Applied subject definitions
 
@@ -298,6 +349,17 @@ requester may instead use `work.cancel-ask`. Completion resumes a live origin in
 with a new readiness epoch; the response and evidence stay on the source. CLI equivalents are
 `st work ask --for PERSON --title TEXT --reason TEXT --step STEP --as AGENT --idempotency-key KEY`
 (or `--new-run NAME`) and `st work done STEP --as PERSON --summary TEXT`.
+
+A `human-gate` card answers its gate with `review.approve` and, by its `review_mode`, either
+`review.reject` (`approve`) or `review.request-changes` (`feedback`); the other is refused.
+Each takes `target_id` set to the card's `source_id` (the step, mission or loop run that owns the
+gate) and an optional `reason`, which the reject and request-changes actions require, and fences
+the card's ID and revision. A gate asked again (a retried step's new attempt, or a newer build's
+wording) gets a new card, so an action through the old one returns `stale-fence` and writes
+nothing. A client then re-reads attention and, if a card of the same `attention_kind` for the
+same `source_id` is open, acts once more through it; it does not retry the old card. A review st
+no longer asks returns `validation-failed`, and its message says why: who already answered it
+and how, or what moved on since it was asked. stui does both on its live and classic screens.
 
 Clients must evict removed source cards and replace their window from fresh snapshots on
 reconnect. The iOS cache version is 4 and stui's is 3; older cached cards are discarded. Offline
@@ -643,6 +705,7 @@ not change it. A terminal action may use an older snapshot from the same host, w
 and explicit revision fences still apply. Attach/detach do not require a screen sequence fence.
 `revision` digests the rest of
 the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
+The optional `kitty_keyboard` mode carries the active Kitty keyboard enhancement bitmask.
 
 Each line keeps its plain `text`, without trailing spaces, and adds `runs`: styled text from column
 zero. A run has `text` and, when they differ from the terminal default, `fg` and `bg` colors and
@@ -650,6 +713,9 @@ zero. A run has `text` and, when they differ from the terminal default, `fg` and
 a palette index from 0 to 255, where 0 to 15 are the client's ANSI theme colors, or a `#rrggbb`
 string. The runs spell `text`, followed by any trailing blanks that are visible because of their
 background, inverse, or underline. Hidden text is sent as spaces.
+Optional line `wrapped` marks automatic continuation to the next row. Optional run `cells`
+records display width rather than text length; `strikethrough` is present when set, and `link`
+contains the hyperlink `uri`. Generated Rust, Swift, and TypeScript models preserve these fields.
 
 When the terminal's runtime incarnation changes or its process exits, the server sends one
 `stale-fence` error envelope and closes the stream, with the error code as the close reason. Other
@@ -766,14 +832,41 @@ rules, adding a required action parameter, or changing action semantics requires
 version or API version. Clients preserve unknown enum cases for display but never send an action
 whose capability version they do not understand.
 
+### Inline schema semantics
+
+The shared JSON Schema carries client semantics next to the wire constraints, not in a separate
+registry. Standard Draft 2020-12 validators ignore these `x-st-*` annotations:
+
+- `x-st-ref` names the subject family, a set of allowed families, or `*` for a generic subject.
+  Named IDs retain the `family/non-whitespace-suffix` wire shape, including nested suffixes.
+  Mission run-generation maps validate both mission-run keys and run-generation values.
+- `x-st-brand` distinguishes opaque cursors, revisions, preview tokens, idempotency keys, and
+  screen revisions. They remain strings on the wire; compare for equality and echo them unchanged.
+- `x-st-codec` identifies RFC 3339 timestamps, Unix epoch milliseconds, millisecond/second
+  durations, and redacted credentials. Units and credential sensitivity are explicit.
+- Root `x-st-integers: "json-safe"` declares the safe-integer policy for generated JSON clients.
+  Existing JSON Schema bounds still apply.
+
+Evolving mission, agent, timeline, and error enums use `anyOf` with known values plus a string
+branch. Consumers accept future strings without changing their wire value. `Resource` includes
+`UnknownResource`, which preserves a future kind's valid header and arbitrary payload. Its kind
+exclusion prevents malformed known resources from falling through that branch. The generated raw
+Rust, Swift, and TypeScript `Resource` types model known kinds only, so TypeScript keeps
+discriminant narrowing on `kind`.
+
+Daemon conformance uses a strict test-only view of the same schema: it closes composed resource
+fields, tightens open enums to known values, and removes `UnknownResource`. Consumer tolerance
+does not authorize producers to emit undeclared cases or weaken family-ID validation.
+
 ## Conformance assets
 
 [`schemas/client-v0.schema.json`](schemas/client-v0.schema.json) contains the shared wire types.
 [`schemas/operations.json`](schemas/operations.json) is the machine-readable route/action/capability
 manifest. [`fixtures/manifest.json`](fixtures/manifest.json) maps every golden fixture to its root
 schema definition. The Rust tests validate fixture coverage, IDs, ordering, fences, timeline links,
-and deterministic preview tokens. Ignored baseline tests exercise the missing implementation and
-are intentionally red until the corresponding server work lands.
+and deterministic preview tokens. Daemon conformance tests validate synthetic collection,
+conversation, and terminal frames with a Draft 2020-12 validator and reject undeclared resource
+fields in the strict test view. No real user data is required for the conformance vectors.
 
 ## Private glasses
 

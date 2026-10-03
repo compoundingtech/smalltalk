@@ -121,6 +121,9 @@ pub enum AttentionKind {
         because: String,
         look_at: Vec<(String, String)>,
         step: String,
+        /// A feedback gate (`mode="feedback"`): sending it back asks for changes, a new
+        /// attempt, where an approval gate's sends back a rejection that fails the step.
+        feedback: bool,
     },
     /// A human feedback gate: the agent wants words, not a verdict.
     Feedback {

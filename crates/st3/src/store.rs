@@ -1,4 +1,5 @@
 mod glasses;
+mod resources;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -309,6 +310,8 @@ WHERE kind='work.person-asked';
 CREATE INDEX IF NOT EXISTS claims_person_ask_run_index ON claims(json_extract(body, '$.fields.run'))
 WHERE kind='work.person-asked';
 CREATE INDEX IF NOT EXISTS claims_person_ask_owner_index ON claims(json_extract(body, '$.fields.owner_run'))
+WHERE kind='work.person-asked';
+CREATE INDEX IF NOT EXISTS claims_person_ask_origin_step_index ON claims(json_extract(body, '$.fields.origin_step'))
 WHERE kind='work.person-asked';
 
 CREATE TABLE IF NOT EXISTS mission_run_requests (
@@ -2341,6 +2344,7 @@ impl Store {
         let transaction = connection.transaction()?;
         rebuild_operations_tx(&transaction)?;
         rebuild_planning_tx(&transaction)?;
+        resources::rebuild(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -2384,6 +2388,7 @@ impl Store {
         mission_id: &str,
         revision: Option<&str>,
     ) -> Result<Option<MissionSpec>> {
+        smallclaims::touched::note_read(|| format!("mission/{mission_id}"));
         let connection = self.readers.get();
         let body = if let Some(revision) = revision {
             connection
@@ -3443,10 +3448,51 @@ impl Store {
         }))
     }
 
+    /// The actor that published the mission revision `run` works to: a broken gate's attention
+    /// goes to it. A nested run works to its root run's revision.
+    pub(crate) fn mission_run_publisher(&self, run: &str) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let id = run.strip_prefix("mission-run/").unwrap_or(run);
+        let Some(header) = mission_run_header_tx(&connection, id).optional()? else {
+            return Ok(None);
+        };
+        let root_id = header
+            .root_mission_run
+            .strip_prefix("mission-run/")
+            .unwrap_or(&header.root_mission_run);
+        let root = if root_id == header.id {
+            header
+        } else {
+            let Some(root) = mission_run_header_tx(&connection, root_id).optional()? else {
+                return Ok(None);
+            };
+            root
+        };
+        let mission = root
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&root.mission);
+        Ok(connection
+            .query_row(
+                "SELECT claims.actor FROM mission_revisions
+                 JOIN claims ON claims.id=mission_revisions.claim_id
+                 WHERE mission_revisions.mission_id=?1 AND mission_revisions.revision=?2",
+                params![mission, root.revision],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn mission_run(&self, run: &str) -> Result<Option<MissionRunView>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        smallclaims::touched::note_read(|| format!("mission-run/{run}"));
         let connection = self.readers.get();
-        Ok(mission_run_view_tx(&connection, run).optional()?)
+        let view = mission_run_view_tx(&connection, run).optional()?;
+        if let Some(view) = &view {
+            note_run_view_reads(view);
+        }
+        Ok(view)
     }
 
     /// A run with each step's effective state, and with `summaries` its latest progress and
@@ -3474,6 +3520,7 @@ impl Store {
     /// Read one run's status without hydrating its step history.
     pub fn mission_run_status(&self, run: &str) -> Result<Option<String>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        smallclaims::touched::note_read(|| format!("mission-run/{run}"));
         let connection = self.readers.get();
         Ok(connection
             .query_row(
@@ -4204,6 +4251,7 @@ impl Store {
 
     pub fn mission_run_for_parent_step(&self, step: &str) -> Result<Option<MissionRunView>> {
         let step = normalize_step_run(step);
+        smallclaims::touched::note_read(|| format!("children-of-step:{step}"));
         let connection = self.connection.write();
         let run_id = connection
             .query_row(
@@ -4212,10 +4260,13 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        run_id
+        let view = run_id
             .map(|run_id| mission_run_view_tx(&connection, &run_id))
-            .transpose()
-            .map_err(Into::into)
+            .transpose()?;
+        if let Some(view) = &view {
+            note_run_view_reads(view);
+        }
+        Ok(view)
     }
 
     pub fn adopt_mission_revision(
@@ -5234,7 +5285,42 @@ impl Store {
     /// otherwise idle daemon.
     pub fn mission_run_for_reconcile(&self, id: &str) -> Result<MissionRunView> {
         let connection = self.readers.get();
-        mission_run_view_for_reconcile_tx(&connection, id).map_err(Into::into)
+        let view = mission_run_view_for_reconcile_tx(&connection, id)?;
+        note_run_view_reads(&view);
+        Ok(view)
+    }
+
+    /// What changed after store index `index` and local observation `local`, and the indexes the
+    /// answer reaches: each new claim and local observation as subject, kind, actor and body.
+    pub fn changes_since(&self, index: u64, local: i64) -> Result<ChangeFeed> {
+        let connection = self.readers.get();
+        let (to_index, to_local): (u64, i64) = connection.query_row(
+            "SELECT (SELECT COALESCE(MAX(store_index), 0) FROM claims),
+                    (SELECT COALESCE(MAX(id), 0) FROM local_observations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut changes = connection
+            .prepare_cached(
+                "SELECT subject, kind, actor, body FROM claims
+                 WHERE store_index>?1 AND store_index<=?2",
+            )?
+            .query_map(params![index, to_index], change_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        changes.extend(
+            connection
+                .prepare_cached(
+                    "SELECT subject, kind, actor, body FROM local_observations
+                     WHERE id>?1 AND id<=?2",
+                )?
+                .query_map(params![local, to_local], change_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+        Ok(ChangeFeed {
+            index: to_index,
+            local: to_local,
+            changes,
+        })
     }
 
     /// The faults this host recorded that have not recovered, keyed by subject and scope.
@@ -5472,6 +5558,7 @@ impl Store {
 
     pub fn mission_runs_for_root(&self, root: &str) -> Result<Vec<MissionRunView>> {
         let root = root.strip_prefix("mission-run/").unwrap_or(root);
+        smallclaims::touched::note_read(|| format!("children:mission-run/{root}"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id FROM mission_runs WHERE root_run_id=?1 ORDER BY created_at_unix_ms, id",
@@ -5480,7 +5567,11 @@ impl Store {
             .query_map([root], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
-            .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
+            .map(|id| {
+                let view = mission_run_view_tx(&connection, &id)?;
+                note_run_view_reads(&view);
+                Ok(view)
+            })
             .collect()
     }
 
@@ -7308,7 +7399,7 @@ impl Store {
                     "create"
                 }
                 .into(),
-                old_revision: current.map(|row| row.revision),
+                old_revision: current.as_ref().map(|row| row.revision.clone()),
                 new_revision: revision,
             });
             if desired.kind == "stop" {
@@ -7317,11 +7408,30 @@ impl Store {
                     action: "stop".into(),
                     reason: "the desired state explicitly stops this member".into(),
                 });
-            } else if desired.member.is_some() {
-                actions.push(PlannedAction {
-                    subject: subject.clone(),
-                    action: "observe-or-start".into(),
-                    reason: "the desired member is active".into(),
+            } else if let Some(member) = &desired.member {
+                // A seat restarts when its declared launch changes; say so before it does.
+                let changes = current
+                    .as_ref()
+                    .filter(|row| row.kind == "agent")
+                    .and_then(|row| row.member.as_deref())
+                    .and_then(|launched| serde_json::from_str::<crate::model::MemberSpec>(launched).ok())
+                    .map(|launched| member.launch_changes(&launched))
+                    .unwrap_or_default();
+                actions.push(if changes.is_empty() {
+                    PlannedAction {
+                        subject: subject.clone(),
+                        action: "observe-or-start".into(),
+                        reason: "the desired member is active".into(),
+                    }
+                } else {
+                    PlannedAction {
+                        subject: subject.clone(),
+                        action: "restart".into(),
+                        reason: format!(
+                            "the declared {} changed; a running seat restarts on its last session",
+                            changes.join(" and ")
+                        ),
+                    }
                 });
             }
         }
@@ -9553,6 +9663,7 @@ impl Store {
     }
 
     pub fn desired_subjects(&self) -> Result<Vec<DesiredSubject>> {
+        smallclaims::touched::note_read(|| "kind:intent.desired".to_owned());
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
@@ -9902,6 +10013,9 @@ impl Store {
 
     /// The desired subjects named in `subjects`, by their primary keys.
     pub fn desired_subjects_named(&self, subjects: &[String]) -> Result<Vec<DesiredSubject>> {
+        for subject in subjects {
+            smallclaims::touched::note_read(|| subject.clone());
+        }
         if subjects.is_empty() {
             return Ok(Vec::new());
         }
@@ -9949,6 +10063,7 @@ impl Store {
     }
 
     pub fn desired_subjects_for_owner_run(&self, owner_run: &str) -> Result<Vec<DesiredSubject>> {
+        smallclaims::touched::note_read(|| format!("owned:{owner_run}"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
@@ -10297,6 +10412,10 @@ impl Store {
         recipient: Option<&str>,
         include_closed: bool,
     ) -> Result<Vec<MessageView>> {
+        smallclaims::touched::note_read(|| match recipient {
+            Some(recipient) => format!("mailbox:{recipient}"),
+            None => "kind:message.sent".to_owned(),
+        });
         let through = self.index()?;
         let mut after = None;
         let mut all = Vec::new();
@@ -10614,6 +10733,7 @@ impl Store {
 
     /// Every claim and local observation of `kind` for `subject`, in log order.
     pub fn observations_for(&self, subject: &str, kind: &str) -> Result<Vec<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let mut records = self.claims_for(subject, Some(kind))?;
         let connection = self.readers.get();
         let mut statement = connection.prepare(&format!(
@@ -10629,6 +10749,7 @@ impl Store {
 
     /// The newest claim or local observation of `kind` for `subject`.
     pub fn latest_observation(&self, subject: &str, kind: &str) -> Result<Option<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let claim = self.latest_claim(subject, Some(kind))?;
         let local = {
             let connection = self.readers.get();
@@ -10693,6 +10814,44 @@ impl Store {
     pub fn pending_human_reviews(&self, reviewer: Option<&str>) -> Result<Vec<HumanReviewView>> {
         let connection = self.readers.get();
         pending_human_reviews_tx(&connection, reviewer)
+    }
+
+    /// Every human gate request as (request, owner, reviewer): the episodes a human gate's
+    /// attention card can name, open or long closed.
+    pub fn human_gate_requests(&self) -> Result<Vec<(String, String, String)>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, json_extract(body, '$.fields.owner'), json_extract(body, '$.fields.reviewer')
+             FROM claims INDEXED BY claims_human_gate_request_index
+             WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL
+               AND json_extract(body, '$.fields.owner') IS NOT NULL",
+        )?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// The reviewer's answer to the human gate request `request`, by the same rule that takes
+    /// an answered request off `pending_human_reviews`.
+    pub fn human_review_answer(&self, request: &str) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        // An answer is written on the request's subject, its gate operation.
+        smallclaims::touched::note_read(|| {
+            connection
+                .query_row("SELECT subject FROM claims WHERE id=?1", [request], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_default()
+        });
+        human_review_answer_tx(&connection, request)
+    }
+
+    /// Why `owner` has no pending human review: answered (how, by whom), stale (which of
+    /// generation, revision, definition, attempt or state moved on), or never asked.
+    pub fn human_review_refusal(&self, owner: &str) -> Result<String> {
+        let connection = self.readers.get();
+        human_review_refusal_tx(&connection, owner)
     }
 
     /// Request attention for a condition the daemon watches itself. The daemon closes it once
@@ -11165,6 +11324,12 @@ impl Store {
     ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
         items.extend(self.person_attention_items(person, as_of)?);
+        // A person who published a broken gate is the one to correct it.
+        items.extend(
+            self.broken_gate_items(person, as_of)?
+                .into_iter()
+                .filter(|item| item.person.starts_with("person/")),
+        );
         self.current_attention(items, as_of)
     }
 
@@ -11175,6 +11340,11 @@ impl Store {
     pub fn fault_snapshot(&self, as_of: u128) -> Result<Vec<FaultView>> {
         let mut items = self.subscription_fault_items(as_of)?;
         items.extend(self.operational_attention_items(None, as_of)?);
+        items.extend(
+            self.broken_gate_items(None, as_of)?
+                .into_iter()
+                .filter(|item| !item.person.starts_with("person/")),
+        );
         items.extend(self.checkpoint_attention_items(None, as_of)?);
         let fallback = self.fleet_fault_agent()?;
         self.current_attention(items, as_of)?
@@ -11315,6 +11485,7 @@ impl Store {
     }
 
     pub fn selected_desired_token(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.claim_id))
     }
@@ -11343,16 +11514,19 @@ impl Store {
     }
 
     pub fn selected_desired_revision(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.revision))
     }
 
     pub fn selected_desired_kind(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.kind))
     }
 
     pub fn selected_desired_origin(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         connection
             .query_row(
@@ -11751,6 +11925,8 @@ impl Store {
                     {
                         item_facts["opened_by_run"] = Value::String(run);
                     }
+                    // A pull request item already keeps its recorded opener: its facts are laid
+                    // over the recorded ones, and opener attribution keeps a named opener.
                     if kind == "vcs.issue" {
                         let normalized = normalize_resource_observation(
                             transaction,
@@ -13350,6 +13526,7 @@ impl Store {
     }
 
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         // The actual state folds only this subject's append-only claims, so the subject's newest
         // claim identifies it. A write elsewhere in the graph must not make every reconcile pass
@@ -13529,6 +13706,9 @@ impl Store {
         &self,
         subject: &str,
     ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        // Its work claims and progress live on step subjects, written with this agent as actor.
+        smallclaims::touched::note_read(|| subject.to_owned());
+        smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
     }
@@ -13555,6 +13735,7 @@ impl Store {
         else {
             return Ok(false);
         };
+        smallclaims::touched::note_read(|| actor.to_owned());
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
             "SELECT body FROM claims
@@ -15920,9 +16101,10 @@ fn normalize_resource_observation(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| previous.as_object().cloned().unwrap_or_default());
-        // Issue attribution belongs to its publisher, not to the latest observer or fixer.
-        // Keep each named field, including a mission-run-only opener, across observations.
-        if kind == "vcs.issue" {
+        // Issue and pull request attribution belongs to its publisher, not to the latest
+        // observer or fixer. Keep each named field, including a mission-run-only opener, across
+        // observations, so a partial snapshot such as a merge never erases it.
+        if carries_opener(&kind) {
             for name in ["opened_by", "opened_by_run"] {
                 if let Some(value) = previous.get(name) {
                     facts.insert(name.into(), value.clone());
@@ -15945,7 +16127,7 @@ fn normalize_resource_observation(
         }
     }
     let mut fields = input.fields.clone();
-    if kind == "vcs.issue" {
+    if carries_opener(&kind) {
         if fields.contains_key("facts") {
             fields.insert("facts".into(), serde_json::to_value(facts).map_err(internal)?);
         } else {
@@ -15954,6 +16136,12 @@ fn normalize_resource_observation(
     }
     fields.insert("kind".into(), Value::String(kind));
     Ok(Some(fields))
+}
+
+/// The resource kinds whose `opened_by` and `opened_by_run` outlast every later observation
+/// (Nathan, 2026-10-03, #778 rule 5).
+fn carries_opener(kind: &str) -> bool {
+    matches!(kind, "vcs.issue" | "vcs.pull-request")
 }
 
 fn resource_facts(fields: &BTreeMap<String, Value>) -> Result<BTreeMap<String, Value>, St3Error> {
@@ -17259,6 +17447,9 @@ fn append_claim_tx(
         forced_batch,
     )?;
     insert_event(transaction, record.store_index, kind, subject, body)?;
+    if kind == "resource.observed" {
+        resources::refresh(transaction, subject)?;
+    }
     normalize_local_projection_timestamps_tx(
         transaction,
         subject,
@@ -17896,6 +18087,43 @@ fn mailbox_harness_ended(
     Ok(true)
 }
 
+/// See [`Store::changes_since`].
+#[derive(Clone, Debug, Default)]
+pub struct ChangeFeed {
+    pub index: u64,
+    pub local: i64,
+    pub changes: Vec<Change>,
+}
+
+/// One new claim or local observation.
+#[derive(Clone, Debug)]
+pub struct Change {
+    pub subject: String,
+    pub kind: String,
+    pub actor: Option<String>,
+    pub body: String,
+}
+
+fn change_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Change> {
+    Ok(Change {
+        subject: row.get(0)?,
+        kind: row.get(1)?,
+        actor: row.get(2)?,
+        body: row.get(3)?,
+    })
+}
+
+/// A run view reads its run, generation and step rows, which change only with claims on those
+/// subjects.
+fn note_run_view_reads(view: &MissionRunView) {
+    smallclaims::touched::note_read(|| view.subject.clone());
+    smallclaims::touched::note_read(|| view.generation.clone());
+    smallclaims::touched::note_read(|| format!("generations:{}", view.subject));
+    for step in &view.steps {
+        smallclaims::touched::note_read(|| step.subject.clone());
+    }
+}
+
 /// See [`Store::mailbox_watermark`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MailboxWatermark {
@@ -18314,43 +18542,128 @@ fn current_human_review(
     connection: &Connection,
     request: ClaimRecord,
 ) -> Result<Option<HumanReviewView>> {
+    Ok(human_review_currency(connection, request)?.ok())
+}
+
+/// The step that runs a loop, from the subject a loop's gates are asked of:
+/// `loop-run/GENERATION/PATH`, or a subject under it such as `.../round/N/candidate/M` for a
+/// person's choice between candidates. The longest step run that prefixes it is the loop's.
+fn loop_step_tx(connection: &Connection, owner: &str) -> Result<Option<StepRunView>> {
+    let Some(path) = owner.strip_prefix("loop-run/") else {
+        return Ok(None);
+    };
+    let mut prefix = path;
+    // GENERATION/PATH: a step run has at least two segments.
+    while prefix.contains('/') {
+        if let Some(step) = step_run_row_tx(connection, &format!("step-run/{prefix}"))? {
+            return Ok(Some(step));
+        }
+        prefix = prefix.rsplit_once('/').map_or("", |(head, _)| head);
+    }
+    Ok(None)
+}
+
+/// Item `item` of the for-each loop `loop_run` (a loop from before such loops were removed):
+/// the round it runs in, its place in the loop's item snapshot, and whether the loop has
+/// recorded that round's result.
+fn loop_item_round_tx(
+    connection: &Connection,
+    loop_run: &str,
+    item: &str,
+) -> Result<Option<(u32, bool)>> {
+    let items: Option<String> = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT json_extract(claims.body, '$.fields.items') FROM claims
+                 WHERE claims.subject=?1 AND claims.kind='loop.state'
+                   AND json_extract(claims.body, '$.fields.items') IS NOT NULL
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+            ),
+            [loop_run],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(items) = items else {
+        return Ok(None);
+    };
+    let Some(index) = serde_json::from_str::<Vec<Value>>(&items)?
+        .iter()
+        .position(|candidate| candidate.get("id").and_then(Value::as_str) == Some(item))
+    else {
+        return Ok(None);
+    };
+    let round = u32::try_from(index + 1)?;
+    let recorded = connection
+        .query_row(
+            "SELECT 1 FROM claims
+             WHERE subject=?1 AND kind='loop.round-result'
+               AND json_extract(body, '$.fields.round')=?2
+               AND json_extract(body, '$.fields.candidate') IS NULL",
+            params![loop_run, round],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(Some((round, recorded)))
+}
+
+/// A step run's own row, without its queue and wake enrichment.
+fn step_run_row_tx(connection: &Connection, subject: &str) -> Result<Option<StepRunView>> {
+    connection
+        .query_row(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee,
+                    available_to, agentless, title, goals, worker_reported, lease_owner,
+                    lease_incarnation, lease_expires_at_unix_ms, blocked_reason,
+                    not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms,
+                    readiness_epoch, constraints
+             FROM step_runs WHERE subject=?1",
+            [subject],
+            step_run_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// The review a human gate request asks, while its gate still waits on it, or why it no longer
+/// does. A request is current while its owner (a step, mission or loop run) is open on the
+/// generation, revision, definition and attempt it was asked for. An answer does not make a
+/// request stale: the reviewers' list leaves out answered requests separately.
+fn human_review_currency(
+    connection: &Connection,
+    request: ClaimRecord,
+) -> Result<std::result::Result<HumanReviewView, String>> {
     let fields = request.body.get("fields").unwrap_or(&request.body);
-    let Some(owner) = fields.get("owner").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(reviewer) = fields.get("reviewer").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(mission_revision) = fields.get("mission_revision").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(step_definition) = fields.get("step_definition").and_then(Value::as_str) else {
-        return Ok(None);
+    let text = |name: &str| fields.get(name).and_then(Value::as_str);
+    let (Some(owner), Some(reviewer), Some(mission_revision), Some(step_definition)) = (
+        text("owner"),
+        text("reviewer"),
+        text("mission_revision"),
+        text("step_definition"),
+    ) else {
+        return Ok(Err(
+            "its request does not name the exact owner, reviewer and revision it asks about".into(),
+        ));
     };
     let Some(attempt) = fields
         .get("attempt")
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
     else {
-        return Ok(None);
+        return Ok(Err("its request does not name an attempt".into()));
     };
+    let short = |revision: &str| revision.chars().take(12).collect::<String>();
     // Only the run's header decides whether a review is current: its steps' queue and wake
     // enrichment is the costliest read in st and would run for every open review.
-    let (run, step, title) = if owner.starts_with("step-run/") {
-        let step = connection
-            .query_row(
-                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee,
-                        available_to, agentless, title, goals, worker_reported, lease_owner,
-                        lease_incarnation, lease_expires_at_unix_ms, blocked_reason,
-                        not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms,
-                        readiness_epoch, constraints
-                 FROM step_runs WHERE subject=?1",
-                [owner],
-                step_run_from_row,
-            )
-            .optional()?;
+    let (run, step, title) = if owner.starts_with("step-run/") || owner.starts_with("loop-run/") {
+        // A loop's gates are asked of its loop subject; the step running the loop decides
+        // whether one is current.
+        let step = if owner.starts_with("loop-run/") {
+            loop_step_tx(connection, owner)?
+        } else {
+            step_run_row_tx(connection, owner)?
+        };
         let Some(step) = step else {
-            return Ok(None);
+            return Ok(Err(format!("`{owner}` names no step run")));
         };
         let run = mission_run_header_tx(
             connection,
@@ -18358,16 +18671,60 @@ fn current_human_review(
         )
         .optional()?;
         let Some(run) = run else {
-            return Ok(None);
+            return Ok(Err(format!("its mission run `{}` is gone", step.run)));
         };
-        let current = step.generation == run.generation
-            && mission_revision == run.revision
-            && step_definition == step.definition_hash
-            && attempt == step.attempt
-            && !is_terminal_run_state(&run.status)
-            && !is_terminal_run_state(&step.status);
-        if !current {
-            return Ok(None);
+        if is_terminal_run_state(&run.status) {
+            return Ok(Err(format!("its mission run is {}", run.status)));
+        }
+        if is_terminal_run_state(&step.status) {
+            return Ok(Err(format!("the step is {}", step.status)));
+        }
+        if step.generation != run.generation {
+            return Ok(Err(format!(
+                "its mission run moved on to {}, which asks for its own review",
+                run.generation
+            )));
+        }
+        if mission_revision != run.revision {
+            return Ok(Err(format!(
+                "it was asked for mission revision {}, and the run is on {}",
+                short(mission_revision),
+                short(&run.revision)
+            )));
+        }
+        if step_definition != step.definition_hash {
+            return Ok(Err(
+                "the step's definition changed since it was asked".into()
+            ));
+        }
+        // A for-each loop runs each item as its own round and asks the item's gates with
+        // that round as their attempt, whatever attempt the step is on.
+        let loop_run = format!(
+            "loop-run/{}",
+            step.subject
+                .strip_prefix("step-run/")
+                .unwrap_or(&step.subject)
+        );
+        if let Some(item) = owner.strip_prefix(&format!("{loop_run}/item/")) {
+            match loop_item_round_tx(connection, &loop_run, item)? {
+                None => return Ok(Err(format!("its loop has no item `{item}`"))),
+                Some((round, _)) if round != attempt => {
+                    return Ok(Err(format!(
+                        "it was asked for round {attempt}, and item `{item}` runs in round {round}"
+                    )));
+                }
+                Some((round, true)) => {
+                    return Ok(Err(format!(
+                        "the loop already recorded item `{item}` (round {round})"
+                    )));
+                }
+                Some((_, false)) => {}
+            }
+        } else if attempt != step.attempt {
+            return Ok(Err(format!(
+                "it was asked for attempt {attempt}, and the step is on attempt {} ({})",
+                step.attempt, step.status
+            )));
         }
         let title = step.title.clone();
         (run, Some(step.step), title)
@@ -18378,19 +18735,32 @@ fn current_human_review(
         )
         .optional()?;
         let Some(run) = run else {
-            return Ok(None);
+            return Ok(Err(format!("`{owner}` names no mission run")));
         };
-        let current = mission_revision == run.revision
-            && step_definition == run.revision
-            && attempt == 1
-            && !is_terminal_run_state(&run.status);
-        if !current {
-            return Ok(None);
+        if is_terminal_run_state(&run.status) {
+            return Ok(Err(format!("the mission run is {}", run.status)));
+        }
+        if mission_revision != run.revision || step_definition != run.revision {
+            return Ok(Err(format!(
+                "it was asked for mission revision {}, and the run is on {}",
+                short(mission_revision),
+                short(&run.revision)
+            )));
+        }
+        if attempt != 1 {
+            return Ok(Err(format!(
+                "it was asked for attempt {attempt}, and a mission gate has one"
+            )));
         }
         (run, None, None)
     } else {
-        return Ok(None);
+        return Ok(Err(format!("`{owner}` cannot own a human gate")));
     };
+    // The person's attention shows a review only while its run still matters, so the review is
+    // offered only then: a review with no card would wait on an answer nobody is asked for.
+    if let Err(why) = person_work::run_liveness(connection, &run.subject, None, false)? {
+        return Ok(Err(why));
+    }
     let strings = |name: &str| {
         fields
             .get(name)
@@ -18404,7 +18774,7 @@ fn current_human_review(
             })
             .unwrap_or_default()
     };
-    Ok(Some(HumanReviewView {
+    Ok(Ok(HumanReviewView {
         operation: fields
             .get("operation")
             .and_then(Value::as_str)
@@ -18435,12 +18805,90 @@ fn current_human_review(
     }))
 }
 
+/// Whether claim `result` answers the human gate request `request`: a `gate.result` on the
+/// request's operation, by its reviewer, bound to it, with a verdict. The reviewers' list and
+/// the gate both read answers by this rule, so a review the list no longer offers is always one
+/// whose answer the gate acts on.
+fn reviewer_answer_sql(result: &str) -> String {
+    format!(
+        "{result}.subject=request.subject
+         AND {result}.kind='gate.result'
+         AND json_extract({result}.body, '$.fields.request')=request.id
+         AND {result}.actor=json_extract(request.body, '$.fields.reviewer')
+         AND json_extract({result}.body, '$.fields.verdict') IN ('pass','fail','feedback')"
+    )
+}
+
+/// The reviewer's answer to the human gate request `request`, the first one by
+/// `reviewer_answer_sql` when a race left two.
+fn human_review_answer_tx(connection: &Connection, request: &str) -> Result<Option<ClaimRecord>> {
+    connection
+        .query_row(
+            &canonical_sql(&format!(
+                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject,
+                        claims.kind, claims.origin, claims.actor, claims.body,
+                        claims.predecessors, claims.accepted_at_unix_ms
+                 FROM claims request JOIN claims ON {}
+                 WHERE request.id=?1 AND request.kind='gate.requested'
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+                reviewer_answer_sql("claims")
+            )),
+            [request],
+            claim_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Why `owner` has no human review waiting, in words for the person who tried to answer it:
+/// its newest request was answered (how, and by whom), no longer matches the owner, or st never
+/// asked one.
+fn human_review_refusal_tx(connection: &Connection, owner: &str) -> Result<String> {
+    let request = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT request.id, request.store_index, request.batch_id, request.subject,
+                        request.kind, request.origin, request.actor, request.body,
+                        request.predecessors, request.accepted_at_unix_ms
+                 FROM claims request
+                 WHERE request.kind='gate.requested'
+                   AND json_extract(request.body, '$.fields.owner')=?1
+                   AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
+                 ORDER BY CANONICAL_DESC(request) LIMIT 1",
+            ),
+            [owner],
+            claim_from_row,
+        )
+        .optional()?;
+    let Some(request) = request else {
+        return Ok("st has asked no person to review it".into());
+    };
+    if let Some(answer) = human_review_answer_tx(connection, &request.id)? {
+        let fields = answer.body.get("fields").unwrap_or(&answer.body);
+        let decision = fields.get("decision").and_then(Value::as_str).unwrap_or(
+            match fields.get("verdict").and_then(Value::as_str) {
+                Some("pass") => "approved",
+                Some("feedback") => "changes-requested",
+                _ => "rejected",
+            },
+        );
+        return Ok(format!(
+            "it was already answered: {decision} by {}",
+            answer.actor.as_deref().unwrap_or("its reviewer")
+        ));
+    }
+    Ok(match human_review_currency(connection, request)? {
+        Err(why) => format!("its review is no longer current: {why}"),
+        Ok(review) => format!("its review waits on {}", review.reviewer),
+    })
+}
+
 fn pending_human_reviews_tx(
     connection: &Connection,
     reviewer: Option<&str>,
 ) -> Result<Vec<HumanReviewView>> {
     let requests = {
-        let mut statement = connection.prepare(&canonical_sql(
+        let mut statement = connection.prepare(&canonical_sql(&format!(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
@@ -18448,16 +18896,10 @@ fn pending_human_reviews_tx(
              WHERE request.kind='gate.requested'
                AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
                AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
-               AND NOT EXISTS (
-                 SELECT 1 FROM claims result
-                 WHERE result.subject=request.subject
-                   AND result.kind='gate.result'
-                   AND json_extract(result.body, '$.fields.request')=request.id
-                   AND result.actor=json_extract(request.body, '$.fields.reviewer')
-                   AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail','feedback')
-               )
+               AND NOT EXISTS (SELECT 1 FROM claims result WHERE {})
              ORDER BY CANONICAL_ASC(request)",
-        ))?;
+            reviewer_answer_sql("result")
+        )))?;
         statement
             .query_map([reviewer], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()?
@@ -20010,6 +20452,10 @@ fn operational_annotation(
 /// How long a mission whose run failed or was cancelled stays in the current missions view.
 pub(crate) const RECENTLY_ENDED_MS: u128 = 24 * 60 * 60 * 1000;
 
+/// The condition of a broken exec gate's operational failure. Its item goes to the publisher of
+/// the run's mission revision: a person reads it in their attention, an agent as a fault.
+pub(crate) const GATE_BROKEN_CONDITION: &str = "gate-broken";
+
 /// The earliest end that still counts as recent.
 pub(crate) fn recently_ended_since() -> u128 {
     now_ms().saturating_sub(RECENTLY_ENDED_MS)
@@ -21194,6 +21640,57 @@ fn a_catching_up_node_projects_once_per_interval_and_again_when_caught_up() {
     assert!(!target.replication_catching_up());
     assert_eq!(target.projected_through(), target.index().unwrap());
     assert!(!target.replication_projection_deferred());
+}
+
+/// A member catching up receives thousands of envelopes in one exchange (#898). Admitting them
+/// in one transaction held the only writer for seconds, so every lease renewal and message
+/// behind it waited; admission now commits in chunks, and the writer serves others between them.
+#[cfg(test)]
+#[test]
+fn a_large_page_is_admitted_in_chunks_that_release_the_writer() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let envelopes = 2 * smallclaims::store::ADMISSION_CHUNK_ENVELOPES + 50;
+    for index in 0..envelopes {
+        source
+            .append_claim(&ClaimInput {
+                subject: format!("custom/catch-up/{index}"),
+                kind: "custom.catch-up.note".into(),
+                actor: Some("person/tester".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let mut inventory = target.replication_inventory().unwrap();
+    inventory.accepts = Some(REPLICATION_PAGE_LIMIT);
+    let response = source
+        .export_replication_exchange(FLEET, &inventory)
+        .unwrap();
+    assert!(response.envelopes.len() >= envelopes);
+    target
+        .receive_replication_exchange("source", FLEET, &response)
+        .unwrap();
+    smallclaims::store::ADMISSION_TRANSACTIONS.with(|count| count.set(0));
+    let admission = target.validate_replication_backlog().unwrap();
+    assert_eq!(
+        smallclaims::store::ADMISSION_TRANSACTIONS.with(std::cell::Cell::get),
+        3
+    );
+    assert!(admission.changed);
+    target.project_replication_backlog().unwrap();
+    assert!(
+        target
+            .claims_for(&format!("custom/catch-up/{}", envelopes - 1), None)
+            .unwrap()
+            .len()
+            == 1
+    );
 }
 
 #[cfg(test)]
@@ -22600,6 +23097,7 @@ fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3
     project_replicated_base_claims(transaction)?;
     project_replicated_mission_runs(transaction)?;
     rebuild_planning_tx(transaction).map_err(internal)?;
+    resources::rebuild(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -24621,10 +25119,13 @@ fn carried_revision_step_paths(
 ) -> BTreeSet<String> {
     let old_definitions = flattened_step_definition_hashes(old);
     let new_definitions = flattened_step_definition_hashes(new);
+    let regated = regated_submitted_steps(old, new, current);
     let dependencies = flattened_dependencies(new);
     let mut unstable = new_definitions
         .iter()
-        .filter(|(path, hash)| old_definitions.get(*path) != Some(*hash))
+        .filter(|(path, hash)| {
+            old_definitions.get(*path) != Some(*hash) && !regated.contains(*path)
+        })
         .map(|(path, _)| path.clone())
         .collect::<BTreeSet<_>>();
     loop {
@@ -24652,6 +25153,51 @@ fn carried_revision_step_paths(
             .map(|step| step.step.clone()),
     );
     compatible
+}
+
+/// The steps a revision changes only in their gates while their worker's submitted work waits
+/// on those gates, as it does behind a broken gate. They keep the submission: the successor
+/// generation checks the work against the revised gates rather than asking for it again.
+fn regated_submitted_steps(
+    old: &MissionSpec,
+    new: &MissionSpec,
+    current: &[StepRunView],
+) -> BTreeSet<String> {
+    let old_steps = flatten_mission_step_specs(old)
+        .into_iter()
+        .map(|step| (step.path.as_str(), step))
+        .collect::<BTreeMap<_, _>>();
+    flatten_mission_step_specs(new)
+        .into_iter()
+        .filter(|step| {
+            current.iter().any(|view| {
+                view.step == step.path && view.status == "verifying" && view.worker_reported
+            }) && old_steps.get(step.path.as_str()).is_some_and(|old| {
+                old.definition_hash != step.definition_hash
+                    && step_definition_without_gates(old) == step_definition_without_gates(step)
+            })
+        })
+        .map(|step| step.path.clone())
+        .collect()
+}
+
+/// A step's definition with its gates, and the gates and definition hashes of any steps nested
+/// in it, left out.
+fn step_definition_without_gates(step: &crate::model::StepSpec) -> Value {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(fields) => {
+                fields.remove("gates");
+                fields.remove("definition_hash");
+                fields.values_mut().for_each(strip);
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(step).unwrap_or(Value::Null);
+    strip(&mut value);
+    value
 }
 
 fn flattened_step_definition_hashes(mission: &MissionSpec) -> BTreeMap<String, String> {
@@ -33172,7 +33718,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: runtime::compatibility_digest(&st3_schema::registry().digest()),
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
@@ -33243,7 +33789,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: runtime::compatibility_digest(&st3_schema::registry().digest()),
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
@@ -33291,7 +33837,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             projection_digests: Default::default(),
             peer: peer.into(),
             fleet_id: TEST_FLEET.into(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: runtime::compatibility_digest(&st3_schema::registry().digest()),
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
@@ -40952,6 +41498,92 @@ version 2
     }
 
     #[test]
+    fn a_gate_only_revision_keeps_submitted_work_and_any_other_change_starts_it_again() {
+        let store = Store::open_memory("node").unwrap();
+        let source = |gate: &str, goal: &str| {
+            format!(
+                r#"
+version 2
+
+  mission "carry" state="ready" {{
+    goal "Keep submitted work across a gate revision."
+    step "work" {{
+      assigned-to "agent/worker"
+      goal {goal:?}
+      gate "checked" {{ exec {gate:?}; host "node"; workspace "/tmp" }}
+    }}
+  }}
+"#
+            )
+        };
+        publish_carry(&store, &source("exit 2", "Do the work."), "regate-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "regate-run".into(),
+            })
+            .unwrap();
+        let work = |run: &MissionRunView| {
+            run.steps
+                .iter()
+                .find(|step| step.step == "work")
+                .unwrap()
+                .clone()
+        };
+        let first = work(&run).subject;
+        store.set_step_state(&first, "ready", None).unwrap();
+        store
+            .work_action(&first, "claim", &carry_request("one", "regate-claim"))
+            .unwrap();
+        let submitted = store
+            .work_action(&first, "complete", &carry_request("one", "regate-complete"))
+            .unwrap();
+        assert_eq!(submitted.status, "verifying");
+
+        let regated = publish_carry(&store, &source("exit 0", "Do the work."), "regate-two");
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &regated,
+                "person/requester",
+                "the gate was broken",
+                "regate-revision",
+            )
+            .unwrap();
+        let carried = work(&adopted);
+        assert_ne!(carried.subject, first);
+        assert_eq!(
+            (
+                carried.status.as_str(),
+                carried.worker_reported,
+                carried.attempt
+            ),
+            ("verifying", true, 1)
+        );
+
+        let rewritten = publish_carry(&store, &source("exit 0", "Do other work."), "regate-three");
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &rewritten,
+                "person/requester",
+                "the work changed",
+                "regate-goal-revision",
+            )
+            .unwrap();
+        let restarted = work(&adopted);
+        assert_eq!(
+            (restarted.status.as_str(), restarted.worker_reported),
+            ("pending", false)
+        );
+    }
+
+    #[test]
     fn a_person_revises_a_run_from_outside_its_graph_location() {
         let store = Store::open_memory("node").unwrap();
         publish_carry(&store, CARRY_SOURCE, "carry-one");
@@ -42696,6 +43328,104 @@ observer "issue" {
                 }))).unwrap();
                 assert_eq!(&changed.body["fields"]["facts"]["opened_by"], opener);
                 assert_eq!(changed.body["fields"]["facts"]["opened_by_run"], "mission-run/author");
+            }
+        }
+    }
+
+    #[test]
+    fn pull_request_openers_survive_partial_publishers_and_observers() {
+        for attribution in [
+            json!({"opened_by_run": "mission-run/author"}),
+            json!({"opened_by": "agent/node.author", "opened_by_run": "mission-run/author"}),
+        ] {
+            let store = Store::open_memory("node").unwrap();
+            let source = r#"version 2
+resource "github/acme/demo/pull/9" { kind "vcs.pull-request" }
+observer "pull" {
+  resource "resource/github/acme/demo/pull/9"
+  provider "github.pull-request"
+  locator "acme/demo#9"
+  field "state"
+}
+"#;
+            let intent = parse_intent(source, "node").unwrap();
+            let planned = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(&intent, &planned.subject_tokens, "publish-watch")
+                .unwrap();
+            let subject = "resource/github/acme/demo/pull/9";
+            let publish = |facts: Value| ClaimInput {
+                subject: subject.into(),
+                kind: "resource.observed".into(),
+                actor: Some("agent/node.author".into()),
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.pull-request".into())),
+                    ("facts".into(), facts),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            };
+            let mut opened = attribution.clone();
+            opened["state"] = json!("open");
+            store.append_client_claim(&publish(opened)).unwrap();
+            // A publisher's partial snapshot of the merge keeps both fields.
+            let merged = store
+                .append_client_claim(&publish(json!({"state": "merged", "merged": true})))
+                .unwrap();
+            assert_eq!(merged.body["fields"]["facts"]["state"], "merged");
+            assert_eq!(
+                merged.body["fields"]["facts"]["opened_by_run"],
+                "mission-run/author"
+            );
+            assert_eq!(
+                merged.body["fields"]["facts"].get("opened_by"),
+                attribution.get("opened_by")
+            );
+            // So does an observer that never reads them.
+            let revision = store
+                .selected_desired_revision("observer/pull")
+                .unwrap()
+                .unwrap();
+            store
+                .record_resource_observation(
+                    "observer/pull",
+                    &revision,
+                    None,
+                    subject,
+                    None,
+                    &json!({"state": "closed"}),
+                    50,
+                    &[],
+                )
+                .unwrap();
+            let actual = store.latest_actual_value(subject).unwrap().unwrap();
+            assert_eq!(actual["facts"]["state"], "closed");
+            assert_eq!(actual["facts"]["opened_by_run"], "mission-run/author");
+            assert_eq!(
+                actual["facts"].get("opened_by"),
+                attribution.get("opened_by")
+            );
+            // A later claim cannot take the opener over.
+            let fixer = store
+                .append_client_claim(&publish(json!({
+                    "opened_by": "agent/node.fixer", "opened_by_run": "mission-run/fixer"
+                })))
+                .unwrap();
+            assert_eq!(
+                fixer.body["fields"]["facts"]["opened_by_run"],
+                "mission-run/author"
+            );
+            if let Some(opener) = attribution.get("opened_by") {
+                assert_eq!(&fixer.body["fields"]["facts"]["opened_by"], opener);
             }
         }
     }
@@ -44537,6 +45267,7 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("documents", &["created_index"]),
     ("desired", &[]),
     ("message_index", &["created_index"]),
+    ("resource_observations", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),

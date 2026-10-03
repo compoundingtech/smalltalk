@@ -263,8 +263,6 @@ pub struct Operational {
     pub owner_generation: Option<String>,
     #[serde(default)]
     pub runtime_incarnation: Option<String>,
-    #[serde(default)]
-    pub runtime_desired_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -713,6 +711,12 @@ pub struct Mission {
     #[serde(default)]
     pub active_runs: Option<usize>,
     #[serde(default)]
+    pub total_runs: Option<usize>,
+    #[serde(default)]
+    pub run_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub runs_truncated: bool,
+    #[serde(default)]
     pub run_generations: BTreeMap<String, String>,
     #[serde(default)]
     pub visualization: Option<Visualization>,
@@ -812,6 +816,16 @@ pub struct Work {
     pub readiness_epoch: u64,
     pub claimant: Option<String>,
     pub claim_incarnation: Option<String>,
+    #[serde(default)]
+    pub agentless: bool,
+    #[serde(default)]
+    pub claim_expires_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub execution_started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub execution_elapsed_ms: u64,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     pub blocked_reason: Option<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
@@ -1211,7 +1225,41 @@ pub struct Session {
     pub ended_at: Option<String>,
     pub timeline_cursor: String,
     #[serde(default)]
+    pub runtime_incarnation: Option<String>,
+    #[serde(default)]
     pub usage: Option<UsageSummary>,
+}
+
+/// Latest canonical resource observation; not an operational resource projection.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResourceObservation {
+    pub id: String,
+    pub kind: String,
+    pub facts: BTreeMap<String, Value>,
+    pub observed_at: String,
+    pub opened_by: Option<String>,
+    pub opened_by_run: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ResourcesFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_prefix: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResourcesPage {
+    pub kind: String,
+    pub collection: String,
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<ResourceObservation>,
+    pub page: PageInfo,
+    #[serde(default)]
+    pub sync: Option<SyncNotice>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2989,12 +3037,16 @@ pub struct TerminalLine {
     /// Styled runs from column zero. Their text, without trailing spaces, is `text`.
     #[serde(default)]
     pub runs: Vec<TerminalRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapped: Option<bool>,
     pub redacted: bool,
     pub truncated: bool,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct TerminalRun {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cells: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fg: Option<TerminalColor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3009,6 +3061,14 @@ pub struct TerminalRun {
     pub underline: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inverse: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strikethrough: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<TerminalLink>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TerminalLink {
+    pub uri: String,
 }
 /// A palette index (0-255) or a `#rrggbb` color. An absent color is the terminal default.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3046,6 +3106,8 @@ pub struct TerminalModes {
     pub focus_events: bool,
     pub mouse_tracking: String,
     pub mouse_encoding: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kitty_keyboard: Option<u32>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TerminalScreen {

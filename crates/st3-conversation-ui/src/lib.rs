@@ -22,7 +22,7 @@ pub use conversation::{Cache, Density, bundle_id};
 pub use entry::{Body, Entry, MailImage, ToolState};
 pub use pane::{PaneIntent, PaneState, Selection, State};
 pub use theme::Theme;
-pub use timeline::{Frame, Timeline};
+pub use timeline::{Frame, Older, Timeline};
 
 #[cfg(test)]
 mod tests;
