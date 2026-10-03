@@ -2317,6 +2317,8 @@ impl Ui {
         {
             return true;
         }
+        // The conversation that typing reaches, if one has the focus.
+        let conversation = self.composing_agent();
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -2354,7 +2356,48 @@ impl Ui {
         let current = glass.layout.groups()[glass.focus].current;
         let subject = glass.focused().is_some();
         let quiet = !self.editing && self.new_mission.is_none() && self.chat.is_none();
+        // Letters type, chords command (Nathan, 2026-10-03): in a conversation tab a plain
+        // printable key opens its message box and types itself, the first key included. Keys
+        // that act are chords below, so a sentence never starts by running a command.
+        if quiet
+            && self.confirm.is_none()
+            && self.popover.is_none()
+            && !control
+            && !alt
+            && !command
+            && let KeyCode::Char(character) = key.code
+            && let Some(agent) = conversation.clone()
+        {
+            let empty = self
+                .conversation_state
+                .drafts
+                .get(&agent)
+                .is_none_or(|draft| draft.is_empty());
+            if character == '?' && empty {
+                self.help = true;
+                return true;
+            }
+            self.editing = true;
+            // The message box takes this key, as it does every key while typing.
+            return false;
+        }
         match key.code {
+            KeyCode::Char('q') if control => self.quit = true,
+            KeyCode::Char('f') if control && conversation.is_some() => {
+                if let Some(agent) = &conversation {
+                    self.find_in(agent, "");
+                }
+            }
+            KeyCode::Char('o') if alt && conversation.is_some() => self.toggle_all_tools(),
+            KeyCode::Char('O') if alt && conversation.is_some() => self.toggle_simple(),
+            KeyCode::Char('i') if alt && conversation.is_some() => self.toggle_details(),
+            KeyCode::Char(letter @ ('r' | 'x')) if alt && conversation.is_some() && self.live => {
+                match self.undelivered() {
+                    Some(entry) if letter == 'r' => self.effects.push(Effect::Resend { entry }),
+                    Some(entry) => self.effects.push(Effect::Forget { entry }),
+                    None => {}
+                }
+            }
             KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
             KeyCode::Char('s') if control => self.toggle_sidebar(),
             // Home over the glass, and away again; in a text box Ctrl+H stays backspace.
@@ -3484,9 +3527,10 @@ mod tests {
 
         press(&mut ui, KeyCode::Char('1'), KeyModifiers::ALT);
         assert_eq!(tabs(&ui).1, 0);
-        typed(&mut ui, "]");
+        // ] and [ type in a conversation tab; Ctrl+PgDn/PgUp move between tabs.
+        press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 1);
-        typed(&mut ui, "[");
+        press(&mut ui, KeyCode::PageUp, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 0);
         press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 1);
@@ -4056,7 +4100,7 @@ mod tests {
             Pane::Agent(Some("agent/example/atlas/builder".into())),
             Open::Tab,
         );
-        typed(&mut ui, "c");
+        // In a conversation tab the first letter starts the message.
         typed(&mut ui, "ship it");
         ctrl(&mut ui, 'a');
         typed(&mut ui, "please ");
@@ -4076,6 +4120,56 @@ mod tests {
     }
 
     #[test]
+    fn in_a_conversation_letters_type_and_commands_are_chords() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        // Nathan, 2026-10-03: "letters type, chords command". A sentence that starts with a
+        // command letter is a sentence, not the command.
+        typed(&mut ui, "quite so");
+        assert!(!ui.quit);
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "quite so"
+        );
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        let shown = screen(&ui);
+        assert!(
+            shown.contains("type message")
+                && shown.contains("alt+i details")
+                && shown.contains("tab tabs"),
+            "the footer names the chords: {shown}"
+        );
+        // Leaving the box keeps the draft; the next letter goes on typing into it.
+        typed(&mut ui, "!");
+        assert!(ui.editing);
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "quite so!"
+        );
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        ui.conversation_state
+            .drafts
+            .remove("agent/example/atlas/builder");
+        // ? on an empty box is help.
+        typed(&mut ui, "?");
+        assert!(ui.help && !ui.editing);
+        ui.help = false;
+        // The commands are chords.
+        let folded = ui.conversation_state.expanded.clone();
+        press(&mut ui, KeyCode::Char('o'), KeyModifiers::ALT);
+        assert!(!ui.editing);
+        assert_ne!(
+            ui.conversation_state.expanded, folded,
+            "alt+o opens the tool calls"
+        );
+        ctrl(&mut ui, 'q');
+        assert!(ui.quit);
+    }
+
+    #[test]
     fn typing_owns_the_editing_keys_and_enter_keeps_the_input() {
         let mut ui = glass();
         ui.open_in_glass(
@@ -4083,9 +4177,12 @@ mod tests {
             Open::Tab,
         );
         ui.live = true;
-        typed(&mut ui, "c");
-        assert!(ui.editing);
-        typed(&mut ui, "ship it now");
+        typed(&mut ui, "s");
+        assert!(
+            ui.editing,
+            "a letter opens the message box and types itself"
+        );
+        typed(&mut ui, "hip it now");
         ctrl(&mut ui, 'w');
         assert_eq!(
             tabs(&ui).2,
@@ -4173,8 +4270,9 @@ mod tests {
             });
         }
         assert!(screen(&ui).contains("unconfirmed, st did not answer"));
-        typed(&mut ui, "r");
-        typed(&mut ui, "x");
+        // Letters type in a conversation: resending and clearing are chords.
+        press(&mut ui, KeyCode::Char('r'), KeyModifiers::ALT);
+        press(&mut ui, KeyCode::Char('x'), KeyModifiers::ALT);
         assert_eq!(
             std::mem::take(&mut ui.effects),
             [
@@ -4278,7 +4376,7 @@ mod tests {
         // A word the demo conversation says more than once.
         let word = "the";
         assert!(said(&ui).len() > 1);
-        typed(&mut ui, "/");
+        ctrl(&mut ui, 'f');
         typed(&mut ui, word);
         let shown = screen(&ui);
         let find = ui.find.as_ref().unwrap();
@@ -4949,8 +5047,10 @@ mod tests {
         typed(&mut ui, "atlas builder");
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
 
-        // A new glass by name, from the palette's glasses section.
-        typed(&mut ui, "5");
+        // A new glass by name, from the palette's glasses section (a digit types in a
+        // conversation tab, so the palette opens first).
+        ctrl(&mut ui, 'k');
+        press(&mut ui, KeyCode::Char('5'), KeyModifiers::ALT);
         typed(&mut ui, "review");
         let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
         let new = ui
