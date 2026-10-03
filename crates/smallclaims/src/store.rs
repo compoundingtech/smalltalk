@@ -6450,29 +6450,92 @@ pub fn expected_operations(
     Ok(grouped
         .into_iter()
         .map(|(operation_id, stored_claims)| {
-            let mut claims = stored_claims.clone();
-            claims.extend(dropped.remove(&operation_id).unwrap_or_default());
-            claims.sort();
-            let request_digest = claims[0].0.clone();
-            let state = if claims.iter().all(|(digest, _)| digest == &request_digest) {
-                "active"
-            } else {
-                "conflict"
-            };
-            let canonical_claim_id = stored_claims
-                .iter()
-                .filter(|(digest, _)| digest == &request_digest)
-                .map(|(_, claim)| claim)
-                .min()
-                .or_else(|| stored_claims.iter().map(|(_, claim)| claim).min())
-                .expect("an operation has at least one stored claim")
-                .clone();
-            (
-                operation_id,
-                (request_digest, canonical_claim_id, state.into()),
-            )
+            let dropped = dropped.remove(&operation_id).unwrap_or_default();
+            (operation_id, operation_row(&stored_claims, dropped))
         })
         .collect())
+}
+
+/// One operation's row from its stored claims and the claims a checkpoint dropped, each as
+/// `(request digest, claim)`: `(request digest, canonical claim, state)`.
+fn operation_row(
+    stored_claims: &[(String, String)],
+    dropped: Vec<(String, String)>,
+) -> (String, String, String) {
+    let mut claims = stored_claims.to_vec();
+    claims.extend(dropped);
+    claims.sort();
+    let request_digest = claims[0].0.clone();
+    let state = if claims.iter().all(|(digest, _)| digest == &request_digest) {
+        "active"
+    } else {
+        "conflict"
+    };
+    let canonical_claim_id = stored_claims
+        .iter()
+        .filter(|(digest, _)| digest == &request_digest)
+        .map(|(_, claim)| claim)
+        .min()
+        .or_else(|| stored_claims.iter().map(|(_, claim)| claim).min())
+        .expect("an operation has at least one stored claim")
+        .clone();
+    (request_digest, canonical_claim_id, state.into())
+}
+
+/// What `expected_operations` holds for one operation, read through the operation index.
+pub fn expected_operation(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT id, body FROM claims
+         WHERE json_extract(body, '$._operation.id')=?1
+           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
+         ORDER BY id",
+    )?;
+    let mut stored = Vec::new();
+    for row in statement.query_map([operation_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (claim_id, body) = row?;
+        let body: Value = serde_json::from_str(&body)?;
+        if let Some((_, request_digest)) = operation_parts(&body) {
+            stored.push((request_digest.to_owned(), claim_id));
+        }
+    }
+    if stored.is_empty() {
+        return Ok(None);
+    }
+    let dropped = checkpoint::checkpointed_operation(connection, operation_id)?
+        .into_iter()
+        .filter(|(_, claim_id)| !stored.iter().any(|(_, stored)| stored == claim_id))
+        .collect();
+    Ok(Some(operation_row(&stored, dropped)))
+}
+
+/// Bring the rows of `operation_ids` to what their claims say, and leave every other row alone.
+/// Returns how many rows it changed.
+pub fn repair_operations_tx(
+    transaction: &Transaction<'_>,
+    operation_ids: &[String],
+) -> Result<usize> {
+    let mut changed = 0;
+    for operation_id in operation_ids {
+        changed += match expected_operation(transaction, operation_id)? {
+            Some((request_digest, canonical_claim_id, state)) => transaction.execute(
+                "INSERT INTO operations(id, request_digest, canonical_claim_id, state)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET request_digest=excluded.request_digest,
+                    canonical_claim_id=excluded.canonical_claim_id, state=excluded.state
+                 WHERE request_digest IS NOT excluded.request_digest
+                    OR canonical_claim_id IS NOT excluded.canonical_claim_id
+                    OR state IS NOT excluded.state",
+                params![operation_id, request_digest, canonical_claim_id, state],
+            )?,
+            None => transaction.execute("DELETE FROM operations WHERE id=?1", [operation_id])?,
+        };
+    }
+    Ok(changed)
 }
 
 pub fn rebuild_operations_tx(transaction: &Transaction<'_>) -> Result<()> {
@@ -6654,10 +6717,13 @@ pub fn select_replicated_document(
         if canonical::claim_key(transaction, &claim.id).map_err(internal)?
             < canonical::claim_key(transaction, &previous).map_err(internal)?
         {
+            // The earliest binding also gives the version its arrival index, as a replay in
+            // canonical order would, so the order bindings arrive in never matters.
             transaction
                 .execute(
-                    "UPDATE documents SET binding_claim_id=?3,binding_key=?4 WHERE name=?1 AND hash=?2",
-                    params![name, hash, claim.id, binding_key],
+                    "UPDATE documents SET binding_claim_id=?3,binding_key=?4,created_index=?5
+                     WHERE name=?1 AND hash=?2",
+                    params![name, hash, claim.id, binding_key, created_index],
                 )
                 .map_err(internal)?;
         }

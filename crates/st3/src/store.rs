@@ -1015,6 +1015,9 @@ pub(crate) struct MissionGateRunner {
     pub retired: bool,
 }
 
+/// The claims of one idempotency key used for different requests, each as `(subject, writer)`.
+pub type IdempotencyConflict = Vec<(String, String)>;
+
 /// smalltalk's store: the graph store, which it derefs to, and smalltalk's runtime, which
 /// keeps the caches of its projections and plugs its claim kinds into the graph.
 pub struct Store {
@@ -2229,14 +2232,50 @@ impl Store {
     /// whether it had to. A start no longer rebuilds it; the daemon checks off the request path
     /// once it serves.
     pub fn repair_operation_projection_drift(&self) -> Result<bool> {
-        if self.operation_projection_drift()?.is_empty() {
+        // Finding the drift reads every operation, on a read connection. Repairing it writes
+        // only the drifted rows: rebuilding the whole table held the only writer for a minute
+        // and more on a populated store, stalling every write behind it.
+        let drift = self.operation_projection_drift()?;
+        if drift.is_empty() {
             return Ok(false);
         }
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
-        rebuild_operations_tx(&transaction)?;
+        repair_operations_tx(&transaction, &drift)?;
         transaction.commit()?;
         Ok(true)
+    }
+
+    /// Idempotency keys that two requests with different content used, which only members
+    /// that accepted them apart, as during a partition, can produce: how many there are, and up
+    /// to `limit` of them with the subject and writer of each claim. Both claims stand.
+    pub fn idempotency_conflicts(&self, limit: usize) -> Result<(u64, Vec<IdempotencyConflict>)> {
+        let connection = self.readers.get();
+        let count: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE state='conflict'",
+            [],
+            |row| row.get(0),
+        )?;
+        let operations = connection
+            .prepare_cached(
+                "SELECT id FROM operations INDEXED BY operations_conflict_index
+                 WHERE state='conflict' ORDER BY id LIMIT ?1",
+            )?
+            .query_map([limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut claims = connection.prepare_cached(
+            "SELECT subject, origin FROM claims
+             WHERE json_extract(body, '$._operation.id')=?1 ORDER BY subject, origin",
+        )?;
+        let mut conflicts = Vec::new();
+        for operation in operations {
+            conflicts.push(
+                claims
+                    .query_map([&operation], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        Ok((count, conflicts))
     }
 
     pub fn operation_projection_drift(&self) -> Result<Vec<String>> {
@@ -20876,6 +20915,105 @@ fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() 
     );
 }
 
+/// A document republished all day, such as a probe report, arrives from its writer after this
+/// node's own newer claims (#898). Each binding keeps the earliest claim of its version whatever
+/// order bindings arrive in, so it extends the projection without rebuilding every version, and
+/// the result is the one a replay from nothing gives.
+#[cfg(test)]
+#[test]
+fn a_document_binding_that_arrives_out_of_order_does_not_rebuild_every_version() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let sync = || {
+        let response = source
+            .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.project_replication_backlog().unwrap();
+    };
+    let publish = |version: usize| {
+        source
+            .put_document(
+                "doc/probe-report",
+                format!("An invented probe report, version {version}.").as_bytes(),
+                &source.latest_document_token("doc/probe-report").unwrap(),
+                &format!("probe-report-{version}"),
+            )
+            .unwrap();
+    };
+    for version in 0..40 {
+        publish(version);
+    }
+    sync();
+
+    // The target writes a claim of its own that sorts after the next binding.
+    let accepted_at = source
+        .connection
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT MAX(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as u128
+        + 10;
+    target.set_write_clock_at(accepted_at + 10).unwrap();
+    target
+        .append_claim(&ClaimInput {
+            subject: "custom/target/newer".into(),
+            kind: "custom.target.note".into(),
+            actor: Some("person/tester".into()),
+            fields: BTreeMap::new(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    target.project_replication_backlog().unwrap();
+    source.set_write_clock_at(accepted_at).unwrap();
+    publish(40);
+    FULL_REPLAYS.with(|replays| replays.set(0));
+    BASE_REBUILDS.with(|rebuilds| rebuilds.set(0));
+    sync();
+    assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+    assert_eq!(BASE_REBUILDS.with(std::cell::Cell::get), 0);
+
+    let documents = |store: &Store| {
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .prepare(
+                "SELECT name, hash, created_index, binding_claim_id, binding_key FROM documents
+                 ORDER BY name, hash",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let incremental = documents(&target);
+    assert_eq!(incremental.len(), 41);
+    target.replay_replication_graph().unwrap();
+    assert_eq!(documents(&target), incremental);
+}
+
 fn subscription_condition_matches(condition: &SubscriptionConditionSpec, facts: &Value) -> bool {
     match condition {
         SubscriptionConditionSpec::Field {
@@ -21496,6 +21634,12 @@ fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), 
     reapply_local_work_lease_renewals_tx(transaction)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Desired subjects, documents and missions this thread rebuilt from their own claims.
+    static BASE_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Rebuild one desired subject, document or mission from its own claims in the replay's order.
 fn rebuild_base_aggregate_tx(
     transaction: &Transaction<'_>,
@@ -21508,6 +21652,8 @@ fn rebuild_base_aggregate_tx(
         Aggregate::RunTree(_) => return Ok(()),
     };
     crate::profile::note(&format!("projection: {kind} subject rebuilt"));
+    #[cfg(test)]
+    BASE_REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get() + 1));
     match aggregate {
         Aggregate::Desired(subject) => {
             transaction
@@ -21701,7 +21847,10 @@ fn try_project_simple_replication_tx(
                 .map_err(internal)?;
             // A claim about a run tree not projected yet waits in the claim log: the claim that
             // creates its run or generation rebuilds the tree with it.
-            if (out_of_order || repaired)
+            // A document keeps the earliest binding of each version, whatever order the
+            // bindings arrive in, so only a repair rebuilds one. Rebuilding every version of a
+            // document that is republished all day costs more with each version.
+            if ((out_of_order && claim.kind != "doc.bound") || repaired)
                 && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
             {
                 dirty.insert(aggregate);
@@ -26931,6 +27080,82 @@ agent "test/empty" { command "true" }
             "{}",
             old.added_since_measured_envelopes
         );
+    }
+
+    /// A start repairs operation rows that drifted (#898). It rewrites only those rows: rebuilding
+    /// the whole table held the only writer for a minute and more on a populated store.
+    #[test]
+    fn an_operation_drift_repair_rewrites_only_the_drifted_rows() {
+        let store = Store::open_memory("node").unwrap();
+        for index in 0..200 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/drift/{index}"),
+                    kind: "custom.drift.note".into(),
+                    actor: Some("person/tester".into()),
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("drift-{index}")),
+                })
+                .unwrap();
+        }
+        let (rows, ids) = {
+            let connection = store.connection.lock().unwrap();
+            let ids = connection
+                .prepare("SELECT id FROM operations ORDER BY id LIMIT 2")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let rows: i64 = connection
+                .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+                .unwrap();
+            (rows, ids)
+        };
+        assert!(rows >= 200, "{rows} operations");
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        // One row changed, one row lost, and one row that no claim backs.
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE operations SET state='conflict' WHERE id=?1",
+                    [&ids[0]],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM operations WHERE id=?1", [&ids[1]])
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO operations(id, request_digest, canonical_claim_id, state)
+                     SELECT 'op/invented-stray', 'digest', canonical_claim_id, 'active'
+                     FROM operations WHERE id=?1",
+                    [&ids[0]],
+                )
+                .unwrap();
+        }
+        assert_eq!(store.operation_projection_drift().unwrap().len(), 3);
+        // Rows written by the repair, besides the ones its triggers write.
+        let operation_rows = || {
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = operation_rows();
+        assert!(store.repair_operation_projection_drift().unwrap());
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        let written = operation_rows() - before;
+        assert!(
+            written <= 3 * 4,
+            "the repair wrote {written} rows for 3 drifted ones"
+        );
+        assert!(!store.repair_operation_projection_drift().unwrap());
     }
 
     #[test]

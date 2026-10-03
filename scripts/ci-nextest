@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Select Cargo targets before building; nextest's ci filter only selects tests after the build.
+set -euo pipefail
+action=${1:?usage: scripts/ci-nextest run|list [nextest options]}
+shift
+case "$action" in
+  run|list) ;;
+  *) echo "unknown nextest action: $action" >&2; exit 2 ;;
+esac
+
+# Use the same selections for --no-run and execution, on Linux and macOS. Keep both groups
+# running after a test failure, as the ci profile does with fail-fast = false.
+status=0
+cargo nextest "$action" --workspace --exclude st2 --locked --profile ci "$@" || status=$?
+# These are the st2 targets with selected tests. Its lib/bin unit tests, event_e2e and
+# resource_profile_supervisor_e2e are entirely excluded by the ci profile. The integration
+# target is only partly filtered, so it (and its required st2 executable) must still build.
+# When adding a st2 test target, update this list alongside .config/nextest.toml.
+cargo nextest "$action" -p st2 --test integration --test agent_resource --test driver_expansion \
+  --locked --profile ci "$@" || status=$?
+exit "$status"

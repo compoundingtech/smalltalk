@@ -29,10 +29,15 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+sys.dont_write_bytecode = True
+from st_boundary import fresh_seat_findings
+
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
 SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend")
 RUN_ID = "c1"
@@ -153,7 +158,7 @@ client_gateway_socket = "{root / 'run/client.sock'}"
         return subprocess.run(["pty", *args], env={**self.env, "PTY_ROOT": str(self.root / "pty")},
                               capture_output=True, text=True)
 
-    def seat_processes(self):
+    def seat_processes(self, with_environment=False):
         """Every process launched for a seat, by this daemon's private endpoint."""
         rows = []
         for proc in Path("/proc").glob("[0-9]*"):
@@ -164,7 +169,10 @@ client_gateway_socket = "{root / 'run/client.sock'}"
                 if not any(item.startswith(b"ST_AGENT=agent/") for item in environ):
                     continue
                 argv = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
-                rows.append((int(proc.name), argv))
+                row = (int(proc.name), argv)
+                if with_environment:
+                    row += ([value.decode(errors="replace") for value in environ],)
+                rows.append(row)
             except (OSError, UnicodeError):
                 pass
         return rows
@@ -532,6 +540,10 @@ def run(args, root, evidence):
             # stopped; `suspend` checks its spool while the resumed seat runs.
             if args.scenario != "suspend":
                 wait_drained(spools, args.bound)
+            processes = node.seat_processes(with_environment=True)
+            violations = list(fresh_seat_findings(root, processes))
+            if violations:
+                fail("fresh seat boundary: " + "; ".join(violations))
         return {"verdict": "pass", "harness": args.harness, "scenario": args.scenario,
                 "seconds_to_boot": seats.timings, "catalog_files": len(catalogs_after),
                 "harness_record_files": len(records), "observation_spools": len(spools)}

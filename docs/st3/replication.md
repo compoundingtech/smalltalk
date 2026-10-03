@@ -136,6 +136,12 @@ Operations are logical rows over the hot operation table and operation facts ret
 checkpoint tombstones. Trimming a claim changes its storage representation, preserving its
 logical operation and claim-source digests. The shuffle test compares that logical union.
 
+An idempotency key names an operation. A member that holds a claim for a key answers a retry with
+that claim and refuses the key for a different request. Two members apart, as during a partition,
+can each accept the same key for different requests: once they meet, both claims stand, the
+operation is a `conflict`, a retry with the key is refused as `idempotency-conflict`, and
+`st doctor`'s `idempotency-keys` check names the subjects and writers.
+
 SQLite triggers update per-table row counts and 512-bit modular sums of domain-separated
 SHA-512 row hashes in the row's own transaction. Insert, update, delete, replacement, savepoint
 rollback and commit therefore change rows and cached digest state together. SHA-256 commits the

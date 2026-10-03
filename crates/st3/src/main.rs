@@ -2844,7 +2844,9 @@ struct ClaimArgs {
     fields: Vec<(String, Value)>,
     #[arg(long)]
     evidence: Vec<String>,
-    /// Return the same logical result when this graph-wide key is retried.
+    /// Return the same logical result when this key is retried. A member refuses the key for a
+    /// different request once it holds the first; members apart during a partition can each
+    /// accept it, and then both claims stand and `st doctor` names them.
     #[arg(long)]
     idempotency_key: Option<String>,
 }

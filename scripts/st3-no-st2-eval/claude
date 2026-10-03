@@ -121,13 +121,13 @@ if server:
 receipt("mcp-server", present=bool(server))
 
 hooks("SessionStart", {"source": "startup", "model": "claude-stub-model"})
-append("user", "no-st2 transcript probe")
-append("assistant", "no-st2 transcript answer")
+append("user", "native-seat transcript probe")
+append("assistant", "native-seat transcript answer")
 status_line()
 if channel:
     channel.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
     channel.stdin.flush()
-turn("no-st2 first turn", "no-st2 first answer")
+turn("native-seat first turn", "native-seat first answer")
 
 notices = []
 lock = threading.Lock()
@@ -165,7 +165,7 @@ while running:
         content = notice.get("content", "")
         receipt("channel", content=content, meta=notice.get("meta"))
         reference = re.search(r"message/[0-9a-f]+", content)
-        turn(content, "no-st2 read the message")
+        turn(content, "native-seat read the message")
         if reference:
             result = subprocess.run([os.environ["ST3_BIN"], "conversations", "read", reference.group(0),
                                      "--as", os.environ["ST_AGENT"], "--json"],
