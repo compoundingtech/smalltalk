@@ -3375,6 +3375,8 @@ struct MessageReferenceArgs {
 
 #[derive(Args)]
 struct ReviewArgs {
+    /// The gate to answer: its `attention/...` ID from `st attention ls`, or the step, mission
+    /// or loop run (`step-run/...`, `mission-run/...`, `loop-run/...`) that owns it.
     target: String,
     #[arg(long)]
     reason: Option<String>,
@@ -3384,6 +3386,8 @@ struct ReviewArgs {
 
 #[derive(Args)]
 struct FeedbackReviewArgs {
+    /// The feedback gate to answer: its `attention/...` ID from `st attention ls`, or the
+    /// step run that owns it.
     target: String,
     #[arg(long)]
     reason: String,

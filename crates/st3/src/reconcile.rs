@@ -5843,24 +5843,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             );
         }
         if loop_spec.for_each.is_some() {
-            return self.evaluate_for_each_loop(
-                run,
-                step,
-                view,
-                loop_spec,
-                &loop_subject,
-                &variables,
-            );
+            return self.evaluate_for_each_loop(run, view, loop_spec, &loop_subject, &variables);
         }
         if loop_spec.candidates.is_some() {
-            return self.evaluate_candidate_loop(
-                run,
-                step,
-                view,
-                loop_spec,
-                &loop_subject,
-                &variables,
-            );
+            return self.evaluate_candidate_loop(run, view, loop_spec, &loop_subject, &variables);
         }
         let dispatch = self.loop_dispatch_count(&loop_subject, view.attempt, None, None)?;
         let base_key = format!("loop-round:{}:{}", view.subject, view.attempt);
@@ -5993,7 +5979,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             "completed" => {
                 let metrics = match self.evaluate_loop_metrics(
                     run,
-                    step,
                     view,
                     loop_spec,
                     &loop_subject,
@@ -6076,7 +6061,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         run,
                         &loop_subject,
                         &loop_spec.id,
-                        &step.spec.definition_hash,
+                        &view.definition_hash,
                         view.attempt,
                         gate,
                         &variables,
@@ -6159,7 +6144,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn evaluate_loop_metrics(
         &self,
         run: &MissionRunView,
-        step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
         loop_spec: &LoopSpec,
         loop_subject: &str,
@@ -6180,7 +6164,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         run,
                         loop_subject,
                         &loop_spec.id,
-                        &step.spec.definition_hash,
+                        &view.definition_hash,
                         view.attempt,
                         gate,
                         variables,
@@ -6591,7 +6575,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn evaluate_for_each_loop(
         &self,
         run: &MissionRunView,
-        step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
         loop_spec: &LoopSpec,
         loop_subject: &str,
@@ -6722,7 +6705,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                         variables.insert("ST_LOOP_ITEM_ID".into(), id.into());
                         let metrics = match self.evaluate_loop_metrics(
                             run,
-                            step,
                             &item_view,
                             loop_spec,
                             &format!("{loop_subject}/item/{id}"),
@@ -6825,7 +6807,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn evaluate_candidate_loop(
         &self,
         run: &MissionRunView,
-        step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
         loop_spec: &LoopSpec,
         loop_subject: &str,
@@ -6918,7 +6899,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                         variables.insert("candidate.index".into(), candidate.to_string());
                         let metrics = match self.evaluate_loop_metrics(
                             run,
-                            step,
                             view,
                             loop_spec,
                             &format!(
@@ -8601,21 +8581,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &request_hash[..24]
             )),
         })?;
-        let decision = self.store.latest_claim(&operation, Some("gate.result"))?;
+        // The reviewer's answer, read by the rule that takes an answered review off the
+        // reviewers' list: a later result on the operation (another actor's, an unbound one)
+        // cannot hide it and leave a gate nobody can answer.
+        let decision = self.store.human_review_answer(&request.id)?;
         match decision.as_ref().and_then(|claim| {
-            (claim.actor.as_deref() == Some(reviewer)
-                && claim
-                    .body
-                    .pointer("/fields/request")
-                    .and_then(Value::as_str)
-                    == Some(request.id.as_str()))
-            .then(|| {
-                claim
-                    .body
-                    .pointer("/fields/verdict")
-                    .and_then(Value::as_str)
-            })
-            .flatten()
+            claim
+                .body
+                .pointer("/fields/verdict")
+                .and_then(Value::as_str)
         }) {
             Some("pass") => Ok(GateOutcome::Pass),
             Some("feedback") if mode == "feedback" => {
@@ -15124,6 +15098,80 @@ version 2
                 .as_deref()
                 .unwrap_or_default()
                 .contains("The proof needs a source.")
+        );
+    }
+
+    /// The reviewers' list and the gate read the same answer: once the reviewer has answered a
+    /// request, a later result on the same operation (another actor's, an unbound one) neither
+    /// hides that answer from the gate nor puts the review back on the list.
+    #[test]
+    fn a_later_result_does_not_hide_the_reviewers_answer_from_the_gate() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+mission "review" state="ready" {
+  goal "Complete mission review."
+  step "approval" {
+    agentless
+    gate "human-review" type="human" { reviewer "person/alex" }
+  }
+}
+"#,
+            "review-later-result",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "review".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "review-later-result-run".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].subject.clone();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let request = store
+            .gate_request_for_owner(&step)
+            .unwrap()
+            .expect("the human review was not requested");
+        let result = |actor: &str, key: &str| ClaimInput {
+            subject: request.subject.clone(),
+            kind: "gate.result".into(),
+            actor: Some(actor.into()),
+            fields: BTreeMap::from([
+                ("verdict".into(), Value::String("pass".into())),
+                ("request".into(), Value::String(request.id.clone())),
+            ]),
+            evidence: vec![request.id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(key.into()),
+        };
+        store
+            .append_claim(&result("person/alex", "the-reviewer"))
+            .unwrap();
+        store
+            .append_claim(&result("person/someone-else", "someone-else"))
+            .unwrap();
+        assert!(
+            store.pending_human_reviews(None).unwrap().is_empty(),
+            "the reviewer answered"
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.step_run(&step).unwrap().unwrap().status,
+            "completed",
+            "the gate waited on an answer the reviewer can no longer give"
         );
     }
 

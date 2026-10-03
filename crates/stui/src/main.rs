@@ -1318,6 +1318,7 @@ fn action_label(action: &str) -> String {
         "work.done" => "Complete step [c]".into(),
         "review.approve" | "launch.approve" => "Approve [a]".into(),
         "review.reject" => "Reject [j]".into(),
+        "review.request-changes" => "Request changes [r]".into(),
         "launch.cancel" => "Cancel [d]".into(),
         "mission.approve-revision" => "Approve revision [CLI]".into(),
         "mission.cancel-revision" => "Cancel revision [CLI]".into(),
@@ -1330,6 +1331,7 @@ fn action_key(action: &str) -> Option<char> {
         "work.done" => Some('c'),
         "review.approve" | "launch.approve" => Some('a'),
         "review.reject" => Some('j'),
+        "review.request-changes" => Some('r'),
         "launch.cancel" => Some('d'),
         "message.read" => Some('m'),
         _ => None,
@@ -1935,24 +1937,181 @@ async fn run_attention_action(
     reason: Option<String>,
 ) -> Result<String> {
     anyhow::ensure!(app.live_ready, "Reconnect before acting");
-    let outcome =
-        attention_action(client, &app.model.actor, attention_id, action, reason, None).await?;
-    match app.model.reload(client).await {
-        Ok(()) => Ok(outcome),
-        Err(error) => Ok(format!("{outcome}; refresh failed: {error}")),
+    let seen = app
+        .model
+        .attention()
+        .find(|card| card.header.id == attention_id)
+        .cloned();
+    let outcome = attention_action(
+        client,
+        &app.model.actor,
+        attention_id,
+        seen.as_ref(),
+        action,
+        reason,
+        None,
+    )
+    .await;
+    // Reload either way: an answer changes the list, and a refusal means st's list moved on.
+    let reloaded = app.model.reload(client).await;
+    match (outcome, reloaded) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(outcome), Err(error)) => Ok(format!("{outcome}; refresh failed: {error}")),
+        (Err(error), _) => Err(error),
     }
 }
 
 /// Perform one attention action against fresh fences. Shared by the old and new screens.
+/// `seen` is the card as the person saw it, which names its source if st has since closed it.
 async fn attention_action(
     client: &Client,
     actor: &str,
     attention_id: &str,
+    seen: Option<&st3_client::Attention>,
     action: &str,
     reason: Option<String>,
     answer: Option<String>,
 ) -> Result<String> {
-    let current = client.attention_get(attention_id).await?;
+    let current = client.attention_get(attention_id).await;
+    act_on_attention(client, actor, current, seen, action, reason, answer).await
+}
+
+/// Act on `current`, a card as st showed it. A review whose card changed (a stale fence) or
+/// closed (not found) before the action arrived was asked again or answered: the action goes
+/// once more to the card st shows now for the same source, if it still asks, and otherwise
+/// says why not. Only once, so a gate st keeps asking again is reported, not chased.
+async fn act_on_attention(
+    client: &Client,
+    actor: &str,
+    current: std::result::Result<st3_client::Envelope<Resource>, ClientError>,
+    seen: Option<&st3_client::Attention>,
+    action: &str,
+    reason: Option<String>,
+    answer: Option<String>,
+) -> Result<String> {
+    let mut source = seen.map(|card| (card.source_id.clone(), card.attention_kind.clone()));
+    let first = match current {
+        Ok(current) => {
+            if let Resource::Attention(card) = &current.value {
+                source = Some((card.source_id.clone(), card.attention_kind.clone()));
+            }
+            act_on_card(
+                client,
+                actor,
+                current,
+                action,
+                reason.clone(),
+                answer.clone(),
+            )
+            .await
+        }
+        Err(error) => Err(error.into()),
+    };
+    match (first, &source) {
+        (Err(error), Some((_, kind))) if kind == "human-gate" && card_moved_on(&error) => {}
+        (outcome, _) => return outcome,
+    }
+    let (source, kind) = source.expect("a review names its source");
+    match current_card(client, actor, &source, &kind).await? {
+        // The person answers what they read: a card that now says something else, such as a
+        // new attempt's work, is shown again instead of answered on their behalf.
+        Some(card)
+            if seen.is_some_and(|seen| {
+                matches!(&card.value, Resource::Attention(now) if (&now.title, &now.detail, &now.what, &now.because)
+                    != (&seen.title, &seen.detail, &seen.what, &seen.because))
+            }) =>
+        {
+            Err(anyhow::anyhow!(
+                "This review changed since you read it; read it again before you answer"
+            ))
+        }
+        Some(card) => act_on_card(client, actor, card, action, reason, answer).await,
+        // The person reads why, not the stale fence that found it out.
+        None => Err(anyhow::anyhow!(no_longer_asked(client, &source).await)),
+    }
+}
+
+/// Whether an action failed because its card is no longer the one st shows: st asked its
+/// source again (a stale fence) or closed it (not found).
+fn card_moved_on(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<ClientError>())
+        .any(|error| {
+            matches!(
+                error,
+                ClientError::Api(ErrorCode::StaleFence | ErrorCode::NotFound, ..)
+            )
+        })
+}
+
+/// The card st shows `actor` now for `source`, of `kind`, with the snapshot it was read at.
+async fn current_card(
+    client: &Client,
+    actor: &str,
+    source: &str,
+    kind: &str,
+) -> Result<Option<st3_client::Envelope<Resource>>> {
+    let mut cursor = None;
+    loop {
+        let page = client
+            .attention_list(cursor.as_deref(), Some(100), false)
+            .await?;
+        let card = page.value.items.iter().find(|item| {
+            matches!(item, Resource::Attention(card)
+                if card.source_id == source && card.attention_kind == kind
+                    && card.person_id == actor && card.state != "resolved")
+        });
+        if let Some(card) = card {
+            return Ok(Some(st3_client::Envelope {
+                api_version: page.api_version,
+                request_id: page.request_id,
+                snapshot: page.snapshot,
+                value: card.clone(),
+            }));
+        }
+        match page.value.page.next_cursor {
+            Some(next) if page.value.page.has_more => cursor = Some(next),
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Why st no longer asks the person about `source`, from its step's state when it has one.
+async fn no_longer_asked(client: &Client, source: &str) -> String {
+    let step = match client.work_get(source).await {
+        Ok(work) => match work.value {
+            Resource::Work(work) => Some(work.state),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    match step.as_deref() {
+        Some("completed") => {
+            "This review is no longer asked: the step is completed, so it was already answered"
+                .into()
+        }
+        Some(state @ ("failed" | "cancelled")) => {
+            format!("This review is no longer asked: the step is {state}")
+        }
+        Some(state) => format!(
+            "This review is no longer asked: the step is {state}; a new card appears if st asks again"
+        ),
+        None => {
+            "This review is no longer asked: it was answered, or what it reviewed moved on".into()
+        }
+    }
+}
+
+/// Perform `action` on `current`, a card as st showed it, fenced on that card.
+async fn act_on_card(
+    client: &Client,
+    actor: &str,
+    current: st3_client::Envelope<Resource>,
+    action: &str,
+    reason: Option<String>,
+    answer: Option<String>,
+) -> Result<String> {
     let Resource::Attention(attention) = &current.value else {
         anyhow::bail!("Attention changed; refresh and choose again");
     };
@@ -2024,6 +2183,20 @@ async fn attention_action(
         "review.reject" => {
             client
                 .review_reject(
+                    id,
+                    idem,
+                    fence,
+                    TargetParameters {
+                        target_id: source,
+                        reason,
+                        ..Default::default()
+                    },
+                )
+                .await?
+        }
+        "review.request-changes" => {
+            client
+                .review_request_changes(
                     id,
                     idem,
                     fence,
@@ -4325,5 +4498,419 @@ mod tests {
         assert!(content.contains("Resolve blocker"));
         assert!(content.contains("Needs owner review"));
         assert!(content.contains("agent/queue"));
+    }
+
+    /// A runtime that starts nothing: the gate in these tests waits only on a person.
+    struct NoRuntime;
+
+    impl st3::reconcile::RuntimeControl for NoRuntime {
+        fn snapshot_ptys(&self) -> anyhow::Result<Vec<st3::reconcile::RuntimeObservation>> {
+            Ok(Vec::new())
+        }
+        fn observe_exec(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<st3::reconcile::RuntimeObservation>> {
+            Ok(None)
+        }
+        fn start(&self, _: &st3::model::MemberSpec) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn stop(&self, _: &str, _: bool, _: Option<&str>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn kill(&self, _: &str, _: bool, _: Option<&str>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn screen(&self, _: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        fn send_key(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn read_exec_log(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    /// st in this process, running a release whose one step waits on person/avery's approval.
+    struct WaitingGate {
+        _root: tempfile::TempDir,
+        store: Arc<st3::store::Store>,
+        reconciler: st3::reconcile::Reconciler<NoRuntime>,
+        client: Client,
+        step: String,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl WaitingGate {
+        async fn start() -> Self {
+            let gate = Self::serve(
+                r#"version 2
+mission "release" state="ready" {
+  goal "Ship the release once a person approves it."
+  step "approve" {
+    agentless
+    title "Approve the release"
+    gate "accept" type="human" {
+      reviewer "person/avery"
+      question "Ship this release?"
+    }
+  }
+}
+"#,
+            )
+            .await;
+            gate.reconcile_until("the gate asked", |gate| gate.request().is_some());
+            gate
+        }
+
+        /// st serving a run of the `release` mission in `source`, before any reconcile pass.
+        async fn serve(source: &str) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let node = "stui-gate";
+            let store = Arc::new(st3::store::Store::open_memory(node).unwrap());
+            let intent = st3::graph::parse_intent(source, node).unwrap();
+            let planned = store
+                .mission(
+                    &intent,
+                    st3::model::IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(&intent, &planned.subject_tokens, "release")
+                .unwrap();
+            let run = store
+                .create_mission_run(&st3::model::MissionRunRequest {
+                    mission: "release".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/avery".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: "release-run".into(),
+                })
+                .unwrap();
+            let state = st3::api::AppState {
+                store: store.clone(),
+                notify: Arc::new(tokio::sync::Notify::new()),
+                event_notify: tokio::sync::watch::channel(0_u64).0,
+                node: node.into(),
+                state_dir: root.path().into(),
+                pty_root: root.path().join("pty"),
+                pty_binary: root.path().join("unused-pty"),
+                fleet_id: None,
+                configured_peers: vec![],
+                client_relay: None,
+                native_session_home: None,
+                planner_default: st3::model::PlannerSpec::default(),
+            };
+            let socket = root.path().join("st3.sock");
+            let server_socket = socket.clone();
+            let server = tokio::spawn(async move {
+                st3::api::serve_unix(&server_socket, st3::api::router(state))
+                    .await
+                    .unwrap();
+            });
+            for _ in 0..200 {
+                if socket.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Self {
+                reconciler: st3::reconcile::Reconciler::new(
+                    store.clone(),
+                    Arc::new(NoRuntime),
+                    node.into(),
+                    Arc::new(tokio::sync::Notify::new()),
+                ),
+                client: Client::unix_as(&socket, "person/avery"),
+                step: run.steps[0].subject.clone(),
+                store,
+                server,
+                _root: root,
+            }
+        }
+
+        fn reconcile_until(&self, what: &str, done: impl Fn(&Self) -> bool) {
+            for _ in 0..30 {
+                self.reconciler.reconcile_once().unwrap();
+                if done(self) {
+                    return;
+                }
+            }
+            panic!("{what} did not happen within 30 reconcile passes");
+        }
+
+        fn request(&self) -> Option<String> {
+            self.store
+                .gate_request_for_owner(&self.step)
+                .unwrap()
+                .map(|request| request.id)
+        }
+
+        fn status(&self) -> String {
+            self.store.step_run(&self.step).unwrap().unwrap().status
+        }
+
+        /// The person's card for the gate, as stui lists it.
+        async fn card(&self) -> Option<st3_client::Attention> {
+            self.client
+                .attention_list(None, Some(50), false)
+                .await
+                .unwrap()
+                .value
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    Resource::Attention(card) if card.source_id == self.step => Some(card),
+                    _ => None,
+                })
+        }
+
+        /// The step fails and is retried, and st asks the gate again for the new attempt: the
+        /// card the person has open names a request the gate no longer waits on.
+        fn ask_again(&self) {
+            let asked = self.request();
+            assert!(
+                self.store
+                    .set_step_state(&self.step, "failed", Some("the build broke"))
+                    .unwrap()
+            );
+            assert!(self.store.retry_step(&self.step, "rebuilt", 0).unwrap());
+            self.reconcile_until("the gate asked again", |gate| gate.request() != asked);
+        }
+    }
+
+    impl Drop for WaitingGate {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn approving_a_gate_asked_again_acts_once_on_its_current_card() {
+        let gate = WaitingGate::start().await;
+        let seen = gate.card().await.expect("the gate has a card");
+        gate.ask_again();
+        let current = gate.card().await.expect("the gate was asked again");
+        assert_ne!(current.header.id, seen.header.id);
+
+        let outcome = attention_action(
+            &gate.client,
+            "person/avery",
+            &seen.header.id,
+            Some(&seen),
+            "review.approve",
+            None,
+            None,
+        )
+        .await
+        .expect("the approval did not reach the current card");
+        assert!(outcome.starts_with("Approve"), "{outcome}");
+        gate.reconcile_until("the step completed", |gate| gate.status() == "completed");
+    }
+
+    /// st asked the gate again with something the person has not read: the approval is not
+    /// carried over to it, and the card is shown again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_review_that_changed_since_it_was_read_is_shown_again_not_answered() {
+        let gate = WaitingGate::start().await;
+        let mut seen = gate.card().await.expect("the gate has a card");
+        gate.ask_again();
+        seen.detail = "what the person read before the step changed".into();
+        let error = attention_action(
+            &gate.client,
+            "person/avery",
+            &seen.header.id,
+            Some(&seen),
+            "review.approve",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a changed review was answered unread");
+        assert!(error.to_string().contains("changed since you read it"), "{error}");
+        for _ in 0..3 {
+            gate.reconciler.reconcile_once().unwrap();
+        }
+        assert_ne!(gate.status(), "completed");
+        assert!(gate.card().await.is_some(), "the review is still asked");
+    }
+
+    /// The card was read, then st asked the gate again before the approval arrived: st refuses
+    /// the stale fence, and the approval goes once more to the card st shows now.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn approving_on_a_stale_fence_retries_once_on_the_current_card() {
+        let gate = WaitingGate::start().await;
+        let seen = gate.card().await.expect("the gate has a card");
+        let read = gate.client.attention_get(&seen.header.id).await.unwrap();
+        gate.ask_again();
+
+        let outcome = act_on_attention(
+            &gate.client,
+            "person/avery",
+            Ok(read.clone()),
+            None,
+            "review.approve",
+            Some("ship it".into()),
+            None,
+        )
+        .await
+        .expect("the approval did not reach the current card");
+        assert!(outcome.starts_with("Approve"), "{outcome}");
+        gate.reconcile_until("the step completed", |gate| gate.status() == "completed");
+
+        // The same stale card again: st no longer asks, and the person reads why.
+        let error = act_on_attention(
+            &gate.client,
+            "person/avery",
+            Ok(read),
+            None,
+            "review.approve",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a spent card takes no answer");
+        assert!(error.to_string().contains("no longer asked"), "{error}");
+    }
+
+    /// A feedback gate's card offers request-changes, and sending it back from stui gives the
+    /// worker a new attempt with the person's notes in its goals.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sending_back_a_feedback_gate_requests_changes() {
+        let gate = WaitingGate::serve(
+            r#"version 2
+agent "worker" { workspace "/tmp"; command "true" }
+mission "release" state="ready" {
+  goal "Write the release notes."
+  step "draft" {
+    assigned-to "agent/worker"
+    goal "Draft the release notes."
+    gate "review" type="human" mode="feedback" { reviewer "person/avery" }
+  }
+}
+"#,
+        )
+        .await;
+        let worker = gate
+            .store
+            .step_run(&gate.step)
+            .unwrap()
+            .unwrap()
+            .assigned_to
+            .unwrap();
+        gate.store
+            .set_step_state(&gate.step, "ready", None)
+            .unwrap();
+        for action in ["claim", "complete"] {
+            gate.store
+                .work_action(
+                    &gate.step,
+                    action,
+                    &st3::model::WorkRequest {
+                        actor: Some(worker.clone()),
+                        incarnation: Some("worker-one".into()),
+                        summary: Some("Drafted".into()),
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: format!("draft-{action}"),
+                    },
+                )
+                .unwrap();
+        }
+        gate.reconcile_until("the gate asked", |gate| gate.request().is_some());
+        let seen = gate.card().await.expect("the gate has a card");
+        assert_eq!(seen.actions, ["review.approve", "review.request-changes"]);
+
+        attention_action(
+            &gate.client,
+            "person/avery",
+            &seen.header.id,
+            Some(&seen),
+            "review.request-changes",
+            Some("Add the missing source.".into()),
+            None,
+        )
+        .await
+        .expect("the notes did not go back to the worker");
+        gate.reconcile_until("the step started again", |gate| {
+            gate.store.step_run(&gate.step).unwrap().unwrap().attempt == 2
+        });
+        let step = gate.store.step_run(&gate.step).unwrap().unwrap();
+        assert!(
+            step.goals
+                .iter()
+                .any(|goal| goal.contains("Add the missing source.")),
+            "{:?}",
+            step.goals
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn approving_a_gate_already_answered_says_so() {
+        let gate = WaitingGate::start().await;
+        let seen = gate.card().await.expect("the gate has a card");
+        attention_action(
+            &gate.client,
+            "person/avery",
+            &seen.header.id,
+            Some(&seen),
+            "review.approve",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        gate.reconcile_until("the step completed", |gate| gate.status() == "completed");
+
+        let error = attention_action(
+            &gate.client,
+            "person/avery",
+            &seen.header.id,
+            Some(&seen),
+            "review.reject",
+            Some("no".into()),
+            None,
+        )
+        .await
+        .expect_err("an answered gate takes no second answer");
+        let error = error.to_string();
+        assert!(
+            error.contains("no longer asked") && error.contains("completed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_classic_screen_approves_a_gate_asked_again_from_its_card() {
+        let gate = WaitingGate::start().await;
+        let mut model = Model::default();
+        model.actor = "person/avery".into();
+        model.reload(&gate.client).await.unwrap();
+        let seen = model
+            .attention()
+            .find(|card| card.source_id == gate.step)
+            .expect("the classic screen lists the gate")
+            .header
+            .id
+            .clone();
+        let mut app = App::new(model);
+        app.live_ready = true;
+        gate.ask_again();
+
+        let outcome = run_attention_action(&mut app, &gate.client, &seen, "review.approve", None)
+            .await
+            .expect("the classic screen did not reach the current card");
+        assert!(outcome.starts_with("Approve"), "{outcome}");
+        gate.reconcile_until("the step completed", |gate| gate.status() == "completed");
     }
 }

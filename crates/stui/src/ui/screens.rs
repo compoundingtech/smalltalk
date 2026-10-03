@@ -668,6 +668,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             because,
             look_at,
             step,
+            ..
         } => {
             card.wrap(&text::inline(question, theme::text()), inner);
             card.blank();

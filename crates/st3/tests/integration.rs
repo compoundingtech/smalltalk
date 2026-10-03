@@ -23,6 +23,7 @@ mod first_sync;
 mod fleet;
 mod getting_started;
 mod hook_telemetry;
+mod human_gates;
 mod idle_budget;
 mod log_diet;
 mod messaging_faults;

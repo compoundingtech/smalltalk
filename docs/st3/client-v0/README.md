@@ -299,6 +299,17 @@ with a new readiness epoch; the response and evidence stay on the source. CLI eq
 `st work ask --for PERSON --title TEXT --reason TEXT --step STEP --as AGENT --idempotency-key KEY`
 (or `--new-run NAME`) and `st work done STEP --as PERSON --summary TEXT`.
 
+A `human-gate` card answers its gate with `review.approve` and, by its `review_mode`, either
+`review.reject` (`approve`) or `review.request-changes` (`feedback`); the other is refused.
+Each takes `target_id` set to the card's `source_id` (the step, mission or loop run that owns the
+gate) and an optional `reason`, which the reject and request-changes actions require, and fences
+the card's ID and revision. A gate asked again (a retried step's new attempt, or a newer build's
+wording) gets a new card, so an action through the old one returns `stale-fence` and writes
+nothing. A client then re-reads attention and, if a card of the same `attention_kind` for the
+same `source_id` is open, acts once more through it; it does not retry the old card. A review st
+no longer asks returns `validation-failed`, and its message says why: who already answered it
+and how, or what moved on since it was asked. stui does both on its live and classic screens.
+
 Clients must evict removed source cards and replace their window from fresh snapshots on
 reconnect. The iOS cache version is 4 and stui's is 3; older cached cards are discarded. Offline
 cards are marked stale and cannot submit actions. A future notification consumer should compare

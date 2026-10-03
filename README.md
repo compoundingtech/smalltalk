@@ -191,6 +191,10 @@ st attention ls         # decisions and requests waiting for you
 st conversations ls person/ada
 ```
 
+`st attention approve ID --as person/ada` answers a gate waiting for you by the ID
+`st attention ls` prints; `reject` and `request-changes` also take `--reason TEXT`. A gate
+that no longer waits says why: who answered it, or what changed since it asked.
+
 `st --help` and `st help` open with the main uses, then group commands for everyday use, agent
 seats, and running a machine or fleet. `st help --all` also lists plumbing commands.
 Use `st help agents new` to open a command's full help.
