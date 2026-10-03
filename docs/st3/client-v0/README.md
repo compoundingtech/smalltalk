@@ -194,6 +194,8 @@ identical concurrent requests share one fetch. Failed reads are not cached.
 The telemetry route, `POST /v1/client/telemetry/traces`, accepts OTLP JSON and
 relays to the collector's `/v1/traces`; it does not rewrite resource attributes. Relays require
 the existing paired client boundary and return `404` when their endpoint is absent.
+These relays do not read or write the local graph; the daemon graph-cost inventory records
+them as outside-graph endpoints rather than measuring upstream usage or collector work.
 
 The collection WebSocket accepts a W3C `traceparent` URL query parameter (and subscription
 commands may supply their own `traceparent`) to correlate gateway delivery with browser
