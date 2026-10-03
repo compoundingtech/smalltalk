@@ -67,10 +67,9 @@ pub(crate) struct HarnessKind {
     pub(crate) session_env: &'static str,
     /// The ownership sequence the wrapper claimed at startup.
     pub(crate) seq_env: &'static str,
-    /// The launch-time provider version gate, for the harness that has one. omp hard-gates its
-    /// MINOR (OMP-R05); pi does not gate at runtime at all, so its slot is `None` rather than a
-    /// function that always succeeds — a gate that cannot refuse is not a gate.
-    pub(crate) verify_version: Option<fn(&str) -> Result<()>>,
+    /// The launch-time measured producer/extension admission gate (OMP-R05). Pi has no
+    /// runtime admission contract, so its slot is `None`.
+    pub(crate) verify_version: Option<fn(&str, &Path, &Path) -> Result<()>>,
 }
 
 /// What the wrapper hands the provider process: the channel environment plus the launch argv with
@@ -148,9 +147,13 @@ pub(crate) fn run_for_paths(
     );
     // Before the claim on purpose: an unadmitted provider must fail without taking ownership of
     // the seat's observed record, so a refused launch leaves the predecessor's state alone.
-    if let Some(verify_version) = kind.verify_version {
-        verify_version(&provider_argv[0])?;
-    }
+    let admitted_set = if let Some(verify_version) = kind.verify_version {
+        let set = channel_extension_set(kind, &runtime_id)?;
+        verify_version(&provider_argv[0], &agent_dir, &set.join(kind.extension))?;
+        Some(set)
+    } else {
+        None
+    };
     let executable = std::env::current_exe()
         .with_context(|| format!("resolving st executable for the {label} channel"))?;
     let session = required_incarnation.unwrap_or_else(harness_state::session_token);
@@ -186,25 +189,9 @@ pub(crate) fn run_for_paths(
                 *key = key.replacen("ST2_", "ST_", 1);
             }
         }
-        // An exported set that holds this binary's exact extension (st3 publishes its own) wins;
-        // otherwise the extension comes from st2's verified hook root.
-        let exported = if managed_push {
-            std::env::var_os("ST_HOOKS")
-                .map(std::path::PathBuf::from)
-                .filter(|dir| {
-                    dir.join(hooks::ST3_SET_MARKER).is_file() && dir.join(kind.extension).is_file()
-                })
-        } else {
-            hooks::exported_set_holding(kind.extension)
-        };
-        let set = match exported {
-            Some(set) => set,
-            None => hooks::verify_required_set().with_context(|| {
-                format!(
-                    "{label} driver '{runtime_id}' needs this binary's verified hook set for {}; the daemon publishes it when it starts",
-                    kind.extension
-                )
-            })?,
+        let set = match &admitted_set {
+            Some(set) => set.clone(),
+            None => channel_extension_set(kind, &runtime_id)?,
         };
         // Pi otherwise derives one project directory beneath the global credential profile. Two
         // supervised seats that start together can then race creation of that directory and one
@@ -432,6 +419,29 @@ fn record_session_end(
             "st {} driver: recording session end failed: {error}",
             kind.label
         );
+    }
+}
+
+fn channel_extension_set(kind: &HarnessKind, runtime_id: &str) -> Result<std::path::PathBuf> {
+    // st3 publishes a marked set with its environment substitutions applied. Admission and
+    // the live launch must select that same asset rather than looking for an st2-only receipt.
+    let exported = if std::env::var("ST3_MAILBOX_TRANSPORT").as_deref() == Ok("push") {
+        std::env::var_os("ST_HOOKS")
+            .map(std::path::PathBuf::from)
+            .filter(|dir| {
+                dir.join(hooks::ST3_SET_MARKER).is_file() && dir.join(kind.extension).is_file()
+            })
+    } else {
+        hooks::exported_set_holding(kind.extension)
+    };
+    match exported {
+        Some(set) => Ok(set),
+        None => hooks::verify_required_set().with_context(|| {
+            format!(
+                "{} driver '{runtime_id}' needs this binary's verified hook set for {}; the daemon publishes it when it starts",
+                kind.label, kind.extension
+            )
+        }),
     }
 }
 
