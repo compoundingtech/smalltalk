@@ -532,6 +532,61 @@ fn named_comment(message: &MessageView) -> Option<(String, String, u64, u64)> {
     })
 }
 
+/// The subject that records which seat posted one comment or review, by its GitHub ID.
+pub fn github_post_subject(locator: &str, kind: &str, id: u64) -> String {
+    format!("github-post/{locator}/{kind}/{id}")
+}
+
+/// The posts seats on this host have in flight: a seat, a repository and a thread. While one is,
+/// that thread's wakes wait for the seat, so the seat never sees its own comment before st knows
+/// its ID.
+fn posts_in_flight() -> &'static Mutex<HashMap<(String, String, u64), usize>> {
+    static IN_FLIGHT: OnceLock<Mutex<HashMap<(String, String, u64), usize>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(Default::default)
+}
+
+/// A seat's post in flight; dropping it ends the post.
+pub struct PostInFlight {
+    key: (String, String, u64),
+}
+
+impl PostInFlight {
+    pub fn begin(agent: &str, thread: &ThreadRef) -> Self {
+        let key = (agent.to_owned(), thread.locator(), thread.number);
+        *posts_in_flight()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key.clone())
+            .or_default() += 1;
+        Self { key }
+    }
+}
+
+impl Drop for PostInFlight {
+    fn drop(&mut self) {
+        let mut posts = posts_in_flight()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = posts.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                posts.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Whether a seat has a post in flight on the thread a wake names.
+pub fn post_in_flight(agent: &str, message: &MessageView) -> bool {
+    let Some((locator, _, _, number)) = named_comment(message) else {
+        return false;
+    };
+    posts_in_flight()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains_key(&(agent.to_owned(), locator, number))
+}
+
 /// The registered GitHub object a wake names, as `github.posted` keys it.
 pub fn named_object(message: &MessageView) -> Option<(String, String, u64)> {
     named_comment(message).map(|(locator, kind, id, _)| (locator, kind, id))
@@ -959,6 +1014,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again.subject, comment.subject);
+    }
+
+    #[test]
+    fn a_seats_post_in_flight_holds_only_its_wakes_on_that_thread() {
+        let thread = ThreadRef::parse("acme/garden#12").unwrap();
+        let message = |thread: &str| MessageView {
+            subject: "message/watch-one".into(),
+            from: "daemon/node".into(),
+            to: "agent/example.planner".into(),
+            content: String::new(),
+            status: "sent".into(),
+            title: None,
+            in_reply_to: None,
+            tags: vec![
+                WATCH_TAG.into(),
+                format!("{COMMENT_TAG}{thread}:comment:5:12"),
+            ],
+            attachments: Vec::new(),
+            created_index: 1,
+        };
+        let post = PostInFlight::begin("agent/example.planner", &thread);
+        assert!(post_in_flight(
+            "agent/example.planner",
+            &message("acme/garden")
+        ));
+        assert!(!post_in_flight(
+            "agent/example.reviewer",
+            &message("acme/garden")
+        ));
+        assert!(!post_in_flight(
+            "agent/example.planner",
+            &message("acme/orchard")
+        ));
+        drop(post);
+        assert!(!post_in_flight(
+            "agent/example.planner",
+            &message("acme/garden")
+        ));
     }
 
     #[test]
