@@ -4265,9 +4265,13 @@ impl Ui {
             MouseEventKind::Up(MouseButton::Left) if self.dragging => {
                 self.dragging = false;
                 if let Some(selection) = &self.conversation_state.selection {
+                    // A drag over nothing copies nothing (and does not say "Copied 0 lines").
                     if selection.anchor == selection.head {
                         self.conversation_state.selection = None;
-                    } else if let Some(copied) = self.selected_text() {
+                    } else if let Some(copied) = self
+                        .selected_text()
+                        .filter(|copied| !copied.trim().is_empty())
+                    {
                         let count = copied.lines().count();
                         copy(&copied);
                         self.flash(format!(

@@ -327,6 +327,8 @@
           pname = "st3";
           inherit version;
           src = self;
+          # Stamp st3, its shared driver library, and stui from this declared flake source.
+          CLI_BUILD_STAMP = buildStamp;
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
@@ -423,6 +425,13 @@
           test "$(readlink ${st3}/bin/st)" = st3
           test -x ${st3}/bin/stui
           test -x ${st3}/bin/pty
+          expected='${version}+${sourceRev}${pkgs.lib.optionalString (sourceDirty && !(pkgs.lib.hasSuffix "-dirty" sourceRev)) "-dirty"}'
+          ${st3}/bin/st3 --version > st3.version
+          grep -F "$expected" st3.version
+          test "$(wc -l < st3.version)" -eq 1
+          ${st3}/bin/st --version --json > version.json
+          test "$(${pkgs.jq}/bin/jq -r .machine_version version.json)" = "$expected"
+          ${st3}/bin/stui --version | grep -F "$expected"
           ${st3}/bin/st3 --help > st3.help
           ${st3}/bin/st --help > st.help
           cmp st3.help st.help

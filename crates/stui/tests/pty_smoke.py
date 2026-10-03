@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the built TUI against a running local st3 daemon in a real PTY.
+"""Exercise the built TUI (spaces) in a real PTY, with or without a local st daemon.
 
 Run with ST3_PERSON=person/<you> python3 crates/stui/tests/pty_smoke.py.
 The script reports only checks and byte counts; it never prints terminal contents.
@@ -25,8 +25,18 @@ import threading
 import time
 
 
+FIRST_FRAME = "\u2261 st".encode()  # spaces' top bar
+
+
 def plain(output: bytes) -> bytes:
     return re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]", b"", output)
+
+
+def answer_queries(master: int, chunk: bytes) -> None:
+    """Answer stui's device-attributes query as a terminal does, so its keyboard-protocol
+    probe ends at once instead of waiting out its timeout."""
+    if b"\x1b[c" in chunk:
+        os.write(master, b"\x1b[?62;c")
 
 
 def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
@@ -38,7 +48,7 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
         env["ST3_ENDPOINT"] = endpoint
     if ending == "panic":
         env["STUI_TEST_PANIC_AFTER_ENTER"] = "1"
-    proc = subprocess.Popen([binary, "--old"], stdin=slave, stdout=slave, stderr=slave, env=env)
+    proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
     captured = bytearray()
 
@@ -52,6 +62,7 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
                     chunk = os.read(master, 65536)
                     output.extend(chunk)
                     captured.extend(chunk)
+                    answer_queries(master, chunk)
                 except OSError:
                     break
         return bytes(output)
@@ -66,30 +77,29 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
                     chunk = os.read(master, 65536)
                     output.extend(chunk)
                     captured.extend(chunk)
+                    answer_queries(master, chunk)
                 except OSError:
                     break
                 if marker in (output if marker.startswith(b"\x1b") else plain(output)):
                     break
         return bytes(output), time.monotonic() - started
 
-    initial, first_frame = wait_for(b"\x1b[?1049h" if ending == "panic" else b"Now", 2)
+    initial, first_frame = wait_for(b"\x1b[?1049h" if ending == "panic" else FIRST_FRAME, 2)
     assert first_frame < 1, f"first frame took {first_frame:.3f}s"
     if ending != "panic":
-        for key in (b"2", b"3", b"4", b"1"):
+        assert b"\x1b[?1000h" in captured, "mouse capture was not enabled"
+        # Ctrl+K opens the palette and Esc closes it; Ctrl+S shows the sidebar and hides it.
+        for key in (b"\x0b", b"\x1b", b"\x13", b"\x13"):
             os.write(master, key)
             changed, latency = wait_for(b"", 1)
             assert changed, f"{key!r} did not redraw"
-            assert latency < 0.5, f"{key!r} navigation took {latency:.3f}s"
-        os.write(master, b"v")
-        selection, _ = wait_for(b"\x1b[?1000l", 1)
-        assert b"\x1b[?1000l" in selection, "selection mode did not release mouse capture"
-        os.write(master, b"v")
-        mouse, _ = wait_for(b"\x1b[?1000h", 1)
-        assert b"\x1b[?1000h" in mouse, "selection mode did not restore mouse capture"
+            assert latency < 0.5, f"{key!r} took {latency:.3f}s to redraw"
+            # Apart, as typed: an Esc read together with the next key is Alt and that key.
+            collect(0.2)
         collect(1)  # A live background snapshot may redraw after navigation.
         assert proc.poll() is None, f"{ending}: TUI exited before quit/signal ({proc.returncode})"
         if ending == "normal":
-            os.write(master, b"q")
+            os.write(master, b"\x11")  # Ctrl+Q
         else:
             proc.send_signal(signal.SIGTERM)
     deadline = time.monotonic() + 5
@@ -102,6 +112,7 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
     collect(0.2)
     os.close(master)
     modes = sorted(set(re.findall(rb"\x1b\[\?[0-9;]*[hl]", captured)))
+    assert ending == "panic" or b"\x1b[?1000l" in captured, f"{ending}: mouse capture was not released"
     assert b"\x1b[?1049l" in captured, (
         f"{ending}: alternate screen was not restored "
         f"(exit {proc.returncode}, {len(captured)} bytes, modes {modes}, tail {captured[-48:].hex()})"
@@ -143,7 +154,7 @@ def delayed_getter_case(binary: str) -> None:
 def hangup_case(binary: str) -> None:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-    proc = subprocess.Popen([binary, "--old"], stdin=slave, stdout=slave, stderr=slave,
+    proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave,
                             env={**os.environ, "TERM": "xterm-256color"})
     os.close(slave)
     deadline = time.monotonic() + 3
@@ -151,8 +162,10 @@ def hangup_case(binary: str) -> None:
     while time.monotonic() < deadline:
         ready, _, _ = select.select([master], [], [], 0.1)
         if ready:
-            output.extend(os.read(master, 65536))
-            if b"Now" in plain(output):
+            chunk = os.read(master, 65536)
+            output.extend(chunk)
+            answer_queries(master, chunk)
+            if FIRST_FRAME in plain(output):
                 break
     else:
         proc.kill()
@@ -178,7 +191,7 @@ def tmux_hangup_case(binary: str) -> None:
     base = [tmux, "-L", socket_name]
     subprocess.run(
         base + ["new-session", "-d", "-s", target,
-                f"exec env ST3_PERSON=person/alex {shlex.quote(binary)} --old"],
+                f"exec env ST3_PERSON=person/alex {shlex.quote(binary)}"],
         check=True, capture_output=True,
     )
     pid = int(subprocess.check_output(

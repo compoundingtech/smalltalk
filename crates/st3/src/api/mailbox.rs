@@ -178,7 +178,9 @@ where
                 let store = state.store.clone();
                 let binding = fence.clone();
                 let unchanged = tokio::task::spawn_blocking(move || {
-                    store.mailbox_changed_since(&binding, &mark, &subjects)
+                    crate::profile::task("task mailbox-change-check", || {
+                        store.mailbox_changed_since(&binding, &mark, &subjects)
+                    })
                 })
                 .await
                 .is_ok_and(|changed| changed.is_ok_and(|changed| !changed));
@@ -192,8 +194,10 @@ where
             let binding = fence.clone();
             let read = read.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let mark = store.mailbox_watermark(&binding);
-                (mark, read(&store, &binding))
+                crate::profile::task("task mailbox-snapshot", || {
+                    let mark = store.mailbox_watermark(&binding);
+                    (mark, read(&store, &binding))
+                })
             })
             .await;
             let (mark, result) = match result {

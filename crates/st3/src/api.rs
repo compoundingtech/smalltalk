@@ -1480,6 +1480,7 @@ async fn client_capabilities(
     let capabilities = client_v0::capabilities(&session);
     Json(json!({
         "kind": "capabilities",
+        "machine_version": st_drivers::version::machine_version(),
         "session_actor": session.actor,
         "transport": session.transport,
         "capabilities": capabilities,
@@ -5268,6 +5269,57 @@ fn unread_current_seat_counts(
     }
     Ok((pending, accepted))
 }
+fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
+    fn has_exit_code_gate(mission: &crate::model::MissionSpec) -> bool {
+        let has_gate = |gates: &[crate::model::GateSpec]| {
+            gates.iter().any(|gate| {
+                matches!(gate, crate::model::GateSpec::Field { path, .. } if path == "exit_code")
+            })
+        };
+        has_gate(&mission.gates)
+            || mission.steps.values().any(|step| {
+                has_gate(&step.gates)
+                    || step
+                        .nested_mission
+                        .as_deref()
+                        .is_some_and(has_exit_code_gate)
+            })
+    }
+    let runs = store.open_mission_run_headers()?;
+    let missions = store.mission_specs_for_runs(
+        &runs
+            .iter()
+            .map(|run| run.subject.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut stuck = Vec::new();
+    for run in runs {
+        let Some(mission) = missions.get(&run.subject) else {
+            continue;
+        };
+        if !has_exit_code_gate(mission) {
+            continue;
+        }
+        // Detail-free step states suffice; do not hydrate wake, timing or loop histories.
+        if let Some(run) = store.mission_run_steps(&run.subject, false)? {
+            stuck.extend(crate::reconcile::stuck_field_gates(store, &run, mission)?);
+        }
+    }
+    stuck.sort();
+    Ok(DoctorCheck {
+        name: "terminal-exec-gates".into(),
+        status: if stuck.is_empty() { "pass" } else { "warn" }.into(),
+        message: if stuck.is_empty() {
+            "no unresolved field gates wait on execs that ended without a restart".into()
+        } else {
+            format!(
+                "stuck gates: {}; inspect `st missions show RUN`",
+                stuck.join("; ")
+            )
+        },
+    })
+}
+
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
@@ -5328,6 +5380,13 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: format!("could not compute the operational repair plan: {error}"),
         }),
     }
+    checks.push(
+        terminal_exec_gates_check(&state.store).unwrap_or_else(|error| DoctorCheck {
+            name: "terminal-exec-gates".into(),
+            status: "warn".into(),
+            message: format!("could not inspect terminal exec gates: {error}"),
+        }),
+    );
     match tempfile::Builder::new()
         .prefix(".st3-doctor-")
         .tempfile_in(&state.state_dir)
@@ -5975,6 +6034,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         "pass"
     };
     Ok(Json(DoctorReport {
+        machine_version: Some(st_drivers::version::machine_version()),
         status: report_status.into(),
         checks,
         performance: crate::performance::snapshot(),
@@ -10935,9 +10995,13 @@ async fn list_mission_runs(
 ) -> Result<Json<Vec<MissionRunView>>, ApiError> {
     let store = state.store.clone();
     match (query.root, query.mission) {
-        (Some(root), None) => blocking_store(move || store.mission_runs_for_root(&root))
-            .await
-            .map(Json),
+        (Some(root), None) => blocking_store(move || {
+            let mut runs = store.mission_runs_for_root(&root)?;
+            annotate_stuck_gates(&store, &mut runs)?;
+            Ok(runs)
+        })
+        .await
+        .map(Json),
         (None, Some(mission)) => {
             blocking_store(move || store.active_mission_runs_for_mission(&mission))
                 .await
@@ -10950,16 +11014,37 @@ async fn list_mission_runs(
     }
 }
 
+fn annotate_stuck_gates(store: &Store, runs: &mut [MissionRunView]) -> anyhow::Result<()> {
+    let active = runs
+        .iter()
+        .filter(|run| matches!(run.status.as_str(), "running" | "standing" | "blocked"))
+        .map(|run| run.subject.clone())
+        .collect::<Vec<_>>();
+    let missions = store.mission_specs_for_runs(&active)?;
+    for run in runs {
+        if let Some(mission) = missions.get(&run.subject) {
+            run.stuck_gates = crate::reconcile::stuck_field_gates(store, run, mission)?;
+        }
+    }
+    Ok(())
+}
+
 async fn get_mission_run(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
 ) -> Result<Json<MissionRunView>, ApiError> {
     let store = state.store.clone();
     let run_for_read = run.clone();
-    blocking_store(move || store.mission_run(&run_for_read))
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))
+    blocking_store(move || {
+        let Some(mut run) = store.mission_run(&run_for_read)? else {
+            return Ok(None);
+        };
+        annotate_stuck_gates(&store, std::slice::from_mut(&mut run))?;
+        Ok(Some(run))
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))
 }
 
 async fn revise_mission_run(

@@ -467,6 +467,13 @@ roots with retained extension claims; unresolved roots leave the migration pendi
 certificates and tombstones remain historical authority, and their certified manifests can still
 be adopted. All checkpoint participants must use v6 before the next cut verifies.
 
+Scheduled occurrence deduplication uses checkpoint rules v7 and a new projection compatibility
+identity. Competing creation claims for one occurrence select one initial definition in canonical
+order, without combining steps from different child revisions. Upgrade rebuilds only run trees
+with multiple creation claims, once; ordinary run trees keep their projections. Historical
+checkpoint certificates remain authority, and mixed builds continue exchanging claim authority
+while deferring incompatible graph comparisons.
+
 Incremental catch-up projection commits at most 128 newly admitted claims per transaction and
 returns the writer between chunks, so queued messages and lease renewals can run. Each commit
 records the frontier actually projected. Admissions and catch-up deferrals advance a generation;
