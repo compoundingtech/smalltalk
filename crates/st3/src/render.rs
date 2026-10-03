@@ -3,8 +3,6 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result};
@@ -1033,7 +1031,7 @@ mod tests {
     }
 
     fn git(workspace: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::test_support::git()
             .args([
                 "-c",
                 "user.name=Example",
@@ -1242,13 +1240,13 @@ host "node" {{
     fn render_refuses_to_change_a_tracked_file() {
         let store = Store::open_memory("node").unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
             .unwrap();
         fs::write(workspace.path().join("tracked"), "original\n").unwrap();
-        Command::new("git")
+        crate::test_support::git()
             .args(["add", "tracked"])
             .current_dir(workspace.path())
             .status()
@@ -1272,7 +1270,7 @@ host "node" {{
     fn git_exclude_updates_a_normal_repository_once() {
         let store = Store::open_memory("node").unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()

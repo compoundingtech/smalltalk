@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use st3::client::Client;
 use st3::model::ClaimInput;
 
-const ST3: &str = env!("CARGO_BIN_EXE_st3");
+const ST3: &str = env!("CARGO_BIN_EXE_st3-fixture");
 const PERSON: &str = "person/fleet-tester";
 const NOTE: &str = "custom.fleet-test.note";
 
@@ -112,7 +112,7 @@ impl Node {
                 .map(|argument| (*argument).to_owned())
                 .collect(),
         );
-        let mut command = Command::new(&self.binary);
+        let mut command = st3::test_support::command(&self.binary);
         command
             .args(arguments)
             .current_dir(&self.root)

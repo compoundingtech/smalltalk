@@ -77,15 +77,14 @@ impl Newcomer {
     }
 
     fn path(root: &Path) -> String {
-        format!("{}:/usr/bin:/bin", root.join("bin").display())
+        format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap())
     }
 
     fn command(root: &Path) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_st3"));
+        let mut command = st3::test_support::command(env!("CARGO_BIN_EXE_st3-fixture"));
         command
             .env_clear()
             .env("PATH", Self::path(root))
-            .env("SHELL", "/bin/sh")
             .env("HOME", root.join("home"))
             .env("XDG_RUNTIME_DIR", root.join("run"))
             .env("XDG_STATE_HOME", root.join("home/.local/state"))

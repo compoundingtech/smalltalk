@@ -10,7 +10,7 @@ fn native_delivery_probe_alerts_and_recovers_without_model_turns() {
         .args(["-f", "env", "-u", "ST_AGENT", "python3"])
         .arg(repo.join("scripts/st3-delivery-probe-test"))
         .arg("--binary")
-        .arg(env!("CARGO_BIN_EXE_st3"))
+        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
         .output()
         .expect("run the isolated native delivery probe");
     let stderr = String::from_utf8_lossy(&result.stderr);

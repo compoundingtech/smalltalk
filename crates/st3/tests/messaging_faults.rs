@@ -56,7 +56,7 @@ fn run_case(case: &str) {
     let output = Command::new("setsid")
         .args(["-f", "env", "-u", "ST_AGENT", "python3"])
         .arg(repo.join("scripts/st3-messaging-faults-eval/run"))
-        .arg(env!("CARGO_BIN_EXE_st3"))
+        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .arg("--old-binary")
         .arg(old)

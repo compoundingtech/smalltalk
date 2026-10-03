@@ -136,7 +136,7 @@ async fn read_request(stream: &mut UnixStream) -> Vec<u8> {
 /// Run the st CLI against `socket` with none of this process's st environment, so a harness
 /// running the suite lends it no seat identity, projection root or incarnation.
 async fn st(socket: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let env = env
         .iter()
@@ -144,7 +144,7 @@ async fn st(socket: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
         .collect::<Vec<_>>();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        let mut command = std::process::Command::new(binary);
+        let mut command = st3::test_support::command(binary);
         for (name, _) in std::env::vars_os() {
             let name = name.to_string_lossy();
             if name.starts_with("ST_") || name.starts_with("ST3_") {

@@ -27,6 +27,7 @@ mod first_sync;
 mod fleet;
 mod gate_kinds;
 mod getting_started;
+mod hermetic;
 mod hook_telemetry;
 mod human_gates;
 mod idle_budget;

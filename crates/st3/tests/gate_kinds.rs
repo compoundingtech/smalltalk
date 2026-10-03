@@ -3,10 +3,9 @@
 //! broken. A stand-in `cargo` plays each way a test target can fare on `origin/main`.
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::process::Command;
 
 fn git(directory: &Path, arguments: &[&str]) {
-    let status = Command::new("git")
+    let status = st3::test_support::git()
         .args([
             "-c",
             "user.name=Example",
@@ -23,7 +22,7 @@ fn git(directory: &Path, arguments: &[&str]) {
 
 fn gate(root: &Path, mode: &str, repository: &Path) -> (Option<i32>, String) {
     std::fs::write(root.join("cargo-mode"), mode).unwrap();
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .env_clear()
         .env("HOME", root)
         .env(
@@ -61,12 +60,12 @@ fn cargo_test_waits_for_its_target_and_breaks_on_a_build_this_host_cannot_make()
     let root = root.path();
     let origin = root.join("origin.git");
     let work = root.join("work");
-    Command::new("git")
+    st3::test_support::git()
         .args(["init", "--quiet", "--bare", "--initial-branch=main"])
         .arg(&origin)
         .status()
         .unwrap();
-    Command::new("git")
+    st3::test_support::git()
         .args(["clone", "--quiet"])
         .arg(&origin)
         .arg(&work)

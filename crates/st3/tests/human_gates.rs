@@ -365,11 +365,11 @@ async fn a_gate_asked_again_refuses_the_old_card_and_takes_the_current_one() {
 }
 
 async fn run_cli(socket: &Path, args: &[&str]) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new(binary)
+        st3::test_support::command(binary)
             .env_remove("ST_AGENT")
             .env_remove("ST_MISSION_RUN")
             .arg("--endpoint")

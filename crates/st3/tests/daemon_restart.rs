@@ -179,7 +179,7 @@ async fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> 
 /// A seat process launched with the environment the reconciler gives it, but with every home
 /// and state directory inside the test root.
 fn seat_command(root: &Path, socket: &Path) -> Command {
-    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("st3"));
+    let mut command = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
     // Its own process group, so stopping the seat also stops the stand-in provider.
     command
         .process_group(0)

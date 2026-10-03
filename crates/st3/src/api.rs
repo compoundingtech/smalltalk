@@ -4371,6 +4371,12 @@ async fn serve_unix_with_ancestor(
     bind_harness: bool,
     ancestor: fn(u32) -> Option<String>,
 ) -> anyhow::Result<()> {
+    // Only st3-fixture initializes this process-local state. Disable host ancestry while
+    // retaining native-driver identification, which mailbox subscriptions require.
+    #[cfg(feature = "test-support")]
+    let bind_ancestry = bind_harness && crate::test_support::login_shell().is_none();
+    #[cfg(not(feature = "test-support"))]
+    let bind_ancestry = bind_harness;
     crate::config::validate_unix_socket_path(socket, "--socket or --client-gateway-socket")?;
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
@@ -4411,7 +4417,7 @@ async fn serve_unix_with_ancestor(
             // out of the accept loop so a slow lookup delays only this peer.
             let (bound_agent, caller, delivery_peer) = match peer_pid {
                 Some(pid) => tokio::task::spawn_blocking(move || {
-                    let bound_agent = bind_harness.then(|| ancestor(pid)).flatten();
+                    let bound_agent = bind_ancestry.then(|| ancestor(pid)).flatten();
                     let caller = Some(crate::profile::Caller::of_command(
                         local_process_arguments(pid).map(|(arguments, _)| arguments),
                         bound_agent.as_deref(),
@@ -16132,7 +16138,7 @@ mission "work" state="ready" {
                 std::fs::write(workspace.path().join("tracked"), "original\n").unwrap();
             }
             assert!(
-                std::process::Command::new("git")
+                crate::test_support::git()
                     .args(args)
                     .current_dir(workspace.path())
                     .status()

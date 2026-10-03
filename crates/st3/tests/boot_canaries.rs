@@ -76,7 +76,7 @@ fn canary(harness: &str, scenario: &str) {
             "python3",
         ])
         .arg(repo.join("scripts/st3-boot-canaries/run"))
-        .arg(env!("CARGO_BIN_EXE_st3"))
+        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .args([harness, scenario, "--bound", "180", "--scratch"])
         .arg(scratch.path())

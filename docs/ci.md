@@ -69,6 +69,16 @@ Each run isolates test `HOME` and XDG state. The summary records the tested SHA,
 each stage's elapsed time, result and exit code; each stage job uploads `<job>-logs` with its log and `.time` file.
 Nextest's final summary retains flaky outcomes.
 
+st3 integration fixtures use the separate `st3-fixture` executable, built automatically by
+the test-only `test-support` dev dependency. It captures an isolated Bash environment,
+reads only the fixture HOME's `.bash_profile`, preserves the fixture PATH, and ignores the
+launching seat's process ancestry. The production `st3` target has no runtime flag or
+environment variable that enables this behavior, even if the executable is renamed.
+Fixture command helpers clear inherited `ST_AGENT`/`ST3_*`; temporary-repository Git helpers
+isolate global/system config, hooks, signing and author identity on each command. Real
+repository commits keep the host's Git policy. Run the same suite from an agent seat with
+`nix develop --command cargo nextest run -p st3 --locked --profile ci --retries 0`.
+
 The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
 channel build remains independently pinned in `.github/messaging-compat-baseline.json`. Its
 provider stand-in runs the omp channel hook's TypeScript with Node 24's built-in type stripping;

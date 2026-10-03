@@ -95,13 +95,21 @@ fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| Mutex::new(Cache::default()))
 }
 
+fn capture_within(timeout: Duration) -> Result<Environment> {
+    #[cfg(feature = "test-support")]
+    if let Some(shell) = crate::test_support::login_shell() {
+        return st_runtime::login_environment_from(shell, timeout);
+    }
+    st_runtime::login_environment_within(timeout)
+}
+
 /// The environment the daemon starts with, captured patiently (see [`STARTUP_ATTEMPTS`]).
 pub fn snapshot_at_startup() -> Result<Environment> {
     cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("daemon environment cache is poisoned"))?
         .start(
-            st_runtime::login_environment_within,
+            capture_within,
             &STARTUP_ATTEMPTS,
             STARTUP_BACKOFF,
         )
@@ -114,7 +122,7 @@ pub fn snapshot() -> Result<Environment> {
     cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("daemon environment cache is poisoned"))?
-        .get(st_runtime::login_environment)
+        .get(|| capture_within(Duration::from_secs(10)))
         .context(
             "capture the daemon login-shell environment; check the account's shell startup files",
         )
