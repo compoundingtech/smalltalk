@@ -132,6 +132,61 @@ pub struct MemberSpec {
     pub driver: Option<String>,
 }
 
+impl MemberSpec {
+    /// What differs between how this member is declared to launch and how `launched` was:
+    /// `host`, `workspace`, `harness`, `terminal` or `launch` (the command, or a typed harness's
+    /// model, effort and arguments). The argv st adds to a typed harness itself (its channel and
+    /// hook settings), the environment and the restart policy are left out, so a new st build or
+    /// a mission run's new generation is not a launch change.
+    pub fn launch_changes(&self, launched: &MemberSpec) -> Vec<&'static str> {
+        let mut changes = Vec::new();
+        if self.host != launched.host {
+            changes.push("host");
+        }
+        if self.workspace != launched.workspace || self.cwd != launched.cwd {
+            changes.push("workspace");
+        }
+        if self.driver != launched.driver {
+            changes.push("harness");
+        }
+        if self.terminal != launched.terminal {
+            changes.push("terminal");
+        }
+        if authored_launch(&self.launch) != authored_launch(&launched.launch) {
+            changes.push("launch");
+        }
+        changes
+    }
+}
+
+/// A launch without the arguments st puts right after a typed harness's program, past the
+/// wrapper's `--`: its channel and its hook settings, which follow st's build, not the author.
+fn authored_launch(launch: &LaunchSpec) -> Vec<&str> {
+    let argv = match launch {
+        LaunchSpec::Shell(source) => return vec![source.as_str()],
+        LaunchSpec::Argv(argv) => argv,
+    };
+    let Some(separator) = argv.iter().position(|argument| argument == "--") else {
+        return argv.iter().map(String::as_str).collect();
+    };
+    let mut authored = argv[..=separator]
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut provider = argv[separator + 1..].iter().map(String::as_str);
+    authored.extend(provider.next());
+    let mut provider = provider.peekable();
+    while provider
+        .peek()
+        .is_some_and(|flag| matches!(*flag, "--channels" | "--settings"))
+    {
+        provider.next();
+        provider.next();
+    }
+    authored.extend(provider);
+    authored
+}
+
 /// Presentation is independent of the durable seat identity.
 pub fn effective_agent_name<'a>(subject: &'a str, desired: Option<&'a Value>) -> &'a str {
     desired.and_then(|desired| {
@@ -535,6 +590,16 @@ pub struct GateContext {
     /// The owner's attempt. A later attempt gets its own mechanical and LLM gate results.
     #[serde(default)]
     pub attempt: u32,
+    /// The mission run and generation the gate decides for. A broken gate's attention item names
+    /// them and closes when the generation is replaced.
+    #[serde(default)]
+    pub run: String,
+    #[serde(default)]
+    pub generation: String,
+    /// Whether the gate decides for an eval run, whose exec gates keep their verdicts: any
+    /// status but 0 fails the boundary.
+    #[serde(default)]
+    pub eval: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2502,4 +2567,58 @@ pub struct MissionOutputView {
     pub mission: String,
     pub revision: String,
     pub claim_id: String,
+}
+
+#[cfg(test)]
+mod launch_change_tests {
+    use super::{LaunchSpec, MemberSpec};
+
+    fn claude(settings: &str, model: &str) -> MemberSpec {
+        let intent = crate::graph::parse_intent(
+            &format!(
+                "version 2\nagent \"example/worker\" {{ workspace \"/work\"; harness \"claude\" {{ model {model:?}; }} }}"
+            ),
+            "example-host",
+        )
+        .unwrap();
+        let mut member = intent.subjects["agent/example/worker"]
+            .member
+            .clone()
+            .unwrap();
+        // Stand in for another st build's hook registration.
+        if let LaunchSpec::Argv(argv) = &mut member.launch {
+            let at = argv.iter().position(|item| item == "--settings").unwrap();
+            argv[at + 1] = settings.into();
+        }
+        member
+    }
+
+    #[test]
+    fn only_what_the_author_declares_changes_a_launch() {
+        let launched = claude("{\"hooks\":{}}", "example-model");
+        // Another st build's hook settings, a new run generation's environment and a new
+        // restart policy launch the same harness.
+        let mut same = claude("{\"hooks\":{\"Stop\":[]}}", "example-model");
+        same.environment
+            .insert("ST_RUN_GENERATION".into(), "next".into());
+        same.restart = super::RestartType::Never;
+        assert!(same.launch_changes(&launched).is_empty());
+
+        assert_eq!(
+            claude("{\"hooks\":{}}", "another-model").launch_changes(&launched),
+            ["launch"]
+        );
+        let mut moved = launched.clone();
+        moved.workspace = "/elsewhere".into();
+        moved.cwd = "/elsewhere".into();
+        assert_eq!(moved.launch_changes(&launched), ["workspace"]);
+        let mut switched = launched.clone();
+        switched.driver = Some("codex".into());
+        assert_eq!(switched.launch_changes(&launched), ["harness"]);
+        let mut command = launched.clone();
+        command.launch = LaunchSpec::Shell("sleep 1".into());
+        let mut other = command.clone();
+        other.launch = LaunchSpec::Shell("sleep 2".into());
+        assert_eq!(other.launch_changes(&command), ["launch"]);
+    }
 }

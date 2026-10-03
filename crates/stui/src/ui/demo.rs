@@ -279,6 +279,7 @@ fn attention() -> Vec<Attention> {
                     ),
                 ],
                 step: s("cut-over"),
+                feedback: false,
             },
         },
         Attention {

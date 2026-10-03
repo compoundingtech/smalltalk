@@ -1,11 +1,13 @@
 # libghostty-vt-sys
 
 Small Talk carries the published `libghostty-vt-sys` 0.2.1 crate here (libghostty-rs
-`46a9d2ac`) through `[patch.crates-io]` with one change to `build.rs`. When Cargo builds
+`46a9d2ac`) through `[patch.crates-io]` with two changes to `build.rs`. When Cargo builds
 libghostty-vt with Zig on Apple silicon and the macOS SDK lists no `arm64-macos` link stubs,
 as in the macOS 26.5 and 27 SDKs, the build gives Zig 0.15.2 a view of that SDK that does
 (see `macos_sdk` in `build.rs`). Builds that find the library through pkg-config, including the
-Nix package, never reach that code. Drop this copy when the pinned Ghostty commit builds with a
+Nix package, never reach that code. And the build script watches its own path relative to this
+package: upstream's path is relative to the libghostty-rs workspace, so here Cargo found no such
+file and reran the script, and rebuilt st3 and stui, on every invocation. Drop this copy when the pinned Ghostty commit builds with a
 Zig that accepts current SDKs.
 
 The upstream README follows.

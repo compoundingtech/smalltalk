@@ -57,7 +57,7 @@ use st3_conversation_ui::pane::order;
 use st3_conversation_ui::{PaneIntent, PaneState, Selection};
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     io::{self, Write},
     rc::Rc,
     time::{Duration, Instant},
@@ -264,6 +264,9 @@ pub struct Ui {
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
+    /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
+    /// the page before it.
+    older_wanted: RefCell<BTreeSet<String>>,
     popover: Option<String>,
     chat: Option<ChatState>,
     /// st's conversation search for the palette: the query asked and what came back.
@@ -367,6 +370,7 @@ impl Ui {
             quit: false,
             live: false,
             effects: Vec::new(),
+            older_wanted: RefCell::default(),
             popover: None,
             chat: None,
             said: None,
@@ -2726,6 +2730,17 @@ impl Ui {
             pane.rect.height as usize,
             key.starts_with("chat:"),
         );
+        if delta < 0
+            && state.top == 0
+            && let Some(target) = key.strip_prefix("chat:")
+        {
+            self.older_wanted.borrow_mut().insert(target.to_owned());
+        }
+    }
+
+    /// The conversations scrolled up to their start since this was last asked.
+    pub(crate) fn take_older_wanted(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.older_wanted.borrow_mut())
     }
 
     fn main_pane_key(&self) -> Option<String> {
@@ -3726,9 +3741,16 @@ impl Ui {
                     .find(|item| item.id == id)
                     .map(|item| item.kind.clone())
                 {
-                    Some(AttentionKind::Review { .. }) => Some(Effect::Attention {
+                    // A feedback gate offers request-changes where an approval gate offers
+                    // reject; st refuses the one its gate does not offer.
+                    Some(AttentionKind::Review { feedback, .. }) => Some(Effect::Attention {
                         id: id.clone(),
-                        action: "review.reject".into(),
+                        action: if feedback {
+                            "review.request-changes"
+                        } else {
+                            "review.reject"
+                        }
+                        .into(),
                         reason: Some(draft),
                         answer: None,
                     }),
@@ -4236,7 +4258,12 @@ impl Ui {
                 }
             }
             Hit::Pane(PaneIntent::LoadOlder) => {
-                self.flash("Earlier history is not available through stui yet");
+                if let Some(target) = self
+                    .main_pane_key()
+                    .and_then(|key| key.strip_prefix("chat:").map(str::to_owned))
+                {
+                    self.older_wanted.borrow_mut().insert(target);
+                }
             }
             Hit::JumpLatest => self.follow_latest(),
             Hit::Composer => {
@@ -4834,6 +4861,71 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// A feedback gate offers approve and request-changes, an approval gate approve and reject.
+    /// Notes sent back from either card take the answer that gate offers.
+    #[test]
+    fn notes_sent_back_on_a_feedback_gate_request_changes() {
+        let gate = |id: &str, mode: &str, back: &str| {
+            serde_json::from_value(serde_json::json!({
+                "kind": "attention", "id": id, "revision": "request/1",
+                "updated_at": "2026-10-03T08:00:00Z", "attention_kind": "human-gate",
+                "source_id": format!("step-run/release/{mode}"), "person_id": "person/avery",
+                "review_mode": mode, "title": "Review the draft", "detail": "Ready to ship?",
+                "priority": "normal", "state": "open", "requested_at": "2026-10-03T08:00:00Z",
+                "actions": ["review.approve", back],
+            }))
+            .unwrap()
+        };
+        let mut model = crate::model::Model::default();
+        model.actor = "person/avery".into();
+        model.now = crate::model::Collection {
+            items: vec![
+                gate("attention/feedback", "feedback", "review.request-changes"),
+                gate("attention/approve", "approve", "review.reject"),
+            ],
+            snapshot: Some(st3_client::Snapshot {
+                id: "snapshot/example-host/1/0".into(),
+                host_id: "host/example-host".into(),
+                store_index: 1,
+                projection_version: "1".into(),
+                created_at: "2026-10-03T08:00:00Z".into(),
+            }),
+            truncated: false,
+            sync: None,
+        };
+        let mut ui = Ui::new(adapt::world(
+            &model,
+            "person/avery",
+            &adapt::Extras::default(),
+        ));
+        ui.live = true;
+        ui.tab = 0;
+        for (id, back) in [
+            ("attention/feedback", "review.request-changes"),
+            ("attention/approve", "review.reject"),
+        ] {
+            let at = ui
+                .listing(60)
+                .ids
+                .iter()
+                .position(|listed| listed == id)
+                .expect("the gate is listed");
+            ui.selected[0] = at;
+            ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+            for letter in "Add the missing source.".chars() {
+                ui.key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+            }
+            ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(
+                matches!(&ui.effects[..], [Effect::Attention { id: sent, action, reason: Some(reason), .. }]
+                    if sent == id && action == back && reason == "Add the missing source."),
+                "{id}: {:?}",
+                ui.effects
+            );
+            ui.effects.clear();
+        }
     }
 
     #[test]

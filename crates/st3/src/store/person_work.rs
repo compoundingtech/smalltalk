@@ -137,23 +137,46 @@ pub(super) fn run_live(
     generation: Option<&str>,
     failure: bool,
 ) -> Result<bool> {
+    Ok(run_liveness(connection, run, generation, failure)?.is_ok())
+}
+
+/// Whether `run` still matters, or why not: it and each run above it exist, are open and on
+/// the generation their parent step belongs to, each parent step is still open, and a
+/// subscription or schedule that delivered it still runs. `failure` keeps a failed run or
+/// parent step live, for the fault that names it.
+pub(super) fn run_liveness(
+    connection: &Connection,
+    run: &str,
+    generation: Option<&str>,
+    failure: bool,
+) -> Result<std::result::Result<(), String>> {
     let mut run = run.strip_prefix("mission-run/").unwrap_or(run).to_owned();
     let mut expected_generation = generation.map(str::to_owned);
     let mut seen = BTreeSet::new();
     loop {
         if !seen.insert(run.clone()) {
-            return Ok(false);
+            return Ok(Err(format!(
+                "mission run `mission-run/{run}` is its own ancestor"
+            )));
         }
         let header = mission_run_header_tx(connection, &run).optional()?;
         let Some(header) = header else {
-            return Ok(false);
+            return Ok(Err(format!("mission run `mission-run/{run}` is gone")));
         };
-        if expected_generation
+        if let Some(expected) = expected_generation
             .as_ref()
-            .is_some_and(|g| g != &header.generation)
-            || (is_terminal_run_state(&header.status) && !(failure && header.status == "failed"))
+            .filter(|expected| *expected != &header.generation)
         {
-            return Ok(false);
+            return Ok(Err(format!(
+                "mission run `{}` moved on from {expected} to {}",
+                header.subject, header.generation
+            )));
+        }
+        if is_terminal_run_state(&header.status) && !(failure && header.status == "failed") {
+            return Ok(Err(format!(
+                "mission run `{}` is {}",
+                header.subject, header.status
+            )));
         }
         if let Some(parent) = header.parent_step_run.as_deref() {
             let Some(parent) = step(connection, parent)? else {
@@ -161,21 +184,25 @@ pub(super) fn run_live(
                 // normalized with a step-run prefix. They do not create a synthetic work step.
                 let subject = parent.strip_prefix("step-run/").unwrap_or(parent);
                 let Some(owner) = current_desired_row(connection, subject)? else {
-                    return Ok(false);
+                    return Ok(Err(format!("`{subject}`, which started it, is gone")));
                 };
                 let body: Value = serde_json::from_str(&owner.body)?;
-                if !matches!(owner.kind.as_str(), "subscription" | "schedule")
-                    || body
-                        .get("children")
-                        .and_then(Value::as_array)
-                        .is_some_and(|children| {
-                            children.len() == 1 && children[0]["name"] == "stop"
-                        })
+                if !matches!(owner.kind.as_str(), "subscription" | "schedule") {
+                    return Ok(Err(format!(
+                        "`{subject}`, which started it, is not a step, subscription or schedule"
+                    )));
+                }
+                if body
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .is_some_and(|children| children.len() == 1 && children[0]["name"] == "stop")
                 {
-                    return Ok(false);
+                    return Ok(Err(format!("`{subject}`, which started it, is stopped")));
                 }
                 let Some(owner_run) = owner.owner_run else {
-                    return Ok(false);
+                    return Ok(Err(format!(
+                        "`{subject}`, which started it, has no owning run"
+                    )));
                 };
                 let owner_header =
                     mission_run_header_tx(connection, owner_run.trim_start_matches("mission-run/"))
@@ -183,7 +210,9 @@ pub(super) fn run_live(
                 if owner_header
                     .is_none_or(|owner| owner.root_mission_run != header.root_mission_run)
                 {
-                    return Ok(false);
+                    return Ok(Err(format!(
+                        "`{subject}`, which started it, now belongs to another run"
+                    )));
                 }
                 run = owner_run.trim_start_matches("mission-run/").into();
                 expected_generation = owner.owner_generation;
@@ -192,7 +221,10 @@ pub(super) fn run_live(
             if matches!(parent.status.as_str(), "completed" | "cancelled")
                 || (parent.status == "failed" && !failure)
             {
-                return Ok(false);
+                return Ok(Err(format!(
+                    "its parent step `{}` is {}",
+                    parent.subject, parent.status
+                )));
             }
             run = parent.run.trim_start_matches("mission-run/").into();
             expected_generation = Some(parent.generation);
@@ -202,9 +234,22 @@ pub(super) fn run_live(
                 header.root_mission_run.trim_start_matches("mission-run/"),
             )
             .optional()?;
-            return Ok(root.is_some_and(|root| {
-                !is_terminal_run_state(&root.status) || (failure && root.status == "failed")
-            }));
+            return Ok(match root {
+                None => Err(format!(
+                    "its root mission run `{}` is gone",
+                    header.root_mission_run
+                )),
+                Some(root)
+                    if is_terminal_run_state(&root.status)
+                        && !(failure && root.status == "failed") =>
+                {
+                    Err(format!(
+                        "its root mission run `{}` is {}",
+                        root.subject, root.status
+                    ))
+                }
+                Some(_) => Ok(()),
+            });
         }
     }
 }
@@ -393,9 +438,13 @@ impl Store {
         }
         self.connection.batched(|tx| {
             let structured = canonical_request(input)?;
-            let origin_subject = normalize_step_run(input.step.as_deref().unwrap());
-            let origin = step(tx, &origin_subject).map_err(internal)?
+            let named = step(tx, &normalize_step_run(input.step.as_deref().unwrap())).map_err(internal)?
                 .ok_or_else(|| St3Error::new("missing-step-run", "the asking step does not exist"))?;
+            // A revision moves a step into the run's new generation, and its worker may still
+            // name it by the predecessor subject, as the seat's environment does. Work actions
+            // accept that name; so does an ask, and only the claimant may ask from either.
+            let origin = current_generation_successor_tx(tx, &named).map_err(internal)?.unwrap_or(named);
+            let origin_subject = origin.subject.clone();
             let identity = serde_json::to_string(&(&origin.generation, &origin_subject, origin.attempt, &input.idempotency_key)).map_err(internal)?;
             let hash = hex::encode(Sha256::digest(identity.as_bytes()));
             let subject = format!("step-run/{}/ask-{}", generation_id_from_subject(&origin.generation), &hash[..32]);
@@ -1174,6 +1223,99 @@ schedule "intake" {
             store.step_run(&ask.subject).unwrap().unwrap().status,
             "completed"
         );
+    }
+
+    /// Revise the fixture's run so `prepare` moves into a new generation: carried with its
+    /// claim when only `review` changes, or issued again and claimed anew when `prepare` changes.
+    fn revise_fixture(store: &Store, origin: &StepRunView, prepare_changes: bool) -> StepRunView {
+        let (prepare, review) = if prepare_changes {
+            ("Prepare the release notes too.", "Review the release.")
+        } else {
+            ("Prepare the release.", "Review the release notes.")
+        };
+        let source = format!(
+            r#"version 2
+mission "person-work" state="ready" {{
+  goal "Review the release.";
+  step "prepare" {{ assigned-to "agent/alder.asker"; goal "{prepare}"; }}
+  step "review" {{ assigned-to "person/avery"; goal "{review}"; }}
+}}
+"#
+        );
+        let intent = crate::graph::parse_internal_intent(&source, "alder").unwrap();
+        store.apply_internal(&intent, "person-revision").unwrap();
+        let revised = store
+            .adopt_mission_revision(
+                &origin.run,
+                &intent.missions["person-work"],
+                "person/avery",
+                "the release needs notes",
+                "person-revision",
+            )
+            .unwrap();
+        let moved = revised
+            .steps
+            .iter()
+            .find(|step| step.step == "prepare")
+            .unwrap()
+            .clone();
+        assert_ne!(moved.subject, origin.subject);
+        if prepare_changes {
+            store.set_step_state(&moved.subject, "ready", None).unwrap();
+            store
+                .work_action(
+                    &moved.subject,
+                    "claim",
+                    &crate::model::WorkRequest {
+                        actor: Some("agent/alder.asker".into()),
+                        incarnation: Some("asker-one".into()),
+                        summary: None,
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: "reclaim-prepare".into(),
+                    },
+                )
+                .unwrap();
+        }
+        let moved = store.step_run(&moved.subject).unwrap().unwrap();
+        assert_eq!(moved.claimant.as_deref(), Some("agent/alder.asker"));
+        moved
+    }
+
+    #[test]
+    fn a_worker_asks_from_the_step_a_revision_moved_by_its_old_name() {
+        for prepare_changes in [false, true] {
+            let (store, origin, input) = fixture();
+            let moved = revise_fixture(&store, &origin, prepare_changes);
+            // The worker still names the step it claimed before the revision.
+            assert_eq!(input.step.as_deref(), Some(origin.subject.as_str()));
+            let ask = store
+                .ask_person(&input)
+                .unwrap_or_else(|error| panic!("prepare changes: {prepare_changes}: {error:?}"));
+            let paused = store.step_run(&moved.subject).unwrap().unwrap();
+            assert_eq!(paused.status, "waiting-person");
+            assert_eq!(
+                store.ask_person(&input).unwrap().subject,
+                ask.subject,
+                "a retry is the same ask"
+            );
+            assert!(
+                ask.subject.starts_with(&format!(
+                    "step-run/{}/",
+                    moved.generation.trim_start_matches("run-generation/")
+                )),
+                "{}",
+                ask.subject
+            );
+            // Another seat cannot ask through a step it never held.
+            let mut stranger = input.clone();
+            stranger.actor = "agent/alder.other".into();
+            stranger.idempotency_key = "stranger".into();
+            assert_eq!(
+                store.ask_person(&stranger).unwrap_err().code,
+                "stale-work-ask"
+            );
+        }
     }
 
     #[test]

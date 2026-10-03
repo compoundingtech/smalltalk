@@ -467,6 +467,16 @@ def suspend_and_resume(node, seats, harness):
     seats.timings["suspend:failed-resume-code"] = code
 
 
+def continued_session(node, label):
+    """The relaunched harness continued the session its predecessor ran, as every restart does."""
+    launched = native_sessions(node, "a")
+    if len(launched) < 2:
+        fail(f"{label}: the seat ran {launched}, not a session and its continuation")
+    previous, latest = launched[-2][0], launched[-1]
+    if latest != (previous, True):
+        fail(f"{label}: the relaunched harness ran {latest}, not session {previous} continued")
+
+
 def scenario(node, seats, name, scratch, replacement_binary=None):
     if name in ("fresh", "concurrent"):
         return
@@ -476,6 +486,7 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
     if name == "restart":
         node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
         seats.prove("restart")
+        continued_session(node, "restart")
     elif name == "daemon-restart":
         # The provider dies with the daemon, so the new daemon's latest observation of the seat is
         # still the running predecessor.
@@ -484,6 +495,7 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
             node.pty("kill", row["name"])
         node.start()
         seats.prove("daemon-restart")
+        continued_session(node, "daemon-restart")
     elif name == "reexec":
         before = driver_processes(node)
         providers = {pid: argv for pid, argv in node.seat_processes() if "stub-" in argv}
