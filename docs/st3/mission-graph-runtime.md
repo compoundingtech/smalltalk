@@ -749,7 +749,10 @@ actor cannot hide an answer from the gate while the list no longer offers the re
 
 A loop's human gates (`until`, a person's candidate choice, `on-exhausted`) are asked of its
 `loop-run/GENERATION/PATH` subject, and are current while the step running the loop is on the
-attempt they were asked for. They are listed, approved and rejected like step gates.
+attempt they were asked for. They are listed, approved and rejected like step gates. A for-each
+loop stored before that mode was removed asks an item's metric gate of
+`loop-run/GENERATION/PATH/item/ID` with the item's round as its attempt; that review is current
+until the loop records the item's round.
 
 `st attention ls --as person/NAME` shows the selected person's pending KDL human gates together
 with their other current decisions and faults.

@@ -18018,6 +18018,50 @@ fn loop_step_tx(connection: &Connection, owner: &str) -> Result<Option<StepRunVi
     Ok(None)
 }
 
+/// Item `item` of the for-each loop `loop_run` (a loop from before such loops were removed):
+/// the round it runs in, its place in the loop's item snapshot, and whether the loop has
+/// recorded that round's result.
+fn loop_item_round_tx(
+    connection: &Connection,
+    loop_run: &str,
+    item: &str,
+) -> Result<Option<(u32, bool)>> {
+    let items: Option<String> = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT json_extract(claims.body, '$.fields.items') FROM claims
+                 WHERE claims.subject=?1 AND claims.kind='loop.state'
+                   AND json_extract(claims.body, '$.fields.items') IS NOT NULL
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+            ),
+            [loop_run],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(items) = items else {
+        return Ok(None);
+    };
+    let Some(index) = serde_json::from_str::<Vec<Value>>(&items)?
+        .iter()
+        .position(|candidate| candidate.get("id").and_then(Value::as_str) == Some(item))
+    else {
+        return Ok(None);
+    };
+    let round = u32::try_from(index + 1)?;
+    let recorded = connection
+        .query_row(
+            "SELECT 1 FROM claims
+             WHERE subject=?1 AND kind='loop.round-result'
+               AND json_extract(body, '$.fields.round')=?2
+               AND json_extract(body, '$.fields.candidate') IS NULL",
+            params![loop_run, round],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(Some((round, recorded)))
+}
+
 /// A step run's own row, without its queue and wake enrichment.
 fn step_run_row_tx(connection: &Connection, subject: &str) -> Result<Option<StepRunView>> {
     connection
@@ -18108,7 +18152,30 @@ fn human_review_currency(
                 "the step's definition changed since it was asked".into()
             ));
         }
-        if attempt != step.attempt {
+        // A for-each loop runs each item as its own round and asks the item's gates with
+        // that round as their attempt, whatever attempt the step is on.
+        let loop_run = format!(
+            "loop-run/{}",
+            step.subject
+                .strip_prefix("step-run/")
+                .unwrap_or(&step.subject)
+        );
+        if let Some(item) = owner.strip_prefix(&format!("{loop_run}/item/")) {
+            match loop_item_round_tx(connection, &loop_run, item)? {
+                None => return Ok(Err(format!("its loop has no item `{item}`"))),
+                Some((round, _)) if round != attempt => {
+                    return Ok(Err(format!(
+                        "it was asked for round {attempt}, and item `{item}` runs in round {round}"
+                    )));
+                }
+                Some((round, true)) => {
+                    return Ok(Err(format!(
+                        "the loop already recorded item `{item}` (round {round})"
+                    )));
+                }
+                Some((_, false)) => {}
+            }
+        } else if attempt != step.attempt {
             return Ok(Err(format!(
                 "it was asked for attempt {attempt}, and the step is on attempt {} ({})",
                 step.attempt, step.status

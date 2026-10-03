@@ -657,3 +657,207 @@ async fn loop_human_gates_are_listed_approved_and_rejected_like_step_gates() {
     );
     server.abort();
 }
+
+/// The owners of the reviews waiting on `person`, by `GET /v1/reviews`.
+async fn waiting_reviews(app: &axum::Router, person: &str) -> Vec<String> {
+    let (status, reviews) = send(
+        app,
+        Request::builder()
+            .uri(format!(
+                "/v1/reviews?reviewer={}",
+                person.replace('/', "%2F")
+            ))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reviews}");
+    reviews["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|review| review["owner"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A loop that ran one round per item of a resource. The grammar no longer accepts one, but a
+/// revision stored before it was removed still runs, so this applies the parsed loop with its
+/// item source put back.
+fn apply_for_each_loop(store: &Store) {
+    let source = r#"version 2
+resource "batch" { kind "custom.test.batch" }
+mission "per-item" state="ready" {
+  goal "Have a person accept each item."
+  completion { when "all-steps-exhausted" }
+  loop "checks" {
+    max-rounds 5
+    metric "accepted" direction="higher" { from-gate "accept" }
+    until {
+      gate "accept" type="human" {
+        reviewer "person/avery"
+        question "Accept ${loop.item.name}?"
+      }
+    }
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+    let mut intent = st3::parse_intent(source, NODE).unwrap();
+    intent
+        .missions
+        .get_mut("per-item")
+        .unwrap()
+        .steps
+        .get_mut("checks")
+        .unwrap()
+        .loop_spec
+        .as_mut()
+        .unwrap()
+        .for_each = Some(st3::model::LoopForEachSpec {
+        resource: "resource/batch".into(),
+        field: "items".into(),
+        max_parallel: 3,
+    });
+    let plan = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    store
+        .apply(&intent, &plan.subject_tokens, "per-item")
+        .unwrap();
+    store
+        .append_claim(&ClaimInput {
+            subject: "resource/batch".into(),
+            kind: "resource.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("kind".into(), json!("custom.test.batch")),
+                (
+                    "items".into(),
+                    json!([
+                        {"id": "one", "name": "the first"},
+                        {"id": "two", "name": "the second"},
+                        {"id": "three", "name": "the third"},
+                    ]),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("batch-items".into()),
+        })
+        .unwrap();
+}
+
+/// Each item of a for-each loop is its own round, and a human metric gate is asked per item
+/// for that round. Each is answerable, from a client, the CLI or the API, while its item waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_item_of_a_for_each_loop_takes_its_own_answer() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    apply_for_each_loop(&store);
+    let run = start(&store, "per-item", "per-item-run");
+    let loop_run = format!(
+        "loop-run/{}/checks",
+        run.generation.strip_prefix("run-generation/").unwrap()
+    );
+    let item = |id: &str| format!("{loop_run}/item/{id}");
+    let reconciler = reconciler(&store);
+    let app = st3::api::router(state.clone());
+    let (socket, server) = serve(state, root.path()).await;
+
+    // The first item, from a client: its card is fenced like any other gate's.
+    reconcile_until(&reconciler, "the first item asked", || {
+        store
+            .gate_request_for_owner(&item("one"))
+            .unwrap()
+            .is_some()
+    });
+    let seen = card(&app, "person/avery", &item("one"))
+        .await
+        .expect("the first item has no card");
+    assert_eq!(seen.0["detail"], "Accept the first?");
+    let (status, approved) = act(&app, "person/avery", "review.approve", "one", &seen, None).await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+
+    // The second item runs in round 2 of a step on attempt 1, and waits on a person too.
+    reconcile_until(&reconciler, "the second item asked", || {
+        store
+            .gate_request_for_owner(&item("two"))
+            .unwrap()
+            .is_some()
+    });
+    assert_eq!(
+        waiting_reviews(&app, "person/avery").await,
+        [item("two")],
+        "the second item's review is not offered"
+    );
+    let (seen, _) = card(&app, "person/avery", &item("two"))
+        .await
+        .expect("the second item has no card");
+    let approved = run_cli(
+        &socket,
+        &[
+            "attention",
+            "approve",
+            seen["id"].as_str().unwrap(),
+            "--as",
+            "person/avery",
+        ],
+    )
+    .await;
+    assert!(
+        approved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+
+    // The third, rejected through the API: its metric counts zero and the loop goes on.
+    reconcile_until(&reconciler, "the third item asked", || {
+        store
+            .gate_request_for_owner(&item("three"))
+            .unwrap()
+            .is_some()
+    });
+    let (status, rejected) = review(
+        &app,
+        &item("three"),
+        "rejected",
+        "person/avery",
+        Some("the third is not ready"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rejected}");
+    reconcile_until(&reconciler, "the loop run completed", || {
+        store.mission_run(&run.id).unwrap().unwrap().status == "completed"
+    });
+    let accepted = store
+        .claims_for(&loop_run, Some("loop.round-result"))
+        .unwrap()
+        .iter()
+        .map(|claim| {
+            claim.body["fields"]["metrics"]["accepted"]
+                .as_f64()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(accepted, [1.0, 1.0, 0.0]);
+
+    // A recorded item takes no second answer, and says whose answer it has.
+    let (status, again) = review(&app, &item("one"), "rejected", "person/avery", Some("no")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{again}");
+    assert!(
+        again["message"]
+            .as_str()
+            .unwrap()
+            .contains("approved by person/avery"),
+        "{again}"
+    );
+    server.abort();
+}
