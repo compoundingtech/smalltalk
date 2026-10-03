@@ -6,12 +6,17 @@ import {
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
 import {
+  afterPickRunner,
   buildEnv,
   commonSetupSteps,
-  linuxStageJob,
-  linuxStageRunner,
   linuxRunner,
+  linuxRunsOn,
+  linuxStageJob as namespaceStageJob,
+  linuxStageRunner,
+  linuxStageRunsOn,
   perfStoresCache,
+  pickRunnerJob,
+  pickRunnerJobId,
   readOnlyBinaryCaches,
   workspacePreparationSteps,
 } from './workspace-ci.ts'
@@ -33,6 +38,54 @@ os.close(vm)
 print(f"KVM API {version}: created a VM")
 EOF
 printf 'KVM: \\x60%s\\x60, CPU virtualization flag %s, VM creation succeeded\\n\\n| Phase | Elapsed |\\n| --- | --- |\\n' "$(ls -l /dev/kvm)" "$(grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo none)" >> "$GITHUB_STEP_SUMMARY"`
+
+// One Linux gate stage: its own runner (ci1 or Namespace, see pickRunnerJob) and caches, the common
+// setup, then scripts/ci-linux.
+const linuxStageJob = ({
+  name,
+  stage,
+  setup,
+  description,
+  env = {},
+  extraLogs = '',
+}: {
+  name: string
+  stage: string
+  setup: readonly unknown[]
+  description?: string
+  env?: Record<string, string>
+  extraLogs?: string
+}) => ({
+  name,
+  ...afterPickRunner,
+  'runs-on': linuxStageRunsOn,
+  'timeout-minutes': 120,
+  defaults: { run: { shell: 'bash' } },
+  env: { ...buildEnv, ...env },
+  steps: [
+    ...setup,
+    {
+      name: 'Summarize tested revision',
+      run: `printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' "$(git rev-parse HEAD)" "$(nproc)" "$(free -h | awk '/^Mem:/ {print $2 " memory"}')" >> "$GITHUB_STEP_SUMMARY"`,
+    },
+    nixDevelopStep({ name: description ?? 'Run nextest', command: ['bash', 'scripts/ci-linux', stage] }),
+    {
+      name: 'Save Nix outputs to the local Nix cache',
+      if: "success() && env.CI_LOCAL_CACHES != '1'",
+      run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
+    },
+    {
+      name: 'Retain stage logs and timings',
+      uses: 'actions/upload-artifact@v4',
+      if: 'always()',
+      with: {
+        name: `${name}-logs`,
+        path: `\${{ runner.temp }}/ci-logs/\n${extraLogs}`,
+        'if-no-files-found': 'ignore',
+      },
+    },
+  ],
+})
 
 // Required gate. Label events belong to macos.yml so they never restart or cancel this workflow.
 export default githubWorkflow({
@@ -57,6 +110,7 @@ export default githubWorkflow({
     selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
   },
   jobs: {
+    [pickRunnerJobId]: pickRunnerJob,
     // Namespace runners are already authenticated. Manual runs record the platform resource limits
     // alongside the CI workload so queue concurrency can be chosen from the actual account capacity.
     'namespace-capacity': {
@@ -88,10 +142,11 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
     },
     'genie-freshness': plainFlakeJob({
       name: 'genie-freshness',
-      runsOn: linuxRunner,
+      ...afterPickRunner,
+      runsOn: linuxRunsOn,
       'timeout-minutes': 20,
       nix: { binaryCaches: readOnlyBinaryCaches },
-      step: nixDevelopStep({ name: 'Check generated files', flake: '.#genie', command: ['genie', '--check'] }),
+      step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && genie --check'] }),
     }),
     // The Linux gate runs as three jobs on separate runners, each with its own caches.
     // `linux-gate` below is the single required check that collects them.
@@ -118,15 +173,16 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
     }),
     'linux-gate': {
       name: 'linux-gate',
-      needs: ['linux-tests', 'linux-clippy', 'linux-fleet-compat'],
+      needs: [pickRunnerJobId, 'linux-tests', 'linux-clippy', 'linux-fleet-compat'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
-      'runs-on': linuxRunner,
+      'runs-on': linuxRunsOn,
       'timeout-minutes': 5,
       steps: [
         {
           name: 'Require every Linux stage to pass',
-          env: { RESULTS: '${{ join(needs.*.result, \' \') }}' },
+          // The stages only: pick-runner is skipped whenever ci1 is off.
+          env: { RESULTS: '${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }}' },
           run: `echo "stage results: $RESULTS"
 for result in $RESULTS; do
   [ "$result" = success ] || exit 1
@@ -140,7 +196,7 @@ done`,
     // runs in perf.yml. It runs where the stages run, and skips merge-queue entries, which do not
     // wait for it, so each queued entry still needs only its required jobs' capacity. A required
     // perf-cost must run there too.
-    'perf-cost': linuxStageJob({
+    'perf-cost': namespaceStageJob({
       name: 'perf-cost',
       stage: 'cost',
       runsOn: linuxStageRunner,
@@ -156,7 +212,8 @@ done`,
     // runner image lacks. A NixOS VM runs this job's prebuilt test binary; it compiles nothing.
     'isolation-vm': {
       name: 'isolation-vm',
-      'runs-on': linuxRunner,
+      ...afterPickRunner,
+      'runs-on': linuxRunsOn,
       'timeout-minutes': 60,
       defaults: { run: { shell: 'bash' } },
       env: buildEnv,

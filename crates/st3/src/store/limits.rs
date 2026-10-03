@@ -36,7 +36,7 @@ pub struct AccountLimit {
 pub struct LimitsPolicy {
     pub stop_at_weekly_percent: u32,
     pub keep: BTreeSet<String>,
-    pub person: String,
+    pub notify: String,
     pub fresh_ms: u64,
 }
 
@@ -44,8 +44,8 @@ pub struct LimitsPolicy {
 pub struct LimitsOutcome {
     /// Seats this node stopped in this pass.
     pub stopped: Vec<String>,
-    /// Person requests this pass made or found.
-    pub asked: Vec<String>,
+    /// Operations messages this pass made or found.
+    pub notified: Vec<String>,
 }
 
 fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, String)> {
@@ -136,13 +136,22 @@ impl Store {
     }
 
     /// Stop the seats this node hosts on every account whose fresh weekly reading reached the
-    /// policy's percentage, and ask the policy's person once per weekly window. Each seat is
+    /// policy's percentage, and notify operations once per weekly window. Each seat is
     /// stopped at most once per window, so a person can start it again.
     pub fn enforce_account_limits(
         &self,
         policy: &LimitsPolicy,
         now: u128,
     ) -> Result<LimitsOutcome, St3Error> {
+        if !policy.notify.starts_with("agent/")
+            || policy.notify.split('/').skip(1).any(str::is_empty)
+            || policy.notify.chars().any(char::is_whitespace)
+        {
+            return Err(St3Error::new(
+                "invalid-limits-recipient",
+                "limits notifications require an operations agent",
+            ));
+        }
         let mut outcome = LimitsOutcome::default();
         for limit in self.account_limits().map_err(internal)? {
             let Some(weekly) = limit.weekly_percent else {
@@ -184,6 +193,7 @@ impl Store {
                     }
                 }
             }
+            let mut stopped_here = Vec::new();
             for seat in local {
                 let kdl = format!("version 2\nstop {seat:?}\n");
                 let intent = crate::graph::parse_internal_intent(&kdl, &self.origin)?;
@@ -210,9 +220,10 @@ impl Store {
                     })
                     .map_err(internal)?
                     .map_err(internal)?;
+                stopped_here.push(seat.clone());
                 outcome.stopped.push(seat);
             }
-            // The node that measured the reading asks, so one node writes the request.
+            // The node that measured the reading notifies operations, so one node writes.
             if targets.is_empty() || limit.host != self.origin {
                 continue;
             }
@@ -238,29 +249,51 @@ impl Store {
                 |at| format!("It resets {}.", utc(at)),
             );
             let title = format!(
-                "{provider} account {} is at {weekly:.0}% of its weekly limit: {} seat{plural} stopped",
+                "{provider} account {} is at {weekly:.0}% of its weekly limit: {} affected seat{plural}",
                 limit.account,
                 targets.len()
             );
             let reason = format!(
-                "{} reached {weekly:.0}% of its weekly limit ({} measured it at {}), so st stopped \
-                 every seat that uses it{kept}. Stopped: {}. {reset} Nothing is needed from you \
-                 unless you want a seat back sooner: start it again and st leaves it running until \
-                 the reset.",
+                "{} reached {weekly:.0}% of its weekly limit ({} measured it at {}). The policy stops \
+                 seats that use it{kept}. Affected seats across the fleet: {}. This pass stopped \
+                 {} on {}. Other hosts enforce their own stops. {reset} A seat restarted by a \
+                 person stays running until the reset. Review the account and stopped seats, group related alerts, and act \
+                 on standing instructions. Ask a person only if a decision is needed, using a \
+                 structured request with your recommendation, reasons and proposed action.",
                 limit.account,
                 limit.measured_by,
                 utc(limit.measured_at_unix_ms),
-                targets.join(", ")
+                targets.join(", "),
+                if stopped_here.is_empty() {
+                    "none".into()
+                } else {
+                    stopped_here.join(", ")
+                },
+                self.origin,
             );
-            let ask = self.ask_person_as_daemon(
-                LIMITS_ACTOR,
-                &policy.person,
-                &title,
-                &reason,
-                &format!("limits/{}", limit.account),
-                &episode,
-            )?;
-            outcome.asked.push(ask.subject);
+            // The payload is pinned by account/window. A later reading must not turn a retry
+            // into an idempotency conflict or recreate an already handled notification.
+            let key = format!("limits-notify:{}:{episode}", limit.account);
+            let subject = format!(
+                "message/limits-{}",
+                &canonical_hash(&key).map_err(internal)?[..20]
+            );
+            self.connection.batched(|tx| {
+                let recorded = tx.query_row(
+                    "SELECT 1 FROM claims WHERE subject=?1 AND kind='message.sent' LIMIT 1",
+                    [&subject], |_| Ok(()),
+                ).optional().map_err(internal)?.is_some();
+                if !recorded {
+                    append_claim_tx(tx, &self.origin, &subject, "message.sent", Some(LIMITS_ACTOR),
+                        &json!({"fields": {
+                            "from": LIMITS_ACTOR, "to": policy.notify,
+                            "title": title, "content": reason, "status": "sent",
+                            "tags": ["account-limits", format!("account:{}", limit.account), format!("window:{episode}")]
+                        }, "evidence": []}), &[], None).map_err(claim_append_error)?;
+                }
+                Ok::<_, St3Error>(())
+            }).map_err(internal)??;
+            outcome.notified.push(subject);
         }
         Ok(outcome)
     }
@@ -327,8 +360,10 @@ mod tests {
     }
 
     #[test]
-    fn an_account_past_its_weekly_limit_stops_its_local_seats_once_and_asks_once() {
-        let store = Store::open_memory("alder").unwrap();
+    fn an_account_past_its_weekly_limit_stops_its_local_seats_once_and_notifies_operations_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let store = Store::open(&path, "alder").unwrap();
         let [busy, idle, coordinator, remote, other] = [
             "agent/alder.busy",
             "agent/alder.idle",
@@ -370,7 +405,7 @@ mod tests {
         let policy = LimitsPolicy {
             stop_at_weekly_percent: 95,
             keep: BTreeSet::from([coordinator.to_owned()]),
-            person: "person/avery".into(),
+            notify: "agent/alder.operations".into(),
             fresh_ms: HOUR as u64,
         };
         let outcome = store.enforce_account_limits(&policy, now).unwrap();
@@ -379,34 +414,93 @@ mod tests {
             [busy, idle],
             "this node's seats, never the kept one"
         );
-        assert_eq!(outcome.asked.len(), 1);
+        assert_eq!(outcome.notified.len(), 1);
         assert!(!live(&store, busy) && !live(&store, idle));
         assert!(live(&store, coordinator) && live(&store, remote));
         assert!(live(&store, other), "a stale reading is not acted on");
-        let ask = store
-            .attention_items(Some("person/avery"))
-            .unwrap()
-            .into_iter()
-            .find(|item| item.subject == outcome.asked[0])
-            .expect("the request is on the person's home");
         assert!(
-            ask.title
-                .contains("claude/aaaa is at 96% of its weekly limit: 3 seats stopped"),
-            "{}",
-            ask.title
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .is_empty()
         );
+        assert!(
+            store
+                .claims_for_kind_at("work.person-asked", None, false, 1)
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        let message = store.message(&outcome.notified[0]).unwrap().unwrap();
+        assert_eq!(message.to, "agent/alder.operations");
+        assert!(
+            message
+                .title
+                .as_deref()
+                .unwrap()
+                .contains("claude/aaaa is at 96% of its weekly limit: 3 affected seats")
+        );
+        assert!(message.content.contains("structured request"));
+        assert!(message.content.contains(busy) && message.content.contains(idle));
+        assert!(message.content.contains("It resets"));
 
-        // A person starts a seat again: it stays up until the window resets, and the request
-        // stays the one request.
+        // Restart the store, then start a stopped seat again. A newer percentage neither
+        // stops that seat again nor resends the notification in the same window.
+        drop(store);
+        let store = Store::open(&path, "alder").unwrap();
         declare(&store, busy, "alder");
+        read(&store, busy, Some("claude/aaaa"), 97.0, now + 60_000);
         let again = store.enforce_account_limits(&policy, now + 60_000).unwrap();
         assert!(again.stopped.is_empty(), "{again:?}");
         assert!(live(&store, busy));
+        assert_eq!(again.notified, outcome.notified);
+        let original = store
+            .claims_for(&outcome.notified[0], Some("message.sent"))
+            .unwrap();
+        assert_eq!(
+            original.len(),
+            1,
+            "a changed percentage must not resend the alert"
+        );
+        assert_eq!(
+            store
+                .message(&outcome.notified[0])
+                .unwrap()
+                .unwrap()
+                .content,
+            message.content
+        );
+
+        // A new window can notify operations again after the seats are started.
+        declare(&store, idle, "alder");
+        let mut next = store
+            .latest_claim(busy, Some("harness.limits"))
+            .unwrap()
+            .unwrap();
+        next.body["fields"]["weekly_resets_at_unix_ms"] = json!(1_800_600_000_000_u64);
+        store
+            .append_claim(&ClaimInput {
+                subject: busy.into(),
+                kind: "harness.limits".into(),
+                actor: Some(busy.into()),
+                fields: serde_json::from_value(next.body["fields"].clone()).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("next-window".into()),
+            })
+            .unwrap();
+        let next_window = store
+            .enforce_account_limits(&policy, now + 120_000)
+            .unwrap();
+        assert_eq!(next_window.stopped, [busy, idle]);
+        assert_eq!(next_window.notified.len(), 1);
+        assert_ne!(next_window.notified, outcome.notified);
         assert!(
-            again
-                .asked
-                .iter()
-                .all(|subject| subject == &outcome.asked[0])
+            store
+                .claims_for_kind_at("work.person-asked", None, false, 1)
+                .unwrap()
+                .claims
+                .is_empty()
         );
     }
 
@@ -418,7 +512,7 @@ mod tests {
         let policy = LimitsPolicy {
             stop_at_weekly_percent: 95,
             keep: BTreeSet::new(),
-            person: "person/avery".into(),
+            notify: "agent/alder.operations".into(),
             fresh_ms: HOUR as u64,
         };
         read(&store, "agent/alder.seat", Some("codex/bbbb"), 94.9, now);

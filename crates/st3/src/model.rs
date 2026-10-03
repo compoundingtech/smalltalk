@@ -1858,6 +1858,23 @@ pub struct MessageView {
     pub created_index: u64,
 }
 
+/// The daemon's answer to a message send, and what a send's idempotency key landed as. Older
+/// daemons answer a send with the bare message, which reads as a new send with no time.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MessageSendReceipt {
+    #[serde(flatten)]
+    pub message: MessageView,
+    /// The key that names this message: a request with the same key and content returns it again.
+    #[serde(default)]
+    pub idempotency_key: String,
+    /// The key already named this message when the request came, so nothing new was sent.
+    #[serde(default)]
+    pub already_sent: bool,
+    /// When this daemon first accepted the message, in RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MessagePage {
     pub items: Vec<MessageView>,

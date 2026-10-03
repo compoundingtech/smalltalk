@@ -18,6 +18,48 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  pick-runner:
+    name: pick-runner
+    if: vars.CI1_RUNNERS == 'on'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: {}
+    outputs:
+      ci1: ${{ steps.pick.outputs.ci1 }}
+    steps:
+      - name: Pick ci1 when it has room, else Namespace
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.CI1_RUNNERS_READ_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          OWNER: ${{ github.repository_owner }}
+          NEED: ${{ vars.CI1_MIN_IDLE || '5' }}
+        run: |
+          namespace() {
+            echo "$1: Namespace"
+            printf 'Runner: **Namespace** (%s)\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          if [ "$EVENT" = pull_request ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
+            namespace "a pull request from a fork never runs on ci1"
+          fi
+          label=ci1
+          [ "$EVENT" = merge_group ] && label=ci1-merge
+          [ -n "$GH_TOKEN" ] || namespace "no runner status token"
+          [[ "$NEED" =~ ^[1-9][0-9]*$ ]] || namespace "invalid minimum idle runner count"
+          if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>&1); then
+            echo "::warning::could not list ci1's runners: $runners"
+            namespace "the runner list is unavailable"
+          fi
+          if ! idle=$(jq -e --arg label "$label" '[.[].runners[] | select(.status == "online" and .busy == false and any(.labels[]; .name == $label))] | length' <<< "$runners"); then
+            namespace "the runner list is invalid"
+          fi
+          [ "$idle" -ge "$NEED" ] || namespace "$idle $label runners idle, $NEED needed"
+          printf 'ci1=["%s"]\n' "$label" >> "$GITHUB_OUTPUT"
+          echo "$idle $label runners idle: ci1"
+          printf 'Runner: **ci1** (%s, %s idle)\n' "$label" "$idle" >> "$GITHUB_STEP_SUMMARY"
   namespace-capacity:
     name: namespace-capacity
     if: github.event_name == 'workflow_dispatch'
@@ -44,9 +86,10 @@ jobs:
           if-no-files-found: error
   genie-freshness:
     name: genie-freshness
+    needs: [pick-runner]
+    if: ${{ !cancelled() }}
     timeout-minutes: 20
-    runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
     permissions:
       contents: read
     defaults:
@@ -68,12 +111,14 @@ jobs:
             extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
             access-tokens = github.com=${{ github.token }}
           summarize: true
-      - name: Check generated files
+      - name: Check runner selection and generated files
         shell: bash
-        run: "nix develop '.#genie' -c genie --check"
+        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && genie --check'"
   linux-tests:
     name: linux-tests
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    needs: [pick-runner]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || '["nscloud-ubuntu-24.04-amd64-8x16"]') }}
     timeout-minutes: 120
     defaults:
       run:
@@ -88,9 +133,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Use the runner's own caches
+        run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi'
       - name: Restore the Cargo target and registry
         id: cargo-cache
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         uses: actions/cache@v4
         with:
           path: |
@@ -101,7 +148,7 @@ jobs:
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
       - name: Restore the local Nix cache
         id: nix-cache
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
@@ -123,12 +170,12 @@ jobs:
         run: |
           # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
           # and actions/cache expands a leading tilde against the HOME of the step that runs it.
-          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
       - name: Use the cached Nix outputs
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Prepare the historical messaging channel
         if: runner.os == 'Linux'
@@ -155,7 +202,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-linux tests
       - name: Save Nix outputs to the local Nix cache
-        if: success()
+        if: success() && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Retain stage logs and timings
         uses: actions/upload-artifact@v4
@@ -169,7 +216,9 @@ jobs:
           if-no-files-found: ignore
   linux-clippy:
     name: linux-clippy
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    needs: [pick-runner]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || '["nscloud-ubuntu-24.04-amd64-8x16"]') }}
     timeout-minutes: 120
     defaults:
       run:
@@ -183,9 +232,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Use the runner's own caches
+        run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi'
       - name: Restore the Cargo target and registry
         id: cargo-cache
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         uses: actions/cache@v4
         with:
           path: |
@@ -196,7 +247,7 @@ jobs:
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
       - name: Restore the local Nix cache
         id: nix-cache
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
@@ -218,12 +269,12 @@ jobs:
         run: |
           # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
           # and actions/cache expands a leading tilde against the HOME of the step that runs it.
-          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
       - name: Use the cached Nix outputs
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Summarize tested revision
         run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
@@ -231,7 +282,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-linux clippy
       - name: Save Nix outputs to the local Nix cache
-        if: success()
+        if: success() && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Retain stage logs and timings
         uses: actions/upload-artifact@v4
@@ -244,7 +295,9 @@ jobs:
           if-no-files-found: ignore
   linux-fleet-compat:
     name: linux-fleet-compat
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    needs: [pick-runner]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || '["nscloud-ubuntu-24.04-amd64-8x16"]') }}
     timeout-minutes: 120
     defaults:
       run:
@@ -258,9 +311,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Use the runner's own caches
+        run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi'
       - name: Restore the Cargo target and registry
         id: cargo-cache
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         uses: actions/cache@v4
         with:
           path: |
@@ -271,7 +326,7 @@ jobs:
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
       - name: Restore the local Nix cache
         id: nix-cache
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
@@ -293,12 +348,12 @@ jobs:
         run: |
           # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
           # and actions/cache expands a leading tilde against the HOME of the step that runs it.
-          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
       - name: Use the cached Nix outputs
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Summarize tested revision
         run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
@@ -306,7 +361,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-linux fleet-compat
       - name: Save Nix outputs to the local Nix cache
-        if: success()
+        if: success() && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Retain stage logs and timings
         uses: actions/upload-artifact@v4
@@ -319,15 +374,14 @@ jobs:
           if-no-files-found: ignore
   linux-gate:
     name: linux-gate
-    needs: [linux-tests, linux-clippy, linux-fleet-compat]
+    needs: [pick-runner, linux-tests, linux-clippy, linux-fleet-compat]
     if: always()
-    runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 5
     steps:
       - name: Require every Linux stage to pass
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
+          RESULTS: "${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }}"
         run: |
           echo "stage results: $RESULTS"
           for result in $RESULTS; do
@@ -351,9 +405,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Use the runner's own caches
+        run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi'
       - name: Restore the Cargo target and registry
         id: cargo-cache
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         uses: actions/cache@v4
         with:
           path: |
@@ -364,7 +420,7 @@ jobs:
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
       - name: Restore the local Nix cache
         id: nix-cache
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         uses: actions/cache@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
@@ -386,12 +442,12 @@ jobs:
         run: |
           # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
           # and actions/cache expands a leading tilde against the HOME of the step that runs it.
-          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
       - name: Use the cached Nix outputs
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Summarize tested revision
         run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
@@ -417,8 +473,9 @@ jobs:
           if-no-files-found: ignore
   isolation-vm:
     name: isolation-vm
-    runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    needs: [pick-runner]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 60
     defaults:
       run:

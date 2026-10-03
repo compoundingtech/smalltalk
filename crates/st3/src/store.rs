@@ -311,6 +311,8 @@ CREATE INDEX IF NOT EXISTS claims_person_ask_run_index ON claims(json_extract(bo
 WHERE kind='work.person-asked';
 CREATE INDEX IF NOT EXISTS claims_person_ask_owner_index ON claims(json_extract(body, '$.fields.owner_run'))
 WHERE kind='work.person-asked';
+CREATE INDEX IF NOT EXISTS claims_person_ask_origin_step_index ON claims(json_extract(body, '$.fields.origin_step'))
+WHERE kind='work.person-asked';
 
 CREATE TABLE IF NOT EXISTS mission_run_requests (
     operation_id TEXT PRIMARY KEY,
@@ -11925,6 +11927,8 @@ impl Store {
                     {
                         item_facts["opened_by_run"] = Value::String(run);
                     }
+                    // A pull request item already keeps its recorded opener: its facts are laid
+                    // over the recorded ones, and opener attribution keeps a named opener.
                     if kind == "vcs.issue" {
                         let normalized = normalize_resource_observation(
                             transaction,
@@ -16099,9 +16103,10 @@ fn normalize_resource_observation(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| previous.as_object().cloned().unwrap_or_default());
-        // Issue attribution belongs to its publisher, not to the latest observer or fixer.
-        // Keep each named field, including a mission-run-only opener, across observations.
-        if kind == "vcs.issue" {
+        // Issue and pull request attribution belongs to its publisher, not to the latest
+        // observer or fixer. Keep each named field, including a mission-run-only opener, across
+        // observations, so a partial snapshot such as a merge never erases it.
+        if carries_opener(&kind) {
             for name in ["opened_by", "opened_by_run"] {
                 if let Some(value) = previous.get(name) {
                     facts.insert(name.into(), value.clone());
@@ -16124,7 +16129,7 @@ fn normalize_resource_observation(
         }
     }
     let mut fields = input.fields.clone();
-    if kind == "vcs.issue" {
+    if carries_opener(&kind) {
         if fields.contains_key("facts") {
             fields.insert("facts".into(), serde_json::to_value(facts).map_err(internal)?);
         } else {
@@ -16133,6 +16138,12 @@ fn normalize_resource_observation(
     }
     fields.insert("kind".into(), Value::String(kind));
     Ok(Some(fields))
+}
+
+/// The resource kinds whose `opened_by` and `opened_by_run` outlast every later observation
+/// (Nathan, 2026-10-03, #778 rule 5).
+fn carries_opener(kind: &str) -> bool {
+    matches!(kind, "vcs.issue" | "vcs.pull-request")
 }
 
 fn resource_facts(fields: &BTreeMap<String, Value>) -> Result<BTreeMap<String, Value>, St3Error> {
@@ -43319,6 +43330,104 @@ observer "issue" {
                 }))).unwrap();
                 assert_eq!(&changed.body["fields"]["facts"]["opened_by"], opener);
                 assert_eq!(changed.body["fields"]["facts"]["opened_by_run"], "mission-run/author");
+            }
+        }
+    }
+
+    #[test]
+    fn pull_request_openers_survive_partial_publishers_and_observers() {
+        for attribution in [
+            json!({"opened_by_run": "mission-run/author"}),
+            json!({"opened_by": "agent/node.author", "opened_by_run": "mission-run/author"}),
+        ] {
+            let store = Store::open_memory("node").unwrap();
+            let source = r#"version 2
+resource "github/acme/demo/pull/9" { kind "vcs.pull-request" }
+observer "pull" {
+  resource "resource/github/acme/demo/pull/9"
+  provider "github.pull-request"
+  locator "acme/demo#9"
+  field "state"
+}
+"#;
+            let intent = parse_intent(source, "node").unwrap();
+            let planned = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(&intent, &planned.subject_tokens, "publish-watch")
+                .unwrap();
+            let subject = "resource/github/acme/demo/pull/9";
+            let publish = |facts: Value| ClaimInput {
+                subject: subject.into(),
+                kind: "resource.observed".into(),
+                actor: Some("agent/node.author".into()),
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.pull-request".into())),
+                    ("facts".into(), facts),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            };
+            let mut opened = attribution.clone();
+            opened["state"] = json!("open");
+            store.append_client_claim(&publish(opened)).unwrap();
+            // A publisher's partial snapshot of the merge keeps both fields.
+            let merged = store
+                .append_client_claim(&publish(json!({"state": "merged", "merged": true})))
+                .unwrap();
+            assert_eq!(merged.body["fields"]["facts"]["state"], "merged");
+            assert_eq!(
+                merged.body["fields"]["facts"]["opened_by_run"],
+                "mission-run/author"
+            );
+            assert_eq!(
+                merged.body["fields"]["facts"].get("opened_by"),
+                attribution.get("opened_by")
+            );
+            // So does an observer that never reads them.
+            let revision = store
+                .selected_desired_revision("observer/pull")
+                .unwrap()
+                .unwrap();
+            store
+                .record_resource_observation(
+                    "observer/pull",
+                    &revision,
+                    None,
+                    subject,
+                    None,
+                    &json!({"state": "closed"}),
+                    50,
+                    &[],
+                )
+                .unwrap();
+            let actual = store.latest_actual_value(subject).unwrap().unwrap();
+            assert_eq!(actual["facts"]["state"], "closed");
+            assert_eq!(actual["facts"]["opened_by_run"], "mission-run/author");
+            assert_eq!(
+                actual["facts"].get("opened_by"),
+                attribution.get("opened_by")
+            );
+            // A later claim cannot take the opener over.
+            let fixer = store
+                .append_client_claim(&publish(json!({
+                    "opened_by": "agent/node.fixer", "opened_by_run": "mission-run/fixer"
+                })))
+                .unwrap();
+            assert_eq!(
+                fixer.body["fields"]["facts"]["opened_by_run"],
+                "mission-run/author"
+            );
+            if let Some(opener) = attribution.get("opened_by") {
+                assert_eq!(&fixer.body["fields"]["facts"]["opened_by"], opener);
             }
         }
     }

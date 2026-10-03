@@ -527,6 +527,10 @@ const PROBES: &[Probe] = &[
     ),
     get("GET /v1/messages", "/v1/messages?to={seat}"),
     get(
+        "GET /v1/messages/by-key",
+        "/v1/messages/by-key?key=cost-fixture-message",
+    ),
+    get(
         "GET /v1/messages/page",
         "/v1/messages/page?include_closed=false&limit=100&to={seat}",
     ),
@@ -1321,7 +1325,7 @@ async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixtur
     items.insert("record", urlencoding::encode(&record).into_owned());
 
     let sent = client
-        .post::<_, Value>(
+        .post::<_, st3::model::MessageSendReceipt>(
             "/v1/messages",
             &json!({
                 "idempotency_key": "cost-fixture-message",
@@ -1332,13 +1336,9 @@ async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixtur
             }),
         )
         .await
-        .ok()
-        .and_then(|view| {
-            view.get("subject")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_default();
+        .expect("the fixture message must send")
+        .message
+        .subject;
     // A person ask needs an agent with a live declaration: a standing agent the generator did
     // not retire.
     let ask = |actor: String, attempt: usize| {

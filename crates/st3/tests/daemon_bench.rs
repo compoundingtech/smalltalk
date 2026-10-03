@@ -900,7 +900,12 @@ async fn writer_loop(
             match sent {
                 Ok(message) => {
                     record(&writes, "message send", started.elapsed());
-                    if let Some(subject) = message.get("subject").and_then(Value::as_str) {
+                    if let Some(subject) = message
+                        .get("message")
+                        .unwrap_or(&message)
+                        .get("subject")
+                        .and_then(Value::as_str)
+                    {
                         let path = format!(
                             "/v1/messages/{}/claims",
                             urlencoding::encode(subject.trim_start_matches("message/"))
