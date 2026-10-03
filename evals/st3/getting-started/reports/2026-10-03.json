@@ -104,7 +104,7 @@
     {
       "page": "getting-started",
       "result": "passed expanded Nix tool-path check",
-      "evidence": "With the installed Nix profile selected on beacon, command -v st stui pty resolves all three under /home/ada/.nix-profile/bin."
+      "evidence": "With the installed Nix profile selected on beacon, command -v st stui pty resolves all three under $HOME/.nix-profile/bin."
     },
     {
       "page": "ios-app",
