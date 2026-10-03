@@ -750,6 +750,19 @@ pub struct MissionRunOutcome {
     pub actor: String,
     pub at: String,
 }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WorkEvidence {
+    pub kind: String,
+    pub reference: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WorkReport {
+    pub claim_id: String,
+    pub attempt: u32,
+    pub at: String,
+    pub summary: String,
+    pub evidence: Vec<WorkEvidence>,
+}
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct MissionStep {
     pub id: String,
@@ -767,6 +780,10 @@ pub struct MissionStep {
     pub since: String,
     #[serde(default)]
     pub last_progress: Option<String>,
+    #[serde(default)]
+    pub progress_report: Option<WorkReport>,
+    #[serde(default)]
+    pub completion_report: Option<WorkReport>,
     #[serde(default)]
     pub blocked_reason: Option<String>,
     #[serde(default)]
@@ -806,6 +823,10 @@ pub struct Work {
     pub title: Option<String>,
     pub assigned_to: Option<String>,
     pub last_progress: Option<String>,
+    #[serde(default)]
+    pub progress_report: Option<WorkReport>,
+    #[serde(default)]
+    pub completion_report: Option<WorkReport>,
     pub state: String,
     pub gate_kind: Option<String>,
     pub attempt: u32,

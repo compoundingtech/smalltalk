@@ -1035,6 +1035,8 @@ pub(crate) fn mission_run_signature(runs: &[MissionRunView]) -> anyhow::Result<S
                     "blocked_reason": step.blocked_reason,
                     "progress_summary": step.progress_summary,
                     "completion_summary": step.completion_summary,
+                    "progress_report": step.progress_report,
+                    "completion_report": step.completion_report,
                 })).collect::<Vec<_>>(),
             })
         })
@@ -1242,12 +1244,87 @@ fn render_graph_step(output: &mut String, step: &StepRunView, indent: &str, styl
     if let Some(reason) = &step.blocked_reason {
         let _ = writeln!(output, "{indent}  reason: {reason}");
     }
-    // The completion summary supersedes progress, so each step adds at most one line.
-    if let Some(summary) = &step.completion_summary {
-        let _ = writeln!(output, "{indent}  done: {}", glance(summary));
+    if let Some(report) = &step.progress_report {
+        output.push_str(&render_work_report(
+            &format!("{indent}  "),
+            "Progress",
+            &report.claim_id,
+            report.attempt,
+            &chrono::DateTime::from_timestamp_millis(report.at_unix_ms as i64)
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &report.summary,
+            report
+                .evidence
+                .iter()
+                .map(|item| (item.kind.as_str(), item.reference.as_str())),
+        ));
     } else if let Some(summary) = &step.progress_summary {
         let _ = writeln!(output, "{indent}  progress: {}", glance(summary));
     }
+    if let Some(report) = &step.completion_report {
+        output.push_str(&render_work_report(
+            &format!("{indent}  "),
+            "Completion reported",
+            &report.claim_id,
+            report.attempt,
+            &chrono::DateTime::from_timestamp_millis(report.at_unix_ms as i64)
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &report.summary,
+            report
+                .evidence
+                .iter()
+                .map(|item| (item.kind.as_str(), item.reference.as_str())),
+        ));
+    } else if let Some(summary) = &step.completion_summary {
+        let _ = writeln!(output, "{indent}  done: {}", glance(summary));
+    }
+}
+
+/// Display reported evidence without executing it. References are shell quoted for copyable
+/// CLI navigation; unknown and external references are retained without inventing an action.
+pub(crate) fn render_work_report<'a>(
+    indent: &str,
+    label: &str,
+    claim_id: &str,
+    attempt: u32,
+    at: &str,
+    summary: &str,
+    evidence: impl Iterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let mut output = String::new();
+    let summary = if summary.is_empty() {
+        "(no summary)"
+    } else {
+        summary
+    };
+    let _ = writeln!(
+        output,
+        "{indent}{label} (attempt {attempt}, {at}): {summary}"
+    );
+    let _ = writeln!(output, "{indent}  claim: {claim_id}");
+    for (kind, reference) in evidence {
+        let quoted = format!("'{}'", reference.replace('\'', "'\"'\"'"));
+        let command = match kind {
+            "document" => Some(format!("st documents get {quoted}")),
+            "subject" if reference.starts_with("step-run/") => {
+                Some(format!("st work show {quoted}"))
+            }
+            "subject"
+                if reference.starts_with("mission-run/") || reference.starts_with("mission/") =>
+            {
+                Some(format!("st missions show {quoted}"))
+            }
+            "subject" => Some(format!("st subject show {quoted}")),
+            _ => None,
+        };
+        let _ = writeln!(output, "{indent}  evidence ({kind}): {reference}");
+        if let Some(command) = command {
+            let _ = writeln!(output, "{indent}    {command}");
+        }
+    }
+    output
 }
 
 /// The first line of a worker summary, cut to fit one terminal line.
@@ -1429,6 +1506,8 @@ mod tests {
             progress_summary: None,
             progress_at_unix_ms: None,
             completion_summary: None,
+            progress_report: None,
+            completion_report: None,
             readiness_epoch: 1,
             blocked_reason: None,
             blockers: Vec::new(),
@@ -1734,10 +1813,10 @@ mod tests {
         assert!(rendered.contains("  progress: Tests pass; opening the pull request\n"));
         assert!(rendered.contains(&format!("  done: {}…\n", "x".repeat(120))));
         assert!(
-            !rendered.contains("Drafting the guide"),
-            "the completion summary supersedes progress"
+            rendered.contains("Drafting the guide"),
+            "progress and completion remain distinct"
         );
-        assert_eq!(rendered.matches("progress:").count(), 1);
+        assert_eq!(rendered.matches("progress:").count(), 2);
         assert_eq!(glance("  one\n\n"), "one");
         assert_eq!(glance("one\ntwo"), "one…");
     }

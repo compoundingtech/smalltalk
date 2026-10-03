@@ -1743,6 +1743,8 @@ fn client_work_values(
                 "title": work.title,
                 "assigned_to": work.assigned_to,
                 "last_progress": work.progress_summary,
+                "progress_report": client_work_report(work.progress_report.as_ref()),
+                "completion_report": client_work_report(work.completion_report.as_ref()),
                 "state": state,
                 "agentless": work.agentless,
                 "gate_kind": gate_kind,
@@ -1764,6 +1766,20 @@ fn client_work_values(
             }))
         })
         .collect()
+}
+
+fn client_work_report(report: Option<&crate::model::WorkReportView>) -> Value {
+    report
+        .map(|report| {
+            json!({
+                "claim_id": report.claim_id,
+                "attempt": report.attempt,
+                "at": client_timestamp(report.at_unix_ms),
+                "summary": report.summary,
+                "evidence": report.evidence,
+            })
+        })
+        .unwrap_or(Value::Null)
 }
 
 #[cfg(test)]
@@ -16755,6 +16771,130 @@ mission "visible-agentless" state="ready" {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn work_reports_survive_completed_historical_owners_in_work_and_parent_detail() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = r#"version 2
+agent "worker" { workspace "/tmp"; command "true" }
+mission "reports" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Show reported results."
+  step "work" { assigned-to "agent/worker" }
+}"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "reports-publish")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "reports".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "reports-run".into(),
+            })
+            .unwrap();
+        let step = &run.steps[0].subject;
+        let request = |key: &str, summary: &str, evidence: Vec<String>| WorkRequest {
+            actor: Some(run.steps[0].assigned_to.clone().unwrap()),
+            incarnation: Some("worker-1".into()),
+            summary: Some(summary.into()),
+            reason: None,
+            evidence,
+            idempotency_key: key.into(),
+        };
+        store.set_step_state(step, "ready", None).unwrap();
+        store
+            .work_action(step, "claim", &request("reports-claim", "Starting", vec![]))
+            .unwrap();
+        let document = format!("doc/reports/result@{}", "a".repeat(64));
+        store
+            .work_action(
+                step,
+                "progress",
+                &request(
+                    "reports-progress",
+                    "Awaiting review",
+                    vec![document.clone()],
+                ),
+            )
+            .unwrap();
+        let progress =
+            client_work_resources(store, None, false, client_now_ms(), store.index().unwrap())
+                .unwrap();
+        assert_eq!(
+            progress[0]["progress_report"]["evidence"][0]["kind"],
+            "document"
+        );
+        assert!(progress[0]["completion_report"].is_null());
+        store
+            .work_action(
+                step,
+                "complete",
+                &request(
+                    "reports-complete",
+                    "Review approved; merge queued",
+                    vec!["https://example.invalid/review/7".into()],
+                ),
+            )
+            .unwrap();
+        store.set_step_state(step, "completed", None).unwrap();
+        store
+            .set_mission_run_state(&run.subject, "completed", "terminal", None)
+            .unwrap();
+        assert!(
+            client_work_resources(store, None, false, client_now_ms(), store.index().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        let history =
+            client_work_resources(store, None, true, client_now_ms(), store.index().unwrap())
+                .unwrap();
+        let work = history.iter().find(|w| w["id"] == *step).unwrap();
+        assert_eq!(client_work_item(store, step, None, client_now_ms(), store.index().unwrap()).unwrap().unwrap(), *work);
+        assert_eq!(work["operational"]["layer"], "history");
+        assert_eq!(work["state"], "completed");
+        assert_eq!(work["last_progress"], "Awaiting review");
+        assert_eq!(work["progress_report"]["summary"], "Awaiting review");
+        assert_eq!(
+            work["completion_report"]["summary"],
+            "Review approved; merge queued"
+        );
+        assert_eq!(work["completion_report"]["evidence"][0]["kind"], "external");
+        let typed: st3_client::Work = serde_json::from_value(work.clone()).unwrap();
+        assert_eq!(
+            typed.progress_report.as_ref().unwrap().evidence[0].reference,
+            document
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&typed.completion_report.as_ref().unwrap().at)
+                .is_ok()
+        );
+        for selected in ["mission/reports"] {
+            let parents =
+                client_v0::mission_resources(store, store.index().unwrap(), true, Some(selected))
+                    .unwrap();
+            let parent_step = &parents[0]["run_details"][0]["steps"][0];
+            assert_eq!(parent_step["id"], *step);
+            assert_eq!(parent_step["progress_report"], work["progress_report"]);
+            assert_eq!(parent_step["completion_report"], work["completion_report"]);
+            let _: st3_client::MissionStep = serde_json::from_value(parent_step.clone()).unwrap();
+        }
     }
 
     /// A work item is the resource the work history lists for it, read without enriching every
