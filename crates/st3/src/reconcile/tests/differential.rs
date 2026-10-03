@@ -626,8 +626,22 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
             }
         };
         log.push(label);
-        full.settle();
-        incremental.settle();
+        // Both sides are strict: a pass that writes for an item nothing marked panics, on the full
+        // side too. Name the sequence that led to it.
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            full.settle();
+            incremental.settle();
+        })) {
+            smallclaims::store::set_thread_clock(None);
+            panic!(
+                "seed {seed}, event {step}: {}\nevents: {log:?}",
+                panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("a pass panicked")
+            );
+        }
         let (expected, actual) = (full.claims(), incremental.claims());
         if expected != actual {
             let missing = expected
@@ -672,7 +686,11 @@ fn incremental_passes_write_what_full_passes_write() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(8);
     let mut reached = BTreeSet::new();
-    for seed in 1..=seeds {
+    for seed in std::env::var("ST3_DIFFERENTIAL_FIRST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)..=seeds
+    {
         reached.extend(run_sequence(seed, 100));
     }
     // The sequences must keep reaching what they exist to compare.

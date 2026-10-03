@@ -1595,6 +1595,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         );
         // A settled stop is evaluated again only when something it read changed or its time came,
         // and on every full pass. Without a PTY snapshot every stop waits on the next one anyway.
+        // Seen first: what this pass already wrote, such as render receipts.
+        self.incremental.observe(&self.store)?;
         let skip_stops = self.skip_unneeded
             && ptys.is_some()
             && !self.incremental.take_full_pass("stop", now_ms());
@@ -1911,6 +1913,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
         let _work_messages_span = crate::profile::span("pass/work-messages");
+        // Earlier stages of this pass can change what a wake reads, such as a step a mission
+        // cancelled, so see their changes first.
+        self.incremental.observe(&self.store)?;
         let skip_wakes = self.skip_unneeded && !self.incremental.take_full_pass("wake", now_ms());
         let mut wakes = BTreeSet::new();
         for (agent, incarnation, member) in work_message_agents {
