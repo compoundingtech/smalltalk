@@ -48,11 +48,11 @@ use st3::store::Store;
 use st3_schema::ValueType;
 use tokio::sync::{Notify, watch};
 
-const FLEET: &str = "7c1e2d3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f";
+pub(crate) const FLEET: &str = "7c1e2d3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f";
 /// The benchmarked daemon's node. No member of a generated or copied store runs here.
-const NODE: &str = "bench-host";
+pub(crate) const NODE: &str = "bench-host";
 /// The peer whose history the generated store replicated, and that replicates during the run.
-const PEER: &str = "bench-peer";
+pub(crate) const PEER: &str = "bench-peer";
 
 /// The reads a person makes from the CLI, stui and the app, and the ones every seat makes.
 /// `{agent}`, `{mission}`, `{step}` and `{message}` stand for items the list reads return, and
@@ -362,7 +362,7 @@ impl Run {
     }
 }
 
-fn percentile(samples: &[Duration], percent: usize) -> Duration {
+pub(crate) fn percentile(samples: &[Duration], percent: usize) -> Duration {
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     if sorted.is_empty() {
@@ -372,7 +372,7 @@ fn percentile(samples: &[Duration], percent: usize) -> Duration {
     sorted[rank.min(sorted.len() - 1)]
 }
 
-fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
+pub(crate) fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -385,16 +385,16 @@ fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 /// Everything the fleet and the probes refer to.
 #[derive(Clone, Default)]
-struct Subjects {
+pub(crate) struct Subjects {
     /// The synthetic fleet's seats.
-    seats: Vec<String>,
-    agents: Vec<String>,
-    missions: Vec<String>,
-    steps: Vec<String>,
-    runs: Vec<String>,
-    messages: Vec<String>,
+    pub(crate) seats: Vec<String>,
+    pub(crate) agents: Vec<String>,
+    pub(crate) missions: Vec<String>,
+    pub(crate) steps: Vec<String>,
+    pub(crate) runs: Vec<String>,
+    pub(crate) messages: Vec<String>,
     /// One claimed step per seat, which that seat renews.
-    held: Vec<(String, String, String)>,
+    pub(crate) held: Vec<(String, String, String)>,
 }
 
 async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
@@ -618,7 +618,7 @@ fn fill(path: &str, subjects: &Subjects, round: usize) -> String {
 }
 
 /// The ids of the first page of a client list, for the detail reads.
-async fn listed(client: &Client, path: &str) -> Vec<String> {
+pub(crate) async fn listed(client: &Client, path: &str) -> Vec<String> {
     let page = client.get::<Value>(path).await.unwrap_or(Value::Null);
     page.get("value")
         .unwrap_or(&page)
@@ -635,7 +635,7 @@ async fn listed(client: &Client, path: &str) -> Vec<String> {
 }
 
 /// A `pty` that lists no terminals and starts none.
-fn stub_pty(root: &Path) -> PathBuf {
+pub(crate) fn stub_pty(root: &Path) -> PathBuf {
     let path = root.join("pty");
     std::fs::write(
         &path,
@@ -648,7 +648,7 @@ fn stub_pty(root: &Path) -> PathBuf {
 
 /// The subjects the fleet uses: seats with a step each to hold, and runs, steps and messages for
 /// the detail reads.
-fn fleet_subjects(store: &Store, seats: usize) -> Subjects {
+pub(crate) fn fleet_subjects(store: &Store, seats: usize) -> Subjects {
     let mut subjects = Subjects::default();
     let runs = store
         .mission_runs()
@@ -900,7 +900,12 @@ async fn writer_loop(
             match sent {
                 Ok(message) => {
                     record(&writes, "message send", started.elapsed());
-                    if let Some(subject) = message.get("subject").and_then(Value::as_str) {
+                    if let Some(subject) = message
+                        .get("message")
+                        .unwrap_or(&message)
+                        .get("subject")
+                        .and_then(Value::as_str)
+                    {
                         let path = format!(
                             "/v1/messages/{}/claims",
                             urlencoding::encode(subject.trim_start_matches("message/"))
@@ -1081,6 +1086,8 @@ struct Mix {
     messages: usize,
     agents: usize,
     documents: usize,
+    /// Versions of the one document a delivery probe binds again every round.
+    probe_versions: usize,
     attention: usize,
     /// Of every hundred claims, how many a peer wrote and this node replicated.
     peer_percent: usize,
@@ -1095,6 +1102,7 @@ const SAMPLED: Mix = Mix {
     messages: 4_947,
     agents: 700,
     documents: 682,
+    probe_versions: 5_000,
     attention: 183,
     peer_percent: 36,
 };
@@ -1104,17 +1112,24 @@ fn scaled(count: usize, scale: f64) -> usize {
 }
 
 /// The generated store for `scale`, from `keep` when an earlier run made it.
-async fn generated_store(keep: &Path, scale: f64) -> PathBuf {
+pub(crate) async fn generated_store(keep: &Path, scale: f64) -> PathBuf {
+    generated_stores(keep, scale).await.0
+}
+
+/// The generated store for `scale` and its peer's, which holds the same claims, from `keep` when
+/// an earlier run made them.
+pub(crate) async fn generated_stores(keep: &Path, scale: f64) -> (PathBuf, PathBuf) {
     let path = keep.join(format!("generated-{scale}.sqlite3"));
-    if path.exists() {
+    let peer_path = keep.join(format!("generated-{scale}-peer.sqlite3"));
+    if path.exists() && peer_path.exists() {
         println!("using {}", path.display());
-        return path;
+        return (path, peer_path);
     }
     // Each claim commits on its own, and a commit waits for a disk flush. Generate in memory-backed
     // storage when the host has room for it, then move the store in.
     let estimate = (scale * 3e9) as u64;
     let shm = Path::new("/dev/shm");
-    let scratch = if shm.is_dir() && free_bytes(shm) > estimate * 2 {
+    let scratch = if shm.is_dir() && free_bytes(shm) > estimate * 3 {
         tempfile::tempdir_in(shm)
     } else {
         tempfile::tempdir_in(keep)
@@ -1124,18 +1139,27 @@ async fn generated_store(keep: &Path, scale: f64) -> PathBuf {
     let started = Instant::now();
     let (main, peer) = (partial.join("main.sqlite3"), partial.join("peer.sqlite3"));
     let (generated_main, generated_peer) = (main.clone(), peer.clone());
-    tokio::task::spawn_blocking(move || {
-        let peer_share = SAMPLED.peer_percent as f64 / 100.0;
+    // The two stores generate side by side; each writes through its own writer.
+    let peer_share = SAMPLED.peer_percent as f64 / 100.0;
+    let peer_generated = tokio::task::spawn_blocking(move || {
         let peer = Store::open(&generated_peer, PEER).unwrap();
         peer.bind_fleet(FLEET).unwrap();
         generate(&peer, "peer", scale * peer_share);
+        peer
+    });
+    let store_generated = tokio::task::spawn_blocking(move || {
         let store = Store::open(&generated_main, NODE).unwrap();
         store.bind_fleet(FLEET).unwrap();
         generate(&store, "host", scale * (1.0 - peer_share));
-        replicate(&peer, &store);
-    })
-    .await
-    .unwrap();
+        store
+    });
+    let (peer_store, store) = (
+        peer_generated.await.unwrap(),
+        store_generated.await.unwrap(),
+    );
+    tokio::task::spawn_blocking(move || replicate(&peer_store, PEER, &store))
+        .await
+        .unwrap();
     // Reopening seals this node's own batches into replication envelopes, as a daemon start does.
     let sealed = main.clone();
     tokio::task::spawn_blocking(move || drop(Store::open(&sealed, NODE).unwrap()))
@@ -1143,10 +1167,21 @@ async fn generated_store(keep: &Path, scale: f64) -> PathBuf {
         .unwrap();
     // The messages go through the API, which is the only writer of their lifecycle.
     send_messages(&partial, &main, scaled(SAMPLED.messages, scale)).await;
-    for suffix in ["", "-wal"] {
-        let from = PathBuf::from(format!("{}{suffix}", main.display()));
-        if from.exists() {
-            std::fs::copy(&from, format!("{}{suffix}", path.display())).unwrap();
+    // The peer receives everything this node wrote, so the two are in step, as live peers are.
+    let (sealed, generated_peer) = (main.clone(), peer.clone());
+    tokio::task::spawn_blocking(move || {
+        let store = Store::open(&sealed, NODE).unwrap();
+        let peer = Store::open(&generated_peer, PEER).unwrap();
+        replicate(&store, NODE, &peer);
+    })
+    .await
+    .unwrap();
+    for (from, to) in [(&main, &path), (&peer, &peer_path)] {
+        for suffix in ["", "-wal"] {
+            let from = PathBuf::from(format!("{}{suffix}", from.display()));
+            if from.exists() {
+                std::fs::copy(&from, format!("{}{suffix}", to.display())).unwrap();
+            }
         }
     }
     drop(scratch);
@@ -1155,7 +1190,7 @@ async fn generated_store(keep: &Path, scale: f64) -> PathBuf {
         started.elapsed().as_secs_f64(),
         path.display()
     );
-    path
+    (path, peer_path)
 }
 
 fn free_bytes(path: &Path) -> u64 {
@@ -1170,13 +1205,13 @@ fn free_bytes(path: &Path) -> u64 {
     }
 }
 
-fn replicate(from: &Store, to: &Store) {
+fn replicate(from: &Store, from_name: &str, to: &Store) {
     loop {
         let before = to.index().unwrap();
         let exchange = from
             .export_replication_exchange(FLEET, &to.replication_inventory().unwrap())
             .unwrap();
-        to.receive_replication_exchange(PEER, FLEET, &exchange)
+        to.receive_replication_exchange(from_name, FLEET, &exchange)
             .unwrap();
         to.validate_replication_backlog().unwrap();
         to.apply_replication_repairs().unwrap();
@@ -1187,7 +1222,7 @@ fn replicate(from: &Store, to: &Store) {
     }
 }
 
-fn publish_mission(store: &Store, name: &str, steps: usize, revision: usize) {
+pub(crate) fn publish_mission(store: &Store, name: &str, steps: usize, revision: usize) {
     let mut source = format!(
         "version 2\nmission \"{name}\" state=\"ready\" {{\n  goal \"Ship invented change {revision} for {name}.\"\n  concurrent-runs max=1000000\n"
     );
@@ -1284,16 +1319,31 @@ fn generate(store: &Store, prefix: &str, scale: f64) {
         }
     }
     standing_agents(store, prefix, scaled(SAMPLED.agents, scale));
+    // A new version of a document names the version it replaces.
+    let mut heads = BTreeMap::<String, String>::new();
+    let mut put = |name: String, bytes: &[u8], key: String| {
+        if let Ok(version) = store.put_document(&name, bytes, &heads.get(&name).cloned(), &key) {
+            heads.insert(name, version.binding_claim_id);
+        }
+    };
     for document in 0..scaled(SAMPLED.documents, scale) {
         let bytes = format!(
             "# Invented report {document}\n\n{}",
             "An invented finding.\n".repeat(700)
         );
-        let _ = store.put_document(
-            &format!("doc/bench/{prefix}/report-{}", document % 470),
+        put(
+            format!("doc/bench/{prefix}/report-{}", document % 470),
             bytes.as_bytes(),
-            &None,
-            &format!("bench-{prefix}-document-{document}"),
+            format!("bench-{prefix}-document-{document}"),
+        );
+    }
+    // A delivery probe binds a new version of its document every round, so one name gathers a
+    // version for every round the host has run.
+    for round in 0..scaled(SAMPLED.probe_versions, scale) {
+        put(
+            format!("doc/bench/{prefix}/probe"),
+            format!("invented probe round {round}\n").as_bytes(),
+            format!("bench-{prefix}-probe-{round}"),
         );
     }
     let asker = format!("agent/bench/{prefix}/standing-0");
@@ -1466,7 +1516,7 @@ fn synthetic_fields(spec: &st3_schema::ClaimSpec, index: usize) -> BTreeMap<Stri
     fields
 }
 
-fn claim_input(kind: &str, key: &str, index: usize, run: &str) -> ClaimInput {
+pub(crate) fn claim_input(kind: &str, key: &str, index: usize, run: &str) -> ClaimInput {
     let registry = st3_schema::registry();
     let spec = &registry.claims[kind];
     let family = spec.subjects.first().map(String::as_str).unwrap_or("agent");

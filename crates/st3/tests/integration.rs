@@ -14,6 +14,8 @@ mod codex_bootstrap;
 mod command_recorder;
 mod convergence;
 mod daemon_bench;
+mod daemon_cost;
+mod daemon_load;
 mod daemon_environment;
 mod daemon_restart;
 mod delivery_probe;

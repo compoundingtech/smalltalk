@@ -34,7 +34,7 @@ use crate::hash::{
 use crate::replication::*;
 use crate::sqlite::{
     PINNED_READER, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS, SQLITE_NANOS,
-    STATEMENT_CACHE_CAPACITY, WriterConnection, record_sqlite_time,
+    STATEMENT_CACHE_CAPACITY, WriterConnection,
 };
 
 pub mod canonical;
@@ -408,7 +408,7 @@ impl Store {
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st database {}", path.display()))?;
         projection_digest::register(&connection)?;
-        connection.profile(Some(record_sqlite_time));
+        crate::sqlite::observe(&mut connection);
         connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         // Keep the hot graph and replication index pages in SQLite's bounded
         // page cache. The default (~2 MiB per connection) churns against the
@@ -447,7 +447,7 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
         projection_digest::register(&connection)?;
-        connection.profile(Some(record_sqlite_time));
+        crate::sqlite::observe(&mut connection);
         connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         Self::create_schema(&connection, &*runtime)?;
         {
