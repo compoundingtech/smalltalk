@@ -395,6 +395,7 @@ const PROBES: &[Probe] = &[
         "/v1/client/documents/content?name={document_reference}",
     ),
     get("GET /v1/client/usage", "/v1/client/usage"),
+    get("GET /v1/client/clients", "/v1/client/clients"),
     get(
         "GET /v1/client/subject-definition",
         "/v1/client/subject-definition?subject={seat}",
