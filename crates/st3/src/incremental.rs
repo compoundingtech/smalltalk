@@ -457,6 +457,42 @@ mod tests {
         }
     }
 
+    fn observe(store: &Store, resource: &str) {
+        store
+            .append_claim(&crate::model::ClaimInput {
+                subject: format!("resource/{resource}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: std::collections::BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.st3.test".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(resource.into()),
+            })
+            .unwrap();
+    }
+
+    /// A correction names what the item wrote: a claim another thread wrote meanwhile, which a
+    /// change feed read would include, is not its write.
+    #[test]
+    fn a_recording_lists_only_its_own_writes() {
+        let store = std::sync::Arc::new(Store::open_memory("node").unwrap());
+        let other = store.clone();
+        let ((), wrote) = smallclaims::touched::record_wrote(|| {
+            observe(&store, "own");
+            std::thread::spawn(move || observe(&other, "other"))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(wrote, ["resource.observed resource/own"]);
+        assert!(
+            smallclaims::touched::wrote_since(0).is_empty(),
+            "nothing records outside it"
+        );
+    }
+
     #[test]
     fn a_change_marks_only_the_items_that_read_it() {
         let incremental = Incremental::default();

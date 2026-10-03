@@ -12,6 +12,64 @@ thread_local! {
     static READS: RefCell<Option<BTreeSet<String>>> = const { RefCell::new(None) };
     static WRITES: Cell<u64> = const { Cell::new(0) };
     static DUE: Cell<Option<u128>> = const { Cell::new(None) };
+    static WROTE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// Note a claim or local observation written for the work being recorded on this thread, as
+/// `kind subject`. Free when nothing is recording.
+pub fn note_wrote(entry: impl FnOnce() -> String) {
+    WROTE.with(|wrote| {
+        if let Some(list) = wrote.borrow_mut().as_mut() {
+            list.push(entry());
+        }
+    });
+}
+
+/// How many writes the recording on this thread holds so far; see [`wrote_since`].
+pub fn wrote_len() -> usize {
+    WROTE.with(|wrote| wrote.borrow().as_ref().map_or(0, Vec::len))
+}
+
+/// The writes the recording on this thread noted after `mark` (from [`wrote_len`]).
+pub fn wrote_since(mark: usize) -> Vec<String> {
+    WROTE.with(|wrote| {
+        wrote
+            .borrow()
+            .as_ref()
+            .map(|list| list.get(mark..).unwrap_or_default().to_vec())
+            .unwrap_or_default()
+    })
+}
+
+/// Whether the work on this thread is recording what it writes.
+pub fn recording_wrote() -> bool {
+    WROTE.with(|wrote| wrote.borrow().is_some())
+}
+
+/// Run `work`, returning the claims and local observations it wrote, as `kind subject`. Nests:
+/// an enclosing recording also gets them. Other threads' writes, which a change feed read would
+/// include, are not among them.
+pub fn record_wrote<T>(work: impl FnOnce() -> T) -> (T, Vec<String>) {
+    struct Scope(Option<Option<Vec<String>>>);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            let Some(outer) = self.0.take() else { return };
+            WROTE.with(|wrote| {
+                let inner = wrote.borrow_mut().take().unwrap_or_default();
+                *wrote.borrow_mut() = outer.map(|mut outer| {
+                    outer.extend(inner);
+                    outer
+                });
+            });
+        }
+    }
+    let scope = Scope(Some(
+        WROTE.with(|wrote| wrote.borrow_mut().replace(Vec::new())),
+    ));
+    let result = work();
+    let wrote = WROTE.with(|wrote| wrote.borrow().clone().unwrap_or_default());
+    drop(scope);
+    (result, wrote)
 }
 
 /// Note that the work being recorded must run again by `at` (unix ms): a timer it armed, a lease

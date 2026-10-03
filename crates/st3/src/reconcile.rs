@@ -1537,6 +1537,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
+        self.recording_writes(|| self.reconcile_pass())
+    }
+
+    fn reconcile_pass(&self) -> Result<()> {
         let observe_span = crate::profile::span("pass/changes");
         self.incremental.observe(&self.store)?;
         drop(observe_span);
@@ -1866,9 +1870,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let queued_before = work_message_agents.len();
             let cpu_started = crate::incremental::thread_cpu();
-            let writes = smallclaims::touched::writes();
-            let feed_before =
-                (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+            let wrote_mark = smallclaims::touched::wrote_len();
             let ((result, due), reads) = smallclaims::touched::record(|| {
                 smallclaims::touched::record_due(|| {
                     caught(|| -> Result<()> {
@@ -2114,17 +2116,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 needed,
                 crate::incremental::thread_cpu().saturating_sub(cpu_started),
             );
-            if !needed && smallclaims::touched::writes() > writes {
-                let wrote: Vec<String> = feed_before
-                    .and_then(Result::ok)
-                    .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
-                    .map(|feed| {
-                        feed.changes
-                            .iter()
-                            .map(|change| format!("{} {}", change.kind, change.subject))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+            if !needed {
+                let wrote = smallclaims::touched::wrote_since(wrote_mark);
                 if !wrote.is_empty() {
                     self.incremental_correction("member", &item, &reads, &wrote);
                 }
@@ -2349,6 +2342,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_provider_capacity_retries(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.recording_writes(|| self.reconcile_provider_capacity_retries_pass(desired))
+    }
+
+    fn reconcile_provider_capacity_retries_pass(&self, desired: &[DesiredSubject]) -> Result<()> {
         self.incremental.observe(&self.store)?;
         let now = now_ms();
         let skip = self.skip_unneeded && !self.incremental.take_full_pass("capacity", now);
@@ -3114,8 +3111,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         let cpu_started = crate::incremental::thread_cpu();
-        let writes = smallclaims::touched::writes();
-        let feed_before = (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+        let wrote_mark = smallclaims::touched::wrote_len();
         let ((result, due), reads) =
             smallclaims::touched::record(|| smallclaims::touched::record_due(|| caught(work)));
         crate::performance::record_evaluation(
@@ -3123,17 +3119,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             needed,
             crate::incremental::thread_cpu().saturating_sub(cpu_started),
         );
-        if !needed && smallclaims::touched::writes() > writes {
-            let wrote: Vec<String> = feed_before
-                .and_then(Result::ok)
-                .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
-                .map(|feed| {
-                    feed.changes
-                        .iter()
-                        .map(|change| format!("{} {}", change.kind, change.subject))
-                        .collect()
-                })
-                .unwrap_or_default();
+        if !needed {
+            let wrote = smallclaims::touched::wrote_since(wrote_mark);
             if !wrote.is_empty() {
                 self.incremental_correction(section, item, &reads, &wrote);
             }
@@ -3449,6 +3436,16 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Reconcile a stop. `actual_origin` is the subject's selected actual origin when the caller
     /// already read it in this pass.
+    /// Run `work` with this thread recording the claims it writes, unless an enclosing pass
+    /// already does, so a correction lists only what an item itself wrote.
+    fn recording_writes<T>(&self, work: impl FnOnce() -> T) -> T {
+        if smallclaims::touched::recording_wrote() {
+            work()
+        } else {
+            smallclaims::touched::record_wrote(work).0
+        }
+    }
+
     /// Whether `item` needs evaluating. When it is evaluated anyway (`evaluated_anyway`: a full
     /// pass, or skipping off), the change feed is read again first: a write that landed after
     /// the pass read it, such as a request through the API, is what the evaluation acts on, not
@@ -3509,8 +3506,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return;
         }
         let cpu_started = crate::incremental::thread_cpu();
-        let writes = smallclaims::touched::writes();
-        let feed_before = (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+        let wrote_mark = smallclaims::touched::wrote_len();
         let ((outcome, due), reads) = smallclaims::touched::record(|| {
             smallclaims::touched::record_due(|| -> Result<Option<Result<()>>> {
                 // A stop's actual origin is read once here and reused by `reconcile_stop`.
@@ -3539,17 +3535,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             needed,
             crate::incremental::thread_cpu().saturating_sub(cpu_started),
         );
-        if !needed && smallclaims::touched::writes() > writes {
-            let wrote: Vec<String> = feed_before
-                .and_then(Result::ok)
-                .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
-                .map(|feed| {
-                    feed.changes
-                        .iter()
-                        .map(|change| format!("{} {}", change.kind, change.subject))
-                        .collect()
-                })
-                .unwrap_or_default();
+        if !needed {
+            let wrote = smallclaims::touched::wrote_since(wrote_mark);
             if !wrote.is_empty() {
                 self.incremental_correction("stop", item, &reads, &wrote);
             }
@@ -5419,6 +5406,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// Evaluate each active run on its own. A run that fails records a fault on that run, and
     /// every other run, including runs in cleanup, is still evaluated in the same pass.
     fn evaluate_mission_runs(&self) -> Result<()> {
+        self.recording_writes(|| self.evaluate_mission_runs_pass())
+    }
+
+    fn evaluate_mission_runs_pass(&self) -> Result<()> {
         self.incremental.observe(&self.store)?;
         // A gate runner's exit is not a claim: look again at the runners evaluations wait on.
         self.incremental.observe_execs(|runtime_id| {
@@ -5454,9 +5445,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 continue;
             }
             let cpu_started = crate::incremental::thread_cpu();
-            let writes = smallclaims::touched::writes();
-            let feed_before =
-                (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+            let wrote_mark = smallclaims::touched::wrote_len();
             let mut due = None;
             let ((evaluated, armed), reads) = smallclaims::touched::record(|| {
                 smallclaims::touched::record_due(|| {
@@ -5481,17 +5470,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 needed,
                 crate::incremental::thread_cpu().saturating_sub(cpu_started),
             );
-            if !needed && smallclaims::touched::writes() > writes {
-                let wrote: Vec<String> = feed_before
-                    .and_then(Result::ok)
-                    .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
-                    .map(|feed| {
-                        feed.changes
-                            .iter()
-                            .map(|change| format!("{} {}", change.kind, change.subject))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+            if !needed {
+                let wrote = smallclaims::touched::wrote_since(wrote_mark);
                 // Rows that are not claims or observations (caches, capabilities) change no
                 // graph state a later pass would have to catch up with.
                 if !wrote.is_empty() {
@@ -10258,6 +10238,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_subscription_missions(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.recording_writes(|| self.reconcile_subscription_missions_pass(desired))
+    }
+
+    fn reconcile_subscription_missions_pass(&self, desired: &[DesiredSubject]) -> Result<()> {
         self.incremental.observe(&self.store)?;
         // Read once for every subscription: it lists the whole host's open attention requests.
         let held = self

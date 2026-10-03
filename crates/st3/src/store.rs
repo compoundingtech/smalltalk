@@ -16767,6 +16767,7 @@ fn insert_local_observation_tx(
             ).map_err(internal)?;
         }
     }
+    smallclaims::touched::note_wrote(|| format!("{} {}", input.kind, input.subject));
     transaction
         .execute(
             "INSERT INTO local_observations(
