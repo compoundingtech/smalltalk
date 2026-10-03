@@ -7,10 +7,11 @@ import {
 
 export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64', runId: '${{ github.run_id }}' })
 /**
- * The Linux gate's stage jobs use a bigger shape than the profile's 8x16: the test build, nextest
- * and clippy scale with the CPU count. Cost is not a constraint for this trial.
+ * The Linux gate's stage jobs. Since about 12:10Z on 2026-10-03 the plain shape label
+ * `nscloud-ubuntu-24.04-amd64-16x32` got no runners while the profile's jobs started, so the stages
+ * run on the profile too, until the bigger shape is available again.
  */
-export const linuxStageRunner = ['nscloud-ubuntu-24.04-amd64-16x32'] as const
+export const linuxStageRunner = linuxRunner
 export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
 
 /** The public, read-only effect-utils cache supplies genie and other pinned effect-utils packages. */
