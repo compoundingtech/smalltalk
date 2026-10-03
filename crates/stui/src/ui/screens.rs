@@ -1034,12 +1034,22 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                             ("y", "Yes", Hit::Key('y'), theme::GREEN),
                             ("n", "No", Hit::Key('n'), theme::RED),
                             ("c", "Answer in words", Hit::Key('c'), theme::ACCENT),
-                            ("x", "Dismiss: nothing to do", Hit::Key('x'), theme::OVERLAY1),
+                            (
+                                "x",
+                                "Dismiss: nothing to do",
+                                Hit::Key('x'),
+                                theme::OVERLAY1,
+                            ),
                         ]);
                     } else {
                         card.buttons(&[
                             ("c", "Answer", Hit::Key('c'), theme::ACCENT),
-                            ("x", "Dismiss: nothing to do", Hit::Key('x'), theme::OVERLAY1),
+                            (
+                                "x",
+                                "Dismiss: nothing to do",
+                                Hit::Key('x'),
+                                theme::OVERLAY1,
+                            ),
                         ]);
                     }
                 }
