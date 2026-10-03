@@ -1324,6 +1324,7 @@ fn item_data_types(
             "comments" => data_types.insert("comments".to_owned()),
             "reactions" => data_types.insert("reactions".to_owned()),
             "mentions" => data_types.insert("mentions".to_owned()),
+            "recent_comments" => data_types.insert("comments".to_owned()),
             "last_comment" => {
                 let reactions = |value: Option<&Value>| {
                     value
@@ -1429,6 +1430,15 @@ fn item_facts(
                 }
             }
             ("last_comment", Some(known)) if !newer_comment(value, known) => {}
+            // Each comment and review once, by kind and ID; the newest are kept.
+            ("recent_comments", known) => {
+                let merged = crate::resource::merge_recent_comments(
+                    known.and_then(Value::as_array).into_iter().flatten(),
+                    value.as_array().into_iter().flatten(),
+                    Some(crate::resource::RECENT_COMMENTS),
+                );
+                facts.insert(name.into(), Value::Array(merged));
+            }
             ("mentions", Some(Value::Array(known))) => {
                 let mut mentions = BTreeMap::<String, Value>::new();
                 for mention in known.iter().chain(value.as_array().into_iter().flatten()) {
@@ -21738,6 +21748,147 @@ fn a_large_page_is_admitted_in_chunks_that_release_the_writer() {
 
 #[cfg(test)]
 #[test]
+fn catch_up_projection_cannot_clear_an_admission_deferred_after_its_index_read() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    for index in 0..1_800 {
+        source
+            .put_document(
+                &format!("doc/late-admission/{index}"),
+                b"An invented late admission.",
+                &None,
+                &format!("late-admission-{index}"),
+            )
+            .unwrap();
+    }
+    assert!(
+        target
+            .project_replication_backlog_before_clear(|| {
+                // Pass A has already observed no pending claims. Admit a new page and defer
+                // pass B before A tries to clear that observation, deterministically.
+                let mut inventory = target.replication_inventory().unwrap();
+                inventory.accepts = None;
+                let exchange = source
+                    .export_replication_exchange(FLEET, &inventory)
+                    .unwrap();
+                target
+                    .receive_replication_exchange("source", FLEET, &exchange)
+                    .unwrap();
+                assert!(target.validate_replication_backlog().unwrap().changed);
+                assert!(target.replication_catching_up());
+                assert_eq!(
+                    target
+                        .project_replication_backlog_unless_catching_up()
+                        .unwrap(),
+                    None
+                );
+                assert!(target.replication_projection_deferred());
+            })
+            .unwrap()
+    );
+    assert!(target.projected_through() < target.index().unwrap());
+    assert!(
+        target.replication_projection_deferred(),
+        "an older projection cleared the newer admission's deferral"
+    );
+    target
+        .last_replication_projection_unix_ms
+        .store(0, Ordering::Release);
+    assert_eq!(
+        target
+            .project_replication_backlog_unless_catching_up()
+            .unwrap(),
+        Some(true)
+    );
+    assert!(!target.replication_projection_deferred());
+    assert_eq!(target.projected_through(), target.index().unwrap());
+}
+
+#[cfg(test)]
+#[test]
+fn catch_up_projection_commits_frontiers_and_serves_writes_between_them() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    target.project_replication_backlog().unwrap();
+    for index in 0..306 {
+        source
+            .put_document(
+                &format!("doc/catch-up/{index}"),
+                b"An invented catch-up document.",
+                &None,
+                &format!("catch-up-doc-{index}"),
+            )
+            .unwrap();
+    }
+    let mut inventory = target.replication_inventory().unwrap();
+    inventory.accepts = Some(REPLICATION_PAGE_LIMIT);
+    let exchange = source
+        .export_replication_exchange(FLEET, &inventory)
+        .unwrap();
+    target
+        .receive_replication_exchange("source", FLEET, &exchange)
+        .unwrap();
+    target.validate_replication_backlog().unwrap();
+    let admitted = target.index().unwrap();
+    let mut frontiers = Vec::new();
+    FULL_REPLAYS.with(|count| count.set(0));
+    assert!(
+        target
+            .project_replication_backlog_with_yield(|| {
+                // A reader sees a committed prefix while sync comparisons remain deferred. A normal
+                // document write can take the writer before the remaining catch-up claims project.
+                let frontier = target.projected_through();
+                assert!(frontier < admitted);
+                assert!(target.replication_projection_deferred());
+                assert!(frontiers.last().is_none_or(|last| frontier > *last));
+                frontiers.push(frontier);
+                target
+                    .put_document(
+                        &format!("doc/during-catch-up/{}", frontiers.len()),
+                        b"A local write while catch-up runs.",
+                        &None,
+                        &format!("during-catch-up-{}", frontiers.len()),
+                    )
+                    .unwrap();
+            })
+            .unwrap()
+    );
+    assert!(
+        frontiers.len() >= 2,
+        "catch-up kept the writer for its entire backlog"
+    );
+    assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+    assert_eq!(target.projected_through(), admitted);
+    assert!(
+        target.replication_projection_deferred(),
+        "later claims still need a pass"
+    );
+    assert!(target.project_replication_backlog().unwrap());
+    assert!(!target.replication_projection_deferred());
+    assert_eq!(target.projected_through(), target.index().unwrap());
+    let digest = || {
+        target
+            .replication_status(true, Some(FLEET), &[])
+            .unwrap()
+            .graph_digest
+    };
+    let incremental = digest();
+    target.replay_replication_graph().unwrap();
+    assert_eq!(
+        digest(),
+        incremental,
+        "interleaved writes must agree with canonical replay"
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() {
     const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
     let source = Store::open_memory("source").unwrap();
@@ -22593,9 +22744,22 @@ fn replay_needed(reason: String) -> bool {
     false
 }
 
+#[cfg(test)]
+fn try_project_all_simple_replication_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+) -> Result<bool, St3Error> {
+    try_project_simple_replication_tx(
+        transaction,
+        origin,
+        current_index_tx(transaction).map_err(internal)?,
+    )
+}
+
 fn try_project_simple_replication_tx(
     transaction: &Transaction<'_>,
     origin: &str,
+    through: u64,
 ) -> Result<bool, St3Error> {
     let health: Option<(String, u64)> = transaction
         .query_row(
@@ -22617,11 +22781,11 @@ fn try_project_simple_replication_tx(
         .prepare(
             "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                     predecessors, accepted_at_unix_ms
-             FROM claims WHERE store_index > ?1 ORDER BY store_index",
+             FROM claims WHERE store_index > ?1 AND store_index <= ?2 ORDER BY store_index",
         )
         .map_err(internal)?;
     let claims = statement
-        .query_map([frontier], claim_from_row)
+        .query_map([frontier, through], claim_from_row)
         .map_err(internal)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(internal)?;
@@ -28457,7 +28621,7 @@ agent "test/empty" { command "true" }
                 None,
             )
             .unwrap();
-            assert!(try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
+            assert!(try_project_all_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.commit().unwrap();
             claim
         };
@@ -29016,7 +29180,7 @@ agent "test/empty" { command "true" }
         {
             let mut connection = store.connection.lock().unwrap();
             let transaction = connection.transaction().unwrap();
-            assert!(try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
+            assert!(try_project_all_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.rollback().unwrap();
         }
         let before = store.connection.lock().unwrap().total_changes();
@@ -29236,7 +29400,7 @@ agent "test/empty" { command "true" }
             None,
         )
         .unwrap();
-        assert!(!try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
+        assert!(!try_project_all_simple_replication_tx(&transaction, &store.origin).unwrap());
     }
 
     #[test]
@@ -29259,7 +29423,7 @@ agent "test/empty" { command "true" }
                 None,
             )
             .unwrap();
-            assert!(try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
+            assert!(try_project_all_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.commit().unwrap();
         }
         assert!(store.operation_projection_drift().unwrap().is_empty());
@@ -29280,7 +29444,7 @@ agent "test/empty" { command "true" }
                 None,
             )
             .unwrap();
-            assert!(!try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
+            assert!(!try_project_all_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.commit().unwrap();
         }
         assert!(store.project_replication_backlog().unwrap());
@@ -32782,7 +32946,7 @@ version 2
                 let mut connection = controller.connection.lock().unwrap();
                 let transaction = connection.transaction().unwrap();
                 assert!(
-                    try_project_simple_replication_tx(&transaction, &controller.origin).unwrap(),
+                    try_project_all_simple_replication_tx(&transaction, &controller.origin).unwrap(),
                     "a single routine work transition should use the bounded projection path"
                 );
                 transaction.rollback().unwrap();
@@ -32962,6 +33126,83 @@ version 2
     /// Another writer's structural claim that sorts before a lease claim this node already
     /// applied rebuilds that step's run tree, without replaying the graph, and the step ends as
     /// the replay's order decides.
+    #[test]
+    fn catch_up_projection_preserves_out_of_order_work_and_local_progress_between_chunks() {
+        let (controller, worker, step) = replicated_step_pair();
+        let accepted = worker
+            .claims_for(&step, None)
+            .unwrap()
+            .iter()
+            .map(|claim| claim.accepted_at_unix_ms)
+            .max()
+            .unwrap()
+            + 10;
+        controller.set_write_clock_at(accepted).unwrap();
+        for index in 0..300 {
+            controller
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/work-catch-up/{index}"),
+                    kind: "custom.work-catch-up.note".into(),
+                    actor: None,
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if index == 100 {
+                controller
+                    .set_step_state(&step, "blocked", Some("an older update"))
+                    .unwrap();
+            }
+            if index == 200 {
+                controller
+                    .set_step_state(&step, "ready", Some("the older block ends"))
+                    .unwrap();
+            }
+        }
+        worker.set_write_clock_at(accepted + 10).unwrap();
+        worker_work(&worker, &step, "claim", None, "catch-up-local-claim");
+        let exchange = exchange_from(&controller, &worker.replication_inventory().unwrap());
+        worker
+            .receive_replication_exchange("controller", TEST_FLEET, &exchange)
+            .unwrap();
+        worker.validate_replication_backlog().unwrap();
+        let mut writes = 0;
+        FULL_REPLAYS.with(|count| count.set(0));
+        assert!(
+            worker
+                .project_replication_backlog_with_yield(|| {
+                    writes += 1;
+                    worker.set_write_clock_at(accepted + 10 + writes).unwrap();
+                    worker_work(
+                        &worker,
+                        &step,
+                        "progress",
+                        Some("working during catch-up"),
+                        &format!("catch-up-local-progress-{writes}"),
+                    );
+                    assert_eq!(worker.step_run(&step).unwrap().unwrap().status, "working");
+                })
+                .unwrap()
+        );
+        assert!(
+            writes >= 2,
+            "normal work updates need turns between projection chunks"
+        );
+        worker.project_replication_backlog().unwrap();
+        assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+        let incremental = graph_digest_of(&worker);
+        let before = worker.step_run(&step).unwrap().unwrap();
+        worker.replay_replication_graph().unwrap();
+        let after = worker.step_run(&step).unwrap().unwrap();
+        assert_eq!(
+            (&before.status, &before.claimant, &before.blocked_reason),
+            (&after.status, &after.claimant, &after.blocked_reason)
+        );
+        assert_eq!(incremental, graph_digest_of(&worker));
+    }
+
     #[test]
     fn a_peer_claim_older_than_a_local_lease_claim_rebuilds_its_run_tree() {
         let (controller, worker, step) = replicated_step_pair();

@@ -145,6 +145,12 @@ pub enum Command {
     Converse {
         targets: Vec<String>,
     },
+    /// Subscribe to a followed agent's conversation again: st resolves an agent to its session
+    /// when the subscription starts, so after the agent restarts into a new session the old
+    /// subscription would keep showing the old one.
+    Resubscribe {
+        target: String,
+    },
 }
 
 /// The most conversations followed at once. A socket holds eight subscriptions: three windows,
@@ -273,6 +279,8 @@ pub async fn run_members(
                     Some(Command::Converse { targets }) => {
                         conversing = targets.into_iter().take(MAX_CONVERSATIONS).map(Conversing::new).collect();
                     }
+                    // Not connected: the next connection subscribes afresh anyway.
+                    Some(Command::Resubscribe { .. }) => {}
                     Some(Command::Follow { runtime_ids }) => {
                         following = None;
                         match resolve(&clients[member], &runtime_ids).await {
@@ -516,6 +524,16 @@ async fn connected(
                         kept.push(current);
                     }
                     *conversing = kept;
+                }
+                Some(Command::Resubscribe { target }) => {
+                    if let Some(current) = conversing.iter_mut().find(|current| current.target == target) {
+                        let _ = stream.unsubscribe(&current.id).await;
+                        current.retry_at = None;
+                        current.failures = 0;
+                        if let Err(error) = converse(stream, current).await {
+                            return Ended::Dropped(error.to_string());
+                        }
+                    }
                 }
                 Some(Command::Follow { runtime_ids }) => {
                     stop_following(client, stream, following).await;

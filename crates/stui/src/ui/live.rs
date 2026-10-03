@@ -44,7 +44,13 @@ struct Pending {
     effect: Effect,
     /// The exact request last sent; a retry repeats it so st can answer with the first result.
     sent: Arc<Mutex<Option<Sent>>>,
+    /// When it was last sent (or sent again): one st has not answered for a while is said to be
+    /// unconfirmed, so it can be sent again or cleared rather than wait forever.
+    since: Instant,
 }
+
+/// How long a message waits for st's answer before it says st has not confirmed it.
+const UNANSWERED_AFTER: Duration = Duration::from_secs(30);
 
 /// A message request as sent: st keys its receipt on the whole request.
 #[derive(Clone, Debug)]
@@ -249,6 +255,8 @@ pub fn run(context: Context) -> Result<()> {
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
     // The agent or session whose conversation the feed holds.
     let mut conversing: Vec<String> = Vec::new();
+    // The session each conversation was last subscribed again for, so it is asked once.
+    let mut resubscribed: BTreeMap<String, String> = BTreeMap::new();
     let mut preview_requested: HashSet<String> = HashSet::new();
     let mut body_requested: HashSet<String> = HashSet::new();
     let mut read_receipts = ReadReceipts::default();
@@ -480,6 +488,7 @@ pub fn run(context: Context) -> Result<()> {
                             Ok(id) => {
                                 entry.message_id = id;
                                 entry.failed = None;
+                                entry.unconfirmed = false;
                             }
                             Err((error, unconfirmed)) => {
                                 entry.failed = Some(error);
@@ -487,6 +496,18 @@ pub fn run(context: Context) -> Result<()> {
                             }
                         }
                     }
+                    // st took it. The copy here gives way once the conversation shows it, which
+                    // may already have happened; with no id to look for, at once.
+                    pending.retain(|entry| {
+                        entry.token != token
+                            || entry.failed.is_some()
+                            || entry.message_id.as_ref().is_some_and(|id| {
+                                !timelines
+                                    .values()
+                                    .flat_map(|timeline| &timeline.items)
+                                    .any(|item| matches!(&item.body, TimelineBody::Message(message) if &message.message_id == id))
+                            })
+                    });
                 }
                 Fetched::Preview(id, preview) => {
                     extras.previews.insert(id, preview);
@@ -715,6 +736,10 @@ pub fn run(context: Context) -> Result<()> {
             conversing = wanted;
             changed = true;
         }
+        changed |= mark_unanswered(&mut pending);
+        for target in moved_sessions(&conversing, &model, &timelines, &mut resubscribed) {
+            let _ = commands.send(Command::Resubscribe { target });
+        }
         if tab == 0
             && let Some(id) = selected.clone()
             && !preview_requested.contains(&id)
@@ -794,6 +819,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
             });
         }
+        ui.read_open_update();
         let mut effects = Vec::new();
         for effect in std::mem::take(&mut ui.effects) {
             // A glass change is kept until st confirms it, and goes once st is reachable.
@@ -932,6 +958,7 @@ pub fn run(context: Context) -> Result<()> {
                     };
                     retry.failed = None;
                     retry.unconfirmed = false;
+                    retry.since = Instant::now();
                     changed = true;
                     (
                         retry.effect.clone(),
@@ -983,6 +1010,7 @@ pub fn run(context: Context) -> Result<()> {
                         unconfirmed: false,
                         effect: effect.clone(),
                         sent: sent.clone(),
+                        since: Instant::now(),
                     });
                     changed = true;
                     (effect, Some(token), Some(sent))
@@ -1290,6 +1318,55 @@ async fn older_page(
         cursor = page.cursor;
     }
     Err("this session is too long to read further back here; st conversations timeline reads it all".into())
+}
+
+/// Say of each message st has not answered for a while that it is unconfirmed, so the person
+/// can send it again (safely: the same request) or clear it, rather than watch it wait forever.
+fn mark_unanswered(pending: &mut [Pending]) -> bool {
+    let mut marked = false;
+    for entry in pending {
+        if entry.message_id.is_none()
+            && entry.failed.is_none()
+            && entry.since.elapsed() >= UNANSWERED_AFTER
+        {
+            entry.failed = Some("still waiting after 30 s".into());
+            entry.unconfirmed = true;
+            marked = true;
+        }
+    }
+    marked
+}
+
+/// The followed agents whose conversation shows a session they have since left: st resolves an
+/// agent to its session when a subscription starts, so after a restart that subscription keeps
+/// the old one (Nathan's message to a restarted seat sat at "sending…" because it landed in the
+/// new session, which his stui was not showing). Each is named once per new session.
+fn moved_sessions(
+    conversing: &[String],
+    model: &Model,
+    timelines: &BTreeMap<String, st3_conversation_ui::Timeline>,
+    resubscribed: &mut BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut moved = Vec::new();
+    for target in conversing {
+        let Some(current) = model
+            .agents()
+            .find(|agent| &agent.header.id == target)
+            .and_then(|agent| agent.current_session_id.clone())
+        else {
+            continue;
+        };
+        let shown = timelines
+            .get(target)
+            .and_then(|timeline| timeline.session_id.as_deref());
+        if shown.is_some_and(|shown| shown != current)
+            && resubscribed.get(target) != Some(&current)
+        {
+            resubscribed.insert(target.clone(), current);
+            moved.push(target.clone());
+        }
+    }
+    moved
 }
 
 /// The quiet line above a conversation's oldest entry: how to see more, that more is on its
@@ -2200,6 +2277,69 @@ mod tests {
             ..Default::default()
         };
         assert!(note(timeline).starts_with("Start of this session"));
+    }
+
+    #[test]
+    fn a_restarted_agents_conversation_follows_its_new_session_once() {
+        let target = "agent/example/harbor/keeper".to_owned();
+        let mut model = Model::default();
+        model.agents.items.push(
+            serde_json::from_str(r#"{"kind":"agent","id":"agent/example/harbor/keeper","revision":"a","updated_at":"2026-10-03T08:28:00Z","name":"Keeper","state":"running","reachability":"reachable","current_session_id":"session/new"}"#)
+                .unwrap(),
+        );
+        let mut timelines = BTreeMap::new();
+        let mut timeline = st3_conversation_ui::Timeline::default();
+        timeline.apply(st3_conversation_ui::Frame {
+            replace: true,
+            session_id: Some("session/old".into()),
+            ..Default::default()
+        });
+        timelines.insert(target.clone(), timeline);
+        let mut asked = BTreeMap::new();
+        let conversing = [target.clone()];
+        assert_eq!(
+            moved_sessions(&conversing, &model, &timelines, &mut asked),
+            [target.clone()]
+        );
+        // Asked once for that session, not on every pass.
+        assert!(moved_sessions(&conversing, &model, &timelines, &mut asked).is_empty());
+        // Once the conversation shows the new session, nothing more is asked.
+        timelines.get_mut(&target).unwrap().apply(st3_conversation_ui::Frame {
+            replace: true,
+            session_id: Some("session/new".into()),
+            ..Default::default()
+        });
+        asked.clear();
+        assert!(moved_sessions(&conversing, &model, &timelines, &mut asked).is_empty());
+    }
+
+    #[test]
+    fn a_message_st_has_not_answered_becomes_unconfirmed_so_it_can_go_again() {
+        let pending = |since: Instant| Pending {
+            token: "t".into(),
+            agent: "agent/example/cos".into(),
+            text: "hello".into(),
+            at: "10:29".into(),
+            message_id: None,
+            failed: None,
+            unconfirmed: false,
+            effect: Effect::Send {
+                agent: "agent/example/cos".into(),
+                text: "hello".into(),
+                tags: Vec::new(),
+                images: Vec::new(),
+            },
+            sent: Arc::new(Mutex::new(None)),
+            since,
+        };
+        let mut fresh = [pending(Instant::now())];
+        assert!(!mark_unanswered(&mut fresh));
+        assert!(fresh[0].failed.is_none());
+        let mut waiting = [pending(Instant::now() - UNANSWERED_AFTER)];
+        assert!(mark_unanswered(&mut waiting));
+        assert!(waiting[0].unconfirmed && waiting[0].failed.is_some());
+        // Said once.
+        assert!(!mark_unanswered(&mut waiting));
     }
 
     fn fixture_screen() -> st3_client::TerminalScreen {
