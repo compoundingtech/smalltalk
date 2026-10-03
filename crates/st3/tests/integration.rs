@@ -5,6 +5,7 @@
 
 mod agents_restart;
 mod boot_canaries;
+mod broken_gates;
 mod client_creation;
 mod client_glasses;
 mod client_v0_cli;
@@ -20,8 +21,10 @@ mod examples;
 mod fault_isolation;
 mod first_sync;
 mod fleet;
+mod gate_kinds;
 mod getting_started;
 mod hook_telemetry;
+mod human_gates;
 mod idle_budget;
 mod log_diet;
 mod message_send_once;

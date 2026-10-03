@@ -637,13 +637,13 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 (Some(error), true) => (
                     rules.unconfirmed.color(theme),
                     format!(
-                        "you · unconfirmed, st did not answer ({error}) · r send again · x clear"
+                        "you · unconfirmed, st did not answer ({error}) · alt+r send again · alt+x clear"
                     ),
                     fg(rules.unconfirmed, theme),
                 ),
                 (Some(error), false) => (
                     rules.failed.color(theme),
-                    format!("you · not sent: {error} · r retry · x clear"),
+                    format!("you · not sent: {error} · alt+r retry · alt+x clear"),
                     fg(rules.failed, theme),
                 ),
             };
@@ -666,10 +666,13 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             }
         }
         Body::Event(event) => {
-            let label = text::truncate(
-                &format!(" {} · {} ", text::sanitize(event), entry.at),
-                width.saturating_sub(1),
-            );
+            // A note with no time (where a session starts) says only itself.
+            let label = if entry.at.is_empty() {
+                format!(" {} ", text::sanitize(event))
+            } else {
+                format!(" {} · {} ", text::sanitize(event), entry.at)
+            };
+            let label = text::truncate(&label, width.saturating_sub(1));
             let side = width.saturating_sub(text::width(&label)) / 2;
             doc.line(Line::from(vec![
                 Span::styled("─".repeat(side.min(6)), fg(RULES.event.rule, theme)),

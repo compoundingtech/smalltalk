@@ -131,7 +131,10 @@ function StructuredRequestView({ item, request, from, onAnswered }: { item: Para
   const { busy, status, actions } = useStore();
   const disabled = busy || status !== 'online';
   const label = (id: string) => request.answers?.find(answer => answer.id === id)?.label ?? id;
-  const send = (answer: { id: string; label: string }) => Alert.alert(`Answer ${from} “${answer.label}”`, undefined, [
+  const send = (answer: { id: string; label: string; outcome?: string | null }) => answer.outcome === 'request_changes'
+    // Requesting changes needs the changes, in words.
+    ? Alert.prompt(answer.label, 'What should change?', text => { if (text.trim()) void actions.done(item, text.trim(), answer.id).then(done => { if (done) onAnswered(); }); })
+    : Alert.alert(`Answer ${from} “${answer.label}”`, undefined, [
     { text: 'Cancel', style: 'cancel' },
     { text: 'Send', onPress: () => void actions.done(item, answer.label, answer.id).then(done => { if (done) onAnswered(); }) },
   ]);

@@ -4,6 +4,8 @@ use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use std::collections::BTreeSet;
 
 pub(super) mod raw_terminal;
+pub(super) mod resources;
+pub(super) mod search;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -7847,6 +7849,26 @@ async fn dispatch_action(
             if request.fence.runtime_desired_revision.as_deref() != Some(token.as_str()) {
                 return Err(stale("the agent desired revision changed"));
             }
+            // A mission seat stops like any other, and starts again on its run's declaration.
+            if action == "agent.start"
+                && state
+                    .store
+                    .declaration_ended_by_stop(&agent)
+                    .map_err(ApiError::internal)?
+                    .is_some_and(|ended| ended.declaration.owner_run.is_some())
+            {
+                state
+                    .store
+                    .start_mission_seat(
+                        &agent,
+                        Some(&token),
+                        authority_actor,
+                        &format!("{}:mission-seat-start", request.idempotency_key),
+                    )
+                    .map_err(ApiError::bad)?;
+                signal_changed(state);
+                return Ok(vec![agent]);
+            }
             let mut claim = state
                 .store
                 .claim_by_id(&token)
@@ -7856,9 +7878,9 @@ async fn dispatch_action(
                 let desired: crate::model::DesiredSubject =
                     serde_json::from_value(claim.body).map_err(ApiError::internal)?;
                 if desired.kind == "agent" {
-                    if desired.owner_run.is_some() {
+                    if action == "agent.start" && desired.owner_run.is_some() {
                         return Err(validation(
-                            "mission-owned agents must be changed through their mission",
+                            "its mission run already declares this agent; restart relaunches it",
                         ));
                     }
                     break desired;
@@ -8498,6 +8520,56 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
+    fn assert_collection_frame_conforms(frame: &Value) {
+        let mut schema: Value = serde_json::from_str(include_str!(
+            "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+        ))
+        .unwrap();
+        schema.as_object_mut().unwrap().remove("oneOf");
+        schema["$ref"] = json!("#/$defs/CollectionFrame");
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&schema)
+            .unwrap();
+        let errors: Vec<_> = validator
+            .iter_errors(frame)
+            .map(|error| error.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{frame}: {errors:?}");
+        let mut extra = frame.clone();
+        extra["undeclared"] = json!(true);
+        assert!(!validator.is_valid(&extra));
+        let mut bad_retry = frame.clone();
+        bad_retry["retryable"] = json!("yes");
+        assert!(!validator.is_valid(&bad_retry));
+    }
+
+    #[tokio::test]
+    async fn conversation_failure_and_recovery_frames_conform_to_collection_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for (remote, expected_kind) in [(Some("host/offline"), "resync"), (None, "error")] {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let follower = tokio::spawn(follow_conversation(
+                state.clone(),
+                ClientSession::local(None).unwrap(),
+                "chat".into(),
+                "session/missing".into(),
+                remote.map(str::to_owned),
+                sender,
+            ));
+            let (_, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            follower.abort();
+            assert_eq!(frame["kind"], expected_kind, "{frame}");
+            assert_eq!(frame["retryable"], expected_kind == "resync");
+            assert_collection_frame_conforms(&frame);
+        }
+        assert_collection_frame_conforms(&json!({"kind":"resync", "id":"minimal"}));
+    }
+
     #[tokio::test]
     async fn steady_collection_retries_a_failed_first_read_without_another_command_or_write() {
         use futures_util::{SinkExt as _, StreamExt as _};
@@ -8519,7 +8591,9 @@ mod tests {
                             move |state, session, request| {
                                 let reads = reads.clone();
                                 async move {
-                                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    if request.id == "refused" {
+                                        Err(validation("unknown collection subscription"))
+                                    } else if reads.fetch_add(1, Ordering::SeqCst) == 0 {
                                         Err(ApiError::internal("injected first read failure"))
                                     } else {
                                         collection_items(&state, &session, &request).await
@@ -8551,6 +8625,7 @@ mod tests {
             serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(first["kind"], "resync");
         assert_eq!(first["retryable"], true);
+        assert_collection_frame_conforms(&first);
         let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
             .await
             .unwrap()
@@ -8560,6 +8635,23 @@ mod tests {
         assert_eq!(recovered["kind"], "snapshot");
         assert_eq!(recovered["id"], "agents");
         assert!(reads.load(Ordering::SeqCst) >= 2);
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe", "id":"refused", "collection":"agents"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let refused: Value = serde_json::from_str(refused.to_text().unwrap()).unwrap();
+        assert_eq!(refused["kind"], "error");
+        assert_eq!(refused["retryable"], false);
+        assert_collection_frame_conforms(&refused);
         socket.close(None).await.unwrap();
         server.abort();
     }
@@ -8718,6 +8810,117 @@ mod tests {
             .unwrap()
             .remove(0);
         assert!(session_message_body(&claim).get("attachments").is_none());
+    }
+
+    #[tokio::test]
+    async fn resources_list_filters_latest_observations_and_fences_pages() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let observe = |subject: &str, kind: &str, facts: Value| {
+            state.store.append_client_claim(&crate::model::ClaimInput {
+                subject: subject.into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("kind".into(), json!(kind)), ("facts".into(), facts)]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap();
+        };
+        observe("resource/github/a", "vcs.pull-request", json!({"title":"Old", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
+        observe("resource/github/b", "vcs.pull-request", json!({"title":"Second", "opened_by":"agent/alice", "opened_by_run":"mission-run/two"}));
+        observe("resource/github/c", "vcs.pull-request", json!({"title":"Other", "opened_by":"agent/bob"}));
+        observe("resource/repository", "vcs.repository", json!({"url":"https://example.org/repository"}));
+        observe("resource/github/a", "vcs.pull-request", json!({"title":"New", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
+        let app = super::super::router(state.clone());
+        let read = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap())
+            }
+        };
+        let (status, all) = read("/v1/client/resources".into()).await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(all["value"]["items"].as_array().unwrap().iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["resource/github/a", "resource/github/b", "resource/github/c", "resource/repository"]);
+        assert_eq!(all["value"]["items"][0]["facts"]["title"], "New");
+        assert_eq!(all["value"]["items"][0]["opened_by"], "agent/alice");
+        assert_eq!(all["value"]["items"][0]["opened_by_run"], "mission-run/one");
+        chrono::DateTime::parse_from_rfc3339(all["value"]["items"][0]["observed_at"].as_str().unwrap()).unwrap();
+        assert_eq!(all["value"]["items"][3]["opened_by"], Value::Null);
+        let (status, run) = read("/v1/client/resources?opened_by=mission-run%2Fone&kind=vcs.pull-request".into()).await;
+        assert_eq!(status, StatusCode::OK, "{run}");
+        assert_eq!(run["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        let (status, repository) = read("/v1/client/resources?kind=vcs.repository".into()).await;
+        assert_eq!(status, StatusCode::OK, "{repository}");
+        assert_eq!(repository["value"]["items"], json!([all["value"]["items"][3].clone()]));
+        let filters = "opened_by=agent%2Falice&kind=vcs.pull-request&subject_prefix=resource%2Fgithub%2F&limit=1";
+        let (status, first) = read(format!("/v1/client/resources?{filters}")).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["value"]["filters"], json!({"opened_by":"agent/alice", "kind":"vcs.pull-request", "subject_prefix":"resource/github/"}));
+        assert_eq!(first["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        assert_eq!(first["value"]["page"]["has_more"], true);
+        let cursor = urlencoding::encode(first["value"]["page"]["next_cursor"].as_str().unwrap());
+        let continuation = format!("/v1/client/resources?{filters}&cursor={cursor}");
+        state.store.append_claim(&ClaimInput {
+            subject: "custom/test/unrelated".into(),
+            kind: "custom.test.marker".into(),
+            actor: None,
+            fields: BTreeMap::new(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
+        let (status, second) = read(continuation.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["snapshot"], first["snapshot"]);
+        assert_eq!(second["value"]["items"], json!([all["value"]["items"][1].clone()]));
+        assert_eq!(second["value"]["page"]["has_more"], false);
+        let (status, changed_filter) = read(format!("/v1/client/resources?opened_by=agent%2Fbob&cursor={cursor}")).await;
+        assert_eq!(status, StatusCode::GONE, "{changed_filter}");
+        assert_eq!(changed_filter["code"], "page-cursor-expired");
+        observe("resource/github/a", "vcs.pull-request", json!({"title":"Reassigned", "opened_by":"agent/bob"}));
+        let (status, expired) = read(continuation).await;
+        assert_eq!(status, StatusCode::GONE, "{expired}");
+        assert_eq!(expired["code"], "page-cursor-expired");
+        let (_, refreshed) = read("/v1/client/resources?opened_by=agent%2Falice".into()).await;
+        assert_eq!(refreshed["value"]["items"], json!([all["value"]["items"][1].clone()]));
+        let (status, invalid) = read("/v1/client/resources?opened_by=person%2Fada".into()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+        assert_eq!(invalid["code"], "validation-failed");
+    }
+
+    #[tokio::test]
+    async fn resources_list_requires_projection_read_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let credential = "resources-reader";
+        let app = super::super::fabric_router(state.clone());
+        for (scopes, expected) in [(json!([]), StatusCode::FORBIDDEN), (json!(["read.projections"]), StatusCode::OK)] {
+            state.store.append_claim(&ClaimInput {
+                subject: "custom/client/resources-reader".into(),
+                kind: "custom.client.pairing-completed".into(),
+                actor: Some("person/ada".into()),
+                fields: BTreeMap::from([
+                    ("credential_hash".into(), json!(credential_digest(credential))),
+                    ("session_actor".into(), json!("client/resources-reader")),
+                    ("person_id".into(), json!("person/ada")),
+                    ("scopes".into(), scopes),
+                    ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 60_000)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap();
+            let response = app.clone().oneshot(Request::builder()
+                .uri("/v1/client/resources")
+                .header(AUTHORIZATION, format!("Bearer {credential}"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 
     #[tokio::test]

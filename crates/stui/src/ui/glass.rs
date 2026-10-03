@@ -14,20 +14,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// The palette's sections, in order; a digit key opens the palette at one.
-const SECTIONS: [&str; 6] = [
+const SECTIONS: [&str; 7] = [
     "needs you",
     "agents",
     "missions",
     "fleet",
     "spaces",
     "start",
+    "said in conversations",
 ];
 const GLASSES: usize = 4;
 /// Where each section ranks while a query is typed: agents, missions, what needs you, then
 /// starting things (so "new terminal" finds New terminal before a glass named after it), the
 /// fleet, and glasses.
-const RANK: [usize; 6] = [2, 0, 1, 4, 5, 3];
+/// What was said in conversations comes right after what needs you.
+const RANK: [usize; 7] = [2, 0, 1, 5, 6, 4, 3];
 const START: usize = 5;
+/// What was said in conversations that matches the query, from st's search.
+const SAID: usize = 6;
 
 /// Every glass this window knows, and the one it shows.
 pub(crate) struct Glasses {
@@ -499,6 +503,11 @@ enum Action {
     ToggleSimple,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
+    /// A conversation where the query was said: open it, found at what was said.
+    Said {
+        agent: String,
+        query: String,
+    },
 }
 
 /// One row the palette can open.
@@ -566,6 +575,75 @@ impl Ui {
         self.glasses
             .as_ref()
             .is_some_and(|glasses| glasses.glass().layout.groups().len() > 1)
+    }
+
+    /// The query st's conversation search should answer while the palette is open: three
+    /// letters or more.
+    pub(crate) fn said_wanted(&self) -> Option<String> {
+        let palette = self.glasses.as_ref()?.palette.as_ref()?;
+        let query = palette.query.trim();
+        (palette.naming.is_none() && query.chars().count() >= 3).then(|| query.to_owned())
+    }
+
+    /// st's search results for `query` as palette rows; a hit without an agent stui can open is
+    /// left out. When st says its index is refreshing or missed conversations, the first row
+    /// says so, so a missing match is not read as "never said".
+    fn said_choices(&self, query: &str) -> Vec<Choice> {
+        let Some((asked, outcome)) = &self.said else {
+            return Vec::new();
+        };
+        if asked != query {
+            return Vec::new();
+        }
+        let Ok(found) = outcome else {
+            return Vec::new();
+        };
+        let caveat = if found.refreshing {
+            "still indexing, more may come · "
+        } else if !found.incomplete_sources.is_empty() {
+            "some conversations not searched · "
+        } else {
+            ""
+        };
+        found
+            .items
+            .iter()
+            .filter_map(|hit| {
+                let agent = hit.agent_id.clone()?;
+                let name = self
+                    .world
+                    .agents
+                    .items()
+                    .iter()
+                    .find(|candidate| candidate.id == agent)
+                    .map_or_else(
+                        || agent.trim_start_matches("agent/").to_owned(),
+                        |found| found.name.clone(),
+                    );
+                let excerpt =
+                    text::sanitize(&hit.excerpt.split_whitespace().collect::<Vec<_>>().join(" "));
+                Some((agent, name, excerpt, hit.timestamp.clone()))
+            })
+            .take(12)
+            .enumerate()
+            .map(|(index, (agent, name, excerpt, at))| Choice {
+                section: SAID,
+                glyph: ("❝", theme::SUBTEXT0),
+                label: text::truncate(&excerpt, 90),
+                // The caveat first, so a narrow palette keeps it.
+                detail: format!(
+                    "{}{name} · {}",
+                    if index == 0 { caveat } else { "" },
+                    at.get(5..16).unwrap_or(&at).replace('T', " "),
+                ),
+                // Always shown while it answers what is typed.
+                search: String::new(),
+                action: Action::Said {
+                    agent,
+                    query: query.to_owned(),
+                },
+            })
+            .collect()
     }
 
     /// Every subject and glass action the palette offers, section by section.
@@ -693,6 +771,7 @@ impl Ui {
                 Action::NewAgent(Some(name.to_owned())),
             ));
         }
+        choices.extend(self.said_choices(name));
         let Some(glasses) = &self.glasses else {
             return choices;
         };
@@ -2238,6 +2317,8 @@ impl Ui {
         {
             return true;
         }
+        // The conversation that typing reaches, if one has the focus.
+        let conversation = self.composing_agent();
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -2275,7 +2356,48 @@ impl Ui {
         let current = glass.layout.groups()[glass.focus].current;
         let subject = glass.focused().is_some();
         let quiet = !self.editing && self.new_mission.is_none() && self.chat.is_none();
+        // Letters type, chords command (Nathan, 2026-10-03): in a conversation tab a plain
+        // printable key opens its message box and types itself, the first key included. Keys
+        // that act are chords below, so a sentence never starts by running a command.
+        if quiet
+            && self.confirm.is_none()
+            && self.popover.is_none()
+            && !control
+            && !alt
+            && !command
+            && let KeyCode::Char(character) = key.code
+            && let Some(agent) = conversation.clone()
+        {
+            let empty = self
+                .conversation_state
+                .drafts
+                .get(&agent)
+                .is_none_or(|draft| draft.is_empty());
+            if character == '?' && empty {
+                self.help = true;
+                return true;
+            }
+            self.editing = true;
+            // The message box takes this key, as it does every key while typing.
+            return false;
+        }
         match key.code {
+            KeyCode::Char('q') if control => self.quit = true,
+            KeyCode::Char('f') if control && conversation.is_some() => {
+                if let Some(agent) = &conversation {
+                    self.find_in(agent, "");
+                }
+            }
+            KeyCode::Char('o') if alt && conversation.is_some() => self.toggle_all_tools(),
+            KeyCode::Char('O') if alt && conversation.is_some() => self.toggle_simple(),
+            KeyCode::Char('i') if alt && conversation.is_some() => self.toggle_details(),
+            KeyCode::Char(letter @ ('r' | 'x')) if alt && conversation.is_some() && self.live => {
+                match self.undelivered() {
+                    Some(entry) if letter == 'r' => self.effects.push(Effect::Resend { entry }),
+                    Some(entry) => self.effects.push(Effect::Forget { entry }),
+                    None => {}
+                }
+            }
             KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
             KeyCode::Char('s') if control => self.toggle_sidebar(),
             // Home over the glass, and away again; in a text box Ctrl+H stays backspace.
@@ -2308,6 +2430,10 @@ impl Ui {
             KeyCode::Char('[') if quiet && key.modifiers.is_empty() => {
                 self.show_tab((current + tabs - 1) % tabs)
             }
+            // Tab and Shift+Tab are tab keys here too. Left to the old layout, Tab switched its
+            // section (Home, Agents…) under the focused conversation (Nathan, 2026-10-03).
+            KeyCode::Tab if quiet => self.show_tab((current + 1) % tabs),
+            KeyCode::BackTab if quiet => self.show_tab((current + tabs - 1) % tabs),
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if alt => {
                 self.move_focus(key.code)
             }
@@ -2467,6 +2593,10 @@ impl Ui {
             Action::NewTerminal => self.open_new_terminal(),
             Action::NewMission => self.open_new_mission(),
             Action::ToggleSimple => self.toggle_simple(),
+            Action::Said { agent, query } => {
+                self.open_in_glass(Pane::Agent(Some(agent.clone())), how);
+                self.find_in(&agent, &query);
+            }
             Action::Home => self.open_home(),
             Action::Name(naming) => {
                 let query = match naming {
@@ -3397,14 +3527,35 @@ mod tests {
 
         press(&mut ui, KeyCode::Char('1'), KeyModifiers::ALT);
         assert_eq!(tabs(&ui).1, 0);
-        typed(&mut ui, "]");
+        // ] and [ type in a conversation tab; Ctrl+PgDn/PgUp move between tabs.
+        press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 1);
-        typed(&mut ui, "[");
+        press(&mut ui, KeyCode::PageUp, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 0);
         press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+    }
+
+    #[test]
+    fn tab_moves_between_a_splits_tabs_and_never_switches_what_a_tab_shows() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "atlas builder");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        ctrl(&mut ui, 't');
+        typed(&mut ui, "weekly release");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        let both = vec![vec![ATLAS.to_owned(), WEEKLY.to_owned()]];
+        assert_eq!(tabs(&ui), (0, 1, both.clone()));
+        // Nathan, 2026-10-03: Tab in a conversation tab changed it to his Home items.
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(tabs(&ui), (0, 0, both.clone()));
+        assert!(screen(&ui).contains("Atlas Builder"));
+        press(&mut ui, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(tabs(&ui), (0, 1, both));
+        assert!(screen(&ui).contains("Weekly release"));
     }
 
     #[test]
@@ -3949,7 +4100,7 @@ mod tests {
             Pane::Agent(Some("agent/example/atlas/builder".into())),
             Open::Tab,
         );
-        typed(&mut ui, "c");
+        // In a conversation tab the first letter starts the message.
         typed(&mut ui, "ship it");
         ctrl(&mut ui, 'a');
         typed(&mut ui, "please ");
@@ -3969,6 +4120,56 @@ mod tests {
     }
 
     #[test]
+    fn in_a_conversation_letters_type_and_commands_are_chords() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        // Nathan, 2026-10-03: "letters type, chords command". A sentence that starts with a
+        // command letter is a sentence, not the command.
+        typed(&mut ui, "quite so");
+        assert!(!ui.quit);
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "quite so"
+        );
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        let shown = screen(&ui);
+        assert!(
+            shown.contains("type message")
+                && shown.contains("alt+i details")
+                && shown.contains("tab tabs"),
+            "the footer names the chords: {shown}"
+        );
+        // Leaving the box keeps the draft; the next letter goes on typing into it.
+        typed(&mut ui, "!");
+        assert!(ui.editing);
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "quite so!"
+        );
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        ui.conversation_state
+            .drafts
+            .remove("agent/example/atlas/builder");
+        // ? on an empty box is help.
+        typed(&mut ui, "?");
+        assert!(ui.help && !ui.editing);
+        ui.help = false;
+        // The commands are chords.
+        let folded = ui.conversation_state.expanded.clone();
+        press(&mut ui, KeyCode::Char('o'), KeyModifiers::ALT);
+        assert!(!ui.editing);
+        assert_ne!(
+            ui.conversation_state.expanded, folded,
+            "alt+o opens the tool calls"
+        );
+        ctrl(&mut ui, 'q');
+        assert!(ui.quit);
+    }
+
+    #[test]
     fn typing_owns_the_editing_keys_and_enter_keeps_the_input() {
         let mut ui = glass();
         ui.open_in_glass(
@@ -3976,9 +4177,12 @@ mod tests {
             Open::Tab,
         );
         ui.live = true;
-        typed(&mut ui, "c");
-        assert!(ui.editing);
-        typed(&mut ui, "ship it now");
+        typed(&mut ui, "s");
+        assert!(
+            ui.editing,
+            "a letter opens the message box and types itself"
+        );
+        typed(&mut ui, "hip it now");
         ctrl(&mut ui, 'w');
         assert_eq!(
             tabs(&ui).2,
@@ -4066,8 +4270,9 @@ mod tests {
             });
         }
         assert!(screen(&ui).contains("unconfirmed, st did not answer"));
-        typed(&mut ui, "r");
-        typed(&mut ui, "x");
+        // Letters type in a conversation: resending and clearing are chords.
+        press(&mut ui, KeyCode::Char('r'), KeyModifiers::ALT);
+        press(&mut ui, KeyCode::Char('x'), KeyModifiers::ALT);
         assert_eq!(
             std::mem::take(&mut ui.effects),
             [
@@ -4171,7 +4376,7 @@ mod tests {
         // A word the demo conversation says more than once.
         let word = "the";
         assert!(said(&ui).len() > 1);
-        typed(&mut ui, "/");
+        ctrl(&mut ui, 'f');
         typed(&mut ui, word);
         let shown = screen(&ui);
         let find = ui.find.as_ref().unwrap();
@@ -4638,6 +4843,69 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_k_finds_what_was_said_in_conversations() {
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].clone();
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "harbor keys");
+        assert_eq!(ui.said_wanted().as_deref(), Some("harbor keys"));
+        // st answers: one hit in the agent's conversation, while its index still refreshes.
+        ui.said = Some((
+            "harbor keys".into(),
+            Ok(st3_client::ConversationSearch {
+                kind: "conversation-search".into(),
+                items: vec![st3_client::ConversationSearchHit {
+                    conversation_id: "session/one".into(),
+                    entry_id: "entry/7".into(),
+                    agent_id: Some(agent.id.clone()),
+                    timestamp: "2026-10-02T21:40:00Z".into(),
+                    entry_type: "content".into(),
+                    excerpt: "the harbor keys\nrotated at noon".into(),
+                }],
+                page: st3_client::PageInfo {
+                    limit: 20,
+                    has_more: false,
+                    next_cursor: None,
+                    cursor_expires_at: None,
+                },
+                indexed_at: "2026-10-02T21:41:00Z".into(),
+                host_id: "host/example".into(),
+                incomplete_sources: vec![],
+                refreshing: true,
+            }),
+        ));
+        let shown = screen(&ui);
+        assert!(shown.contains("said in conversations"), "{shown}");
+        assert!(shown.contains("the harbor keys rotated at noon"), "{shown}");
+        assert!(shown.contains("still indexing"), "{shown}");
+        // Choosing it opens the conversation, found at what was said.
+        let said = ui
+            .matches(ui.glasses.as_ref().unwrap().palette.as_ref().unwrap())
+            .into_iter()
+            .position(|choice| matches!(choice.action, Action::Said { .. }))
+            .unwrap();
+        ui.glasses
+            .as_mut()
+            .unwrap()
+            .palette
+            .as_mut()
+            .unwrap()
+            .selected = said;
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!ui.palette_open());
+        assert_eq!(ui.focused_pane(), Some(Pane::Agent(Some(agent.id.clone()))));
+        assert!(
+            ui.find
+                .as_ref()
+                .is_some_and(|find| find.agent == agent.id && find.query == "harbor keys")
+        );
+        // An answer to another query is not shown.
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "atlas");
+        assert!(!screen(&ui).contains("said in conversations"));
+    }
+
+    #[test]
     fn a_needs_you_item_opens_in_a_new_tab_or_in_home() {
         let mut ui = glass();
         let item = ui.world.attention.items()[0].id.clone();
@@ -4779,8 +5047,10 @@ mod tests {
         typed(&mut ui, "atlas builder");
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
 
-        // A new glass by name, from the palette's glasses section.
-        typed(&mut ui, "5");
+        // A new glass by name, from the palette's glasses section (a digit types in a
+        // conversation tab, so the palette opens first).
+        ctrl(&mut ui, 'k');
+        press(&mut ui, KeyCode::Char('5'), KeyModifiers::ALT);
         typed(&mut ui, "review");
         let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
         let new = ui

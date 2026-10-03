@@ -22,6 +22,7 @@ pub mod rules;
 pub mod sqlite;
 pub mod store;
 pub mod sync;
+pub mod touched;
 
 pub use claim::{
     ClaimInput, ClaimRecord, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,

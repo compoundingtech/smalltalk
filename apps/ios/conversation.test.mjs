@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { applyConversation, conversationRows } from './sessionView.ts';
+import { applyConversation, applyOlderPage, conversationRows, olderFailed, olderLoading, olderNote, readOlder } from './sessionView.ts';
 
 const status = sequence => ({ id: `entry/${sequence}`, revision: 1, sequence, type: 'status', role: 'system', body: { state: 'idle' } });
 const content = (sequence, text) => ({ id: `entry/${sequence}`, revision: 1, sequence, type: 'content', role: 'assistant', body: { media_type: 'text/plain', text } });
@@ -39,3 +39,48 @@ assert.equal(chatty.hasOlder, true);
 const rows = conversationRows([content(1, 'old'), content(2, 'new')], true);
 assert.deepEqual(rows.map(row => row.kind === 'older' ? 'older' : row.entry.body.text), ['older', 'old', 'new']);
 assert.deepEqual(conversationRows([content(1, 'only')], false).map(row => row.kind), ['entry']);
+
+// Reading back: an earlier page goes above what is held and is never dropped; held entries win.
+const window = (items, hasMore) => ({ replace: true, items, hasMore, sessionId: 'session/a' });
+let back = applyConversation(undefined, window([content(3, 'c'), content(4, 'd')], true));
+assert.equal(olderNote(back), 'Scroll up for earlier entries');
+back = olderLoading(back);
+assert.equal(olderNote(back), 'Loading earlier entries…');
+back = applyOlderPage(back, 'session/a', { items: [content(2, 'b'), { ...content(3, 'stale'), revision: 0 }], hasMore: true, cursor: 'cursor-1' }, 1000);
+assert.deepEqual(texts(back), ['b', 'c', 'd']);
+assert.equal(back.hasOlder, true);
+assert.deepEqual(back.older.cursor, { value: 'cursor-1', at: 1000 });
+back = applyOlderPage(back, 'session/a', { items: [content(1, 'a')], hasMore: false });
+assert.equal(back.hasOlder, false);
+assert.match(olderNote(back), /^Start of this session/);
+// A reconnect's newest page that meets what is held keeps the earlier pages; one that skipped
+// past it would leave a hole, so they go.
+back = applyConversation(back, window([content(4, 'd'), content(5, 'e')], true));
+assert.deepEqual(texts(back), ['a', 'b', 'c', 'd', 'e']);
+assert.equal(back.hasOlder, false);
+const skipped = applyConversation(back, window([content(9, 'x')], true));
+assert.deepEqual(texts(skipped), ['x']);
+assert.equal(skipped.hasOlder, true);
+// A page for another session is dropped; a failure says why.
+assert.deepEqual(texts(applyOlderPage(skipped, 'session/b', { items: [content(8, 'w')], hasMore: true })), ['x']);
+assert.match(olderNote(olderFailed(skipped, 'st did not answer')), /^Could not load earlier entries: st did not answer/);
+// Paged entries are kept past the live bound.
+const many = applyOlderPage(applyConversation(undefined, window([content(100, 'new')], true), 2), 'session/a', { items: [content(97, 'x'), content(98, 'y'), content(99, 'z')], hasMore: true });
+assert.equal(applyConversation(many, { replace: false, items: [content(101, 'newer')], hasMore: true }, 2).entries.length, 5);
+
+// A live cursor continues; an expired one (or none) reads again from the newest until a page
+// reaches past the oldest entry held.
+const expired = Object.assign(new Error('gone'), { response: { code: 'page-cursor-expired' } });
+const pages = { undefined: { items: [content(5, 'e'), content(6, 'f')], hasMore: true, cursor: 'p2' }, p2: { items: [content(3, 'c'), content(4, 'd')], hasMore: true, cursor: 'p3' } };
+const asked = [];
+const read = async cursor => { asked.push(cursor); if (cursor === 'old') throw expired; return pages[cursor]; };
+const oldest = content(5, 'e');
+let got = await readOlder(read, { paged: true, start: false, loading: false, cursor: { value: 'old', at: 0 } }, oldest, 1);
+assert.deepEqual(asked, ['old', undefined, 'p2']);
+assert.deepEqual(got.items.map(entry => entry.body.text), ['c', 'd']);
+asked.length = 0;
+got = await readOlder(read, { paged: true, start: false, loading: false, cursor: { value: 'p2', at: 0 } }, oldest, 1);
+assert.deepEqual(asked, ['p2']);
+asked.length = 0;
+await readOlder(read, { paged: true, start: false, loading: false, cursor: { value: 'p2', at: 0 } }, oldest, 300_000);
+assert.deepEqual(asked, [undefined, 'p2'], 'a cursor st has let go is not tried');

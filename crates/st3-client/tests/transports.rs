@@ -546,6 +546,7 @@ async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
         changed.value.lines[1].runs[1],
         TerminalRun {
             text: "echo".into(),
+            cells: Some(4),
             fg: Some(TerminalColor::Palette(2)),
             bold: true,
             ..TerminalRun::default()
@@ -1032,6 +1033,35 @@ mission "example/definition" state="ready" {
         client.subject_definition("agent/example/large-definition", false).await,
         Err(ClientError::Api(ErrorCode::ValidationFailed, _, _))
     ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn conversation_search_uses_the_typed_unix_client_and_private_reader() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = state(root.path(), "search-unix");
+    for (id, person) in [("visible", "person/ada"), ("private", "person/blair")] {
+        state.store.append_claim(&ClaimInput {
+            subject: format!("message/{id}"), kind: "message.sent".into(),
+            actor: Some("agent/scribe".into()), fields: BTreeMap::from([
+                ("from".into(), serde_json::json!("agent/scribe")),
+                ("to".into(), serde_json::json!(person)),
+                ("content".into(), serde_json::json!("café orchid")),
+                ("status".into(), serde_json::json!("sent")),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+    let app = st3::api::router(state);
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+    wait_for_socket(&socket).await;
+    let client = Client::unix_as(&socket,"person/ada");
+    let hits = client.conversation_search("café orchid",Some("agent/scribe"),None,None,Some(50)).await.unwrap();
+    assert_eq!(hits.value.items.len(),1);
+    assert_eq!(hits.value.items[0].entry_id,"message/visible");
+    assert!(matches!(Client::unix(&socket).conversation_search("orchid",None,None,None,None).await,
+        Err(ClientError::Api(ErrorCode::Forbidden, _, _))));
     server.abort();
 }
 

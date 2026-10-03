@@ -7,6 +7,9 @@
     "public_listener": false,
     "remote_mode": "online-thin-client"
   },
+  "streams": [
+    { "id": "collections.stream", "method": "GET", "path": "/v1/client/collections/stream", "websocket_protocol": "st3.client.collections.v0", "command": "CollectionCommand", "frame": "CollectionFrame", "max_subscriptions": 8 }
+  ],
   "reads": [
     { "id": "capabilities.get", "method": "GET", "path": "/v1/client/capabilities", "response": "Capabilities" },
     { "id": "document.get", "method": "GET", "path": "/v1/client/documents/content", "response": "DocumentContent" },
@@ -28,6 +31,7 @@
     { "id": "missions.get", "method": "GET", "path": "/v1/client/missions/{id}", "response": "Resource" },
     { "id": "work.list", "method": "GET", "path": "/v1/client/work", "response": "Page" },
     { "id": "work.get", "method": "GET", "path": "/v1/client/work/{id}", "response": "Resource" },
+    { "id": "resources.list", "method": "GET", "path": "/v1/client/resources", "response": "ResourcesPage" },
     { "id": "agents.list", "method": "GET", "path": "/v1/client/agents", "response": "Page" },
     { "id": "agents.get", "method": "GET", "path": "/v1/client/agents/{id}", "response": "Resource" },
     { "id": "agent-declaration.get", "method": "GET", "path": "/v1/client/agent-declarations/{id}", "response": "AgentDeclaration", "scope": "read.declarations" },
@@ -47,6 +51,7 @@
     { "id": "history.get", "method": "GET", "path": "/v1/client/history/{id}", "response": "Resource" },
     { "id": "sessions.list", "method": "GET", "path": "/v1/client/sessions", "response": "Page" },
     { "id": "sessions.get", "method": "GET", "path": "/v1/client/sessions/{id}", "response": "Resource" },
+    { "id": "conversation.search", "method": "GET", "path": "/v1/client/conversations/search", "response": "ConversationSearch" },
     { "id": "timeline.list", "method": "GET", "path": "/v1/client/sessions/{id}/timeline", "response": "TimelinePage" },
     { "id": "conversation.changes", "method": "GET", "path": "/v1/client/conversations/{id}/changes", "response": "ConversationChanges" },
     { "id": "events.list", "method": "GET", "path": "/v1/client/events", "response": "EventPage" },

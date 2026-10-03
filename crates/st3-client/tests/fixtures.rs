@@ -13,6 +13,15 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
 }
 
 #[test]
+fn search_fixture_preserves_result_targets_and_incomplete_history() {
+    let search: Envelope<ConversationSearch> = decode("conversation-search.json");
+    assert_eq!(search.value.items[0].entry_id, "timeline-entry/note");
+    assert_eq!(search.value.items[0].agent_id.as_deref(), Some("agent/scribe"));
+    assert_eq!(search.value.incomplete_sources, ["session/older: truncation"]);
+    assert!(!search.value.page.has_more);
+}
+
+#[test]
 fn glass_groups_preserve_nested_tabs_and_empty_groups_on_round_trip() {
     let put: GlassPut = decode("glass-put.json");
     let GlassLayout::Split {
@@ -115,6 +124,7 @@ fn generated_models_decode_every_stream_fixture() {
         screen.value.lines[0].runs[0],
         TerminalRun {
             text: "$ ".into(),
+            cells: Some(2),
             fg: Some(TerminalColor::Palette(2)),
             bold: true,
             ..TerminalRun::default()

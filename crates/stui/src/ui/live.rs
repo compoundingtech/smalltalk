@@ -131,6 +131,13 @@ fn usage_error(error: &st3_client::ClientError) -> String {
 
 enum Fetched {
     Read(String, Result<(), String>),
+    /// A page before the oldest entry of a conversation's session: its entries, whether st
+    /// holds more before them, and the cursor for that next page; or why it could not be read.
+    Older {
+        target: String,
+        session_id: String,
+        page: Result<OlderPage, String>,
+    },
     Preview(String, Load<MissionPreview>),
     /// The message behind an unread-message item: sender, title and text.
     Body(String, String, Option<String>, String),
@@ -141,6 +148,8 @@ enum Fetched {
     Machines(Collection),
     /// Token spend over a period of this many hours, or why st could not say.
     Usage(u64, Result<st3_client::UsagePeriod, String>),
+    /// st's conversation search for the palette's query, or why st could not say.
+    Said(String, Result<st3_client::ConversationSearch, String>),
     Devices(Collection),
     /// A send finished: the pending token and st's message id, or why it failed and whether st's
     /// answer is unknown.
@@ -286,6 +295,9 @@ pub fn run(context: Context) -> Result<()> {
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     let mut usage_reading = false;
+    // The palette's conversation search: what st was last asked, and what is typed since when.
+    let mut said_asked: Option<String> = None;
+    let mut said_typed: Option<(String, Instant)> = None;
     let mut last_cache_save = Instant::now();
     // A closed terminal ends the loop: without this check a detached stui spins and keeps
     // polling the daemon forever.
@@ -360,6 +372,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 feed::Update::Conversation {
                     target,
+                    session_id,
                     replace,
                     has_more,
                     items,
@@ -373,6 +386,7 @@ pub fn run(context: Context) -> Result<()> {
                             replace,
                             has_more,
                             items,
+                            session_id: Some(session_id),
                         });
                     // A message sent from here is done once st shows it in the conversation.
                     pending.retain(|pending| {
@@ -485,6 +499,27 @@ pub fn run(context: Context) -> Result<()> {
                     model.sessions = native;
                 }
                 Fetched::Machines(machines) => model.machines = machines,
+                Fetched::Older {
+                    target,
+                    session_id,
+                    page,
+                } => {
+                    if let Some(timeline) = timelines.get_mut(&target) {
+                        match page {
+                            Ok(page) => timeline.older_page(
+                                &session_id,
+                                page.items,
+                                page.has_more,
+                                page.cursor,
+                            ),
+                            Err(reason) => timeline.older_failed(reason),
+                        }
+                    }
+                }
+                Fetched::Said(query, outcome) => {
+                    ui.said = Some((query, outcome));
+                    changed = true;
+                }
                 Fetched::Usage(hours, outcome) => {
                     usage_reading = false;
                     if hours == ui.usage_hours {
@@ -614,6 +649,33 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
+        }
+        // Ctrl+K asks st's conversation search once what is typed has been still for a moment;
+        // an answer to an earlier query is dropped where it lands (Ui::said_choices).
+        match ui.said_wanted() {
+            Some(query) if said_asked.as_deref() != Some(query.as_str()) => match &said_typed {
+                Some((typed, at)) if *typed == query => {
+                    if at.elapsed() >= Duration::from_millis(250) && extras.live {
+                        said_asked = Some(query.clone());
+                        let client = client.clone();
+                        let tx = fetched_tx.clone();
+                        runtime.spawn(async move {
+                            let outcome = client
+                                .conversation_search(&query, None, None, None, Some(20))
+                                .await
+                                .map(|envelope| envelope.value)
+                                .map_err(|error| error.plain());
+                            let _ = tx.send(Fetched::Said(query, outcome));
+                        });
+                    }
+                }
+                _ => said_typed = Some((query, Instant::now())),
+            },
+            None => {
+                said_asked = None;
+                said_typed = None;
+            }
+            _ => {}
         }
         // Usage has no stream: it is read while something shows it, again each minute, and at
         // once over a new period.
@@ -825,6 +887,40 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 other => effects.push(other),
             }
+        }
+        // Scrolling to the top of a conversation asks for the page before it; one at a time.
+        for target in ui.take_older_wanted() {
+            let Some(timeline) = timelines.get_mut(&target) else {
+                continue;
+            };
+            let Some(session_id) = timeline.session_id.clone() else {
+                continue;
+            };
+            if !extras.live || timeline.older.loading || !timeline.more_before() {
+                continue;
+            }
+            timeline.older.loading = true;
+            changed = true;
+            let cursor = timeline
+                .older
+                .cursor
+                .as_ref()
+                .filter(|(_, read)| read.elapsed() < OLDER_CURSOR_LIFE)
+                .map(|(cursor, _)| cursor.clone());
+            let oldest = timeline
+                .items
+                .first()
+                .map(|entry| (entry.timestamp.clone(), entry.sequence));
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let page = older_page(&client, &session_id, cursor, oldest).await;
+                let _ = tx.send(Fetched::Older {
+                    target,
+                    session_id,
+                    page,
+                });
+            });
         }
         for effect in effects {
             let (effect, token, sent) = match effect {
@@ -1124,7 +1220,13 @@ fn conversations(
             }
             // A failure after the conversation loaded is said on the rule above its message
             // box, where it clears once st catches up; the feed retries on its own.
-            (Some(timeline), _) => Load::Ready(adapt::conversation(&timeline.items, &names)),
+            (Some(timeline), _) => {
+                let mut entries = adapt::conversation(&timeline.items, &names);
+                if let Some(note) = history_note(timeline) {
+                    entries.insert(0, note);
+                }
+                Load::Ready(entries)
+            }
             (None, Some(error)) => {
                 Load::Failed(format!("Could not load this conversation: {error}"))
             }
@@ -1133,6 +1235,84 @@ fn conversations(
         out.insert(target.to_owned(), load);
     }
     out
+}
+
+/// Entries per page read back: st's largest, so a long session takes few requests.
+const OLDER_PAGE: usize = 200;
+
+/// st keeps a page cursor for five minutes; one older than this starts again from the newest.
+const OLDER_CURSOR_LIFE: Duration = Duration::from_secs(240);
+
+struct OlderPage {
+    items: Vec<st3_client::TimelineEntry>,
+    has_more: bool,
+    cursor: Option<String>,
+}
+
+/// The page of `session_id`'s timeline before `oldest`. A live `cursor` continues where the
+/// last page ended. Without one (or once st has let it go), pages are read again from the
+/// newest until one reaches past `oldest`, so nothing between is skipped.
+async fn older_page(
+    client: &Client,
+    session_id: &str,
+    cursor: Option<String>,
+    oldest: Option<(String, u64)>,
+) -> Result<OlderPage, String> {
+    let read = |cursor: Option<String>| async move {
+        client
+            .timeline(session_id, cursor.as_deref(), Some(OLDER_PAGE))
+            .await
+            .map(|found| OlderPage {
+                has_more: found.value.page.has_more,
+                cursor: found.value.page.next_cursor,
+                items: found.value.items,
+            })
+    };
+    if cursor.is_some() {
+        match read(cursor).await {
+            Ok(page) => return Ok(page),
+            Err(ClientError::Api(st3_client::ErrorCode::PageCursorExpired, _, _)) => {}
+            Err(error) => return Err(error.plain()),
+        }
+    }
+    let mut cursor = None;
+    // Bounded: a session longer than this many pages stops loading with a reason.
+    for _ in 0..50 {
+        let page = read(cursor).await.map_err(|error| error.plain())?;
+        let reaches = oldest.as_ref().is_none_or(|(at, sequence)| {
+            page.items
+                .first()
+                .is_some_and(|first| (&first.timestamp, first.sequence) < (at, *sequence))
+        });
+        if reaches || !page.has_more || page.cursor.is_none() {
+            return Ok(page);
+        }
+        cursor = page.cursor;
+    }
+    Err("this session is too long to read further back here; st conversations timeline reads it all".into())
+}
+
+/// The quiet line above a conversation's oldest entry: how to see more, that more is on its
+/// way, why it could not come, or that this is where the session starts.
+fn history_note(timeline: &st3_conversation_ui::Timeline) -> Option<super::view::Entry> {
+    use st3_conversation_ui::Body;
+    let older = &timeline.older;
+    let text = if older.loading {
+        "Loading earlier entries…".to_owned()
+    } else if let Some(reason) = &older.failed {
+        format!("Could not load earlier entries: {reason} · scroll up to try again")
+    } else if timeline.more_before() {
+        "Scroll up for earlier entries".to_owned()
+    } else if timeline.items.is_empty() {
+        return None;
+    } else {
+        "Start of this session · earlier ones: st conversations sessions".to_owned()
+    };
+    Some(super::view::Entry {
+        id: "history".into(),
+        at: String::new(),
+        body: Body::Event(text),
+    })
 }
 
 /// The draw loop supplies body-visible IDs. Metadata fetches, caches and hidden pages never
@@ -1185,7 +1365,7 @@ async fn perform_steadily(
     let mut wait = Duration::from_millis(50);
     for _ in 0..7 {
         match perform(client, person, model, effect.clone(), sent).await {
-            Err(error) if not_applied(&error) => {
+            Err(error) if not_applied(&error, &effect) => {
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_secs(2));
             }
@@ -1196,19 +1376,18 @@ async fn perform_steadily(
 }
 
 /// Whether st refused a request in a way that guarantees it applied nothing and a fresh try
-/// may succeed.
-fn not_applied(error: &anyhow::Error) -> bool {
+/// may succeed. An attention action already moved to its source's current card once on a
+/// stale fence (`crate::attention_action`); trying its old card again cannot help.
+fn not_applied(error: &anyhow::Error, effect: &Effect) -> bool {
+    let attention = matches!(effect, Effect::Attention { .. });
     error
         .chain()
         .filter_map(|cause| cause.downcast_ref::<ClientError>())
-        .any(|error| {
-            matches!(
-                error,
-                ClientError::Api(
-                    st3_client::ErrorCode::StaleFence | st3_client::ErrorCode::RateLimited,
-                    ..
-                ) | ClientError::Unreachable(_)
-            )
+        .any(|error| match error {
+            ClientError::Api(st3_client::ErrorCode::StaleFence, ..) => !attention,
+            ClientError::Api(st3_client::ErrorCode::RateLimited, ..)
+            | ClientError::Unreachable(_) => true,
+            _ => false,
         })
 }
 
@@ -1328,7 +1507,8 @@ async fn perform(
             reason,
             answer,
         } => {
-            crate::attention_action(client, person, &id, &action, reason, answer)
+            let seen = model.attention().find(|card| card.header.id == id);
+            crate::attention_action(client, person, &id, seen, &action, reason, answer)
                 .await
                 .map(|notice| (notice, None))
         }
@@ -1665,6 +1845,48 @@ async fn send_message(
 mod tests {
     use super::*;
 
+    /// A stale fence is retried for an action that reads a fresh one each try, but not for an
+    /// attention action: it already moved once to its source's current card. A busy or absent
+    /// st is retried for both.
+    #[test]
+    fn an_attention_action_is_not_retried_on_a_stale_fence() {
+        let refused = |code: st3_client::ErrorCode| {
+            anyhow::Error::new(ClientError::Api(
+                code.clone(),
+                "refused".into(),
+                Box::new(st3_client::ErrorEnvelope {
+                    api_version: "st3.client.v0".into(),
+                    error_version: "st3.client.error.v0".into(),
+                    request_id: "request/1".into(),
+                    code,
+                    message: "refused".into(),
+                    retryable: false,
+                    retry_after_ms: None,
+                    details: BTreeMap::new(),
+                }),
+            ))
+        };
+        let attention = Effect::Attention {
+            id: "attention/one".into(),
+            action: "review.approve".into(),
+            reason: None,
+            answer: None,
+        };
+        let terminal = Effect::CreateTerminal {
+            name: "shell".into(),
+        };
+        let stale = refused(st3_client::ErrorCode::StaleFence);
+        assert!(!not_applied(&stale, &attention));
+        assert!(not_applied(&stale, &terminal));
+        let busy = refused(st3_client::ErrorCode::RateLimited);
+        assert!(not_applied(&busy, &attention));
+        assert!(not_applied(&busy, &terminal));
+        assert!(!not_applied(
+            &refused(st3_client::ErrorCode::ValidationFailed),
+            &attention
+        ));
+    }
+
     #[test]
     fn read_receipt_retries_survive_navigation_and_serialize_snapshot_changes() {
         let now = Instant::now();
@@ -1927,6 +2149,57 @@ mod tests {
             ),
             other => panic!("expected one failure, not entries: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_conversation_says_above_its_oldest_entry_how_far_back_it_goes() {
+        let items: Vec<st3_client::TimelineEntry> = serde_json::from_value(serde_json::json!([
+            {"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"assistant","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"The audit is done."}},
+        ]))
+        .unwrap();
+        let target = "agent/example/harbor/keeper";
+        let note = |timeline: st3_conversation_ui::Timeline| {
+            let shown = conversations(
+                &Model::default(),
+                "person/avery",
+                &BTreeMap::from([(target.to_owned(), timeline)]),
+                &BTreeMap::new(),
+                &[target.to_owned()],
+            );
+            let Load::Ready(entries) = &shown[target] else {
+                panic!("expected entries");
+            };
+            match &entries[0].body {
+                st3_conversation_ui::Body::Event(text) => text.clone(),
+                _ => String::new(),
+            }
+        };
+        let mut timeline = st3_conversation_ui::Timeline {
+            items: items.clone(),
+            has_more: true,
+            ..Default::default()
+        };
+        assert_eq!(note(timeline), "Scroll up for earlier entries");
+        timeline = st3_conversation_ui::Timeline {
+            items: items.clone(),
+            has_more: true,
+            ..Default::default()
+        };
+        timeline.older.loading = true;
+        assert_eq!(note(timeline), "Loading earlier entries…");
+        timeline = st3_conversation_ui::Timeline {
+            items: items.clone(),
+            has_more: true,
+            ..Default::default()
+        };
+        timeline.older_failed("st did not answer".into());
+        assert!(note(timeline).starts_with("Could not load earlier entries: st did not answer"));
+        timeline = st3_conversation_ui::Timeline {
+            items,
+            ..Default::default()
+        };
+        assert!(note(timeline).starts_with("Start of this session"));
     }
 
     fn fixture_screen() -> st3_client::TerminalScreen {

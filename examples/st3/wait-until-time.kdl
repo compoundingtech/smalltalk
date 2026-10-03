@@ -2,16 +2,15 @@ version 2
 
 // Hold work until a wall-clock time, without an agent waiting in a turn.
 //
-// The `window` step is agentless. Its gate passes once the time has come. Before then the gate
-// fails, the attempt fails, and `retry` starts a new attempt after the backoff. The dependent
-// step becomes ready only after the gate passes, and st then wakes the seat for it.
+// The `window` step is agentless. Its gate passes once the time has come. Before then `test`
+// exits 1, which an exec gate reads as not yet, and st checks the clock again: a minute later,
+// then twice as long after each further not yet, up to every fifteen minutes. The dependent step
+// becomes ready only after the gate passes, and st then wakes the seat for it.
 //
-// Each attempt runs the gate again, so each retry checks the clock. `$(...)` is ordinary shell,
-// run through `sh -c` with a minimal environment.
+// `$(...)` is ordinary shell, run through `sh -c` with a minimal environment.
 //
-// The wait ends up to one backoff after the time. `attempts` times `backoff` must cover the
-// longest wait: 100 attempts ten minutes apart cover about 16 hours. For a repeating time, use a
-// `schedule` instead (recurring-stewardship.kdl).
+// The wait ends at most fifteen minutes after the time. For a repeating time, use a `schedule`
+// instead (recurring-stewardship.kdl).
 //
 //   st agents apply examples/st3/seats/omp.kdl --as person/operator
 //   st missions publish examples/st3/wait-until-time.kdl --as person/operator
@@ -23,7 +22,6 @@ mission "example/app/release-at-window" state="ready" {
 
   step "window" {
     agentless
-    retry { attempts 100; backoff "10m"; }
     gate "the release window has opened" {
       exec "test \"$(/usr/bin/date -u +%s)\" -ge \"$(/usr/bin/date -u -d 2026-10-01T18:00:00Z +%s)\""
       host "local"

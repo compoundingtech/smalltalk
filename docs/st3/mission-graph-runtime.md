@@ -317,6 +317,8 @@ The daemon gives a running native harness 60 seconds to become ready. At the dea
 
 A mission can have one `finally` block. Final steps can depend on other final steps.
 
+A run's outcome follows its normal work. A final step that fails after that work completed does not fail the run: the run completes, the failed step stays on it with its reason, and st raises one fault for the run to `person/operator` that names each failed step and shows for a day after the run ends. A run whose normal work failed is failed, and a cancelled run is cancelled, with the final failure in its reason.
+
 Dependencies cannot cross the normal and final phases. A final step does not make normal work optional.
 
 Step revision protection adds to inherited mission protection. Direct agents in the step can revise that step subtree.
@@ -644,7 +646,7 @@ Sibling gates form an AND relation. There is no `gates` wrapper.
 
 Step gates run after direct declarations, worker report, nested work, used mission, and products hold. Mission gates run after every normal step and all mission products hold.
 
-Each running gate records `gate.requested` and `gate.result`. The result cites operation evidence. A pass releases the boundary. A failure fails the step or mission. A pending graph or human gate keeps the boundary pending.
+Each running gate records `gate.requested` and `gate.result`. The result cites operation evidence. A pass releases the boundary. A failure fails the step or mission. A pending graph or human gate keeps the boundary pending. An exec gate never fails its boundary: it passes, says not yet, or is broken (see [Mechanical gates](#mechanical-gates)).
 
 ### Predicate gates
 
@@ -683,14 +685,54 @@ including baselines, dependencies, loop exit gates, and ordinary gates.
 
 A mission gate can also use `deadline "10m"`. A step uses its `timeout` property instead.
 
+### Built-in gates
+
+st answers what gates shelled out for most. Prefer one of these to an `exec` gate that does the
+same thing:
+
+```kdl
+gate "the handoff is published" { document "doc/acme/release/handoff" }
+gate "the fix merged" { merged "acme/app#42" }
+gate "linux-gate passed on main" { ci-passed "linux-gate" repo="acme/app" branch="main" }
+gate "CI passed on the release commit" { ci-passed "st/ci" repo="acme/app" commit="${input.commit}" }
+gate "the parser suite passes on main" { cargo-test "parser" package="app" }
+```
+
+- `document "doc/NAME"` passes once any version of the document is stored, and
+  `document "doc/NAME@SHA256"` once that exact version is. It is a graph predicate: it waits
+  without running anything and passes as soon as the document arrives. Publication neither
+  requires the document nor pins its version. Use it instead of grepping `st documents ls`, which
+  lists 100 documents by default.
+- `merged "OWNER/REPO#NUMBER"` passes once the pull request merged. A pull request that closed
+  without merging breaks the gate.
+- `ci-passed "CHECK" repo="OWNER/REPO"` with `commit="SHA"` or `branch="NAME"` passes once the
+  check run or commit status named CHECK succeeded on that commit, or on the branch's head. A
+  pending, failed or missing check is not yet: a rerun or a new commit can still pass.
+- `cargo-test "TARGET" package="PACKAGE"` fetches `ref` (`origin/main` by default), checks it out in
+  a worktree st keeps for the repository beneath its state directory (or at `worktree="DIR"`), builds
+  the test target, and runs it. A ref without that target or package, a failed fetch, and failing
+  tests are not yet. A target that does not build breaks the gate: a ref that passed its own CI
+  almost always fails to build only on a host that lacks something, such as a linker. The worktree
+  keeps its `target` directory between checks, so later checks build incrementally.
+
+`merged`, `ci-passed`, and `cargo-test` run as exec gates whose command is
+`"$ST3_BIN" gate KIND ...`. They take the exec gate's `host` (`local` by default), `workspace`
+(`${ST_WORKSPACE}` by default; for `cargo-test`, the repository), and `time-limit` (two minutes,
+or an hour for `cargo-test`). They check again when not yet, break the same way, and
+`st missions check` runs them. `merged` and `ci-passed` read GitHub with the token st's observers
+use (`GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`); without one, the gate is broken. Each
+`st gate KIND` command also runs by hand and prints its answer; `st gate --help` lists them.
+
+A mission stores each of these as the gate it expands to: an `exists` predicate or an exec gate.
+
 ### Mechanical gates
 
 ```kdl
-gate "the tests pass" {
-  exec "cargo test --workspace"
+gate "the release notes name every change" {
+  exec "./scripts/check-release-notes.sh"
   host "local"
   workspace "${ST_WORKSPACE}"
-  env { RUST_BACKTRACE "1" }
+  env { RELEASE "1.4.0" }
   time-limit "10m"
 }
 ```
@@ -698,6 +740,89 @@ gate "the tests pass" {
 A mechanical gate requires `exec`, `host`, and `workspace`. `env` is optional. `time-limit` defaults to two minutes.
 
 The command runs through the supervised exec runtime. Its result is attempt-bound and durable.
+
+The command's exit status is its answer:
+
+| Exit | Answer | What st does |
+|---|---|---|
+| 0 | pass | The boundary passes. |
+| 1 | not yet | The boundary waits. The gate checks again a minute later, then doubles the wait after each further not yet, up to every fifteen minutes. |
+| anything else | broken | The boundary waits for a revision, and the mission's publisher gets one attention item. |
+
+A check is also broken when it cannot start (its workspace is missing, for example), when something
+kills it, when it runs past its time limit, or when an `st` command inside it was refused or printed
+only part of a listing. st runs each check with `ST_GATE_REPORT` naming a file. An `st` command
+that st turns down (a usage error, a limit st does not allow, or an authorization or validation
+refusal) or that lists a page with more items left appends a line to that file, and any line marks
+the check broken, whatever its exit status. A pipeline cannot hide it: in
+`st missions ls --limit 500 | grep -q NAME`, `grep` exits 1, but st refused the limit, so the gate
+is broken rather than not yet. A missing subject, an unreachable daemon or a timed-out wait is not a
+refusal. A reader that stops early, such as `grep -q` on a match, closes the listing before st
+reports it, so a gate that found what it looked for still passes.
+
+A shell exits 127 for a command it cannot find, and `cargo test` exits 101 when it cannot build or a
+test fails, so both are broken. Write a check that exits 1 when it should wait; here `git cat-file`
+fails until the pushed branch has the file:
+
+```kdl
+gate "the pushed branch has release notes" {
+  exec "git fetch --quiet origin release-notes 2>/dev/null || exit 1; git cat-file -e FETCH_HEAD:RELEASE-NOTES.md 2>/dev/null || exit 1"
+  host "local"
+  workspace "${ST_WORKSPACE}"
+}
+```
+
+For a cargo test target, use the built-in `cargo-test` gate, which tells failing tests (not yet)
+from a build this host cannot make (broken). To wait on another test suite rather than break on it,
+end its command with `|| exit 1`. A build that cannot start then waits too, so do that only for a
+check already known to run.
+
+Filter or name what a check looks for. `st documents ls` lists 100 documents by default, so a check
+that greps the whole listing breaks once more exist; the built-in `document` gate names the one
+document it needs.
+
+A broken gate does not fail its step. The step keeps waiting, and st raises one attention item for
+the actor that published the run's mission revision. It names the gate, the step, the host, why the
+gate is broken, and the end of the check's output. A person who published the mission sees it in
+`st attention ls`; an agent receives it as a fault message. When st did not record the revision's
+publisher, the run's requester receives it. Correct the gate and revise the run with
+`st work revise RUN FILE`. A revision that changes only a step's gates keeps the work its worker
+already submitted, and the revised gates check that work in the new generation. The item closes
+when the revision replaces the generation. A finally step cannot take a revision, so its broken
+gate fails that step, as it did before.
+
+A gate in a loop's `until` answers each round: not yet ends the round without a pass, and a broken
+gate holds the loop for a revision.
+
+An eval run keeps the verdicts its judges give. Nobody revises an eval run, so there an exec gate
+that says not yet or is broken fails its boundary, as any status but 0 did before, and st raises no
+attention item.
+
+#### Check a gate before you publish it
+
+`st missions check FILE` runs each exec gate in the file once, now, on this host, with the
+environment and `ST_GATE_REPORT` a run gives it, and prints each answer: pass, not yet, broken, or
+unchecked. `--workspace DIR` (the current directory by default) stands for the run's workspace,
+`--input NAME=VALUE` gives an input as `missions start` does, and the other run variables name the
+check. Gates run one at a time, in the order the file declares them. A gate declared for another
+host, whose workspace does not exist yet, or that reads an input the check was not given, is
+unchecked; check it where it will run, or with the input. The command exits 1 when a gate is broken. A check runs
+each command for real, so a gate with side effects has them when it is checked, too.
+
+```sh
+st missions check release.kdl --workspace ~/src/app --input commit=4f2a9c1
+```
+
+`st missions publish` runs the same check first and refuses a mission with a broken gate, printing
+each gate's answer and the end of a broken check's output. Not yet does not stop a publication:
+before the work exists, most gates should say not yet. `--workspace` names the workspace for the
+check. `--no-gate-check` publishes without it, for a gate whose check cannot run before its run,
+such as one that waits on a lock the run takes.
+
+Each check records its result on the gate's `gate.result` subject. The result's `verdict` is
+`pass`, `fail` for not yet, or `error` for broken, so every fleet build can read it; its
+`value.answer` is `pass`, `not-yet`, or `broken`, with `check`, `exit_code`, `host`, `output`, and
+any reported `calls`. A later check runs as its own operation, `GATE/check/N`.
 
 ### LLM gates
 
@@ -740,12 +865,34 @@ A newer st build can word the same gate's request differently and ask again for 
 The reviewer then sees one review: the newest request, which is the one the gate waits on, aged
 from the first request, on every node.
 
+Each reconcile pass asks a waiting gate for its owner's current generation, revision, definition
+and attempt. A request that went stale, because the step was retried or its definition changed,
+is asked again on the next pass, so an open step waiting on a person always has a request the
+person can answer. The reviewer's answer is the `gate.result` that the request's reviewer bound
+to it. The gate and the review list read answers by that one rule, so a later result from another
+actor cannot hide an answer from the gate while the list no longer offers the review.
+
+A loop's human gates (`until`, a person's candidate choice, `on-exhausted`) are asked of its
+`loop-run/GENERATION/PATH` subject, and are current while the step running the loop is on the
+attempt they were asked for. They are listed, approved and rejected like step gates. A for-each
+loop stored before that mode was removed asks an item's metric gate of
+`loop-run/GENERATION/PATH/item/ID` with the item's round as its attempt; that review is current
+until the loop records the item's round.
+
+The review list and each reviewer's attention agree: a review is offered exactly while its card
+is shown. Both need the gate's run, and every run above it, to be open and on the generation of
+the step that started it, each such parent step to be open (a failed one counts as closed until
+it is retried), and a subscription or schedule that delivered the run to still run. While that
+does not hold, an answer could change nothing, so the review is not listed and an answer is
+refused with the reason, such as which parent step failed. It is offered again once that step
+is retried.
+
 `st attention ls --as person/NAME` shows the selected person's pending KDL human gates together
 with their other current decisions and faults.
 
 The human view shows the mission, owner step, question, review targets, age, and exact decision commands. `--json` returns the same current review records as structured data.
 
-The list excludes resolved requests, old generations, changed definitions, old attempts, and terminal owners. A result from a different actor does not resolve a request.
+The list excludes resolved requests, old generations, changed definitions, old attempts, terminal owners, and runs whose parent step or delivering subscription has ended. A result from a different actor does not resolve a request.
 
 ### Human attention inbox
 
@@ -1332,7 +1479,9 @@ Use `st agents apply FILE --as person/NAME` for authored KDL or `st agents start
 convenience. `st agents new NAME --host HOST --attach` declares a new seat with the fleet's
 harness defaults, waits until its harness is ready, and attaches from any fleet host.
 `--print-kdl` prints the exact declaration. `st agents stop SUBJECT` publishes an explicit root
-stop.
+stop. On a seat a mission run declared, that stop holds for the rest of the run's generation: the
+run does not materialize the seat again, even after a daemon restart, and `st agents start SUBJECT`
+restores the run's own declaration.
 
 For `agents start`, `example/cos/standing/cos` and `agent/example/cos/standing/cos` both name
 `agent/example/cos/standing/cos`. Pass an identity or its complete `agent/` subject, never a
@@ -1359,6 +1508,8 @@ Cancellation also cancels active descendant mission runs. Each descendant uses i
 The terminal state is `cancelled` after successful final work. A final failure makes the run failed.
 
 After final work, st enters cleanup and stops every runtime owned by the mission run. A seat is never stopped while it holds a message nobody has read or work in a run outside this one. The run still finishes. The seat keeps its stop declaration, st checks it again every ten seconds, and it stops once the message is read and the other work ends. A person's own stop is not delayed.
+
+A final step that stops a seat completes once the stop asks nothing more of it: the seat is stopped, absent, never observed, already being stopped, or kept for the reasons above. A kept seat does not hold the step to its timeout, so the step never fails a run whose work succeeded. The deferral records a `stop-deferred` warning diagnostic on the seat.
 
 The run becomes terminal only after those runtime subjects report a stopped, absent, or exited state.
 
@@ -1522,6 +1673,9 @@ st work revision generation RUN_GENERATION
 ```
 
 st compares normalized step definition hashes. A changed step and every transitive dependent start without prior completion.
+One change keeps prior work: a step whose definition changes only in its gates, while its worker's
+submitted work waits on them, carries that submission. The successor checks it against the revised
+gates, as it does when a revision corrects a [broken gate](#mechanical-gates).
 
 Every compatible state carries to the successor. Compatible claimed, working, or blocked work keeps its
 worker lease, so the worker continues without claiming again. Compatible verifying work that its

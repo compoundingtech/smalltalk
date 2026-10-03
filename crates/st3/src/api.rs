@@ -366,6 +366,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work", get(client_work))
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
+        .route("/v1/client/resources", get(client_v0::resources::list))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
         .route(
             "/v1/client/agent-declarations/{*id}",
@@ -376,6 +377,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
         .route("/v1/client/history/{*id}", get(client_history_detail))
+        .route("/v1/client/conversations/search", get(client_v0::search::search))
         .route("/v1/client/sessions", get(client_sessions))
         .route("/v1/client/sessions/{*id}", get(client_sessions_detail))
         .route(
@@ -442,9 +444,12 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/schema", get(schema))
         .route("/v1/intent/mission", post(mission))
+        .route("/v1/gate-checks", post(start_gate_check))
+        .route("/v1/gate-checks/{id}", get(read_gate_check))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
+        .route("/v1/agents/start", post(start_mission_seat))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
         .route("/v1/agents/native-session", post(report_native_session))
@@ -1096,6 +1101,14 @@ fn client_error_code(code: Option<&str>) -> String {
         | "missing-ask-owner"
         | "ambiguous-ask-owner"
         | "update-not-asked" => "validation-failed".into(),
+        // A review refusal says why in its message: answered and by whom, or what moved on.
+        "review-not-requested"
+        | "review-target-unknown"
+        | "review-decision-not-offered"
+        | "missing-review-reason"
+        | "invalid-review-decision"
+        | "feedback-gate-needs-step" => "validation-failed".into(),
+        "wrong-reviewer" => "forbidden".into(),
         "stale-work-ask"
         | "stale-subject"
         | "missing-subject-token"
@@ -2541,6 +2554,16 @@ fn insert_attention_target_states(
     Ok(())
 }
 
+/// An attention card's ID: its source, recipient and waiting episode. A source asked again
+/// (a human gate's new request, a person step's new episode) gets a new card.
+fn client_attention_id(subject: &str, person: &str, episode: &str) -> anyhow::Result<String> {
+    let identity = serde_json::to_vec(&(subject, person, episode))?;
+    Ok(format!(
+        "attention/{}",
+        &hex::encode(Sha256::digest(identity))[..32]
+    ))
+}
+
 fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
@@ -2549,8 +2572,7 @@ fn client_attention_resources(
     let current = store.attention_snapshot(person, client_now_ms())?;
     let mut resources = Vec::new();
     for item in current {
-        let identity = serde_json::to_vec(&(&item.subject, &item.person, &item.episode))?;
-        let id = format!("attention/{}", &hex::encode(Sha256::digest(identity))[..32]);
+        let id = client_attention_id(&item.subject, &item.person, &item.episode)?;
         let mut resource = json!({
             "id": id, "kind": "attention", "attention_kind": item.kind,
             "source_id": item.subject, "source_kind": item.kind, "episode": item.episode,
@@ -4705,6 +4727,7 @@ async fn guard_bound_request(
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
         "/v1/agents/restart",
+        "/v1/agents/start",
         "/v1/agents/suspend",
         "/v1/agents/resume",
         "/v1/agents/native-session",
@@ -8186,6 +8209,61 @@ async fn mission(
     Ok(Json(response))
 }
 
+/// Start running each exec gate of a mission file once, the way a run would: `st missions check`.
+/// The answer lists every gate; poll `GET /v1/gate-checks/{id}` until it is finished.
+async fn start_gate_check(
+    State(state): State<AppState>,
+    Json(request): Json<crate::model::GateCheckRequest>,
+) -> Result<Json<crate::model::GateCheckView>, ApiError> {
+    let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
+    // Check the commands a publication would store: document names pinned to their versions.
+    let intent = state
+        .store
+        .document_bindings_at(&initial.document_refs, None)
+        .ok()
+        .and_then(|bindings| resolve_document_references(&request.intent.kdl, &bindings).ok())
+        .and_then(|resolved| parse_intent(&resolved, &state.node).ok())
+        .unwrap_or(initial);
+    let workspace = std::path::Path::new(&request.workspace);
+    if !workspace.is_absolute() {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-check-workspace",
+            "a gate check's workspace must be an absolute path",
+        )));
+    }
+    let (node, state_dir, pty_root) = (state.node, state.state_dir, state.pty_root);
+    let view = tokio::task::spawn_blocking(move || {
+        crate::gate_check::start(
+            crate::gate_check::CheckHost {
+                node: &node,
+                state_dir: &state_dir,
+                pty_root: &pty_root,
+            },
+            &intent,
+            &request.workspace,
+            &request.inputs,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow::anyhow!(error)))?
+    .map_err(ApiError::internal)?;
+    Ok(Json(view))
+}
+
+async fn read_gate_check(
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<crate::model::GateCheckView>, ApiError> {
+    tokio::task::spawn_blocking(move || crate::gate_check::poll(&id))
+        .await
+        .map_err(|error| ApiError::internal(anyhow::anyhow!(error)))?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "no such gate check: it started over an hour ago or the daemon restarted",
+            )
+        })
+}
+
 /// One preview warning for each agent the publication declares, directly or inside a mission,
 /// that carries authority blocks, which free mode ignores.
 fn ignored_authority_warnings(
@@ -8402,6 +8480,36 @@ async fn restart_agent(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(claim))
+}
+
+#[derive(Deserialize)]
+struct MissionSeatStartRequest {
+    subject: String,
+    actor: String,
+    /// The selected stop the caller read, when it read one.
+    #[serde(default)]
+    expected: Option<String>,
+    idempotency_key: String,
+}
+
+/// Start a stopped mission seat on the declaration its run gave it, as `st agents start` does.
+async fn start_mission_seat(
+    State(state): State<AppState>,
+    Json(request): Json<MissionSeatStartRequest>,
+) -> Result<Json<ApplyResponse>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "invalid-start-actor")?;
+    let subject = agent_subject(request.subject);
+    let response = state
+        .store
+        .start_mission_seat(
+            &subject,
+            request.expected.as_deref(),
+            &actor,
+            &format!("agent-start:{subject}:{}", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -9462,6 +9570,97 @@ async fn withdraw_attention(
     )))
 }
 
+/// The owner a review decision answers. A step, mission or loop run, or a resource, answers for
+/// itself. An `attention/...` card or a `gate-operation/...` request names its gate's owner, and
+/// a bare `GENERATION/PATH` a step run. Anything else is refused as naming no review, rather
+/// than read as a step run that has none.
+fn review_owner(state: &AppState, target: &str) -> Result<String, ApiError> {
+    if ["resource/", "step-run/", "mission-run/", "loop-run/"]
+        .iter()
+        .any(|prefix| target.starts_with(prefix))
+    {
+        return Ok(target.to_owned());
+    }
+    let unknown = |why: String| ApiError::bad(St3Error::new("review-target-unknown", why));
+    if target.starts_with("attention/") {
+        if let Some(card) = client_attention_resources(&state.store, None, false)
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .find(|card| card["id"] == target)
+        {
+            return match (card["attention_kind"].as_str(), card["source_id"].as_str()) {
+                (Some("human-gate"), Some(owner)) => Ok(owner.to_owned()),
+                (kind, _) => Err(unknown(format!(
+                    "`{target}` is a {} card, not a review; answer it where it asks",
+                    kind.unwrap_or("different")
+                ))),
+            };
+        }
+        // A gate's card closes once it is answered or asked again. Say which, for its owner.
+        for (request, owner, reviewer) in state
+            .store
+            .human_gate_requests()
+            .map_err(ApiError::internal)?
+        {
+            if client_attention_id(&owner, &reviewer, &request).map_err(ApiError::internal)?
+                != target
+            {
+                continue;
+            }
+            let current = state
+                .store
+                .pending_human_reviews(Some(&reviewer))
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .find(|review| review.owner == owner);
+            let why = match current {
+                Some(review) => format!(
+                    "st asked `{owner}` again as `{}`; review that card",
+                    client_attention_id(&owner, &review.reviewer, &review.request)
+                        .map_err(ApiError::internal)?
+                ),
+                None => format!(
+                    "`{owner}` has no pending human review: {}",
+                    state
+                        .store
+                        .human_review_refusal(&owner)
+                        .map_err(ApiError::internal)?
+                ),
+            };
+            return Err(ApiError::bad(St3Error::new(
+                "review-not-requested",
+                format!("`{target}` is not open: {why}"),
+            )));
+        }
+        return Err(unknown(format!("`{target}` names no review card")));
+    }
+    if target.starts_with("gate-operation/") {
+        return state
+            .store
+            .claims_for(target, Some("gate.requested"))
+            .map_err(ApiError::internal)?
+            .last()
+            .and_then(|request| request.body.pointer("/fields/owner"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| unknown(format!("`{target}` names no gate request")));
+    }
+    let step = format!("step-run/{target}");
+    if target.contains('/')
+        && state
+            .store
+            .step_run(&step)
+            .map_err(ApiError::internal)?
+            .is_some()
+    {
+        return Ok(step);
+    }
+    Err(unknown(format!(
+        "`{target}` names no step run, mission run, loop or attention card; \
+         `st attention ls --as PERSON` lists the reviews waiting"
+    )))
+}
+
 async fn post_review(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
@@ -9487,14 +9686,7 @@ async fn post_review(
             "a rejection or request for changes needs a reason",
         )));
     }
-    let subject = if subject.starts_with("resource/")
-        || subject.starts_with("step-run/")
-        || subject.starts_with("mission-run/")
-    {
-        subject
-    } else {
-        format!("step-run/{subject}")
-    };
+    let subject = review_owner(&state, &subject)?;
     let actor = request.actor.map(|actor| {
         if actor.contains('/') {
             actor
@@ -9502,20 +9694,26 @@ async fn post_review(
             format!("person/{actor}")
         }
     });
-    let review_request = if subject.starts_with("step-run/") || subject.starts_with("mission-run/")
+    let review_request = if subject.starts_with("step-run/")
+        || subject.starts_with("mission-run/")
+        || subject.starts_with("loop-run/")
     {
         let pending = state
             .store
             .pending_human_reviews(None)
             .map_err(ApiError::internal)?
             .into_iter()
-            .find(|review| review.owner == subject)
-            .ok_or_else(|| {
-                ApiError::bad(St3Error::new(
-                    "review-not-requested",
-                    format!("`{subject}` has no pending human review"),
-                ))
-            })?;
+            .find(|review| review.owner == subject);
+        let Some(pending) = pending else {
+            let why = state
+                .store
+                .human_review_refusal(&subject)
+                .map_err(ApiError::internal)?;
+            return Err(ApiError::bad(St3Error::new(
+                "review-not-requested",
+                format!("`{subject}` has no pending human review: {why}"),
+            )));
+        };
         let review_request = state
             .store
             .claim_by_id(&pending.request)
@@ -10823,12 +11021,14 @@ async fn revise_mission_run(
             planned.blockers.join("; "),
         )));
     }
+    // The revision records its publisher: a broken gate in it raises attention for them.
     state
         .store
-        .apply(
+        .apply_as(
             &publication,
             &planned.subject_tokens,
             &format!("{}:publish", request.idempotency_key),
+            Some(&actor),
         )
         .map_err(ApiError::bad)?;
     // A failed run has no active work to drain, so it adopts an unreviewed revision now.
@@ -12864,6 +13064,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
             "/v1/agents/restart",
+            "/v1/agents/start",
             "/v1/agents/suspend",
             "/v1/agents/resume",
             "/v1/agents/native-session",

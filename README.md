@@ -191,6 +191,10 @@ st attention ls         # decisions and requests waiting for you
 st conversations ls person/ada
 ```
 
+`st attention approve ID --as person/ada` answers a gate waiting for you by the ID
+`st attention ls` prints; `reject` and `request-changes` also take `--reason TEXT`. A gate
+that no longer waits says why: who answered it, or what changed since it asked.
+
 `st --help` and `st help` open with the main uses, then group commands for everyday use, agent
 seats, and running a machine or fleet. `st help --all` also lists plumbing commands.
 Use `st help agents new` to open a command's full help.
@@ -348,12 +352,27 @@ connects straight to the PTY session, so a busy daemon cannot stall it. If the d
 answer within a second, st attaches to the seat's newest PTY session on that host without it and
 says so.
 
-A running seat keeps its current process when you apply a changed declaration; launch changes
-take effect the next time it starts. Use `st agents restart agent/example/worker --as person/ada`
-to apply those changes now. Restart preserves the declaration, works for top-level and mission
-seats, and waits for a new running incarnation. `--timeout 2m` changes the default ten-minute
+A running seat restarts when you apply a declaration that changes how it launches: its
+workspace, harness, model, effort, arguments or command. A change to its label, environment or
+restart policy keeps the running process and takes effect the next time it starts; use `st agents
+restart agent/example/worker --as person/ada` to apply it now. Restart preserves the declaration,
+works for top-level and mission seats, and waits for a new running incarnation.
+
+Every relaunch of a seat continues its harness's last native session: `st agents restart`, a
+changed launch, a harness that hung up or crashed, a daemon restart, and a stop followed by a
+start. Claude, Codex, pi, omp and OpenCode each resume the session their driver last reported for
+the seat, and a Claude seat whose workspace changed carries its transcript into the new
+workspace's project. A harness that cannot continue that session (its transcript is gone, or the
+declaration selects its own session) starts a new one and records a
+`native-continue-unavailable` warning; later relaunches do not try that session again. Only a
+mission step with `fresh-context` starts a seat on a new session on purpose. `--timeout 2m` changes the default ten-minute
 wait; a failure or timeout explains why the seat is not running again. `st agents stop
-agent/example/worker --as person/ada` stops a seat until you apply its file again.
+agent/example/worker --as person/ada` stops a seat until you apply its file again. It ends every
+process the seat started, including builds and tests that outlived the harness, on hosts with a
+systemd user manager; [Stopping a session](docs/st3/priority.md#stopping-a-session) says what
+other hosts miss. A mission seat you stop stays stopped while its run's generation lasts, across
+daemon restarts, and `st agents start` starts it again on its run's own declaration, creating no
+other seat.
 
 `st agents suspend agent/example/worker --as person/ada` stops a quiet seat and keeps its harness's
 own session; `st agents resume agent/example/worker --as person/ada` brings the seat back on that
@@ -435,6 +454,7 @@ st conversations ls person/ada
 st conversations read MESSAGE --as person/ada
 st conversations thread MESSAGE
 st conversations archive MESSAGE --as person/ada
+st conversations search "release date" --agent agent/example/worker --since 2026-10-01T00:00:00Z
 ```
 
 Running the same send or reply again never sends it twice. Without `--idempotency-key`, st names
@@ -452,6 +472,13 @@ message may have landed: the error prints its key and the command that tells whe
 shows one conversation as stui shows it: messages, Small Talk, and tool calls folded to a line
 or two. `--raw` prints every stored entry instead (message boundaries, tool input and output in
 full), and `--json` prints the page.
+
+`conversations search` searches the authenticated person's sent and received messages and
+the normalized transcripts they can view. It returns conversation and entry IDs with short
+excerpts, newest first. Use `--cursor` for older matches, or `--json` for the typed client
+response. The response dates its index and reports incomplete sources, including retained
+history limits and unavailable hosts. See [conversation search](docs/st3/conversation-search.md)
+for freshness, costs, and the embedding API.
 
 ## Bring in sessions st does not own
 

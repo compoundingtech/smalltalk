@@ -177,6 +177,33 @@ test('collection stream holds commands until the socket opens and passes frames 
     assert.deepEqual(socket.closed, [1000]);
 });
 
+test('collection commands preserve omitted and nullable options and failure metadata', async () => {
+    const socket = collectionSocket();
+    const frames = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), socket: () => socket });
+    socket.onopen();
+    stream.subscribe('agents', 'agents');
+    stream.subscribe('nullable', 'work', 100, { person: null, actor: null, status: null });
+    stream.subscribeTerminal('current', 'terminal/example', undefined, 'capability-proof');
+    stream.subscribeTerminal('nullable-terminal', 'terminal/example', null, 'capability-proof');
+    assert.deepEqual(socket.sent, [
+        { kind: 'subscribe', id: 'agents', collection: 'agents' },
+        { kind: 'subscribe', id: 'nullable', collection: 'work', limit: 100, person: null, actor: null, status: null },
+        { kind: 'subscribe', id: 'current', collection: 'terminal', terminal: 'terminal/example', capability: 'capability-proof' },
+        { kind: 'subscribe', id: 'nullable-terminal', collection: 'terminal', terminal: 'terminal/example', incarnation: null, capability: 'capability-proof' },
+    ]);
+    const failures = [
+        { kind: 'resync', id: 'agents', code: 'internal', message: 'Retry the read', retryable: true },
+        { kind: 'resync', id: 'chat', collection: 'conversation', retryable: true },
+        { kind: 'error', id: 'chat', collection: 'conversation', code: 'timeline-history-incomplete', message: 'History missing', retryable: false },
+        { kind: 'error', id: 'current', collection: 'terminal', code: 'stale-fence', message: 'Restarted', retryable: false },
+    ];
+    for (const frame of failures) socket.onmessage({ data: JSON.stringify(frame) });
+    assert.deepEqual(frames, failures);
+    stream.close();
+});
+
 test('closing the collection stream sends nothing more and reports no end', async () => {
     const socket = collectionSocket();
     const ends = [];
@@ -249,4 +276,23 @@ test('creation methods submit the shared typed fixtures', async () => {
         await client[method](request);
         assert.deepEqual(JSON.parse(calls.at(-1).init.body), request);
     }
+});
+
+
+test('search encodes text, filters, and cursor and preserves result targets', async () => {
+    const calls = [];
+    const fixture = require('../../../docs/st3/client-v0/fixtures/conversation-search.json');
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async url => {
+        calls.push(url);
+        return response(url.endsWith('/capabilities') ? envelope(capabilities) : fixture);
+    } });
+    const search = await client.conversationSearch('café & orchid', { agent: 'agent/scribe', since: '2026-10-02T00:00:00Z', cursor: 'opaque+/=', limit: 2 });
+    const url = new URL(calls[1]);
+    assert.equal(url.pathname, '/v1/client/conversations/search');
+    assert.equal(url.searchParams.get('text'), 'café & orchid');
+    assert.equal(url.searchParams.get('agent'), 'agent/scribe');
+    assert.equal(url.searchParams.get('since'), '2026-10-02T00:00:00Z');
+    assert.equal(url.searchParams.get('cursor'), 'opaque+/=');
+    assert.equal(search.value.items[0].entry_id, 'timeline-entry/note');
+    assert.deepEqual(search.value.incomplete_sources, ['session/older: truncation']);
 });

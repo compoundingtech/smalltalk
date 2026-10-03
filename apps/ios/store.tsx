@@ -3,8 +3,9 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
-import { isSnapshotChurn, listSessionPages, type Conversation, type SessionView } from './sessionView';
+import { API_VERSION, ClientError, St3Client, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { personAnswer } from './requestView';
+import { isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView } from './sessionView';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
 import { listCollectionPages } from './collectionPages';
 import { rememberBounded } from './boundedCache';
@@ -235,7 +236,9 @@ function useAppStore() {
     /** Complete a person step; `answer` is a structured request's named answer, by id. */
     async done(item: Attention, summary: string, answer?: string) {
       if (!client) return false;
-      return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(answer ? { answer: { id: answer } } : {}) } }); });
+      const typed = personAnswer(item.request, answer, summary);
+      if (typeof typed === 'string') { setError(typed); return false; }
+      return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }); });
     },
     /** An image a message carries, as a data URI; st reads it from the member that has it. */
     image(image: { sha256: string; message: string; mediaType: string }): Promise<string> {
@@ -344,6 +347,21 @@ function useAppStore() {
         const id = actionId();
         return client.terminalResize({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, rows, columns } });
       });
+    },
+    /** The page of a session's timeline before `oldest`, continuing from `older`'s cursor. */
+    async olderTimeline(sessionId: string, older: Older, oldest: TimelineEntry | undefined) {
+      if (!client || status !== 'online') throw new Error('offline');
+      try {
+        return await readOlder(async cursor => {
+          const found = (await client.timelineList(sessionId, { cursor, limit: OLDER_PAGE })).value;
+          return { items: found.items, hasMore: found.page.has_more, cursor: found.page.next_cursor ?? undefined };
+        }, older, oldest);
+      } catch (e) { throw new Error(errorText(e)); }
+    },
+    /** What was said in conversations, as st's search finds it; a string says why not. */
+    async searchConversations(text: string): Promise<ConversationSearch | string> {
+      if (!client || status !== 'online') return 'offline';
+      try { return (await client.conversationSearch(text, { limit: 20 })).value; } catch (e) { return errorText(e); }
     },
     async mission(id: string): Promise<Mission | null> {
       if (!client || status !== 'online') return missionDetailCache.current.get(id) ?? null;

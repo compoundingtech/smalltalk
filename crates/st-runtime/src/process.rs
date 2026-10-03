@@ -7,7 +7,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,13 @@ impl ExecRuntime {
     ) -> Result<ExecGeneration> {
         fs::create_dir_all(&self.state_dir)?;
         fs::create_dir_all(&self.log_dir)?;
+        // What the previous generation left running ends before its replacement starts. Each
+        // launch has a scope of its own, so this never reaches the replacement.
+        if let Err(error) = self.end_leftovers(id) {
+            eprintln!(
+                "st3: WARN what the last generation of {id} left running did not end: {error:#}"
+            );
+        }
         self.rotate_generation(id)?;
         let log_path = self.log_path(id, false);
         let log = fs::OpenOptions::new()
@@ -237,7 +244,41 @@ impl ExecRuntime {
     }
 
     pub fn stop_if(&self, id: &str, expected_generation: Option<&str>) -> Result<()> {
-        self.signal_if(id, expected_generation, libc::SIGTERM)
+        self.end_if(id, expected_generation, libc::SIGTERM)
+    }
+
+    /// Sends `signal`, SIGTERM or SIGKILL, to everything the exec started. Its work scope holds
+    /// its process group and every process that left that group, so the scope gets the signal
+    /// where there is one. Once the group has ended, what it left in its scope ends.
+    fn end_if(&self, id: &str, expected_generation: Option<&str>, signal: i32) -> Result<()> {
+        let generation = match self.observe(id)? {
+            Some(ExecObservation::Running(generation)) => generation,
+            Some(ExecObservation::Exited(generation)) => {
+                if let Some(unit) = &generation.scope_unit {
+                    let grace = if signal == libc::SIGKILL {
+                        Duration::ZERO
+                    } else {
+                        crate::SCOPE_GRACE
+                    };
+                    crate::end_scope(unit, grace)?;
+                }
+                return Ok(());
+            }
+            Some(ExecObservation::Indeterminate(_)) | None => return Ok(()),
+        };
+        if expected_generation.is_some_and(|expected| expected != generation.generation_id) {
+            anyhow::bail!("exec `{id}` changed incarnation before signal {signal}");
+        }
+        if let Some(unit) = &generation.scope_unit {
+            match crate::signal_scope(unit, signal) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "st3: WARN exec {id}'s scope missed signal {signal}, so only its group gets it: {error:#}"
+                ),
+            }
+        }
+        signal_group(id, generation.pid, signal)
     }
 
     pub fn signal_if(
@@ -252,15 +293,7 @@ impl ExecRuntime {
         if expected_generation.is_some_and(|expected| expected != generation.generation_id) {
             anyhow::bail!("exec `{id}` changed incarnation before signal {signal}");
         }
-        let result = unsafe { libc::kill(-(generation.pid as i32), signal) };
-        if result != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error)
-                    .with_context(|| format!("signal {signal} to exec process group"));
-            }
-        }
-        Ok(())
+        signal_group(id, generation.pid, signal)
     }
 
     pub fn kill(&self, id: &str) -> Result<()> {
@@ -268,7 +301,42 @@ impl ExecRuntime {
     }
 
     pub fn kill_if(&self, id: &str, expected_generation: Option<&str>) -> Result<()> {
-        self.signal_if(id, expected_generation, libc::SIGKILL)
+        self.end_if(id, expected_generation, libc::SIGKILL)
+    }
+
+    /// The work scope of an exec whose process group has ended. It can still hold a process that
+    /// left the group, such as a build started in a session of its own.
+    pub fn leftover_scope(&self, id: &str) -> Result<Option<String>> {
+        Ok(match self.observe(id)? {
+            Some(ExecObservation::Exited(generation)) => generation.scope_unit,
+            _ => None,
+        })
+    }
+
+    /// Ends what an ended exec left running in its work scope. A running exec keeps everything:
+    /// [`Self::stop_if`] ends it.
+    pub fn end_leftovers(&self, id: &str) -> Result<()> {
+        if let Some(unit) = self.leftover_scope(id)? {
+            crate::end_scope(&unit, crate::SCOPE_GRACE)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::end_leftovers`] on a background worker. A scope already seen empty costs one read
+    /// of the exec's record.
+    pub fn end_leftovers_later(&self, id: &str) {
+        let Ok(Some(unit)) = self.leftover_scope(id) else {
+            return;
+        };
+        if crate::isolate::has_ended(&unit) {
+            return;
+        }
+        let id = id.to_owned();
+        crate::isolate::end_later(unit.clone(), move || {
+            crate::end_scope(&unit, crate::SCOPE_GRACE)
+                .map(|_| ())
+                .with_context(|| format!("end what exec `{id}` left running"))
+        });
     }
 
     pub fn read_log(&self, id: &str) -> Result<Option<String>> {
@@ -294,6 +362,8 @@ impl ExecRuntime {
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
+        // The record is the last place that names the exec's work scope.
+        self.end_leftovers(id)?;
         for path in [
             self.record_path(id),
             self.previous_record_path(id),
@@ -371,6 +441,18 @@ fn observe_exited_group(generation: ExecGeneration) -> Result<ExecObservation> {
         Ok(false) => Ok(ExecObservation::Exited(generation)),
         Err(error) => Ok(ExecObservation::Indeterminate(error.to_string())),
     }
+}
+
+fn signal_group(id: &str, group: u32, signal: i32) -> Result<()> {
+    let result = unsafe { libc::kill(-(group as i32), signal) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error)
+                .with_context(|| format!("signal {signal} to exec `{id}`'s process group"));
+        }
+    }
+    Ok(())
 }
 
 fn process_group_is_live(group: u32) -> Result<bool> {
@@ -657,5 +739,164 @@ mod tests {
         let exited = wait_for_exit(&adopted, "work");
         assert_eq!(exited.exit_signal, Some(libc::SIGTERM));
         assert!(process_identity(child).map_or(true, |(state, _)| state == 'Z'));
+    }
+
+    /// A launch that starts `orphan.pid`'s writer in a session of its own whose parent exits at
+    /// once, waits for the pid, then runs `then`. The writer has left the exec's process group.
+    #[cfg(target_os = "linux")]
+    fn orphaning_launch(then: &str) -> crate::Launch {
+        crate::Launch::Shell(format!(
+            "(setsid sh -c 'echo $$ > orphan.pid; exec sleep 600' &); \
+             while [ ! -s orphan.pid ]; do sleep 0.02; done; {then}"
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_orphan(root: &Path) -> u32 {
+        for _ in 0..500 {
+            if let Some(pid) = fs::read_to_string(root.join("orphan.pid"))
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the exec never started its background process");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_gone_soon(pid: u32) {
+        for _ in 0..250 {
+            if process_identity(pid).map_or(true, |(state, _)| state == 'Z') {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        panic!("background process {pid} outlived its exec");
+    }
+
+    /// Kills the test's exec when dropped, so a failing test leaves nothing behind.
+    #[cfg(target_os = "linux")]
+    struct KillOnDrop(ExecRuntime);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill("work");
+        }
+    }
+
+    /// The environment a member needs to start in a systemd user scope, and no more.
+    #[cfg(target_os = "linux")]
+    fn scope_environment() -> BTreeMap<String, String> {
+        ["PATH", "HOME", "XDG_RUNTIME_DIR"]
+            .into_iter()
+            .filter_map(|key| Some((key.to_owned(), std::env::var(key).ok()?)))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopping_an_exec_ends_what_it_left_running() {
+        if crate::isolation_mode() != crate::Isolation::Scope {
+            eprintln!("skipped: no systemd user scopes");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ExecRuntime::new(root.path().join("exec"), root.path().join("logs"));
+        let _kill = KillOnDrop(runtime.clone());
+        let generation = runtime
+            .spawn(
+                "work",
+                &orphaning_launch("exec sleep 600"),
+                root.path(),
+                &scope_environment(),
+            )
+            .unwrap();
+        let orphan = read_orphan(root.path());
+
+        runtime
+            .stop_if("work", Some(&generation.generation_id))
+            .unwrap();
+
+        wait_for_exit(&runtime, "work");
+        assert_gone_soon(orphan);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_ended_execs_leftovers_end_and_its_replacement_keeps_running() {
+        if crate::isolation_mode() != crate::Isolation::Scope {
+            eprintln!("skipped: no systemd user scopes");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ExecRuntime::new(root.path().join("exec"), root.path().join("logs"));
+        let _kill = KillOnDrop(runtime.clone());
+        let ended = runtime
+            .spawn(
+                "work",
+                &orphaning_launch("exit 0"),
+                root.path(),
+                &scope_environment(),
+            )
+            .unwrap();
+        let orphan = read_orphan(root.path());
+        wait_for_exit(&runtime, "work");
+
+        let replacement = runtime
+            .spawn(
+                "work",
+                &crate::Launch::Argv(vec!["sleep".into(), "600".into()]),
+                root.path(),
+                &scope_environment(),
+            )
+            .unwrap();
+
+        assert_gone_soon(orphan);
+        // Each launch has a scope of its own. Ending the ended one again, as a reconcile pass
+        // that read the record before the replacement started does, leaves the replacement.
+        let ended_unit = ended.scope_unit.unwrap();
+        assert_ne!(Some(&ended_unit), replacement.scope_unit.as_ref());
+        assert!(crate::end_scope(&ended_unit, crate::SCOPE_GRACE).unwrap());
+        runtime.end_leftovers("work").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(matches!(
+            runtime.observe("work").unwrap(),
+            Some(ExecObservation::Running(_))
+        ));
+        runtime
+            .kill_if("work", Some(&replacement.generation_id))
+            .unwrap();
+        wait_for_exit(&runtime, "work");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_ended_exec_ends_what_it_left_running() {
+        if crate::isolation_mode() != crate::Isolation::Scope {
+            eprintln!("skipped: no systemd user scopes");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ExecRuntime::new(root.path().join("exec"), root.path().join("logs"));
+        let _kill = KillOnDrop(runtime.clone());
+        runtime
+            .spawn(
+                "work",
+                &orphaning_launch("exit 0"),
+                root.path(),
+                &scope_environment(),
+            )
+            .unwrap();
+        let orphan = read_orphan(root.path());
+        wait_for_exit(&runtime, "work");
+
+        // The reconciler asks this on each pass in which a stopped runtime is not running.
+        runtime.end_leftovers("work").unwrap();
+
+        assert_gone_soon(orphan);
     }
 }
