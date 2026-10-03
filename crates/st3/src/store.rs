@@ -24468,6 +24468,25 @@ fn carried_claim_successor_tx(
         .optional()
 }
 
+/// Return the current-generation step that took the place of a superseded step, whoever holds it.
+fn current_generation_successor_tx(
+    connection: &Connection,
+    step: &StepRunView,
+) -> rusqlite::Result<Option<StepRunView>> {
+    let run_id = step.run.strip_prefix("mission-run/").unwrap_or(&step.run);
+    connection
+        .query_row(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+             FROM step_runs
+             WHERE run_id=?1 AND step_path=?2 AND generation_id<>?3
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
+            params![run_id, step.step, generation_id_from_subject(&step.generation)],
+            step_run_from_row,
+        )
+        .optional()
+}
+
 /// A carried step keeps the worker lease of the status it carries, so its worker continues in
 /// the successor generation without claiming again.
 fn carried_step_lease(
