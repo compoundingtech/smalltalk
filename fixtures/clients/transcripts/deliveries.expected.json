@@ -1,0 +1,142 @@
+[
+  {
+    "body": {
+      "kind": "user",
+      "value": "Please audit the harbor keys and tell me what still reads the old ones."
+    },
+    "id": "delivery-1#0"
+  },
+  {
+    "body": {
+      "kind": "assistant",
+      "value": "Starting the audit."
+    },
+    "id": "delivery-2"
+  },
+  {
+    "body": {
+      "kind": "mail",
+      "value": {
+        "body": "how is the audit going?",
+        "delivered": true,
+        "dictated": false,
+        "from": "example",
+        "subject": "",
+        "to": "example/quay"
+      }
+    },
+    "id": "message/aa01"
+  },
+  {
+    "body": {
+      "kind": "mail",
+      "value": {
+        "body": "is this a watcher",
+        "delivered": true,
+        "dictated": false,
+        "from": "example",
+        "subject": "",
+        "to": "example/quay"
+      }
+    },
+    "id": "message/aa02"
+  },
+  {
+    "body": {
+      "kind": "mail",
+      "value": {
+        "body": "Keys rotated & checked.",
+        "delivered": false,
+        "dictated": false,
+        "from": "example/harbor",
+        "subject": "Key audit",
+        "to": "example/quay"
+      }
+    },
+    "id": "delivery-9#0"
+  },
+  {
+    "body": {
+      "kind": "mail",
+      "value": {
+        "body": "tide tables are ready",
+        "delivered": true,
+        "dictated": false,
+        "from": "example/harbor",
+        "subject": "Tide tables",
+        "to": "example/quay"
+      }
+    },
+    "id": "message/aa04"
+  },
+  {
+    "body": {
+      "kind": "event",
+      "value": "delivered to the agent: Berth schedule · from agent/example/harbor"
+    },
+    "id": "delivery-13#0"
+  },
+  {
+    "body": {
+      "kind": "user",
+      "value": "please look at the crane report"
+    },
+    "id": "delivery-14#0"
+  },
+  {
+    "body": {
+      "kind": "event",
+      "value": "delivered to the agent: Crane report · from example/harbor"
+    },
+    "id": "delivery-14#1"
+  },
+  {
+    "body": {
+      "kind": "user",
+      "value": "/review 42"
+    },
+    "id": "delivery-15#0"
+  },
+  {
+    "body": {
+      "kind": "tool",
+      "value": {
+        "output": [
+          "review queued",
+          "all checks green"
+        ],
+        "state": "ok",
+        "title": "command output"
+      }
+    },
+    "id": "delivery-16#0"
+  },
+  {
+    "body": {
+      "kind": "event",
+      "value": "the turn was interrupted"
+    },
+    "id": "delivery-17#0"
+  },
+  {
+    "body": {
+      "kind": "tool",
+      "value": {
+        "output": [
+          "This session is being continued from a previous conversation that ran out of context.",
+          "Summary: the audit found two readers."
+        ],
+        "state": "ok",
+        "title": "context summary · the conversation was compacted"
+      }
+    },
+    "id": "delivery-19#0"
+  },
+  {
+    "body": {
+      "kind": "assistant",
+      "value": "Two readers still use the old keys; both are fixed."
+    },
+    "id": "delivery-20"
+  }
+]

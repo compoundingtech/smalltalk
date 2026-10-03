@@ -182,6 +182,18 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     const subject = block.split('\n').map(line => line.trim()).find(line => line.startsWith('Subject:'))?.slice('Subject:'.length).trim() ?? shorten(cleanMessageText(block), 70);
     bodies.push({ kind: 'event', tone: 'quiet', text: `delivered to the agent: ${shorten(subject, 80)} · from ${senders[index] ?? 'someone'}` });
   });
+  // `[PING from st3] message/ID from SENDER: TITLE` announces mail on its own line: mail the
+  // stream shows is marked delivered; otherwise it is one quiet line, as in stui.
+  const pings: Body[] = [];
+  text.value = text.value.split('\n').filter(line => {
+    const id = pingId(line);
+    if (id && shown.has(id)) { delivered.add(id); return false; }
+    const ping = /^\s*\[PING from st3\] \S+ from (\S+): (.*)$/.exec(line);
+    if (!ping) return true;
+    pings.push({ kind: 'event', tone: 'quiet', text: `delivered to the agent: ${shorten(ping[2], 80)} · from ${short(ping[1])}` });
+    return false;
+  }).join('\n');
+  bodies.push(...pings);
   for (const command of takeBlocks(text, 'command-name')) {
     bodies.push({ kind: 'user', text: `${command.trim()} ${field(raw, 'command-args') ?? ''}`.trim() });
   }
@@ -333,7 +345,8 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
       case 'content': {
         const raw = contentText(entry.body);
         if (entry.role === 'user' || entry.role === 'system') {
-          fromHarness(entry.role === 'user', raw, shown, delivered).forEach((part, index) => push(entry, `${entry.id}#${index}`, part));
+          // Mail read from a delivery is named as the stream names it, as stui does.
+          fromHarness(entry.role === 'user', raw, shown, delivered).forEach((part, index) => push(entry, `${entry.id}#${index}`, part.kind === 'mail' ? { ...part, from: name(part.from), to: name(part.to) } : part));
         } else if (entry.role === 'tool') {
           const lines = cleanMessageText(raw).split('\n');
           if (lines.join('').trim()) push(entry, entry.id, { kind: 'tool', title: lines[0], state: 'ok', output: lines.slice(1) });
