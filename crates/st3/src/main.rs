@@ -4401,12 +4401,11 @@ async fn run_up(args: UpArgs) -> Result<()> {
             st3::store::LimitsPolicy {
                 stop_at_weekly_percent: config.limits.stop_at_weekly_percent,
                 keep: config.limits.keep.iter().cloned().collect(),
-                person: config
+                notify: config
                     .limits
-                    .ask
+                    .notify
                     .clone()
-                    .or_else(|| config.person.clone())
-                    .expect("the daemon validated its limits person"),
+                    .expect("the daemon validated its limits operations agent"),
                 fresh_ms: config
                     .limits
                     .fresh_ms()
@@ -18717,7 +18716,7 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
 /// Trim the local observation log at startup and then once an hour. Local observations
 /// never replicate, so this never changes what any peer holds.
 /// Apply this node's `[limits]` policy every two minutes: stop the seats it hosts on an account
-/// past its weekly limit, and ask the policy's person once per weekly window.
+/// past its weekly limit, and notify operations once per weekly window.
 async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPolicy) {
     const LIMITS_INTERVAL: Duration = Duration::from_secs(2 * 60);
     loop {

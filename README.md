@@ -334,12 +334,16 @@ person = "person/ada"
 enabled = true
 stop_at_weekly_percent = 95
 keep = ["agent/example/coordinator"]
+notify = "agent/example/operations"
 fresh = "1h"
 ```
 
 When an account's freshest weekly reading, no older than `fresh`, reaches the percentage, each
 node stops the seats it hosts on that account, except those in `keep`, and the node that measured
-the reading puts one request on the person's home naming the stopped seats and the reset time.
+the reading sends one message to `notify`, naming the affected seats and the reset time. The
+operations agent groups alerts, acts on standing instructions, and asks a person through a
+structured request only when a decision is needed. Enabled policies require `notify` to name
+an agent; the legacy `ask` setting is accepted but never sends raw events to a person.
 Each seat is stopped once per weekly window: start it again and it stays up until the reset. Give
 every node that hosts seats the same `[limits]`.
 
