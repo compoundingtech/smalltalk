@@ -12916,11 +12916,12 @@ async fn send_message(
                     // A daemon from before the lookup has no such route. Its sends still repeat
                     // only within the hour.
                     Err(error) if st3::client::http_status(&error) == Some(404) => {}
-                    Err(error) => {
-                        return Err(error.context(format!(
-                            "st could not check whether this message was already sent, so nothing was sent with idempotency key {key}; running the same command again is safe"
-                        )));
-                    }
+                    // A busy daemon still takes the send: only a send whose answer was lost in
+                    // the hour's last moments could repeat, and refusing every send is worse.
+                    Err(error) => eprintln!(
+                        "st: could not check the previous hour for this message ({}); sending it with idempotency key {key}",
+                        plain_error(&error)
+                    ),
                 }
             }
             key
