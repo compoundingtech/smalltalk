@@ -6,6 +6,11 @@ that member. It runs no st daemon or replication worker, holds no graph replica,
 fleet membership, member key, peer exposure, or fleet sync secret. Members continue to sync as
 described in [replication](replication.md) and [Fleet join](../fleet-join.md).
 
+The [iOS fabric transport proof](ios-fabric-protocol.md) documents a pinned,
+development-only direct iroh carrier and app-owned loopback adapter for the same
+paired gateway. It is a protocol specification; device interoperability is still
+to be proven.
+
 ## Pair once
 
 First publish the member's **paired-only** `st3-client.sock` through an existing LAN or tailnet
