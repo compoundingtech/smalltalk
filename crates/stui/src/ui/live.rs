@@ -298,6 +298,8 @@ pub fn run(context: Context) -> Result<()> {
     // Attaching a dropped terminal again: whether a try is out, and how many failed.
     let mut reattaching = false;
     let mut reattach_tries = 0_u32;
+    // The cursor shape last set, so it changes only when the attached terminal asks.
+    let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
     // When usage was last asked for and over how many hours, and whether that read is out.
@@ -1077,6 +1079,16 @@ pub fn run(context: Context) -> Result<()> {
         ui.step_voice();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
+        // The attached terminal's cursor shape (vim's bar while inserting), and the person's
+        // own shape back once it is gone.
+        let style = ui.cursor_style();
+        if style != cursor_style {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                style.unwrap_or(crossterm::cursor::SetCursorStyle::DefaultUserShape)
+            );
+            cursor_style = style;
+        }
         execute!(io::stdout(), EndSynchronizedUpdate)?;
         let visible = ui.visible_messages();
         let incoming: HashSet<_> = timelines
@@ -1138,6 +1150,7 @@ pub fn run(context: Context) -> Result<()> {
         {
             reattach_tries = 0;
         }
+        ui.terminal_requests();
         // While an attached terminal's output flows, or voice listens, draw it as it comes.
         let flowing = ui.voice.is_some()
             || ui
