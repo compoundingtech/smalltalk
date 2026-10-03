@@ -326,11 +326,11 @@ mod tests {
         let keys = change_keys(&change(
             "message/m",
             "message.sent",
-            Some("person/p"),
+            Some("person/example"),
             r#"{"fields":{"to":"agent/x"}}"#,
         ));
         assert!(keys.contains(&"mailbox:agent/x".to_owned()));
-        assert!(keys.contains(&"actor:person/p".to_owned()));
+        assert!(keys.contains(&"actor:person/example".to_owned()));
         assert!(keys.contains(&"kind:message.sent".to_owned()));
     }
 }
