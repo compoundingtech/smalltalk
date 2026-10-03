@@ -2045,6 +2045,9 @@ pub struct DoctorCheck {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DoctorReport {
+    /// Build identity of the responding daemon, absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_version: Option<String>,
     pub status: String,
     pub checks: Vec<DoctorCheck>,
     #[serde(default)]
@@ -2183,6 +2186,9 @@ pub struct MissionRunView {
     pub steps: Vec<StepRunView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loops: Vec<LoopRunView>,
+    /// Unresolved exit-code field gates on terminal execs, computed for mission details.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stuck_gates: Vec<String>,
 }
 
 /// Who set a finished run's outcome, from what, and why.
