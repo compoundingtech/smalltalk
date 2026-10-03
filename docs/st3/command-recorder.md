@@ -138,6 +138,10 @@ names the URL, actor, `ST_MISSION_RUN`, exit code, and timestamp. A URL is publi
 command exits nonzero, because creation can succeed before a later attachment fails. Without the
 marker's `receipts` field, no stdout capture or receipt publication occurs.
 
+Signal forwarding remains active when the caller stops reading stdout. Once the signaled child
+exits, a stalled consumer cannot hold up the command's exit status: undeliverable queued output
+is abandoned and the incomplete capture produces no receipt.
+
 The shim never contacts the daemon. The daemon consumes the spool asynchronously and publishes
 the resource's `opened_by` and `opened_by_run` facts, preserving an opener already named. Duplicate
 receipts for the same URL and actor collapse through an idempotency key. A receipt-born resource
