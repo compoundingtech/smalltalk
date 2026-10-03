@@ -10834,6 +10834,14 @@ impl Store {
     /// an answered request off `pending_human_reviews`.
     pub fn human_review_answer(&self, request: &str) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
+        // An answer is written on the request's subject, its gate operation.
+        smallclaims::touched::note_read(|| {
+            connection
+                .query_row("SELECT subject FROM claims WHERE id=?1", [request], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_default()
+        });
         human_review_answer_tx(&connection, request)
     }
 
