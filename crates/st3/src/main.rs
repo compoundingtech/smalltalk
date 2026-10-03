@@ -3286,6 +3286,8 @@ struct AttentionWithdrawArgs {
 #[derive(Subcommand)]
 enum WorkCommand {
     /// Ask a person through a runtime step owned by live work.
+    ///
+    /// Puts a structured request on the person's home.
     Ask(WorkAskArgs),
     /// Bring a person information they asked for. Nothing waits on it; it clears once read.
     Update(WorkUpdateArgs),
@@ -3324,6 +3326,8 @@ enum WorkCommand {
     /// Extend the live lease for work this incarnation still owns.
     Renew(WorkActionArgs),
     /// Record a material progress update without changing ownership.
+    ///
+    /// Records progress in the graph at no cost to anyone; people read it in stui.
     Progress(WorkActionArgs),
     /// Add time to the execution budget of claimed work that ran out of it.
     Extend(WorkExtendArgs),
@@ -3529,6 +3533,9 @@ enum MessageCommand {
     },
 
     /// Send one durable normalized message to a person or agent.
+    ///
+    /// A message is a direct connection: it wakes the recipient agent for a full turn,
+    /// which rereads its context.
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
@@ -3538,6 +3545,9 @@ enum MessageCommand {
     /// Read exact messages and optionally mark them read or archived.
     Read(MessageReadArgs),
     /// Reply to one canonical message ID while preserving its thread.
+    ///
+    /// A message is a direct connection: it wakes the recipient agent for a full turn,
+    /// which rereads its context.
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
