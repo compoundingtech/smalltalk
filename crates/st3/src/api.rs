@@ -1082,6 +1082,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-not-local"
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
+        | "search-index-building"
+        | "search-index-failed"
         | "terminal-unavailable"
         | "terminal-ended"
         | "blob-too-large"

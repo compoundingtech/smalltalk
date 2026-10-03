@@ -37,34 +37,36 @@ The index is a disposable, daemon-local SQLite FTS5 database in memory. It is de
 durable message text and st's existing normalized timeline entries, with no new graph facts,
 replication vocabulary, or client-owned store. A first search starts its index in the
 background and waits at most two seconds. If a large inventory is still being read, the
-response is retryable `remote-unavailable`; that work continues. Later first-page searches
-trigger a refresh at most once per 30 seconds and return the previous dated index with
+response is retryable `search-index-building`; that work continues. A failed cold
+refresh returns `search-index-failed` with its reason. Neither means an owner host is
+unreachable. Later first-page searches trigger a refresh at most once per 30 seconds and return the previous dated index with
 `refreshing: true` while it runs. Repeat the query once the refresh finishes to see new text.
 There is no idle search timer and no extra work on the graph writer's critical path.
 
-Mailbox change detection reads the existing from/to expression indexes; unrelated fleet
-writes do not rebuild message text. A changed mailbox is rebuilt newest first. Managed
-timeline change detection includes incarnation, observation identity and count (including
-prefix deletion), plus native transcript size and modification time. Unchanged local
-timelines are reused; changed timelines are normalized and paged once per refresh. Remote
-timelines are rechecked on a demand refresh because their local replicated observation may
-lag the file. Replacements and finalizations replace old indexed text. A missing or
-unreadable source drops its old searchable entries and reports the source.
+Each demand refresh inspects the available normalized source windows again so recent
+entries in a previously excluded source can displace older indexed text. It retains a
+global newest suffix ordered by normalized timestamp, conversation ID and entry ID,
+within both text and entry budgets. This selection is independent of source enumeration
+order. A single entry larger than the whole text budget is excluded. Older entries are
+not backfilled into spare bytes behind the selection cutoff. Unchanged selected text
+preserves the index revision and its pagination; changed text replaces old postings.
+A missing or unreadable source drops its old searchable entries and reports the source.
 
 A daemon keeps at most four reader indexes and runs at most two refresh workers. Each index
 contains at most 50,000 entries and 16 MiB of text, plus SQLite postings and IDs. Refresh
-temporarily holds changed text and one normalized source's bounded timeline; it reads no
-more than 50,001 mailbox records. Query work runs on a blocking worker and returns at most
+temporarily holds at most two bounded candidate sets and one normalized source's timeline;
+it reads no more than 50,001 mailbox records. Query work runs on a blocking worker and returns at most
 201 rows to determine pagination, with at most 200 sent to the client. The index consumes
 no additional disk writes. Cold cost is one inventory read, message projection, and a
 normalization pass over available source windows; warm queries read FTS postings, and
-refresh cost depends on changed sources and reachable remote timelines.
+refresh cost includes all exposed sources and reachable remote timelines.
 
 Search covers the history that st's normalized readers retain and expose. Their native
 transcript and inventory limits still apply; it is not an archive of discarded transcript
 prefixes. Truncation, redaction, malformed history, offline hosts, and index budget limits
-are reported in `incomplete_sources`, even when a query has zero matches. At most 128 source
-warnings are returned, with a count if more were omitted. A refresh failure also reports
+are reported in `incomplete_sources`, even when a query has zero matches. Error entries
+include their code and a bounded explanation rather than only the word `error`. At most
+128 source warnings are returned, with a count if more were omitted. A refresh failure also reports
 that the dated index could not be updated. Clients should display this metadata when
 interpreting a missing match.
 
