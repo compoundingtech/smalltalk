@@ -4239,6 +4239,7 @@ dependencies = [
  "st-wire",
  "st2-resource-providers",
  "st2-resource-wasip2",
+ "st3-schema",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "tracing",

@@ -5,6 +5,7 @@
 //! is then drawn in the wrong cells: the stray digits on the old stui's borders.
 
 use crate::theme::{self, Theme};
+use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -121,7 +122,10 @@ pub fn wrap(
         }
         *used = prefix_width(prefix);
     };
-    let finish = |current: &mut Vec<Span<'static>>, used: usize, lines: &mut Vec<Line<'static>>| {
+    let finish = |current: &mut Vec<Span<'static>>,
+                  used: usize,
+                  lines: &mut Vec<Line<'static>>,
+                  joining: Option<Alignment>| {
         if let Some(bg) = fill
             && used < width
         {
@@ -130,8 +134,12 @@ pub fn wrap(
                 Style::default().bg(bg),
             ));
         }
-        lines.push(Line::from(std::mem::take(current)));
+        let mut line = Line::from(std::mem::take(current));
+        line.alignment = joining;
+        lines.push(line);
     };
+    // How the line being built continues the one before it (see `continues`).
+    let mut joining = None;
     start(&mut current, &mut used, first);
     let base = used;
     let mut line_has_words = false;
@@ -151,7 +159,8 @@ pub fn wrap(
             let piece_width = self::width(piece);
             if used + piece_width > width && line_has_words {
                 trim_trailing_space(&mut current, &mut used);
-                finish(&mut current, used, &mut lines);
+                finish(&mut current, used, &mut lines, joining);
+                joining = Some(SPACE_WRAP);
                 start(&mut current, &mut used, rest);
             }
             if used + piece_width <= width {
@@ -162,7 +171,8 @@ pub fn wrap(
                 for character in piece.chars() {
                     let w = character.width().unwrap_or(0);
                     if used + w > width {
-                        finish(&mut current, used, &mut lines);
+                        finish(&mut current, used, &mut lines, joining);
+                        joining = Some(WORD_WRAP);
                         start(&mut current, &mut used, rest);
                     }
                     push(&mut current, &character.to_string(), style);
@@ -173,9 +183,36 @@ pub fn wrap(
         }
     }
     if line_has_words || used > base || lines.is_empty() {
-        finish(&mut current, used, &mut lines);
+        finish(&mut current, used, &mut lines, joining);
     }
     lines
+}
+
+/// A line that only wraps the one before it, at a space (the space is dropped) or inside a long
+/// word, is marked in its alignment: drawing a line (`Buffer::set_line`) ignores alignment, and
+/// copying joins the two back into one line, so only real newlines reach the clipboard
+/// (Nathan, 2026-10-03).
+const SPACE_WRAP: Alignment = Alignment::Left;
+const WORD_WRAP: Alignment = Alignment::Right;
+
+/// What joins `line` to the line before it when copied: a space or nothing if it only wraps that
+/// line, `None` if it starts a line of its own.
+pub fn continues(line: &Line<'_>) -> Option<&'static str> {
+    match line.alignment {
+        Some(SPACE_WRAP) => Some(" "),
+        Some(WORD_WRAP) => Some(""),
+        _ => None,
+    }
+}
+
+/// `line` drawn after `prefix` (an edge, an indent), still wrapping the line before it if it did.
+pub fn prefixed(prefix: Vec<Span<'static>>, line: Line<'static>) -> Line<'static> {
+    let alignment = line.alignment;
+    let mut spans = prefix;
+    spans.extend(line.spans);
+    let mut line = Line::from(spans);
+    line.alignment = alignment;
+    line
 }
 
 fn trim_trailing_space(current: &mut [Span<'static>], used: &mut usize) {

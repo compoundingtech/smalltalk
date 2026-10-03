@@ -785,6 +785,7 @@
             "fault": { "type": ["string", "null"], "description": "Current member reconcile failure; cleared by a successful pass." },
             "incarnation_id": { "type": ["string", "null"] },
             "current_session_id": { "type": ["string", "null"] },
+            "todo": { "oneOf": [{ "$ref": "#/$defs/AgentTodo" }, { "type": "null" }], "description": "Latest accepted harness todo snapshot and claim provenance; null if none was observed. Stale observations remain visible." },
             "current_work_ids": { "type": "array", "items": { "$ref": "#/$defs/StepRunId" } },
             "active_work_count": { "type": "integer", "minimum": 0 },
             "next_work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
@@ -801,6 +802,63 @@
           }
         }
       ]
+    },
+    "AgentTodo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot", "claim_id", "accepted_at", "stale"],
+      "properties": {
+        "snapshot": { "$ref": "#/$defs/HarnessTodoSnapshot" },
+        "claim_id": { "type": "string" },
+        "accepted_at": { "$ref": "#/$defs/Timestamp" },
+        "stale": { "type": "boolean" }
+      }
+    },
+    "HarnessTodoSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["harness", "session_id", "incarnation_id", "observed_at", "source_op", "phases", "totals", "truncated"],
+      "properties": {
+        "harness": { "type": "string" },
+        "session_id": { "type": "string" },
+        "incarnation_id": { "type": "string" },
+        "observed_at": { "$ref": "#/$defs/Timestamp" },
+        "source_op": { "type": "string" },
+        "phases": { "type": "array", "items": { "$ref": "#/$defs/HarnessPhase" } },
+        "totals": { "$ref": "#/$defs/HarnessTodoTotals" },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "HarnessPhase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "tasks"],
+      "properties": {
+        "name": { "type": "string" },
+        "tasks": { "type": "array", "items": { "$ref": "#/$defs/HarnessTask" } }
+      }
+    },
+    "HarnessTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content", "status"],
+      "properties": {
+        "content": { "type": "string" },
+        "status": { "enum": ["pending", "in_progress", "completed", "blocked"] },
+        "blocker": { "type": ["string", "null"] }
+      }
+    },
+    "HarnessTodoTotals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pending", "in_progress", "completed", "blocked"],
+      "properties": {
+        "pending": { "type": "integer", "minimum": 0 },
+        "in_progress": { "type": "integer", "minimum": 0 },
+        "completed": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 },
+        "abandoned": { "type": "integer", "minimum": 0 }
+      }
     },
     "AgentDelivery": {
       "type": "object",
