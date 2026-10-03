@@ -279,7 +279,7 @@ mod tests {
             fleet_id: None, configured_peers: Vec::new(), client_relay: None,
             native_session_home: None, planner_default: crate::model::PlannerSpec::default(),
         };
-        claim(&state, "shell", "runtime.observed", json!({"status":"running","runtime_id":"runtime-shell","incarnation_id":"incarnation-one","terminal":true}));
+        claim(&state, "agent/shell", "runtime.observed", json!({"status":"running","runtime_id":"runtime-shell","incarnation_id":"incarnation-one","terminal":true}));
         (root, state, ClientSession::local(Some("person/alex")).unwrap())
     }
 
@@ -290,7 +290,7 @@ mod tests {
     }
 
     fn acquire(state: &AppState, session: &ClientSession) -> Arc<Lease> {
-        Lease::register(state,session,"terminal/shell","host/lease-owner","incarnation-one",None,&authorization_epoch(state,session).unwrap()).unwrap()
+        Lease::register(state,session,"terminal/agent/shell","host/lease-owner","incarnation-one",None,&authorization_epoch(state,session).unwrap()).unwrap()
     }
 
     #[tokio::test(start_paused = true)]
@@ -347,7 +347,7 @@ mod tests {
         claim(&state,"person/alex","principal.key-revoked",json!({"key":"old-key","reason":"test"}));
         assert!(old.check().is_err(), "mutation returned before lease invalidation");
         let replacement = acquire(&state,&session);
-        claim(&state,"shell","runtime.observed",json!({"status":"running","runtime_id":"runtime-shell","incarnation_id":"incarnation-two","terminal":true}));
+        claim(&state,"agent/shell","runtime.observed",json!({"status":"running","runtime_id":"runtime-shell","incarnation_id":"incarnation-two","terminal":true}));
         assert!(replacement.check().is_err(), "incarnation mutation returned before invalidation");
         assert!(old.check().is_err());
     }
@@ -363,13 +363,13 @@ mod tests {
         claim(&state,"custom/client/device-one","custom.client.pairing-revoked",json!({"device_id":"device-one"}));
         assert!(old.check().is_err());
         assert!(replacement.check().is_err());
-        assert!(Lease::register(&state,&session,"terminal/shell","host/lease-owner","incarnation-one",None,&old.acquisition_epoch).is_err());
+        assert!(Lease::register(&state,&session,"terminal/agent/shell","host/lease-owner","incarnation-one",None,&old.acquisition_epoch).is_err());
         session.actor = "client/device-two".into();
         let mut restricted = grant;
         restricted["session_actor"] = json!(session.actor);
         restricted["scopes"] = json!([]);
         claim(&state,"custom/client/device-two","custom.client.pairing-completed",restricted);
-        assert!(Lease::register(&state,&session,"terminal/shell","host/lease-owner","incarnation-one",None,&old.acquisition_epoch).is_err());
+        assert!(Lease::register(&state,&session,"terminal/agent/shell","host/lease-owner","incarnation-one",None,&old.acquisition_epoch).is_err());
     }
 
     #[tokio::test]
@@ -381,7 +381,7 @@ mod tests {
         binding.grant_subject = Some("custom/client/original".into());
         let grant = json!({"fields":{"session_actor":"client/original","person_id":"person/alex","scopes":["terminal.read"],"expires_at_unix_ms":client_now_ms()+600_000}});
         binding.grant_digest = Some(credential_digest(&serde_json::to_string(&grant).unwrap()));
-        let forwarded = Lease::register(&state, &session, "terminal/shell", "host/lease-owner", "incarnation-one", Some(binding), &authorization_epoch(&state, &session).unwrap()).unwrap();
+        let forwarded = Lease::register(&state, &session, "terminal/agent/shell", "host/lease-owner", "incarnation-one", Some(binding), &authorization_epoch(&state, &session).unwrap()).unwrap();
         assert!(forwarded.check().is_ok());
         claim(&state, "custom/client/original", "custom.client.pairing-completed", json!({
             "session_actor":"client/original","person_id":"person/alex","scopes":[],
@@ -428,7 +428,7 @@ mod tests {
         let acquired = authorization_epoch(&state,&session).unwrap();
         // No lease is registered yet: invalidate between consumption and registration.
         claim(&state,"person/alex","principal.key-revoked",json!({"key":"acquired-key","reason":"race"}));
-        assert!(Lease::register(&state,&session,"terminal/shell","host/lease-owner","incarnation-one",None,&acquired).is_err());
+        assert!(Lease::register(&state,&session,"terminal/agent/shell","host/lease-owner","incarnation-one",None,&acquired).is_err());
         let fresh = acquire(&state,&session);
         assert!(fresh.check().is_ok(), "only a fresh authorization may acquire the new epoch");
     }

@@ -1,8 +1,9 @@
 // Real scratch daemon endpoints, signed peer route, and an actual detached PTY process.
 struct LeasePair {
+    // Tear down the detached process before its registry directory is removed.
+    _pty: ScratchRawPty,
     _owner_root: tempfile::TempDir,
     _gateway_root: tempfile::TempDir,
-    _pty: ScratchRawPty,
     owner: crate::api::AppState,
     gateway: crate::api::AppState,
     client: st3_client::Client,
