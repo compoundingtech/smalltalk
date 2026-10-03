@@ -457,10 +457,16 @@ st conversations archive MESSAGE --as person/ada
 st conversations search "release date" --agent agent/example/worker --since 2026-10-01T00:00:00Z
 ```
 
-If a send or reply goes unanswered, st retries once with the same message and idempotency
-key. If delivery remains unconfirmed, the error prints the key: rerun the same command with
-`--idempotency-key KEY` to recover its result without sending a second message. Use a new key
-for a new message.
+Running the same send or reply again never sends it twice. Without `--idempotency-key`, st names
+the message by its sender, recipient (or the message it answers), title, body, tags, attachments
+and the hour, so a repeat within the hour or the next reports the message already sent
+(`already_sent` with `--json`) and sends nothing; the same words a few hours later are a new
+message. An explicit `--idempotency-key` names one message at any hour, and reusing it with
+different words is refused.
+
+If a send goes unanswered, st retries once with the same key. If it is still unconfirmed, the
+message may have landed: the error prints its key and the command that tells whether it did,
+`st conversations status --idempotency-key KEY`. Running the same command again is safe.
 
 `st conversations sessions` lists harness sessions and `st conversations timeline SESSION`
 shows one conversation as stui shows it: messages, Small Talk, and tool calls folded to a line
