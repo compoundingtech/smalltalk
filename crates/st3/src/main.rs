@@ -16755,8 +16755,12 @@ fn activate_channel_todo_observations(
     Ok(observations)
 }
 
+// Wall-clock minute boundaries can be one second apart; confirmations need a full period.
+const CHANNEL_TODO_END_CONFIRMATION_GAP: Duration = Duration::from_secs(60);
+
 async fn remove_confirmed_ended_channel_todo_outbox(
-    client: &Client, subject: &str, incarnation: &str, dir: &Path, end_seen: &mut bool,
+    client: &Client, subject: &str, incarnation: &str, dir: &Path,
+    end_seen: &mut Option<tokio::time::Instant>,
 ) -> Result<bool> {
     let status: Result<StatusResponse> = client.get(&format!(
         "/v1/status?subject={}", urlencoding::encode(subject),
@@ -16764,20 +16768,38 @@ async fn remove_confirmed_ended_channel_todo_outbox(
     let status = match status {
         Ok(status) => status,
         Err(error) => {
-            *end_seen = false;
+            *end_seen = None;
             return Err(error);
         }
     };
     let ended = status.subjects.first().and_then(|seat| seat.actual.as_ref())
         .is_some_and(|actual| todo_runtime_has_ended(actual, incarnation));
-    let confirmed = ended && *end_seen;
-    *end_seen = ended;
-    if confirmed
-    {
+    if !ended {
+        *end_seen = None;
+        return Ok(false);
+    }
+    let first_seen = end_seen.get_or_insert_with(tokio::time::Instant::now);
+    if first_seen.elapsed() >= CHANNEL_TODO_END_CONFIRMATION_GAP {
         fs::remove_dir_all(dir)?;
         return Ok(true);
     }
     Ok(false)
+}
+
+async fn finish_channel_todo_outbox(
+    client: &Client, subject: &str, incarnation: &str, dir: &Path,
+    end_seen: &mut Option<tokio::time::Instant>,
+) -> Result<bool> {
+    loop {
+        if remove_confirmed_ended_channel_todo_outbox(
+            client, subject, incarnation, dir, end_seen,
+        ).await? {
+            return Ok(true);
+        }
+        let Some(first_seen) = *end_seen else { return Ok(false); };
+        // EOF is not an independent liveness confirmation until the same gap has elapsed.
+        tokio::time::sleep_until(first_seen + CHANNEL_TODO_END_CONFIRMATION_GAP).await;
+    }
 }
 
 async fn run_pi_channel(
@@ -16917,7 +16939,7 @@ async fn run_pi_channel(
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
     let mut checked_todo_minute = None;
-    let mut todo_end_seen = false;
+    let mut todo_end_seen = None;
     loop {
         tokio::select! {
             wake = async { match todo_observations.as_mut() {
@@ -16987,7 +17009,7 @@ async fn run_pi_channel(
                             if let Err(error) = observations.drain(client, subject, driver, &mut false).await {
                                 warn_pi_channel(subject, &error, &mut last_warning);
                             }
-                            if let Err(error) = remove_confirmed_ended_channel_todo_outbox(
+                            if let Err(error) = finish_channel_todo_outbox(
                                 client, subject, &incarnation, &observations.dir, &mut todo_end_seen,
                             ).await {
                                 warn_pi_channel(subject, &error, &mut last_warning);
@@ -19663,7 +19685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn todo_transient_liveness_miss_preserves_spool_until_consecutive_confirmations() {
+    async fn todo_liveness_confirmation_requires_full_period_including_eof() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("spool");
         fs::create_dir(&dir).unwrap();
@@ -19695,12 +19717,26 @@ mod tests {
             while !path.exists() { tokio::task::yield_now().await; }
         }).await.unwrap();
         let client = Client::unix(&path);
-        let mut end_seen = false;
+        tokio::time::pause();
+        // Keep socket I/O from automatically advancing the paused clock to unrelated timers.
+        let clock_guard = tokio::spawn(async {
+            loop { tokio::task::yield_now().await; }
+        });
+        let mut end_seen = None;
         observe("vanished");
         assert!(!remove_confirmed_ended_channel_todo_outbox(
             &client, "agent/seat", "current", &dir, &mut end_seen,
         ).await.unwrap());
         assert_eq!(fs::read(dir.join("pending")).unwrap(), b"unpublished todo");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        tokio::time::advance(Duration::from_secs(58)).await;
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        assert!(dir.join("pending").exists());
         observe("running");
         assert!(!remove_confirmed_ended_channel_todo_outbox(
             &client, "agent/seat", "current", &dir, &mut end_seen,
@@ -19723,9 +19759,29 @@ mod tests {
             &client, "agent/seat", "current", &dir, &mut end_seen,
         ).await.unwrap());
         assert!(dir.join("pending").exists());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        tokio::time::advance(Duration::from_secs(59)).await;
         assert!(remove_confirmed_ended_channel_todo_outbox(
             &client, "agent/seat", "current", &dir, &mut end_seen,
         ).await.unwrap());
+        assert!(!dir.exists());
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("pending"), b"unpublished EOF todo").unwrap();
+        end_seen = None;
+        assert!(!remove_confirmed_ended_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        let first_seen = end_seen.unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        clock_guard.abort();
+        let _ = clock_guard.await;
+        assert!(finish_channel_todo_outbox(
+            &client, "agent/seat", "current", &dir, &mut end_seen,
+        ).await.unwrap());
+        assert!(first_seen.elapsed() >= CHANNEL_TODO_END_CONFIRMATION_GAP);
         assert!(!dir.exists());
         server.abort();
         let _ = server.await;
