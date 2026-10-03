@@ -269,6 +269,18 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "image bytes, outside the graph",
     ),
     (
+        "GET /v1/client/usage/history",
+        "external usage history relay, outside the graph",
+    ),
+    (
+        "GET /v1/client/usage/quota",
+        "external quota relay, outside the graph",
+    ),
+    (
+        "POST /v1/client/telemetry/traces",
+        "external OTLP export relay, outside the graph",
+    ),
+    (
         "PUT /v1/client/glasses/{id}",
         "a stui layout, outside the graph",
     ),
