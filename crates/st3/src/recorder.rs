@@ -18,7 +18,7 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -108,8 +108,9 @@ pub fn install(
     let directory = directory(state_dir)?;
     let log = log_path(state_dir)?;
     let receipts = std::path::absolute(receipt_path(state_dir))?;
-    fs::create_dir_all(&receipts)
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(&receipts)
         .with_context(|| format!("create the receipt directory {}", receipts.display()))?;
+    fs::set_permissions(&receipts, fs::Permissions::from_mode(0o700))?;
     fs::create_dir_all(&directory)
         .with_context(|| format!("create the recorder directory {}", directory.display()))?;
     let marker = serde_json::to_vec_pretty(&Marker {
@@ -220,6 +221,12 @@ pub fn run(program: &'static str) -> ! {
         && program == "gh"
         && arguments.get(1).is_some_and(|argument| argument == "create")
         && arguments.first().is_some_and(|argument| argument == "issue" || argument == "pr")
+        && !arguments.iter().any(|argument| {
+            let argument = argument.as_bytes();
+            matches!(argument, b"--dry-run" | b"--web" | b"-w" | b"--help" | b"-h")
+                || argument.starts_with(b"--dry-run=")
+                || argument.starts_with(b"--web=")
+        })
         && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0;
     let mut last_line = LastLine::default();
     let outcome = match &real {
@@ -1079,6 +1086,7 @@ mod tests {
         assert!(receipts.is_absolute());
         assert_eq!(receipts, receipt_path(&state));
         assert!(receipts.is_dir());
+        assert_eq!(fs::metadata(&receipts).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(
             fs::metadata(&installation.log)
                 .unwrap()

@@ -16882,8 +16882,8 @@ fn normalize_resource_observation(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| previous.as_object().cloned().unwrap_or_default());
-        // A creation receipt contributes attribution only. Merge under the writer transaction
-        // so an observer publishing newer facts concurrently cannot have those facts erased.
+        // Receipts publish attribution and identity only, never a local observer snapshot:
+        // this writer may be behind on replication when the receipt arrives.
         if input
             .idempotency_key
             .as_deref()
@@ -16894,7 +16894,6 @@ fn normalize_resource_observation(
                 facts.remove("opened_by");
                 facts.remove("opened_by_run");
             }
-            facts.extend(previous.clone());
         }
         // Issue and pull request attribution belongs to its publisher, not to the latest
         // observer or fixer. Keep each named field, including a mission-run-only opener, across

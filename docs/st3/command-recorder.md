@@ -132,6 +132,12 @@ and retains only the last line, bounded to 1 KiB. Terminal output and every othe
 direct descriptor. A wrapper before the recorder on `PATH` can exec it without changing this check:
 the recorder checks the caller's real stdout descriptor.
 
+`--dry-run`, browser mode (`--web`/`-w`), and help do not capture receipts. In
+[`cli/cli` v2.100.0's PR create implementation](https://github.com/cli/cli/blob/v2.100.0/pkg/cmd/pr/create/create.go),
+dry-run renders the proposed body instead of submitting, while browser mode returns through
+`previewPR`; neither creates a PR. Issue create also uses browser mode for preview. A body ending
+in an existing PR URL must not credit the caller with creating that PR.
+
 When the last line is a GitHub issue or pull request URL, the log includes `receipt_url` and the
 recorder atomically writes a private mode-0600 receipt under `<state>/recorder/receipts`. The receipt
 names the URL, actor, `ST_MISSION_RUN`, exit code, and timestamp. A URL is published even when the
@@ -147,6 +153,15 @@ the resource's `opened_by` and `opened_by_run` facts, preserving an opener alrea
 receipts for the same URL and actor collapse through an idempotency key. A receipt-born resource
 does not replace a GitHub observation: its first observed state still triggers issue or review
 delivery normally.
+
+Receipt claims contain attribution and required resource identity fields only, never the daemon's
+previous observer snapshot. The spool directory is mode 0700 (including after reinstall).
+Filesystem notifications wake ingestion immediately; a fallback scan backs off from two seconds
+to at most sixty seconds while idle and returns to one second after ingestion. Failed appends
+retain their retry count in the filename across daemon restarts. After five failures the receipt
+becomes a `.dead-letter` file, is logged once, and is no longer retried. To retry after correcting
+the cause, rename it to a fresh `.json` name. Abandoned `.tmp` files older than one hour are removed;
+fresh temporary files are left alone so an active publisher can finish.
 
 ## Limits
 
