@@ -86,7 +86,7 @@ for provider in GITHUB_ISSUE GITHUB_PR PTY_STATS VISTA; do
 done`,
   },
   nixDevelopStep({ name: 'Install matching rendered hooks', command: ['cargo', 'run', '--locked', '-p', 'st2', '--', 'hooks', 'install'] }),
-  nixDevelopStep({ name: 'Build workspace tests first (no debug info)', command: ['cargo', 'nextest', 'run', '--workspace', '--locked', '--profile', 'ci', '--no-run'] }),
+  nixDevelopStep({ name: 'Build selected test targets first (no debug info)', command: ['bash', 'scripts/ci-nextest', 'run', '--no-run'] }),
 ]
 
 /** Everything a job that runs the workspace tests needs. */

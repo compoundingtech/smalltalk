@@ -93,12 +93,12 @@ jobs:
       - name: Install matching rendered hooks
         shell: bash
         run: nix develop -c cargo run --locked -p st2 -- hooks install
-      - name: Build workspace tests first (no debug info)
+      - name: Build selected test targets first (no debug info)
         shell: bash
-        run: nix develop -c cargo nextest run --workspace --locked --profile ci --no-run
+        run: nix develop -c bash scripts/ci-nextest run --no-run
       - name: Run macOS workspace tests (25 minute limit)
         shell: bash
-        run: nix develop -c cargo nextest run --workspace --locked --profile ci
+        run: nix develop -c bash scripts/ci-nextest run
         timeout-minutes: 25
       - name: Cargo clippy
         shell: bash

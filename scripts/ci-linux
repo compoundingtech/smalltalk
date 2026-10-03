@@ -42,7 +42,7 @@ clippy_and_codegen() {
 start=$SECONDS status=0
 case "$stage" in
   # The nextest --no-run step already compiled the test executables.
-  tests) cargo nextest run --workspace --locked --profile ci --test-threads "$(nproc)" \
+  tests) bash scripts/ci-nextest run --test-threads "$(nproc)" \
     2>&1 | tee "$logs/$stage.log" || status=$? ;;
   clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   fleet-compat) fleet_compat 2>&1 | tee "$logs/$stage.log" || status=$? ;;

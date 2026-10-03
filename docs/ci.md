@@ -27,8 +27,8 @@ them succeeded (a skipped or cancelled stage fails it). The stage jobs use the N
 `linux-gate` aggregate use `namespace-profile-linux-x86-64`. `scripts/ci-linux STAGE` runs one stage:
 
 - `linux-tests`: prepares the provider component fixtures, installs matching rendered st2 hooks,
-  builds the workspace test executables with dev/test debug info and incremental compilation
-  disabled, then runs `cargo nextest run --workspace --locked --profile ci` on every CPU, selected
+  builds the selected test executables with dev/test debug info and incremental compilation
+  disabled, then runs `bash scripts/ci-nextest run` on every CPU, selected
   by the profile's default filter (see [gate scope](#gate-scope));
 - `linux-clippy`: `cargo clippy --workspace --all-targets --locked`, then
   `cargo run --locked -p st3-client-codegen -- --check`;
@@ -103,7 +103,23 @@ It leaves out st2-only tests: st2's own unit tests (none of its remaining module
 st3), the st-drivers `catalog*`, `resync` and `resource_profile_supervisor` modules, and st2's
 `catalog_*`, `nomad_survival`, `event_e2e`, `eval_run_e2e`, `resync*`, `supervisor_auto_archive`
 and `resource_profile_supervisor_e2e` tests. No CI job runs these. Clippy still checks the whole
-workspace. List the selection with `cargo nextest list --workspace --profile ci`.
+workspace. List the selection with `bash scripts/ci-nextest list`.
+
+`scripts/ci-nextest` supplies Cargo's target selection for both the build-only step
+(`bash scripts/ci-nextest run --no-run`) and execution, on Linux and macOS. It runs two groups:
+the workspace excluding st2, then st2's `integration`, `agent_resource` and `driver_expansion`
+test targets. Both use the unchanged `ci` profile, and both run even if the first fails; any
+failure fails the stage. This avoids compiling st2's entirely excluded lib/bin unit-test
+targets, `event_e2e` and `resource_profile_supervisor_e2e`. Nextest filters alone do not avoid
+compiling them. Partially selected binaries (st2 `integration` and st-drivers' library tests)
+still compile in full, and the retained st2 tests still build the st2 executable they need.
+When adding a st2 test target or changing binary-level exclusions, update the script's
+retained target list alongside `.config/nextest.toml`.
+
+The old trusted fleet runner and st merge train are retired; there is no operations installation
+handoff. Namespace workflows use this script from the checkout and land through GitHub's merge
+queue. Provider fixtures, rendered hooks, workspace Clippy and the isolation archive keep their
+existing scope.
 
 ### Isolation VM
 
