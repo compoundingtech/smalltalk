@@ -12,7 +12,7 @@ Run the local contract checks with:
 
 ```sh
 cargo run -p st3-client-codegen -- --check
-apps/ios/node_modules/.bin/tsc --strict --noEmit --allowImportingTsExtensions --target ES2022 --module NodeNext --moduleResolution NodeNext --lib es2022,dom clients/typescript/st3-client/index.ts clients/typescript/st3-client/types.test.ts
+apps/ios/node_modules/.bin/tsc --strict --exactOptionalPropertyTypes --noEmit --allowImportingTsExtensions --target ES2022 --module NodeNext --moduleResolution NodeNext --lib es2022,dom clients/typescript/st3-client/index.ts clients/typescript/st3-client/types.test.ts
 node --test clients/typescript/st3-client/contract.test.cjs
 ```
 

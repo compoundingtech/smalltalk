@@ -144,7 +144,7 @@ export class St3Client {
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
         const response = await this.fetchImpl(this.baseUrl + path, {
-            method, headers, body: body === undefined ? undefined : raw ? (body as BodyInit) : JSON.stringify(body),
+            method, headers, ...(body === undefined ? {} : { body: raw ? (body as BodyInit) : JSON.stringify(body) }),
         });
         const payload: unknown = await response.json();
         if (!payload || typeof payload !== 'object' || (payload as { api_version?: unknown }).api_version !== API_VERSION) {
@@ -189,7 +189,7 @@ export class St3Client {
         const parts: Uint8Array[] = [];
         let received = 0;
         for (;;) {
-            const chunk = (await this.blobChunk(sha256, { message, offset: received })).value;
+            const chunk = (await this.blobChunk(sha256, { ...(message === undefined ? {} : { message }), offset: received })).value;
             const binary = atob(chunk.data);
             const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
             if (bytes.length === 0 && received < chunk.size) throw new Error('A blob chunk came back empty');
