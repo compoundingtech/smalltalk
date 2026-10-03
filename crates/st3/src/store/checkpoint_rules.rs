@@ -18,8 +18,9 @@ use smallclaims::store::checkpoint_agreement::*;
 /// when they run the same rules. Version 5 leaves repaired originals out of the sealed set and
 /// proves on the sealed claims' blobs only. Version 6 applies work extensions to the canonical
 /// graph and execution timing, so older builds seal different rules rather than publishing an
-/// incompatible one-time graph or reader verification under the same terms.
-pub const RULES_VERSION: u32 = 6;
+/// incompatible one-time graph or reader verification under the same terms. Version 7 selects
+/// one initial definition when members independently create the same scheduled occurrence.
+pub const RULES_VERSION: u32 = 7;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local

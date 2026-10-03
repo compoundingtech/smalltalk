@@ -3101,7 +3101,7 @@ impl Store {
         &self,
         request: &MissionRunRequest,
     ) -> Result<MissionRunView, St3Error> {
-        self.create_mission_run_inner(request, None)
+        self.create_mission_run_inner(request, None, None)
     }
 
     pub fn mission_run_subject_for_idempotency_key(&self, idempotency_key: &str) -> String {
@@ -3132,13 +3132,49 @@ impl Store {
                 parent_step_run: normalize_step_run(parent_step_run),
                 default_selector: default_selector.cloned(),
             }),
+            None,
         )
+    }
+
+    /// An occurrence belongs to its schedule, regardless of the requesting member or revision.
+    pub fn scheduled_mission_run_subject(schedule: &str, occurrence: u64) -> String {
+        format!(
+            "mission-run/{}",
+            &canonical_hash(&("schedule-occurrence", schedule, occurrence))
+                .expect("schedule occurrence identity serializes")[..32]
+        )
+    }
+
+    pub fn create_scheduled_mission_run(
+        &self,
+        request: &MissionRunRequest,
+        parent: Option<&MissionRunView>,
+        schedule: &str,
+        occurrence: u64,
+    ) -> Result<MissionRunView, St3Error> {
+        let subject = Self::scheduled_mission_run_subject(schedule, occurrence);
+        // A replicated or replayed run remains the occurrence's run even if the child head,
+        // workspace or parent revision has changed since its request was accepted.
+        if let Some(run) = self.mission_run(&subject).map_err(internal)? {
+            return Ok(run);
+        }
+        let child = parent.map(|parent| ChildMissionContext {
+            root_revision: parent.root_revision.clone(),
+            root_run_id: parent
+                .root_mission_run
+                .trim_start_matches("mission-run/")
+                .into(),
+            parent_step_run: normalize_step_run(schedule),
+            default_selector: None,
+        });
+        self.create_mission_run_inner(request, child, Some(&subject))
     }
 
     fn create_mission_run_inner(
         &self,
         request: &MissionRunRequest,
         child: Option<ChildMissionContext>,
+        occurrence_subject: Option<&str>,
     ) -> Result<MissionRunView, St3Error> {
         let mission_id = request
             .mission
@@ -3187,6 +3223,18 @@ impl Store {
             .map_err(internal)?,
         ));
         let mut connection = self.connection.write();
+        if let Some(subject) = occurrence_subject
+            && let Some(run) = connection
+                .query_row(
+                    "SELECT id FROM mission_runs WHERE id=?1",
+                    [subject.trim_start_matches("mission-run/")],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(internal)?
+        {
+            return mission_run_view_tx(&connection, &run).map_err(internal);
+        }
         if let Some((response, stored_hash)) = connection
             .query_row(
                 "SELECT i.response, r.request_hash FROM idempotency i JOIN mission_run_requests r ON r.operation_id=i.operation_id WHERE i.operation_id=?1",
@@ -3208,15 +3256,15 @@ impl Store {
         owned_sets::guard_mission_start(&transaction, mission_id)?;
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
         enforce_mission_run_capacity(&transaction, &mission)?;
-        let run_id = self
-            .mission_run_subject_for_idempotency_key(&request.idempotency_key)
-            .trim_start_matches("mission-run/")
-            .to_owned();
-        let subject = format!("mission-run/{run_id}");
-        let generation_id = hex::encode(Sha256::digest(
-            format!("{}:{}:generation:1", self.origin, request.idempotency_key).as_bytes(),
-        ))[..32]
-            .to_owned();
+        let subject = occurrence_subject.map(str::to_owned).unwrap_or_else(|| {
+            self.mission_run_subject_for_idempotency_key(&request.idempotency_key)
+        });
+        let run_id = subject.trim_start_matches("mission-run/").to_owned();
+        let generation_key = occurrence_subject.map_or_else(
+            || format!("{}:{}:generation:1", self.origin, request.idempotency_key),
+            |subject| format!("{subject}:generation:1"),
+        );
+        let generation_id = hex::encode(Sha256::digest(generation_key.as_bytes()))[..32].to_owned();
         let generation_subject = format!("run-generation/{generation_id}");
         let root_revision = child
             .as_ref()
@@ -17448,6 +17496,29 @@ fn mark_work_extensions_projected_tx(transaction: &Transaction<'_>) -> Result<()
     Ok(())
 }
 
+/// Upgrade only run trees with competing creation claims; ordinary runs already fold the same.
+fn migrate_occurrence_creation_projections_tx(transaction: &Transaction<'_>) -> Result<()> {
+    if transaction.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key='occurrence_creation_projection_rules' AND value='1')", [], |row| row.get::<_, bool>(0))? {
+        return Ok(());
+    }
+    let subjects = transaction.prepare("SELECT subject FROM claims WHERE kind='mission-run.created' GROUP BY subject HAVING COUNT(*)>1")?
+        .query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut roots = BTreeSet::new();
+    for subject in subjects {
+        if let Some(root) = run_tree_of_tx(transaction, &subject).map_err(anyhow::Error::new)? {
+            roots.insert(root);
+        }
+    }
+    for root in roots {
+        rebuild_run_tree_tx(transaction, &root).map_err(anyhow::Error::new)?;
+    }
+    transaction.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('occurrence_creation_projection_rules','1')",
+        [],
+    )?;
+    Ok(())
+}
+
 fn work_extension_roots_tx(transaction: &Transaction<'_>) -> Result<(BTreeSet<String>, bool)> {
     let subjects = transaction
         .prepare("SELECT DISTINCT subject FROM claims WHERE kind='work.extended'")?
@@ -24043,6 +24114,18 @@ fn project_mission_run_created(
             format!("claim `{}` has an invalid mission run subject", claim.id),
         )
     })?;
+    // Creation claims fold in canonical order. A second admission of the same occurrence must
+    // not append steps from another child revision to the winning initial generation.
+    if transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mission_runs WHERE id=?1)",
+            [run_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(internal)?
+    {
+        return Ok(());
+    }
     let mission_subject = fields
         .get("mission")
         .and_then(Value::as_str)

@@ -84,6 +84,47 @@ const SEAT_RETENTION_CHECK_MS: u128 = 60_000;
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const DECLARED_CHECKOUT_LIMIT: usize = 4096;
 
+/// On a fleet member's cold start, occurrence history may still be elsewhere. Require a fresh
+/// complete exchange before admitting schedules, then hold while known history is missing.
+fn schedule_admission_ready(
+    store: &Store,
+    host: &str,
+    configured: &[String],
+    since: u128,
+) -> Result<bool> {
+    if store.replication_projection_deferred()
+        || store.replication_catching_up()
+        || store
+            .first_sync()?
+            .is_some_and(|sync| sync.state == "syncing")
+    {
+        return Ok(false);
+    }
+    let membership = store.fleet_membership()?;
+    let peers = configured
+        .iter()
+        .cloned()
+        .chain(
+            membership
+                .incarnations()
+                .filter(|member| member.end.is_none())
+                .map(|member| member.name.clone()),
+        )
+        .filter(|peer| peer != host && !matches!(membership.state(peer),
+            crate::fleet::MemberState::Ended(_) | crate::fleet::MemberState::LegacyRemoved(_)))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if peers.is_empty() {
+        return Ok(true);
+    }
+    let sync = store.replication_peer_sync(&peers);
+    Ok(!sync.values().any(|peer| peer.peer_only_envelopes > 0)
+        && sync
+            .values()
+            .any(|peer| peer.measured_at_unix_ms >= since && peer.peer_only_envelopes == 0))
+}
+
 #[cfg(test)]
 thread_local! {
     static DECLARATION_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -540,6 +581,8 @@ pub struct Reconciler<R = NativeRuntime> {
     notify: Arc<Notify>,
     event_notify: watch::Sender<u64>,
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
+    schedule_peers: Vec<String>,
+    started_at_unix_ms: u128,
     armed_observers: Arc<Mutex<std::collections::HashSet<String>>>,
     gate_poll_armed: Arc<AtomicBool>,
     /// The gate runners the gate poll watches.
@@ -679,6 +722,8 @@ impl Reconciler<NativeRuntime> {
             notify,
             event_notify,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            schedule_peers: Vec::new(),
+            started_at_unix_ms: now_ms(),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
             gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
@@ -740,6 +785,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             notify,
             event_notify: watch::channel(0_u64).0,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            schedule_peers: Vec::new(),
+            started_at_unix_ms: now_ms(),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
             gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
@@ -804,6 +851,12 @@ impl<R: RuntimeControl> Reconciler<R> {
     #[doc(hidden)]
     pub fn with_cleanup_deadline(mut self, deadline: Duration) -> Self {
         self.cleanup_deadline = deadline;
+        self
+    }
+
+    /// Legacy configured peers supplement the current claim-derived fleet membership.
+    pub fn with_schedule_peers(mut self, peers: Vec<String>) -> Self {
+        self.schedule_peers = peers;
         self
     }
 
@@ -9904,6 +9957,15 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    fn schedules_caught_up(&self) -> Result<bool> {
+        schedule_admission_ready(
+            &self.store,
+            &self.host,
+            &self.schedule_peers,
+            self.started_at_unix_ms,
+        )
+    }
+
     /// Record this schedule's next occurrence and arm its timer.
     fn reconcile_schedule(&self, schedule: &DesiredSubject) -> Result<()> {
         self.store
@@ -9918,6 +9980,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         if self.schedule_has_open_work(&schedule.subject)? {
             return Ok(());
         }
+        if !self.schedules_caught_up()? {
+            self.arm_restart("stage/schedule-sync", now_ms().saturating_add(DEADLINE_SOURCE_RETRY_MS));
+            return Ok(());
+        }
         let Some(revision) = self.store.selected_desired_revision(&schedule.subject)? else {
             return Ok(());
         };
@@ -9926,13 +9992,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             .claims_for(&schedule.subject, Some("schedule.occurrence-reached"))?;
         let last = reached
             .iter()
-            .filter(|claim| {
-                claim
-                    .body
-                    .pointer("/fields/revision")
-                    .and_then(Value::as_str)
-                    == Some(&revision)
-            })
             .filter_map(|claim| {
                 claim
                     .body
@@ -10059,6 +10118,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         let event_notify = self.event_notify.clone();
         let armed = self.armed_schedules.clone();
         let schedule_subject = schedule.subject.clone();
+        let schedule_peers = self.schedule_peers.clone();
+        let host = self.host.clone();
+        let started_at = self.started_at_unix_ms;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let delay = scheduled_at.saturating_sub(now_ms() as i64).max(0) as u64;
@@ -10086,6 +10148,28 @@ impl<R: RuntimeControl> Reconciler<R> {
                         expected_subject: None,
                         idempotency_key: Some(format!("clock-cancel:{operation}")),
                     });
+                    armed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&operation);
+                    signal_changed(&notify, &event_notify);
+                    return;
+                }
+                // A timer can outlive a replication catch-up or another armed wake. Check at
+                // admission as well as arming, including reached facts from older revisions.
+                let ready = schedule_admission_ready(&store, &host, &schedule_peers, started_at)
+                    .unwrap_or(false);
+                let already_reached = store
+                    .claims_for(&schedule_subject, Some("schedule.occurrence-reached"))
+                    .map(|claims| {
+                        claims.iter().any(|claim| {
+                            claim.body["fields"]["occurrence"]
+                                .as_u64()
+                                .is_some_and(|value| value >= occurrence)
+                        })
+                    })
+                    .unwrap_or(true);
+                if !ready || already_reached {
                     armed
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
@@ -10225,6 +10309,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             .into_iter()
             .filter(|request| request.origin == self.host)
             .collect::<Vec<_>>();
+        if requests.is_empty() {
+            return Ok(());
+        }
+        if !self.schedules_caught_up()? {
+            self.arm_restart("stage/schedule-sync", now_ms().saturating_add(DEADLINE_SOURCE_RETRY_MS));
+            return Ok(());
+        }
         // A stopped schedule's queued work is cancelled, so declaring the schedule again does not
         // start work that was requested before it stopped.
         if intake_is_stopped(schedule, &self.host) {
@@ -10238,10 +10329,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             return Ok(());
         }
-        if requests.is_empty()
-            || self
-                .store
-                .schedule_has_active_started_run(&schedule.subject)?
+        if self.store.schedule_has_active_started_run(&schedule.subject)?
         {
             return Ok(());
         }
@@ -10255,20 +10343,23 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let fields = request.body.get("fields").unwrap_or(&request.body);
             let field = |name: &str| fields.get(name).and_then(Value::as_str);
-            let (Some(mission), Some(revision), Some(root)) = (
+            let (Some(mission), Some(revision), Some(root), Some(occurrence)) = (
                 field("mission"),
                 field("mission_revision"),
                 field("workspace"),
+                fields.get("occurrence").and_then(Value::as_u64),
             ) else {
                 self.fail_schedule_work(
                     schedule,
                     &request.id,
                     "invalid-request",
-                    "the request names no mission, revision, or workspace",
+                    "the request names no mission, revision, workspace, or occurrence",
                 )?;
                 continue;
             };
-            let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
+            let occurrence_subject =
+                Store::scheduled_mission_run_subject(&schedule.subject, occurrence);
+            let suffix = &occurrence_subject.trim_start_matches("mission-run/")[..16];
             let workspace = Path::new(root).join(suffix);
             if let Err(error) = fs::create_dir_all(&workspace) {
                 self.record_once(
@@ -10301,23 +10392,37 @@ impl<R: RuntimeControl> Reconciler<R> {
                 inputs,
                 idempotency_key: format!("schedule-work:{}", request.id),
             };
-            let created = match &schedule.owner_run {
-                Some(owner) => match self.store.mission_run(owner)? {
-                    Some(parent) => self.store.create_child_mission_run(
+            // Preserve a run created by an older daemon just before it could acknowledge this
+            // request. New requests use the member-independent occurrence identity.
+            let legacy_subject = self
+                .store
+                .mission_run_subject_for_idempotency_key(&request_value.idempotency_key);
+            let created = if let Some(run) = self.store.mission_run(&legacy_subject)? {
+                Ok(run)
+            } else {
+                match &schedule.owner_run {
+                    Some(owner) => match self.store.mission_run(owner)? {
+                        Some(parent) => self.store.create_scheduled_mission_run(
+                            &request_value,
+                            Some(&parent),
+                            &schedule.subject,
+                            occurrence,
+                        ),
+                        None => {
+                            waiting.push(format!(
+                                "request {}: its owner run {owner} is not stored here yet",
+                                request.id
+                            ));
+                            continue;
+                        }
+                    },
+                    None => self.store.create_scheduled_mission_run(
                         &request_value,
-                        &parent,
-                        &schedule.subject,
                         None,
+                        &schedule.subject,
+                        occurrence,
                     ),
-                    None => {
-                        waiting.push(format!(
-                            "request {}: its owner run {owner} is not stored here yet",
-                            request.id
-                        ));
-                        continue;
-                    }
-                },
-                None => self.store.create_mission_run(&request_value),
+                }
             };
             let run = match created {
                 Ok(run) => run,
@@ -10339,9 +10444,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ("request".into(), Value::String(request.id.clone())),
                     ("mission_run".into(), Value::String(run.subject)),
                 ]),
-                evidence: vec![request.id],
+                evidence: vec![request.id.clone()],
                 expected_subject: None,
-                idempotency_key: Some(format!("schedule-work-started:{}", run.id)),
+                idempotency_key: Some(format!("schedule-work-started:{}", request.id)),
             })?;
             let attention = schedule_head_attention_subject(&schedule.subject);
             if self
@@ -20090,6 +20195,217 @@ mission "scheduled-cycle" state="ready" {
             .revision
     }
     #[test]
+    fn scheduled_work_requests_on_two_members_converge() {
+        let root = tempfile::tempdir().unwrap();
+        let ivory = Arc::new(Store::open_memory("ivory").unwrap());
+        let revision = scheduled_mission_revision(&ivory);
+        apply_source(
+            &ivory,
+            &format!(r#"version 2
+schedule "cycle" {{
+  every "7d"; anchor "2030-01-01T00:00:00Z"; catch-up "latest"
+  work {{ mission "scheduled-cycle@{revision}"; workspace "{}" }}
+}}"#, root.path().display()),
+            "cycle",
+        );
+        let jade = Arc::new(Store::open_memory("jade").unwrap());
+        jade.import_replication("ivory", &ivory.export_replication(0).unwrap())
+            .unwrap();
+        // Both members admit the same tick while apart. The later request selects a different
+        // child definition, so convergence must also avoid steps from the losing definition.
+        apply_source(
+            &jade,
+            r#"version 2
+mission "scheduled-cycle" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Complete another harvest."
+  step "other" { agentless }
+}"#,
+            "other-cycle",
+        );
+        let other = jade
+            .mission_spec("scheduled-cycle", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let mut runs = Vec::new();
+        for (store, revision, host) in [(&ivory, revision, "ivory"), (&jade, other, "jade")] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "schedule/cycle".into(),
+                    kind: "schedule.work-requested".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("revision".into(), Value::String(host.into())),
+                        ("occurrence".into(), Value::from(4)),
+                        (
+                            "mission".into(),
+                            Value::String("mission/scheduled-cycle".into()),
+                        ),
+                        ("mission_revision".into(), Value::String(revision)),
+                        (
+                            "workspace".into(),
+                            Value::String(root.path().to_string_lossy().into_owned()),
+                        ),
+                        ("inputs".into(), serde_json::json!({})),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let reconciler = Reconciler::new(
+                store.clone(),
+                Arc::new(FakeRuntime::default()),
+                host.into(),
+                Arc::new(Notify::new()),
+            );
+            reconciler.reconcile_once().unwrap();
+            let started = store
+                .claims_for("schedule/cycle", Some("schedule.work-started"))
+                .unwrap();
+            assert_eq!(started.len(), 1);
+            runs.push(
+                started[0].body["fields"]["mission_run"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            runs[0], runs[1],
+            "two members created different runs for one occurrence"
+        );
+        for (from, to, peer) in [(&jade, &ivory, "jade"), (&ivory, &jade, "ivory")] {
+            let exchange = from.export_replication_exchange("orchard-fleet", &to.replication_inventory().unwrap()).unwrap();
+            to.receive_replication_exchange(peer, "orchard-fleet", &exchange).unwrap();
+            let admission = to.validate_replication_backlog().unwrap();
+            assert_eq!((admission.invalid, admission.unknown), (0, 0));
+            to.project_replication_backlog().unwrap();
+        }
+        let expected = ivory.mission_run(&runs[0]).unwrap().unwrap();
+        assert_eq!(expected.steps.len(), 1);
+        for store in [&ivory, &jade] {
+            let before = store.mission_run(&runs[0]).unwrap().unwrap();
+            assert_eq!(before.initial_revision, expected.initial_revision);
+            assert_eq!(before.steps.len(), 1);
+            assert_eq!(before.steps[0].step, expected.steps[0].step);
+            let digest = store.replication_snapshot().unwrap().graph_digest.clone();
+            store.replay_replication_graph().unwrap();
+            assert_eq!(
+                store.replication_snapshot().unwrap().graph_digest,
+                digest,
+                "replay changed the graph"
+            );
+        }
+        assert_eq!(
+            ivory.replication_snapshot().unwrap().graph_digest,
+            jade.replication_snapshot().unwrap().graph_digest
+        );
+        // An older projector could mix steps from both creation claims. Upgrade repairs that
+        // tree once from its claims, preserving the same canonical result as a fresh replay.
+        let copy = root.path().join("upgrade.sqlite3");
+        ivory.copy_store_to(&copy).unwrap();
+        let connection = rusqlite::Connection::open(&copy).unwrap();
+        smallclaims::store::projection_digest::register(&connection).unwrap();
+        let columns = connection.prepare("PRAGMA table_info(step_runs)").unwrap()
+            .query_map([], |row| row.get::<_, String>(1)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let select = columns.iter().map(|column| match column.as_str() {
+            "subject" => "subject || '-ghost'".into(),
+            "step_path" => "'ghost'".into(),
+            _ => column.clone(),
+        }).collect::<Vec<_>>().join(",");
+        connection.execute(&format!("INSERT INTO step_runs ({}) SELECT {select} FROM step_runs LIMIT 1", columns.join(",")), []).unwrap();
+        connection.execute("DELETE FROM meta WHERE key='occurrence_creation_projection_rules'", []).unwrap();
+        connection.execute_batch("INSERT OR REPLACE INTO meta(key,value) VALUES
+            ('canonical_shared_projection_rules','2'), ('work_extended_projection_rules','1');").unwrap();
+        drop(connection);
+        let upgraded = Store::open(&copy, "ivory").unwrap();
+        assert_eq!(upgraded.mission_run(&runs[0]).unwrap().unwrap().steps.len(), 1);
+        assert_eq!(upgraded.replication_snapshot().unwrap().graph_digest, ivory.replication_snapshot().unwrap().graph_digest);
+    }
+
+    #[tokio::test]
+    async fn scheduled_occurrence_waits_for_history_on_a_new_member() {
+        let root = tempfile::tempdir().unwrap();
+        let ivory = Arc::new(Store::open_memory("ivory").unwrap());
+        let revision = scheduled_mission_revision(&ivory);
+        let anchor = (Utc::now() - chrono::Duration::seconds(10))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        apply_source(
+            &ivory,
+            &format!(
+                r#"version 2
+schedule "orchard" {{
+  host "jade"; every "7d"; anchor "{anchor}"; catch-up "latest"
+  work {{ mission "scheduled-cycle@{revision}"; workspace "{}" }}
+}}"#, root.path().display()
+            ),
+            "orchard",
+        );
+        let jade = Arc::new(Store::open_memory("jade").unwrap());
+        jade.import_replication("ivory", &ivory.export_replication(0).unwrap())
+            .unwrap();
+        ivory
+            .append_claim(&ClaimInput {
+                subject: "schedule/orchard".into(),
+                kind: "schedule.occurrence-reached".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("revision".into(), Value::String("old-revision".into())),
+                    ("occurrence".into(), Value::from(0)),
+                    (
+                        "scheduled_at_unix_ms".into(),
+                        Value::String((now_ms() - 10_000).to_string()),
+                    ),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            jade.clone(),
+            Arc::new(FakeRuntime::default()),
+            "jade".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_schedule_peers(vec!["ivory".into()]);
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            jade.claims_for("schedule/orchard", Some("schedule.occurrence-scheduled"))
+                .unwrap()
+                .is_empty(),
+            "cold member armed a tick before receiving its history"
+        );
+        let exchange = ivory
+            .export_replication_exchange("orchard-fleet", &jade.replication_inventory().unwrap())
+            .unwrap();
+        jade.receive_replication_exchange("ivory", "orchard-fleet", &exchange)
+            .unwrap();
+        jade.validate_replication_backlog().unwrap();
+        jade.project_replication_backlog().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let armed = jade
+            .claims_for("schedule/orchard", Some("schedule.occurrence-scheduled"))
+            .unwrap();
+        assert_eq!(
+            armed.len(),
+            1,
+            "caught-up member did not resume its schedule"
+        );
+        assert_eq!(armed[0].body["fields"]["occurrence"], 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            jade.claims_for("schedule/orchard", Some("schedule.occurrence-reached"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[test]
     fn daily_calendar_gap_fold_and_catch_up_keep_local_date_keys() {
         let berlin = CalendarSchedule {
             at_minute: 150,
@@ -20490,27 +20806,32 @@ mission "scheduled-cycle" state="draft" { goal "Not ready." }"#,
             Arc::new(Notify::new()),
         );
         let attention = schedule_head_attention_subject("schedule/unready");
+        let anchor = (Utc::now() + chrono::Duration::milliseconds(100))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        apply_source(
+            &store,
+            &format!(r#"version 2
+schedule "unready" {{
+  every "100ms"
+  anchor "{anchor}"
+  catch-up "latest"
+  work {{ mission "scheduled-cycle"; workspace "{}" }}
+}}"#, root.path().display()),
+            "unready-schedule",
+        );
         for occurrence in 0..4 {
             if occurrence == 3 {
                 scheduled_mission_revision(&store);
             }
-            let at = (Utc::now() + chrono::Duration::milliseconds(40))
-                .to_rfc3339_opts(SecondsFormat::Millis, true);
-            apply_source(
-                &store,
-                &format!(
-                    r#"version 2
-schedule "unready" {{
-  at "{at}"
-  work {{ mission "scheduled-cycle"; workspace "{}" }}
-}}"#,
-                    root.path().display()
-                ),
-                &format!("occurrence-{occurrence}"),
-            );
             reconciler.reconcile_once().unwrap();
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            reconciler.reconcile_once().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while store.claims_for("schedule/unready", Some("schedule.occurrence-reached")).unwrap().len() <= occurrence {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.unwrap();
+            if occurrence == 3 {
+                reconciler.reconcile_once().unwrap();
+            }
             assert_eq!(
                 store
                     .claims_for("schedule/unready", Some("operational.failure"))
