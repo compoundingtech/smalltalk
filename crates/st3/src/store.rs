@@ -10039,6 +10039,64 @@ impl Store {
         Ok(records.into_iter().collect())
     }
 
+    /// Search refreshes only a person's private message texts, using the same endpoint
+    /// indexes as the mailbox. Other fleet writes do not invalidate this source.
+    pub(crate) fn conversation_search_mail_stamp(&self, person: &str, through: u64) -> Result<String> {
+        let connection = self.readers.get();
+        let (count, newest): (u64, u64) = connection.query_row(
+            "WITH sent AS (
+                SELECT store_index FROM claims INDEXED BY claims_message_to_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1 AND store_index<=?2
+                UNION SELECT store_index FROM claims INDEXED BY claims_message_from_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.from')=?1 AND store_index<=?2
+            ) SELECT COUNT(*), COALESCE(MAX(store_index),0) FROM sent",
+            params![person,through],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(format!("{count}:{newest}"))
+    }
+
+    pub(crate) fn conversation_search_timeline_stamp(&self, agent: &str, incarnation: &str, through: u64) -> Result<String> {
+        let connection = self.readers.get();
+        let (local_count, local_newest): (u64,u64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(MAX(id),0) FROM local_observations
+             WHERE subject=?1 AND kind='harness.timeline'
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND after_store_index<=?3", params![agent,incarnation,through],
+            |row| Ok((row.get(0)?,row.get(1)?)))?;
+        let (legacy_count, legacy_newest): (u64,u64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(MAX(store_index),0) FROM claims
+             WHERE subject=?1 AND kind='harness.timeline'
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND store_index<=?3", params![agent,incarnation,through],
+            |row| Ok((row.get(0)?,row.get(1)?)))?;
+        Ok(format!("{local_count}:{local_newest}:{legacy_count}:{legacy_newest}"))
+    }
+
+    pub(crate) fn conversation_search_messages(&self, person: &str, through: u64) -> Result<Vec<MessageView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&canonical_sql(
+            "WITH candidates AS (
+                SELECT id FROM claims INDEXED BY claims_message_to_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1 AND store_index<=?2
+                UNION SELECT id FROM claims INDEXED BY claims_message_from_index
+                WHERE kind='message.sent' AND json_extract(body,'$.fields.from')=?1 AND store_index<=?2
+            ), ranked AS (
+                SELECT claims.id,claims.batch_id,claims.subject,claims.store_index,claims.accepted_at_unix_ms,
+                    MIN(claims.store_index) OVER (PARTITION BY claims.subject) AS created_index,
+                    ROW_NUMBER() OVER (PARTITION BY claims.subject ORDER BY CANONICAL_ASC(claims)) AS ordinal
+                FROM claims JOIN candidates ON candidates.id=claims.id
+            ) SELECT sent.subject,sent.created_index FROM ranked AS sent
+              WHERE ordinal=1 ORDER BY CANONICAL_DESC(sent) LIMIT 50001"))?;
+        let rows = statement.query_map(params![person,through], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (subject, index) = row?;
+            messages.push(self.message_view_cached(&connection, &subject, index)?);
+        }
+        Ok(messages)
+    }
+
     pub fn messages(
         &self,
         recipient: Option<&str>,
@@ -13203,6 +13261,73 @@ impl Store {
 
     pub(crate) fn check_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
         check_mailbox_fence(&self.readers.get(), fence)
+    }
+
+    /// What a mailbox stream's snapshot can depend on, read before the snapshot is taken. A change
+    /// after it to any of that brings a new snapshot; see [`Store::mailbox_changed_since`].
+    pub(crate) fn mailbox_watermark(
+        &self,
+        fence: &crate::mailbox::Fence,
+    ) -> Result<MailboxWatermark, St3Error> {
+        let index = self.index().map_err(internal)?;
+        let connection = self.readers.get();
+        let local = connection
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM local_observations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        Ok(MailboxWatermark {
+            index,
+            local,
+            owner: mailbox_owner_key(&connection, fence)?,
+        })
+    }
+
+    /// Whether anything a mailbox stream's snapshot reads changed after `mark`: a claim or local
+    /// observation of the seat (its declaration, runtime and harness), its channel ownership, a
+    /// message sent to it or newly declared, or a claim of a message in its last snapshot. Every
+    /// graph change wakes every stream, and each used to read the seat's whole mailbox again.
+    pub(crate) fn mailbox_changed_since(
+        &self,
+        fence: &crate::mailbox::Fence,
+        mark: &MailboxWatermark,
+        messages: &[String],
+    ) -> Result<bool, St3Error> {
+        let connection = self.readers.get();
+        let recipient = normalize_message_party(&fence.subject);
+        let bare_recipient = recipient
+            .strip_prefix("agent/")
+            .filter(|suffix| !suffix.contains('/'))
+            .unwrap_or(&recipient)
+            .to_owned();
+        let changed: i64 = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND store_index>?2)
+                     OR EXISTS(SELECT 1 FROM claims INDEXED BY claims_message_to_order_index
+                               WHERE kind='message.sent'
+                                 AND json_extract(body, '$.fields.to') IN (?3, ?4)
+                                 AND store_index>?2)
+                     OR EXISTS(SELECT 1 FROM claims
+                               WHERE subject IN (SELECT value FROM json_each(?5))
+                                 AND store_index>?2)
+                     OR EXISTS(SELECT 1 FROM claims
+                               WHERE kind='intent.desired' AND store_index>?2
+                                 AND subject GLOB 'message/*')
+                     OR EXISTS(SELECT 1 FROM local_observations WHERE subject=?1 AND id>?6)",
+                params![
+                    fence.subject,
+                    mark.index,
+                    recipient,
+                    bare_recipient,
+                    serde_json::to_string(messages).map_err(internal)?,
+                    mark.local,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        Ok(changed != 0 || mailbox_owner_key(&connection, fence)? != mark.owner)
     }
 
     pub fn current_harness(
@@ -17574,6 +17699,31 @@ fn mailbox_harness_ended(
         }
     }
     Ok(true)
+}
+
+/// See [`Store::mailbox_watermark`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MailboxWatermark {
+    index: u64,
+    local: i64,
+    owner: Option<(String, i64, bool)>,
+}
+
+/// The seat channel's current owner, and whether `fence`'s binding still exists.
+fn mailbox_owner_key(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+) -> Result<Option<(String, i64, bool)>, St3Error> {
+    connection
+        .query_row(
+            "SELECT owner.incarnation, owner.epoch,
+                    EXISTS(SELECT 1 FROM local_mailbox_bindings WHERE token=?3)
+             FROM local_mailbox_owners owner WHERE owner.subject=?1 AND owner.component=?2",
+            params![fence.subject, fence.component, fence.token],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(internal)
 }
 
 fn check_mailbox_fence(

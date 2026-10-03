@@ -2961,8 +2961,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &subject.subject,
                 "harness.diagnostic",
                 BTreeMap::from([
-                    ("severity".into(), Value::String("info".into())),
-                    ("status".into(), Value::String("info".into())),
+                    ("severity".into(), Value::String("warning".into())),
+                    ("status".into(), Value::String("waiting".into())),
                     ("code".into(), Value::String("stop-deferred".into())),
                     ("reason".into(), Value::String(reason)),
                 ]),
@@ -4562,7 +4562,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&subject);
-            crate::performance::record_wake("timer restart", None);
+            crate::performance::record_wake("timer restart", Some(restart_wake_kind(&subject)));
             notify.notify_one();
         });
     }
@@ -4942,36 +4942,29 @@ impl<R: RuntimeControl> Reconciler<R> {
                 });
                 let failed = run.phase != "final-cancelled"
                     && run.steps.iter().any(|step| {
-                        !step.step.is_empty()
+                        normal_paths.contains(step.step.as_str())
                             && matches!(step.status.as_str(), "failed" | "cancelled")
                     });
+                // A run's outcome follows its work. A finally step that fails after the work
+                // went well is a fault on the run, shown as one, and does not fail the run.
                 let terminal_status = if run.phase == "final-cancelled" {
                     "cancelled"
-                } else if final_failed || failed {
+                } else if failed {
                     "failed"
                 } else {
                     "completed"
                 };
-                let failure_reason = if final_failed {
-                    Some(format!(
-                        "finally steps failed: {}",
-                        flat.iter()
-                            .filter(|step| step.spec.finally)
-                            .filter_map(|step| views.get(step.spec.path.as_str()))
-                            .filter(|view| view.status == "failed")
-                            .map(|view| format!(
-                                "{}: {}",
-                                view.step,
-                                view.blocked_reason.as_deref().unwrap_or("the step failed")
-                            ))
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ))
-                } else if failed {
-                    Some("one or more mission steps failed".to_owned())
+                let failures = final_step_failures(&flat, &views);
+                // A cancelled run keeps the failure in its reason, since cancellation is already
+                // its outcome and says nothing about cleanup.
+                let failure_reason = if final_failed && terminal_status == "cancelled" {
+                    Some(format!("finally steps failed: {}", failures.join("; ")))
                 } else {
-                    None
+                    failed.then(|| "one or more mission steps failed".to_owned())
                 };
+                if final_failed && terminal_status != "cancelled" {
+                    changed |= self.record_final_step_faults(run, &failures)?;
+                }
                 changed |= self.store.set_mission_run_state(
                     &run.id,
                     "running",
@@ -8116,6 +8109,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let holds = match subject.kind.as_str() {
                 "stop" => {
                     matches!(status.as_deref(), Some("stopped" | "absent" | "exited"))
+                        || self.stop_is_settled(&subject)?
                 }
                 "message" => matches!(status.as_deref(), Some("delivered" | "read" | "closed")),
                 _ => match subject.member.as_ref() {
@@ -8134,6 +8128,38 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         Ok(true)
+    }
+
+    /// Whether a stop that has not yet reached a stopped runtime asks nothing more of its step.
+    /// A seat that was never observed is gone. A seat the stop already set going is stopping, and
+    /// the stop's own deadline kills it. A seat kept for unread mail or another run's work stops
+    /// once it is free, as it does for the run's cleanup. Holding the step for any of these ran
+    /// it into its execution timeout, which failed the run's final step and so the run.
+    fn stop_is_settled(&self, subject: &DesiredSubject) -> Result<bool> {
+        let Some(actual) = self.store.latest_actual_value(&subject.subject)? else {
+            return Ok(true);
+        };
+        let fields = actual.get("fields").unwrap_or(&actual);
+        let incarnation = fields.get("incarnation_id").and_then(Value::as_str);
+        if self
+            .store
+            .observations_for(&subject.subject, "runtime.action.requested")?
+            .iter()
+            .any(|claim| {
+                claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("terminate")
+                    && claim
+                        .body
+                        .pointer("/fields/incarnation_id")
+                        .and_then(Value::as_str)
+                        == incarnation.or(Some("unknown"))
+            })
+        {
+            return Ok(true);
+        }
+        let Some(run) = subject.owner_run.as_deref() else {
+            return Ok(false);
+        };
+        Ok(self.seat_retention(&subject.subject, run)?.is_some())
     }
 
     /// Return the first produced native driver that cannot still satisfy this step.
@@ -8769,6 +8795,30 @@ impl<R: RuntimeControl> Reconciler<R> {
                 targets: vec![view.subject.clone()],
                 actor: RECONCILER_ACTOR.into(),
                 idempotency_key: key,
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Raise one fault on `run` for its failed finally steps. It names each step and why it failed.
+    fn record_final_step_faults(&self, run: &MissionRunView, failures: &[String]) -> Result<bool> {
+        if failures.is_empty() {
+            return Ok(false);
+        }
+        self.store.record_operational_failure(
+            &format!("final-steps:{}", run.generation),
+            &AttentionRequest {
+                reviewer: "person/operator".into(),
+                title: "A run's cleanup failed".into(),
+                reason: format!(
+                    "`{}` finished its work, so its outcome is not changed. Its finally steps failed: {}.",
+                    run.subject,
+                    failures.join("; ")
+                ),
+                severity: "warning".into(),
+                targets: vec![run.subject.clone()],
+                actor: RECONCILER_ACTOR.into(),
+                idempotency_key: format!("final-steps:{}", run.generation),
             },
         )?;
         Ok(true)
@@ -11172,6 +11222,25 @@ struct RuntimeStep<'a> {
     parent: Option<String>,
 }
 
+/// Each failed finally step of a run with the reason it failed.
+fn final_step_failures(
+    flat: &[RuntimeStep<'_>],
+    views: &HashMap<&str, &crate::model::StepRunView>,
+) -> Vec<String> {
+    flat.iter()
+        .filter(|step| step.spec.finally)
+        .filter_map(|step| views.get(step.spec.path.as_str()))
+        .filter(|view| view.status == "failed")
+        .map(|view| {
+            format!(
+                "{}: {}",
+                view.step,
+                view.blocked_reason.as_deref().unwrap_or("the step failed")
+            )
+        })
+        .collect()
+}
+
 fn flatten_mission_steps(mission: &MissionSpec) -> Vec<RuntimeStep<'_>> {
     fn append<'a>(
         mission: &'a MissionSpec,
@@ -11824,6 +11893,17 @@ fn work_wake_deadline(
 /// began, and that pass changed nothing, cannot be acted on yet, so the loop backs off instead of
 /// spinning. A deadline that fell due during or after that pass has not been evaluated, so it
 /// runs at once: a mission timeout must not wait out the back-off.
+/// What a delayed restart key is for, without the subject it names, so the performance report's
+/// wake table stays small: `stop`, `checkout`, `stage/faults`, or `member` for a member's own
+/// restart backoff.
+fn restart_wake_kind(key: &str) -> &str {
+    match key.split_once(':') {
+        Some((kind, _)) => kind,
+        None if key.starts_with("stage/") || !key.contains('/') => key,
+        None => "member",
+    }
+}
+
 fn deadline_sleep_ms(deadline: u128, now: u128, quiet_pass_started: Option<u128>) -> u64 {
     if quiet_pass_started.is_some_and(|started| deadline <= started) {
         WORK_WAKE_RETRY_MS as u64
@@ -12486,6 +12566,18 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn restart_wakes_are_named_by_what_they_are_for() {
+        assert_eq!(restart_wake_kind("stop:agent/example/seat"), "stop");
+        assert_eq!(
+            restart_wake_kind("readiness:agent/example/seat:1:2"),
+            "readiness"
+        );
+        assert_eq!(restart_wake_kind("stage/faults"), "stage/faults");
+        assert_eq!(restart_wake_kind("runtime-snapshot"), "runtime-snapshot");
+        assert_eq!(restart_wake_kind("agent/example/seat"), "member");
     }
 
     #[tokio::test(start_paused = true)]
@@ -21773,6 +21865,209 @@ version 2
         reconciler.seat_retention.lock().unwrap().clear();
         reconciler.reconcile_once().unwrap();
         assert_eq!(runtime.stops.lock().unwrap().as_slice(), &[runtime_id]);
+    }
+
+    /// A run whose final step stops a seat that holds an unread message, with the seat live.
+    fn run_with_a_final_stop_of_a_held_seat() -> (Arc<Store>, Reconciler<FakeRuntime>, String) {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+
+mission "held-stop" state="ready" {
+  goal "Stop a seat that is still wanted."
+  completion { when "all-steps-exhausted" }
+  agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+  step "work" { agentless }
+  finally { step "stop-worker" timeout="10m" { agentless; stop "agent/${ST_MISSION_RUN}/worker" } }
+}
+"#,
+            "publish-held-stop",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "held-stop".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-held-stop".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let seat = format!("agent/{}/worker", run.id);
+        let member = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.subject == seat)
+            .and_then(|desired| desired.member)
+            .unwrap();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: member.runtime_id,
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("held-incarnation".into()),
+        });
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/held".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/test".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), Value::String("person/test".into())),
+                    ("to".into(), Value::String(seat)),
+                    ("content".into(), Value::String("read me".into())),
+                    ("status".into(), Value::String("sent".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("held-message".into()),
+            })
+            .unwrap();
+        (store, reconciler, run.id)
+    }
+
+    #[test]
+    fn a_final_stop_of_a_held_seat_completes_and_the_run_completes() {
+        let (store, reconciler, run_id) = run_with_a_final_stop_of_a_held_seat();
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let run = store.mission_run(&run_id).unwrap().unwrap();
+        let stop = run
+            .steps
+            .iter()
+            .find(|step| step.step == "stop-worker")
+            .unwrap();
+        assert_eq!(stop.status, "completed", "{:?}", stop.blocked_reason);
+        assert_eq!(run.status, "completed");
+        assert!(
+            !store
+                .claims_for(&format!("agent/{run_id}/worker"), Some("runtime.reconcile-decision"))
+                .unwrap()
+                .iter()
+                .any(|claim| claim.body.to_string().contains("invalid-claim-field")),
+            "the deferral diagnostic is a valid claim"
+        );
+    }
+
+    #[test]
+    fn a_final_stop_of_a_seat_already_stopping_completes_at_once() {
+        let (store, reconciler, run_id) = run_with_a_final_stop_of_a_held_seat();
+        let seat = format!("agent/{run_id}/worker");
+        // The message is read, so only the stop itself is in progress.
+        for (kind, status) in [
+            ("message.staged", "staged"),
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/held".into(),
+                    kind: kind.into(),
+                    actor: Some(seat.clone()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("held-{status}")),
+                })
+                .unwrap();
+        }
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let run = store.mission_run(&run_id).unwrap().unwrap();
+        assert_eq!(
+            run.steps
+                .iter()
+                .find(|step| step.step == "stop-worker")
+                .unwrap()
+                .status,
+            "completed"
+        );
+        // Cleanup still waits for the seat the stop is bringing down.
+        assert_eq!(run.status, "running");
+    }
+
+    #[test]
+    fn a_failed_final_step_after_completed_work_is_a_fault_not_the_outcome() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+
+resource "never" { kind "custom.test.never-ready" }
+mission "cleanup-fails" state="ready" {
+  goal "Finish the work, then fail the cleanup."
+  completion { when "all-steps-exhausted" }
+  step "work" { agentless }
+  finally {
+    step "tidy" timeout="1ms" {
+      agentless
+      gate "the absent resource becomes ready" { field "state" "resource/never" is "ready" }
+    }
+  }
+}
+"#,
+            "publish-cleanup-fails",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "cleanup-fails".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-cleanup-fails".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let finished = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            finished
+                .steps
+                .iter()
+                .find(|step| step.step == "tidy")
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            (finished.status.as_str(), finished.phase.as_str()),
+            ("completed", "terminal")
+        );
+        let faults = store
+            .claims_for(&run.subject, Some("operational.failure"))
+            .unwrap();
+        assert_eq!(faults.len(), 1);
+        assert!(
+            faults[0].body["fields"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("tidy: the active execution timeout expired")
+        );
     }
 
     #[test]

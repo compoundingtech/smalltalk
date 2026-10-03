@@ -18,7 +18,7 @@ use sha2::{Digest as _, Sha256};
 use walkdir::WalkDir;
 
 const MAX_DISCOVERED_FILES: usize = 10_000;
-const MAX_EXPOSED_HISTORY: usize = 2_000;
+pub(crate) const MAX_EXPOSED_HISTORY: usize = 2_000;
 const MAX_METADATA_LINES: usize = 64;
 const MAX_TIMELINE_LINES: usize = 4_096;
 const MAX_TIMELINE_BYTES: u64 = 32 * 1024 * 1024;
