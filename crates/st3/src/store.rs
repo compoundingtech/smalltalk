@@ -1030,6 +1030,7 @@ pub struct EndedDeclaration {
 /// whether it includes history, and the status.
 type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MissionGateRunner {
     pub subject: String,
     pub host: String,
@@ -10130,7 +10131,18 @@ impl Store {
             ))
         })? {
             let (subject, host, owner) = row?;
+            // A runner leaves this list once its stop is observed on it.
+            smallclaims::touched::note_read(|| subject.clone());
             requests.entry(owner).or_default().push((subject, host));
+        }
+        // New requests, and owners that finish or move on.
+        for kind in [
+            "gate.requested",
+            "step-run.state",
+            "mission-run.state",
+            "run-generation.state",
+        ] {
+            smallclaims::touched::note_read(|| format!("kind:{kind}"));
         }
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -11219,6 +11231,10 @@ impl Store {
         let subjects = statement
             .query_map([actor, origin], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        smallclaims::touched::note_read(|| "kind:attention.requested".to_owned());
+        for subject in &subjects {
+            smallclaims::touched::note_read(|| subject.clone());
+        }
         subjects
             .iter()
             .filter_map(|subject| attention_request_view_tx(&connection, subject).transpose())
@@ -12570,6 +12586,7 @@ impl Store {
     }
 
     pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         // Every pass asks this for every subscription. The finished requests are listed once, not
         // scanned for each request: a correlated NOT EXISTS read every finished claim once per

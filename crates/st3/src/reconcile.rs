@@ -567,6 +567,8 @@ pub struct Reconciler<R = NativeRuntime> {
     /// Each seat's last retention reading: when it was taken and why the seat stays.
     /// When each seat's retention was last checked, why it is held, and what the check read.
     seat_retention: Mutex<HashMap<String, (u128, Option<String>, BTreeSet<String>)>>,
+    /// The gate runners the last read found, kept until a change they depend on.
+    gate_runners: Mutex<Option<Vec<crate::store::MissionGateRunner>>>,
     fault_injection: Option<Arc<dyn FaultInjection>>,
     /// Reads free space for the disk stage. Without one the stage does nothing.
     disk_probe: Option<DiskProbe>,
@@ -677,6 +679,7 @@ impl Reconciler<NativeRuntime> {
             raised_broken_gates: Mutex::new(BTreeSet::new()),
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
+            gate_runners: Mutex::new(None),
             fault_injection: None,
             disk_probe: Some(Arc::new(crate::disk::disk_space)),
             disk_paths: vec![state_dir.to_path_buf()],
@@ -733,6 +736,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             raised_broken_gates: Mutex::new(BTreeSet::new()),
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
+            gate_runners: Mutex::new(None),
             fault_injection: None,
             disk_probe: None,
             disk_paths: Vec::new(),
@@ -1395,7 +1399,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.incremental.observe(&self.store)?;
         drop(observe_span);
         let _runners_span = crate::profile::span("pass/gate-runners");
-        for runner in self.store.mission_gate_runners()? {
+        for runner in self.gate_runners()? {
             if runner.retired && runner.host == self.host {
                 let _ = self.isolate("gate", &runner.subject, || {
                     let runtime_id = runner.subject.replace('/', ".");
@@ -1921,7 +1925,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         for (agent, incarnation, member) in work_message_agents {
             let item = format!("wake:{agent}@{incarnation}");
             wakes.insert(item.clone());
-            let result = self.reconcile_wake_item(&item, skip_wakes, || {
+            let result = self.reconcile_item("wake", &item, skip_wakes, || {
                 self.reconcile_work_messages(&agent, &incarnation, Some(&member))
             });
             let result = match deferred_member_faults.remove(&agent) {
@@ -2758,10 +2762,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(false)
     }
 
-    /// Deliver one running agent's work wakes, or skip them when `skip` and nothing they read
-    /// changed and no retry is due. A write by an unmarked agent is counted as a correction.
-    fn reconcile_wake_item(
+    /// Evaluate one item of `section` (a running agent's work wakes, a subscription), or skip
+    /// it when `skip` and nothing it read changed and nothing is due. A write by an item that was
+    /// not marked is counted as an incremental correction.
+    fn reconcile_item(
         &self,
+        section: &'static str,
         item: &str,
         skip: bool,
         work: impl FnOnce() -> Result<()>,
@@ -2776,7 +2782,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let ((result, due), reads) =
             smallclaims::touched::record(|| smallclaims::touched::record_due(|| caught(work)));
         crate::performance::record_evaluation(
-            "wake",
+            section,
             needed,
             crate::incremental::thread_cpu().saturating_sub(cpu_started),
         );
@@ -2792,7 +2798,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })
                 .unwrap_or_default();
             if !wrote.is_empty() {
-                self.incremental_correction("wake", item, &reads, &wrote);
+                self.incremental_correction(section, item, &reads, &wrote);
             }
         }
         // A failed delivery is tried again on the next pass, as before.
@@ -3106,6 +3112,34 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Reconcile a stop. `actual_origin` is the subject's selected actual origin when the caller
     /// already read it in this pass.
+    /// Gate runners, read again only when a request, a runner's stop, or an owner's state
+    /// changed, and on each full pass. A full pass that finds the kept list stale although
+    /// nothing marked it counts an incremental correction.
+    fn gate_runners(&self) -> Result<Vec<crate::store::MissionGateRunner>> {
+        const ITEM: &str = "gate-runners";
+        let now = now_ms();
+        let full = !self.skip_unneeded || self.incremental.take_full_pass(ITEM, now);
+        let needed = self.incremental.needs(ITEM, now);
+        let mut kept = self
+            .gate_runners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !full
+            && !needed
+            && let Some(kept) = kept.as_ref()
+        {
+            return Ok(kept.clone());
+        }
+        let (fresh, reads) = smallclaims::touched::record(|| self.store.mission_gate_runners());
+        let fresh = fresh?;
+        if !needed && kept.as_ref().is_some_and(|kept| *kept != fresh) {
+            self.incremental_correction(ITEM, ITEM, &reads, &["a changed runner list".into()]);
+        }
+        self.incremental.evaluated(ITEM, reads, None);
+        *kept = Some(fresh.clone());
+        Ok(fresh)
+    }
+
     /// Evaluate one stop this host owns, or skip it when `skip` and nothing it read changed and
     /// its time has not come. As with mission runs, an evaluation that writes a claim although its
     /// stop was not marked is counted as an incremental correction.
@@ -9819,16 +9853,34 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_subscription_missions(&self, desired: &[DesiredSubject]) -> Result<()> {
+        // Read once for every subscription: it lists the whole host's open attention requests.
+        let held = self
+            .store
+            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .into_iter()
+            .filter(|request| request.title == "A subscription is holding mission requests")
+            .collect::<Vec<_>>();
+        let skip = self.skip_unneeded && !self.incremental.take_full_pass("subscription", now_ms());
+        let mut items = BTreeSet::new();
         for item in desired.iter().filter(|item| item.kind == "subscription") {
+            let key = format!("subscription:{}", item.subject);
+            items.insert(key.clone());
             self.isolate("subscription", &item.subject, || {
-                self.reconcile_subscription_mission(item)
+                self.reconcile_item("subscription", &key, skip, || {
+                    self.reconcile_subscription_mission(item, &held)
+                })
             });
         }
+        self.incremental.retain("subscription:", &items);
         Ok(())
     }
 
     /// Start the missions that this subscription's deliveries requested.
-    fn reconcile_subscription_mission(&self, item: &DesiredSubject) -> Result<()> {
+    fn reconcile_subscription_mission(
+        &self,
+        item: &DesiredSubject,
+        held: &[crate::model::AttentionRequestView],
+    ) -> Result<()> {
         let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
             return Ok(());
         };
@@ -9841,7 +9893,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
-        self.retire_legacy_held_subscription_attention(&item.subject)?;
+        self.retire_legacy_held_subscription_attention(&item.subject, held)?;
         if spec.stopped {
             self.cancel_unstarted_subscription_requests(&item.subject)?;
             return Ok(());
@@ -10113,6 +10165,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .saturating_add(u128::from(every_ms))
         });
         if due > now_ms() {
+            smallclaims::touched::note_due(due);
             deadlines.insert(item.subject.clone(), due);
             return Ok(());
         }
@@ -10262,14 +10315,15 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     /// Retire stored attention from the old burst cap. Queued requests now start automatically.
-    fn retire_legacy_held_subscription_attention(&self, subscription: &str) -> Result<()> {
-        for request in self
-            .store
-            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
-        {
-            if request.targets == [subscription]
-                && request.title == "A subscription is holding mission requests"
-            {
+    fn retire_legacy_held_subscription_attention(
+        &self,
+        subscription: &str,
+        held: &[crate::model::AttentionRequestView],
+    ) -> Result<()> {
+        smallclaims::touched::note_read(|| "kind:attention.requested".to_owned());
+        for request in held {
+            smallclaims::touched::note_read(|| request.subject.clone());
+            if request.targets == [subscription] {
                 self.store.resolve_attention_automatically(
                     &request.subject,
                     "subscription requests now wait in an automatic queue",
