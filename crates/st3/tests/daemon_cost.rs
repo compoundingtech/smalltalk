@@ -640,6 +640,10 @@ const PROBES: &[Probe] = &[
     ),
     get("GET /v1/status", "/v1/status?subject={seat}"),
     get("GET /v1/desired/{*subject}", "/v1/desired/{seat}"),
+    get(
+        "GET /v1/resource-references/{*subject}",
+        "/v1/resource-references/resource/bench/cost",
+    ),
     get("GET /v1/events", "/v1/events?limit=100"),
     // The route streams JSON Lines rather than the JSON document the HTTP probe expects.
     // Measure the same paged exporter directly, normalizing work by archive bytes.
