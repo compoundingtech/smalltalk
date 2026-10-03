@@ -2,7 +2,9 @@
 //! reads. stui writes it to `fixtures/clients/conversation-style.json` and the phone draws
 //! from that file, so both apps draw a conversation the same way.
 
+#[cfg(feature = "ratatui")]
 use crate::theme::Theme;
+#[cfg(feature = "ratatui")]
 use ratatui::style::Color;
 use serde::Serialize;
 
@@ -25,6 +27,7 @@ pub enum Token {
     ToolBg,
 }
 
+#[cfg(feature = "ratatui")]
 impl Token {
     pub fn color(self, theme: &Theme) -> Color {
         match self {
