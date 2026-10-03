@@ -3,7 +3,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type AgentCreateParameters, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { personAnswer, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
 import { createDeviceKey, removeDeviceKey, signWithDeviceKey } from './modules/st-device-key';
@@ -346,12 +346,12 @@ function useAppStore() {
       return created;
     },
     /** A new agent with its first message; its id, or null with the reason shown. */
-    async createAgent(parameters: { name: string; harness: string; model?: string; effort?: string; host?: string; message?: string }): Promise<string | null> {
+    async createAgent(parameters: AgentCreateParameters): Promise<string | null> {
       if (!client) return null;
       let created: string | null = null;
       const done = await runAction(async () => {
         const id = actionId();
-        const result = await client.agentCreate({ id, idempotency_key: id, fence: await fence(), parameters: parameters as never });
+        const result = await client.agentCreate({ id, idempotency_key: id, fence: await fence(), parameters });
         created = result.value.affected_ids?.find(affected => affected.startsWith('agent/')) ?? null;
       });
       return done ? created : null;

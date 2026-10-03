@@ -4632,6 +4632,61 @@ mod tests {
     }
 
     #[test]
+    fn new_agent_worktree_fields_follow_focus_and_send_the_selected_checkout() {
+        let mut ui = glass();
+        ui.live = true;
+        ui.open_new_agent(None);
+        ui.new_agent.as_mut().unwrap().name = "willow.keen-otter".into();
+        let host = ui.agent_repository_host().unwrap();
+        ui.agent_repositories = Some((
+            host,
+            super::super::view::Load::Ready(vec![
+                "/srv/example/atlas".into(),
+                "/srv/example/site".into(),
+            ]),
+        ));
+        screen(&ui);
+        for _ in 0..6 {
+            press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        }
+        let shown = screen(&ui);
+        assert!(
+            shown.contains("REPOSITORY") && shown.contains("/srv/example/atlas"),
+            "{shown}"
+        );
+        ctrl(&mut ui, 'n');
+        assert_eq!(
+            ui.new_agent.as_ref().unwrap().repository,
+            "/srv/example/atlas"
+        );
+        ui.click(Hit::Repository("/srv/example/site".into()));
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(screen(&ui).contains("keen-otter"));
+        ui.paste("fix/login".into());
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        ui.paste("origin/develop".into());
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        ui.paste("/srv/example/login".into());
+        let shown = screen(&ui);
+        assert!(
+            shown.contains("WORKSPACE") && shown.contains("/srv/example/login"),
+            "{shown}"
+        );
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(&ui.effects[0], Effect::CreateAgent { repo: Some(repo), branch: Some(branch), base: Some(base), workspace: Some(workspace), .. } if repo == "/srv/example/site" && branch == "fix/login" && base == "origin/develop" && workspace == "/srv/example/login")
+        );
+        // Changing hosts clears paths and cannot cycle suggestions from the old host.
+        ui.new_agent.as_mut().unwrap().focus = 5;
+        press(&mut ui, KeyCode::Right, KeyModifiers::NONE);
+        assert!(ui.new_agent.as_ref().unwrap().repository.is_empty());
+        assert!(ui.new_agent.as_ref().unwrap().workspace.is_empty());
+        ui.new_agent.as_mut().unwrap().focus = 6;
+        ctrl(&mut ui, 'n');
+        assert!(ui.new_agent.as_ref().unwrap().repository.is_empty());
+    }
+
+    #[test]
     fn a_new_agent_starts_from_a_form_in_its_own_tab() {
         let mut ui = glass();
         ui.live = true;
@@ -4672,6 +4727,10 @@ mod tests {
                 model: Some("gpt-6-sol".into()),
                 effort: None,
                 host: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workspace: None,
                 message: Some("fix the login test, then open a PR".into()),
             }],
             "a name keeps to letters, digits, dots and dashes"

@@ -1053,3 +1053,5 @@ Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and S
 Messages tagged `dictated` carry a delivery-only line explaining that voice transcription may
 contain mistakes. The stored text and body digest stay unchanged. Timeline message bodies carry
 the message's optional `tags` array so clients can mark dictation without inspecting its text.
+
+Agent projections include optional `workspace` and `checkout {repository, base, branch}` from the declaration, so clients can label a new seat before it launches. These describe the requested checkout; `state` and `fault` report whether launch succeeded. Older daemons omit the metadata. Both new-agent forms consume `host.repositories`, permit an absolute path typed on the selected host, keep the base editable, and leave an empty repository as a plain workspace. Their wire parameters and worktree label share `fixtures/clients/agent-launch.json`.

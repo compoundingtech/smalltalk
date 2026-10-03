@@ -573,6 +573,7 @@ fn validate_surfaces(
         "DocumentContent",
         "AgentDeclaration",
         "AgentRepository",
+        "AgentCheckout",
         "HostRepositories",
         "CanonicalNode",
         "SubjectDefinition",

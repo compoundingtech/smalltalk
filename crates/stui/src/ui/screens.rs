@@ -2950,6 +2950,11 @@ pub fn models(harness: &str) -> &'static [&'static str] {
 pub struct AgentForm {
     pub task: String,
     pub name: String,
+    pub repository: String,
+    /// Empty follows the safe simple name as it changes.
+    pub branch: String,
+    pub base: String,
+    pub workspace: String,
     pub harness: usize,
     pub model: usize,
     pub effort: usize,
@@ -2959,7 +2964,27 @@ pub struct AgentForm {
 }
 
 impl AgentForm {
-    pub const FIELDS: usize = 6;
+    pub const FIELDS: usize = 10;
+
+    pub fn branch(&self) -> String {
+        if self.branch.trim().is_empty() {
+            st3_client::agent_branch(self.name.trim())
+        } else {
+            self.branch.trim().to_owned()
+        }
+    }
+
+    pub fn base(&self) -> &str {
+        if self.base.trim().is_empty() {
+            "origin/main"
+        } else {
+            self.base.trim()
+        }
+    }
+
+    pub fn choice(&self) -> bool {
+        (2..=5).contains(&self.focus)
+    }
 
     pub fn new(task: String) -> Self {
         Self {
@@ -3001,7 +3026,11 @@ impl AgentForm {
                 step(&mut self.model, count)
             }
             4 => step(&mut self.effort, EFFORTS.len()),
-            5 => step(&mut self.host, hosts + 1),
+            5 => {
+                step(&mut self.host, hosts + 1);
+                self.repository.clear();
+                self.workspace.clear();
+            }
             _ => {}
         }
     }
@@ -3030,7 +3059,8 @@ pub fn random_name() -> String {
 pub fn new_agent_form(
     form: &AgentForm,
     hosts: &[String],
-    cursors: [usize; 2],
+    cursors: [usize; 6],
+    repositories: &Load<Vec<String>>,
     width: usize,
 ) -> Doc {
     let mut inner = Doc::new();
@@ -3058,6 +3088,13 @@ pub fn new_agent_form(
             w,
         );
         for line in start..inner.lines.len() {
+            if inner
+                .targets
+                .iter()
+                .any(|target| target.line == line && matches!(target.hit, Hit::Repository(_)))
+            {
+                continue;
+            }
             inner.targets.push(super::doc::Target {
                 line,
                 column: 0,
@@ -3135,6 +3172,73 @@ pub fn new_agent_form(
                 theme::dim(),
             ),
         ]));
+        field(&mut inner, index, label, body);
+    }
+    inner.blank();
+    inner.wrap(&[run("Choose a repository for a worktree, or leave it empty for a plain workspace. Paths belong to the selected host.", theme::soft())], w);
+    for (cursor_index, index, label, value, hint) in [
+        (
+            2,
+            6,
+            "repository",
+            form.repository.as_str(),
+            "empty: plain workspace".to_owned(),
+        ),
+        (3, 7, "branch", form.branch.as_str(), form.branch()),
+        (4, 8, "base", form.base.as_str(), form.base().to_owned()),
+        (
+            5,
+            9,
+            "workspace",
+            form.workspace.as_str(),
+            "empty: st chooses a new directory".to_owned(),
+        ),
+    ] {
+        let mut body = Doc::new();
+        let focused = form.focus == index;
+        if value.is_empty() {
+            body.line(Line::from(span(hint, theme::dim())));
+        }
+        for runs in super::edit::lines(
+            value,
+            focused.then_some(cursors[cursor_index]),
+            theme::text(),
+        ) {
+            body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
+        }
+        if index == 6 {
+            match repositories {
+                Load::Loading => body.line(Line::from(span(
+                    "Loading this host’s repositories…",
+                    theme::dim(),
+                ))),
+                Load::Failed(why) => body.line(Line::from(span(
+                    format!("Suggestions unavailable: {why}"),
+                    theme::dim(),
+                ))),
+                Load::Ready(paths) => {
+                    body.line(Line::from(span(
+                        "ctrl+p / ctrl+n choose a repository; or type a path",
+                        theme::dim(),
+                    )));
+                    for path in paths
+                        .iter()
+                        .filter(|path| {
+                            form.repository.is_empty() || path.contains(&form.repository)
+                        })
+                        .take(5)
+                    {
+                        body.targets.push(super::doc::Target {
+                            line: body.lines.len(),
+                            column: 0,
+                            width: w.saturating_sub(4) as u16,
+                            hit: Hit::Repository(path.clone()),
+                        });
+                        body.line(Line::from(span(path.clone(), theme::soft())));
+                    }
+                }
+            }
+        }
         field(&mut inner, index, label, body);
     }
     inner.blank();

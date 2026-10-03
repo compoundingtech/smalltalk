@@ -1,32 +1,7 @@
 //! Declaration builders shared by client actions and CLI creation.
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 
-/// The simple seat name, restricted to characters that always form a Git branch component.
-pub fn agent_branch(name: &str) -> String {
-    let identity = name.trim_start_matches("agent/");
-    let name = identity.rsplit('/').next().unwrap_or(identity);
-    let name = if identity.contains('/') {
-        name
-    } else {
-        name.split_once('.').map_or(name, |(_, simple)| simple)
-    };
-    let branch: String = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let branch = branch.trim_matches('-');
-    if branch.is_empty() {
-        "agent".into()
-    } else {
-        branch.into()
-    }
-}
+pub use st3_client::agent_branch;
 
 pub fn validate_agent_checkout(args: &st3_client::AgentCreateParameters) -> anyhow::Result<()> {
     anyhow::ensure!(

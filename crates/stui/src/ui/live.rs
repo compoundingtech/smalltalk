@@ -152,6 +152,7 @@ enum Fetched {
     Sessions(Collection),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
+    Repositories(String, Load<Vec<String>>),
     /// Token spend over a period of this many hours, or why st could not say.
     Usage(u64, Result<st3_client::UsagePeriod, String>),
     /// st's conversation search for the palette's query, or why st could not say.
@@ -309,6 +310,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
+    let mut repositories_asked: Option<String> = None;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     let mut usage_reading = false;
@@ -530,6 +532,12 @@ pub fn run(context: Context) -> Result<()> {
                     model.sessions = native;
                 }
                 Fetched::Machines(machines) => model.machines = machines,
+                Fetched::Repositories(host, load) => {
+                    if ui.agent_repository_host().as_ref() == Some(&host) {
+                        ui.agent_repositories = Some((host, load));
+                    }
+                    changed = true;
+                }
                 Fetched::Older {
                     target,
                     session_id,
@@ -680,6 +688,33 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
+        }
+        if !extras.live {
+            repositories_asked = None;
+        }
+        match ui.agent_repository_host() {
+            Some(host) if extras.live && repositories_asked.as_ref() != Some(&host) => {
+                repositories_asked = Some(host.clone());
+                ui.agent_repositories = Some((host.clone(), Load::Loading));
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                runtime.spawn(async move {
+                    let load = match client.host_repositories(&host).await {
+                        Ok(reply) => Load::Ready(
+                            reply
+                                .value
+                                .repositories
+                                .into_iter()
+                                .map(|repo| repo.path)
+                                .collect(),
+                        ),
+                        Err(error) => Load::Failed(error.plain()),
+                    };
+                    let _ = tx.send(Fetched::Repositories(host, load));
+                });
+            }
+            None => repositories_asked = None,
+            _ => {}
         }
         // Ctrl+K asks st's conversation search once what is typed has been still for a moment;
         // an answer to an earlier query is dropped where it lands (Ui::said_choices).
@@ -1571,6 +1606,10 @@ async fn perform(
             effort,
             host,
             message,
+            repo,
+            branch,
+            base,
+            workspace,
         } => {
             let snapshot = client.capabilities().await?.snapshot.id;
             let (id, idem) = crate::action_pair();
@@ -1588,7 +1627,10 @@ async fn perform(
                         host,
                         model,
                         effort,
-                        workspace: None,
+                        workspace,
+                        repo,
+                        branch,
+                        base,
                         description: None,
                         message,
                         ..Default::default()
@@ -2060,6 +2102,10 @@ mod tests {
                 model: None,
                 effort: None,
                 host: None,
+                repo: Some("/srv/example/repo".into()),
+                branch: Some("copper".into()),
+                base: Some("origin/main".into()),
+                workspace: Some("/srv/example/copper".into()),
                 message: None,
             },
             Effect::CreateTerminal {
@@ -2087,6 +2133,21 @@ mod tests {
                 .iter()
                 .any(|item| item.subject == "agent/example/copper")
         );
+        let agent = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.subject == "agent/example/copper")
+            .unwrap();
+        let checkout = agent.desired["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == "checkout")
+            .unwrap();
+        assert_eq!(checkout["arguments"][0], "/srv/example/repo");
+        assert_eq!(checkout["properties"]["branch"], "copper");
+        assert_eq!(agent.member.unwrap().workspace, "/srv/example/copper");
         assert_eq!(store.planning_sessions(true).unwrap().len(), 1);
         let launch = store.planning_sessions(true).unwrap().pop().unwrap();
         let transport = st3::client::Client::unix_as(&socket, "person/avery").unwrap();

@@ -9710,6 +9710,14 @@ subscription "watch/source" {
         assert_eq!(checkout.base, "main");
         assert_eq!(checkout.branch, "example/parser");
         assert!(checkout.remove_at_run_end);
+        let projected =
+            client_agent_resources(&state.store, false, "now", state.store.index().unwrap())
+                .unwrap();
+        assert_eq!(projected[0]["workspace"], "/work/parser");
+        assert_eq!(
+            projected[0]["checkout"],
+            json!({"repository":"/work/repo", "base":"main", "branch":"example/parser"})
+        );
         let read = host_repositories(
             State(state.clone()),
             Extension(session.clone()),
