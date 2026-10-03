@@ -488,7 +488,8 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
         ]}], "totals":{"pending":0,"in_progress":1,"completed":0,"blocked":0},
         "truncated":false});
     st_drivers::harness_events::enable(&dir, &incarnation).unwrap();
-    let fields = st_drivers::pi_channel::todo_observation(&todo, "omp", Some("native"), &incarnation).unwrap();
+    let mut fields = st_drivers::pi_channel::todo_observation(&todo, "omp", Some("native"), &incarnation).unwrap();
+    fields.get_mut("phases").unwrap()[0]["tasks"][0]["content"] = "Older rejected hydration".into();
     st_drivers::harness_events::write_channel_todo(&dir, &incarnation, &json!(fields)).unwrap();
     let event = st_drivers::harness_events::pending(&dir, 10).unwrap().remove(0);
     let mut bad_fields: BTreeMap<String, Value> = serde_json::from_value(event.payload).unwrap();
@@ -561,7 +562,8 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
     assert_eq!(old_slots, 0);
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!driver_log(root).contains("unknown-claim-field"), "{}", driver_log(root));
-    assert!(stop(channel).is_empty());
+    assert_alive(&mut channel, "the repaired channel after later retry ticks");
+    let _ = stop(channel);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
