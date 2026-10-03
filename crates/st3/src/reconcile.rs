@@ -8628,8 +8628,19 @@ impl<R: RuntimeControl> Reconciler<R> {
             attempt,
             run: run.subject.clone(),
             generation: run.generation.clone(),
+            eval: run.mode == "eval",
         };
-        self.evaluate_gate(&stage, &gate)
+        let outcome = self.evaluate_gate(&stage, &gate)?;
+        // An eval's judges decide its verdict and nobody revises an eval run, so there an exec
+        // gate that says not yet or is broken fails its boundary, as every status but 0 did.
+        Ok(match outcome {
+            GateOutcome::NotYet if stage.eval => GateOutcome::Fail(format!(
+                "exec gate `{}` exited 1",
+                crate::graph::gate_name(&gate)
+            )),
+            GateOutcome::Broken(reason) if stage.eval => GateOutcome::Fail(reason),
+            outcome => outcome,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10866,7 +10877,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         result_subject: &str,
         result: &crate::model::ClaimRecord,
     ) -> Result<()> {
-        if stage.run.is_empty() {
+        // An eval run fails on a broken gate instead; see `evaluate_context_gate`.
+        if stage.run.is_empty() || stage.eval {
             return Ok(());
         }
         let episode = format!("gate-broken:{}:{result_subject}", stage.generation);
@@ -13268,6 +13280,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             attempt: 1,
             run: "mission-run/test".into(),
             generation: "run-generation/test".into(),
+            eval: false,
         };
 
         assert!(matches!(
@@ -17002,6 +17015,59 @@ mission "proof" state="ready" {{
     }
 
     #[test]
+    fn an_eval_run_still_fails_on_an_exec_gate_that_does_not_pass() {
+        // An eval's judges decide its verdict, and nobody revises an eval run.
+        for code in [1, 7] {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            publish_as(
+                &store,
+                &exec_gate_mission("bash ./judges/no-skip.sh", ".").replace(
+                    "mission \"proof\" state=\"ready\" {",
+                    "mission \"proof\" state=\"ready\" timeout=\"10m\" {",
+                ),
+                "eval-source",
+                "person/pat",
+            );
+            let run = store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: "proof".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/requester".into()),
+                    mode: Some("eval".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: "eval-run".into(),
+                })
+                .unwrap();
+            let runtime = Arc::new(FakeRuntime::default());
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+            for _ in 0..4 {
+                reconciler.reconcile_once().unwrap();
+            }
+            let runner = gate_runners(&runtime)
+                .pop()
+                .expect("the gate did not start");
+            exit_gate_runner(&runtime, &runner, Some(code), "missing command dispatch\n");
+            for _ in 0..4 {
+                reconciler.reconcile_once().unwrap();
+            }
+            let current = store.mission_run(&run.id).unwrap().unwrap();
+            assert_eq!(step_of(&current, "verify").status, "failed", "{code}");
+            assert!(
+                store
+                    .attention_items(Some("person/pat"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn an_exec_gate_that_cannot_start_or_outlives_its_time_limit_is_broken() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         publish_as(
@@ -19842,6 +19908,7 @@ schedule "unready" {{
             attempt,
             run: "mission-run/window".into(),
             generation: "run-generation/generation".into(),
+            eval: false,
         };
         let definition = serde_json::json!({"type": "mechanical", "command": "/usr/bin/true"});
         let first = gate_result_subject(&stage(1), "open", &definition).unwrap();

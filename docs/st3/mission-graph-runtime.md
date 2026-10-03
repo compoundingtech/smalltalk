@@ -752,6 +752,10 @@ gate fails that step, as it did before.
 A gate in a loop's `until` answers each round: not yet ends the round without a pass, and a broken
 gate holds the loop for a revision.
 
+An eval run keeps the verdicts its judges give. Nobody revises an eval run, so there an exec gate
+that says not yet or is broken fails its boundary, as any status but 0 did before, and st raises no
+attention item.
+
 Each check records its result on the gate's `gate.result` subject. The result's `verdict` is
 `pass`, `fail` for not yet, or `error` for broken, so every fleet build can read it; its
 `value.answer` is `pass`, `not-yet`, or `broken`, with `check`, `exit_code`, `host`, `output`, and

@@ -596,6 +596,10 @@ pub struct GateContext {
     pub run: String,
     #[serde(default)]
     pub generation: String,
+    /// Whether the gate decides for an eval run, whose exec gates keep their verdicts: any
+    /// status but 0 fails the boundary.
+    #[serde(default)]
+    pub eval: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
