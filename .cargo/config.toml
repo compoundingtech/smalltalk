@@ -1,2 +1,10 @@
 [target.'cfg(target_os = "linux")']
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[env]
+# Bundled SQLite (libsqlite3-sys reads LIBSQLITE3_FLAGS in its build script): compile with
+# memory statistics off, so SQLite stops taking the global memstat mutex in sqlite3Malloc on
+# every allocation. smalltalk #946 measured 48.5% of daemon CPU under that mutex's futex.
+# Cargo [env] applies to cargo-driven builds, including the flake's crane build, which runs
+# cargo in this workspace where .cargo/config.toml is read.
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"
