@@ -12203,6 +12203,8 @@ mission "example/steps" state="ready" {
         let expected = json!([{
             "name": "tracker",
             "subject": format!("resource/uri/{}", hex::encode(Sha256::digest(uri))),
+            "kind": "uri",
+            "resolution": "resolved",
             "uri": uri,
             "reason": "tracking issue",
         }]);
