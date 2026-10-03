@@ -67,6 +67,10 @@ const CHECKOUT_RETRY_MS: u128 = 30_000;
 // are late by at most this much.
 const DEADLINE_SOURCE_RETRY_MS: u128 = 5_000;
 
+/// When a seat's retention was last checked, why the seat is held (if it is), and what the
+/// check read.
+type SeatRetention = (u128, Option<String>, BTreeSet<String>);
+
 // A seat kept running past its run is checked again this soon for unread mail and other work.
 // Reading a conversation message does not wake the reconciler, so this check is what lets the
 // stop go ahead; each check is a pass, and at 10 s held seats were a hetz daemon's most frequent
@@ -577,9 +581,8 @@ pub struct Reconciler<R = NativeRuntime> {
     raised_broken_gates: Mutex<BTreeSet<String>>,
     /// The wait before an exec gate's second check; see [`GATE_RECHECK_BASE_MS`].
     gate_recheck_base_ms: u128,
-    /// Each seat's last retention reading: when it was taken and why the seat stays.
-    /// When each seat's retention was last checked, why it is held, and what the check read.
-    seat_retention: Mutex<HashMap<String, (u128, Option<String>, BTreeSet<String>)>>,
+    /// Each seat's last retention reading.
+    seat_retention: Mutex<HashMap<String, SeatRetention>>,
     /// The gate runners the last read found, kept until a change they depend on.
     gate_runners: Mutex<Option<Vec<crate::store::MissionGateRunner>>>,
     fault_injection: Option<Arc<dyn FaultInjection>>,
