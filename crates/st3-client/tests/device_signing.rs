@@ -267,6 +267,7 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
             device_name: "Hall display".into(),
             person_id: PERSON.into(),
             full_control: None,
+            scopes: None,
         })
         .await
         .unwrap();
