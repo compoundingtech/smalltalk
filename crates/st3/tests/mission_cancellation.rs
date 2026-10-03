@@ -238,6 +238,8 @@ mission "orchid/cancellation" state="ready" {
         file.to_str().unwrap(),
         "--as",
         "person/operator",
+        // Its gates hold a lock and wait for the test; running them at publish would block.
+        "--no-gate-check",
     ]);
     daemon.command(&[
         "missions",
