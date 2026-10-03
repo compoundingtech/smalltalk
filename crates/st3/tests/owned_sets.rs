@@ -451,4 +451,40 @@ async fn disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirm
             .state,
         st3::model::MissionState::Retired
     );
+    let launched_token = amber
+        .store
+        .selected_desired_token("agent/garden/orchard")
+        .unwrap()
+        .unwrap();
+    append(
+        &amber.store,
+        "agent/garden/orchard",
+        "runtime.action.succeeded",
+        json!({
+            "action":"start", "incarnation_id":"launch-agent/garden/orchard",
+            "desired_token":launched_token,
+        }),
+    );
+    let labeled = bundle("mixed", false).replace(
+        "description \"mixed\"",
+        "description \"mixed\"\n name \"Orchard\"",
+    );
+    let mut labeled = request(&amber, 80, labeled).await;
+    preview(&amber, &mut labeled).await;
+    amber
+        .client
+        .post::<_, Value>("/v1/sets/apply", &labeled)
+        .await
+        .unwrap();
+    let status: Value = amber.client.get("/v1/client/sets/garden").await.unwrap();
+    let orchard = status["members_status"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["subject"] == "agent/garden/orchard")
+        .unwrap();
+    assert_eq!(orchard["rollout"], "running");
+    assert_eq!(orchard["launch_current"], true);
+    assert_eq!(orchard["launched_token"], launched_token);
+    assert_ne!(orchard["desired_token"], orchard["launched_token"]);
 }

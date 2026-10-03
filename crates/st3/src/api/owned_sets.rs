@@ -79,9 +79,15 @@ fn resource(state: &AppState, view: sets::View) -> anyhow::Result<Value> {
             .and_then(|s| s.actual.as_ref())
             .and_then(|a| a.get("status"))
             .and_then(Value::as_str);
-        let running = actual == Some("running") && launched.as_deref() == Some(&member.claim);
+        let launch_current = launched.as_ref().is_some_and(|token| {
+            state
+                .store
+                .launch_lineage(&subject)
+                .is_ok_and(|lineage| lineage.contains(token))
+        });
+        let running = actual == Some("running") && launch_current;
         statuses.push(json!({"subject":subject,"desired_token":member.claim,"launched_token":launched,"incarnation":incarnation,
-            "retired":retired,"rollout":if !view.blockers.is_empty(){"blocked"}else if retired && actual==Some("running"){"retirement-pending"}else if retired{"retired"}else if running{"running"}else if member.kind=="mission"||member.kind=="schedule"{"published"}else{"pending"}}));
+            "retired":retired,"launch_current":launch_current,"rollout":if !view.blockers.is_empty(){"blocked"}else if retired && actual==Some("running"){"retirement-pending"}else if retired{"retired"}else if running{"running"}else if member.kind=="mission"||member.kind=="schedule"{"published"}else{"pending"}}));
     }
     value["members_status"] = json!(statuses);
     let mut replicas = state

@@ -92,7 +92,9 @@ st sets status garden --sha 0123456789abcdef0123456789abcdef01234567
 The selected resource reports source, immutable live and retired references, blockers, and each
 member's desired token, launched token and running incarnation. A successful `start` action's
 `desired_token` proves the declaration that launched that incarnation. Publication alone does not
-prove a seat is running. A commit query distinguishes a recorded receipt, local visibility,
+prove a seat is running. Label-only updates share their existing launch lineage, so a running
+seat stays current while its reported launched token retains the original label revision. A commit
+query distinguishes a recorded receipt, local visibility,
 supersession and current rollout. Remote replica visibility remains unknown in this response.
 
 Plain declaration-changing start, stop, rename and publication routes refuse managed subjects.
