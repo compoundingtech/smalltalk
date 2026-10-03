@@ -1260,6 +1260,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    /// [`Self::next_reconcile_deadline`], for the quiet-pass benchmark.
+    #[doc(hidden)]
+    pub fn next_deadline(&self) -> Option<u128> {
+        self.next_reconcile_deadline()
+    }
+
     /// The earliest time the reconciler must wake. Each deadline source is read on its own. One
     /// that fails records a fault on the daemon and asks to be read again shortly, so the other
     /// sources keep their deadlines.
@@ -1273,10 +1279,26 @@ impl<R: RuntimeControl> Reconciler<R> {
             read("deadline/missions", &|| {
                 self.store.next_active_mission_deadline(&self.host)
             }),
-            read("deadline/work-wakes", &|| self.next_work_wake_deadline()),
-            read("deadline/provider-capacity-retries", &|| {
-                self.next_provider_capacity_retry_deadline()
+            // Skipping passes keep each wake's and capacity retry's due time, so these need
+            // no scan of every local agent's work and diagnostics after every pass. The next
+            // full pass bounds what a missing due time could delay.
+            read("deadline/work-wakes", &|| {
+                if self.skip_unneeded {
+                    Ok(self.incremental.next_due("wake:"))
+                } else {
+                    self.next_work_wake_deadline()
+                }
             }),
+            read("deadline/provider-capacity-retries", &|| {
+                if self.skip_unneeded {
+                    Ok(self.incremental.next_due("capacity:"))
+                } else {
+                    self.next_provider_capacity_retry_deadline()
+                }
+            }),
+            self.skip_unneeded
+                .then(|| self.incremental.next_full_pass())
+                .flatten(),
             read("deadline/subscription-retries", &|| {
                 self.store.next_subscription_mission_retry_deadline()
             }),
@@ -2050,7 +2072,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_provider_capacity_retries(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.incremental.observe(&self.store)?;
         let now = now_ms();
+        let skip = self.skip_unneeded && !self.incremental.take_full_pass("capacity", now);
+        let mut items = BTreeSet::new();
         for subject in desired.iter().filter(|subject| {
             subject.kind == "agent"
                 && subject
@@ -2058,110 +2083,124 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .as_ref()
                     .is_some_and(|member| member.host == self.host)
         }) {
-            for claim in self
-                .store
-                .claims_for(&subject.subject, Some("harness.diagnostic"))?
+            let item = format!("capacity:{}", subject.subject);
+            items.insert(item.clone());
+            self.reconcile_item("capacity", &item, skip, || {
+                self.reconcile_provider_capacity_retry(subject, now)
+            })?;
+        }
+        self.incremental.retain("capacity:", &items);
+        Ok(())
+    }
+
+    /// Retry the provider-capacity backoffs of one local agent that have elapsed.
+    fn reconcile_provider_capacity_retry(&self, subject: &DesiredSubject, now: u128) -> Result<()> {
+        for claim in self
+            .store
+            .claims_for(&subject.subject, Some("harness.diagnostic"))?
+        {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            if fields.get("code").and_then(Value::as_str) != Some("provider-capacity")
+                || fields.get("status").and_then(Value::as_str) != Some("waiting")
             {
-                let fields = claim.body.get("fields").unwrap_or(&claim.body);
-                if fields.get("code").and_then(Value::as_str) != Some("provider-capacity")
-                    || fields.get("status").and_then(Value::as_str) != Some("waiting")
-                {
-                    continue;
+                continue;
+            }
+            let Some(due) = fields.get("retry_after_unix_ms").and_then(Value::as_u64) else {
+                continue;
+            };
+            let retry_key = provider_capacity_retry_key(&claim.id);
+            if u128::from(due) > now {
+                if self.store.operation_claim(&retry_key)?.is_none() {
+                    smallclaims::touched::note_due(u128::from(due));
                 }
-                let Some(due) = fields.get("retry_after_unix_ms").and_then(Value::as_u64) else {
-                    continue;
-                };
-                if u128::from(due) > now {
-                    continue;
-                }
-                let retry_key = provider_capacity_retry_key(&claim.id);
-                if self.store.operation_claim(&retry_key)?.is_some() {
-                    continue;
-                }
-                let incarnation = fields
-                    .get("incarnation_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let same_capacity_session = self
-                    .store
+                continue;
+            }
+            if self.store.operation_claim(&retry_key)?.is_some() {
+                continue;
+            }
+            let incarnation = fields
+                .get("incarnation_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let same_capacity_session =
+                self.store
                     .current_harness(&subject.subject)?
                     .is_some_and(|harness| {
                         harness.incarnation_id == incarnation
                             && harness.state == "idle"
                             && harness.reason.as_deref() == Some("providerCapacity")
                     });
-                if !same_capacity_session {
-                    self.store.append_claim(&ClaimInput {
-                        subject: subject.subject.clone(),
-                        kind: "publication.operation".into(),
-                        actor: None,
-                        fields: BTreeMap::from([
-                            (
-                                "operation".into(),
-                                Value::String("provider-capacity-retry".into()),
-                            ),
-                            (
-                                "action".into(),
-                                Value::String("skip-stale-incarnation".into()),
-                            ),
-                            ("status".into(), Value::String("accepted".into())),
-                        ]),
-                        evidence: vec![claim.id],
-                        expected_subject: None,
-                        idempotency_key: Some(retry_key),
-                    })?;
-                    self.signal_changed();
-                    continue;
-                }
-                let attempt = fields
-                    .get("retry_attempt")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1);
-                let step = fields.get("step_run").and_then(Value::as_str);
-                let message_id = &hex::encode(sha2::Sha256::digest(retry_key.as_bytes()))[..16];
-                let message_subject = format!("message/{message_id}");
-                let work_context = step
-                    .map(|step| format!(" Continue the claimed work `{step}`."))
-                    .unwrap_or_default();
+            if !same_capacity_session {
                 self.store.append_claim(&ClaimInput {
-                    subject: message_subject,
-                    kind: "message.sent".into(),
-                    actor: Some("daemon/runtime".into()),
+                    subject: subject.subject.clone(),
+                    kind: "publication.operation".into(),
+                    actor: None,
                     fields: BTreeMap::from([
-                        ("from".into(), Value::String("daemon/runtime".into())),
-                        ("to".into(), Value::String(subject.subject.clone())),
                         (
-                            "content".into(),
-                            Value::String(format!(
-                                "The provider-capacity backoff elapsed.{work_context} Resume in this existing session; do not create a replacement worker."
-                            )),
+                            "operation".into(),
+                            Value::String("provider-capacity-retry".into()),
                         ),
                         (
-                            "status".into(),
-                            Value::String("sent".into()),
+                            "action".into(),
+                            Value::String("skip-stale-incarnation".into()),
                         ),
-                        (
-                            "title".into(),
-                            Value::String(format!(
-                                "Provider capacity retry {attempt}"
-                            )),
-                        ),
-                        ("in_reply_to".into(), Value::Null),
-                        (
-                            "tags".into(),
-                            Value::Array(vec![
-                                Value::String("st3-provider-capacity-retry".into()),
-                                Value::String(format!("st3-retry-attempt:{attempt}")),
-                                Value::String(format!("diagnostic-claim:{}", claim.id)),
-                            ]),
-                        ),
+                        ("status".into(), Value::String("accepted".into())),
                     ]),
                     evidence: vec![claim.id],
                     expected_subject: None,
                     idempotency_key: Some(retry_key),
                 })?;
                 self.signal_changed();
+                continue;
             }
+            let attempt = fields
+                .get("retry_attempt")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let step = fields.get("step_run").and_then(Value::as_str);
+            let message_id = &hex::encode(sha2::Sha256::digest(retry_key.as_bytes()))[..16];
+            let message_subject = format!("message/{message_id}");
+            let work_context = step
+                .map(|step| format!(" Continue the claimed work `{step}`."))
+                .unwrap_or_default();
+            self.store.append_claim(&ClaimInput {
+                subject: message_subject,
+                kind: "message.sent".into(),
+                actor: Some("daemon/runtime".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), Value::String("daemon/runtime".into())),
+                    ("to".into(), Value::String(subject.subject.clone())),
+                    (
+                        "content".into(),
+                        Value::String(format!(
+                            "The provider-capacity backoff elapsed.{work_context} Resume in this existing session; do not create a replacement worker."
+                        )),
+                    ),
+                    (
+                        "status".into(),
+                        Value::String("sent".into()),
+                    ),
+                    (
+                        "title".into(),
+                        Value::String(format!(
+                            "Provider capacity retry {attempt}"
+                        )),
+                    ),
+                    ("in_reply_to".into(), Value::Null),
+                    (
+                        "tags".into(),
+                        Value::Array(vec![
+                            Value::String("st3-provider-capacity-retry".into()),
+                            Value::String(format!("st3-retry-attempt:{attempt}")),
+                            Value::String(format!("diagnostic-claim:{}", claim.id)),
+                        ]),
+                    ),
+                ]),
+                evidence: vec![claim.id],
+                expected_subject: None,
+                idempotency_key: Some(retry_key),
+            })?;
+            self.signal_changed();
         }
         Ok(())
     }
@@ -9863,6 +9902,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_subscription_missions(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.incremental.observe(&self.store)?;
         // Read once for every subscription: it lists the whole host's open attention requests.
         let held = self
             .store

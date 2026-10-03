@@ -193,6 +193,34 @@ impl Incremental {
         }
     }
 
+    /// The earliest time an item whose name starts with `prefix` comes due.
+    pub fn next_due(&self, prefix: &str) -> Option<u128> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .items
+            .iter()
+            .filter(|(name, _)| name.starts_with(prefix))
+            .filter_map(|(_, item)| item.due)
+            .min()
+    }
+
+    /// When the next section's full pass is due: the earliest last full pass plus
+    /// [`FULL_PASS_INTERVAL_MS`]. A due time an item failed to record still comes round then.
+    pub fn next_full_pass(&self) -> Option<u128> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .last_full
+            .values()
+            .min()
+            .map(|last| last.saturating_add(FULL_PASS_INTERVAL_MS))
+    }
+
     /// What `item`'s last evaluation read.
     pub fn reads_of(&self, item: &str) -> BTreeSet<String> {
         let state = self

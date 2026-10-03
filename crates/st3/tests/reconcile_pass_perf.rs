@@ -179,10 +179,21 @@ fn quiet_reconcile_passes_on_a_store_copy() {
         wall.push(started.elapsed().as_secs_f64() * 1000.0);
     }
     let after = queries(&st3::performance::snapshot());
+    // The loop reads the next deadline after every pass.
+    let mut deadline_cpu = Vec::new();
+    for _ in 0..passes {
+        let cpu_started = thread_cpu_ms();
+        st3::profile::task("task reconcile-deadline", || reconciler.next_deadline());
+        deadline_cpu.push(thread_cpu_ms() - cpu_started);
+    }
     println!(
         "quiet pass: wall {:.0} ms, CPU on the pass thread {:.0} ms (mean of {passes})",
         wall.iter().sum::<f64>() / passes as f64,
         cpu.iter().sum::<f64>() / passes as f64
+    );
+    println!(
+        "next deadline after a pass: CPU {:.0} ms (mean of {passes})",
+        deadline_cpu.iter().sum::<f64>() / passes as f64
     );
     let mut rows = after
         .iter()
