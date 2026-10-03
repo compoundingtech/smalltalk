@@ -539,6 +539,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/doctor", get(doctor))
         .route("/v1/repair", get(operational_repair_plan))
         .route("/v1/repair/apply", post(apply_operational_repair))
+        .route("/v1/backup", get(backup_export))
         .route("/v1/replication/status", get(replication_status))
         .route("/v1/replication/records", get(replication_records))
         .route("/v1/replication/records/{*record}", get(replication_record))
@@ -6183,6 +6184,35 @@ async fn repair_replication_record(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(claim))
+}
+
+/// Spool one snapshot on a read worker; a slow downloader never holds the SQLite snapshot.
+async fn backup_export(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let store = state.store.clone();
+    let file = blocking_store(move || {
+        let mut file = tempfile::tempfile()?;
+        store.write_backup(&mut file)?;
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    })
+    .await?;
+    let file = tokio::fs::File::from_std(file);
+    let stream = futures_util::stream::try_unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = vec![0_u8; 64 * 1024];
+        let read = file.read(&mut bytes).await?;
+        if read == 0 {
+            return Ok::<_, std::io::Error>(None);
+        }
+        bytes.truncate(read);
+        Ok(Some((bytes, file)))
+    });
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 async fn replication_export(

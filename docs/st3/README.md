@@ -12,6 +12,7 @@ Use these documents for implementation details:
   runs the fleet may do, as itself, until principals and grants land.
 - [Schema registry](schema.md) lists the generated public subject, resource, and claim vocabulary.
 - [Data authority](data-authority.md) separates durable facts from projections and caches.
+- [Claim backups](backups.md) explains live snapshots, offline restore, and recovered writer identities.
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.
 - [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
   are recorded and replicated.
