@@ -323,6 +323,8 @@ def judge(proof):
         failures.append("message reached the reader before the injected outage cleared")
     if proof["received_copies"] != 1:
         failures.append(f"native provider received {proof['received_copies']} copies (expected 1)")
+    if proof["warmup_received_copies"] != 1:
+        failures.append(f"already-read warmup mail reached the provider {proof['warmup_received_copies']} times (expected 1)")
     if proof["provider_starts"] != proof["expected_provider_starts"]:
         failures.append(f"provider started {proof['provider_starts']} times (expected {proof['expected_provider_starts']})")
     if proof["case"] != "harness-restart":
@@ -544,6 +546,8 @@ agent "fault-probe" {{
         graph_reads = [claim for claim in claims if claim.get("kind") == "message.read"]
         source_view = await source.api("/v1/messages/read/" + subject)
         result.update(
+            warmup_received_copies=sum(1 for row in all_receipts
+                if row.get("subject") == warmup and row.get("event") == "received"),
             projected_message_files=sum(1 for path in (target.root / "state").rglob("*")
                 if path.is_file() and any(part in ("inbox", "archive") for part in path.parts)),
             driver_catalog_files=sum(1 for pattern in ("catalog.kdl", "agent.kdl")

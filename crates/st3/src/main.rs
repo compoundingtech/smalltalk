@@ -17649,13 +17649,28 @@ impl PiFamilyReports {
             self.acknowledgements.remove(&message);
         }
         while let Some(message) = self.reads.first().cloned() {
-            if let Some(fence) = &self.fence {
-                mailbox_receipt(client, fence, &message, "read").await?;
-                use tokio::io::AsyncWriteExt as _;
-                let mut stdout = tokio::io::stdout();
-                stdout.write_all(format!("{}\n", json!({"type":"settled","meta":{"messageId":message}})).as_bytes()).await?;
-                stdout.flush().await?;
+            match &self.fence {
+                Some(fence) => mailbox_receipt(client, fence, &message, "read").await?,
+                None => {
+                    let _: ClaimRecord = client.post(
+                        &format!("/v1/messages/{}/claims", urlencoding::encode(message.trim_start_matches("message/"))),
+                        &MessageLifecycleRequest {
+                            lifecycle: "read".into(),
+                            actor: Some(subject.into()),
+                            transport: None,
+                            runtime_id: None,
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: format!("pi-read:{subject}:{message}"),
+                        },
+                    ).await?;
+                }
             }
+            // Both transports retain the native receipt until the graph acknowledges it.
+            use tokio::io::AsyncWriteExt as _;
+            let mut stdout = tokio::io::stdout();
+            stdout.write_all(format!("{}\n", json!({"type":"settled","meta":{"messageId":message}})).as_bytes()).await?;
+            stdout.flush().await?;
             self.reads.remove(&message);
         }
         // Last, and never fatal: a report the daemon does not take must not hold back delivery.
@@ -20505,83 +20520,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pi_family_pending_read_survives_daemon_outage_and_reexec_under_its_fence() {
+    async fn pi_family_pending_read_survives_daemon_outage_and_reexec_across_both_transports() {
         use axum::{Json, Router, routing::post};
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("daemon.sock");
-        let client = Client::new(st3::client::Endpoint::Unix(path.clone()));
-        let mut fence = st3::mailbox::Fence::new("agent/eval.worker", "session-1", "delivery");
-        fence.epoch = 7; // The daemon's already-allocated binding, carried through exec.
-        let mut state = PiChannelResume {
-            incarnation: "session-1".into(),
-            session: "native-session".into(),
-            pending: PiFamilyReports {
-                fence: Some(fence.clone()),
+        for fenced in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("daemon.sock");
+            let client = Client::new(st3::client::Endpoint::Unix(path.clone()));
+            let mut fence = st3::mailbox::Fence::new("agent/eval.worker", "session-1", "delivery");
+            fence.epoch = 7; // The daemon's already-allocated binding, carried through exec.
+            let mut state = PiChannelResume {
+                incarnation: "session-1".into(),
+                session: "native-session".into(),
+                pending: PiFamilyReports {
+                    fence: fenced.then_some(fence.clone()),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        state.accept_frame(r#"{"type":"read","meta":{"messageId":"message/native"}}"#);
-        assert!(
-            state
-                .pending
-                .publish(
-                    &client,
-                    &fence.subject,
-                    "omp",
-                    &fence.incarnation,
-                    "native-session"
-                )
-                .await
-                .is_err()
-        );
-        assert!(state.pending.reads.contains("message/native"));
-        assert!(state.pending.acknowledgements.contains("message/native"));
-        let resume_path =
-            st_drivers::reexec::write_state(root.path(), "channel-resume", &state).unwrap();
-        let mut resumed: PiChannelResume = st_drivers::reexec::read_state(&resume_path).unwrap();
-        assert_eq!(
-            serde_json::to_value(resumed.pending.fence.as_ref().unwrap()).unwrap(),
-            serde_json::to_value(&fence).unwrap()
-        );
-        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured = received.clone();
-        let expected = serde_json::to_value(&fence).unwrap();
-        let store = std::sync::Arc::new(
-            st3::store::Store::open(&root.path().join("graph.db"), "node").unwrap(),
-        );
-        store
-            .append_claim(&ClaimInput {
-                subject: "message/native".into(),
-                kind: "message.sent".into(),
-                actor: Some("person/eval".into()),
-                fields: BTreeMap::from([
-                    ("status".into(), json!("sent")),
-                    ("from".into(), json!("person/eval")),
-                    ("to".into(), json!(fence.subject)),
-                    ("content".into(), json!("QUARTZ SIGNAL")),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("read-resume-send".into()),
-            })
-            .unwrap();
-        let graph = store.clone();
-        let app = Router::new().route(
-            "/v1/mailbox/receipts",
-            post(move |Json(receipt): Json<st3::mailbox::Receipt>| {
+            };
+            state.accept_frame(r#"{"type":"read","meta":{"messageId":"message/native"}}"#);
+            assert!(
+                state
+                    .pending
+                    .publish(
+                        &client,
+                        &fence.subject,
+                        "omp",
+                        &fence.incarnation,
+                        "native-session"
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(state.pending.reads.contains("message/native"));
+            assert!(state.pending.acknowledgements.contains("message/native"));
+            let resume_path =
+                st_drivers::reexec::write_state(root.path(), "channel-resume", &state).unwrap();
+            let mut resumed: PiChannelResume = st_drivers::reexec::read_state(&resume_path).unwrap();
+            assert_eq!(
+                serde_json::to_value(&resumed.pending.fence).unwrap(),
+                serde_json::to_value(fenced.then_some(&fence)).unwrap()
+            );
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = received.clone();
+            let expected = serde_json::to_value(&fence).unwrap();
+            let store = std::sync::Arc::new(
+                st3::store::Store::open(&root.path().join("graph.db"), "node").unwrap(),
+            );
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/native".into(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/eval".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), json!("sent")),
+                        ("from".into(), json!("person/eval")),
+                        ("to".into(), json!(fence.subject)),
+                        ("content".into(), json!("QUARTZ SIGNAL")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some("read-resume-send".into()),
+                })
+                .unwrap();
+            let graph = store.clone();
+            let handler = post(move |Json(receipt): Json<Value>| {
                 let received = captured.clone();
                 let expected = expected.clone();
                 let store = graph.clone();
                 async move {
-                    assert_eq!(serde_json::to_value(&receipt.fence).unwrap(), expected);
-                    received.lock().unwrap().push(receipt.lifecycle.clone());
+                    let lifecycle = receipt["lifecycle"].as_str().unwrap().to_owned();
+                    let (message, actor) = if fenced {
+                        let receipt: st3::mailbox::Receipt = serde_json::from_value(receipt).unwrap();
+                        assert_eq!(serde_json::to_value(&receipt.fence).unwrap(), expected);
+                        (receipt.message, receipt.fence.subject)
+                    } else {
+                        assert_eq!(receipt["actor"], "agent/eval.worker");
+                        ("message/native".into(), "agent/eval.worker".into())
+                    };
+                    received.lock().unwrap().push(lifecycle.clone());
                     let record = store
                         .append_claim(&ClaimInput {
-                            subject: receipt.message,
-                            kind: format!("message.{}", receipt.lifecycle),
-                            actor: Some(receipt.fence.subject),
-                            fields: BTreeMap::from([("status".into(), json!(receipt.lifecycle))]),
+                            subject: message,
+                            kind: format!("message.{lifecycle}"),
+                            actor: Some(actor),
+                            fields: BTreeMap::from([("status".into(), json!(lifecycle))]),
                             evidence: Vec::new(),
                             expected_subject: None,
                             idempotency_key: None,
@@ -20589,38 +20611,41 @@ mod tests {
                         .unwrap();
                     Json(json!({"api_version":"st3.v1", "value":record}))
                 }
-            }),
-        );
-        let server_path = path.clone();
-        let server = tokio::spawn(async move {
-            st3::api::serve_unix(&server_path, app).await.unwrap();
-        });
-        for _ in 0..100 {
-            if path.exists() {
-                break;
+            });
+            let app = Router::new()
+                .route("/v1/mailbox/receipts", handler.clone())
+                .route("/v1/messages/{message_id}/claims", handler);
+            let server_path = path.clone();
+            let server = tokio::spawn(async move {
+                st3::api::serve_unix(&server_path, app).await.unwrap();
+            });
+            for _ in 0..100 {
+                if path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            resumed
+                .pending
+                .publish(
+                    &client,
+                    &fence.subject,
+                    "omp",
+                    &fence.incarnation,
+                    "native-session",
+                )
+                .await
+                .unwrap();
+            assert!(resumed.pending.reads.is_empty());
+            assert!(resumed.pending.acknowledgements.is_empty());
+            assert_eq!(*received.lock().unwrap(), vec!["delivered", "read"]);
+            assert_eq!(
+                store.message("message/native").unwrap().unwrap().status,
+                "read"
+            );
+            assert!(!root.path().join("resources").exists());
+            server.abort();
         }
-        resumed
-            .pending
-            .publish(
-                &client,
-                &fence.subject,
-                "omp",
-                &fence.incarnation,
-                "native-session",
-            )
-            .await
-            .unwrap();
-        assert!(resumed.pending.reads.is_empty());
-        assert!(resumed.pending.acknowledgements.is_empty());
-        assert_eq!(*received.lock().unwrap(), vec!["delivered", "read"]);
-        assert_eq!(
-            store.message("message/native").unwrap().unwrap().status,
-            "read"
-        );
-        assert!(!root.path().join("resources").exists());
-        server.abort();
     }
     #[test]
     fn a_human_ask_survives_channel_replacement_until_an_answered_state_frame() {
