@@ -2817,10 +2817,13 @@ struct OwnedSetApplyArgs {
 
 #[derive(Subcommand)]
 enum OwnedSetsCommand {
+    /// List selected owned sets and their source receipts.
     Ls,
+    /// Show a set's live membership, retirements and blockers.
     Show {
         name: String,
     },
+    /// Inspect publication and rollout for one source commit.
     Status {
         name: String,
         #[arg(long)]
