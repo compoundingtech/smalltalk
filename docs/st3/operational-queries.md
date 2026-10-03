@@ -66,6 +66,11 @@ claim kind for `/v1/claims`), replication receives, the reconciler's own timers 
 Every member runs a reconcile pass for each change in the fleet, so this table names the writes
 that keep an idle daemon busy. Wakes that arrive during a pass share the next one.
 
+Native mailbox streams report their store work as `task mailbox-change-check` and
+`task mailbox-snapshot`, including CPU time. These tasks continue after the subscription request
+upgrades to a WebSocket, so their cost appears separately from that initial request. They count
+as background tasks, leaving the request count and per-client request rates unchanged.
+
 This accounting writes no graph claims and requires no file profiling configuration. Samples
 are local to the daemon and disappear on restart. `--performance` requests the timing report
 without running dependency checks. File profiling remains available for deeper investigation.
