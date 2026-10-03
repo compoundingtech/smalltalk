@@ -57,7 +57,7 @@ use st3_conversation_ui::pane::order;
 use st3_conversation_ui::{PaneIntent, PaneState, Selection};
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     io::{self, Write},
     rc::Rc,
     time::{Duration, Instant},
@@ -264,6 +264,9 @@ pub struct Ui {
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
+    /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
+    /// the page before it.
+    older_wanted: RefCell<BTreeSet<String>>,
     popover: Option<String>,
     chat: Option<ChatState>,
     /// st's conversation search for the palette: the query asked and what came back.
@@ -367,6 +370,7 @@ impl Ui {
             quit: false,
             live: false,
             effects: Vec::new(),
+            older_wanted: RefCell::default(),
             popover: None,
             chat: None,
             said: None,
@@ -2726,6 +2730,17 @@ impl Ui {
             pane.rect.height as usize,
             key.starts_with("chat:"),
         );
+        if delta < 0
+            && state.top == 0
+            && let Some(target) = key.strip_prefix("chat:")
+        {
+            self.older_wanted.borrow_mut().insert(target.to_owned());
+        }
+    }
+
+    /// The conversations scrolled up to their start since this was last asked.
+    pub(crate) fn take_older_wanted(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.older_wanted.borrow_mut())
     }
 
     fn main_pane_key(&self) -> Option<String> {
@@ -4236,7 +4251,12 @@ impl Ui {
                 }
             }
             Hit::Pane(PaneIntent::LoadOlder) => {
-                self.flash("Earlier history is not available through stui yet");
+                if let Some(target) = self
+                    .main_pane_key()
+                    .and_then(|key| key.strip_prefix("chat:").map(str::to_owned))
+                {
+                    self.older_wanted.borrow_mut().insert(target);
+                }
             }
             Hit::JumpLatest => self.follow_latest(),
             Hit::Composer => {
