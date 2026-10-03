@@ -183,7 +183,7 @@ where
                 Ok((mark, result)) => (mark.ok(), Ok(result)),
                 Err(error) => (None, Err(error)),
             };
-            let (seat, messages) = match result {
+            let (seat, mut messages) = match result {
                 Ok(Ok(snapshot)) => snapshot,
                 Ok(Err(error)) => {
                     if error
@@ -221,6 +221,9 @@ where
                     previous_seat = bytes;
                 }
             }
+            // A watch's wake shows its comment's opening words, read from GitHub now and never
+            // stored in the graph.
+            crate::github_watch::add_excerpts(&mut messages).await;
             last = mark.map(|mark| {
                 let subjects = messages
                     .iter()

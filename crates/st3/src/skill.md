@@ -1,6 +1,6 @@
 ---
 name: st
-description: How to use st from an st agent seat. Applies only when the ST_AGENT environment variable is set, which means st started this session. Covers reading and replying to st messages; listing, claiming, and finishing mission steps; attention requests; and this machine's host facts.
+description: How to use st from an st agent seat. Applies only when the ST_AGENT environment variable is set, which means st started this session. Covers reading and replying to st messages; listing, claiming, and finishing mission steps; attention requests; watching GitHub issues and pull requests; and this machine's host facts.
 ---
 
 # st
@@ -42,6 +42,10 @@ Messages stay in conversations and do not enter a person's attention.
 A fault arrives as a message to the agent that owns it, which retries, revises or cancels, and asks a person with `work ask` only for what only a person can give.
 
 `"$ST3_BIN" agents restart AGENT --as "$ST_AGENT"` keeps a top-level or mission seat's declaration and waits for a new running incarnation, or explains why it cannot. `--timeout 2m` changes the default ten-minute wait. Its authority is the same as stop and start.
+
+## GitHub
+
+`"$ST3_BIN" gh watch OWNER/REPO#N --as "$ST_AGENT"` wakes this seat once for each new comment or review on that issue or pull request, each time the required checks on its current head turn pass or fail, and when it closes or merges, which ends the watch; `--until 4h` ends it sooner. `gh ls` lists this seat's watches and `gh unwatch OWNER/REPO#N` ends one.
 
 ## Other agents' terminals
 

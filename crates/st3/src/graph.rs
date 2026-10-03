@@ -3543,6 +3543,71 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
                 ));
             }
         }
+        // A seat's watch on one issue or pull request: every comment and review, each move of the
+        // required checks into pass or fail, and a final wake when it closes.
+        "watch" => {
+            let target = required_child_string(body, "to", "subscription")?;
+            validate_full_subject(&target)?;
+            if !target.starts_with("agent/") {
+                return Err(St3Error::new(
+                    "invalid-watch-delivery",
+                    "a watch wakes one agent",
+                ));
+            }
+            if unique_child(body, "when")?.is_some() || !logins.is_empty() {
+                return Err(St3Error::new(
+                    "invalid-watch-delivery",
+                    "a watch hears every event of its item, with no `when` or `mention`",
+                ));
+            }
+            if let Some(field) = fields
+                .iter()
+                .find(|field| !crate::github_watch::WATCH_FIELDS.contains(&field.as_str()))
+            {
+                return Err(St3Error::new(
+                    "invalid-watch-delivery",
+                    format!("a watch hears comments, issues and pull requests, not `{field}`"),
+                ));
+            }
+            let delivery_body = delivery.children().ok_or_else(|| {
+                St3Error::new(
+                    "invalid-watch-delivery",
+                    "a watch delivery names its `item` and `since`",
+                )
+            })?;
+            reject_unknown_children(
+                delivery_body,
+                &["item", "since", "until"],
+                "watch delivery",
+                "delivery",
+            )?;
+            let item = unique_child(delivery_body, "item")?
+                .and_then(|node| {
+                    positional_values(node)
+                        .first()
+                        .and_then(|value| value.as_integer())
+                })
+                .filter(|item| *item > 0);
+            if item.is_none() {
+                return Err(St3Error::new(
+                    "invalid-watch-delivery",
+                    "a watch delivery names one positive `item` number",
+                ));
+            }
+            for (name, required) in [("since", true), ("until", false)] {
+                unique_child(delivery_body, name)?;
+                match child_string(delivery_body, name)? {
+                    Some(at) if crate::github_watch::parse_rfc3339_ms(&at).is_some() => {}
+                    None if !required => {}
+                    _ => {
+                        return Err(St3Error::new(
+                            "invalid-watch-delivery",
+                            format!("a watch delivery's `{name}` is an RFC 3339 time"),
+                        ));
+                    }
+                }
+            }
+        }
         "mission" => {
             if child_string(body, "to")?.is_some() {
                 return Err(St3Error::new(
@@ -4350,6 +4415,7 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             mentions: Vec::new(),
             text_input: None,
             batch_every_ms: None,
+            watch: None,
             stopped: true,
         });
     }
@@ -4370,6 +4436,19 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             |(mission, revision)| (Some(mission.to_owned()), Some(revision.to_owned())),
         )
     });
+    let watch = (delivery == "watch")
+        .then(|| {
+            Some(crate::model::WatchSpec {
+                item: canonical_child_value(delivery_node, "item")?.as_u64()?,
+                since_unix_ms: canonical_child_value(delivery_node, "since")
+                    .and_then(Value::as_str)
+                    .and_then(crate::github_watch::parse_rfc3339_ms)?,
+                until_unix_ms: canonical_child_value(delivery_node, "until")
+                    .and_then(Value::as_str)
+                    .and_then(crate::github_watch::parse_rfc3339_ms),
+            })
+        })
+        .flatten();
     Some(SubscriptionSpec {
         observer: canonical_child_value(value, "observer")?
             .as_str()?
@@ -4414,6 +4493,7 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
         batch_every_ms: canonical_child_value(delivery_node, "every")
             .and_then(Value::as_str)
             .and_then(|value| parse_duration(value, true).ok()),
+        watch,
         stopped: false,
     })
 }

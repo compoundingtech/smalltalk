@@ -88,6 +88,7 @@ mod tests {
             "this machine's host facts",
             "`work cancel-ask PERSON_STEP --as \"$ST_AGENT\" --reason TEXT`",
             "Keys typed into another agent's terminal",
+            "`\"$ST3_BIN\" gh watch OWNER/REPO#N --as \"$ST_AGENT\"`",
         ] {
             assert!(body.contains(usage), "{usage}");
         }
@@ -107,7 +108,7 @@ mod tests {
                 "the skill prescribes conduct: {rule}"
             );
         }
-        assert!(SKILL.lines().count() <= 50, "the skill stays short");
+        assert!(SKILL.lines().count() <= 54, "the skill stays short");
     }
 
     #[test]
