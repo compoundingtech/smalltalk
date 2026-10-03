@@ -2253,6 +2253,144 @@ async fn full_control_pairing_requires_explicit_local_person_opt_in_and_can_be_r
 }
 
 #[tokio::test]
+async fn read_only_pairing_reads_projections_but_is_denied_attention_and_launch_actions() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        store.origin(),
+    )
+    .unwrap();
+    store.apply_internal(&intent, "read-only-asker").unwrap();
+    let step = store
+        .ask_person(&st3::model::PersonAskRequest {
+            legacy_request: None,
+            person: "person/ada".into(),
+            title: "Decision for Ada".into(),
+            reason: "Reply with the release date.".into(),
+            actor: format!("agent/{}.asker", store.origin()),
+            step: None,
+            new_run: Some("person/ada".into()),
+            incarnation: None,
+            idempotency_key: "read-only-ada".into(),
+            request: None,
+        })
+        .unwrap();
+    let local = st3::api::router(state.clone());
+    let gateway = st3::api::fabric_router(state);
+    let begin = |scopes: Value| {
+        serde_json::json!({
+            "api_version": "st3.client.v0",
+            "device_name": "Ada's wall display",
+            "person_id": "person/ada",
+            "scopes": scopes
+        })
+    };
+    let mut full_control_with_scopes = begin(serde_json::json!(["read.projections"]));
+    full_control_with_scopes["full_control"] = Value::Bool(true);
+    for (rejected, why) in [
+        (
+            begin(serde_json::json!(["read.projections", "control.messages"])),
+            "scope beyond the limited grant",
+        ),
+        (begin(serde_json::json!([])), "empty scope list"),
+        (full_control_with_scopes, "full control combined with scopes"),
+    ] {
+        let (status, body) =
+            client_post_json_person(local.clone(), "/v1/client/pairings", "person/ada", rejected)
+                .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{why}: {body}");
+    }
+
+    let (status, challenge) = client_post_json_person(
+        local.clone(),
+        "/v1/client/pairings",
+        "person/ada",
+        begin(serde_json::json!(["terminal.read", "read.projections", "read.glasses"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let pairing = challenge["value"]["pairing_id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("pairing/");
+    let (status, paired) = client_post_json(
+        gateway.clone(),
+        &format!("/v1/client/pairings/{pairing}/complete"),
+        serde_json::json!({
+            "api_version": "st3.client.v0",
+            "code": challenge["value"]["code"],
+            "device_public_key": "read-only-test-display-key-000000000000000000"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{paired}");
+    assert_eq!(
+        paired["value"]["scopes"],
+        serde_json::json!(["read.projections", "read.glasses", "terminal.read"])
+    );
+    let credential = paired["value"]["credential"].as_str().unwrap();
+
+    let (status, capabilities) =
+        client_json_auth(gateway.clone(), "/v1/client/capabilities", credential).await;
+    assert_eq!(status, StatusCode::OK, "{capabilities}");
+    for action in ["work.done", "launch.create", "message.send"] {
+        let state = capabilities["value"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capability| capability["id"] == action)
+            .unwrap()["state"]
+            .clone();
+        assert_eq!(state, "ungranted", "{action}");
+    }
+
+    let (status, attention) =
+        client_json_auth(gateway.clone(), "/v1/client/attention", credential).await;
+    assert_eq!(status, StatusCode::OK, "{attention}");
+    let item = attention["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["source_id"] == step.subject)
+        .unwrap()
+        .clone();
+
+    let done = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/read-only-work-done",
+        "type": "work.done", "idempotency_key": "read-only-work-done-0001",
+        "fence": {
+            "snapshot_id": attention["snapshot"]["id"],
+            "subject_revisions": { (item["id"].as_str().unwrap()): item["revision"] }
+        },
+        "parameters": { "target_id": step.subject, "summary": "Friday", "episode": item["episode"] }
+    });
+    let (status, denied) =
+        client_post_json_auth(gateway.clone(), "/v1/client/actions", credential, done).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert_eq!(
+        store.step_run(&step.subject).unwrap().unwrap().status,
+        "ready"
+    );
+
+    let create = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/read-only-launch-create",
+        "type": "launch.create", "idempotency_key": "read-only-launch-create-01",
+        "fence": { "snapshot_id": capabilities["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": {
+            "title": "Read-only launch", "request": "Must not be created.",
+            "target": { "type": "new-mission", "mission_id": "mission/read-only", "workspace": workspace }
+        }
+    });
+    let (status, denied) =
+        client_post_json_auth(gateway, "/v1/client/actions", credential, create).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+}
+
+#[tokio::test]
 async fn core_launch_and_mission_actions_use_session_identity_and_exact_fences() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");

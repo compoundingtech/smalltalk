@@ -2244,6 +2244,9 @@ struct ActivityArgs {
     all: bool,
 }
 
+/// Observation-only device grant requested by `st devices pair --read-only`.
+const READ_ONLY_PAIRING_SCOPES: &[&str] = &["read.projections", "read.glasses", "terminal.read"];
+
 #[derive(Subcommand)]
 enum DevicesCommand {
     /// List paired devices visible to the authenticated person.
@@ -2254,6 +2257,9 @@ enum DevicesCommand {
         /// Delegate every current client scope to this trusted device.
         #[arg(long)]
         full_control: bool,
+        /// Delegate only observation: projections, glasses frames, and terminal output.
+        #[arg(long, conflicts_with = "full_control")]
+        read_only: bool,
     },
     /// Revoke one paired device.
     Revoke {
@@ -7396,6 +7402,7 @@ async fn run_devices(
         DevicesCommand::Pair {
             device_name,
             full_control,
+            read_only,
         } => {
             let response = client
                 .pairing_begin(&PairingBegin {
@@ -7403,6 +7410,12 @@ async fn run_devices(
                     device_name,
                     person_id: person.clone(),
                     full_control: full_control.then_some(true),
+                    scopes: read_only.then(|| {
+                        READ_ONLY_PAIRING_SCOPES
+                            .iter()
+                            .map(|scope| (*scope).to_owned())
+                            .collect()
+                    }),
                 })
                 .await?;
             print_client_value(&response, json_output)?;
@@ -24145,6 +24158,44 @@ mod tests {
             panic!("expected a device pairing command")
         };
         assert!(full_control);
+
+        let observer = Cli::try_parse_from([
+            "st3",
+            "devices",
+            "--as",
+            "person/alex",
+            "pair",
+            "--read-only",
+            "iPad",
+        ])
+        .unwrap();
+        let Command::Devices(DevicesArgs {
+            command:
+                Some(DevicesCommand::Pair {
+                    full_control,
+                    read_only,
+                    ..
+                }),
+            ..
+        }) = observer.command
+        else {
+            panic!("expected a device pairing command")
+        };
+        assert!(read_only && !full_control);
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "devices",
+                "--as",
+                "person/alex",
+                "pair",
+                "--read-only",
+                "--full-control",
+                "iPad",
+            ])
+            .is_err(),
+            "read-only and full-control pairing must be mutually exclusive"
+        );
     }
 
     #[test]

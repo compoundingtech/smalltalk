@@ -25,8 +25,9 @@ st devices --as person/avery pair --full-control "Demo laptop"
 ```
 
 This returns a `pairing_id`, a code, and its expiration time. `--full-control` grants the actions
-stui offers; omit it for the API's limited read/terminal/attention/launch scopes. stui cannot
-expand the member's grant.
+stui offers; omit it for the API's limited read/terminal/attention/launch scopes, or pass
+`--read-only` for a device that may only observe projections, glasses, and terminal output.
+stui cannot expand the member's grant.
 
 On the laptop, install the stui binary and run one setup command:
 

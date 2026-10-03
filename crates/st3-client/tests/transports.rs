@@ -394,6 +394,7 @@ async fn raw_terminal_bytes_capability_replay_and_close_over_paired_gateways() {
         device_name: "Raw terminal device".into(),
         person_id: "person/avery".into(),
         full_control: Some(true),
+        scopes: None,
     }).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1118,6 +1119,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
                 device_name: "Unattributed device".into(),
                 person_id: "person/ada".into(),
                 full_control: None,
+                scopes: None,
             })
             .await
             .is_err(),
@@ -1493,6 +1495,7 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
             device_name: "Conformance phone".into(),
             person_id: "person/ada".into(),
             full_control: None,
+            scopes: None,
         })
         .await
         .unwrap();
