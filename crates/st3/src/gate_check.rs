@@ -61,11 +61,13 @@ struct Item {
 }
 
 /// Start checking every exec gate the intent's missions declare, with `workspace` standing for a
-/// run's workspace, and return the check as it starts.
+/// run's workspace and `inputs` for its input values, and return the check as it starts. A gate
+/// that reads an input `inputs` does not give is unchecked.
 pub fn start(
     host: CheckHost<'_>,
     intent: &NormalizedIntent,
     workspace: &str,
+    inputs: &BTreeMap<String, String>,
 ) -> Result<GateCheckView> {
     sweep();
     let id = uuid::Uuid::now_v7().simple().to_string();
@@ -74,8 +76,24 @@ pub fn start(
         .with_context(|| format!("create the gate check directory {}", directory.display()))?;
     let mut items = Vec::new();
     for mission in intent.missions.values() {
-        let variables = stand_in_variables(mission, workspace, &id);
-        collect(mission, "mission".into(), &variables, workspace, &mut items);
+        let mut variables = stand_in_variables(mission, workspace, &id);
+        let mut missing = std::collections::BTreeSet::new();
+        for name in mission.inputs.keys() {
+            match inputs.get(name) {
+                Some(value) => {
+                    variables.insert(format!("input.{name}"), value.clone());
+                }
+                None => {
+                    missing.insert(name.clone());
+                }
+            }
+        }
+        let scope = Scope {
+            variables: &variables,
+            missing_inputs: &missing,
+            workspace,
+        };
+        collect(mission, "mission".into(), &scope, &mut items);
     }
     for (index, item) in items.iter_mut().enumerate() {
         item.log = directory.join(format!("{index}.log"));
@@ -369,16 +387,18 @@ fn stand_in_variables(
     variables
 }
 
+/// What a check's gates expand with: run variables, the inputs nobody gave, and the workspace.
+struct Scope<'a> {
+    variables: &'a BTreeMap<String, String>,
+    missing_inputs: &'a std::collections::BTreeSet<String>,
+    workspace: &'a str,
+}
+
 /// Each exec gate of `mission`, its steps, nested missions and loops, in declaration order.
-fn collect(
-    mission: &MissionSpec,
-    owner: String,
-    variables: &BTreeMap<String, String>,
-    workspace: &str,
-    items: &mut Vec<Item>,
-) {
+fn collect(mission: &MissionSpec, owner: String, scope: &Scope<'_>, items: &mut Vec<Item>) {
+    let variables = scope.variables;
     for gate in &mission.gates {
-        push(mission, &owner, gate, variables, workspace, items);
+        push(mission, &owner, gate, scope, items);
     }
     for id in &mission.display_order {
         let Some(step) = mission.steps.get(id) else {
@@ -395,36 +415,20 @@ fn collect(
             format!("step-run/{generation}/{}", step.path),
         );
         let step_owner = format!("step {}", step.path);
+        let step_scope = Scope {
+            variables: &step_variables,
+            ..*scope
+        };
         for gate in &step.gates {
-            push(
-                mission,
-                &step_owner,
-                gate,
-                &step_variables,
-                workspace,
-                items,
-            );
+            push(mission, &step_owner, gate, &step_scope, items);
         }
         if let Some(nested) = step.nested_mission.as_deref() {
-            collect(
-                nested,
-                step_owner.clone(),
-                &step_variables,
-                workspace,
-                items,
-            );
+            collect(nested, step_owner.clone(), &step_scope, items);
         }
         if let Some(spec) = step.loop_spec.as_deref() {
             let loop_owner = format!("loop {}", spec.path);
             for gate in &spec.until {
-                push(
-                    mission,
-                    &loop_owner,
-                    gate,
-                    &step_variables,
-                    workspace,
-                    items,
-                );
+                push(mission, &loop_owner, gate, &step_scope, items);
             }
             for round in [
                 Some(&spec.round),
@@ -434,7 +438,7 @@ fn collect(
             .into_iter()
             .flatten()
             {
-                collect(round, loop_owner.clone(), &step_variables, workspace, items);
+                collect(round, loop_owner.clone(), &step_scope, items);
             }
         }
     }
@@ -444,15 +448,21 @@ fn push(
     mission: &MissionSpec,
     owner: &str,
     gate: &GateSpec,
-    variables: &BTreeMap<String, String>,
-    workspace: &str,
+    scope: &Scope<'_>,
     items: &mut Vec<Item>,
 ) {
     let GateSpec::Mechanical { .. } = gate else {
         return;
     };
+    let definition = serde_json::to_string(gate).unwrap_or_default();
+    let missing = scope
+        .missing_inputs
+        .iter()
+        .filter(|name| definition.contains(&format!("${{input.{name}}}")))
+        .map(|name| format!("--input {name}=VALUE"))
+        .collect::<Vec<_>>();
     let mut expanded = gate.clone();
-    let expansion = crate::reconcile::expand_gate(&mut expanded, variables, workspace);
+    let expansion = crate::reconcile::expand_gate(&mut expanded, scope.variables, scope.workspace);
     let GateSpec::Mechanical {
         name,
         command,
@@ -474,7 +484,13 @@ fn push(
         answer: "waiting".into(),
         ..GateCheckItemView::default()
     };
-    if let Err(error) = expansion {
+    if !missing.is_empty() {
+        view.answer = "unchecked".into();
+        view.reason = Some(format!(
+            "it reads a mission input; give it with {}",
+            missing.join(" ")
+        ));
+    } else if let Err(error) = expansion {
         view.answer = "unchecked".into();
         view.reason = Some(format!("its definition does not expand: {error:#}"));
     }

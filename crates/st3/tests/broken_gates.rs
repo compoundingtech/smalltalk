@@ -549,4 +549,62 @@ mission "orchid/elsewhere" state="ready" {
             .unwrap()
             .contains("does not exist here yet")
     );
+
+    // A gate that reads an input runs with the value given, and is unchecked without one. A
+    // built-in gate runs its `st gate` command; this host has no GitHub token, so it is broken.
+    let inputs = root.path().join("inputs.kdl");
+    std::fs::write(
+        &inputs,
+        r#"version 2
+mission "orchid/inputs" state="ready" {
+  goal "Check gates that read inputs."
+  input "release" kind="text"
+  input "pull_request" kind="text"
+  step "tag" {
+    gate "the release is 1.4.0" { exec "test '${input.release}' = 1.4.0"; host "orchid"; workspace "."; }
+  }
+  step "land" {
+    gate "the fix merged" { merged "${input.pull_request}" }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let inputs = inputs.to_str().unwrap();
+    let check = |extra: &[&str]| {
+        let mut args = vec!["missions", "check", inputs, "--workspace", workspace];
+        args.extend_from_slice(extra);
+        let output = daemon.run_cli(&args);
+        let view: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.code(), view)
+    };
+    let (code, view) = check(&[]);
+    assert_eq!(code, Some(0), "{view:#}");
+    for gate in view["gates"].as_array().unwrap() {
+        assert_eq!(gate["answer"], "unchecked", "{gate:#}");
+        assert!(
+            gate["reason"].as_str().unwrap().contains("--input "),
+            "{gate:#}"
+        );
+    }
+    let (code, view) = check(&[
+        "--input",
+        "release=1.4.0",
+        "--input",
+        "pull_request=acme/app#7",
+    ]);
+    assert_eq!(code, Some(1), "{view:#}");
+    assert_eq!(view["gates"][0]["answer"], "pass", "{view:#}");
+    let merged = &view["gates"][1];
+    assert_eq!(merged["answer"], "broken", "{merged:#}");
+    assert_eq!(merged["exit_code"], 3, "{merged:#}");
+    assert!(
+        merged["output"]
+            .as_str()
+            .unwrap()
+            .contains("broken: GitHub observers have no token"),
+        "{merged:#}"
+    );
+    let (_, view) = check(&["--input", "release=1.5.0"]);
+    assert_eq!(view["gates"][0]["answer"], "not-yet", "{view:#}");
 }

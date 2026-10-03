@@ -8200,6 +8200,7 @@ async fn start_gate_check(
             },
             &intent,
             &request.workspace,
+            &request.inputs,
         )
     })
     .await

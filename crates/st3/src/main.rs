@@ -1677,6 +1677,10 @@ struct MissionCheckArgs {
     /// it.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// A mission input value for the check, as `missions start` takes it. A gate that reads an
+    /// input without one is unchecked.
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
 }
 
 #[derive(Subcommand)]
@@ -5080,7 +5084,7 @@ async fn check_before_publish(
     workspace: &Path,
 ) -> Result<()> {
     let mut announced = false;
-    let checked = run_gate_check(client, intent, workspace, |view, item| {
+    let checked = run_gate_check(client, intent, workspace, &[], |view, item| {
         if !announced {
             eprintln!("{}", gate_check_heading(view));
             announced = true;
@@ -5125,16 +5129,22 @@ async fn check_mission_file(
     let (kdl, source_name) = read_intent(Some(&args.file))?;
     let intent = IntentInput { kdl, source_name };
     let mut announced = false;
-    let checked = run_gate_check(client, &intent, &args.workspace, |view, item| {
-        if json_output {
-            return;
-        }
-        if !announced {
-            println!("{}", gate_check_heading(view));
-            announced = true;
-        }
-        print!("{}", render_gate_check_item(item));
-    })
+    let checked = run_gate_check(
+        client,
+        &intent,
+        &args.workspace,
+        &args.inputs,
+        |view, item| {
+            if json_output {
+                return;
+            }
+            if !announced {
+                println!("{}", gate_check_heading(view));
+                announced = true;
+            }
+            print!("{}", render_gate_check_item(item));
+        },
+    )
     .await?;
     let view = checked.context("this st daemon cannot check exec gates; update it")?;
     if json_output {
@@ -5154,6 +5164,7 @@ async fn run_gate_check(
     client: &Client,
     intent: &IntentInput,
     workspace: &Path,
+    inputs: &[(String, String)],
     mut report: impl FnMut(&st3::model::GateCheckView, &st3::model::GateCheckItemView),
 ) -> Result<Option<st3::model::GateCheckView>> {
     let workspace = std::path::absolute(workspace)
@@ -5161,6 +5172,7 @@ async fn run_gate_check(
     let request = st3::model::GateCheckRequest {
         intent: intent.clone(),
         workspace: workspace.display().to_string(),
+        inputs: inputs.iter().cloned().collect(),
     };
     let mut view: st3::model::GateCheckView = match client.post("/v1/gate-checks", &request).await {
         Ok(view) => view,

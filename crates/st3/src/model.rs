@@ -995,6 +995,9 @@ pub struct GateCheckRequest {
     pub intent: IntentInput,
     /// The workspace `${ST_WORKSPACE}` and relative gate workspaces stand for.
     pub workspace: String,
+    /// Values for the mission's inputs. A gate that reads an input without one is unchecked.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

@@ -803,13 +803,14 @@ attention item.
 `st missions check FILE` runs each exec gate in the file once, now, on this host, with the
 environment and `ST_GATE_REPORT` a run gives it, and prints each answer: pass, not yet, broken, or
 unchecked. `--workspace DIR` (the current directory by default) stands for the run's workspace,
-and the other run variables name the check. Gates run one at a time, in the order the file
-declares them. A gate declared for another host, or whose workspace does not exist yet, is
-unchecked; check it where it will run. The command exits 1 when a gate is broken. A check runs
+`--input NAME=VALUE` gives an input as `missions start` does, and the other run variables name the
+check. Gates run one at a time, in the order the file declares them. A gate declared for another
+host, whose workspace does not exist yet, or that reads an input the check was not given, is
+unchecked; check it where it will run, or with the input. The command exits 1 when a gate is broken. A check runs
 each command for real, so a gate with side effects has them when it is checked, too.
 
 ```sh
-st missions check release.kdl --workspace ~/src/app
+st missions check release.kdl --workspace ~/src/app --input commit=4f2a9c1
 ```
 
 `st missions publish` runs the same check first and refuses a mission with a broken gate, printing
