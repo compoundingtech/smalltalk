@@ -233,6 +233,9 @@ pub fn run_with_paths(
                     paths.session_dir.join(delivery_ledger::LEDGER_FILE),
                 );
                 delivery.control = control;
+                delivery.pinned_session = selected_session(&argv);
+                // A predecessor's record names the predecessor's session, never this one's.
+                let _ = std::fs::remove_file(&delivery.binding_path);
                 delivery
             },
             diagnostics,
@@ -603,6 +606,9 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
         if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
             evidence =
                 seed_with_diagnostics(&session.client, &mut machine, &mut session.diagnostics);
+        }
+        if evidence {
+            session.delivery.confirm_pinned(&session.client);
         }
         if evidence && let Some(observation) = machine.observation() {
             let _ = session.writer.observe(observation);
@@ -1657,6 +1663,27 @@ enum ReadBack {
     Indeterminate,
 }
 
+/// The file in a seat's agent directory naming the OpenCode session its delivery is bound to. The
+/// st3 driver reports it as the seat's native session.
+pub const NATIVE_SESSION_FILE: &str = "opencode-native-session";
+
+/// The session an OpenCode argv selects with `--session ID` or `-s ID`, before any `--`.
+pub fn selected_session(argv: &[String]) -> Option<String> {
+    let options = argv
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .collect::<Vec<_>>();
+    options.iter().enumerate().find_map(|(index, argument)| {
+        if let Some(id) = argument.strip_prefix("--session=") {
+            return Some(id.to_owned());
+        }
+        matches!(argument.as_str(), "--session" | "-s")
+            .then(|| options.get(index + 1).map(|id| (*id).clone()))
+            .flatten()
+    })
+}
+
 struct Delivery {
     catalog_root: PathBuf,
     inbox: PathBuf,
@@ -1667,7 +1694,12 @@ struct Delivery {
     ledger: delivery_ledger::Ledger,
     /// The session a new delivery binds to: the most recently observed one.
     target_session: Option<String>,
+    /// The one session this seat runs, when its argv selected one: delivery never leaves it.
+    pinned_session: Option<String>,
+    /// Where the bound session is recorded for the st3 driver.
+    binding_path: PathBuf,
     next_attempt: Instant,
+    next_pin_check: Instant,
 }
 
 impl Delivery {
@@ -1698,12 +1730,49 @@ impl Delivery {
             identity: identity.to_string(),
             ledger,
             target_session: None,
+            pinned_session: None,
+            binding_path: agent_dir.join(NATIVE_SESSION_FILE),
             next_attempt: Instant::now(),
+            next_pin_check: Instant::now(),
         }
     }
 
     fn saw_session(&mut self, session_id: &str) {
+        if self
+            .pinned_session
+            .as_deref()
+            .is_some_and(|pinned| pinned != session_id)
+        {
+            return;
+        }
+        if self.target_session.as_deref() == Some(session_id) {
+            return;
+        }
         self.target_session = Some(session_id.to_string());
+        // Best effort: a lost record delays only the report, never delivery.
+        if let Err(error) = harness_state::write_json_atomic(
+            &self.binding_path,
+            &json!({ "sessionId": session_id }),
+            self.binding_path.parent().unwrap_or(Path::new(".")),
+            ".opencode-native-session",
+        ) {
+            tracing::warn!("st opencode-session: native session record write failed: {error:#}");
+        }
+    }
+
+    /// Bind the pinned session once the server confirms it exists. Nothing else proves a
+    /// resumed session that stays idle: an idle session emits no event.
+    fn confirm_pinned(&mut self, client: &Client) {
+        let Some(pinned) = self.pinned_session.clone() else {
+            return;
+        };
+        if self.target_session.is_some() || Instant::now() < self.next_pin_check {
+            return;
+        }
+        self.next_pin_check = Instant::now() + Duration::from_secs(1);
+        if client.get_json(&format!("/session/{pinned}")).is_ok() {
+            self.saw_session(&pinned);
+        }
     }
 
     /// An assistant message whose `parentID` is our exact stable client message is the first

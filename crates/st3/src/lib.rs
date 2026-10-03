@@ -25,6 +25,8 @@ pub mod lane;
 pub mod mailbox;
 pub mod mission;
 pub mod model;
+/// A driver relaunches its harness on the native session a suspended seat resumes.
+pub mod native_resume;
 pub mod otlp;
 pub mod peer;
 pub mod person_request;
@@ -49,6 +51,8 @@ pub mod service;
 pub mod skill;
 pub mod store;
 pub mod subagents;
+/// Suspends a quiet seat and resumes its own native session.
+pub mod suspension;
 pub mod telemetry;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;

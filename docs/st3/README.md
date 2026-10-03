@@ -14,11 +14,16 @@ Use these documents for implementation details:
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.
 - [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
   are recorded and replicated.
+- [Checkpoints and trimming](checkpoints.md) explains how every node of a fleet agrees to delete old
+  claims together: when a checkpoint is due, seal, verify and trim, which claims a rule may drop and
+  why, excusing an unreachable member, and what the first real trim taught.
 - [Lanes](lanes.md) defines the ordered lanes a mission run works through, such as the merge
   train, and `st lanes`.
 - [Attachments](attachments.md) defines the images a message carries between machines: where the
   bytes live (never in sync), the limits, upload and read, and delivery to a seat.
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
+- [Suspending a seat](suspend.md) explains `st agents suspend` and `resume`: when a seat is quiet
+  enough to stop, and how each harness comes back on its own native session.
 - [Seats across deploys](seat-deploys.md) explains how a running seat's driver and channels follow
   a replaced st binary without ending the provider session, and how st reports a stale message path.
 - [Delivery probes](delivery-probes.md) describes token-free native-channel probes, per-direction

@@ -2629,7 +2629,9 @@ fn run_controlled_with_required_resume(
 ///
 /// The claims-graph runtime uses this entry point without an st2 catalog. The driver keeps the
 /// app-server protocol, delivery receipts, and harness records. Each st3 seat
-/// launch starts a new Codex thread; the graph holds continuity across restarts.
+/// launch starts a new Codex thread, except a resumed seat's: `resume_thread` names the thread it
+/// suspended on, and the TUI and control connection resume exactly that thread or fail.
+#[allow(clippy::too_many_arguments)]
 pub fn run_controlled_paths(
     driver_root: &Path,
     state_dir: &Path,
@@ -2638,6 +2640,7 @@ pub fn run_controlled_paths(
     runtime_id: String,
     codex_argv: Vec<String>,
     gate: crate::session_control::DeliveryGate,
+    resume_thread: Option<String>,
 ) -> Result<()> {
     anyhow::ensure!(
         !codex_argv.is_empty(),
@@ -2668,12 +2671,21 @@ pub fn run_controlled_paths(
     let _owner_lock = acquire_owner_lock(state_dir)?;
     let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
     diagnostics.record("ownerAcquired", json!({ "mode": "explicit-paths" }))?;
-    let resume_thread = select_resume_thread(
+    // The prior binding is always retired: a resumed thread binds again once its control
+    // connection accepts `thread/resume`, and only that new binding proves the resume.
+    let retired = select_resume_thread(
         &state_dir.join("binding.json"),
         &identity,
         &runtime_id,
         false,
     )?;
+    if let Some(thread) = &resume_thread {
+        anyhow::ensure!(
+            resume_insertion_index(&codex_argv[1..])?.is_some(),
+            "the Codex argv already selects a thread, so it cannot resume {thread}"
+        );
+    }
+    let resume_thread = resume_thread.or(retired);
     let result = run_controlled_owned(
         driver_root,
         state_dir,

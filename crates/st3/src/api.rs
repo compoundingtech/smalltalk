@@ -222,7 +222,7 @@ fn signal_visible_change(state: &AppState) {
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     code: String,
     message: String,
@@ -446,6 +446,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
+        .route("/v1/agents/suspend", post(suspend_agent))
+        .route("/v1/agents/resume", post(resume_agent))
+        .route("/v1/agents/native-session", post(report_native_session))
         .route("/v1/missions/{id}", get(get_mission))
         .route("/v1/missions/{id}/retire", post(retire_mission))
         .route("/v1/launches/{id}", get(get_planning_session))
@@ -1861,6 +1864,23 @@ fn client_agent_resources(
     Ok(items)
 }
 
+/// A seat's latest suspend or resume as client-v0 shows it.
+fn client_suspension(suspension: &crate::suspension::Suspension) -> Value {
+    json!({
+        "action": suspension.action,
+        "phase": suspension.phase,
+        "operation_id": suspension.operation_id,
+        "harness": suspension.harness,
+        "native_session_id": suspension.native_session_id,
+        "incarnation_id": suspension.incarnation_id,
+        "suspended_at": suspension.suspended_at_unix_ms.map(client_timestamp),
+        "updated_at": client_timestamp(suspension.updated_at_unix_ms),
+        "code": suspension.code,
+        "reason": suspension.reason,
+        "blocking": suspension.blocking,
+    })
+}
+
 /// Each seat's running subagents: open, with a lease that runs past this read. A lease runs out
 /// without a claim, so this is read per request rather than cached with the agents.
 fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
@@ -2081,6 +2101,13 @@ fn client_agent_resources_uncached(
                 _ => "stopped",
             };
             let state = if fault.is_some() { "failed" } else { state };
+            let suspension = crate::suspension::current(store, &subject.subject)?;
+            // A suspended seat has no process by design: it is neither stopped nor failed.
+            let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
+                Some("suspended") if fault.is_none() => "suspended",
+                Some("snapshotting" | "restoring") if state == "stopped" => "suspended",
+                _ => state,
+            };
             let runtime_id = fields
                 .and_then(|fields| fields.get("runtime_id"))
                 .and_then(Value::as_str);
@@ -2156,7 +2183,8 @@ fn client_agent_resources_uncached(
                     "agent_id": relationship.agent,
                     "reason": relationship.reason
                 })).collect::<Vec<_>>(),
-                "operational": subject.projection
+                "operational": subject.projection,
+                "suspension": suspension.as_ref().map(client_suspension),
             });
             Ok((name, value))
         })
@@ -4637,6 +4665,9 @@ async fn guard_bound_request(
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
         "/v1/agents/restart",
+        "/v1/agents/suspend",
+        "/v1/agents/resume",
+        "/v1/agents/native-session",
         "/v1/delivery/hold",
         "/v1/lane-changes",
         "/v1/work/",
@@ -8246,6 +8277,15 @@ async fn restart_agent(
     {
         return Ok(Json(prior));
     }
+    if crate::suspension::current(&state.store, &subject)
+        .map_err(ApiError::internal)?
+        .is_some_and(|suspension| suspension.holds_seat())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "restart-suspended",
+            "the seat is suspended; resume it with `st agents resume`",
+        )));
+    }
     let status = state
         .store
         .status(Some(&subject))
@@ -8318,6 +8358,321 @@ async fn restart_agent(
             evidence: vec![token],
             expected_subject: None,
             idempotency_key: Some(key),
+        })
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(claim))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentSuspensionRequest {
+    pub subject: String,
+    pub actor: String,
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// The seat a suspend or resume names: a declared service seat with no conflicting declaration.
+fn suspension_target(
+    state: &AppState,
+    subject: &str,
+) -> Result<
+    (
+        crate::model::SubjectStatus,
+        crate::model::MemberSpec,
+        String,
+    ),
+    ApiError,
+> {
+    let status = state
+        .store
+        .status(Some(subject))
+        .map_err(ApiError::internal)?;
+    let current = status
+        .subjects
+        .into_iter()
+        .find(|item| item.subject == subject)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-agent",
+                format!("no seat `{subject}`"),
+            ))
+        })?;
+    if !current.conflicts.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "suspend-conflict",
+            "resolve the seat's conflicting declarations first",
+        )));
+    }
+    let member = state
+        .store
+        .desired_subject_with_writer(subject)
+        .map_err(ApiError::internal)?
+        .map(|(desired, _)| desired)
+        .filter(|desired| desired.kind == "agent")
+        .and_then(|desired| desired.member)
+        .filter(|member| member.lifecycle == crate::model::MemberLifecycle::Service)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "suspend-not-declared",
+                "only a declared, started seat can be suspended or resumed",
+            ))
+        })?;
+    let token = current.desired_token.clone().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "suspend-not-declared",
+            "the seat has no selected declaration",
+        ))
+    })?;
+    Ok((current, member, token))
+}
+
+fn agent_subject(subject: String) -> String {
+    if subject.starts_with("agent/") {
+        subject
+    } else {
+        format!("agent/{subject}")
+    }
+}
+
+/// Ask the seat's owner to suspend it. The seat must be running and quiet now: its driver reports
+/// the harness quiescent, it holds no claimed step and runs no subagent, and its driver has bound
+/// a native session to resume. The owner checks again before it stops anything.
+async fn suspend_agent(
+    State(state): State<AppState>,
+    Json(request): Json<AgentSuspensionRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    request_suspend(&state, request, None).map(Json)
+}
+
+/// The fence a client-v0 action carries: the seat's running incarnation, when it names one, and
+/// its selected declaration.
+pub(crate) struct SuspensionFence {
+    pub incarnation: Option<String>,
+    pub desired: String,
+}
+
+fn check_suspension_fence(
+    fence: Option<&SuspensionFence>,
+    incarnation: Option<&str>,
+    token: &str,
+) -> Result<(), ApiError> {
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    if fence.desired != token
+        || fence
+            .incarnation
+            .as_deref()
+            .is_some_and(|expected| Some(expected) != incarnation)
+    {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            code: "stale-fence".into(),
+            message: "the seat changed since this action was prepared".into(),
+            details: Box::default(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn request_suspend(
+    state: &AppState,
+    request: AgentSuspensionRequest,
+    fence: Option<SuspensionFence>,
+) -> Result<ClaimRecord, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "invalid-suspend-actor")?;
+    let subject = agent_subject(request.subject);
+    let key = format!("agent-suspend:{subject}:{}", request.idempotency_key);
+    if let Some(prior) = state
+        .store
+        .operation_claim(&key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(prior);
+    }
+    let (current, member, token) = suspension_target(state, &subject)?;
+    if let Some(suspension) =
+        crate::suspension::current(&state.store, &subject).map_err(ApiError::internal)?
+        && suspension.holds_seat()
+    {
+        return Err(ApiError::bad(
+            St3Error::new(
+                "already-suspended",
+                format!("the seat is already {}", suspension.phase),
+            )
+            .with_detail("phase", suspension.phase),
+        ));
+    }
+    let actual = current
+        .actual
+        .as_ref()
+        .map(|actual| actual.get("fields").unwrap_or(actual));
+    let incarnation = actual
+        .filter(|fields| fields.get("status").and_then(Value::as_str) == Some("running"))
+        .and_then(|fields| fields.get("incarnation_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "suspend-not-running",
+                "only a running seat can be suspended",
+            ))
+        })?;
+    check_suspension_fence(fence.as_ref(), Some(incarnation), &token)?;
+    let blocking = crate::suspension::blockers(&state.store, &subject, incarnation)
+        .map_err(ApiError::internal)?;
+    if !blocking.is_empty() {
+        return Err(ApiError::bad(
+            St3Error::new(
+                "suspend-blocked",
+                format!("the seat is not quiet: {}", blocking.join(", ")),
+            )
+            .with_detail("blocking", blocking),
+        ));
+    }
+    let mut fields = BTreeMap::from([
+        ("action".into(), Value::String("suspend".into())),
+        (
+            "runtime_id".into(),
+            Value::String(member.runtime_id.clone()),
+        ),
+        ("incarnation_id".into(), Value::String(incarnation.into())),
+    ]);
+    if let Some(reason) = request.reason.filter(|reason| !reason.trim().is_empty()) {
+        fields.insert("reason".into(), Value::String(reason));
+    }
+    let claim = state
+        .store
+        .append_claim(&ClaimInput {
+            subject,
+            kind: "runtime.action.requested".into(),
+            actor: Some(actor),
+            fields,
+            evidence: vec![token],
+            expected_subject: None,
+            idempotency_key: Some(key),
+        })
+        .map_err(ApiError::bad)?;
+    signal_changed(state);
+    Ok(claim)
+}
+
+/// Ask the seat's owner to resume a suspended seat on the native session it suspended.
+async fn resume_agent(
+    State(state): State<AppState>,
+    Json(request): Json<AgentSuspensionRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    request_resume(&state, request, None).map(Json)
+}
+
+pub(crate) fn request_resume(
+    state: &AppState,
+    request: AgentSuspensionRequest,
+    fence: Option<SuspensionFence>,
+) -> Result<ClaimRecord, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "invalid-resume-actor")?;
+    let subject = agent_subject(request.subject);
+    let key = format!("agent-resume:{subject}:{}", request.idempotency_key);
+    if let Some(prior) = state
+        .store
+        .operation_claim(&key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(prior);
+    }
+    let (_, member, token) = suspension_target(state, &subject)?;
+    check_suspension_fence(fence.as_ref(), None, &token)?;
+    let suspension = crate::suspension::current(&state.store, &subject)
+        .map_err(ApiError::internal)?
+        .filter(|suspension| suspension.phase == "suspended")
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new("not-suspended", "the seat is not suspended"))
+        })?;
+    let suspend = suspension.suspend_operation_id.clone().ok_or_else(|| {
+        ApiError::internal(anyhow::anyhow!("a suspension without its suspend request"))
+    })?;
+    let claim = state
+        .store
+        .append_claim(&ClaimInput {
+            subject,
+            kind: "runtime.action.requested".into(),
+            actor: Some(actor),
+            fields: BTreeMap::from([
+                ("action".into(), Value::String("resume".into())),
+                (
+                    "runtime_id".into(),
+                    Value::String(member.runtime_id.clone()),
+                ),
+            ]),
+            evidence: vec![token, suspend],
+            expected_subject: None,
+            idempotency_key: Some(key),
+        })
+        .map_err(ApiError::bad)?;
+    signal_changed(state);
+    Ok(claim)
+}
+
+#[derive(Deserialize)]
+struct NativeSessionReport {
+    subject: String,
+    actor: String,
+    incarnation_id: String,
+    harness: String,
+    session_id: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// A seat's driver reports the native session its harness bound for one incarnation. Only the
+/// seat itself reports its own session.
+async fn report_native_session(
+    State(state): State<AppState>,
+    Json(request): Json<NativeSessionReport>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let subject = agent_subject(request.subject);
+    if request.actor != subject {
+        return Err(ApiError::bad(St3Error::new(
+            "foreign-agent-actor",
+            "a seat reports only its own native session",
+        )));
+    }
+    if request.session_id.is_empty() || request.incarnation_id.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-native-session",
+            "a native session report needs a session ID and an incarnation",
+        )));
+    }
+    let mut fields = BTreeMap::from([
+        ("harness".into(), Value::String(request.harness)),
+        (
+            "session_id".into(),
+            Value::String(request.session_id.clone()),
+        ),
+        ("agent".into(), Value::String(subject.clone())),
+        (
+            "incarnation_id".into(),
+            Value::String(request.incarnation_id.clone()),
+        ),
+        ("status".into(), Value::String("active".into())),
+    ]);
+    if let Some(path) = request.path {
+        fields.insert("path".into(), Value::String(path));
+    }
+    let claim = state
+        .store
+        .append_claim(&ClaimInput {
+            subject: subject.clone(),
+            kind: "harness.session-file".into(),
+            actor: Some(subject.clone()),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!(
+                "native-session:{subject}:{}:{}",
+                request.incarnation_id, request.session_id
+            )),
         })
         .map_err(ApiError::bad)?;
     signal_changed(&state);
@@ -12451,6 +12806,9 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
             "/v1/agents/restart",
+            "/v1/agents/suspend",
+            "/v1/agents/resume",
+            "/v1/agents/native-session",
             "/v1/work/revision/approve/proposal",
             "/v1/mission-runs/example%2Fdemo%2F1/outcome",
             "/v1/mission-runs/example%2Fdemo%2F1/revision",
@@ -12507,6 +12865,102 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 .await
                 .is_ok()
         );
+    }
+
+    /// #901: a seat suspends only once its driver reports it quiet and it has a native session
+    /// to resume; a suspension holds the seat against restarts until a resume.
+    #[tokio::test]
+    async fn suspend_waits_for_a_quiet_seat_with_a_native_session() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let source = format!(
+            "version 2\nagent \"test/seat\" {{\n host \"node\"\n workspace {:?}\n harness \"claude\" {{}}\n}}\n",
+            root.path().display().to_string()
+        );
+        let request = apply_request(&state, &source, "person/test", "declare");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(request).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let subject = "agent/test/seat";
+        let incarnation = "4242:2026-10-02T20:00:00.000Z";
+        let append = |kind: &str, fields: Value| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let ask = |path: &'static str, key: &str| {
+            json_request(
+                app.clone(),
+                path,
+                json!({"subject": subject, "actor": "person/test", "idempotency_key": key}),
+            )
+        };
+        let (status, body) = ask("/v1/agents/suspend", "stopped").await;
+        assert_eq!(body["code"], "suspend-not-running", "{status} {body}");
+        append(
+            "runtime.observed",
+            json!({"status": "running", "runtime_id": "seat", "incarnation_id": incarnation}),
+        );
+        append(
+            "harness.observed",
+            json!({"state": "working", "incarnation_id": incarnation, "quiescent": false,
+                   "blocking": ["turn-in-flight"]}),
+        );
+        let (status, body) = ask("/v1/agents/suspend", "busy").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "suspend-blocked");
+        assert_eq!(
+            body["details"]["blocking"],
+            json!(["native-session-unbound", "turn-in-flight"])
+        );
+        // Only the seat itself reports its native session.
+        let report = |actor: &str| {
+            json!({"subject": subject, "actor": actor, "incarnation_id": incarnation,
+                   "harness": "claude", "session_id": "native-one"})
+        };
+        let (_, body) = json_request(
+            app.clone(),
+            "/v1/agents/native-session",
+            report("agent/other"),
+        )
+        .await;
+        assert_eq!(body["code"], "foreign-agent-actor");
+        let (status, body) =
+            json_request(app.clone(), "/v1/agents/native-session", report(subject)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        append(
+            "harness.observed",
+            json!({"state": "idle", "incarnation_id": incarnation, "quiescent": true,
+                   "blocking": []}),
+        );
+        let (_, body) = ask("/v1/agents/resume", "early").await;
+        assert_eq!(body["code"], "not-suspended");
+        let (status, body) = ask("/v1/agents/suspend", "quiet").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["body"]["fields"]["action"], "suspend");
+        let suspension = crate::suspension::current(&state.store, subject)
+            .unwrap()
+            .unwrap();
+        assert_eq!(suspension.phase, "quiescing");
+        assert!(suspension.holds_seat());
+        let (_, body) = ask("/v1/agents/suspend", "again").await;
+        assert_eq!(body["code"], "already-suspended");
+        let (_, body) = ask("/v1/agents/restart", "restart").await;
+        assert_eq!(body["code"], "restart-suspended");
     }
 
     #[cfg(target_os = "linux")]

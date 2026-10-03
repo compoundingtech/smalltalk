@@ -18,8 +18,12 @@ use super::checkpoint_agreement::{
 use super::*;
 use crate::replication::InventoryCheckpoint;
 
-/// Envelopes deleted per transaction, so a trim never holds the writer for long.
+/// At most this many envelopes deleted per transaction.
 pub const TRIM_CHUNK_ENVELOPES: usize = 2_000;
+
+/// A trim commits a chunk once it has run this long, so it never holds the writer for long
+/// however slow a row is to delete, and writes queued behind it wait about this long.
+pub const TRIM_CHUNK_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// A point in a trim where a test makes it stop, as a crash would there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +152,22 @@ impl Store {
     pub fn set_trim_chunk_envelopes(&self, envelopes: usize) {
         self.trim_chunk_envelopes
             .store(envelopes.max(1), Ordering::Release);
+    }
+
+    /// Make deleting each envelope or claim take this much longer, as a slow store would. Tests
+    /// only.
+    pub fn set_trim_row_cost(&self, cost: std::time::Duration) {
+        self.trim_row_cost_micros.store(
+            u64::try_from(cost.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    fn pause_for_trim_row_cost(&self) {
+        let micros = self.trim_row_cost_micros.load(Ordering::Acquire);
+        if micros > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(micros));
+        }
     }
 
     /// Apply a graph fault a test armed, inside the first chunk's transaction.
@@ -505,94 +525,42 @@ impl Store {
     }
 
     /// Delete every row a tombstone stands for, in chunks, then mark the checkpoint trimmed.
-    /// Running it again after a crash deletes only what is left. Each chunk checks, inside its
-    /// own transaction, that the graph did not change; the proof showed it cannot.
+    /// Running it again after a crash deletes only what is left. A chunk deletes one envelope at
+    /// a time and commits once it has run for `TRIM_CHUNK_BUDGET`, so it holds the writer for
+    /// tens of milliseconds however slow a row is to delete, and the writes queued behind it run
+    /// before the next chunk takes the writer again. Each chunk checks, inside its own
+    /// transaction, that the graph did not change; the proof showed it cannot.
     pub fn finish_trim(&self, checkpoint: &str, actions: &mut Vec<CheckpointAction>) -> Result<()> {
         let mut chunks = 0;
         let mut deleted_envelopes = 0;
         let mut deleted_claims = 0;
+        let mut cursor = TrimCursor::default();
         loop {
             let mut connection = self.connection.write();
             let transaction = connection.transaction()?;
-            let envelopes = transaction
-                .prepare_cached(
-                    "SELECT tombstone.writer, tombstone.sequence, tombstone.envelope_hash,
-                            tombstone.accepted_at_unix_ms
-                     FROM checkpoint_envelopes AS tombstone
-                     WHERE EXISTS (
-                         SELECT 1 FROM replica_envelopes AS held
-                         WHERE held.writer=tombstone.writer AND held.sequence=tombstone.sequence
-                           AND held.envelope_hash=tombstone.envelope_hash)
-                     LIMIT ?1",
-                )?
-                .query_map([self.trim_chunk_envelopes.load(Ordering::Acquire)], |row| {
-                    Ok(EnvelopeTombstone {
-                        writer: row.get(0)?,
-                        sequence: row.get(1)?,
-                        envelope_hash: row.get(2)?,
-                        accepted_at_unix_ms: u128::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut claims = Vec::new();
-            {
-                let mut statement = transaction.prepare_cached(
-                    "SELECT tombstone.id, tombstone.operation_id FROM checkpoint_claims AS tombstone
-                     WHERE tombstone.writer=?1 AND tombstone.sequence=?2
-                       AND tombstone.envelope_hash=?3
-                       AND EXISTS (SELECT 1 FROM claims WHERE claims.id=tombstone.id)",
-                )?;
-                for envelope in &envelopes {
-                    claims.extend(
-                        statement
-                            .query_map(
-                                params![envelope.writer, envelope.sequence, envelope.envelope_hash],
-                                |row| {
-                                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                                },
-                            )?
-                            .collect::<rusqlite::Result<Vec<_>>>()?,
-                    );
-                }
-            }
-            // A claim whose envelope is already gone, left by an older build's trim or a
-            // crash between chunks of another checkpoint.
-            if envelopes.is_empty() {
-                claims = transaction
-                    .prepare_cached(
-                        "SELECT tombstone.id, tombstone.operation_id FROM checkpoint_claims AS tombstone
-                         WHERE EXISTS (SELECT 1 FROM claims WHERE claims.id=tombstone.id)
-                         LIMIT ?1",
-                    )?
-                    .query_map([self.trim_chunk_envelopes.load(Ordering::Acquire)], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                if claims.is_empty() {
-                    break;
-                }
-            }
-            let claims = claims
-                .into_iter()
-                .map(|(id, operation_id)| ClaimTombstone {
-                    id,
-                    operation_id,
-                    writer: String::new(),
-                    sequence: 0,
-                    envelope_hash: String::new(),
-                    subject: String::new(),
-                    kind: String::new(),
-                    actor: None,
-                    predecessors: Vec::new(),
-                    request_digest: None,
-                    accepted_at_unix_ms: 0,
-                })
-                .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            let most = self.trim_chunk_envelopes.load(Ordering::Acquire);
             // Deleting claims touches no graph table, so the generation stays. Only if it moved
             // are the digests themselves compared, before and after, in this transaction.
             let generation = projection_digest::generation(&transaction)?;
             transaction.execute_batch("SAVEPOINT trim_chunk")?;
-            delete_dropped_rows_tx(&transaction, &envelopes, &claims)?;
+            let mut envelopes = Vec::new();
+            let mut claims = Vec::new();
+            let mut steps = 0;
+            while steps < most && started.elapsed() < TRIM_CHUNK_BUDGET {
+                let (envelope, envelope_claims) = next_trim_rows(&transaction, &mut cursor)?;
+                if envelope.is_none() && envelope_claims.is_empty() {
+                    break;
+                }
+                delete_dropped_rows_tx(&transaction, envelope.as_slice(), &envelope_claims)?;
+                self.pause_for_trim_row_cost();
+                envelopes.extend(envelope);
+                claims.extend(envelope_claims);
+                steps += 1;
+            }
+            if steps == 0 {
+                break;
+            }
             self.alter_graph_for_trim_fault(&transaction)?;
             let changed = if projection_digest::generation(&transaction)? == generation {
                 false
@@ -652,5 +620,107 @@ impl Store {
             claims: deleted_claims,
         });
         Ok(())
+    }
+}
+
+/// Where a trim goes on from: the last envelope tombstone it read, then the last claim tombstone
+/// whose envelope was already gone. Each is read once, however many chunks the trim takes.
+#[derive(Default)]
+struct TrimCursor {
+    envelope: (String, i64, String),
+    envelopes_done: bool,
+    claim: String,
+}
+
+/// The next envelope a tombstone stands for that this node still holds, with its claims. Once
+/// none is left, the next claim whose envelope is already gone, left by an older build's trim or
+/// a crash between chunks of another checkpoint. Nothing when the trim is done.
+fn next_trim_rows(
+    transaction: &Transaction<'_>,
+    cursor: &mut TrimCursor,
+) -> Result<(Option<EnvelopeTombstone>, Vec<ClaimTombstone>)> {
+    if !cursor.envelopes_done {
+        let envelope = transaction
+            .prepare_cached(
+                "SELECT tombstone.writer, tombstone.sequence, tombstone.envelope_hash,
+                        tombstone.accepted_at_unix_ms
+                 FROM checkpoint_envelopes AS tombstone
+                 WHERE (tombstone.writer, tombstone.sequence, tombstone.envelope_hash)
+                       > (?1, ?2, ?3)
+                   AND EXISTS (
+                     SELECT 1 FROM replica_envelopes AS held
+                     WHERE held.writer=tombstone.writer AND held.sequence=tombstone.sequence
+                       AND held.envelope_hash=tombstone.envelope_hash)
+                 ORDER BY tombstone.writer, tombstone.sequence, tombstone.envelope_hash
+                 LIMIT 1",
+            )?
+            .query_row(
+                params![cursor.envelope.0, cursor.envelope.1, cursor.envelope.2],
+                |row| {
+                    Ok(EnvelopeTombstone {
+                        writer: row.get(0)?,
+                        sequence: row.get(1)?,
+                        envelope_hash: row.get(2)?,
+                        accepted_at_unix_ms: u128::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(envelope) = envelope {
+            cursor.envelope = (
+                envelope.writer.clone(),
+                i64::try_from(envelope.sequence)?,
+                envelope.envelope_hash.clone(),
+            );
+            let claims = transaction
+                .prepare_cached(
+                    "SELECT tombstone.id, tombstone.operation_id FROM checkpoint_claims AS tombstone
+                     WHERE tombstone.writer=?1 AND tombstone.sequence=?2
+                       AND tombstone.envelope_hash=?3
+                       AND EXISTS (SELECT 1 FROM claims WHERE claims.id=tombstone.id)",
+                )?
+                .query_map(
+                    params![envelope.writer, envelope.sequence, envelope.envelope_hash],
+                    |row| Ok(deletable_claim(row.get(0)?, row.get(1)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            return Ok((Some(envelope), claims));
+        }
+        cursor.envelopes_done = true;
+    }
+    let claim = transaction
+        .prepare_cached(
+            "SELECT tombstone.id, tombstone.operation_id FROM checkpoint_claims AS tombstone
+             WHERE tombstone.id > ?1
+               AND EXISTS (SELECT 1 FROM claims WHERE claims.id=tombstone.id)
+             ORDER BY tombstone.id LIMIT 1",
+        )?
+        .query_row([&cursor.claim], |row| {
+            Ok(deletable_claim(row.get(0)?, row.get(1)?))
+        })
+        .optional()?;
+    Ok(match claim {
+        Some(claim) => {
+            cursor.claim = claim.id.clone();
+            (None, vec![claim])
+        }
+        None => (None, Vec::new()),
+    })
+}
+
+/// What `delete_dropped_rows_tx` needs of a claim it deletes.
+fn deletable_claim(id: String, operation_id: Option<String>) -> ClaimTombstone {
+    ClaimTombstone {
+        id,
+        operation_id,
+        writer: String::new(),
+        sequence: 0,
+        envelope_hash: String::new(),
+        subject: String::new(),
+        kind: String::new(),
+        actor: None,
+        predecessors: Vec::new(),
+        request_digest: None,
+        accepted_at_unix_ms: 0,
     }
 }

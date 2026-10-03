@@ -7,7 +7,9 @@ message.
     run BINARY EVIDENCE_DIR HARNESS SCENARIO [--bound SECONDS] [--scratch DIR] [--replacement-binary BINARY]
 
 `HARNESS` is `claude`, `codex`, `pi`, `omp` or `opencode`. `SCENARIO` is `fresh`, `restart`,
-`daemon-restart`, `reexec` or `concurrent`; `run --help` says what each does. The Rust wrapper
+`daemon-restart`, `reexec`, `concurrent` or `suspend`; `run --help` says what each does. Each
+stand-in keeps its sessions the way its harness does, so `suspend` proves that a resumed seat comes
+back on the session it suspended on. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
 
 Every fresh scenario also checks that the native driver creates no `catalog.kdl`, `agent.kdl`,

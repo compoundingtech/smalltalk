@@ -97,6 +97,8 @@
     "agent.create": { "capability": "control.runtimes", "parameters": "AgentCreateParameters" },
     "agent.stop": { "capability": "control.runtimes", "parameters": "AgentStopParameters" },
     "agent.start": { "capability": "control.runtimes", "parameters": "AgentStartParameters" },
+    "agent.suspend": { "capability": "control.runtimes", "parameters": "AgentSuspendParameters" },
+    "agent.resume": { "capability": "control.runtimes", "parameters": "AgentResumeParameters" },
     "terminal.create": { "capability": "terminal.control", "parameters": "TerminalCreateParameters" },
     "terminal.end": { "capability": "terminal.control", "parameters": "TargetParameters" },
     "agent.queue-move": { "capability": "control.work", "parameters": "AgentQueueMoveParameters" },

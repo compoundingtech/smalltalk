@@ -1002,6 +1002,8 @@ const ACTIONS: &[&str] = &[
     "agent.create",
     "agent.stop",
     "agent.start",
+    "agent.suspend",
+    "agent.resume",
     "terminal.create",
     "terminal.end",
     "agent.queue-move",
@@ -1051,6 +1053,8 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "agent.create",
     "agent.stop",
     "agent.start",
+    "agent.suspend",
+    "agent.resume",
     "terminal.create",
     "terminal.end",
     "agent.queue-move",
@@ -6604,7 +6608,10 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
-    if matches!(action, "agent.create" | "agent.stop" | "agent.start") {
+    if matches!(
+        action,
+        "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume"
+    ) {
         return Some("control.runtimes");
     }
     if action == "work.done" {
@@ -7902,6 +7909,43 @@ async fn dispatch_action(
                 format!("version 2\n{node}\n")
             };
             apply_runtime_control_intent(state, snapshot, request, authority_actor, kdl).await?;
+            Ok(vec![agent])
+        }
+        action @ ("agent.suspend" | "agent.resume") => {
+            let agent = client_detail_id("agent", &parameter_string(p, "agent")?);
+            let reason = if action == "agent.suspend" {
+                serde_json::from_value::<st3_client::AgentSuspendParameters>(p.clone())
+                    .map_err(|error| validation(error.to_string()))?
+                    .reason
+            } else {
+                serde_json::from_value::<st3_client::AgentResumeParameters>(p.clone())
+                    .map_err(|error| validation(error.to_string()))?;
+                None
+            };
+            let desired = request
+                .fence
+                .runtime_desired_revision
+                .clone()
+                .ok_or_else(|| validation("the action needs fence.runtime_desired_revision"))?;
+            let incarnation = request.fence.runtime_incarnation.clone();
+            if action == "agent.suspend" && incarnation.is_none() {
+                return Err(validation("agent.suspend needs fence.runtime_incarnation"));
+            }
+            let suspension = super::AgentSuspensionRequest {
+                subject: agent.clone(),
+                actor: authority_actor.clone(),
+                idempotency_key: request.idempotency_key.clone(),
+                reason,
+            };
+            let fence = super::SuspensionFence {
+                incarnation,
+                desired,
+            };
+            if action == "agent.suspend" {
+                super::request_suspend(state, suspension, Some(fence))?;
+            } else {
+                super::request_resume(state, suspension, Some(fence))?;
+            }
             Ok(vec![agent])
         }
         "agent.queue-move" => {

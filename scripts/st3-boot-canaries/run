@@ -14,6 +14,10 @@ step it names. SCENARIO is one of
     reexec          the st binary is replaced; the seat's driver re-execs into it and still
                     takes a message
     concurrent      five seats launch at once
+    suspend         the booted seat finishes its step and is suspended: no process remains, a
+                    message waits, and resume brings back the same native session, which reads
+                    it. Then a resume whose transcript is gone fails with a typed reason and the
+                    seat stays suspended.
 
 Every seat must, within the time bound, claim its step with its current incarnation and read an
 st message, and none may park in the crash-loop guard. The verdict is in EVIDENCE_DIR/result.json.
@@ -35,7 +39,7 @@ sys.dont_write_bytecode = True
 from st_boundary import fresh_seat_findings
 
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
-SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent")
+SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend")
 RUN_ID = "c1"
 MISSION = "canary/boot"
 LETTERS = "abcde"
@@ -199,9 +203,16 @@ def seat_subject(letter):
     return f"agent/{RUN_ID}/seat-{letter}"
 
 
-def mission_source(node, count, harness):
+def mission_source(node, count, harness, hold=False):
     seats = ""
-    steps = ""
+    # A step waiting on a gate that never passes keeps the run, and so its seats, alive after the
+    # seats finish theirs.
+    steps = """
+  step "hold" {
+    agentless
+    title "Boot canary: the run stays open"
+    gate "never" { exists "mission-run/${ST_MISSION_RUN}/never" }
+  }""" if hold else ""
     for letter in LETTERS[:count]:
         seats += f'''
   agent "seat-{letter}" {{
@@ -325,8 +336,142 @@ def driver_processes(node):
     return rows
 
 
+def check_boundary(node):
+    """A fresh seat's processes stay inside st's boundary."""
+    processes = node.seat_processes(with_environment=True)
+    violations = list(fresh_seat_findings(node.root, processes))
+    if violations:
+        fail("fresh seat boundary: " + "; ".join(violations))
+
+
+def wait_drained(spools, bound):
+    """Every observation a seat's driver committed to its spool is acknowledged in time."""
+    import sqlite3
+
+    def drained():
+        for database in spools:
+            with sqlite3.connect(database) as connection:
+                if connection.execute("SELECT EXISTS(SELECT 1 FROM events)").fetchone()[0]:
+                    return False
+        return True
+    until(drained, bound, "committed harness observations were not acknowledged")
+
+
+def receipts(node, letter):
+    path = node.root / "ws" / f"receipts-{seat_subject(letter).replace('/', '-')}.jsonl"
+    rows = []
+    for line in path.read_text().splitlines() if path.exists() else []:
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    return rows
+
+
+def native_sessions(node, letter):
+    """Each native session the stand-in ran, in order: (id, resumed)."""
+    found = []
+    for row in receipts(node, letter):
+        if row.get("event") in ("session", "thread"):
+            found.append((row.get("session_id") or row.get("sessionId") or row.get("id"),
+                          bool(row.get("resumed"))))
+    return found
+
+
+def forget_native_session(node, harness, session):
+    """Remove what the harness resumes `session` from, as a lost transcript would."""
+    home = node.root / "home"
+    if harness == "claude":
+        paths = list((home / ".claude/projects").rglob(f"{session}.jsonl"))
+    elif harness == "codex":
+        paths = list((home / ".codex/sessions").rglob(f"rollout-*-{session}.jsonl"))
+    elif harness in ("pi", "omp"):
+        paths = list((node.root / "state").rglob(f"provider-sessions/*_{session}.jsonl"))
+    else:
+        import sqlite3
+        with sqlite3.connect(home / ".local/share/opencode/opencode.db") as connection:
+            removed = connection.execute("DELETE FROM session WHERE id=?", (session,)).rowcount
+        paths = [] if removed else None
+    if paths is None or (harness != "opencode" and not paths):
+        fail(f"no {harness} transcript of {session} to remove")
+    for path in paths:
+        path.unlink()
+
+
+def suspend_and_resume(node, seats, harness):
+    subject = seat_subject("a")
+    step = seats.step("a")
+    work = node.json("work", "show", step)["value"]
+    node.cli("work", "complete", step, "--as", subject, "--incarnation", work["claim_incarnation"],
+             "--summary", "boot canary step done")
+
+    def suspend():
+        # The harness settles after its last turn; until its driver reports it quiet, st refuses.
+        result = node.cli("agents", "suspend", subject, "--as", "person/eval", "--timeout", "60s",
+                          "--json", check=False)
+        try:
+            return json.loads(result)
+        except ValueError:
+            return None
+    agent = until(suspend, seats.bound, "the seat never suspended: " + json.dumps(
+        node.json("agents", "show", subject).get("value", {}).get("suspension")))
+    suspension = agent.get("suspension") or {}
+    native = suspension.get("native_session_id")
+    if agent.get("state") != "suspended" or suspension.get("phase") != "suspended" or not native:
+        fail(f"suspend did not leave a suspended seat with a native session: {json.dumps(agent)}")
+    launched = native_sessions(node, "a")
+    if not launched or launched[-1][0] != native:
+        fail(f"the suspended session {native} is not the one the harness ran: {launched}")
+    # The suspend scenario runs one seat, so every seat process this daemon launched is its.
+    until(lambda: not node.seat_processes(), 60, "a suspended seat still has processes: "
+          + json.dumps(node.seat_processes()))
+
+    # Mail to a suspended seat waits, and its restart policy does not wake it.
+    sent = node.json("conversations", "send", subject, "--from", "person/eval",
+                     "--subject", "while suspended", "--body", "boot canary suspended")["subject"]
+    time.sleep(5)
+    held = node.api("/v1/messages/read/" + sent) or {}
+    if held.get("status") in ("read", "closed"):
+        fail("a suspended seat read a message")
+    if node.json("agents", "show", subject)["value"].get("state") != "suspended":
+        fail("a suspended seat did not stay suspended")
+
+    resumed = json.loads(node.cli("agents", "resume", subject, "--as", "person/eval",
+                                  "--timeout", f"{seats.bound:.0f}s", "--json"))
+    after = resumed.get("suspension") or {}
+    if after.get("phase") != "resumed" or after.get("native_session_id") != native:
+        fail(f"resume did not bring back session {native}: {json.dumps(resumed)}")
+    latest = native_sessions(node, "a")[-1]
+    if latest != (native, True):
+        fail(f"the resumed harness ran {latest}, not session {native} resumed")
+    until(lambda: (node.api("/v1/messages/read/" + sent) or {}).get("status") in ("read", "closed"),
+          seats.bound, "the resumed seat did not read the message that waited for it")
+    wait_drained(list((node.root / "state/drivers").rglob("st-harness-events.sqlite")), seats.bound)
+    check_boundary(node)
+
+    # A resume that cannot find its session says why, and the seat stays suspended.
+    agent = until(suspend, seats.bound, "the resumed seat never suspended again")
+    native = agent["suspension"]["native_session_id"]
+    forget_native_session(node, harness, native)
+    result = subprocess.run([str(node.binary), "--endpoint", str(node.endpoint), "agents", "resume", subject,
+                             "--as", "person/eval", "--timeout", f"{seats.bound:.0f}s"],
+                            env=node.env, capture_output=True, text=True, timeout=seats.bound + 30)
+    if result.returncode == 0:
+        fail("a resume without its transcript succeeded")
+    shown = node.json("agents", "show", subject)["value"]
+    code = (shown.get("suspension") or {}).get("code")
+    if shown.get("state") != "suspended" or code not in (
+            "transcript-missing", "harness-refused", "native-resume-unavailable"):
+        fail(f"a failed resume left {json.dumps(shown.get('suspension'))} in state {shown.get('state')}: "
+             f"{result.stderr.strip()}")
+    seats.timings["suspend:failed-resume-code"] = code
+
+
 def scenario(node, seats, name, scratch, replacement_binary=None):
     if name in ("fresh", "concurrent"):
+        return
+    if name == "suspend":
+        suspend_and_resume(node, seats, node.harness)
         return
     if name == "restart":
         node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
@@ -378,7 +523,7 @@ def run(args, root, evidence):
     try:
         node.start()
         source = root / "mission.kdl"
-        source.write_text(mission_source(node, count, args.harness))
+        source.write_text(mission_source(node, count, args.harness, hold=args.scenario == "suspend"))
         node.cli("missions", "publish", str(source), "--as", "person/eval")
         node.cli("missions", "start", MISSION, "--id", RUN_ID, "--workspace", str(root / "ws"),
                  "--as", "person/eval")
@@ -400,18 +545,11 @@ def run(args, root, evidence):
                 fail("fresh native seats used polled harness records: " + str(records))
             if len(spools) != len(letters):
                 fail("a fresh native seat has no durable observation spool")
-            import sqlite3
-            def drained():
-                for database in spools:
-                    with sqlite3.connect(database) as connection:
-                        if connection.execute("SELECT EXISTS(SELECT 1 FROM events)").fetchone()[0]:
-                            return False
-                return True
-            until(drained, args.bound, "committed harness observations were not acknowledged")
-            processes = node.seat_processes(with_environment=True)
-            violations = list(fresh_seat_findings(root, processes))
-            if violations:
-                fail("fresh seat boundary: " + "; ".join(violations))
+            # A suspended seat has no driver to acknowledge what its last one committed while it
+            # stopped, and no process to inspect; `suspend` checks both while the resumed seat runs.
+            if args.scenario != "suspend":
+                wait_drained(spools, args.bound)
+                check_boundary(node)
         return {"verdict": "pass", "harness": args.harness, "scenario": args.scenario,
                 "seconds_to_boot": seats.timings, "catalog_files": len(catalogs_after),
                 "harness_record_files": len(records), "observation_spools": len(spools)}
