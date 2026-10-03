@@ -52,6 +52,8 @@ pub mod reconcile;
 pub mod rules;
 /// Observes git and gh calls without changing their command behavior.
 pub mod recorder;
+/// Imports local command receipts into durable resource observations.
+pub mod recorder_receipts;
 /// Summarizes command recorder logs from one or more hosts.
 pub mod recorder_report;
 /// Finds references a publication or the graph names that do not resolve.
