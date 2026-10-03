@@ -1015,6 +1015,9 @@ pub(crate) struct MissionGateRunner {
     pub retired: bool,
 }
 
+/// The claims of one idempotency key used for different requests, each as `(subject, writer)`.
+pub type IdempotencyConflict = Vec<(String, String)>;
+
 /// smalltalk's store: the graph store, which it derefs to, and smalltalk's runtime, which
 /// keeps the caches of its projections and plugs its claim kinds into the graph.
 pub struct Store {
@@ -2229,14 +2232,50 @@ impl Store {
     /// whether it had to. A start no longer rebuilds it; the daemon checks off the request path
     /// once it serves.
     pub fn repair_operation_projection_drift(&self) -> Result<bool> {
-        if self.operation_projection_drift()?.is_empty() {
+        // Finding the drift reads every operation, on a read connection. Repairing it writes
+        // only the drifted rows: rebuilding the whole table held the only writer for a minute
+        // and more on a populated store, stalling every write behind it.
+        let drift = self.operation_projection_drift()?;
+        if drift.is_empty() {
             return Ok(false);
         }
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
-        rebuild_operations_tx(&transaction)?;
+        repair_operations_tx(&transaction, &drift)?;
         transaction.commit()?;
         Ok(true)
+    }
+
+    /// Idempotency keys that two requests with different content used, which only members
+    /// that accepted them apart, as during a partition, can produce: how many there are, and up
+    /// to `limit` of them with the subject and writer of each claim. Both claims stand.
+    pub fn idempotency_conflicts(&self, limit: usize) -> Result<(u64, Vec<IdempotencyConflict>)> {
+        let connection = self.readers.get();
+        let count: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE state='conflict'",
+            [],
+            |row| row.get(0),
+        )?;
+        let operations = connection
+            .prepare_cached(
+                "SELECT id FROM operations INDEXED BY operations_conflict_index
+                 WHERE state='conflict' ORDER BY id LIMIT ?1",
+            )?
+            .query_map([limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut claims = connection.prepare_cached(
+            "SELECT subject, origin FROM claims
+             WHERE json_extract(body, '$._operation.id')=?1 ORDER BY subject, origin",
+        )?;
+        let mut conflicts = Vec::new();
+        for operation in operations {
+            conflicts.push(
+                claims
+                    .query_map([&operation], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        Ok((count, conflicts))
     }
 
     pub fn operation_projection_drift(&self) -> Result<Vec<String>> {
@@ -8248,6 +8287,63 @@ impl Store {
             .map_err(|error| St3Error::new("internal", error))?
     }
 
+    pub(crate) fn append_harness_event(
+        &self,
+        publication: &crate::harness_events::Publication,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        let mut input = publication.claim.clone();
+        if publication.sequence == 0
+            || publication.runtime_incarnation.is_empty()
+            || !matches!(
+                input.kind.as_str(),
+                "harness.observed" | "harness.usage" | "harness.limits" | "harness.timeline"
+            )
+            || input.actor.as_deref() != Some(input.subject.as_str())
+            || input.idempotency_key.is_none()
+        {
+            return Err(St3Error::new(
+                "invalid-harness-event",
+                "invalid native observation envelope",
+            ));
+        }
+        st3_schema::registry()
+            .validate_public_claim(
+                &input.subject,
+                &input.kind,
+                &input.fields,
+                input.actor.as_deref(),
+            )
+            .map_err(|error| St3Error::new(error.code, error.message))?;
+        // A context event can yield two independently acknowledged usage semantics. Its slot
+        // is stable even if a caller mistakenly changes its body on retry.
+        let source_runtime = input
+            .fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            .filter(|runtime| !runtime.is_empty())
+            .ok_or_else(|| {
+                St3Error::new(
+                    "invalid-harness-event",
+                    "event has no source runtime provenance",
+                )
+            })?;
+        let slot = input
+            .fields
+            .get("semantics")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        input.idempotency_key = Some(format!(
+            "harness-event:{}:{}:{}:{}:{}",
+            input.subject, source_runtime, publication.sequence, input.kind, slot
+        ));
+        append_claim_with_fences(
+            &self.graph,
+            &input,
+            None,
+            Some(&publication.runtime_incarnation),
+        )
+    }
+
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
         self.append_claim_outcome(input).map(|(claim, _)| claim)
     }
@@ -8259,13 +8355,23 @@ impl Store {
         self.graph.append_claim_outcome(input)
     }
 
+    #[cfg(test)]
     pub(crate) fn append_mailbox_receipt(
         &self,
         input: &ClaimInput,
         fence: &crate::mailbox::Fence,
     ) -> Result<ClaimRecord, St3Error> {
-        self.append_claim_fenced_outcome(input, Some(fence))
+        self.append_mailbox_receipt_outcome(input, fence)
             .map(|(claim, _)| claim)
+    }
+
+    /// A fenced receipt, and whether it appended a claim rather than repeating or settling one.
+    pub(crate) fn append_mailbox_receipt_outcome(
+        &self,
+        input: &ClaimInput,
+        fence: &crate::mailbox::Fence,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        self.append_claim_fenced_outcome(input, Some(fence))
     }
 
     pub(crate) fn append_claim_fenced_outcome(
@@ -13495,7 +13601,6 @@ impl Store {
             )
             .unwrap();
     }
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -17095,6 +17200,21 @@ fn message_view_tx(
                     .map(|value| canonical_child_strings(value, "tag"))
                     .unwrap_or_default()
             }),
+        // A replicated claim is another member's word: keep only references a file name can be
+        // built from, so a hostile hash never reaches a path or a URL.
+        attachments: actual
+            .get("attachments")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<crate::model::MessageAttachment>>(value).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|attachment| {
+                crate::blobs::is_sha256(&attachment.sha256)
+                    && attachment.origin.starts_with("host/")
+                    && crate::blobs::MEDIA_TYPES.contains(&attachment.media_type.as_str())
+            })
+            .take(crate::blobs::MAX_ATTACHMENTS)
+            .collect(),
         created_index,
     })
 }
@@ -20853,6 +20973,105 @@ fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() 
     );
 }
 
+/// A document republished all day, such as a probe report, arrives from its writer after this
+/// node's own newer claims (#898). Each binding keeps the earliest claim of its version whatever
+/// order bindings arrive in, so it extends the projection without rebuilding every version, and
+/// the result is the one a replay from nothing gives.
+#[cfg(test)]
+#[test]
+fn a_document_binding_that_arrives_out_of_order_does_not_rebuild_every_version() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let sync = || {
+        let response = source
+            .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.project_replication_backlog().unwrap();
+    };
+    let publish = |version: usize| {
+        source
+            .put_document(
+                "doc/probe-report",
+                format!("An invented probe report, version {version}.").as_bytes(),
+                &source.latest_document_token("doc/probe-report").unwrap(),
+                &format!("probe-report-{version}"),
+            )
+            .unwrap();
+    };
+    for version in 0..40 {
+        publish(version);
+    }
+    sync();
+
+    // The target writes a claim of its own that sorts after the next binding.
+    let accepted_at = source
+        .connection
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT MAX(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as u128
+        + 10;
+    target.set_write_clock_at(accepted_at + 10).unwrap();
+    target
+        .append_claim(&ClaimInput {
+            subject: "custom/target/newer".into(),
+            kind: "custom.target.note".into(),
+            actor: Some("person/tester".into()),
+            fields: BTreeMap::new(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    target.project_replication_backlog().unwrap();
+    source.set_write_clock_at(accepted_at).unwrap();
+    publish(40);
+    FULL_REPLAYS.with(|replays| replays.set(0));
+    BASE_REBUILDS.with(|rebuilds| rebuilds.set(0));
+    sync();
+    assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+    assert_eq!(BASE_REBUILDS.with(std::cell::Cell::get), 0);
+
+    let documents = |store: &Store| {
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .prepare(
+                "SELECT name, hash, created_index, binding_claim_id, binding_key FROM documents
+                 ORDER BY name, hash",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let incremental = documents(&target);
+    assert_eq!(incremental.len(), 41);
+    target.replay_replication_graph().unwrap();
+    assert_eq!(documents(&target), incremental);
+}
+
 fn subscription_condition_matches(condition: &SubscriptionConditionSpec, facts: &Value) -> bool {
     match condition {
         SubscriptionConditionSpec::Field {
@@ -21473,6 +21692,12 @@ fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), 
     reapply_local_work_lease_renewals_tx(transaction)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Desired subjects, documents and missions this thread rebuilt from their own claims.
+    static BASE_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Rebuild one desired subject, document or mission from its own claims in the replay's order.
 fn rebuild_base_aggregate_tx(
     transaction: &Transaction<'_>,
@@ -21485,6 +21710,8 @@ fn rebuild_base_aggregate_tx(
         Aggregate::RunTree(_) => return Ok(()),
     };
     crate::profile::note(&format!("projection: {kind} subject rebuilt"));
+    #[cfg(test)]
+    BASE_REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get() + 1));
     match aggregate {
         Aggregate::Desired(subject) => {
             transaction
@@ -21678,7 +21905,10 @@ fn try_project_simple_replication_tx(
                 .map_err(internal)?;
             // A claim about a run tree not projected yet waits in the claim log: the claim that
             // creates its run or generation rebuilds the tree with it.
-            if (out_of_order || repaired)
+            // A document keeps the earliest binding of each version, whatever order the
+            // bindings arrive in, so only a repair rebuilds one. Rebuilding every version of a
+            // document that is republished all day costs more with each version.
+            if ((out_of_order && claim.kind != "doc.bound") || repaired)
                 && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
             {
                 dirty.insert(aggregate);
@@ -26908,6 +27138,82 @@ agent "test/empty" { command "true" }
             "{}",
             old.added_since_measured_envelopes
         );
+    }
+
+    /// A start repairs operation rows that drifted (#898). It rewrites only those rows: rebuilding
+    /// the whole table held the only writer for a minute and more on a populated store.
+    #[test]
+    fn an_operation_drift_repair_rewrites_only_the_drifted_rows() {
+        let store = Store::open_memory("node").unwrap();
+        for index in 0..200 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/drift/{index}"),
+                    kind: "custom.drift.note".into(),
+                    actor: Some("person/tester".into()),
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("drift-{index}")),
+                })
+                .unwrap();
+        }
+        let (rows, ids) = {
+            let connection = store.connection.lock().unwrap();
+            let ids = connection
+                .prepare("SELECT id FROM operations ORDER BY id LIMIT 2")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let rows: i64 = connection
+                .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+                .unwrap();
+            (rows, ids)
+        };
+        assert!(rows >= 200, "{rows} operations");
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        // One row changed, one row lost, and one row that no claim backs.
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE operations SET state='conflict' WHERE id=?1",
+                    [&ids[0]],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM operations WHERE id=?1", [&ids[1]])
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO operations(id, request_digest, canonical_claim_id, state)
+                     SELECT 'op/invented-stray', 'digest', canonical_claim_id, 'active'
+                     FROM operations WHERE id=?1",
+                    [&ids[0]],
+                )
+                .unwrap();
+        }
+        assert_eq!(store.operation_projection_drift().unwrap().len(), 3);
+        // Rows written by the repair, besides the ones its triggers write.
+        let operation_rows = || {
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = operation_rows();
+        assert!(store.repair_operation_projection_drift().unwrap());
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        let written = operation_rows() - before;
+        assert!(
+            written <= 3 * 4,
+            "the repair wrote {written} rows for 3 drifted ones"
+        );
+        assert!(!store.repair_operation_projection_drift().unwrap());
     }
 
     #[test]
@@ -43567,20 +43873,30 @@ pub(crate) fn append_claim_fenced_outcome(
     input: &ClaimInput,
     fence: Option<&crate::mailbox::Fence>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_claim_with_fences(graph, input, fence, None)
+}
+
+fn append_claim_with_fences(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    fence: Option<&crate::mailbox::Fence>,
+    event_runtime: Option<&str>,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
         || (input.actor.is_none() && system_local_retention(&input.kind))
     {
-        return append_local_observation(graph, input);
+        return append_local_observation_fenced(graph, input, event_runtime);
     }
     if latest_retention(&input.kind) {
-        return append_latest_observation(graph, input, now_ms());
+        return append_latest_observation_fenced(graph, input, now_ms(), event_runtime);
     }
     let operation = claim_operation(input)?;
     // One claim in a savepoint of the writer's next batch; its caller hears back once that
     // batch commits.
     graph.connection
         .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+            check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let settled_receipt = if let Some(fence) = fence {
                 check_mailbox_fence(transaction, fence)?;
                 let index = transaction.query_row(
@@ -43754,14 +44070,44 @@ pub fn validate_claim_input(input: &ClaimInput) -> Result<(), St3Error> {
 /// Record an observation of `local` retention on this node only. It gets no batch, no
 /// envelope and no idempotency row, and it never replicates. A repeated idempotency key
 /// returns the first observation. The record's ID starts with `local-observation/`.
-fn append_local_observation(
+fn check_harness_event_runtime(
+    connection: &Connection,
+    subject: &str,
+    runtime: Option<&str>,
+) -> Result<(), St3Error> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let body: Option<String> = connection
+        .prepare_cached(&format!(
+            "{} LIMIT 1",
+            newest_claims_of_kind_query("claims.body", "runtime.observed")
+        ))
+        .map_err(internal)?
+        .query_row(params![subject, i64::MAX], |r| r.get(0))
+        .optional()
+        .map_err(internal)?;
+    let body: Value = serde_json::from_str(body.as_deref().unwrap_or("null")).map_err(internal)?;
+    let fields = body.get("fields").unwrap_or(&body);
+    if fields["status"] != "running" || fields["incarnation_id"].as_str() != Some(runtime) {
+        return Err(St3Error::new(
+            "stale-harness-event-session",
+            "the publishing driver is not this seat's running incarnation",
+        ));
+    }
+    Ok(())
+}
+
+fn append_local_observation_fenced(
     graph: &GraphStore,
     input: &ClaimInput,
+    event_runtime: Option<&str>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_local_observation(input)?;
     graph
         .connection
         .batched(|transaction| {
+            check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             insert_local_observation_tx(transaction, &graph.origin, input, now_ms())
         })
         .map_err(|error| St3Error::new("internal", error))?
@@ -43770,15 +44116,26 @@ fn append_local_observation(
 /// Record an observation of `latest` retention. The local observation log keeps every
 /// one. The replicated claim log gets a claim only when the observed state changes; the
 /// returned record is that claim, or the local observation when nothing replicated.
+#[cfg(test)]
 fn append_latest_observation(
     graph: &GraphStore,
     input: &ClaimInput,
     now: u128,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_latest_observation_fenced(graph, input, now, None)
+}
+
+fn append_latest_observation_fenced(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    now: u128,
+    event_runtime: Option<&str>,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_local_observation(input)?;
     graph
         .connection
         .batched(|transaction| {
+            check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let (local, appended) =
                 insert_local_observation_tx(transaction, &graph.origin, input, now)?;
             if !appended {
@@ -44023,4 +44380,167 @@ fn a_malformed_peer_hash_does_not_stop_replication() {
             .iter()
             .any(|envelope| envelope.hash == "NOT-A-SHA256")
     );
+}
+
+#[cfg(test)]
+mod harness_event_tests {
+    use super::*;
+    use crate::harness_events::Publication;
+    const SEAT: &str = "agent/example/event-seat";
+    fn runtime(store: &Store, incarnation: &str, status: &str) {
+        store
+            .append_claim(&ClaimInput {
+                subject: SEAT.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(SEAT.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!(status)),
+                    ("incarnation_id".into(), json!(incarnation)),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    fn event(kind: &str) -> Publication {
+        let fields = match kind {
+            "harness.observed" => BTreeMap::from([
+                ("state".into(), json!("working")),
+                ("driver".into(), json!("claude")),
+                ("incarnation_id".into(), json!("runtime-a")),
+            ]),
+            "harness.usage" => BTreeMap::from([
+                ("semantics".into(), json!("context_occupancy")),
+                ("context_used_tokens".into(), json!(10)),
+                ("driver".into(), json!("claude")),
+                ("incarnation_id".into(), json!("runtime-a")),
+            ]),
+            "harness.limits" => BTreeMap::from([
+                ("driver".into(), json!("claude")),
+                ("measured_at_unix_ms".into(), json!(1)),
+                ("incarnation_id".into(), json!("runtime-a")),
+                ("five_hour_percent".into(), json!(5.0)),
+            ]),
+            "harness.timeline" => BTreeMap::from([
+                ("operation".into(), json!("append")),
+                ("entry_id".into(), json!("entry-a")),
+                ("sequence".into(), json!(1)),
+                ("revision".into(), json!(1)),
+                ("role".into(), json!("assistant")),
+                ("entry_type".into(), json!("content")),
+                ("final".into(), json!(true)),
+                ("body".into(), json!({"text":"hello"})),
+                ("driver".into(), json!("claude")),
+                ("incarnation_id".into(), json!("runtime-a")),
+                ("observed_at_unix_ms".into(), json!(1)),
+            ]),
+            _ => unreachable!(),
+        };
+        Publication {
+            runtime_incarnation: "runtime-a".into(),
+            sequence: 1,
+            claim: ClaimInput {
+                subject: SEAT.into(),
+                kind: kind.into(),
+                actor: Some(SEAT.into()),
+                fields,
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some("producer-event".into()),
+            },
+        }
+    }
+    #[test]
+    fn native_event_admission_fences_every_retention_and_replays_lost_acknowledgements() {
+        for kind in [
+            "harness.observed",
+            "harness.usage",
+            "harness.limits",
+            "harness.timeline",
+        ] {
+            let store = Store::open_memory("amber").unwrap();
+            let mut input = event(kind);
+            assert_eq!(
+                store.append_harness_event(&input).unwrap_err().code,
+                "stale-harness-event-session"
+            );
+            runtime(&store, "runtime-a", "running");
+            let (first, changed) = store.append_harness_event(&input).unwrap();
+            assert!(changed);
+            let (replayed, changed) = store.append_harness_event(&input).unwrap();
+            assert!(!changed);
+            if !latest_retention(kind) {
+                assert_eq!(first.id, replayed.id);
+            }
+            assert_eq!(replayed.body["fields"], json!(input.claim.fields));
+            input.claim.fields.insert("driver".into(), json!("codex"));
+            assert_eq!(
+                store.append_harness_event(&input).unwrap_err().code,
+                "idempotency-mismatch"
+            );
+            input.claim.fields.insert("driver".into(), json!("claude"));
+            runtime(&store, "runtime-b", "running");
+            assert_eq!(
+                store.append_harness_event(&input).unwrap_err().code,
+                "stale-harness-event-session"
+            );
+            input.runtime_incarnation = "runtime-b".into();
+            let (replayed, changed) = store.append_harness_event(&input).unwrap();
+            assert!(!changed);
+            if !latest_retention(kind) {
+                assert_eq!(first.id, replayed.id);
+            }
+            input.sequence = 2;
+            let (historical, _) = store.append_harness_event(&input).unwrap();
+            assert_eq!(
+                historical
+                    .body
+                    .pointer("/fields/incarnation_id")
+                    .and_then(Value::as_str),
+                input
+                    .claim
+                    .fields
+                    .get("incarnation_id")
+                    .and_then(Value::as_str)
+            );
+            runtime(&store, "runtime-b", "exited");
+            input.sequence = 3;
+            assert_eq!(
+                store.append_harness_event(&input).unwrap_err().code,
+                "stale-harness-event-session"
+            );
+        }
+    }
+    #[test]
+    fn terminal_state_can_be_followed_by_its_final_timeline_before_runtime_exit() {
+        let store = Store::open_memory("amber").unwrap();
+        runtime(&store, "runtime-a", "running");
+        let mut state = event("harness.observed");
+        state.claim.fields.insert("state".into(), json!("ended"));
+        store.append_harness_event(&state).unwrap();
+        let mut timeline = event("harness.timeline");
+        timeline.sequence = 2;
+        store.append_harness_event(&timeline).unwrap();
+        runtime(&store, "runtime-a", "exited");
+        timeline.sequence = 3;
+        assert!(store.append_harness_event(&timeline).is_err());
+    }
+    #[test]
+    fn event_envelopes_cannot_publish_foreign_or_non_harness_claims() {
+        let store = Store::open_memory("amber").unwrap();
+        runtime(&store, "runtime-a", "running");
+        let mut input = event("harness.observed");
+        input.claim.actor = Some("agent/example/other".into());
+        assert_eq!(
+            store.append_harness_event(&input).unwrap_err().code,
+            "invalid-harness-event"
+        );
+        input.claim.actor = Some(SEAT.into());
+        input.sequence = 0;
+        assert!(store.append_harness_event(&input).is_err());
+        input.sequence = 1;
+        input.claim.kind = "intent.desired".into();
+        assert!(store.append_harness_event(&input).is_err());
+    }
 }

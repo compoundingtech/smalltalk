@@ -69,6 +69,37 @@ identities appear only in logs and spans. Span IDs are stable when a batch is re
 configuration lives in `[observations.otlp]`; `OTEL_EXPORTER_OTLP_*` in a native seat no longer
 controls an exporter in its hooks. The legacy st2 product's exporter remains separately testable.
 
+Fresh native seats publish activity, context, account limits and normalized timeline operations
+through an st-owned observation outbox, `st-harness-events.sqlite`, in their explicit observation
+directory. Matching producers commit a snapshot or timeline operation and its queued event in
+one SQLite transaction with full synchronization. A pipe wake notifies the native driver;
+it publishes the ordered events to `/v1/harness-events` and deletes only the acknowledged prefix.
+Daemon outages, a lost acknowledgement and driver re-execution leave unacknowledged events for
+replay. The source runtime and driver remain attached to historical events when a successor
+publishes a backlog. Admission binds the Unix peer to its seat and checks the publishing runtime
+inside the daemon's writer transaction. Source runtime, spool sequence, claim kind and usage
+semantics identify an exact retry; changed input is rejected. Graph-derived claim fields are
+persisted in the spool before the first HTTP attempt so retries preserve their original attribution.
+
+The outbox is transport recovery state, not graph authority. The daemon retains each admitted
+observation under its existing local/latest/durable policy. Producer snapshots remain local
+coalescing and ownership evidence; timeline producers read only the previous matching entry and
+latest status instead of parsing/replacing a retained JSON log. That auxiliary timeline history
+is bounded to 4,096 operations and 2 MiB, independently of unacknowledged events. An outbox with 64 MiB of pending payload
+rejects a producer transaction and reports the failure rather than dropping queued events.
+An evidence deadline queues derived unknown once after fifteen minutes without fresh state;
+a concurrent heartbeat supersedes that deadline. Native transcripts and session bindings retain
+their existing source paths.
+
+The outbox is enabled only before a fresh provider launch. An already-running provider adopted
+by a replacement binary retains the polled record transport until ordinary restart, and the
+separately maintained st2 product keeps its record transport. Deploy the matching daemon before
+restarting providers into event publication. Rollback to a binary without event-outbox support
+requires an operations-coordinated provider restart, recovery of any unacknowledged outbox,
+and archiving the drained outbox before starting the old producer;
+an old binary cannot adopt an event-producing provider. This work does not restart shared
+services or seats automatically.
+
 The exporter keeps its cursor in `meta` and moves it only after the collector accepts a batch of
 at most 512 observations, including every log/metric/trace request that batch needs. Delivery is
 at least once: partial acceptance can repeat logs, delta points or spans on retry. A collector that is down delays export
@@ -123,6 +154,7 @@ order from the same admitted claims.
 | `batches` | Claim-log authority | Accepted local and replicated batch headers |
 | `claims` | Claim-log authority | Accepted local and replicated claims |
 | `blobs` | Content authority | Posted bytes, verified by SHA-256 |
+| `local_blob_uploads` | Local upload ledger | Who uploaded each attachment file; quota and early read access only |
 | `local_blobs` | Local upload staging | Bytes awaiting a durable claim reference; promotion into `blobs` commits with that claim |
 | `operations` | Projection | Claim `_operation` metadata |
 | `documents` | Projection | `doc.bound` claims and blobs |

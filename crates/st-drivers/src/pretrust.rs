@@ -3,7 +3,7 @@
 //!
 //! The claude config is a JSON object at `$CLAUDE_CONFIG_DIR/.claude.json` (else `$HOME/.claude.json`)
 //! whose `projects` map is keyed by absolute workspace path. A workspace is trusted when its entry has
-//! `"hasTrustDialogAccepted": true`; st2 also sets `"hasCompletedProjectOnboarding": true` to skip
+//! `"hasTrustDialogAccepted": true`; st also sets `"hasCompletedProjectOnboarding": true` to skip
 //! onboarding friction. We merge into any existing entry and never clobber the
 //! other per-project fields — and write ALL requested dirs in ONE atomic read-modify-write.
 //!
@@ -142,6 +142,7 @@ pub fn pretrust_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
 /// outlive the read-merge-publish cycle, and closing the descriptor is what releases it.
 struct ConfigLock {
     _held: FileLock,
+    _predecessor: Option<FileLock>,
 }
 
 impl ConfigLock {
@@ -151,13 +152,32 @@ impl ConfigLock {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let mut path = config.as_os_str().to_owned();
-        path.push(".st2trust.lock");
+        path.push(".st-trust.lock");
         let path = PathBuf::from(path);
         let file = flock::open(&path, flock::Open::Create)
             .with_context(|| format!("opening {}", path.display()))?;
         let held = FileLock::hold_blocking(file, flock::Mode::Exclusive)
             .map_err(|error| anyhow::anyhow!("locking {}: {error}", path.display()))?;
-        Ok(Self { _held: held })
+        // Existing writers may still hold the historical lock. Keep that inode and join
+        // its lock domain when present, but never create a legacy path for a fresh config.
+        // Both generations also take ClaudeConfigLock before reading or publishing.
+        let mut predecessor = config.as_os_str().to_owned();
+        predecessor.push(".st2trust.lock");
+        let predecessor = PathBuf::from(predecessor);
+        let old = match flock::open(&predecessor, flock::Open::Existing) {
+            Ok(file) => Some(
+                FileLock::hold_blocking(file, flock::Mode::Exclusive)
+                    .with_context(|| format!("locking {}", predecessor.display()))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("opening {}", predecessor.display()));
+            }
+        };
+        Ok(Self {
+            _held: held,
+            _predecessor: old,
+        })
     }
 }
 
@@ -172,7 +192,7 @@ const CLAUDE_LOCK_WAIT: Duration = Duration::from_secs(30);
 /// taken with `mkdir` and released with `rmdir`. Every Claude process re-reads, merges, and
 /// replaces the config while it holds this lock.
 ///
-/// The st2 trust lock excludes only other st2 writers. A Claude process that read the config under
+/// The trust file lock excludes only other driver writers. A Claude process that read the config under
 /// its lock before a trust write and replaced it afterwards published its older copy and dropped
 /// the new workspace entry. On 2026-09-27 that left two of three seats started together at Claude's
 /// trust prompt. Holding this lock serializes the trust write with every Claude writer.
@@ -266,13 +286,13 @@ fn write_atomic(config: &Path, value: &Value) -> Result<()> {
 /// pretrusts do not collide.
 ///
 /// Deliberately NOT the shared `fsatomic` primitive, and the reason is the same one that keeps
-/// this module out of it: these are files st2 does not own — `~/.claude.json` and
+/// this module out of it: these are files st does not own — `~/.claude.json` and
 /// `~/.codex/config.toml` — so the staged file must inherit the umask a harness's own config
-/// carries rather than st2's `0600`, and the staging path must sit beside the config under a name
+/// carries rather than the driver's `0600`, and the staging path must sit beside the config under a name
 /// its owner will recognize.
 fn write_atomic_str(config: &Path, contents: &str) -> Result<()> {
     let mut tmp = config.as_os_str().to_owned();
-    tmp.push(format!(".st2trust.{}", std::process::id()));
+    tmp.push(format!(".st-trust.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     if let Some(parent) = config.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -636,7 +656,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join(".claude.json");
-        let lock_path = tmp.path().join(".claude.json.st2trust.lock");
+        let lock_path = tmp.path().join(".claude.json.st-trust.lock");
         let held = ConfigLock::acquire(&config).unwrap();
         assert_eq!(
             std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
@@ -655,5 +675,37 @@ mod tests {
         );
         drop(held);
         assert!(probe(), "dropping the guard must release the trust lock");
+    }
+
+    #[test]
+    fn fresh_trust_writes_use_neutral_paths_and_join_existing_predecessor_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".claude.json");
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        pretrust_at(&config, &[workspace]).unwrap();
+        assert!(tmp.path().join(".claude.json.st-trust.lock").exists());
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .all(|entry| { !entry.unwrap().file_name().to_string_lossy().contains("st2") })
+        );
+
+        let legacy = tmp.path().join(".claude.json.st2trust.lock");
+        std::fs::write(&legacy, "historical inode").unwrap();
+        let held = ConfigLock::acquire(&config).unwrap();
+        let probe = || {
+            let file = flock::open(&legacy, flock::Open::Existing).unwrap();
+            FileLock::hold(file, flock::Mode::Exclusive, flock::Wait::Now)
+                .unwrap()
+                .is_some()
+        };
+        assert!(!probe(), "a new writer must exclude a predecessor writer");
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "historical inode"
+        );
+        drop(held);
+        assert!(probe());
     }
 }

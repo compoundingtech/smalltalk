@@ -106,6 +106,19 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.equal(spoken(['urgent']).dictated, undefined);
 }
 
+// A message's images ride on its mail entry; a message may be only its images.
+{
+  const sent = (text) => conversationEntries([
+    { id: 'm', sequence: 1, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'message', final: true, body: { message_id: 'message/one', from: 'person/avery', to: 'agent/example/harbor/keeper', attachments: [
+      { blob: 'blob/aa', sha256: 'aa', media_type: 'image/png', name: 'Screenshot.png', size: 1200, origin: 'host/example' },
+      { blob: 'blob/bb', sha256: 'bb', media_type: 'application/pdf', size: 10, origin: 'host/example' },
+    ] } },
+    { id: 'c', sequence: 2, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text } },
+  ], new Map([['person/avery', 'you']]))[0].body;
+  assert.deepEqual(sent('see this').images, [{ sha256: 'aa', message: 'message/one', mediaType: 'image/png', name: 'Screenshot.png', size: 1200 }]);
+  assert.equal(sent('').text, '', 'an image alone is not a "(notification)"');
+}
+
 // Finding: an entry matches by what a person reads in it, case aside.
 {
   const mail = { id: 'm', at: '', timestamp: '', body: { kind: 'mail', from: 'Keeper', to: 'you', subject: 'Audit', text: 'The Harbor keys rotated.' } };

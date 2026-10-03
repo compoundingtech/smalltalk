@@ -60,6 +60,12 @@ pub enum ErrorCode {
     TerminalUnavailable,
     TerminalEnded,
     TimelineHistoryIncomplete,
+    BlobTooLarge,
+    UnsupportedMediaType,
+    BlobContentMismatch,
+    BlobQuotaExceeded,
+    BlobNotFound,
+    BlobExpired,
     Internal,
     #[serde(other)]
     Unknown,
@@ -138,6 +144,22 @@ pub struct Page {
     /// as current, and while its graph has diverged from a peer's, so the page can be wrong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncNotice>,
+    /// Present on a list about another host's agent: whether the owner answered or this host's
+    /// replica stood in, and whether the replica can be missing recent items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated: Option<ReplicatedNotice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReplicatedNotice {
+    pub owner_host_id: String,
+    /// `owner` or `replica`.
+    pub source: String,
+    pub complete: bool,
+    /// `current`, `lagging` or `unverified`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -419,6 +441,29 @@ pub struct Message {
     pub session_id: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
+/// A file a message carries. The bytes stay on `origin`; read them with `Client::blob`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Attachment {
+    pub blob: String,
+    pub sha256: String,
+    pub media_type: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub size: u64,
+    pub origin: String,
+}
+
+/// An upload to attach to a message: `blob` is the `blob/<sha256>` an upload answered.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AttachmentInput {
+    pub blob: String,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct StructuredDiff {
@@ -1401,6 +1446,8 @@ pub struct TimelineMessageBody {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2604,6 +2651,8 @@ pub struct MessageSendParameters {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentInput>,
     /// The sending device's signature over the message, as `docs/st3/device-signing.md` lays out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<DeviceSignature>,
@@ -2794,6 +2843,16 @@ pub struct TerminalAttachment {
     pub stream_capability: Option<String>,
     pub state: String,
     pub expires_at: String,
+    /// The capability opens any number of streams until it expires or is detached.
+    #[serde(default)]
+    pub reusable: bool,
+    /// How long the capability lives from attach, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_s: Option<u64>,
+    /// `reattach` when the capability can no longer open a stream: attach again with a new
+    /// idempotency key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

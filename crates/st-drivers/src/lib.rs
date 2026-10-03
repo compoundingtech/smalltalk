@@ -41,6 +41,7 @@ mod flock;
 #[doc(hidden)]
 pub mod fsatomic;
 pub mod harness_context;
+pub mod harness_events;
 pub mod harness_state;
 pub mod harness_timeline;
 pub mod harness_version;

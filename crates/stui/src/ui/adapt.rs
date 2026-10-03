@@ -692,6 +692,35 @@ mod tests {
     ];
 
     #[test]
+    fn the_images_a_message_carries_ride_on_its_mail() {
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(serde_json::json!([
+            {"id":"e1","sequence":4,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/picture","from":"person/example","to":"agent/example/cos","attachments":[
+                {"blob":"blob/aa","sha256":"aa","media_type":"image/png","name":"Screenshot.png","size":1200,"origin":"host/example"},
+                {"blob":"blob/bb","sha256":"bb","media_type":"application/pdf","size":10,"origin":"host/example"}]}},
+            {"id":"e2","sequence":5,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":""}}
+        ]))
+        .unwrap();
+        let entries = conversation(&timeline, &BTreeMap::new());
+        let Body::Mail { body, images, .. } = &entries[0].body else {
+            panic!("{entries:#?}");
+        };
+        // An image alone is the message, not a "(notification)".
+        assert_eq!(body, "");
+        assert_eq!(
+            images,
+            &[st3_conversation_ui::MailImage {
+                sha256: "aa".into(),
+                message: "message/picture".into(),
+                media_type: "image/png".into(),
+                name: Some("Screenshot.png".into()),
+                size: 1200,
+            }]
+        );
+    }
+
+    #[test]
     fn small_talk_in_the_timeline_draws_as_mail_and_step_pings_as_events() {
         let timeline: Vec<TimelineEntry> = serde_json::from_value(serde_json::json!([
             {"id":"e1","sequence":4,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"message","final":true,

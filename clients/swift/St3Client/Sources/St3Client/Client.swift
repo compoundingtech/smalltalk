@@ -99,6 +99,25 @@ public actor St3Client {
             }
         }
     }
+    /// Keep one image (PNG, JPEG, GIF or WebP, at most 10 MiB) on the member this client talks to. Name the answer's `blob` in a `message.send` attachment.
+    public func uploadBlob(_ bytes: Data, mediaType: String) async throws -> Envelope<BlobUpload> { try await request("v1/client/blobs", query: [], method: "POST", body: bytes, contentType: mediaType) }
+    /// Up to 512 KiB of an attachment from `offset`, base64 in `data`.
+    public func blobChunk(sha256: String, message: String? = nil, offset: UInt64 = 0) async throws -> Envelope<BlobChunk> {
+        var query: [URLQueryItem] = [.init(name: "offset", value: String(offset))]
+        if let message { query.append(.init(name: "message", value: message)) }
+        return try await get("v1/client/blobs/\(sha256)/chunk", query: query)
+    }
+    /// A whole attachment, read in chunks. Pass the message that carries it.
+    public func blob(sha256: String, message: String? = nil) async throws -> Data {
+        var whole = Data()
+        while true {
+            let chunk = try await blobChunk(sha256: sha256, message: message, offset: UInt64(whole.count)).value
+            guard let bytes = Data(base64Encoded: chunk.data) else { throw URLError(.cannotParseResponse) }
+            if bytes.isEmpty && UInt64(whole.count) < chunk.size { throw URLError(.cannotParseResponse) }
+            whole.append(bytes)
+            if UInt64(whole.count) >= chunk.size { return whole }
+        }
+    }
     public func documentGet(name: String) async throws -> Envelope<DocumentContent> { try await get("v1/client/documents/content", query: [.init(name: "name", value: name)]) }
     public func subjectDefinition(subject: String, showEnvValues: Bool = false) async throws -> Envelope<SubjectDefinition> { try await get("v1/client/subject-definition", query: [.init(name: "subject", value: subject), .init(name: "show_env_values", value: showEnvValues ? "true" : "false")]) }
     public func usagePeriod(sinceMS: UInt64? = nil, untilMS: UInt64? = nil) async throws -> Envelope<UsagePeriod> { var query: [URLQueryItem] = []; if let sinceMS { query.append(.init(name: "since_ms", value: String(sinceMS))) }; if let untilMS { query.append(.init(name: "until_ms", value: String(untilMS))) }; return try await get("v1/client/usage", query: query) }
@@ -227,10 +246,10 @@ public actor St3Client {
 
     private func get<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem] = []) async throws -> T { try await request(path, query: query, method: "GET", body: Optional<Data>.none) }
     private func post<T: Decodable & Sendable, Body: Encodable>(_ path: String, _ body: Body) async throws -> T { try await request(path, query: [], method: "POST", body: try JSONEncoder().encode(body)) }
-    private func request<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem], method: String, body: Data?, idempotencyKey: String? = nil) async throws -> T {
+    private func request<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem], method: String, body: Data?, idempotencyKey: String? = nil, contentType: String = "application/json") async throws -> T {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!; let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")); components.percentEncodedPath = "/" + ([basePath, path].filter { !$0.isEmpty }.joined(separator: "/")); if !query.isEmpty { components.queryItems = query }
         var request = URLRequest(url: components.url!); request.httpMethod = method; request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }; if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        if body != nil { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }; if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
         let (data, response) = try await session.data(for: request); let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if !(200..<300).contains(status) { throw try JSONDecoder().decode(ErrorEnvelope.self, from: data) }

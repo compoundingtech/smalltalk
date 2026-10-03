@@ -39,7 +39,9 @@ while a window is read neither tear it nor delay it; they arrive in the next
 An `error` frame reports a permanent refusal and ends that subscription. A
 `resync` frame with `retryable: true` reports a temporary read failure; the server
 keeps the subscription and retries after its reread interval, including when the
-first snapshot failed. Clients may resubscribe with the same ID to request a
+first snapshot failed. A followed conversation's `resync` also carries the failure's
+`code` and `message`, such as `remote-unavailable` while the owner's host cannot be
+reached, so a client still showing its last copy can say that copy is stale. Clients may resubscribe with the same ID to request a
 fresh snapshot. If the socket closes, including during a daemon
 restart, open a new socket and subscribe again; the new snapshot is authoritative.
 Each socket subscribes to store changes before taking its first snapshot, so a
@@ -49,7 +51,9 @@ write racing that snapshot is visible in the snapshot or a subsequent frame.
 
 A terminal is one more subscription on the same socket. Call `terminal.attach`
 first, then subscribe with the terminal ID, the incarnation it fenced, and the
-single-use `stream_capability` it returned:
+`stream_capability` it returned. The capability is a reusable lease (see `ttl_s` and
+`expires_at` on the attachment): a client that reconnects subscribes again with it until it
+expires or the viewer is detached:
 
 ```json
 {"kind":"subscribe","id":"term","collection":"terminal","terminal":"terminal/ID","incarnation":"INCARNATION","capability":"CAPABILITY"}
@@ -63,9 +67,9 @@ screen, never a backlog, and one terminal never holds back the socket's other
 subscriptions. An incarnation change ends that subscription with `stale-fence`.
 A process exit returns `terminal-ended` with `retryable: false`. A temporary
 owner, I/O or viewer-idle failure returns `terminal-unavailable` with
-`retryable: true`; clients attach and subscribe again. Unsubscribing, or
-closing the socket, stops following; `terminal.detach` still ends the viewer
-record. After a dropped socket, attach again and subscribe on the new socket.
+`retryable: true`; clients subscribe again with the same lease, or attach again once it has
+expired. Unsubscribing, or closing the socket, stops following; `terminal.detach` still ends the
+viewer record and revokes the lease. After a dropped socket, subscribe on the new socket.
 
 ## Conversations
 

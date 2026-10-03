@@ -95,7 +95,7 @@ HTTPS route after every rollout, then make an authenticated paired-client read.
 
 This provides tailnet-only HTTPS and WebSocket transport at the host's Tailscale name while the
 gateway continues to enforce the same paired credential, scopes, terminal subprotocol, and
-single-use attachment capability. Begin pairing over the trusted local socket with, for example,
+attachment capability. Begin pairing over the trusted local socket with, for example,
 `st devices --as person/alex pair "Alex iPhone"`; complete pairing from the remote device over
 the served gateway. To remove the carrier without changing graph credentials or daemon state:
 
@@ -489,6 +489,20 @@ An accepted action returns one stable operation ID and status. `202 accepted` me
 durable, not complete; clients follow operation events or read `/operations/{id}`. Result objects
 include affected stable IDs and the resulting snapshot ID.
 
+## Attachments
+
+A `message.send` action may carry `attachments: [{blob, media_type, name?}]`, up to four, and a
+message resource lists `attachments: [{blob, sha256, media_type, name, size, origin}]`. The bytes
+are not in the graph. [Attachments](../attachments.md) defines the limits, retention and delivery.
+
+- `POST /v1/client/blobs`: raw image body, `Content-Type` one of `image/png`, `image/jpeg`,
+  `image/gif`, `image/webp`, scope `control.messages`; answers `{blob, sha256, size, media_type}`.
+- `GET /v1/client/blobs/{sha256}?message=message/ID`: the raw bytes.
+- `GET /v1/client/blobs/{sha256}/chunk?message=message/ID&offset=N`: up to 512 KiB as base64 JSON,
+  with the total `size`. `Client::blob` / `blob()` in each client assembles the file.
+- Errors: `blob-too-large`, `unsupported-media-type`, `blob-content-mismatch`,
+  `blob-quota-exceeded`, `blob-not-found`, `blob-expired`.
+
 ## Event feed and resynchronization
 
 `GET /v1/client/events?after=CURSOR&limit=N&wait_ms=M` returns at most the negotiated event and byte
@@ -600,10 +614,16 @@ reach the owner or the owner refuses, the CLI says why and falls back to this pr
 each screen into the local terminal and sends keystrokes and size changes as `terminal.input` (raw
 mode) and `terminal.resize` actions.
 
-`terminal.attach` returns a short-lived, single-use stream capability and URL bound to the
-authenticated session, terminal, and runtime incarnation; `terminal.detach` idempotently invalidates
-that viewer. A client opens the URL on the same Unix or Fabric-loopback gateway with WebSocket
-subprotocol `st3.client.terminal.v0`. Authentication, single-use capability consumption, and
+`terminal.attach` returns a stream capability and URL bound to the authenticated session, terminal,
+and runtime incarnation; `terminal.detach` idempotently invalidates that viewer. The capability is a
+lease: `reusable` is true, `ttl_s` (300) and `expires_at` say how long it lives, and every stream a
+client opens with it before then is accepted, so a reconnecting client reuses it instead of
+attaching again and, for a remote terminal, instead of making the gateway ask the owner again. The
+lease ends at `expires_at`, at `terminal.detach`, or when the runtime incarnation changes; the
+attachment then reports `state` `expired` or `detached` with no capability and `retry_hint`
+`reattach`: attach again with a new idempotency key. A stream already open is not cut off when its
+lease expires. A client opens the URL on the same Unix or Fabric-loopback gateway with WebSocket
+subprotocol `st3.client.terminal.v0`. Authentication, capability validation, and
 runtime-incarnation validation happen before upgrade.
 
 The WebSocket then stays open. The first message is the current screen. After that the server sends
@@ -651,6 +671,16 @@ answer or refusal back unchanged. Every hop checks that its sender is a fleet me
 applies its own grants to the person the read carries. A laptop peered only with a desktop
 therefore reads a conversation on a server that only the desktop dials. Each hop waits longer than
 the next one, so a long poll's answer is never cut short on its way back.
+
+`GET /v1/client/messages?actor=AGENT` lists an agent that another host owns from that host: the
+gateway relays the read for a concrete person or agent, the owner lists the messages it holds, and
+the page carries `replicated` with `source` `owner`, `complete` true and `state` `current`. Messages
+reach a gateway by replication, so its own copy can lag and read as empty. When the owner cannot be
+asked, the gateway returns its replica, never as if it were whole: `replicated` has `source`
+`replica`, `complete` false, `state` `lagging` (this host is still catching up with the owner's
+fleet, see `sync`) or `unverified`, and the `reason` the owner was not asked, such as `no-route` or
+`timed-out`. A client renders that as waiting, not as no messages. A list that names no remote
+agent has no `replicated`. Page cursors of a relayed list belong to the owner.
 
 A read that no peer can carry fails with `remote-unavailable`, and its `details` say why, so a
 client can tell a host nobody reaches from a slow or refusing one: `reason` is `no-route` (this node

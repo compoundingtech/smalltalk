@@ -314,7 +314,13 @@ pub enum CollectionEvent {
         has_more: bool,
     },
     /// Subscribe again: the server could not bring this subscription up to date.
-    Resync { id: String },
+    /// `code` and `message` say why when a temporary failure caused it, such as a conversation
+    /// whose owner cannot be reached; the server keeps retrying.
+    Resync {
+        id: String,
+        code: Option<ErrorCode>,
+        message: Option<String>,
+    },
     /// The subscription failed or ended; the socket and other subscriptions continue.
     Error {
         id: String,
@@ -367,7 +373,17 @@ impl CollectionEvent {
                 has_more: field::<Option<bool>>(&frame, "has_more")?.unwrap_or(false),
                 id,
             }),
-            Some("resync") => Ok(Self::Resync { id }),
+            Some("resync") => Ok(Self::Resync {
+                code: frame
+                    .get("code")
+                    .cloned()
+                    .and_then(|code| serde_json::from_value(code).ok()),
+                message: frame
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                id,
+            }),
             Some("error") => Ok(Self::Error {
                 code: frame
                     .get("code")
@@ -509,6 +525,18 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::TimelineHistoryIncomplete => message.to_owned(),
         ErrorCode::TerminalEnded => "the terminal ended: its process exited".into(),
         ErrorCode::TerminalUnavailable => "the terminal cannot be reached right now".into(),
+        ErrorCode::BlobTooLarge => "the image is too large; the limit is 10 MiB".into(),
+        ErrorCode::UnsupportedMediaType => {
+            "only PNG, JPEG, GIF and WebP images can be attached".into()
+        }
+        ErrorCode::BlobContentMismatch => "the file is not the kind of image it says it is".into(),
+        ErrorCode::BlobQuotaExceeded => {
+            "too many images were uploaded recently; try again later".into()
+        }
+        ErrorCode::BlobNotFound => "this image is not stored on this machine".into(),
+        ErrorCode::BlobExpired => {
+            "this image was removed after its retention window; the message text remains".into()
+        }
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
@@ -576,6 +604,24 @@ impl std::fmt::Display for DaemonUnreachable {
 }
 
 impl std::error::Error for DaemonUnreachable {}
+
+/// What an upload answers: the reference to name in a message's attachments.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BlobUpload {
+    pub blob: String,
+    pub sha256: String,
+    pub size: u64,
+    pub media_type: String,
+}
+
+/// One slice of an attachment: `data` is base64.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BlobChunk {
+    pub sha256: String,
+    pub size: u64,
+    pub offset: u64,
+    pub data: String,
+}
 
 impl Client {
     /// An unscoped read on the trusted local Unix socket. Paired transports
@@ -662,6 +708,63 @@ impl Client {
         }
     }
 
+    /// Keep one image on the member this client talks to, and learn its reference. The type is
+    /// one of `image/png`, `image/jpeg`, `image/gif` and `image/webp`, and the bytes must be
+    /// that type and at most 10 MiB. The same bytes answer the same reference.
+    pub async fn upload_blob(
+        &self,
+        bytes: Vec<u8>,
+        media_type: &str,
+    ) -> Result<Envelope<BlobUpload>, ClientError> {
+        self.request_typed(
+            Method::POST,
+            "/v1/client/blobs",
+            Some(bytes),
+            None,
+            media_type,
+        )
+        .await
+    }
+    /// Up to 512 KiB of an attachment from `offset`. A member that does not hold the file asks
+    /// the one that took the upload, so the first read of a large file can take a moment.
+    pub async fn blob_chunk(
+        &self,
+        sha256: &str,
+        message: Option<&str>,
+        offset: u64,
+        local_only: bool,
+    ) -> Result<Envelope<BlobChunk>, ClientError> {
+        let mut path = format!("/v1/client/blobs/{sha256}/chunk?offset={offset}");
+        if let Some(message) = message {
+            path.push_str(&format!("&message={}", percent_encode(message)));
+        }
+        if local_only {
+            path.push_str("&local=true");
+        }
+        self.get(&path).await
+    }
+    /// A whole attachment, read in chunks. `message` is the message that carries it; a person's
+    /// session may read an attachment only through a message it may read, or after uploading it.
+    pub async fn blob(&self, sha256: &str, message: Option<&str>) -> Result<Vec<u8>, ClientError> {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = self
+                .blob_chunk(sha256, message, bytes.len() as u64, false)
+                .await?
+                .value;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(&chunk.data)
+                .map_err(|error| ClientError::Protocol(error.to_string()))?;
+            if data.is_empty() && (bytes.len() as u64) < chunk.size {
+                return Err(ClientError::Protocol("a blob chunk came back empty".into()));
+            }
+            bytes.extend_from_slice(&data);
+            if bytes.len() as u64 >= chunk.size {
+                return Ok(bytes);
+            }
+        }
+    }
     async fn capabilities_internal(&self) -> Result<Envelope<Capabilities>, ClientError> {
         let envelope: Envelope<Capabilities> = self.get("/v1/client/capabilities").await?;
         self.max_response_bytes.store(
@@ -2347,12 +2450,23 @@ impl Client {
         body: Option<Vec<u8>>,
         key: Option<&str>,
     ) -> Result<T, ClientError> {
+        self.request_typed(method, path, body, key, "application/json")
+            .await
+    }
+    async fn request_typed<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        key: Option<&str>,
+        content_type: &str,
+    ) -> Result<T, ClientError> {
         let started = tokio::time::Instant::now();
         let mut pause = Duration::from_millis(100);
         let mut announced = false;
         loop {
             match self
-                .request_once(method.clone(), path, body.clone(), key)
+                .request_once(method.clone(), path, body.clone(), key, content_type)
                 .await
             {
                 Err(ClientError::Unreachable(mut outage)) if !self.outage_wait.is_zero() => {
@@ -2382,6 +2496,7 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
         key: Option<&str>,
+        content_type: &str,
     ) -> Result<T, ClientError> {
         let limit = self.response_limit();
         let request = async {
@@ -2396,6 +2511,7 @@ impl Client {
                         self.local_person.as_deref(),
                         limit,
                         key,
+                        content_type,
                     )
                     .await
                 }
@@ -2408,9 +2524,7 @@ impl Client {
                         request = request.bearer_auth(credential);
                     }
                     if let Some(body) = body {
-                        request = request
-                            .header("content-type", "application/json")
-                            .body(body);
+                        request = request.header("content-type", content_type).body(body);
                     }
                     let mut response = request.send().await.map_err(|error| {
                         if error.is_connect() {
@@ -2506,6 +2620,7 @@ async fn unix_request(
     local_person: Option<&str>,
     limit: usize,
     key: Option<&str>,
+    content_type: &str,
 ) -> Result<(u16, Vec<u8>), ClientError> {
     let stream = tokio::net::UnixStream::connect(socket)
         .await
@@ -2530,7 +2645,7 @@ async fn unix_request(
         builder = builder.header("x-st3-person", person);
     }
     if body.is_some() {
-        builder = builder.header("content-type", "application/json");
+        builder = builder.header("content-type", content_type);
     }
     let response = sender
         .send_request(

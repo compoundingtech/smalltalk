@@ -205,6 +205,8 @@ fn driver_log(root: &Path) -> String {
 }
 
 fn files_containing(directory: &Path, needle: &str) -> Vec<PathBuf> {
+    // Driver directories contain IPC endpoints as well as evidence. Reading a FIFO as a
+    // text file waits for its writer to close and can block this restart proof indefinitely.
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir(directory) else {
         return found;
@@ -213,7 +215,9 @@ fn files_containing(directory: &Path, needle: &str) -> Vec<PathBuf> {
         let path = entry.path();
         if path.is_dir() {
             found.extend(files_containing(&path, needle));
-        } else if std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle)) {
+        } else if path.is_file()
+            && std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+        {
             found.push(path);
         }
     }

@@ -47,6 +47,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_mailbox_bindings",
         "local_observations",
         "local_blobs",
+        "local_blob_uploads",
         "local_subscription_mission_deferrals",
         "local_usage_spend",
         "local_usage_responses",

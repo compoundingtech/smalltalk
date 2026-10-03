@@ -15,6 +15,8 @@ final-status-level = "flaky"
 # supervisor tests, and st-drivers' catalog, resync and resource-profile supervisor modules.
 # `transport_isolation` needs real systemd user scopes; the isolation-vm job runs it in a
 # NixOS VM. See docs/ci.md.
+# scripts/ci-nextest also omits entirely excluded st2 targets from Cargo's build selection;
+# keep its retained target list in sync when changing the binary-level exclusions below.
 default-filter = '''
 not (
   (package(=st2) and (
@@ -33,9 +35,9 @@ not (
 filter = 'package(st3) and test(/^fleet::outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts$/)'
 priority = 100
 
-# A boot canary's race that sometimes loses is the bug it exists to catch, so a retry that passes
-# would hide it. Start these early too: five seats launch together in one case.
+# A boot canary's race or a fresh-seat boundary violation must not disappear behind a retry.
+# Start these early too: five seats launch together in one case.
 [[profile.ci.overrides]]
-filter = 'package(st3) and test(/^boot_canaries::/)'
+filter = 'package(st3) and (test(/^boot_canaries::/) or test(/^no_st2_seat::/))'
 retries = 0
 priority = 100

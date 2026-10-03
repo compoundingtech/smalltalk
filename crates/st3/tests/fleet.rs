@@ -2656,3 +2656,79 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
     }
     reject_task.abort();
 }
+
+/// A member that returns more than two pages behind catches up page after page (#1019).
+/// Both members have just exchanged in the other direction, so each finished page must not
+/// leave the rest to the 30-second quiet window that follows the peer's last inbound exchange.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backlog_of_several_pages_is_fetched_without_waiting_for_the_quiet_window() {
+    // Pages of 100 envelopes make a backlog of several pages cheap to write and to admit.
+    const SETTINGS: [(&str, &str); 2] = [
+        ("ST3_WORKER_INTERVAL_MS", "30000"),
+        ("ST3_REPLICATION_PAGE_LIMIT", "100"),
+    ];
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Node::new(root.path(), "a");
+    a.env
+        .extend(SETTINGS.map(|(key, value)| (key.to_owned(), value.to_owned())));
+    a.create();
+    a.start().await;
+    a.wait_listening().await;
+    let mut b = Node::new(root.path(), "b");
+    b.env
+        .extend(SETTINGS.map(|(key, value)| (key.to_owned(), value.to_owned())));
+    let code = a.invite("b", &[]);
+    assert!(b.join(&code, &[]).status.success());
+    b.start().await;
+    b.st_ok(&["fleet", "wait", "--timeout", "120s"]);
+
+    b.stop();
+    let mut writers = Vec::new();
+    for writer in 0..4 {
+        let client = a.client();
+        writers.push(tokio::spawn(async move {
+            for index in 0..150 {
+                let _: Value = client
+                    .post(
+                        "/v1/claims",
+                        &ClaimInput {
+                            subject: format!("custom/fleet-test/backlog-{writer}-{index}"),
+                            kind: NOTE.into(),
+                            actor: Some(PERSON.into()),
+                            fields: Default::default(),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    for writer in writers {
+        writer.await.unwrap();
+    }
+    // b writes a few envelopes of its own when it starts, so it holds at least a's.
+    let target = a.st_json(&["replication", "status"])["received_envelopes"]
+        .as_u64()
+        .unwrap();
+    b.start().await;
+    let started = Instant::now();
+    loop {
+        let status = b.st_json(&["replication", "status"]);
+        if status["received_envelopes"].as_u64().unwrap() >= target {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "b holds {} of a's {target} envelopes {:?} after it returned\n{}\n{}",
+            status["received_envelopes"],
+            started.elapsed(),
+            a.logs(),
+            b.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    eprintln!("caught up {:?} after returning", started.elapsed());
+}

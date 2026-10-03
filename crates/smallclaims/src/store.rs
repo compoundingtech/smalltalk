@@ -137,6 +137,17 @@ CREATE TABLE IF NOT EXISTS local_blobs (
     size INTEGER NOT NULL
 );
 
+-- Who uploaded an attachment file the daemon holds outside the graph, for the per-actor quota and
+-- for who may fetch it before a message names it. Local only: never replicated, in no digest.
+CREATE TABLE IF NOT EXISTS local_blob_uploads (
+    hash TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    uploaded_ms INTEGER NOT NULL,
+    PRIMARY KEY(hash, actor)
+);
+
 CREATE TABLE IF NOT EXISTS documents (
     name TEXT NOT NULL,
     hash TEXT NOT NULL REFERENCES blobs(hash),
@@ -2782,6 +2793,20 @@ pub const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 /// request timeout, and a first sync needs a few dozen exchanges instead of hundreds.
 pub const REPLICATION_PAGE_LIMIT: u32 = 4_096;
 
+/// The page this node asks peers for: `REPLICATION_PAGE_LIMIT`, or less when
+/// `ST3_REPLICATION_PAGE_LIMIT` caps it, so tests can make a backlog of several pages cheaply.
+pub fn replication_accepts() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ST3_REPLICATION_PAGE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map_or(REPLICATION_PAGE_LIMIT, |cap| {
+                cap.clamp(1, REPLICATION_PAGE_LIMIT)
+            })
+    })
+}
+
 /// How many envelopes one exchange carries to a peer, from the inventory it sent. An older
 /// peer says nothing and takes the classic 512.
 pub fn replication_page_limit(remote: &ReplicationInventory) -> usize {
@@ -4349,6 +4374,80 @@ impl Store {
         Ok(hash)
     }
 
+    /// Record that `actor` uploaded `size` bytes of `hash`, for the per-actor quota and for who
+    /// may fetch them before a message names them. Rows older than `ttl_ms` are dropped first.
+    /// The same bytes uploaded again by the same actor cost nothing. The bytes themselves are
+    /// not here: they are files the daemon owns, and never part of replication.
+    pub fn record_blob_upload(
+        &self,
+        actor: &str,
+        hash: &str,
+        media_type: &str,
+        size: u64,
+        quota: u64,
+        ttl_ms: u64,
+    ) -> Result<(), St3Error> {
+        let now = now_ms() as u64;
+        let connection = self.connection.write();
+        let result = (|| -> rusqlite::Result<Result<(), St3Error>> {
+            connection.execute(
+                "DELETE FROM local_blob_uploads WHERE uploaded_ms<?1",
+                [now.saturating_sub(ttl_ms)],
+            )?;
+            let already: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_blob_uploads WHERE hash=?1 AND actor=?2)",
+                params![hash, actor],
+                |row| row.get(0),
+            )?;
+            if !already {
+                let held: u64 = connection.query_row(
+                    "SELECT COALESCE(SUM(size),0) FROM local_blob_uploads WHERE actor=?1",
+                    [actor],
+                    |row| row.get(0),
+                )?;
+                if held.saturating_add(size) > quota {
+                    return Ok(Err(St3Error::new(
+                        "blob-quota-exceeded",
+                        format!(
+                            "{actor} already holds {held} bytes of uploads; the limit is {quota}"
+                        ),
+                    )));
+                }
+            }
+            connection.execute(
+                "INSERT INTO local_blob_uploads(hash, actor, media_type, size, uploaded_ms)
+                 VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(hash, actor) DO UPDATE SET uploaded_ms=excluded.uploaded_ms",
+                params![hash, actor, media_type, size, now],
+            )?;
+            Ok(Ok(()))
+        })();
+        match result {
+            Ok(outcome) => outcome,
+            Err(error) => Err(internal(error)),
+        }
+    }
+
+    /// The type `actor` gave when it uploaded these bytes, if it did within the retention window.
+    pub fn blob_upload_media_type(&self, hash: &str, actor: &str) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT media_type FROM local_blob_uploads WHERE hash=?1 AND actor=?2",
+                params![hash, actor],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Forget uploads older than `ttl_ms`; the daemon deletes the files in the same sweep.
+    pub fn expire_blob_uploads(&self, ttl_ms: u64) -> Result<usize> {
+        let cutoff = (now_ms() as u64).saturating_sub(ttl_ms);
+        let connection = self.connection.write();
+        Ok(connection.execute("DELETE FROM local_blob_uploads WHERE uploaded_ms<?1", [cutoff])?)
+    }
+
     pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
         let connection = self.readers.get();
         connection
@@ -4658,7 +4757,7 @@ impl Store {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
                 buckets: snapshot.buckets.clone(),
-                accepts: Some(REPLICATION_PAGE_LIMIT),
+                accepts: Some(replication_accepts()),
                 checkpoint: self.trimmed_checkpoint()?,
             },
             envelopes: Vec::new(),
@@ -4717,7 +4816,7 @@ impl Store {
                     digest: snapshot.inventory.digest.clone(),
                     envelopes: listed,
                     buckets: snapshot.buckets.clone(),
-                    accepts: Some(REPLICATION_PAGE_LIMIT),
+                    accepts: Some(replication_accepts()),
                     checkpoint: self.trimmed_checkpoint()?,
                 },
                 envelopes: self.replica_envelopes(missing)?,
@@ -4756,7 +4855,7 @@ impl Store {
             graph_digest: snapshot.legacy_graph_digest.clone(),
             projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
-                accepts: Some(REPLICATION_PAGE_LIMIT),
+                accepts: Some(replication_accepts()),
                 checkpoint: self.trimmed_checkpoint()?,
                 ..if same {
                     ReplicationInventory {
@@ -6351,29 +6450,92 @@ pub fn expected_operations(
     Ok(grouped
         .into_iter()
         .map(|(operation_id, stored_claims)| {
-            let mut claims = stored_claims.clone();
-            claims.extend(dropped.remove(&operation_id).unwrap_or_default());
-            claims.sort();
-            let request_digest = claims[0].0.clone();
-            let state = if claims.iter().all(|(digest, _)| digest == &request_digest) {
-                "active"
-            } else {
-                "conflict"
-            };
-            let canonical_claim_id = stored_claims
-                .iter()
-                .filter(|(digest, _)| digest == &request_digest)
-                .map(|(_, claim)| claim)
-                .min()
-                .or_else(|| stored_claims.iter().map(|(_, claim)| claim).min())
-                .expect("an operation has at least one stored claim")
-                .clone();
-            (
-                operation_id,
-                (request_digest, canonical_claim_id, state.into()),
-            )
+            let dropped = dropped.remove(&operation_id).unwrap_or_default();
+            (operation_id, operation_row(&stored_claims, dropped))
         })
         .collect())
+}
+
+/// One operation's row from its stored claims and the claims a checkpoint dropped, each as
+/// `(request digest, claim)`: `(request digest, canonical claim, state)`.
+fn operation_row(
+    stored_claims: &[(String, String)],
+    dropped: Vec<(String, String)>,
+) -> (String, String, String) {
+    let mut claims = stored_claims.to_vec();
+    claims.extend(dropped);
+    claims.sort();
+    let request_digest = claims[0].0.clone();
+    let state = if claims.iter().all(|(digest, _)| digest == &request_digest) {
+        "active"
+    } else {
+        "conflict"
+    };
+    let canonical_claim_id = stored_claims
+        .iter()
+        .filter(|(digest, _)| digest == &request_digest)
+        .map(|(_, claim)| claim)
+        .min()
+        .or_else(|| stored_claims.iter().map(|(_, claim)| claim).min())
+        .expect("an operation has at least one stored claim")
+        .clone();
+    (request_digest, canonical_claim_id, state.into())
+}
+
+/// What `expected_operations` holds for one operation, read through the operation index.
+pub fn expected_operation(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT id, body FROM claims
+         WHERE json_extract(body, '$._operation.id')=?1
+           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
+         ORDER BY id",
+    )?;
+    let mut stored = Vec::new();
+    for row in statement.query_map([operation_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (claim_id, body) = row?;
+        let body: Value = serde_json::from_str(&body)?;
+        if let Some((_, request_digest)) = operation_parts(&body) {
+            stored.push((request_digest.to_owned(), claim_id));
+        }
+    }
+    if stored.is_empty() {
+        return Ok(None);
+    }
+    let dropped = checkpoint::checkpointed_operation(connection, operation_id)?
+        .into_iter()
+        .filter(|(_, claim_id)| !stored.iter().any(|(_, stored)| stored == claim_id))
+        .collect();
+    Ok(Some(operation_row(&stored, dropped)))
+}
+
+/// Bring the rows of `operation_ids` to what their claims say, and leave every other row alone.
+/// Returns how many rows it changed.
+pub fn repair_operations_tx(
+    transaction: &Transaction<'_>,
+    operation_ids: &[String],
+) -> Result<usize> {
+    let mut changed = 0;
+    for operation_id in operation_ids {
+        changed += match expected_operation(transaction, operation_id)? {
+            Some((request_digest, canonical_claim_id, state)) => transaction.execute(
+                "INSERT INTO operations(id, request_digest, canonical_claim_id, state)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET request_digest=excluded.request_digest,
+                    canonical_claim_id=excluded.canonical_claim_id, state=excluded.state
+                 WHERE request_digest IS NOT excluded.request_digest
+                    OR canonical_claim_id IS NOT excluded.canonical_claim_id
+                    OR state IS NOT excluded.state",
+                params![operation_id, request_digest, canonical_claim_id, state],
+            )?,
+            None => transaction.execute("DELETE FROM operations WHERE id=?1", [operation_id])?,
+        };
+    }
+    Ok(changed)
 }
 
 pub fn rebuild_operations_tx(transaction: &Transaction<'_>) -> Result<()> {
@@ -6555,10 +6717,13 @@ pub fn select_replicated_document(
         if canonical::claim_key(transaction, &claim.id).map_err(internal)?
             < canonical::claim_key(transaction, &previous).map_err(internal)?
         {
+            // The earliest binding also gives the version its arrival index, as a replay in
+            // canonical order would, so the order bindings arrive in never matters.
             transaction
                 .execute(
-                    "UPDATE documents SET binding_claim_id=?3,binding_key=?4 WHERE name=?1 AND hash=?2",
-                    params![name, hash, claim.id, binding_key],
+                    "UPDATE documents SET binding_claim_id=?3,binding_key=?4,created_index=?5
+                     WHERE name=?1 AND hash=?2",
+                    params![name, hash, claim.id, binding_key, created_index],
                 )
                 .map_err(internal)?;
         }
