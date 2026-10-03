@@ -880,6 +880,8 @@ pub struct Agent {
     #[serde(default)]
     pub current_session_id: Option<String>,
     #[serde(default)]
+    pub todo: Option<AgentTodo>,
+    #[serde(default)]
     pub current_work_ids: Vec<String>,
     #[serde(default)]
     pub active_work_count: u64,
@@ -908,6 +910,54 @@ pub struct Agent {
     /// The seat's latest suspend or resume and its phase. An older daemon omits it.
     #[serde(default)]
     pub suspension: Option<AgentSuspension>,
+}
+/// The latest accepted harness todo observation, including its provenance and freshness.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentTodo {
+    pub snapshot: HarnessTodoSnapshot,
+    pub claim_id: String,
+    pub accepted_at: String,
+    pub stale: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessTodoSnapshot {
+    pub harness: String,
+    pub session_id: String,
+    pub incarnation_id: String,
+    pub observed_at: String,
+    pub source_op: String,
+    pub phases: Vec<HarnessPhase>,
+    pub totals: HarnessTodoTotals,
+    pub truncated: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessPhase {
+    pub name: String,
+    pub tasks: Vec<HarnessTask>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessTask {
+    pub content: String,
+    pub status: HarnessTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessTaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessTodoTotals {
+    pub pending: u64,
+    pub in_progress: u64,
+    pub completed: u64,
+    pub blocked: u64,
+    #[serde(default)]
+    pub abandoned: u64,
 }
 /// Where a seat's latest suspend or resume stands.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
