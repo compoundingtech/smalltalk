@@ -40,6 +40,21 @@ export function HomeScreen() {
     });
   }, [navigation, actions]);
   const sections = useMemo(() => homeSections(rows).map(section => ({ ...section, data: section.rows })), [rows]);
+  // Dismiss, as stui's x: a request is closed with word to its asker that there is nothing for
+  // the person to do (after a confirm), an update or a message is read. A decision has none.
+  const dismiss = (row: HomeRow): (() => void) | undefined => {
+    const item = row.item;
+    if (item.update && item.actions.includes('work.done')) return () => void actions.done(item, 'Read', 'read');
+    if (isRequest(item.attention_kind) && item.actions.includes('work.done')) {
+      const asker = item.requester_id?.replace(/^agent\//, '') ?? 'the agent';
+      return () => Alert.alert(`Tell ${asker} there is nothing for you to do`, row.title, [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Dismiss', onPress: () => void actions.done(item, ANSWERS.nothing) },
+      ]);
+    }
+    if (item.actions.includes('message.read')) return () => void actions.markRead(item);
+    return undefined;
+  };
   return <Screen>
     <Banners />
     <SectionList
@@ -53,7 +68,8 @@ export function HomeScreen() {
         { id: 'open', title: 'Open', symbol: 'arrow.up.right', run: () => navigation.navigate('Attention', { id: row.item.id }) },
         ...(agentOf(row) ? [{ id: 'chat', title: 'Chat with the agent', symbol: 'bubble.left.and.bubble.right', run: () => navigation.navigate('Conversation', { target: agentOf(row)! }) }] : []),
         ...(row.item.mission_id ? [{ id: 'mission', title: 'Open the mission', symbol: 'point.3.connected.trianglepath.dotted', run: () => navigation.navigate('Mission', { id: row.item.mission_id! }) }] : []),
-        ...(row.item.actions.includes('work.done') && !busy && status === 'online' ? [{ id: 'done', title: 'Complete step', symbol: 'checkmark.circle', run: () => Alert.prompt('Complete step', row.title, summary => { if (summary.trim()) void actions.done(row.item, summary); }) }] : []),
+        ...(row.item.actions.includes('work.done') && !row.item.update && !busy && status === 'online' ? [{ id: 'done', title: 'Complete step', symbol: 'checkmark.circle', run: () => Alert.prompt('Complete step', row.title, summary => { if (summary.trim()) void actions.done(row.item, summary); }) }] : []),
+        ...(dismiss(row) && !busy && status === 'online' ? [{ id: 'dismiss', title: 'Dismiss', symbol: 'xmark.circle', run: dismiss(row)! }] : []),
       ]}>
         <ListRow
           glyph={row.glyph}
@@ -94,7 +110,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
   const agentId = [item.requester_id, item.source_id].find(id => id?.startsWith('agent/'));
   const agent = agentId ? data.agents.find(candidate => candidate.id === agentId) : undefined;
   const mission = item.mission_id ? data.missions.find(candidate => candidate.id === item.mission_id) : undefined;
-  const other = item.actions.filter(action => action !== 'work.done');
+  const other = item.actions.filter(action => action !== 'work.done' && action !== 'message.read');
   if (item.update) {
     const from = agent ? agentName(agent) : item.requester_id?.replace(/^agent\//, '') ?? 'An agent';
     return <Screen>
@@ -147,6 +163,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
       {agentId ? <Button label={`chat with ${agent ? agentName(agent) : agentId}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: agent ? agentName(agent) : undefined })} /> : null}
       <T dim selectable>{item.id}{item.source_id !== item.id ? ` · from ${item.source_id}` : ''}</T>
       {item.actions.includes('work.done') ? <Button label={attentionActionLabel('work.done').toLowerCase()} disabled={busy || status !== 'online'} onPress={() => Alert.prompt('Complete step', item.title, summary => { if (summary.trim()) void actions.done(item, summary).then(done => { if (done) navigation.goBack(); }); })} /> : null}
+      {item.actions.includes('message.read') ? <Button label="dismiss: mark read" disabled={busy || status !== 'online'} onPress={() => void actions.markRead(item).then(done => { if (done) navigation.goBack(); })} /> : null}
       {other.length ? <Note>in the CLI: {other.map(attentionActionLabel).join(', ')}</Note> : null}
     </ScrollView>
   </Screen>;
