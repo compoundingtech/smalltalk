@@ -38,6 +38,8 @@ struct State {
     ptys: Option<HashMap<String, String>>,
     /// The last value seen for each key observed by value, such as `live-workspaces`.
     values: HashMap<String, String>,
+    /// When each polled key (such as a terminal's screen) was last looked at.
+    polled_at: HashMap<String, u128>,
 }
 
 /// How often a pass evaluates every item even when nothing marked them, counting what it corrects.
@@ -181,6 +183,58 @@ impl Incremental {
         if state.values.get(key) != Some(&value) {
             state.values.insert(key.to_owned(), value);
             Self::mark_locked(&mut state, key);
+        }
+    }
+
+    /// Remember what an evaluation saw for a polled key, so a later poll marks its readers only
+    /// when the value changes from that.
+    pub fn saw_value(&self, key: &str, value: String, now: u128) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.values.insert(key.to_owned(), value);
+        state.polled_at.insert(key.to_owned(), now);
+    }
+
+    /// Look again, at most every `every_ms`, at each key with `prefix` that an item read, and
+    /// mark its readers when the value changed. `poll` gets the key without the prefix.
+    pub fn poll_values(
+        &self,
+        prefix: &str,
+        every_ms: u128,
+        now: u128,
+        poll: impl Fn(&str) -> Option<String>,
+    ) {
+        let keys = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .readers
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .filter(|key| {
+                    state
+                        .polled_at
+                        .get(*key)
+                        .is_none_or(|at| now.saturating_sub(*at) >= every_ms)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for key in keys {
+            let value = poll(&key[prefix.len()..]).unwrap_or_default();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.polled_at.insert(key.clone(), now);
+            if state.values.get(&key) != Some(&value) {
+                state.values.insert(key.clone(), value);
+                Self::mark_locked(&mut state, &key);
+            }
         }
     }
 
