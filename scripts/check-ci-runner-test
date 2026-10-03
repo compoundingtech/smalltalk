@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -15,6 +16,8 @@ picker = workflow.split("  pick-runner:\n", 1)[1].split("  namespace-capacity:\n
 assert "if: vars.CI1_RUNNERS == 'on'" in picker, "ci1 must ship disabled"
 # Read this generated YAML block scalar without adding a YAML dependency to the CI shell.
 script = textwrap.dedent(picker.split("        run: |\n", 1)[1])
+bash = shutil.which("bash")
+assert bash, "runner selection tests require bash on PATH"
 
 
 def runner(label="ci1", busy=False, status="online"):
@@ -25,7 +28,7 @@ def check(name, pages, expected=None, api=True, **overrides):
     with tempfile.TemporaryDirectory() as scratch:
         tmp = Path(scratch)
         gh = tmp / "gh"
-        gh.write_text("#!/bin/bash\necho called >> \"$API_CALLS\"\nprintf '%s' \"$API_RESPONSE\"\nexit \"$API_EXIT\"\n")
+        gh.write_text(f"#!{bash}\necho called >> \"$API_CALLS\"\nprintf '%s' \"$API_RESPONSE\"\nexit \"$API_EXIT\"\n")
         gh.chmod(0o755)
         output, summary, calls = (tmp / n for n in ("output", "summary", "calls"))
         output.touch()
