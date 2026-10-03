@@ -2388,6 +2388,16 @@ impl Ui {
                     self.find_in(agent, "");
                 }
             }
+            // Ctrl chords work on a Mac, where Option types characters instead (Nathan,
+            // 2026-10-03); the Alt chords stay where Alt is Alt.
+            KeyCode::Char('e') if control && conversation.is_some() => self.toggle_all_tools(),
+            KeyCode::Char('p') if control && conversation.is_some() => self.toggle_simple(),
+            KeyCode::Char('d') if control && conversation.is_some() => self.toggle_details(),
+            KeyCode::Char('r') if control && conversation.is_some() && self.live => {
+                if let Some(entry) = self.undelivered() {
+                    self.effects.push(Effect::Resend { entry });
+                }
+            }
             KeyCode::Char('o') if alt && conversation.is_some() => self.toggle_all_tools(),
             KeyCode::Char('O') if alt && conversation.is_some() => self.toggle_simple(),
             KeyCode::Char('i') if alt && conversation.is_some() => self.toggle_details(),
@@ -3556,6 +3566,31 @@ mod tests {
         press(&mut ui, KeyCode::BackTab, KeyModifiers::SHIFT);
         assert_eq!(tabs(&ui), (0, 1, both));
         assert!(screen(&ui).contains("Weekly release"));
+    }
+
+    #[test]
+    fn details_are_per_agent_and_ctrl_chords_work_where_option_types() {
+        let mut ui = glass();
+        let atlas = "agent/example/atlas/builder".to_owned();
+        ui.open_in_glass(Pane::Agent(Some(atlas.clone())), Open::Tab);
+        // Nathan, 2026-10-03: hiding one agent's details hid every agent's.
+        ctrl(&mut ui, 'd');
+        assert!(!ui.editing, "a chord, not typing");
+        assert!(ui.details_hidden.contains(&atlas));
+        ui.open_in_glass(Pane::Agent(Some("agent/example/cos".into())), Open::Tab);
+        assert!(!ui.details_hidden.contains("agent/example/cos"));
+        // Ctrl+P is the simplified view and Ctrl+E opens the tool calls, on a Mac too.
+        ui.open_in_glass(Pane::Agent(Some(atlas.clone())), Open::Here);
+        let simple = ui.simple;
+        ctrl(&mut ui, 'p');
+        assert_ne!(ui.simple, simple);
+        let expanded = ui.conversation_state.expanded.clone();
+        ctrl(&mut ui, 'e');
+        assert!(!ui.editing);
+        assert_ne!(
+            ui.conversation_state.expanded, expanded,
+            "ctrl+e opens the tool calls"
+        );
     }
 
     #[test]
