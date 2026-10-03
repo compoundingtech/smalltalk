@@ -6654,10 +6654,13 @@ pub fn select_replicated_document(
         if canonical::claim_key(transaction, &claim.id).map_err(internal)?
             < canonical::claim_key(transaction, &previous).map_err(internal)?
         {
+            // The earliest binding also gives the version its arrival index, as a replay in
+            // canonical order would, so the order bindings arrive in never matters.
             transaction
                 .execute(
-                    "UPDATE documents SET binding_claim_id=?3,binding_key=?4 WHERE name=?1 AND hash=?2",
-                    params![name, hash, claim.id, binding_key],
+                    "UPDATE documents SET binding_claim_id=?3,binding_key=?4,created_index=?5
+                     WHERE name=?1 AND hash=?2",
+                    params![name, hash, claim.id, binding_key, created_index],
                 )
                 .map_err(internal)?;
         }
