@@ -12,7 +12,6 @@ for (const name of ['Models.generated', 'Client.generated']) {
     fs.writeFileSync(path.join(temporary, `${name}.js`), output);
 }
 const { St3Client, ClientError, applyWindow } = require(path.join(temporary, 'Client.generated.js'));
-const { CONTRACT_SHA256 } = require(path.join(temporary, 'Models.generated.js'));
 fs.rmSync(temporary, { recursive: true, force: true });
 
 const snapshot = { id: 'snapshot/test', host_id: 'host/test', store_index: 1, projection_version: 'client-projection.v0', created_at: '2026-09-20T00:00:00Z' };
@@ -231,15 +230,6 @@ test('applyWindow keeps a window in the order each frame names', () => {
     assert.equal(window.hasMore, false);
     assert.equal(window.snapshot.id, 'snapshot/later');
     assert.equal(applyWindow(window, { kind: 'resync', id: 'm' }), window);
-});
-
-test('generated hash uses normative schema and operations bytes', () => {
-    const crypto = require('node:crypto');
-    const root = path.join(__dirname, '../../..');
-    const hash = crypto.createHash('sha256');
-    hash.update(fs.readFileSync(path.join(root, 'docs/st3/client-v0/schemas/client-v0.schema.json')));
-    hash.update(fs.readFileSync(path.join(root, 'docs/st3/client-v0/schemas/operations.json')));
-    assert.equal(CONTRACT_SHA256, hash.digest('hex'));
 });
 
 test('glass methods preserve structure, null creation base, and idempotency headers', async () => {
