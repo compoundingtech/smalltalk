@@ -56,9 +56,8 @@ const SLACK: u64 = 5_000;
 /// much worse unnoticed. Each breaks the daemon's rule that no query's cost grows with the whole
 /// store and is owed a fix. A fixed one fails the check until it leaves this list.
 const KNOWN_GROWTH: &[(&str, f64)] = &[
-    // Attention and the mission detail read every person ask (11.8x full-scan steps).
+    // Attention reads every person ask (11.8x full-scan steps).
     ("GET /v1/attention", 18.0),
-    ("GET /v1/client/missions/{*id}", 18.0),
     // Checkpoint status walks the sealed set (9.8x).
     ("GET /v1/checkpoint/status", 15.0),
     // Device inventory reads every principal claim (9.8x).
