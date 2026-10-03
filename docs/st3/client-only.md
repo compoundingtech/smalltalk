@@ -36,7 +36,7 @@ session actor; local actor settings cannot change that authority.
 
 Then run `stui`. A saved profile selects client-only mode automatically. `stui --client` requires
 a saved pairing; `stui --local` explicitly selects the usual local Unix socket and configured
-person. The retired `--old` screens require local mode. `stui --help` lists these choices.
+person. `stui --help` lists these choices.
 
 ## Several members and reconnecting
 
