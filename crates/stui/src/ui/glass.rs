@@ -96,6 +96,8 @@ enum Drop {
     },
 }
 
+/// The sidebar's Usage section.
+const USAGE_SECTION: usize = 4;
 /// The sidebar's sections, what the number keys were in the old stui.
 /// The sidebar's sections, by the tab whose list each shows. Home is not one: it opens from
 /// the status line's ⌂ and "need you", over the glass.
@@ -310,7 +312,7 @@ impl Glasses {
     /// focused group first.
     /// Whether usage is on screen: the sidebar's Usage section or a usage tab in front.
     pub(crate) fn shows_usage(&self) -> bool {
-        if self.sidebar.shown && self.sidebar.section == 4 {
+        if self.sidebar.shown && self.sidebar.section == USAGE_SECTION {
             return true;
         }
         let glass = self.glass();
@@ -1501,6 +1503,23 @@ impl Ui {
     }
 
     /// Show the sidebar with the keys, or hide it when it has them (Ctrl+S).
+    /// The top bar's usage slot: the sidebar at Usage, or hidden when Usage already shows.
+    pub(crate) fn toggle_usage(&mut self) {
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        let sidebar = &mut glasses.sidebar;
+        if sidebar.shown && sidebar.section == USAGE_SECTION {
+            sidebar.shown = false;
+            sidebar.focused = false;
+        } else {
+            sidebar.shown = true;
+            sidebar.section = USAGE_SECTION;
+            sidebar.focused = true;
+        }
+        glasses.save();
+    }
+
     pub(crate) fn toggle_sidebar(&mut self) {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
@@ -1945,6 +1964,31 @@ impl Ui {
                 Hit::PaletteSection(3),
             );
         }
+        // Usage beside the fleet: the sidebar's Usage, shown and hidden (Nathan, 2026-10-03).
+        // The fleet's counts end in a space already.
+        let gap = if machines_shown { "· " } else { " · " };
+        spans.push(Span::styled(gap, bar(theme::dim())));
+        let x = area.x + Line::from(spans.clone()).width() as u16;
+        let usage_text = "$ usage";
+        let showing = self.glasses.as_ref().is_some_and(|glasses| {
+            glasses.sidebar.shown && glasses.sidebar.section == USAGE_SECTION
+        });
+        spans.push(Span::styled(
+            usage_text,
+            bar(if showing {
+                theme::strong(theme::YELLOW)
+            } else {
+                theme::fg(theme::YELLOW)
+            }),
+        ));
+        self.hit(
+            Rect {
+                x,
+                width: text::width(usage_text) as u16,
+                ..area
+            },
+            Hit::Usage,
+        );
         buf.set_line(area.x, area.y, &Line::from(spans), area.width);
         // ▢: one space.
         let name = format!(" ▢ {} ▾ ", glass.name);
@@ -3789,6 +3833,29 @@ mod tests {
             Some(shell)
         );
         assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
+    fn the_top_bars_usage_slot_shows_and_hides_the_sidebars_usage() {
+        let mut ui = glass();
+        let shown = screen(&ui);
+        let top = shown.lines().next().unwrap();
+        let column = top[..top.find("$ usage").expect("the top bar has usage")]
+            .chars()
+            .count() as u16;
+        let hit = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .find(|(rect, _)| rect.y == 0 && rect.x <= column && column < rect.x + rect.width)
+            .map(|(_, hit)| hit.clone());
+        assert_eq!(hit, Some(Hit::Usage));
+        ui.click(Hit::Usage);
+        assert!(ui.glasses.as_ref().unwrap().shows_usage());
+        assert!(ui.glasses.as_ref().unwrap().sidebar.focused);
+        ui.click(Hit::Usage);
+        assert!(!ui.glasses.as_ref().unwrap().sidebar.shown);
     }
 
     #[test]
