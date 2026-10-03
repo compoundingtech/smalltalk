@@ -21631,6 +21631,57 @@ fn a_catching_up_node_projects_once_per_interval_and_again_when_caught_up() {
     assert!(!target.replication_projection_deferred());
 }
 
+/// A member catching up receives thousands of envelopes in one exchange (#898). Admitting them
+/// in one transaction held the only writer for seconds, so every lease renewal and message
+/// behind it waited; admission now commits in chunks, and the writer serves others between them.
+#[cfg(test)]
+#[test]
+fn a_large_page_is_admitted_in_chunks_that_release_the_writer() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let envelopes = 2 * smallclaims::store::ADMISSION_CHUNK_ENVELOPES + 50;
+    for index in 0..envelopes {
+        source
+            .append_claim(&ClaimInput {
+                subject: format!("custom/catch-up/{index}"),
+                kind: "custom.catch-up.note".into(),
+                actor: Some("person/tester".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let mut inventory = target.replication_inventory().unwrap();
+    inventory.accepts = Some(REPLICATION_PAGE_LIMIT);
+    let response = source
+        .export_replication_exchange(FLEET, &inventory)
+        .unwrap();
+    assert!(response.envelopes.len() >= envelopes);
+    target
+        .receive_replication_exchange("source", FLEET, &response)
+        .unwrap();
+    smallclaims::store::ADMISSION_TRANSACTIONS.with(|count| count.set(0));
+    let admission = target.validate_replication_backlog().unwrap();
+    assert_eq!(
+        smallclaims::store::ADMISSION_TRANSACTIONS.with(std::cell::Cell::get),
+        3
+    );
+    assert!(admission.changed);
+    target.project_replication_backlog().unwrap();
+    assert!(
+        target
+            .claims_for(&format!("custom/catch-up/{}", envelopes - 1), None)
+            .unwrap()
+            .len()
+            == 1
+    );
+}
+
 #[cfg(test)]
 #[test]
 fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() {
