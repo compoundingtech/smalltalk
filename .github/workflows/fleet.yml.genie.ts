@@ -5,7 +5,16 @@ import {
   plainFlakeJob,
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
-import { buildEnv, commonSetupSteps, linuxStageRunner, linuxRunner, readOnlyBinaryCaches, workspacePreparationSteps } from './workspace-ci.ts'
+import {
+  buildEnv,
+  commonSetupSteps,
+  linuxStageJob,
+  linuxStageRunner,
+  linuxRunner,
+  perfStoresCache,
+  readOnlyBinaryCaches,
+  workspacePreparationSteps,
+} from './workspace-ci.ts'
 
 // Namespace offers nested virtualization on linux/amd64. Prove /dev/kvm can create a VM before
 // anything else; QEMU is also forbidden to fall back to emulation (nix/transport-isolation-vm.nix).
@@ -24,61 +33,6 @@ os.close(vm)
 print(f"KVM API {version}: created a VM")
 EOF
 printf 'KVM: \\x60%s\\x60, CPU virtualization flag %s, VM creation succeeded\\n\\n| Phase | Elapsed |\\n| --- | --- |\\n' "$(ls -l /dev/kvm)" "$(grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo none)" >> "$GITHUB_STEP_SUMMARY"`
-
-// One Linux stage: its own runner and caches, the common setup, then scripts/ci-linux (or the
-// command given), with steps before and after it.
-const linuxStageJob = ({
-  name,
-  stage,
-  setup,
-  description,
-  env = {},
-  extraLogs = '',
-  command = ['bash', 'scripts/ci-linux', stage],
-  before = [],
-  after = [],
-}: {
-  name: string
-  stage: string
-  setup: readonly unknown[]
-  description?: string
-  env?: Record<string, string>
-  extraLogs?: string
-  command?: string[]
-  before?: readonly unknown[]
-  after?: readonly unknown[]
-}) => ({
-  name,
-  'runs-on': linuxStageRunner,
-  'timeout-minutes': 120,
-  defaults: { run: { shell: 'bash' } },
-  env: { ...buildEnv, ...env },
-  steps: [
-    ...setup,
-    {
-      name: 'Summarize tested revision',
-      run: `printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' "$(git rev-parse HEAD)" "$(nproc)" "$(free -h | awk '/^Mem:/ {print $2 " memory"}')" >> "$GITHUB_STEP_SUMMARY"`,
-    },
-    ...before,
-    nixDevelopStep({ name: description ?? 'Run nextest', command }),
-    ...after,
-    {
-      name: 'Save Nix outputs to the local Nix cache',
-      if: 'success()',
-      run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
-    },
-    {
-      name: 'Retain stage logs and timings',
-      uses: 'actions/upload-artifact@v4',
-      if: 'always()',
-      with: {
-        name: `${name}-logs`,
-        path: `\${{ runner.temp }}/ci-logs/\n${extraLogs}`,
-        'if-no-files-found': 'ignore',
-      },
-    },
-  ],
-})
 
 // Required gate. Label events belong to macos.yml so they never restart or cancel this workflow.
 export default githubWorkflow({
@@ -182,7 +136,8 @@ done`,
     },
     // The cost check: SQLite work per daemon request on a small and a ten times larger generated
     // store. Counts, not timings, so a lightly optimized build only speeds up the generation.
-    // Not part of linux-gate; it must finish before linux-tests does (docs/ci.md).
+    // Not part of linux-gate; it must finish before linux-tests does (docs/ci.md). The load test
+    // runs in perf.yml.
     'perf-cost': linuxStageJob({
       name: 'perf-cost',
       stage: 'cost',
@@ -191,53 +146,7 @@ done`,
       command: ['bash', 'scripts/ci-perf', 'cost'],
       env: { CARGO_PROFILE_DEV_OPT_LEVEL: '1' },
       extraLogs: '${{ runner.temp }}/perf/',
-    }),
-    // The load test: a production-sized generated store under a busy host's request mix, against
-    // main's last report. Main's successful runs save their report as the next baseline.
-    'perf-load': linuxStageJob({
-      name: 'perf-load',
-      stage: 'load',
-      setup: commonSetupSteps,
-      description: 'Run the load test',
-      command: ['bash', 'scripts/ci-perf', 'load'],
-      extraLogs: '${{ runner.temp }}/perf/',
-      before: [
-        // Generating the production-sized stores takes longer than the test; they are kept for
-        // as long as the generator and the schema stay the same.
-        {
-          name: 'Restore the generated stores',
-          uses: 'actions/cache@v4',
-          with: {
-            path: '${{ runner.temp }}/st-bench',
-            key: "perf-load-stores-${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}",
-          },
-        },
-        {
-          name: "Restore main's load test baseline",
-          uses: 'actions/cache/restore@v4',
-          with: {
-            path: '${{ runner.temp }}/perf-baseline',
-            key: 'perf-load-baseline-${{ github.run_id }}',
-            'restore-keys': 'perf-load-baseline-',
-          },
-        },
-      ],
-      after: [
-        {
-          name: 'Keep this report as the next baseline',
-          if: "success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'",
-          run: 'mkdir -p "$RUNNER_TEMP/perf-baseline" && cp "$RUNNER_TEMP/perf/load.json" "$RUNNER_TEMP/perf-baseline/load.json"',
-        },
-        {
-          name: 'Save the baseline',
-          if: "success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'",
-          uses: 'actions/cache/save@v4',
-          with: {
-            path: '${{ runner.temp }}/perf-baseline',
-            key: 'perf-load-baseline-${{ github.run_id }}',
-          },
-        },
-      ],
+      before: [perfStoresCache('cost')],
     }),
     // st2's transport-isolation cascade tests need a real systemd user manager, which the
     // runner image lacks. A NixOS VM runs this job's prebuilt test binary; it compiles nothing.

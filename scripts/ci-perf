@@ -38,28 +38,20 @@ summarize_load() {
 start=$SECONDS status=0
 case "$stage" in
   cost)
-    # The counts do not depend on the build's speed, so a lightly optimized build only makes the
-    # stores generate faster.
-    cargo test -p st3 --test integration --locked --no-run 2>&1 | tee "$out/build.log" || status=$?
-    printf '| build | | %ss | %s |\n' "$((SECONDS - start))" "$status" >> "$GITHUB_STEP_SUMMARY"
-    if [ "$status" -eq 0 ]; then
-      # The counts are the whole process's, so nothing else may run beside the check.
-      ST_COST_REPORT="$out/cost.json" cargo test -p st3 --test integration --locked daemon_cost:: \
-        -- --nocapture --test-threads 1 2>&1 | tee "$out/cost.log" || status=$?
-      [ -f "$out/cost.json" ] && summarize_cost "$out/cost.json"
-    fi
+    # One cargo invocation builds and runs: a second one reruns a vendored build script and
+    # recompiles st3. The counts do not depend on the build's speed, so the job's lightly
+    # optimized build only makes the stores generate faster. The counts are the whole
+    # process's, so nothing else may run beside the check.
+    ST_COST_REPORT="$out/cost.json" cargo test -p st3 --test integration --locked daemon_cost:: \
+      -- --nocapture --test-threads 1 2>&1 | tee "$out/cost.log" || status=$?
+    [ -f "$out/cost.json" ] && summarize_cost "$out/cost.json"
     ;;
   load)
-    cargo test --release -p st3 --test integration --locked --no-run 2>&1 | tee "$out/build.log" || status=$?
-    printf '| build | | %ss | %s |\n' "$((SECONDS - start))" "$status" >> "$GITHUB_STEP_SUMMARY"
-    if [ "$status" -eq 0 ]; then
-      baseline=()
-      [ -f "$RUNNER_TEMP/perf-baseline/load.json" ] && baseline=(ST_LOAD_BASELINE="$RUNNER_TEMP/perf-baseline/load.json")
-      env "${baseline[@]}" ST_LOAD_GATE=1 ST_LOAD_REPORT="$out/load.json" \
-        cargo test --release -p st3 --test integration --locked daemon_load:: -- --nocapture \
-        2>&1 | tee "$out/load.log" || status=$?
-      [ -f "$out/load.json" ] && summarize_load "$out/load.json"
-    fi
+    # Main's last reports, newest first; the test compares with the worst of them.
+    ST_LOAD_GATE=1 ST_LOAD_REPORT="$out/load.json" ST_LOAD_BASELINE="$RUNNER_TEMP/perf-baseline" \
+      cargo test --release -p st3 --test integration --locked daemon_load:: -- --nocapture \
+      2>&1 | tee "$out/load.log" || status=$?
+    [ -f "$out/load.json" ] && summarize_load "$out/load.json"
     ;;
   *) echo "unknown stage: $stage" >&2; exit 2 ;;
 esac

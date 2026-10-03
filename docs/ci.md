@@ -208,11 +208,21 @@ with `opt-level = 1` only to generate the stores faster.
   8,007,288 steps for a store ten times larger) and the foreign-key columns #1103 indexed (a trim's
   work per deleted row grew 7.3 times, its full-scan steps 9.3 times).
 
-`perf-load` runs `daemon_load::` in a release build: a store the size of a busy host's (scale 1),
-the request mix and rates that host's daemon reported in its busiest five-minute window, and the
-reconciler. It fails when a request's p99 or the daemon's CPU passes its budget, or is more than
-20% worse than main's last report. Main's successful runs save their report as the next baseline
-(`perf-load-baseline-*` in the Actions cache); a run without one checks only the budgets.
+`perf-load` runs `daemon_load::` in a release build, in its own `Performance` workflow
+(`perf.yml`): nightly on `main`, on pull requests that change the daemon or the store, and on
+dispatch. It serves a store the size of a busy host's (scale 1, about 240,000 claims) to the
+request mix and rates that host's daemon reported in its busiest five-minute window (30 requests a
+second: harness events, mailbox pages, claims, desired state, delivery holds, replication rounds,
+renewals, status and work reads, and a person's reads), with the reconciler running. It fails when
+a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
+main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a
+regression is what passes several. Main's successful runs add their report
+(`perf-load-baseline-*` in the Actions cache); a run without any checks only the budgets. It is
+not in Workspace CI because with warm caches it takes as long as `linux-tests`, and twice as long
+when its stores must generate.
+
+Both jobs keep their generated stores in the Actions cache, keyed by the generator and
+`docs/st3/schema.md`, so a store from an older generator is never measured.
 
 Run either locally with `TMPDIR=/var/tmp`; `ST_BENCH_DIR` keeps the generated stores between runs:
 

@@ -91,3 +91,71 @@ done`,
 
 /** Everything a job that runs the workspace tests needs. */
 export const workspacePreparationSteps = [...commonSetupSteps, ...testBuildSteps]
+
+// One Linux stage: its own runner and caches, the common setup, then scripts/ci-linux (or the
+// command given), with steps before and after it.
+export const linuxStageJob = ({
+  name,
+  stage,
+  setup,
+  description,
+  env = {},
+  extraLogs = '',
+  command = ['bash', 'scripts/ci-linux', stage],
+  before = [],
+  after = [],
+}: {
+  name: string
+  stage: string
+  setup: readonly unknown[]
+  description?: string
+  env?: Record<string, string>
+  extraLogs?: string
+  command?: string[]
+  before?: readonly unknown[]
+  after?: readonly unknown[]
+}) => ({
+  name,
+  'runs-on': linuxStageRunner,
+  'timeout-minutes': 120,
+  defaults: { run: { shell: 'bash' } },
+  env: { ...buildEnv, ...env },
+  steps: [
+    ...setup,
+    {
+      name: 'Summarize tested revision',
+      run: `printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' "$(git rev-parse HEAD)" "$(nproc)" "$(free -h | awk '/^Mem:/ {print $2 " memory"}')" >> "$GITHUB_STEP_SUMMARY"`,
+    },
+    ...before,
+    nixDevelopStep({ name: description ?? 'Run nextest', command }),
+    ...after,
+    {
+      name: 'Save Nix outputs to the local Nix cache',
+      if: 'success()',
+      run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
+    },
+    {
+      name: 'Retain stage logs and timings',
+      uses: 'actions/upload-artifact@v4',
+      if: 'always()',
+      with: {
+        name: `${name}-logs`,
+        path: `\${{ runner.temp }}/ci-logs/\n${extraLogs}`,
+        'if-no-files-found': 'ignore',
+      },
+    },
+  ],
+})
+
+/**
+ * The perf jobs' generated stores, kept for as long as the generator and the schema stay the
+ * same: a store from an older generator must never be measured.
+ */
+export const perfStoresCache = (stage: string) => ({
+  name: 'Restore the generated stores',
+  uses: 'actions/cache@v4',
+  with: {
+    path: '${{ runner.temp }}/st-bench',
+    key: `perf-${stage}-stores-\${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}`,
+  },
+})

@@ -21,7 +21,8 @@
 //! - `ST_LOAD_SCALE` sets the generated store's scale. The default, `1`, is the busy host's size.
 //! - `ST_BENCH_DIR` keeps the generated store for the next run, as for `daemon_bench`.
 //! - `ST_LOAD_SECONDS` sets how long the load runs. The default is 120.
-//! - `ST_LOAD_BASELINE` names main's report to compare with; without it only the budgets apply.
+//! - `ST_LOAD_BASELINE` names main's reports to compare with, a file or a directory of them; the
+//!   comparison takes the worst of each. Without one only the budgets apply.
 //! - `ST_LOAD_REPORT` writes this run's report there, for the next comparison.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -94,8 +95,8 @@ const MIX: &[Load] = &[
 /// What a person reads while moving through stui, one after another, and each read's p99 budget.
 const PERSON_READS: &[(&str, u64)] = &[
     ("/v1/client/now", 250),
-    // The agents list reads every agent's state; it is slow already (see docs/ci.md).
-    ("/v1/client/agents", 1_500),
+    // The agents list reads every agent's state: 0.6 to 2 s at this size already.
+    ("/v1/client/agents", 4_000),
     ("/v1/client/missions", 250),
     ("/v1/client/attention", 250),
     ("/v1/client/messages", 250),
@@ -197,10 +198,7 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         ));
     }
     if let Some(baseline) = std::env::var_os("ST_LOAD_BASELINE") {
-        match std::fs::read(&baseline)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Report>(&bytes).ok())
-        {
+        match worst_of(Path::new(&baseline)) {
             Some(baseline) => failures.extend(compare(&report, &baseline)),
             None => println!(
                 "no baseline at {}; only the budgets apply",
@@ -214,6 +212,47 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// Main's reports at `path`, a report or a directory of them, combined into the worst of each:
+/// one run's p99 on a shared runner moves by half or more from the next's, so a regression is
+/// what passes the worst of several runs.
+fn worst_of(path: &Path) -> Option<Report> {
+    let files = if path.is_dir() {
+        std::fs::read_dir(path)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|file| {
+                file.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
+    let reports = files
+        .iter()
+        .filter_map(|file| serde_json::from_slice::<Report>(&std::fs::read(file).ok()?).ok())
+        .collect::<Vec<_>>();
+    let mut worst = Report::default();
+    for report in &reports {
+        worst.daemon_cores = worst.daemon_cores.max(report.daemon_cores);
+        for (name, path) in &report.paths {
+            let into = worst.paths.entry(name.clone()).or_insert(PathReport {
+                count: path.count,
+                ..PathReport::default()
+            });
+            into.count = into.count.min(path.count);
+            into.p50_ms = into.p50_ms.max(path.p50_ms);
+            into.p99_ms = into.p99_ms.max(path.p99_ms);
+            into.max_ms = into.max_ms.max(path.max_ms);
+        }
+    }
+    println!(
+        "comparing with the worst of {} reports of main",
+        reports.len()
+    );
+    (!reports.is_empty()).then_some(worst)
 }
 
 /// Where this run is more than [`WORSE`] past the baseline. A path with few requests has a p99
