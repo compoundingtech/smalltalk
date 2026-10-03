@@ -18781,7 +18781,19 @@ fn current_harness_at(
             Ok::<_, anyhow::Error>((claim, store_index, observed_at_unix_ms, key))
         })
         .transpose()?;
+    let codex_failure = current.as_ref().is_some_and(|(state, ..)| {
+        crate::codex_failure::failure_detail(
+            optional
+                .get("driver")
+                .and_then(|v| v.as_deref())
+                .unwrap_or_default(),
+            state,
+            optional.get("reason").and_then(|v| v.as_deref()),
+        )
+        .is_some()
+    });
     if let Some((claim, _store_index, observed_at_unix_ms, key)) = work_activity
+        && !codex_failure
         && key > runtime_key
         && current
             .as_ref()

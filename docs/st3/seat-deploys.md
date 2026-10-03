@@ -140,6 +140,16 @@ A stale seat shows as `waiting` instead of `running`, and `st agents show` print
 
 ## Deploys
 
+Codex's `systemError` is a failed thread status, not proof that its app-server process crashed.
+The driver retains the typed turn error, including when it has to recover it from the session
+rollout because the control subscriber missed a completion. Policy refusals, model capacity,
+credential rejection and usage limits have distinct causes. They appear in the agent's `fault`
+field and the fault list; an unknown cause stays explicit rather than becoming healthy state.
+Only a positive harness recovery or a replacement incarnation clears that fault; later work
+progress cannot erase it. A model-capacity refusal uses the existing bounded retry in the same
+session. A cyber-policy refusal needs review of the task and provider refusal before resuming;
+st does not automatically retry it.
+
 A deploy only needs to install the binary and restart the daemon. Drivers with reexec support
 follow the replacement within about two seconds of the install. Older native paths can keep
 delivering and report `legacy`; an older executable is not represented as a current one. A deploy
