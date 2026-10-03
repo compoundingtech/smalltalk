@@ -740,6 +740,17 @@ A newer st build can word the same gate's request differently and ask again for 
 The reviewer then sees one review: the newest request, which is the one the gate waits on, aged
 from the first request, on every node.
 
+Each reconcile pass asks a waiting gate for its owner's current generation, revision, definition
+and attempt. A request that went stale, because the step was retried or its definition changed,
+is asked again on the next pass, so an open step waiting on a person always has a request the
+person can answer. The reviewer's answer is the `gate.result` that the request's reviewer bound
+to it. The gate and the review list read answers by that one rule, so a later result from another
+actor cannot hide an answer from the gate while the list no longer offers the review.
+
+A loop's human gates (`until`, a person's candidate choice, `on-exhausted`) are asked of its
+`loop-run/GENERATION/PATH` subject, and are current while the step running the loop is on the
+attempt they were asked for. They are listed, approved and rejected like step gates.
+
 `st attention ls --as person/NAME` shows the selected person's pending KDL human gates together
 with their other current decisions and faults.
 

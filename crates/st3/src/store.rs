@@ -10440,6 +10440,36 @@ impl Store {
         pending_human_reviews_tx(&connection, reviewer)
     }
 
+    /// Every human gate request as (request, owner, reviewer): the episodes a human gate's
+    /// attention card can name, open or long closed.
+    pub fn human_gate_requests(&self) -> Result<Vec<(String, String, String)>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, json_extract(body, '$.fields.owner'), json_extract(body, '$.fields.reviewer')
+             FROM claims INDEXED BY claims_human_gate_request_index
+             WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL
+               AND json_extract(body, '$.fields.owner') IS NOT NULL",
+        )?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// The reviewer's answer to the human gate request `request`, by the same rule that takes
+    /// an answered request off `pending_human_reviews`.
+    pub fn human_review_answer(&self, request: &str) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        human_review_answer_tx(&connection, request)
+    }
+
+    /// Why `owner` has no pending human review: answered (how, by whom), stale (which of
+    /// generation, revision, definition, attempt or state moved on), or never asked.
+    pub fn human_review_refusal(&self, owner: &str) -> Result<String> {
+        let connection = self.readers.get();
+        human_review_refusal_tx(&connection, owner)
+    }
+
     /// Request attention for a condition the daemon watches itself. The daemon closes it once
     /// that condition clears.
     /// Retained for historical import and audit fixtures. Current requests use `ask_person`.
@@ -17967,43 +17997,84 @@ fn current_human_review(
     connection: &Connection,
     request: ClaimRecord,
 ) -> Result<Option<HumanReviewView>> {
+    Ok(human_review_currency(connection, request)?.ok())
+}
+
+/// The step that runs a loop, from the subject a loop's gates are asked of:
+/// `loop-run/GENERATION/PATH`, or a subject under it such as `.../round/N/candidate/M` for a
+/// person's choice between candidates. The longest step run that prefixes it is the loop's.
+fn loop_step_tx(connection: &Connection, owner: &str) -> Result<Option<StepRunView>> {
+    let Some(path) = owner.strip_prefix("loop-run/") else {
+        return Ok(None);
+    };
+    let mut prefix = path;
+    // GENERATION/PATH: a step run has at least two segments.
+    while prefix.contains('/') {
+        if let Some(step) = step_run_row_tx(connection, &format!("step-run/{prefix}"))? {
+            return Ok(Some(step));
+        }
+        prefix = prefix.rsplit_once('/').map_or("", |(head, _)| head);
+    }
+    Ok(None)
+}
+
+/// A step run's own row, without its queue and wake enrichment.
+fn step_run_row_tx(connection: &Connection, subject: &str) -> Result<Option<StepRunView>> {
+    connection
+        .query_row(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee,
+                    available_to, agentless, title, goals, worker_reported, lease_owner,
+                    lease_incarnation, lease_expires_at_unix_ms, blocked_reason,
+                    not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms,
+                    readiness_epoch, constraints
+             FROM step_runs WHERE subject=?1",
+            [subject],
+            step_run_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// The review a human gate request asks, while its gate still waits on it, or why it no longer
+/// does. A request is current while its owner (a step, mission or loop run) is open on the
+/// generation, revision, definition and attempt it was asked for. An answer does not make a
+/// request stale: the reviewers' list leaves out answered requests separately.
+fn human_review_currency(
+    connection: &Connection,
+    request: ClaimRecord,
+) -> Result<std::result::Result<HumanReviewView, String>> {
     let fields = request.body.get("fields").unwrap_or(&request.body);
-    let Some(owner) = fields.get("owner").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(reviewer) = fields.get("reviewer").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(mission_revision) = fields.get("mission_revision").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(step_definition) = fields.get("step_definition").and_then(Value::as_str) else {
-        return Ok(None);
+    let text = |name: &str| fields.get(name).and_then(Value::as_str);
+    let (Some(owner), Some(reviewer), Some(mission_revision), Some(step_definition)) = (
+        text("owner"),
+        text("reviewer"),
+        text("mission_revision"),
+        text("step_definition"),
+    ) else {
+        return Ok(Err(
+            "its request does not name the exact owner, reviewer and revision it asks about".into(),
+        ));
     };
     let Some(attempt) = fields
         .get("attempt")
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
     else {
-        return Ok(None);
+        return Ok(Err("its request does not name an attempt".into()));
     };
+    let short = |revision: &str| revision.chars().take(12).collect::<String>();
     // Only the run's header decides whether a review is current: its steps' queue and wake
     // enrichment is the costliest read in st and would run for every open review.
-    let (run, step, title) = if owner.starts_with("step-run/") {
-        let step = connection
-            .query_row(
-                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee,
-                        available_to, agentless, title, goals, worker_reported, lease_owner,
-                        lease_incarnation, lease_expires_at_unix_ms, blocked_reason,
-                        not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms,
-                        readiness_epoch, constraints
-                 FROM step_runs WHERE subject=?1",
-                [owner],
-                step_run_from_row,
-            )
-            .optional()?;
+    let (run, step, title) = if owner.starts_with("step-run/") || owner.starts_with("loop-run/") {
+        // A loop's gates are asked of its loop subject; the step running the loop decides
+        // whether one is current.
+        let step = if owner.starts_with("loop-run/") {
+            loop_step_tx(connection, owner)?
+        } else {
+            step_run_row_tx(connection, owner)?
+        };
         let Some(step) = step else {
-            return Ok(None);
+            return Ok(Err(format!("`{owner}` names no step run")));
         };
         let run = mission_run_header_tx(
             connection,
@@ -18011,16 +18082,37 @@ fn current_human_review(
         )
         .optional()?;
         let Some(run) = run else {
-            return Ok(None);
+            return Ok(Err(format!("its mission run `{}` is gone", step.run)));
         };
-        let current = step.generation == run.generation
-            && mission_revision == run.revision
-            && step_definition == step.definition_hash
-            && attempt == step.attempt
-            && !is_terminal_run_state(&run.status)
-            && !is_terminal_run_state(&step.status);
-        if !current {
-            return Ok(None);
+        if is_terminal_run_state(&run.status) {
+            return Ok(Err(format!("its mission run is {}", run.status)));
+        }
+        if is_terminal_run_state(&step.status) {
+            return Ok(Err(format!("the step is {}", step.status)));
+        }
+        if step.generation != run.generation {
+            return Ok(Err(format!(
+                "its mission run moved on to {}, which asks for its own review",
+                run.generation
+            )));
+        }
+        if mission_revision != run.revision {
+            return Ok(Err(format!(
+                "it was asked for mission revision {}, and the run is on {}",
+                short(mission_revision),
+                short(&run.revision)
+            )));
+        }
+        if step_definition != step.definition_hash {
+            return Ok(Err(
+                "the step's definition changed since it was asked".into()
+            ));
+        }
+        if attempt != step.attempt {
+            return Ok(Err(format!(
+                "it was asked for attempt {attempt}, and the step is on attempt {} ({})",
+                step.attempt, step.status
+            )));
         }
         let title = step.title.clone();
         (run, Some(step.step), title)
@@ -18031,18 +18123,26 @@ fn current_human_review(
         )
         .optional()?;
         let Some(run) = run else {
-            return Ok(None);
+            return Ok(Err(format!("`{owner}` names no mission run")));
         };
-        let current = mission_revision == run.revision
-            && step_definition == run.revision
-            && attempt == 1
-            && !is_terminal_run_state(&run.status);
-        if !current {
-            return Ok(None);
+        if is_terminal_run_state(&run.status) {
+            return Ok(Err(format!("the mission run is {}", run.status)));
+        }
+        if mission_revision != run.revision || step_definition != run.revision {
+            return Ok(Err(format!(
+                "it was asked for mission revision {}, and the run is on {}",
+                short(mission_revision),
+                short(&run.revision)
+            )));
+        }
+        if attempt != 1 {
+            return Ok(Err(format!(
+                "it was asked for attempt {attempt}, and a mission gate has one"
+            )));
         }
         (run, None, None)
     } else {
-        return Ok(None);
+        return Ok(Err(format!("`{owner}` cannot own a human gate")));
     };
     let strings = |name: &str| {
         fields
@@ -18057,7 +18157,7 @@ fn current_human_review(
             })
             .unwrap_or_default()
     };
-    Ok(Some(HumanReviewView {
+    Ok(Ok(HumanReviewView {
         operation: fields
             .get("operation")
             .and_then(Value::as_str)
@@ -18088,12 +18188,90 @@ fn current_human_review(
     }))
 }
 
+/// Whether claim `result` answers the human gate request `request`: a `gate.result` on the
+/// request's operation, by its reviewer, bound to it, with a verdict. The reviewers' list and
+/// the gate both read answers by this rule, so a review the list no longer offers is always one
+/// whose answer the gate acts on.
+fn reviewer_answer_sql(result: &str) -> String {
+    format!(
+        "{result}.subject=request.subject
+         AND {result}.kind='gate.result'
+         AND json_extract({result}.body, '$.fields.request')=request.id
+         AND {result}.actor=json_extract(request.body, '$.fields.reviewer')
+         AND json_extract({result}.body, '$.fields.verdict') IN ('pass','fail','feedback')"
+    )
+}
+
+/// The reviewer's answer to the human gate request `request`, the first one by
+/// `reviewer_answer_sql` when a race left two.
+fn human_review_answer_tx(connection: &Connection, request: &str) -> Result<Option<ClaimRecord>> {
+    connection
+        .query_row(
+            &canonical_sql(&format!(
+                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject,
+                        claims.kind, claims.origin, claims.actor, claims.body,
+                        claims.predecessors, claims.accepted_at_unix_ms
+                 FROM claims request JOIN claims ON {}
+                 WHERE request.id=?1 AND request.kind='gate.requested'
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+                reviewer_answer_sql("claims")
+            )),
+            [request],
+            claim_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Why `owner` has no human review waiting, in words for the person who tried to answer it:
+/// its newest request was answered (how, and by whom), no longer matches the owner, or st never
+/// asked one.
+fn human_review_refusal_tx(connection: &Connection, owner: &str) -> Result<String> {
+    let request = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT request.id, request.store_index, request.batch_id, request.subject,
+                        request.kind, request.origin, request.actor, request.body,
+                        request.predecessors, request.accepted_at_unix_ms
+                 FROM claims request
+                 WHERE request.kind='gate.requested'
+                   AND json_extract(request.body, '$.fields.owner')=?1
+                   AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
+                 ORDER BY CANONICAL_DESC(request) LIMIT 1",
+            ),
+            [owner],
+            claim_from_row,
+        )
+        .optional()?;
+    let Some(request) = request else {
+        return Ok("st has asked no person to review it".into());
+    };
+    if let Some(answer) = human_review_answer_tx(connection, &request.id)? {
+        let fields = answer.body.get("fields").unwrap_or(&answer.body);
+        let decision = fields.get("decision").and_then(Value::as_str).unwrap_or(
+            match fields.get("verdict").and_then(Value::as_str) {
+                Some("pass") => "approved",
+                Some("feedback") => "changes-requested",
+                _ => "rejected",
+            },
+        );
+        return Ok(format!(
+            "it was already answered: {decision} by {}",
+            answer.actor.as_deref().unwrap_or("its reviewer")
+        ));
+    }
+    Ok(match human_review_currency(connection, request)? {
+        Err(why) => format!("its review is no longer current: {why}"),
+        Ok(review) => format!("its review waits on {}", review.reviewer),
+    })
+}
+
 fn pending_human_reviews_tx(
     connection: &Connection,
     reviewer: Option<&str>,
 ) -> Result<Vec<HumanReviewView>> {
     let requests = {
-        let mut statement = connection.prepare(&canonical_sql(
+        let mut statement = connection.prepare(&canonical_sql(&format!(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
@@ -18101,16 +18279,10 @@ fn pending_human_reviews_tx(
              WHERE request.kind='gate.requested'
                AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
                AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
-               AND NOT EXISTS (
-                 SELECT 1 FROM claims result
-                 WHERE result.subject=request.subject
-                   AND result.kind='gate.result'
-                   AND json_extract(result.body, '$.fields.request')=request.id
-                   AND result.actor=json_extract(request.body, '$.fields.reviewer')
-                   AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail','feedback')
-               )
+               AND NOT EXISTS (SELECT 1 FROM claims result WHERE {})
              ORDER BY CANONICAL_ASC(request)",
-        ))?;
+            reviewer_answer_sql("result")
+        )))?;
         statement
             .query_map([reviewer], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()?
