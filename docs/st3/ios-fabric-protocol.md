@@ -29,7 +29,7 @@ recheck them when implementing against a newer main.
 | Identity, peer representation, exact grants | [`src/config.rs`](https://github.com/compoundingtech/fabric/blob/8bd9017a79f4aaa2b25a33321bd7daed6a0acaa6/src/config.rs): `load_or_create_identity`, `Peer`, `PeerBook::may` |
 | Endpoint setup, transport trust, service admission | [`src/daemon.rs`](https://github.com/compoundingtech/fabric/blob/8bd9017a79f4aaa2b25a33321bd7daed6a0acaa6/src/daemon.rs): `build_daemon_endpoint`, `AllowListHook`, `handle_mux_connection`, `handle_mux_stream` |
 | Connection ALPN, generation preface, stream routing | [`src/mux.rs`](https://github.com/compoundingtech/fabric/blob/8bd9017a79f4aaa2b25a33321bd7daed6a0acaa6/src/mux.rs): `MUX_ALPN`, `PeerConnections`, `MuxStreamHeader`, `read_admission` |
-| Generic exposure framing and resumable byte delivery | [`src/tunnel.rs`](https://github.com/compoundingtech/fabric/blob/8bd9017a79f4aaa2b25a33321bd7daed6a0acaa6/src/tunnel.rs): `Frame`, `write_frame`, `decode_frame`, `attach_session`, `serve_connection`, `TunnelSession` |
+| Generic exposure framing and resumable byte delivery | [`src/tunnel.rs`](https://github.com/compoundingtech/fabric/blob/8bd9017a79f4aaa2b25a33321bd7daed6a0acaa6/src/tunnel.rs): `Frame`, `write_frame`, `decode_frame`, `attach_stream_inner`, `serve_connection`, `TunnelSession::run_attach`, `write_attach_loop`, `read_attach_loop`, `ServerSessionStore::get_or_create` |
 | Service-side interface, distinct from a dialer | [`fabric-service-api`](https://github.com/compoundingtech/fabric/blob/8bd9017a79f4aaa2b25a33321bd7daed6a0acaa6/crates/fabric-service-api/src/lib.rs): `Service`, `PeerStream`, `Access` |
 
 ## Identity, addresses, and discovery
@@ -82,6 +82,8 @@ phone grant after the proof:
 
 ```sh
 fabric expose demo-client/0 --socket /path/to/private/st3-client.sock --ephemeral
+fabric peers
+# Choose an unused peer name before adding the phone.
 fabric add PHONE_NODE_ID demo-phone --allow demo-client/0
 fabric reload-peers
 ```
@@ -94,14 +96,16 @@ format = 2
 [[peers]]
 id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 name = "demo-phone"
-roaming = true
 allow = ["demo-client/0"]
 ```
 
 The example ID is a placeholder. Inspect the resulting entry, particularly if
 updating an existing peer: `PeerBook::add_with_allow` preserves existing grants
-when the allow argument is omitted. Do not silently widen a phone’s grant. The
-member-side scope is one exposure and this phone’s exact grant only; broader
+when the allow argument is omitted. It also replaces any other peer with the same
+name: choose an unused alias after inspecting `fabric peers`. A new entry has
+`roaming = false`; `fabric add` has no roaming flag. If the isolated experiment
+needs `roaming = true`, edit that field explicitly and reload. Do not silently
+widen a phone’s grant. The member-side scope is one exposure and this phone’s exact grant only; broader
 changes go through operations. `--ephemeral` avoids persisting the exposure;
 peer grants still persist and require deliberate cleanup after the proof.
 
@@ -125,8 +129,10 @@ applies to this generic gateway exposure. Format 2’s generated `allow_shell` a
 At this pin, a `PeerBook::load` failure clears the in-memory peer book and
 transport allow-list. A later `SyncBook` validation failure occurs before the
 new book is installed. Do not infer successful admission from an edited file.
-Existing sessions also require a separate revocation check; a new-stream grant
-check is not evidence that all previously admitted byte streams were closed.
+`reload-peers` does not close already attached connections or sessions. Removing
+the grant prevents new connections and resumes, but does not cut an already
+admitted stream. Close the app’s active carrier sessions as part of proof cleanup;
+verify detached sessions drain, expire, or are evicted on the isolated daemon.
 
 After fabric admits the stream, **st still checks pairing and client scopes**.
 Fabric does not synthesize a person, device grant, or bearer credential. Complete
@@ -160,6 +166,17 @@ session. Reuse the app’s **Endpoint**, not a direct connection containing seve
 logical service streams: this generic direct handler accepts one bidirectional
 stream. The proof can close local connections on fabric loss and reconnect at
 HTTP/WebSocket client level; it need not implement daemon generation arbitration.
+Each new local TCP connection costs a QUIC handshake and a member `tunnel_accept`
+log entry, so preserve HTTP keep-alive instead of reconnecting per request.
+
+A trusted phone still receives the daemon’s ordinary peer behavior at this pin:
+health probes every 20 seconds while online, backoff while away, and announcements
+on peer reload/network change. An outbound-only phone speaking neither
+`fabric/mux/2` nor `fabric/echo/0` cannot answer, so it is marked unreachable and
+probed on backoff even while its gateway tunnels work. This bounded cost is
+accepted for the proof, but measure it. The fabric owner proposes an inbound-only
+peer kind, without probing/announcements, before this becomes a lasting client
+surface; it does not exist in v0.2.30.
 
 ## Mux wire reference: daemon-to-daemon routing
 
@@ -207,7 +224,7 @@ not fabric frame boundaries. All integers below are unsigned and big-endian.
 | 2 Data | u64 `offset` + bytes | Bytes starting at this direction’s absolute byte offset |
 | 3 Ack | u64 `recv_next` | Cumulative acknowledgement of peer bytes delivered locally |
 | 4 Close | u64 `offset` | This direction ends after byte `offset`; drain those bytes before half-closing locally |
-| 5 Error | UTF-8 message bytes | Tunnel/session refusal or failure |
+| 5 Error | UTF-8 message bytes | Server rejection of Hello/session attachment |
 
 For a fresh local TCP connection generate a random 16-byte session ID. Send
 Hello with `recv_next = 0`, `resume = 0` (25-byte payload, header `01 00 00 00 19`).
@@ -217,17 +234,60 @@ forwarding HTTP. The decoder also accepts an older 24-byte Hello without the
 resume byte; the pinned encoder emits 25 bytes.
 
 Offsets start at zero independently in both directions. Advance `recv_next` only
-after writing delivered bytes to the local socket. Send cumulative Acks, retain
-unacknowledged outgoing bytes, discard duplicate received prefixes, and reject
-gaps (`offset > recv_next`). Fabric uses 8192-byte local reads and bounds queued
-outgoing replay bytes at 4 MiB per session; preserve bounded backpressure in an
-adapter. On local EOF send Close at the final outgoing offset and keep draining
-the reverse direction. A remote Close may precede its final Data; defer the local
-write-half shutdown until that offset is delivered. Never inject reconnect
-notices or diagnostics into an HTTP/WebSocket byte stream.
+after writing delivered bytes to the local socket. The writer sends an Ack at the
+start of each attach and whenever `recv_next` changes, with no delayed-Ack timer:
+expect **Ack{0} immediately after the server Hello**. Ack promptly after each local
+delivery. Retain unacknowledged outgoing bytes, discard duplicate received
+prefixes, and reject gaps (`offset > recv_next`). Older Acks are ignored; the
+pinned implementation clamps Acks beyond `send_next` instead of rejecting them.
 
-Full fabric resumption reopens a logical stream to the **same service**, then
-sends the same session ID, current receive offset, and `resume = 1`. Each side
+Acks provide flow control: the member stops reading the target when 4 MiB is
+unacknowledged. It checks before reads of up to 8192 bytes, so the threshold can
+be exceeded by one read. Preserve bounded backpressure in the adapter. Never
+inject reconnect notices or diagnostics into an HTTP/WebSocket byte stream.
+
+On local EOF or a local read error send Close at the final outgoing offset,
+**after all Data through that offset**, and keep draining the reverse direction.
+Fabric emits Close after its final Data on that attach and re-sends Close on
+reattach. Its receiver tolerates an early Close by recording the pending offset
+and deferring local write-half shutdown until `recv_next` reaches it; the adapter
+should tolerate that too.
+
+A second Hello on an attached stream is a protocol error. Error is sent in answer
+to Hello for cases such as failed target connect, a session limit, or an expired
+resume; the server finishes the stream and waits up to one second. Its text may
+include a host-local socket path. Treat it as a private diagnostic, never as
+forwarded HTTP content or uploaded user data.
+
+### Graceful teardown and abandoned sessions
+
+A session completes only after both Close frames have been exchanged and all
+data has been acknowledged. Continue reading and acknowledging delivered bytes
+until the member Close arrives and the phone’s outgoing data is fully Acked.
+Send the final Ack before finishing the send stream. Do not call
+`connection.close()` before that Ack has gone out: a QUIC close discards unsent
+stream data. Check this behavior against `TunnelSession::run_attach` and its
+reader/writer loops, not just the frame encoder.
+
+Fabric loss, suspension, or premature connection closure can leave the session
+detached on the member. The original `st3-client.sock` connection remains open
+and gateway output can accumulate to the 4 MiB threshold plus one read until the
+900-second TTL or eviction. A framing gap also ends the attach and leaves it
+detached. A failed local target write is `LocalEndpointGone`, which instead
+causes the server to remove the session immediately.
+
+At the default limits, a phone has at most 16 concurrent sessions and the machine
+has 64 total, shared with other peers’ tunnels and resumable shell/exec sessions.
+A new session evicts the oldest detached session when needed, preferring this
+phone’s own detached sessions first; it refuses admission if all relevant slots
+are attached. Sixteen abandoned phone sessions can therefore retain roughly
+64 MiB plus up to one 8 KiB read per session on the gateway. A gateway WebSocket
+writer may keep writing until the abandoned tunnel’s buffer fills. Measure
+abandoned session count, retained bytes, eviction, and target socket cleanup in
+the isolated proof, especially for the no-resume adapter.
+
+Full fabric resumption reconnects with the **same service ALPN** (or reopens a
+logical mux stream to the same service), then sends the same session ID, current receive offset, and `resume = 1`. Each side
 replays unacknowledged bytes from the other side’s advertised receive offset. The
 member keeps the original target socket, checks session ownership by NodeID, and
 rejects a resume after expiry/eviction. A resume rejection must not become a fresh
@@ -339,13 +399,18 @@ source and run independent fixture and interoperability checks against the exact
 member artifact before advancing the pin.
 
 Owner review: the fabric owner confirmed the pin, direct-ALPN path, exact grant
-checks, Hello-first ordering, and 15-minute default TTL before this draft was
-shared. Final corrections to this document are requested separately.
+checks, Hello-first ordering, and 15-minute default TTL. Its subsequent review of
+the document confirmed the framing/Hello/admission bytes and supplied corrections
+for teardown/reaping, Ack cadence/backpressure, Close ordering, peer creation,
+ongoing probes, and existing-session revocation. Those corrections are included
+here. The stui owner also required bridge-owned loopback selection and an
+isolated-daemon proof before member provisioning.
 
 The executable proof should establish: unknown NodeID refusal; trusted phone
 refusal for an ungranted exposure; exact gateway admission; st refusal without a
 paired credential; pairing/capabilities and collections over the carrier; uploads
 and WebSocket/terminal capability forwarding; half-close and concurrent requests;
-network loss/foreground recovery without replaying actions; a recorded
+network loss/foreground recovery without replaying actions; abandoned session
+limits/reaping and final-Ack teardown; member probe cost; a recorded
 relay/direct path; and Tailscale working after disabling the development setting.
 Keep these results separate from this source-derived protocol document.
