@@ -893,11 +893,13 @@
       "type": "object",
       "additionalProperties": false,
       "description": "A named edge from a seat or mission declaration to an ordinary resource subject in the graph.",
-      "required": ["name", "subject", "uri"],
+      "required": ["name", "subject", "kind", "resolution"],
       "properties": {
         "name": { "type": "string", "description": "Unique within the declaration." },
-        "subject": { "$ref": "#/$defs/Id", "description": "The `uri.reference` resource subject: `resource/uri/` followed by the SHA-256 of the exact URI. Every declaration of one URI names the same subject." },
-        "uri": { "type": ["string", "null"], "description": "The exact absolute URI, any scheme. Null while the referenced subject has not reached this host." },
+        "subject": { "$ref": "#/$defs/Id", "description": "The ordinary resource subject targeted by this edge. URI references use resource/uri/SHA256 of the exact URI." },
+        "kind": { "type": "string", "enum": ["uri", "subject"], "description": "Whether the edge was authored with uri= or subject=." },
+        "resolution": { "type": "string", "enum": ["resolved", "unresolved", "not-applicable"], "description": "URI locator availability. Subject references use not-applicable; this is not a subject existence check." },
+        "uri": { "type": "string", "description": "The exact absolute URI, any scheme. Present only for resolved URI references." },
         "reason": { "type": ["string", "null"] }
       }
     },

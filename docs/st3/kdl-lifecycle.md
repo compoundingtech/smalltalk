@@ -222,16 +222,27 @@ beside it. The publication declares `resource/uri/SHA256`, where `SHA256` is the
 SHA-256 of the exact URI's bytes, of kind `uri.reference` with an immutable `uri`. There is no URI
 normalization: spelling differences, including percent-escape case, produce different subjects.
 Every declaration of the same exact URI shares one subject, regardless of its local name or
-reason, and no run owns it. The seat or mission stores only typed edges `{name, subject, reason?}`;
+reason, and no run owns it. The seat or mission stores only typed edges `{name, subject, kind, reason?}`;
 the URI lives on the referenced subject. Client v0 resolves these edges and shows them read-only
-as `resources` on agents and missions; `st subject show AGENT --kdl` writes them back as
-`resource` children.
+as `resources` on agents and missions. `resource "tracker" subject="resource/github/example/issue/1"`
+instead names an existing or not-yet-replicated graph resource without declaring or fetching it.
+Exactly one of `uri` and `subject` is required. `st subject show AGENT --kdl` writes URI edges
+back with `uri=` when their locator is available and degrades to `subject=` when it is not,
+so incomplete replication never prevents reading the declaration. Explicit subject references
+remain `subject=` even when the referenced resource has a URI.
 
 Reapplying a seat declaration or publishing a new mission revision replaces that owner's edge
 list. Omitting a resource drops its edge, not the shared subject or another owner's references.
 Changing a resource's URI points the edge at a different subject; it does not mutate the old
 subject's URI. A nested or loop mission body cannot name resources, because only a published
 top-level mission declares them.
+
+To inspect incoming edges, run `st subject show RESOURCE --references` (add the global
+`--json` flag for JSON), or request `GET /v1/resource-references/{subject}`. Each incoming
+reference contains `owner`, local `name`, and nullable `reason`. The lookup covers current agent
+declarations and selected published mission definitions, including references to unavailable
+targets. Its target-indexed SQLite projection is derived from those declarations, backfilled for
+existing stores, and maintained as replicated selection and replay change the graph.
 
 ## Ordered queue authoring
 
