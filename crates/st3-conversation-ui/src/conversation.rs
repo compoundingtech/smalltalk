@@ -570,12 +570,14 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 on(fg(look.text, theme)),
                 theme,
             ) {
+                let alignment = line.alignment;
                 let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
                 spans.extend(line.spans.into_iter().map(|span| {
                     let style = on(span.style);
                     span.style(style)
                 }));
-                let line = Line::from(spans);
+                let mut line = Line::from(spans);
+                line.alignment = alignment;
                 rows.push(match tint {
                     Some(bg) => pad(line, inner, bg),
                     None => line,
@@ -660,9 +662,10 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             ));
             for line in text::markdown(body, inner.saturating_sub(2), fg(rules.text, theme), theme)
             {
-                let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
-                spans.extend(line.spans);
-                doc.line(Line::from(spans));
+                doc.line(text::prefixed(
+                    vec![Span::styled(bar.text.clone(), bar.style)],
+                    line,
+                ));
             }
         }
         Body::Event(event) => {
@@ -732,9 +735,7 @@ fn fold_control(
 }
 
 fn indent(line: Line<'static>) -> Line<'static> {
-    let mut spans = vec![Span::raw(" ")];
-    spans.extend(line.spans);
-    Line::from(spans)
+    text::prefixed(vec![Span::raw(" ")], line)
 }
 
 fn pad(line: Line<'static>, width: usize, bg: ratatui::style::Color) -> Line<'static> {
