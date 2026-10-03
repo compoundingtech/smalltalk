@@ -69,7 +69,7 @@ impl CheckpointConfig {
 
 /// `[limits]`: when an account's freshest weekly reading reaches `stop_at_weekly_percent`, this
 /// node stops the seats it hosts that use that account, except those in `keep`, once per weekly
-/// window, and asks `ask` (else `person`) on their home. A seat a person starts again stays up
+/// window, and notifies the operations agent in `notify`. A seat a person starts again stays up
 /// until the next window. Every node that hosts seats needs the same settings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -78,7 +78,9 @@ pub struct LimitsConfig {
     pub stop_at_weekly_percent: u32,
     /// Seats never stopped, such as the seat that coordinates the fleet.
     pub keep: Vec<String>,
-    /// The person asked; the node's `person` when absent.
+    /// The operations agent that receives one message per account window.
+    pub notify: Option<String>,
+    /// Legacy setting, accepted for migration but never used for person delivery.
     pub ask: Option<String>,
     /// A reading older than this is not acted on, as a number followed by `s`, `m`, `h` or `d`.
     pub fresh: String,
@@ -90,6 +92,7 @@ impl Default for LimitsConfig {
             enabled: false,
             stop_at_weekly_percent: 95,
             keep: Vec::new(),
+            notify: None,
             ask: None,
             fresh: "1h".into(),
         }
@@ -338,12 +341,13 @@ impl Config {
                     .all(|seat| seat.starts_with("agent/")),
                 "limits.keep lists agent/... subjects"
             );
-            let ask = self.limits.ask.as_deref().or(self.person.as_deref());
             anyhow::ensure!(
-                ask.is_some_and(|person| person.starts_with("person/")
-                    && person.matches('/').count() == 1
-                    && person.len() > "person/".len()),
-                "limits needs a person to ask: set limits.ask or person"
+                self.limits.notify.as_deref().is_some_and(|agent| {
+                    agent.starts_with("agent/")
+                        && agent.split('/').skip(1).all(|part| !part.is_empty())
+                        && !agent.chars().any(char::is_whitespace)
+                }),
+                "limits needs an operations agent: set limits.notify to agent/... (limits.ask and person never receive raw limit events)"
             );
         }
         anyhow::ensure!(
@@ -522,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn the_limits_policy_is_off_until_enabled_and_needs_a_person_to_ask() {
+    fn the_limits_policy_is_off_until_enabled_and_needs_an_operations_agent() {
         let config = Config::default();
         assert!(!config.limits.enabled);
         assert_eq!(config.limits.stop_at_weekly_percent, 95);
@@ -533,10 +537,21 @@ mod tests {
         )
         .unwrap();
         let error = parsed.validate().unwrap_err().to_string();
-        assert!(error.contains("a person to ask"), "{error}");
+        assert!(error.contains("an operations agent"), "{error}");
         let mut config = parsed.clone();
         config.person = Some("person/avery".into());
+        config.limits.ask = Some("person/avery".into());
+        assert!(
+            config.validate().is_err(),
+            "a legacy person target cannot receive events"
+        );
+        config.limits.notify = Some("agent/example/operations".into());
         config.validate().unwrap();
+        for recipient in ["person/avery", "agent/", "agent//ops", "agent/ops seat"] {
+            let mut invalid = config.clone();
+            invalid.limits.notify = Some(recipient.into());
+            assert!(invalid.validate().is_err(), "{recipient}");
+        }
         assert_eq!(config.limits.fresh_ms().unwrap(), 30 * 60_000);
         for (field, value) in [("stop_at_weekly_percent", "0"), ("keep", "[\"seat\"]")] {
             let parsed: Config = toml::from_str(&format!(

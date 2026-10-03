@@ -71,6 +71,18 @@ fn label_text(model: &Model, label: &WorkLabel) -> String {
     format!("{mission} › {}", label.path)
 }
 
+/// Who asked: the agent's name, or the tail of its id; "An agent" when st does not say.
+fn requester_name(model: &Model, id: Option<&str>) -> String {
+    id.map(|id| {
+        model
+            .agents()
+            .find(|agent| agent.header.id == id)
+            .map(crate::agent_label)
+            .unwrap_or_else(|| short(id))
+    })
+    .unwrap_or_else(|| "An agent".into())
+}
+
 fn short(id: &str) -> String {
     id.trim_start_matches("mission/")
         .trim_start_matches("agent/")
@@ -220,21 +232,40 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         changes: vec![],
                     },
                 ),
+                // Information the person asked for: nothing waits on it.
+                "person-step" if let Some(update) = &item.update => (
+                    Tier::Later,
+                    AttentionKind::Update {
+                        from: requester_name(model, item.requester_id.as_deref()),
+                        body: clean_message_text(
+                            update
+                                .summary
+                                .as_deref()
+                                .filter(|_| item.detail.trim().is_empty())
+                                .unwrap_or(&item.detail),
+                        ),
+                        about: update.about.clone(),
+                        subjects: update
+                            .subjects
+                            .iter()
+                            .map(|subject| {
+                                (
+                                    subject.label.clone(),
+                                    subject
+                                        .url
+                                        .clone()
+                                        .or_else(|| subject.reference.clone())
+                                        .unwrap_or_default(),
+                                )
+                            })
+                            .collect(),
+                    },
+                ),
                 // An agent stopped on the person: a request to answer, not a fault to clear.
                 "person-step" | "agent-request" => (
                     Tier::Stopped,
                     AttentionKind::Request {
-                        from: item
-                            .requester_id
-                            .as_deref()
-                            .map(|id| {
-                                model
-                                    .agents()
-                                    .find(|agent| agent.header.id == id)
-                                    .map(crate::agent_label)
-                                    .unwrap_or_else(|| short(id))
-                            })
-                            .unwrap_or_else(|| "An agent".into()),
+                        from: requester_name(model, item.requester_id.as_deref()),
                         from_id: item.requester_id.clone().unwrap_or_default(),
                         question: clean_message_text(
                             item.request
@@ -279,6 +310,10 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     AttentionKind::Request { from_id, .. } if from_id.starts_with("agent/") => {
                         Some(from_id.clone())
                     }
+                    AttentionKind::Update { .. } => item
+                        .requester_id
+                        .clone()
+                        .filter(|id| id.starts_with("agent/")),
                     _ => None,
                 });
             let related = item
@@ -693,6 +728,46 @@ mod tests {
     ];
 
     #[test]
+    fn an_update_on_home_is_information_not_a_request() {
+        let mut model = Model::default();
+        model.actor = "person/example".into();
+        model.now.items.push(
+            serde_json::from_value(serde_json::json!({
+                "kind":"attention","id":"attention/update","revision":"one","updated_at":"2026-10-03T10:00:00Z",
+                "attention_kind":"person-step","source_id":"step-run/update-aa/update","person_id":"person/example",
+                "requester_id":"agent/example/cos","title":"The audit you asked for","detail":"All three machines run main.",
+                "priority":"normal","state":"open","requested_at":"2026-10-03T10:00:00Z","actions":["work.done"],
+                "update":{"version":1,"type":"update","about":"message/0123456789abcdef",
+                          "subjects":[{"kind":"link","label":"the audit","url":"https://example.com/audit"}]}
+            }))
+            .unwrap(),
+        );
+        let items = attention(&model, &Extras::default());
+        let [item] = &items[..] else {
+            panic!("{items:#?}");
+        };
+        assert_eq!(item.tier, Tier::Later);
+        let AttentionKind::Update {
+            body,
+            about,
+            subjects,
+            ..
+        } = &item.kind
+        else {
+            panic!("{:#?}", item.kind);
+        };
+        assert_eq!(body, "All three machines run main.");
+        assert_eq!(about, "message/0123456789abcdef");
+        assert_eq!(
+            subjects,
+            &[(
+                "the audit".to_owned(),
+                "https://example.com/audit".to_owned()
+            )]
+        );
+    }
+
+    #[test]
     fn the_images_a_message_carries_ride_on_its_mail() {
         let timeline: Vec<TimelineEntry> = serde_json::from_value(serde_json::json!([
             {"id":"e1","sequence":4,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"message","final":true,
@@ -898,6 +973,23 @@ mod tests {
         assert!(
             matches!(&bodies[..], [Body::User(text), Body::Event(line)]
                 if text == "please look" && line == "delivered to the agent: Tide tables · from example/quay"),
+            "{bodies:?}"
+        );
+    }
+
+    #[test]
+    fn a_channel_delivery_carrying_an_envelope_is_that_mail_not_a_line() {
+        // The Claude channel's delivery: st's envelope, then the delivery notes after it.
+        let delivery = "<channel source=\"plugin:st3-channel:st3\" from=\"person/example\" messageId=\"message/c3\">\n<smalltalk-message id=\"c3\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/c3\">\nhow is it going?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.\n</channel>";
+        // Shown in the stream already: marked delivered, no line (Nathan, 2026-10-03).
+        let shown = BTreeSet::from(["message/c3".to_owned()]);
+        let bodies = from_harness(true, delivery, &shown);
+        assert!(bodies.is_empty(), "{bodies:?}");
+        // Not shown: it is the mail itself, never "delivered to the agent: The person reads…".
+        let bodies = from_harness(true, delivery, &BTreeSet::new());
+        assert!(
+            matches!(&bodies[..], [Body::Mail { from, body, .. }]
+                if from == "person/example" && body == "how is it going?"),
             "{bodies:?}"
         );
     }

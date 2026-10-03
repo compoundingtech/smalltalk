@@ -109,6 +109,9 @@ struct Demo {
     harbor_seen: Option<Instant>,
 }
 
+/// How long an update stays open on Home before it counts as read.
+const UPDATE_READ_AFTER: Duration = Duration::from_secs(3);
+
 /// A request the live loop sends to st. The demo never produces these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -264,6 +267,10 @@ pub struct Ui {
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
+    /// The update open on Home and since when: one left open a moment counts as read.
+    update_open: Option<(String, Instant)>,
+    /// Updates marked read from here, so each is sent once.
+    updates_read: HashSet<String>,
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
@@ -273,6 +280,8 @@ pub struct Ui {
     pub(crate) said: Option<(String, Result<st3_client::ConversationSearch, String>)>,
     /// The named answer chosen on the focused structured request, before Enter sends it.
     answering: Option<usize>,
+    /// A decision's "request changes" answer, chosen: its id goes with the words typed next.
+    changes_answer: Option<String>,
     /// Voice mode: the speech helper listening for one input.
     pub(crate) voice: Option<voice::VoiceState>,
     /// Inputs whose text came from voice; their next message is tagged `dictated`.
@@ -370,12 +379,15 @@ impl Ui {
             quit: false,
             live: false,
             effects: Vec::new(),
+            update_open: None,
+            updates_read: HashSet::new(),
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
             said: None,
             voice: None,
             answering: None,
+            changes_answer: None,
             dictated: HashSet::new(),
             details: true,
             kdl: false,
@@ -757,6 +769,21 @@ impl Ui {
     }
 
     /// The selected agent's newest message that failed or went unconfirmed, by entry id.
+    /// The managed agent whose conversation has the focus in a glass, when its message box is
+    /// what typing reaches: not a terminal, a list, a card or an undeclared session.
+    pub(crate) fn composing_agent(&self) -> Option<String> {
+        self.glasses.as_ref()?;
+        let Some(Pane::Agent(Some(id))) = self.focused_pane() else {
+            return None;
+        };
+        self.world
+            .agents
+            .items()
+            .iter()
+            .any(|agent| agent.id == id && !agent.unmanaged)
+            .then_some(id)
+    }
+
     fn undelivered(&self) -> Option<String> {
         let agent = self.selected_id()?;
         let Some(Load::Ready(entries)) = self.world.conversations.get(&agent) else {
@@ -1112,8 +1139,24 @@ impl Ui {
                 Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
                 None => vec![("1-5", "tabs"), ("↑↓", "select")],
             };
+            // A glass conversation types: its commands are chords.
+            let typing = self.composing_agent().is_some();
+            if typing {
+                for hint in &mut hints {
+                    if hint.0 == "[ ]" {
+                        *hint = ("tab", "tabs");
+                    }
+                }
+            }
             match self.tab {
                 0 => hints.extend([("keys", "on the card"), ("c", "write")]),
+                1 if typing => hints.extend([
+                    ("type", "message"),
+                    ("alt+i", "details"),
+                    ("alt+o", "tools"),
+                    ("end", "latest"),
+                    ("drag", "select + copy"),
+                ]),
                 1 => hints.extend([
                     ("c", "message"),
                     ("i", "details"),
@@ -1124,7 +1167,11 @@ impl Ui {
                 2 => hints.extend([("n", "new mission"), ("t", "tree"), ("x", "system")]),
                 _ => {}
             }
-            hints.extend([("?", "help"), ("q", "quit")]);
+            if typing {
+                hints.extend([("?", "help"), ("ctrl+q", "quit")]);
+            } else {
+                hints.extend([("?", "help"), ("q", "quit")]);
+            }
             hints
         };
         // The build, always at the right edge; the hints give way to it.
@@ -1703,13 +1750,16 @@ impl Ui {
             theme::fg(theme::SURFACE0),
         );
         if !agent.unmanaged && (!narrow || self.composing(&agent.id)) {
+            // In a space, letters type: details is a chord.
+            let key = if self.glasses.is_some() { "alt+i" } else { "i" };
             let label = if narrow {
-                " i details "
+                format!(" {key} details ")
             } else if self.details {
-                " i hide details ▸ "
+                format!(" {key} hide details ▸ ")
             } else {
-                " ◂ i details "
+                format!(" ◂ {key} details ")
             };
+            let label = label.as_str();
             let width = text::width(label) as u16;
             let x = area.x + area.width.saturating_sub(width + 1);
             buf.set_stringn(x, rule_y, label, width as usize, theme::fg(theme::OVERLAY1));
@@ -2363,7 +2413,15 @@ impl Ui {
         }
         if draft.is_empty() && !editing {
             let hint = if self.composing(&agent.id) {
-                format!("Message {} · c or click", agent.name)
+                format!(
+                    "Message {} · {}",
+                    agent.name,
+                    if self.glasses.is_some() {
+                        "type or click"
+                    } else {
+                        "c or click"
+                    }
+                )
             } else {
                 format!("Message {} · click", agent.name)
             };
@@ -2526,21 +2584,27 @@ impl Ui {
         );
         keys(
             &mut right,
-            "a conversation",
+            "a conversation (in a space, letters type; commands are chords)",
             &[
-                ("c or click", "write: a message, feedback, a reply"),
-                ("wheel pgup pgdn", "scroll the pane under the pointer"),
+                ("type", "any letter starts a message to the agent"),
+                ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
                 ("end", "jump to the newest message and follow it"),
-                ("/", "find in this conversation"),
-                ("o", "expand or collapse tool output"),
+                ("ctrl+f", "find in this conversation"),
+                ("alt+o", "expand or collapse tool output"),
                 (
-                    "shift+o",
+                    "alt+shift+o",
                     "simplified view: tool calls fold to a line (this device)",
                 ),
-                ("i", "the agent's details beside it"),
+                ("alt+i", "the agent's details beside it"),
                 ("drag", "select text in one pane; release copies it"),
                 ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
-                ("r  x", "resend or clear a message that was not sent"),
+                (
+                    "alt+r  alt+x",
+                    "resend or clear a message that was not sent",
+                ),
+                ("ctrl+c", "stop the agent (asks first)"),
+                ("tab  shift+tab", "the next or previous tab"),
+                ("ctrl+q", "quit"),
             ],
         );
         keys(
@@ -2640,6 +2704,13 @@ impl Ui {
                 let Some(answer) = request.answers.get(index) else {
                     return true;
                 };
+                // Requesting changes needs the changes in words: write them, then Enter sends both.
+                if answer.outcome.as_deref() == Some("request_changes") {
+                    self.changes_answer = Some(answer.id.clone());
+                    self.editing = true;
+                    self.flash(format!("“{}”: write the changes, then Enter", answer.label));
+                    return true;
+                }
                 if self.live {
                     self.effects.push(Effect::Attention {
                         id,
@@ -2963,7 +3034,10 @@ impl Ui {
                 .get(&key_id)
                 .is_none_or(String::is_empty);
             match key.code {
-                KeyCode::Esc => self.editing = false,
+                KeyCode::Esc => {
+                    self.editing = false;
+                    self.changes_answer = None;
+                }
                 KeyCode::Enter => self.submit(),
                 // Ctrl+R speaks into the input instead of typing.
                 KeyCode::Char('r') if control => self.start_voice(),
@@ -3123,6 +3197,44 @@ impl Ui {
         }
     }
 
+    /// Mark the focused update read: st clears it from Home and tells nobody (nothing waits).
+    fn read_update(&mut self) {
+        let Some(id) = self.attention_focus() else {
+            return;
+        };
+        if !self.updates_read.insert(id.clone()) {
+            return;
+        }
+        if self.live {
+            self.effects.push(Effect::Attention {
+                id,
+                action: "work.done".into(),
+                reason: Some("Read".into()),
+                answer: Some("read".into()),
+            });
+        } else {
+            self.flash("Read · demo: nothing was sent");
+        }
+    }
+
+    /// An update left open on Home for a moment has been read (docs: it clears when the person
+    /// opens it). Passing over it with the arrows does not count.
+    pub(crate) fn read_open_update(&mut self) {
+        let open = self
+            .attention_focus()
+            .filter(|_| !self.help && self.popover.is_none())
+            .filter(|_| self.current_kind() == Some("update"));
+        match (open, &self.update_open) {
+            (None, _) => self.update_open = None,
+            (Some(id), Some((shown, since))) if *shown == id => {
+                if since.elapsed() >= UPDATE_READ_AFTER {
+                    self.read_update();
+                }
+            }
+            (Some(id), _) => self.update_open = Some((id, Instant::now())),
+        }
+    }
+
     fn current_kind(&self) -> Option<&'static str> {
         let id = self.attention_focus()?;
         self.world
@@ -3213,6 +3325,7 @@ impl Ui {
                         }
                     }
                     ("request", 'y' | 'n') => self.confirm = Some(key),
+                    ("update", 'r') => self.read_update(),
                     ("message", 'm') => self.act('m'),
                     _ => {}
                 }
@@ -3762,7 +3875,7 @@ impl Ui {
                         id: id.clone(),
                         action: "work.done".into(),
                         reason: Some(draft),
-                        answer: None,
+                        answer: self.changes_answer.take(),
                     }),
                     Some(AttentionKind::Message { from, .. }) => Some(Effect::Reply {
                         id: id.clone(),
@@ -5121,6 +5234,72 @@ mod tests {
             "{:?}",
             ui.effects
         );
+    }
+
+    #[test]
+    fn an_update_shows_what_was_asked_for_and_clears_once_read() {
+        let mut world = demo::world();
+        let item = Attention {
+            id: "attention/update".into(),
+            tier: Tier::Later,
+            title: "The audit you asked for".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Update {
+                from: "Chief of Staff".into(),
+                body: "All three machines run main.".into(),
+                about: "message/0123456789abcdef".into(),
+                subjects: vec![("the audit".into(), "https://example.com/audit".into())],
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/update")
+            .unwrap();
+        ui.select(at);
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in [
+            "All three machines run main.",
+            "message/0123456789abcdef",
+            "https://example.com/audit",
+            "Nothing waits on this",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        // Open, but only just: not read yet.
+        ui.read_open_update();
+        assert!(ui.effects.is_empty());
+        // r reads it, once.
+        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, answer: Some(answer), .. }]
+                if id == "attention/update" && answer == "read"),
+            "{:?}",
+            ui.effects
+        );
+        // Left open a moment, it counts as read without a key.
+        ui.effects.clear();
+        ui.updates_read.clear();
+        ui.update_open = Some((
+            "attention/update".into(),
+            Instant::now() - UPDATE_READ_AFTER,
+        ));
+        ui.read_open_update();
+        assert_eq!(ui.effects.len(), 1);
     }
 
     #[test]

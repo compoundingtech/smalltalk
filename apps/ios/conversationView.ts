@@ -106,6 +106,15 @@ function takeBlocks(text: { value: string }, tag: string): string[] {
   }
   return found;
 }
+/** An attribute of a `<tag …>` head, unescaped. */
+function attribute(head: string, name: string): string | undefined {
+  const value = new RegExp(` ${name}="([^"]*)"`).exec(head)?.[1];
+  return value === undefined ? undefined : unescapeXml(value);
+}
+/** Undo the XML escaping st applies to a delivery's attributes and body. */
+function unescapeXml(text: string): string {
+  return text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
 function field(block: string, tag: string): string | undefined {
   return takeBlocks({ value: block }, tag)[0]?.trim();
 }
@@ -136,10 +145,21 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
   for (const block of takeBlocks(text, 'task-notification')) {
     bodies.push({ kind: 'event', tone: 'quiet', text: `background task ${field(block, 'status') ?? 'update'}: ${shorten(field(block, 'summary') ?? '', 90)}` });
   }
-  const senders = [...text.value.matchAll(/<channel\b[^>]*>/g)].map(match => /from="([^"]*)"/.exec(match[0])?.[1] ?? 'someone');
+  const channelHeads = [...text.value.matchAll(/<channel\b[^>]*>/g)].map(match => match[0]);
+  const senders = channelHeads.map(head => attribute(head, 'from') ?? 'someone');
   takeBlocks(text, 'channel').forEach((block, index) => {
-    const id = pingId(block);
+    // The delivered message: its PING line, the message the channel names, or the st envelope
+    // it carries. One the stream shows is marked delivered, never announced again.
+    const envelope = /<smalltalk-message\b[^>]*>/.exec(block)?.[0];
+    const id = pingId(block) ?? attribute(channelHeads[index] ?? '', 'messageId') ?? (envelope ? attribute(envelope, 'graph') : undefined);
     if (id && shown.has(id)) { delivered.add(id); return; }
+    // Mail the stream does not show reads as that mail, never as the delivery's other lines
+    // (Nathan, 2026-10-03: "delivered to the agent: The person reads replies in st…").
+    if (envelope) {
+      const inner = takeBlocks({ value: block }, 'smalltalk-message')[0] ?? '';
+      bodies.push({ kind: 'mail', from: attribute(envelope, 'from') ?? senders[index] ?? 'someone', to: attribute(envelope, 'to') ?? '', subject: attribute(envelope, 'subject') ?? '', text: cleanMessageText(unescapeXml(inner)).trim() });
+      return;
+    }
     const subject = block.split('\n').map(line => line.trim()).find(line => line.startsWith('Subject:'))?.slice('Subject:'.length).trim() ?? shorten(cleanMessageText(block), 70);
     bodies.push({ kind: 'event', tone: 'quiet', text: `delivered to the agent: ${shorten(subject, 80)} · from ${senders[index] ?? 'someone'}` });
   });

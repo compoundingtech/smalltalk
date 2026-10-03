@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { Alert, Linking, Pressable, ScrollView, SectionList, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -78,13 +78,42 @@ export function HomeScreen() {
 // One attention item: what it asks, who raised it, and what can be done here.
 export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) {
   const { data, busy, status, actions } = useStore();
-  const item = data.attention.find(candidate => candidate.id === route.params.id);
+  const found = data.attention.find(candidate => candidate.id === route.params.id);
+  // An update clears once read, which is as soon as it is opened; it stays here while it is read.
+  const kept = useRef(found);
+  if (found) kept.current = found;
+  const item = found ?? (kept.current?.update ? kept.current : undefined);
+  const read = useRef(false);
+  useEffect(() => {
+    if (!item?.update || read.current || status !== 'online') return;
+    read.current = true;
+    void actions.done(item, 'Read', 'read');
+  }, [item?.id, status]);
   if (!item) return <Screen><Banners /><Empty text="This item is no longer open." /></Screen>;
   const [row] = homeRows([item], undefined);
   const agentId = [item.requester_id, item.source_id].find(id => id?.startsWith('agent/'));
   const agent = agentId ? data.agents.find(candidate => candidate.id === agentId) : undefined;
   const mission = item.mission_id ? data.missions.find(candidate => candidate.id === item.mission_id) : undefined;
   const other = item.actions.filter(action => action !== 'work.done');
+  if (item.update) {
+    const from = agent ? agentName(agent) : item.requester_id?.replace(/^agent\//, '') ?? 'An agent';
+    return <Screen>
+      <Banners />
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
+        <T><T bold color={row.color}>{row.glyph} update</T><T dim>  {row.age} ago</T></T>
+        <T bold selectable>{row.title}</T>
+        <T><T dim>from  </T><T bold color={theme.person}>{from}</T></T>
+        <Markdown text={spaced(cleanMessageText(item.detail || item.update.summary || ''))} color={theme.text} />
+        <T dim selectable>about {item.update.about}</T>
+        {item.update.subjects?.map((subject, index) => subject.url
+          ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
+          : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
+        <T dim>Nothing waits on this. Opening it marked it read, so it has left Home.</T>
+        {agentId ? <Button label={`chat with ${from}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: from })} /> : null}
+        <T dim selectable>{item.id}</T>
+      </ScrollView>
+    </Screen>;
+  }
   if (isRequest(item.attention_kind) && item.actions.includes('work.done')) {
     const from = agent ? agentName(agent) : item.requester_id?.replace(/^agent\//, '') ?? 'An agent';
     return <Screen>
@@ -131,7 +160,10 @@ function StructuredRequestView({ item, request, from, onAnswered }: { item: Para
   const { busy, status, actions } = useStore();
   const disabled = busy || status !== 'online';
   const label = (id: string) => request.answers?.find(answer => answer.id === id)?.label ?? id;
-  const send = (answer: { id: string; label: string }) => Alert.alert(`Answer ${from} “${answer.label}”`, undefined, [
+  const send = (answer: { id: string; label: string; outcome?: string | null }) => answer.outcome === 'request_changes'
+    // Requesting changes needs the changes, in words.
+    ? Alert.prompt(answer.label, 'What should change?', text => { if (text.trim()) void actions.done(item, text.trim(), answer.id).then(done => { if (done) onAnswered(); }); })
+    : Alert.alert(`Answer ${from} “${answer.label}”`, undefined, [
     { text: 'Cancel', style: 'cancel' },
     { text: 'Send', onPress: () => void actions.done(item, answer.label, answer.id).then(done => { if (done) onAnswered(); }) },
   ]);

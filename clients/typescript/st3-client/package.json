@@ -1,0 +1,21 @@
+{
+  "name": "@smalltalk/st3-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:schema": "node --test schema.test.cjs"
+  },
+  "exports": {
+    ".": "./index.ts",
+    "./schema": "./Schema.generated.ts"
+  },
+  "peerDependencies": {
+    "effect": "4.0.0-rc.118"
+  },
+  "peerDependenciesMeta": {
+    "effect": {
+      "optional": true
+    }
+  }
+}

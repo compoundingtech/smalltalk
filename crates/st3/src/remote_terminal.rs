@@ -691,6 +691,7 @@ mod tests {
             row: 0,
             text: String::new(),
             runs: vec![run],
+            wrapped: None,
             redacted: false,
             truncated: false,
         };

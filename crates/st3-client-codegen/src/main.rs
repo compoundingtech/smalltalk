@@ -6,6 +6,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod rich;
+
 const RUST_MODELS_TEMPLATE: &str = include_str!("../templates/generated.rs.in");
 const RUST_CLIENT_TEMPLATE: &str = include_str!("../templates/lib.rs.in");
 const SWIFT_MODELS_TEMPLATE: &str = include_str!("../templates/Models.swift.in");
@@ -55,6 +57,7 @@ fn main() -> Result<()> {
         &swift_operation_methods(reads, actions)?,
     )?;
     let typescript_models = typescript_models(&schema, &operations, &digest)?;
+    let typescript_schema = rich::models(&schema, &digest)?;
     let typescript_client = render_marker(
         TYPESCRIPT_CLIENT_TEMPLATE,
         "    // @st3-codegen:typescript-operation-methods",
@@ -101,6 +104,11 @@ fn main() -> Result<()> {
     output(
         &root.join("clients/typescript/st3-client/Models.generated.ts"),
         &typescript_models,
+        check,
+    )?;
+    output(
+        &root.join("clients/typescript/st3-client/Schema.generated.ts"),
+        &typescript_schema,
         check,
     )?;
     output(
@@ -445,7 +453,17 @@ fn validate_model(
         .with_context(|| format!("client schema `{definition}` has no properties"))?;
     let rust_block = struct_block(rust, &format!("pub struct {rust_name} {{"))?;
     let swift_block = struct_block(swift, &format!("public struct {swift_name}:"))?;
-    for property in properties.keys().filter(|name| name.as_str() != "kind") {
+    // Resource branches may narrow a header field such as `id` to its family reference;
+    // generated clients model that field once through the shared header.
+    let header_backed = model["allOf"].as_array().is_some_and(|branches| {
+        branches
+            .iter()
+            .any(|branch| branch["$ref"] == "#/$defs/ResourceHeader")
+    }) && rust_block.contains("pub header: ResourceHeader,");
+    let header = &schema["$defs"]["ResourceHeader"]["properties"];
+    for property in properties.keys().filter(|name| {
+        name.as_str() != "kind" && !(header_backed && header.get(name.as_str()).is_some())
+    }) {
         let rust_field = rust_field(property);
         let rust_discriminated_timeline = definition == "TimelineEntry"
             && property == "type"
@@ -483,6 +501,11 @@ fn validate_surfaces(
             .as_str()
             .and_then(|value| value.rsplit('/').next())
             .context("Resource reference")?;
+        // The open schema branch preserves future kinds for schema consumers; it has no
+        // concrete generated resource model.
+        if definition == "UnknownResource" {
+            continue;
+        }
         validate_model(
             schema,
             definition,
@@ -935,7 +958,17 @@ fn typescript_models(schema: &Value, operations: &Value, digest: &str) -> Result
         if name == "ActionRequest" {
             continue;
         }
-        let shape = ts_conditional_body(definition)?.unwrap_or(ts_type(definition)?);
+        let shape = if name == "Resource" {
+            // UnknownResource's open `kind: string` would defeat discriminant narrowing in the
+            // raw union; like the Rust and Swift clients, raw TypeScript models known kinds only.
+            let mut known = definition.clone();
+            if let Some(branches) = known["oneOf"].as_array_mut() {
+                branches.retain(|branch| branch["$ref"] != "#/$defs/UnknownResource");
+            }
+            ts_type(&known)?
+        } else {
+            ts_conditional_body(definition)?.unwrap_or(ts_type(definition)?)
+        };
         writeln!(out, "export type {name} = {shape};\n")?;
     }
     let actions = operations["actions"]
@@ -1120,6 +1153,7 @@ mod tests {
             include_bytes!("../../../docs/st3/client-v0/schemas/operations.json"),
         ]);
         let ts_models = typescript_models(&schema, &operations, &digest)?;
+        let ts_schema = rich::models(&schema, &digest)?;
         let ts_client = render_marker(
             TYPESCRIPT_CLIENT_TEMPLATE,
             "    // @st3-codegen:typescript-operation-methods",
@@ -1163,6 +1197,15 @@ mod tests {
                 "Client.generated.ts",
                 ts_client.as_str(),
                 ts_client.replacen("async eventsList(", "async removedEventsList(", 1),
+            ),
+            (
+                "Schema.generated.ts",
+                ts_schema.as_str(),
+                ts_schema.replacen(
+                    "export const Resource =",
+                    "export const RemovedResource =",
+                    1,
+                ),
             ),
         ];
         for (name, expected, drifted) in cases {

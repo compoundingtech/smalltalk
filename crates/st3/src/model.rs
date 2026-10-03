@@ -989,6 +989,53 @@ pub struct MissionRequest {
     pub at_index: Option<u64>,
 }
 
+/// Run each exec gate of a mission file once, now, the way a run would: `st missions check`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GateCheckRequest {
+    pub intent: IntentInput,
+    /// The workspace `${ST_WORKSPACE}` and relative gate workspaces stand for.
+    pub workspace: String,
+    /// Values for the mission's inputs. A gate that reads an input without one is unchecked.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct GateCheckView {
+    pub id: String,
+    /// The host that ran the checks. A gate declared for another host is `unchecked`.
+    pub host: String,
+    /// Whether every gate has its answer.
+    pub finished: bool,
+    pub gates: Vec<GateCheckItemView>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct GateCheckItemView {
+    pub mission: String,
+    /// What the gate decides for: `mission`, `step PATH`, or `loop PATH`.
+    pub owner: String,
+    pub gate: String,
+    pub host: String,
+    pub workspace: String,
+    pub command: String,
+    /// `waiting`, `running`, `pass`, `not-yet`, `broken`, or `unchecked`.
+    pub answer: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    /// Why the gate is broken or unchecked.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The end of the check's output.
+    #[serde(default)]
+    pub output: String,
+    /// The refusals and partial listings the check's `st` commands reported.
+    #[serde(default)]
+    pub calls: Vec<String>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubjectChange {
     pub subject: String,
@@ -1809,6 +1856,23 @@ pub struct MessageView {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachment>,
     pub created_index: u64,
+}
+
+/// The daemon's answer to a message send, and what a send's idempotency key landed as. Older
+/// daemons answer a send with the bare message, which reads as a new send with no time.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MessageSendReceipt {
+    #[serde(flatten)]
+    pub message: MessageView,
+    /// The key that names this message: a request with the same key and content returns it again.
+    #[serde(default)]
+    pub idempotency_key: String,
+    /// The key already named this message when the request came, so nothing new was sent.
+    #[serde(default)]
+    pub already_sent: bool,
+    /// When this daemon first accepted the message, in RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
