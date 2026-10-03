@@ -356,16 +356,19 @@ A running seat restarts when you apply a declaration that changes how it launche
 workspace, harness, model, effort, arguments or command. A change to its label, environment or
 restart policy keeps the running process and takes effect the next time it starts; use `st agents
 restart agent/example/worker --as person/ada` to apply it now. Restart preserves the declaration,
-works for top-level and mission seats, and waits for a new running incarnation.
+works for top-level and mission seats under any restart policy, fences the current incarnation,
+and waits for a new running incarnation. It resumes the current saved native conversation by
+default; `--fresh-context` deliberately starts a new conversation. Clients can inspect
+`Agent.restart_will_resume` before a restart that may lose context.
 
-Every relaunch of a seat continues its harness's last native session: `st agents restart`, a
-changed launch, a harness that hung up or crashed, a daemon restart, and a stop followed by a
-start. Claude, Codex, pi, omp and OpenCode each resume the session their driver last reported for
-the seat, and a Claude seat whose workspace changed carries its transcript into the new
-workspace's project. A harness that cannot continue that session (its transcript is gone, or the
-declaration selects its own session) starts a new one and records a
-`native-continue-unavailable` warning; later relaunches do not try that session again. Only a
-mission step with `fresh-context` starts a seat on a new session on purpose. `--timeout 2m` changes the default ten-minute
+Ordinary relaunches also continue the harness's last native session: a changed launch, a harness
+that hung up or crashed, a daemon restart, and a stop followed by a start. Claude, Codex, pi, omp
+and OpenCode each resume the session their driver last reported for the seat, and a Claude seat
+whose workspace changed carries its transcript into the new workspace's project. A harness that
+cannot continue that session (its transcript is gone, or the declaration selects its own session)
+starts a new one and records a `native-continue-unavailable` warning; later relaunches do not try
+that session again. A mission step with `fresh-context` also starts a seat on a new session on
+purpose. `--timeout 2m` changes the default ten-minute
 wait; a failure or timeout explains why the seat is not running again. `st agents stop
 agent/example/worker --as person/ada` stops a seat until you apply its file again. It ends every
 process the seat started, including builds and tests that outlived the harness, on hosts with a

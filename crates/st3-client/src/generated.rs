@@ -861,6 +861,8 @@ pub struct Agent {
     #[serde(default)]
     pub incarnation_id: Option<String>,
     #[serde(default)]
+    pub restart_will_resume: bool,
+    #[serde(default)]
     pub current_session_id: Option<String>,
     #[serde(default)]
     pub current_work_ids: Vec<String>,
@@ -1780,6 +1782,8 @@ pub enum ActionType {
     AgentSuspend,
     #[serde(rename = "agent.resume")]
     AgentResume,
+    #[serde(rename = "agent.restart")]
+    AgentRestart,
     #[serde(rename = "terminal.create")]
     TerminalCreate,
     #[serde(rename = "terminal.end")]
@@ -1873,6 +1877,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::AgentQueueMove,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn agent_restart(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentRestartParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::AgentRestart,
             idempotency_key,
             fence,
             &parameters,
@@ -2723,6 +2741,14 @@ pub struct AgentSuspendParameters {
 #[serde(deny_unknown_fields)]
 pub struct AgentResumeParameters {
     pub agent: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRestartParameters {
+    pub agent: String,
+    #[serde(default)]
+    pub fresh_context: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

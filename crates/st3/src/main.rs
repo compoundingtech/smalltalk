@@ -2898,6 +2898,9 @@ struct AgentRestartArgs {
     subject: String,
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
+    /// Start a new native harness conversation instead of resuming the current one.
+    #[arg(long)]
+    fresh_context: bool,
     /// How long to wait for a new running incarnation.
     #[arg(long, default_value = "10m")]
     timeout: String,
@@ -10081,12 +10084,23 @@ async fn run_agents(
             let timeout = st3::graph::parse_duration(&args.timeout, false)?;
             let subject = format!("agent/{}", args.subject);
             let client = cli_client(endpoint);
+            let status = status_for(&client, &subject).await?;
+            let current = status.subjects.iter().find(|item| item.subject == subject)
+                .context("the seat has no current declaration")?;
+            let incarnation = current.actual.as_ref()
+                .map(|actual| actual.get("fields").unwrap_or(actual))
+                .and_then(|fields| fields.get("incarnation_id"))
+                .and_then(Value::as_str)
+                .context("the seat has no runtime incarnation to restart")?;
             let request: ClaimRecord = client
                 .post(
                     "/v1/agents/restart",
                     &json!({
                         "subject": subject,
                         "actor": args.actor,
+                        "incarnation_id": incarnation,
+                        "desired_revision": current.desired_token,
+                        "fresh_context": args.fresh_context,
                         "idempotency_key": uuid::Uuid::now_v7().to_string(),
                     }),
                 )
@@ -10117,6 +10131,13 @@ async fn run_agents(
                                 .incarnation_id
                                 .as_deref()
                                 .is_some_and(|incarnation| incarnation != previous)
+                            && match request.body["fields"]["native_session_id"].as_str() {
+                                Some(expected) => restart_has_native_binding(
+                                    &client, &subject, agent.incarnation_id.as_deref().unwrap(),
+                                    request.store_index, expected,
+                                ).await?,
+                                None => true,
+                            }
                         {
                             return Ok::<_, anyhow::Error>(agent);
                         }
@@ -10140,6 +10161,7 @@ async fn run_agents(
                             anyhow::bail!("`{subject}` could not restart: {fault}");
                         }
                         if agent.state == "waiting"
+                            && agent.blocked_on.as_deref() == Some("human")
                             && agent
                                 .incarnation_id
                                 .as_deref()
@@ -13962,6 +13984,9 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
     let (program, arguments) = args.argv.split_first().context("driver argv is empty")?;
     let mut child = tokio::process::Command::new(program)
         .args(arguments)
+        .env_remove(st_drivers::restart_context::NATIVE_SESSION_ENV)
+        .env_remove(st_drivers::restart_context::FRESH_CONTEXT_ENV)
+        .env_remove(st_drivers::restart_context::EXPECTED_SESSION_ENV)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -14344,6 +14369,203 @@ struct NativeLoopState {
     delivery_episode: u64,
     #[serde(default)]
     mailbox_fence: Option<st3::mailbox::Fence>,
+    #[serde(default)]
+    published_native_session: Option<NativeSessionBinding>,
+}
+
+/// Exact provider identity observed in a hook or controlled server, never inferred from argv.
+/// `resume_available` is positive persisted evidence: an unsaved conversation cannot be resumed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct NativeSessionBinding {
+    session_id: String,
+    path: Option<String>,
+    #[serde(default)]
+    resume_available: bool,
+}
+
+impl NativeSessionBinding {
+    /// Claude, pi and omp name their exact session file; it exists once the conversation saved.
+    fn from_session_file(session_id: &str, path: Option<&str>) -> Option<Self> {
+        let path = path.filter(|path| !path.is_empty()).map(str::to_owned);
+        Some(Self {
+            session_id: Some(session_id).filter(|id| !id.is_empty())?.to_owned(),
+            resume_available: path.as_deref().is_some_and(|path| Path::new(path).is_file()),
+            path,
+        })
+    }
+
+    /// The same binding once its session file appeared since publication.
+    fn saved_since(&self) -> Option<Self> {
+        (!self.resume_available && self.path.as_deref().is_some_and(|path| Path::new(path).is_file()))
+            .then(|| Self { resume_available: true, ..self.clone() })
+    }
+}
+
+fn native_session_binding(
+    value: &Value,
+    provider_incarnation: &str,
+    codex: bool,
+) -> Option<NativeSessionBinding> {
+    let (incarnation_key, session_key) = if codex {
+        ("runtimeIncarnation", "threadId")
+    } else {
+        ("incarnation", "native_session_id")
+    };
+    if value.get(incarnation_key)?.as_str()? != provider_incarnation {
+        return None;
+    }
+    let session_id = value.get(session_key)?.as_str()?;
+    let mut binding = NativeSessionBinding::from_session_file(
+        session_id,
+        value.get("path").and_then(Value::as_str),
+    )?;
+    // OpenCode states the server's persisted-store answer; Codex proves it in a sidecar.
+    if let Some(saved) = value.get("resume_available").and_then(Value::as_bool) {
+        binding.resume_available = saved;
+    }
+    Some(binding)
+}
+
+/// Codex's binding names only the thread; `rollout.json` beside it is the wrapper's positive
+/// evidence that this exact runtime's thread has a persisted rollout.
+fn codex_rollout_evidence(binding: &mut NativeSessionBinding, evidence: &Value, provider_incarnation: &str) {
+    if evidence.get("runtimeIncarnation").and_then(Value::as_str) != Some(provider_incarnation)
+        || evidence.get("threadId").and_then(Value::as_str) != Some(binding.session_id.as_str())
+    {
+        return;
+    }
+    let rollout = evidence.get("path").and_then(Value::as_str).filter(|path| !path.is_empty());
+    if rollout.is_none_or(|path| Path::new(path).is_file()) {
+        binding.path = rollout.map(str::to_owned);
+        binding.resume_available = true;
+    }
+}
+
+fn read_native_session_binding(
+    path: &Path,
+    provider_incarnation: &str,
+    codex: bool,
+) -> Option<NativeSessionBinding> {
+    let bytes = fs::read(path).ok()?;
+    let mut binding =
+        native_session_binding(&serde_json::from_slice::<Value>(&bytes).ok()?, provider_incarnation, codex)?;
+    if codex {
+        binding.resume_available = false;
+        if let Some(evidence) = fs::read(path.with_file_name(st_drivers::codex_app_server::ROLLOUT_EVIDENCE_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        {
+            codex_rollout_evidence(&mut binding, &evidence, provider_incarnation);
+        }
+    }
+    Some(binding)
+}
+
+/// A running replacement is not a successful captured resume until its driver names the session.
+async fn restart_has_native_binding(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    after_index: u64,
+    expected: &str,
+) -> Result<bool> {
+    let query = format!(
+        "/v1/claims?subject={}&after_index={after_index}&order=desc&limit=64",
+        urlencoding::encode(subject),
+    );
+    let mut before = None;
+    loop {
+        let page: ClaimsPage = match before {
+            Some(cursor) => client.get(&format!("{query}&before_index={cursor}")).await?,
+            None => client.get(&query).await?,
+        };
+        for claim in page.claims {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            if claim.kind == "harness.session-file"
+                && fields.get("incarnation_id").and_then(Value::as_str) == Some(incarnation)
+            {
+                return Ok(fields.get("session_id").and_then(Value::as_str) == Some(expected));
+            }
+        }
+        let Some(cursor) = page.next_cursor else { return Ok(false) };
+        before = Some(cursor);
+    }
+}
+
+/// A captured resume may not silently become a fresh provider conversation.
+#[derive(Debug)]
+struct NativeSessionMismatch {
+    expected: String,
+    actual: String,
+}
+
+impl std::fmt::Display for NativeSessionMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "requested native session {:?}, but the harness bound {:?}", self.expected, self.actual)
+    }
+}
+
+impl std::error::Error for NativeSessionMismatch {}
+
+fn verify_first_native_session(
+    expected: Option<&str>,
+    actual: &str,
+    already_bound: bool,
+) -> Result<()> {
+    if !already_bound && let Some(expected) = expected.filter(|id| !id.is_empty())
+        && expected != actual
+    {
+        return Err(NativeSessionMismatch {
+            expected: expected.into(),
+            actual: actual.into(),
+        }.into());
+    }
+    Ok(())
+}
+
+fn requested_restart_session() -> Option<String> {
+    std::env::var(st_drivers::restart_context::NATIVE_SESSION_ENV).ok()
+        .filter(|id| !id.is_empty())
+}
+
+async fn refuse_restart_session_mismatch(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    driver: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    refuse_native_resume(client, subject, incarnation, driver,
+        st3::native_resume::Refusal::new("session-mismatch", error.to_string())).await
+}
+
+
+async fn publish_native_session_binding(
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    incarnation: &str,
+    binding: &NativeSessionBinding,
+    published: &mut Option<NativeSessionBinding>,
+) -> Result<()> {
+    verify_first_native_session(
+        requested_restart_session().as_deref(), &binding.session_id, published.is_some(),
+    )?;
+    if published.as_ref() == Some(binding) {
+        return Ok(());
+    }
+    let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(binding)?));
+    let _: ClaimRecord = client.post("/v1/claims/harness-session-binding", &json!({
+        "agent": subject,
+        "harness": driver,
+        "session_id": binding.session_id,
+        "resume_available": binding.resume_available,
+        "path": binding.path,
+        "incarnation_id": incarnation,
+        "idempotency_key": format!("native-session:{subject}:{incarnation}:{fingerprint}"),
+    })).await?;
+    *published = Some(binding.clone());
+    Ok(())
 }
 
 /// What a native driver hands its next image across `execve`.
@@ -14555,6 +14777,11 @@ async fn drive_st2_native(
     let mut replacement = DriverReplacement::new();
     let mut binding_watch = ClaudeBindingWatch::default();
     let mut reported_session = None;
+    let native_binding_path = match driver {
+        "claude" => Some(agent_dir.join("claude-native-session")),
+        "opencode" => Some(agent_dir.join("opencode-native-session")),
+        _ => None,
+    };
     // Claude's hooks keep the subagent ledger; this driver records it on the seat.
     let mut subagents = (driver == "claude").then(|| {
         st3::subagents::Publisher::start(
@@ -14770,6 +14997,15 @@ async fn drive_st2_native(
                 }
                 }
                 let tick: Result<()> = async {
+                    if let Some(binding_path) = native_binding_path.as_deref()
+                        && let Some(wrapper) = provider_incarnation.as_deref()
+                        && let Some(binding) = read_native_session_binding(
+                            binding_path, wrapper, false,
+                        )
+                    {
+                        publish_native_session_binding(client, subject, driver, &incarnation,
+                            &binding, &mut loop_state.published_native_session).await?;
+                    }
                     if observations.enabled { return Ok(()) }
                     if native_file_may_override_channel(driver)
                         && loop_state.harness_record_started
@@ -14883,6 +15119,11 @@ async fn drive_st2_native(
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
+                    if error.is::<NativeSessionMismatch>() {
+                        return Err(refuse_restart_session_mismatch(
+                            client, subject, &incarnation, driver, error,
+                        ).await);
+                    }
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 if let Some(subagents) = subagents.as_mut()
@@ -15961,6 +16202,15 @@ fn accept_managed_channel_frame(
     observer: &mut Option<st_drivers::pi_channel::EventObserver>,
     line: &str,
 ) -> Result<bool> {
+    if let Ok(frame) = serde_json::from_str::<Value>(line)
+        && matches!(frame.get("type").and_then(Value::as_str), Some("session" | "ready"))
+        && let Some(actual) = frame.get("sessionId").and_then(Value::as_str)
+    {
+        verify_first_native_session(
+            requested_restart_session().as_deref(), actual,
+            state.pending.published_native_session.is_some(),
+        )?;
+    }
     if let Some(observer) = observer.as_mut()
         && let Ok(frame) = serde_json::from_str(line)
     {
@@ -16142,6 +16392,11 @@ async fn run_pi_channel(
                         while let Some(line) = state.lines.next_line() {
                             match accept_managed_channel_frame(&mut state, &mut observer, &line) {
                                 Ok(changed) => publish |= changed,
+                                Err(error) if error.is::<NativeSessionMismatch>() => {
+                                    return Err(refuse_restart_session_mismatch(
+                                        client, subject, &incarnation, driver, error,
+                                    ).await);
+                                }
                                 Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
                             }
                         }
@@ -16403,6 +16658,22 @@ impl PiChannelResume {
             return false;
         };
         match frame.get("type").and_then(Value::as_str) {
+            // The extension names its native session both on hello and when it changes.
+            Some("session" | "ready") => {
+                let Some(binding) = frame.get("sessionId").and_then(Value::as_str)
+                    .and_then(|id| NativeSessionBinding::from_session_file(
+                        id, frame.get("sessionFile").or_else(|| frame.get("path")).and_then(Value::as_str),
+                    ))
+                else {
+                    return false;
+                };
+                if self.pending.published_native_session.as_ref() != Some(&binding) {
+                    self.pending.native_session = Some((binding.session_id, binding.path));
+                    true
+                } else {
+                    false
+                }
+            }
             Some("state") => {
                 let Some(state) = frame.get("state").and_then(Value::as_str) else {
                     return false;
@@ -16431,22 +16702,6 @@ impl PiChannelResume {
                     .get("reason")
                     .and_then(Value::as_str)
                     .map(|reason| reason.chars().take(2_000).collect());
-                true
-            }
-            // The extension names the native session it runs, before and after its hello.
-            Some("session" | "ready") => {
-                let Some(native) = frame
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                else {
-                    return false;
-                };
-                let path = frame
-                    .get("sessionFile")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                self.pending.native_session = Some((native.to_owned(), path));
                 true
             }
             Some("delivered") => {
@@ -16533,6 +16788,8 @@ struct PiFamilyReports {
     /// The native session the harness reported, with its transcript, until the daemon has it.
     #[serde(default)]
     native_session: Option<(String, Option<String>)>,
+    #[serde(default)]
+    published_native_session: Option<NativeSessionBinding>,
 }
 
 impl PiFamilyReports {
@@ -16608,43 +16865,36 @@ impl PiFamilyReports {
             }
             self.reads.remove(&message);
         }
-        // Last, and never fatal: a report the daemon does not take must not hold back delivery.
-        // It stays pending and goes again with the next report. A session is reported only once
-        // its transcript exists, because only then can a resume find it: pi writes nothing until
-        // its first turn.
-        let resumable = |native: &str| {
-            std::env::var_os(st_drivers::driver_paths::SESSION_DIR_ENV).is_none_or(|dir| {
-                st3::native_resume::pi_family_transcript(
-                    &PathBuf::from(dir).join("provider-sessions"),
-                    native,
-                )
-                .is_some()
-            })
-        };
-        if let Some((native, path)) = self.native_session.clone()
-            && resumable(&native)
+        // Native session evidence is last and nonfatal, so a daemon refusal never holds delivery.
+        // Keep the pending tuple's reexec wire shape and refresh positive evidence once pi/omp
+        // writes the transcript after its first exchange.
+        if self.native_session.is_none()
+            && let Some(saved) = self.published_native_session.as_ref().and_then(NativeSessionBinding::saved_since)
         {
-            let reported: Result<ClaimRecord> = client
-                .post(
-                    "/v1/agents/native-session",
-                    &json!({
-                        "subject": subject,
-                        "actor": subject,
-                        "incarnation_id": incarnation,
-                        "harness": driver,
-                        "session_id": native,
-                        "path": path,
-                    }),
-                )
-                .await;
-            match reported {
-                Ok(_) => self.native_session = None,
-                Err(error) => {
-                    let _ = write_driver_log(
-                        subject,
-                        &json!({"type":"native_session_report_failed","error":format!("{error:#}")})
-                            .to_string(),
-                    );
+            self.native_session = Some((saved.session_id, saved.path));
+        }
+        if let Some((native, path)) = self.native_session.as_ref() {
+            let path = path.clone().or_else(|| {
+                std::env::var_os(st_drivers::driver_paths::SESSION_DIR_ENV).and_then(|dir| {
+                    st3::native_resume::pi_family_transcript(
+                        &PathBuf::from(dir).join("provider-sessions"),
+                        native,
+                    )
+                    .map(|path| path.to_string_lossy().into_owned())
+                })
+            });
+            if let Some(binding) = NativeSessionBinding::from_session_file(native, path.as_deref()) {
+                match publish_native_session_binding(
+                    client, subject, driver, incarnation, &binding, &mut self.published_native_session,
+                ).await {
+                    Ok(()) => self.native_session = None,
+                    Err(error) => {
+                        let _ = write_driver_log(
+                            subject,
+                            &json!({"type":"native_session_report_failed","error":format!("{error:#}")})
+                                .to_string(),
+                        );
+                    }
                 }
             }
         }
@@ -16938,7 +17188,8 @@ async fn drive_codex_native(
     } else {
         loop_state.harness_record_started = true;
     }
-    let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
+    let binding_path = state_dir.join("binding.json");
+    let prior_binding = std::fs::read(&binding_path).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
     let mut mailbox =
@@ -17102,7 +17353,7 @@ async fn drive_codex_native(
                 .await;
                 }
                 let tick: Result<()> = async {
-                    if !loop_state.ready && std::fs::read(state_dir.join("binding.json"))
+                    if !loop_state.ready && std::fs::read(&binding_path)
                         .ok()
                         .is_some_and(|binding| Some(&binding) != prior_binding.as_ref())
                     {
@@ -17136,7 +17387,15 @@ async fn drive_codex_native(
                     {
                         note_driver_tick_failure(subject, error, &mut last_control_warning);
                     }
-                    if observations.enabled { return Ok(()) }
+                    if observations.enabled {
+                        if let Some(wrapper) = observations.provider_incarnation.as_deref()
+                            && let Some(binding) = read_native_session_binding(&binding_path, wrapper, true)
+                        {
+                            publish_native_session_binding(client, subject, "codex", &incarnation,
+                                &binding, &mut loop_state.published_native_session).await?;
+                        }
+                        return Ok(());
+                    }
                     let current_record = fs::read(&harness_state_path).ok();
                     loop_state.harness_record_started = harness_record_belongs_to_current_session(
                         loop_state.harness_record_started,
@@ -17148,6 +17407,14 @@ async fn drive_codex_native(
                         .then(|| st_drivers::harness_state::read(&harness_state_path, None))
                         .flatten()
                     {
+                        if let Some(wrapper) = observed.evidence_incarnation.as_deref()
+                            && let Some(binding) = read_native_session_binding(
+                                &binding_path, wrapper, true,
+                            )
+                        {
+                            publish_native_session_binding(client, subject, "codex", &incarnation,
+                                &binding, &mut loop_state.published_native_session).await?;
+                        }
                         publish_harness_activity(
                             &ObservationClient { client, event: None },
                             subject,
@@ -17222,6 +17489,11 @@ async fn drive_codex_native(
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
+                    if error.is::<NativeSessionMismatch>() {
+                        return Err(refuse_restart_session_mismatch(
+                            client, subject, &incarnation, "codex", error,
+                        ).await);
+                    }
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 subagents.set_timeline_incarnation(
@@ -18725,6 +18997,100 @@ mod tests {
     }
 
     #[test]
+    fn explicit_restart_first_native_binding_rejects_fallback_but_allows_later_switches() {
+        let error = verify_first_native_session(Some("captured"), "fresh", false).unwrap_err();
+        let mismatch = error.downcast_ref::<NativeSessionMismatch>().unwrap();
+        assert_eq!(mismatch.expected, "captured");
+        assert_eq!(mismatch.actual, "fresh");
+        assert!(verify_first_native_session(Some("captured"), "captured", false).is_ok());
+        assert!(verify_first_native_session(Some("captured"), "switched", true).is_ok());
+        assert!(verify_first_native_session(None, "ordinary", false).is_ok());
+    }
+
+    #[test]
+    fn restart_context_binding_requires_exact_provider_incarnation_and_saved_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = root.path().join("transcript.jsonl");
+        let transcript_path = transcript.to_str().unwrap();
+        for (codex, binding) in [
+            (false, json!({"incarnation":"wrapper-current", "native_session_id":"native-exact", "path":transcript_path})),
+            (true, json!({"runtimeIncarnation":"wrapper-current", "threadId":"native-exact"})),
+        ] {
+            assert!(native_session_binding(&binding, "wrapper-previous", codex).is_none());
+            let current = native_session_binding(&binding, "wrapper-current", codex).unwrap();
+            assert_eq!(current.session_id, "native-exact");
+            assert_eq!(current.path.as_deref(), if codex { None } else { Some(transcript_path) });
+            assert!(!current.resume_available, "an unsaved session is not resumable");
+        }
+        assert!(native_session_binding(&json!({"incarnation":"current", "native_session_id":""}), "current", false).is_none());
+        // Claude/pi/omp: the exact session file existing is the saved evidence.
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let saved = native_session_binding(
+            &json!({"incarnation":"current", "native_session_id":"native", "path":transcript_path}), "current", false,
+        ).unwrap();
+        assert!(saved.resume_available);
+        // OpenCode states its server store's answer, which wins over a missing path.
+        for answer in [true, false] {
+            let opencode = native_session_binding(
+                &json!({"incarnation":"current", "native_session_id":"ses", "resume_available":answer}), "current", false,
+            ).unwrap();
+            assert_eq!(opencode.resume_available, answer);
+        }
+        // Codex: only rollout evidence for this exact runtime and thread counts.
+        let state = root.path().join("codex");
+        std::fs::create_dir_all(&state).unwrap();
+        let binding_path = state.join("binding.json");
+        std::fs::write(&binding_path, serde_json::to_vec(&json!({
+            "runtimeIncarnation":"current", "threadId":"thread", "resume_available": true,
+        })).unwrap()).unwrap();
+        let codex = |evidence: Value| {
+            std::fs::write(state.join("rollout.json"), serde_json::to_vec(&evidence).unwrap()).unwrap();
+            read_native_session_binding(&binding_path, "current", true).unwrap()
+        };
+        assert!(!codex(json!({"runtimeIncarnation":"previous", "threadId":"thread", "path":transcript_path})).resume_available);
+        assert!(!codex(json!({"runtimeIncarnation":"current", "threadId":"other", "path":transcript_path})).resume_available);
+        let missing = root.path().join("missing.jsonl");
+        assert!(!codex(json!({"runtimeIncarnation":"current", "threadId":"thread", "path":missing})).resume_available);
+        let rollout = codex(json!({"runtimeIncarnation":"current", "threadId":"thread", "path":transcript_path}));
+        assert!(rollout.resume_available);
+        assert_eq!(rollout.path.as_deref(), Some(transcript_path));
+        assert!(codex(json!({"runtimeIncarnation":"current", "threadId":"thread", "path":null})).resume_available);
+    }
+
+    #[test]
+    fn restart_context_pi_binding_survives_adoption_and_tracks_native_session_switches() {
+        let mut channel = PiChannelResume::default();
+        assert!(channel.accept_frame(r#"{"type":"session","sessionId":"native-one","path":"/one.jsonl"}"#));
+        let mut adopted: PiChannelResume = serde_json::from_slice(&serde_json::to_vec(&channel).unwrap()).unwrap();
+        assert_eq!(adopted.pending.native_session.as_ref().unwrap().0, "native-one");
+        let (session, path) = adopted.pending.native_session.take().unwrap();
+        adopted.pending.published_native_session = NativeSessionBinding::from_session_file(&session, path.as_deref());
+        assert!(!adopted.accept_frame(r#"{"type":"session","sessionId":"native-one","path":"/one.jsonl"}"#));
+        assert!(adopted.accept_frame(r#"{"type":"session","sessionId":"native-two","path":"/two.jsonl"}"#));
+        assert_eq!(adopted.pending.native_session.as_ref().unwrap().0, "native-two");
+        assert!(!adopted.accept_frame(r#"{"type":"session","sessionId":""}"#));
+    }
+
+    #[test]
+    fn restart_context_pi_session_saved_after_its_frame_becomes_resumable() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("session.jsonl");
+        let frame = json!({"type":"session", "sessionId":"native", "path":file}).to_string();
+        let mut channel = PiChannelResume::default();
+        assert!(channel.accept_frame(&frame));
+        let (session, path) = channel.pending.native_session.take().unwrap();
+        let published = NativeSessionBinding::from_session_file(&session, path.as_deref()).unwrap();
+        assert!(!published.resume_available);
+        assert!(published.saved_since().is_none());
+        std::fs::write(&file, "{}\n").unwrap();
+        let saved = published.saved_since().unwrap();
+        assert!(saved.resume_available);
+        assert_eq!((saved.session_id.as_str(), saved.path.as_ref()), ("native", published.path.as_ref()));
+        channel.pending.published_native_session = Some(saved);
+        assert!(!channel.accept_frame(&frame), "the saved binding is already published");
+    }
+
+    #[test]
     fn a_claude_session_without_a_binding_is_reported_once_after_the_grace() {
         let dir = tempfile::tempdir().unwrap();
         let start = Instant::now();
@@ -19405,6 +19771,7 @@ mod tests {
                 predecessor_harness_record: Some(b"ignored".to_vec()),
                 published_timeline: BTreeSet::from(["one:1:1:upsert".to_owned()]),
                 delivery_episode: 2,
+                ..NativeLoopState::default()
             },
         };
         let back: DriverResume =

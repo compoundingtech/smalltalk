@@ -148,6 +148,8 @@ pub fn run_controlled_paths(
         !claude_argv.is_empty(),
         "Claude driver '{runtime_id}' has no provider argv"
     );
+    let restart = crate::restart_context::Context::from_env();
+    let claude_argv = restart.apply_argv("claude", claude_argv)?;
     let claude_argv = prepare_st3_channel_argv(&paths.root, &identity, claude_argv)?;
     let workspace = std::env::current_dir().context("reading the Claude driver workspace")?;
     crate::pretrust::pretrust_claude(std::slice::from_ref(&workspace))
@@ -161,6 +163,12 @@ pub fn run_controlled_paths(
         ("ST_CLAUDE_IDENTITY".to_string(), identity.clone()),
     ];
     env.extend(paths.environment(&identity));
+    if let Some(expected) = restart.native_session() {
+        env.push((
+            crate::restart_context::EXPECTED_SESSION_ENV.into(),
+            expected.into(),
+        ));
+    }
     // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
     run_provider_with_env_removals(
         "Claude",
@@ -170,6 +178,7 @@ pub fn run_controlled_paths(
         &[
             EXPECTED_NATIVE_SESSION_ENV,
             RESUME_GENERATION_ENV,
+            crate::restart_context::EXPECTED_SESSION_ENV,
             "CATALOG",
             "ST_ROOT",
         ],
@@ -1256,6 +1265,16 @@ fn observe_payload(
         })
         .transpose()?;
     if event == "SessionStart" {
+        let expected_restart = var(crate::restart_context::EXPECTED_SESSION_ENV);
+        let already_bound = fs::read(agent_dir.join("claude-native-session")).ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|binding| binding["incarnation"].as_str() == exported_session.as_deref());
+        if !already_bound {
+            crate::restart_context::verify_native_session(
+                expected_restart.as_deref(),
+                payload.get("session_id").and_then(serde_json::Value::as_str).unwrap_or_default(),
+            )?;
+        }
         let binding = match (runtime_id, exported_session.as_deref()) {
             (Some(runtime_id), Some(runtime_incarnation)) => Some(record_session_start_binding(
                 session_dir,
@@ -1286,7 +1305,10 @@ fn observe_payload(
                 .and_then(serde_json::Value::as_str),
         ) {
             if !native_id.is_empty() {
-                if let Err(error) = write_native_session_binding(agent_dir, incarnation, native_id)
+                if let Err(error) = write_native_session_binding(
+                    agent_dir, incarnation, native_id,
+                    payload.get("transcript_path").and_then(serde_json::Value::as_str),
+                )
                 {
                     tracing::warn!(
                         "st claude-observe: native session binding write failed: {error:#}"
@@ -1374,12 +1396,14 @@ fn write_native_session_binding(
     agent_dir: &Path,
     incarnation: &str,
     native_id: &str,
+    transcript_path: Option<&str>,
 ) -> Result<()> {
     harness_state::write_json_atomic(
         &agent_dir.join("claude-native-session"),
         &serde_json::json!({
             "incarnation": incarnation,
             "native_session_id": native_id,
+            "path": transcript_path,
         }),
         agent_dir,
         ".claude-native-session",
@@ -1994,13 +2018,40 @@ mod tests {
     #[test]
     fn native_session_binding_is_atomic_and_names_the_exact_provider_incarnation() {
         let root = tempfile::tempdir().unwrap();
-        write_native_session_binding(root.path(), "wrapper-current", "native-current").unwrap();
+        write_native_session_binding(root.path(), "wrapper-current", "native-current", Some("/transcript.jsonl")).unwrap();
         let binding: serde_json::Value = serde_json::from_slice(
             &std::fs::read(root.path().join("claude-native-session")).unwrap(),
         )
         .unwrap();
         assert_eq!(binding["incarnation"], "wrapper-current");
         assert_eq!(binding["native_session_id"], "native-current");
+        assert_eq!(binding["path"], "/transcript.jsonl");
+    }
+
+    #[test]
+    fn restart_context_hook_proves_initial_identity_without_fencing_later_session_switches() {
+        let root = tempfile::tempdir().unwrap();
+        let seq = harness_state::claim(root.path(), "worker", "claude", "wrapper-current").unwrap();
+        let var = |key: &str| match key {
+            SESSION_ENV => Some("wrapper-current".into()),
+            SESSION_SEQ_ENV => Some(seq.to_string()),
+            crate::restart_context::EXPECTED_SESSION_ENV => Some("native-exact".into()),
+            _ => None,
+        };
+        let observe = |native: &str| observe_payload(
+            root.path(), root.path(), true, "worker", Some("run.worker"), "SessionStart",
+            &serde_json::json!({"session_id": native, "source": "resume", "transcript_path": "/transcript.jsonl"}).to_string(),
+            &var,
+        );
+        assert!(observe("native-wrong").is_err());
+        assert!(!root.path().join("claude-native-session").exists());
+        observe("native-exact").unwrap();
+        observe("human-selected-later").unwrap();
+        let binding: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("claude-native-session")).unwrap(),
+        ).unwrap();
+        assert_eq!(binding["native_session_id"], "human-selected-later");
+        assert_eq!(binding["incarnation"], "wrapper-current");
     }
 
     #[test]
