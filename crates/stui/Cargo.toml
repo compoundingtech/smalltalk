@@ -12,6 +12,7 @@ anyhow = "1"
 crossterm = "0.29"
 ratatui = { workspace = true }
 st3-client = { path = "../st3-client" }
+st3-feed = { path = "../st3-feed" }
 st3-conversation-ui = { path = "../st3-conversation-ui", features = ["ratatui"] }
 st3-ui-model = { path = "../st3-ui-model" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

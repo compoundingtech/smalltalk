@@ -4494,6 +4494,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "st3-feed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "st3",
+ "st3-client",
+ "st3-conversation-ui",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "st3-migrate"
 version = "0.1.0"
 dependencies = [
@@ -4594,6 +4609,7 @@ dependencies = [
  "st3",
  "st3-client",
  "st3-conversation-ui",
+ "st3-feed",
  "st3-ui-model",
  "tempfile",
  "tokio",

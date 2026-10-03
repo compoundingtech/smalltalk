@@ -1,11 +1,20 @@
-//! One socket to st for everything stui shows live.
+//! One socket to st for live collection windows, conversations and a terminal.
 //!
 //! The feed holds one collection socket with the attention, missions and agents windows, the
-//! open conversation, and, while a terminal is open, that terminal. st joins each row and each
-//! conversation, so stui never joins lists itself or reads item by item. When the socket drops,
+//! open conversations, and, while a terminal is open, that terminal. st joins each row and each
+//! conversation, so callers never join lists themselves or read item by item. When the socket drops,
 //! the feed opens a new one, subscribes again, and attaches the open terminal again. Nothing
 //! here polls projections while connected: frames arrive only when something changed. Remote
 //! devices also make a bounded liveness read so an idle network blackhole becomes offline.
+
+#![doc = include_str!("../README.md")]
+
+pub mod cache;
+pub mod model;
+mod terminal;
+pub mod tree;
+
+pub use terminal::{action_pair, terminal_fence, terminal_screen_fence};
 
 use st3_client::{
     CapabilityState, Client, ClientError, CollectionEvent, CollectionStream, ErrorCode, Fence,
@@ -39,7 +48,7 @@ pub enum Window {
     Attention,
     Missions,
     Agents,
-    /// The person's glasses, followed only by `stui --glasses` when st grants them.
+    /// The person's glasses, followed when requested and granted by st.
     Glasses,
 }
 
@@ -83,6 +92,9 @@ pub enum Update {
     Connected(Client),
     /// st cannot be reached; the feed keeps trying and every window keeps its last items.
     Offline(String),
+    /// The granted glasses shape, delivered before its window. The embedding UI chooses how
+    /// to store glasses for this version; the feed owns no application state.
+    GlassesVersion(u32),
     /// A window's current items, in st's display order.
     Window {
         window: Window,
@@ -179,8 +191,7 @@ struct Following {
     failures: usize,
 }
 
-/// Keep stui's windows and terminal current until the receiving side goes away.
-#[cfg(test)]
+/// Follow one local member's core windows, conversations and terminal without glasses.
 pub async fn run(
     client: Client,
     updates: mpsc::Sender<Update>,
@@ -189,6 +200,9 @@ pub async fn run(
     run_members(vec![client], false, false, updates, commands).await;
 }
 
+/// Follow the core windows on one active member, trying each supplied client before backing off.
+/// `glasses` requests the optional granted glasses window. `remote` identifies a device gateway
+/// for connection diagnostics. Dropping the command sender stops the feed.
 pub async fn run_members(
     clients: Vec<Client>,
     remote: bool,
@@ -299,7 +313,7 @@ pub async fn run_members(
 }
 
 enum Ended {
-    /// stui is closing.
+    /// The caller is closing.
     Closed,
     /// The socket dropped; open another.
     Dropped(String),
@@ -343,8 +357,10 @@ async fn connected(
         None
     };
     // From version 2 a glass's splits keep their sizes in st.
-    if let Some(version) = version {
-        crate::ui::set_glasses_version(version);
+    if let Some(version) = version
+        && updates.send(Update::GlassesVersion(version)).is_err()
+    {
+        return Ended::Closed;
     }
     let granted = version.is_some();
     for window in Window::ALL
@@ -1135,6 +1151,114 @@ mod tests {
                 Err(mpsc::TryRecvError::Disconnected) => panic!("the feed stopped"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_member_falls_back_and_announces_glasses_before_their_window() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("live.sock");
+        let app = st3::api::router(test_state(root.path()));
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let live = Client::unix_as(&socket, "person/avery");
+        let (tx, rx) = mpsc::channel();
+        let (commands, command_receiver) = channel::unbounded_channel();
+        let feed = tokio::spawn(run_members(
+            vec![
+                Client::unix_as(root.path().join("absent.sock"), "person/avery"),
+                live.clone(),
+            ],
+            false,
+            true,
+            tx,
+            command_receiver,
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut connected = false;
+            let mut version = None;
+            loop {
+                match rx.try_recv() {
+                    Ok(Update::Connected(client)) => {
+                        assert_eq!(format!("{client:?}"), format!("{live:?}"));
+                        connected = true;
+                    }
+                    Ok(Update::GlassesVersion(value)) => {
+                        assert!(connected);
+                        version = Some(value);
+                    }
+                    Ok(Update::Window {
+                        window: Window::Glasses,
+                        ..
+                    }) => {
+                        assert!(version.is_some_and(|value| value >= GLASSES_VERSION));
+                        break;
+                    }
+                    Ok(Update::Offline(reason)) => panic!("live member was available: {reason}"),
+                    Ok(_) => {}
+                    Err(mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => panic!("the feed stopped"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(commands);
+        tokio::time::timeout(Duration::from_secs(5), feed)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_cursor_from_another_member_discards_the_timeline_and_reloads_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let app = st3::api::router(test_state(root.path()));
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let client = Client::unix_as(&socket, "person/avery");
+        let mut model = model::Model::bootstrap(&client).await.unwrap();
+        model.event_cursor = "event-cursor/previous-member/0".into();
+        model.timeline.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"entry/stale", "sequence":1, "revision":1,
+                "timestamp":"2026-10-01T00:00:00Z", "role":"assistant", "final":true,
+                "type":"content", "body":{"media_type":"text/plain", "text":"Stale transcript"}
+            }))
+            .unwrap(),
+        );
+        let (changed, sessions, gap) =
+            tokio::time::timeout(Duration::from_secs(10), model.sync(&client))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(changed && gap);
+        assert!(sessions.is_empty());
+        assert!(model.timeline.is_empty());
+        assert_eq!(
+            model.event_cursor,
+            client.capabilities().await.unwrap().value.event_cursor
+        );
+        assert!(model.machines.snapshot.is_some());
+        assert_eq!(model.status, "Resynchronized after cursor gap");
+        server.abort();
     }
 
     #[tokio::test]

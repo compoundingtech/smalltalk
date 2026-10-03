@@ -8,7 +8,8 @@ The screens follow [docs/clients/ui-contract.md](../../docs/clients/ui-contract.
 iOS app.
 
 `stui` connects through the generated Rust `st3.client.v0` client, the same typed data boundary
-used by the CLI. It paints immediately, hydrates attention/agents/sessions first, then fills in
+used by the CLI. Its subscriptions, reconnects, snapshot model and cache come from
+[`st3-feed`](../st3-feed/README.md). It paints immediately, hydrates attention/agents/sessions first, then fills in
 mission and fleet details without blocking keys. A private, actor-and-endpoint-scoped read-only
 cache keeps the last snapshot visible while reconnecting. Actions still need a live connection
 and fresh fences; there is no offline mutation queue.

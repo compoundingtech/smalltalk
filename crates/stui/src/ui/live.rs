@@ -332,6 +332,7 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(update) = incoming.try_recv() {
             match update {
+                feed::Update::GlassesVersion(version) => super::set_glasses_version(version),
                 feed::Update::Connected(member) => {
                     client = member;
                     extras.live = false;
