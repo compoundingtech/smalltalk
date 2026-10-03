@@ -3,6 +3,10 @@ mod gateway_tests {
     use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
 
     fn paired_device(state: &AppState, credential: &str, suffix: &str) {
+        paired_device_scoped(state, credential, suffix, &["read.projections", "terminal.read"]);
+    }
+
+    fn paired_device_scoped(state: &AppState, credential: &str, suffix: &str, scopes: &[&str]) {
         state
             .store
             .append_claim(&ClaimInput {
@@ -19,10 +23,7 @@ mod gateway_tests {
                         json!(format!("person/alex/session/{suffix}")),
                     ),
                     ("person_id".into(), json!("person/alex")),
-                    (
-                        "scopes".into(),
-                        json!(["read.projections", "terminal.read"]),
-                    ),
+                    ("scopes".into(), json!(scopes)),
                     (
                         "expires_at_unix_ms".into(),
                         json!(client_now_ms() as u64 + 60_000),
@@ -323,13 +324,22 @@ mod gateway_tests {
     >;
 
     async fn connect(address: std::net::SocketAddr, path: &str, protocols: &str) -> TestSocket {
+        connect_as(address, path, protocols, "viewer-secret").await
+    }
+
+    async fn connect_as(
+        address: std::net::SocketAddr,
+        path: &str,
+        protocols: &str,
+        credential: &str,
+    ) -> TestSocket {
         let mut request = format!("ws://{address}{path}")
             .into_client_request()
             .unwrap();
         // Model browser WebSocket: no Authorization header, only offered protocols.
         request.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
-            format!("{protocols}, {BEARER_PROTOCOL_PREFIX}viewer-secret")
+            format!("{protocols}, {BEARER_PROTOCOL_PREFIX}{credential}")
                 .parse()
                 .unwrap(),
         );
@@ -712,5 +722,212 @@ mod gateway_tests {
             server.abort();
             let _ = server.await;
         }
+    }
+
+    async fn send_json(socket: &mut TestSocket, value: Value) {
+        socket
+            .send(Message::Text(value.to_string().into()))
+            .await
+            .unwrap();
+    }
+
+    /// The next input frame, past screens and the terminal errors that end follows.
+    async fn next_input(socket: &mut TestSocket) -> Value {
+        loop {
+            let frame = next_json(socket).await;
+            if frame["kind"] != "screen" && frame["collection"] != "terminal" {
+                return frame;
+            }
+        }
+    }
+
+    /// One real PTY driven through input sessions: a repeat is acknowledged without a write,
+    /// and a gap, a detach, an incarnation change or a revoked pairing closes input before its
+    /// batch is written. Only a `terminal.control` device opens input at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_input_writes_each_batch_once_in_order_and_closes_without_writing() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let Some(pty) = std::env::split_paths(&path)
+            .map(|dir| dir.join("pty"))
+            .find(|p| p.is_file())
+        else {
+            assert!(std::env::var_os("CI").is_none(), "CI must provide pty");
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state(root.path());
+        state.pty_binary = pty.clone();
+        let runtime =
+            st_runtime::PtyRuntime::new(state.pty_root.clone()).with_binary(pty.to_string_lossy());
+        struct Cleanup(st_runtime::PtyRuntime);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.stop("input-test");
+                let _ = self.0.remove("input-test");
+            }
+        }
+        let _cleanup = Cleanup(runtime.clone());
+        let pty_root = state.pty_root.clone();
+        let output = tokio::task::spawn_blocking(move || std::process::Command::new(pty)
+            .env("PTY_ROOT", pty_root)
+            .args(["run", "-d", "--force", "--id", "input-test", "--tag", "keep=true", "--", "/bin/sh", "-c", "stty -echo; printf ready; while IFS= read -r line; do printf '\\r\\naccepted:%s' \"$line\"; done"])
+            .output().unwrap()).await.unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let live = runtime
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|live| live.name == "input-test")
+            .unwrap();
+        let incarnation = format!("{}:{}", live.pid.unwrap(), live.created_at.unwrap());
+        let observe = |incarnation: &str| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/input-test".into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("runtime_id".into(), json!("input-test")),
+                        ("incarnation_id".into(), json!(incarnation)),
+                        ("status".into(), json!("running")),
+                        ("terminal".into(), json!(true)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            signal_changed(&state);
+        };
+        observe(&incarnation);
+        paired_device_scoped(
+            &state,
+            "control-secret",
+            "control",
+            &["read.projections", "terminal.read", "terminal.control"],
+        );
+        paired_device(&state, "viewer-secret", "viewer");
+        let auth = Request::builder()
+            .uri("/v1/client/agents")
+            .header(AUTHORIZATION, "Bearer control-secret")
+            .body(Body::empty())
+            .unwrap();
+        let control = authenticate(&state, &auth, "fabric-loopback").unwrap();
+        let request = |action_type: &str, key: &str, parameters: Value| ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: format!("action/{key}"),
+            action_type: action_type.into(),
+            idempotency_key: key.into(),
+            fence: Fence {
+                runtime_incarnation: Some(incarnation.clone()),
+                ..Fence::default()
+            },
+            parameters,
+        };
+        let attach = |key: &str| {
+            let target = json!({"target_id": "terminal/agent/input-test"});
+            create_terminal_attachment(&state, &control, &request("terminal.attach", key, target), key)
+                .unwrap()
+        };
+        let (address, server) = serve(crate::api::fabric_router(state.clone())).await;
+        let mut socket = connect_as(
+            address,
+            "/v1/client/collections/stream",
+            COLLECTION_SUBPROTOCOL,
+            "control-secret",
+        )
+        .await;
+        let follow = async |socket: &mut TestSocket, id: &str, attachment: &Value| {
+            send_json(socket, json!({"kind":"subscribe", "id":id, "collection":"terminal", "terminal":"terminal/agent/input-test", "incarnation":incarnation, "capability":attachment["stream_capability"]})).await;
+            while next_json(socket).await["kind"] != "screen" {}
+        };
+        let open = async |socket: &mut TestSocket, id: &str, follow: &str| {
+            send_json(socket, json!({"kind":"input-open", "id":id, "follow":follow})).await;
+            assert_eq!(
+                next_input(socket).await,
+                json!({"kind":"input-opened", "id":id, "follow":follow, "next_seq":0})
+            );
+        };
+        let input = async |socket: &mut TestSocket, id: &str, seq: u64, data: Value| {
+            send_json(socket, json!({"kind":"input", "id":id, "seq":seq, "data":data})).await;
+            next_input(socket).await
+        };
+        let ack = |id: &str, seq: u64| json!({"kind":"input-ack", "id":id, "seq":seq});
+        let text = |line: &str| json!({"text": format!("{line}\r")});
+
+        let first = attach("input-first");
+        follow(&mut socket, "term", &first).await;
+        open(&mut socket, "in", "term").await;
+        assert_eq!(input(&mut socket, "in", 0, text("one")).await, ack("in", 0));
+        let encoded = base64::engine::general_purpose::STANDARD.encode("two\r");
+        let bytes = json!({"bytes_b64": encoded});
+        assert_eq!(input(&mut socket, "in", 1, bytes).await, ack("in", 1));
+        // A repeat of an acknowledged batch is acknowledged again and never written.
+        assert_eq!(input(&mut socket, "in", 0, text("repeat")).await, ack("in", 0));
+        let gap = input(&mut socket, "in", 3, text("gapped")).await;
+        assert_eq!((gap["kind"].as_str(), gap["reason"].as_str()), (Some("input-closed"), Some("gap")));
+        // A batch still on its way after the close is dropped without a frame.
+        send_json(&mut socket, json!({"kind":"input", "id":"in", "seq":2, "data":text("late")})).await;
+        open(&mut socket, "in", "term").await;
+        assert_eq!(input(&mut socket, "in", 0, text("kept")).await, ack("in", 0));
+        let target = json!({"target_id": first["attachment_id"]});
+        detach_terminal_attachment(&state, &control, &request("terminal.detach", "detach-first", target))
+            .unwrap();
+        let detached = input(&mut socket, "in", 1, text("detached")).await;
+        assert_eq!(detached["reason"], "detached");
+
+        let second = attach("input-second");
+        follow(&mut socket, "term2", &second).await;
+        open(&mut socket, "in2", "term2").await;
+        observe("input-test:replacement");
+        let changed = input(&mut socket, "in2", 0, text("replaced")).await;
+        assert_eq!((changed["id"].as_str(), changed["reason"].as_str()), (Some("in2"), Some("incarnation-changed")));
+
+        observe(&incarnation);
+        let third = attach("input-third");
+        follow(&mut socket, "term3", &third).await;
+        open(&mut socket, "in3", "term3").await;
+        assert_eq!(input(&mut socket, "in3", 0, text("fresh")).await, ack("in3", 0));
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/client/pairing-control".into(),
+                kind: "custom.client.pairing-revoked".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::from([("device_id".into(), json!("control"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let revoked = input(&mut socket, "in3", 1, text("revoked")).await;
+        assert_eq!(revoked["reason"], "revoked");
+
+        let mut viewer = connect(address, "/v1/client/collections/stream", COLLECTION_SUBPROTOCOL).await;
+        send_json(&mut viewer, json!({"kind":"input-open", "id":"ro", "follow":"term"})).await;
+        let refused = next_input(&mut viewer).await;
+        assert_eq!((refused["id"].as_str(), refused["reason"].as_str()), (Some("ro"), Some("rejected")));
+
+        let screen = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let screen = runtime.screen("input-test").unwrap();
+                if screen.contains("accepted:fresh") || std::time::Instant::now() > deadline {
+                    return screen;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .await
+        .unwrap();
+        for line in ["one", "two", "kept", "fresh"] {
+            assert!(screen.contains(&format!("accepted:{line}")), "{line} missing: {screen}");
+        }
+        for line in ["repeat", "gapped", "late", "detached", "replaced", "revoked"] {
+            assert!(!screen.contains(&format!("accepted:{line}")), "{line} written: {screen}");
+        }
+        server.abort();
+        let _ = server.await;
     }
 }
