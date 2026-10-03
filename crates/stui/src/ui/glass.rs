@@ -14,20 +14,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// The palette's sections, in order; a digit key opens the palette at one.
-const SECTIONS: [&str; 6] = [
+const SECTIONS: [&str; 7] = [
     "needs you",
     "agents",
     "missions",
     "fleet",
     "spaces",
     "start",
+    "said in conversations",
 ];
 const GLASSES: usize = 4;
 /// Where each section ranks while a query is typed: agents, missions, what needs you, then
 /// starting things (so "new terminal" finds New terminal before a glass named after it), the
 /// fleet, and glasses.
-const RANK: [usize; 6] = [2, 0, 1, 4, 5, 3];
+/// What was said in conversations comes right after what needs you.
+const RANK: [usize; 7] = [2, 0, 1, 5, 6, 4, 3];
 const START: usize = 5;
+/// What was said in conversations that matches the query, from st's search.
+const SAID: usize = 6;
 
 /// Every glass this window knows, and the one it shows.
 pub(crate) struct Glasses {
@@ -499,6 +503,11 @@ enum Action {
     ToggleSimple,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
+    /// A conversation where the query was said: open it, found at what was said.
+    Said {
+        agent: String,
+        query: String,
+    },
 }
 
 /// One row the palette can open.
@@ -566,6 +575,75 @@ impl Ui {
         self.glasses
             .as_ref()
             .is_some_and(|glasses| glasses.glass().layout.groups().len() > 1)
+    }
+
+    /// The query st's conversation search should answer while the palette is open: three
+    /// letters or more.
+    pub(crate) fn said_wanted(&self) -> Option<String> {
+        let palette = self.glasses.as_ref()?.palette.as_ref()?;
+        let query = palette.query.trim();
+        (palette.naming.is_none() && query.chars().count() >= 3).then(|| query.to_owned())
+    }
+
+    /// st's search results for `query` as palette rows; a hit without an agent stui can open is
+    /// left out. When st says its index is refreshing or missed conversations, the first row
+    /// says so, so a missing match is not read as "never said".
+    fn said_choices(&self, query: &str) -> Vec<Choice> {
+        let Some((asked, outcome)) = &self.said else {
+            return Vec::new();
+        };
+        if asked != query {
+            return Vec::new();
+        }
+        let Ok(found) = outcome else {
+            return Vec::new();
+        };
+        let caveat = if found.refreshing {
+            "still indexing, more may come · "
+        } else if !found.incomplete_sources.is_empty() {
+            "some conversations not searched · "
+        } else {
+            ""
+        };
+        found
+            .items
+            .iter()
+            .filter_map(|hit| {
+                let agent = hit.agent_id.clone()?;
+                let name = self
+                    .world
+                    .agents
+                    .items()
+                    .iter()
+                    .find(|candidate| candidate.id == agent)
+                    .map_or_else(
+                        || agent.trim_start_matches("agent/").to_owned(),
+                        |found| found.name.clone(),
+                    );
+                let excerpt =
+                    text::sanitize(&hit.excerpt.split_whitespace().collect::<Vec<_>>().join(" "));
+                Some((agent, name, excerpt, hit.timestamp.clone()))
+            })
+            .take(12)
+            .enumerate()
+            .map(|(index, (agent, name, excerpt, at))| Choice {
+                section: SAID,
+                glyph: ("❝", theme::SUBTEXT0),
+                label: text::truncate(&excerpt, 90),
+                // The caveat first, so a narrow palette keeps it.
+                detail: format!(
+                    "{}{name} · {}",
+                    if index == 0 { caveat } else { "" },
+                    at.get(5..16).unwrap_or(&at).replace('T', " "),
+                ),
+                // Always shown while it answers what is typed.
+                search: String::new(),
+                action: Action::Said {
+                    agent,
+                    query: query.to_owned(),
+                },
+            })
+            .collect()
     }
 
     /// Every subject and glass action the palette offers, section by section.
@@ -693,6 +771,7 @@ impl Ui {
                 Action::NewAgent(Some(name.to_owned())),
             ));
         }
+        choices.extend(self.said_choices(name));
         let Some(glasses) = &self.glasses else {
             return choices;
         };
@@ -2467,6 +2546,10 @@ impl Ui {
             Action::NewTerminal => self.open_new_terminal(),
             Action::NewMission => self.open_new_mission(),
             Action::ToggleSimple => self.toggle_simple(),
+            Action::Said { agent, query } => {
+                self.open_in_glass(Pane::Agent(Some(agent.clone())), how);
+                self.find_in(&agent, &query);
+            }
             Action::Home => self.open_home(),
             Action::Name(naming) => {
                 let query = match naming {
@@ -4635,6 +4718,69 @@ mod tests {
             (small.x, small.y, small.width, small.height),
             (6, 3, 68, 20)
         );
+    }
+
+    #[test]
+    fn ctrl_k_finds_what_was_said_in_conversations() {
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].clone();
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "harbor keys");
+        assert_eq!(ui.said_wanted().as_deref(), Some("harbor keys"));
+        // st answers: one hit in the agent's conversation, while its index still refreshes.
+        ui.said = Some((
+            "harbor keys".into(),
+            Ok(st3_client::ConversationSearch {
+                kind: "conversation-search".into(),
+                items: vec![st3_client::ConversationSearchHit {
+                    conversation_id: "session/one".into(),
+                    entry_id: "entry/7".into(),
+                    agent_id: Some(agent.id.clone()),
+                    timestamp: "2026-10-02T21:40:00Z".into(),
+                    entry_type: "content".into(),
+                    excerpt: "the harbor keys\nrotated at noon".into(),
+                }],
+                page: st3_client::PageInfo {
+                    limit: 20,
+                    has_more: false,
+                    next_cursor: None,
+                    cursor_expires_at: None,
+                },
+                indexed_at: "2026-10-02T21:41:00Z".into(),
+                host_id: "host/example".into(),
+                incomplete_sources: vec![],
+                refreshing: true,
+            }),
+        ));
+        let shown = screen(&ui);
+        assert!(shown.contains("said in conversations"), "{shown}");
+        assert!(shown.contains("the harbor keys rotated at noon"), "{shown}");
+        assert!(shown.contains("still indexing"), "{shown}");
+        // Choosing it opens the conversation, found at what was said.
+        let said = ui
+            .matches(ui.glasses.as_ref().unwrap().palette.as_ref().unwrap())
+            .into_iter()
+            .position(|choice| matches!(choice.action, Action::Said { .. }))
+            .unwrap();
+        ui.glasses
+            .as_mut()
+            .unwrap()
+            .palette
+            .as_mut()
+            .unwrap()
+            .selected = said;
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!ui.palette_open());
+        assert_eq!(ui.focused_pane(), Some(Pane::Agent(Some(agent.id.clone()))));
+        assert!(
+            ui.find
+                .as_ref()
+                .is_some_and(|find| find.agent == agent.id && find.query == "harbor keys")
+        );
+        // An answer to another query is not shown.
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "atlas");
+        assert!(!screen(&ui).contains("said in conversations"));
     }
 
     #[test]

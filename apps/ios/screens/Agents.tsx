@@ -3,6 +3,7 @@ import { FlatList, SectionList, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import SegmentedControl from '@react-native-segmented-control/segmented-control';
+import { saidRows, type SaidRow } from '../conversationSearch';
 import { AGENT_LEGEND, agentGlyph, agentRows, agentSections, agentTreeLines, filterAgentRows, harnessColor, UNMANAGED_GROUP, type AgentRowView, type TreeLine } from '../agentsView';
 import { Banners, Empty, StatusLine, useDebugScroll, useListsOnFocus, useRefresh } from '../chrome';
 import { ContextMenu, type MenuAction } from '../menu';
@@ -40,6 +41,18 @@ export function AgentsScreen() {
       },
     });
   }, [navigation]);
+  // Typed text also searches what was said in conversations, as stui's Ctrl+K does.
+  const [said, setSaid] = useState<{ query: string; rows: SaidRow[]; note: string } | null>(null);
+  const query = filter.trim();
+  useEffect(() => {
+    if (query.length < 3) { setSaid(null); return; }
+    let live = true;
+    const timer = setTimeout(() => void actions.searchConversations(query).then(found => {
+      if (!live) return;
+      setSaid(typeof found === 'string' ? { query, rows: [], note: `search failed: ${found}` } : { query, ...saidRows(found, data.agents) });
+    }), 250);
+    return () => { live = false; clearTimeout(timer); };
+  }, [query, status]); // eslint-disable-line react-hooks/exhaustive-deps
   const rows = useMemo(() => filterAgentRows(agentRows(data.agents, data.sessions, gatewayHost || '?'), filter), [data.agents, data.sessions, gatewayHost, filter]);
   const open = (row: AgentRowView) => navigation.navigate('Conversation', { target: row.target, ...(row.unmanaged ? { sessionId: row.id } : {}), title: row.name });
   const menu = (row: AgentRowView): MenuAction[] => {
@@ -59,6 +72,20 @@ export function AgentsScreen() {
     </View>
   </View>;
   const footer = <View style={{ paddingBottom: 24 }}>
+    {said && said.query === query && (said.rows.length || said.note) ? <View>
+      <SectionHeader title="said in conversations" count={said.rows.length} color={theme.overlay1} />
+      {said.note ? <Note tone="warning">{said.note}</Note> : null}
+      {said.rows.map(hit => <ListRow
+        key={hit.key}
+        glyph="›"
+        glyphColor={theme.overlay1}
+        title={hit.excerpt}
+        right={<T dim>{hit.when}</T>}
+        second={hit.name}
+        onPress={() => navigation.navigate('Conversation', { target: hit.agentId, title: hit.name, find: said.query })}
+        accessibilityLabel={`${hit.name} said ${hit.excerpt}`}
+      />)}
+    </View> : null}
     {truncated.agents ? <Note tone="warning">More agents exist beyond these 200.</Note> : null}
     <Legend entries={legend} />
     <View style={{ paddingHorizontal: 12 }}><Button label="past sessions" onPress={() => navigation.navigate('History')} /></View>
