@@ -455,6 +455,18 @@ The graph is replayed from nothing only in these cases:
 A rebuilt part costs what its own history costs, while a replay holds the store's only writer for
 as long as the whole graph takes.
 
+Routine work actions, including `work.extended`, project incrementally. An extension preserves
+the attempt's execution budget and lease on its own node and its peers; an out-of-order extension
+can rebuild its run tree. The extension regression checks newer local state, full-replay parity
+and restart without requiring a full-store replay for the work action.
+
+The extension correction uses checkpoint rules v6 and a new shared projection compatibility
+identity. Mixed builds continue authority sync and defer incompatible graph comparisons. On
+upgrade, `work_extended_projection_rules=1` records a successful canonical rebuild of just the
+roots with retained extension claims; unresolved roots leave the migration pending. Existing v5
+certificates and tombstones remain historical authority, and their certified manifests can still
+be adopted. All checkpoint participants must use v6 before the next cut verifies.
+
 Incremental catch-up projection commits at most 128 newly admitted claims per transaction and
 returns the writer between chunks, so queued messages and lease renewals can run. Each commit
 records the frontier actually projected. Admissions and catch-up deferrals advance a generation;
