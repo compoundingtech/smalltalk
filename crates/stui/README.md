@@ -52,5 +52,5 @@ normal exit, SIGTERM, a long-running PTY hangup, and a debug panic. For a packag
 binary, pass its path followed by `--no-panic`; the release build has no debug panic hook. The two
 QA scripts need a live daemon and the `pty` executable: one opens an agent from `Ctrl+K`, scrolls
 it and drags to copy; the other attaches the agent's terminal and leaves it by `Ctrl+\` and by a
-click on its header. Use a person of their own (such as `person/qa-NAME`) so they mark nothing
+click on its header. Use a person of their own (such as `person/<qa-name>`) so they mark nothing
 read for anyone.
