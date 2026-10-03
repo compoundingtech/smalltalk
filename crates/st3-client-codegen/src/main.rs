@@ -6,6 +6,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod rich;
+
 const RUST_MODELS_TEMPLATE: &str = include_str!("../templates/generated.rs.in");
 const RUST_CLIENT_TEMPLATE: &str = include_str!("../templates/lib.rs.in");
 const SWIFT_MODELS_TEMPLATE: &str = include_str!("../templates/Models.swift.in");
@@ -55,6 +57,7 @@ fn main() -> Result<()> {
         &swift_operation_methods(reads, actions)?,
     )?;
     let typescript_models = typescript_models(&schema, &operations, &digest)?;
+    let typescript_schema = rich::models(&schema, &digest)?;
     let typescript_client = render_marker(
         TYPESCRIPT_CLIENT_TEMPLATE,
         "    // @st3-codegen:typescript-operation-methods",
@@ -101,6 +104,11 @@ fn main() -> Result<()> {
     output(
         &root.join("clients/typescript/st3-client/Models.generated.ts"),
         &typescript_models,
+        check,
+    )?;
+    output(
+        &root.join("clients/typescript/st3-client/Schema.generated.ts"),
+        &typescript_schema,
         check,
     )?;
     output(
@@ -1145,6 +1153,7 @@ mod tests {
             include_bytes!("../../../docs/st3/client-v0/schemas/operations.json"),
         ]);
         let ts_models = typescript_models(&schema, &operations, &digest)?;
+        let ts_schema = rich::models(&schema, &digest)?;
         let ts_client = render_marker(
             TYPESCRIPT_CLIENT_TEMPLATE,
             "    // @st3-codegen:typescript-operation-methods",
@@ -1188,6 +1197,15 @@ mod tests {
                 "Client.generated.ts",
                 ts_client.as_str(),
                 ts_client.replacen("async eventsList(", "async removedEventsList(", 1),
+            ),
+            (
+                "Schema.generated.ts",
+                ts_schema.as_str(),
+                ts_schema.replacen(
+                    "export const Resource =",
+                    "export const RemovedResource =",
+                    1,
+                ),
             ),
         ];
         for (name, expected, drifted) in cases {
