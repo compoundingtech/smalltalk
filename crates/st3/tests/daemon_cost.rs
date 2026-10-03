@@ -471,6 +471,7 @@ const PROBES: &[Probe] = &[
         "GET /v1/client/missions/{*id}",
         "/v1/client/missions/{mission}",
     ),
+    get("GET /v1/client/resources", "/v1/client/resources"),
     get("GET /v1/client/runtimes", "/v1/client/runtimes"),
     get(
         "GET /v1/client/runtimes/{*id}",
