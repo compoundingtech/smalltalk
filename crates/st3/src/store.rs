@@ -5235,6 +5235,10 @@ impl Store {
     /// cannot be built does not hide the others.
     /// Live work that `seat` holds or is assigned in a run outside the root of `owner_run`.
     pub fn seat_work_in_other_runs(&self, seat: &str, owner_run: &str) -> Result<Vec<String>> {
+        // Any step or run can come to hold or release this seat's work.
+        smallclaims::touched::note_read(|| format!("actor:{seat}"));
+        smallclaims::touched::note_read(|| "kind:step-run.state".to_owned());
+        smallclaims::touched::note_read(|| "kind:mission-run.state".to_owned());
         let owner = owner_run.strip_prefix("mission-run/").unwrap_or(owner_run);
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -10425,6 +10429,11 @@ impl Store {
                 Some(cursor) => after = Some(cursor),
                 None => {
                     sort_messages_canonically(&self.readers.get(), &mut all)?;
+                    // A message's lifecycle (staged, delivered, read, closed) is written on the
+                    // message, not the mailbox.
+                    for message in &all {
+                        smallclaims::touched::note_read(|| message.subject.clone());
+                    }
                     return Ok(all);
                 }
             }
@@ -11542,6 +11551,7 @@ impl Store {
     /// `selected_actual_source_at`'s preference for a runtime observation over later
     /// non-runtime claims, without reducing the subject's entire history.
     pub fn selected_actual_origin(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         // Walk the accepted-time index newest first: sorting every runtime observation of the
         // subject cost each settled stop, checked on every pass, a tenth of a millisecond.

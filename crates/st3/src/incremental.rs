@@ -1,14 +1,13 @@
 //! Which items a reconcile pass must evaluate.
 //!
-//! Each item (a mission run, later members and intake declarations) remembers what its last
-//! evaluation read, and when its result could next change with time alone. A pass reads what
-//! changed since the last one, turns each change into the keys a read would have noted, and marks
-//! the items that read any of them. An item needs evaluating when it is new, marked, or due. See
-//! `doc/fleet/smalltalk/idle-cpu-incremental-design`.
-//!
-//! For now every item is still evaluated on every pass, and an evaluation that wrote although its
-//! item did not need evaluating is counted as a correction: a write an incremental pass would
-//! have missed.
+//! Each item (a mission run, a stop, later live members and intake declarations) remembers what
+//! its last evaluation read, and when its result could next change with time alone. A pass reads
+//! what changed since the last one (claims, local observations, the PTY snapshot, watched files,
+//! exec runners), turns each change into the keys a read would have noted, and marks the items that
+//! read any of them. An item needs evaluating when it is new, marked, or due; the others are
+//! skipped. Every [`FULL_PASS_INTERVAL_MS`] a section evaluates every item anyway, and an
+//! evaluation that writes although its item was not marked is counted as a correction: a write
+//! the skipping passes missed. See `doc/fleet/smalltalk/idle-cpu-incremental-design`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -33,8 +32,12 @@ struct State {
     readers: HashMap<String, BTreeSet<String>>,
     /// The last status seen for each exec runtime an item waits on (`exec:` keys).
     execs: HashMap<String, Option<String>>,
-    /// When the last full pass ran.
-    last_full: Option<u128>,
+    /// When each section's last full pass ran.
+    last_full: HashMap<&'static str, u128>,
+    /// The last PTY snapshot, by runtime: `None` before the first, or while it was unavailable.
+    ptys: Option<HashMap<String, String>>,
+    /// The last value seen for each key observed by value, such as `live-workspaces`.
+    values: HashMap<String, String>,
 }
 
 /// How often a pass evaluates every item even when nothing marked them, counting what it corrects.
@@ -112,28 +115,82 @@ impl Incremental {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let readers = state.readers.get(key).cloned().unwrap_or_default();
-        for item in readers {
-            if let Some(item) = state.items.get_mut(&item) {
-                item.dirty = true;
-            }
-        }
+        Self::mark_locked(&mut state, key);
     }
 
-    /// Whether this pass must evaluate every item: the first since a start, or the first after
-    /// [`FULL_PASS_INTERVAL_MS`]. Records it as the last full pass.
-    pub fn take_full_pass(&self, now: u128) -> bool {
+    /// Whether this pass must evaluate every item of `section`: the first since a start, or the
+    /// first after [`FULL_PASS_INTERVAL_MS`]. Records it as the section's last full pass.
+    pub fn take_full_pass(&self, section: &'static str, now: u128) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let due = state
             .last_full
-            .is_none_or(|last| now.saturating_sub(last) >= FULL_PASS_INTERVAL_MS);
+            .get(section)
+            .is_none_or(|last| now.saturating_sub(*last) >= FULL_PASS_INTERVAL_MS);
         if due {
-            state.last_full = Some(now);
+            state.last_full.insert(section, now);
         }
         due
+    }
+
+    /// Compare this pass's PTY snapshot (each runtime's state, as text) with the last one, and mark
+    /// the items that read a runtime whose state changed (`pty:{runtime}`). When the snapshot comes
+    /// back after it was unavailable, every item that read any runtime is marked.
+    pub fn observe_ptys(&self, snapshot: Option<HashMap<String, String>>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(snapshot) = snapshot else {
+            state.ptys = None;
+            return;
+        };
+        let changed = match &state.ptys {
+            Some(previous) => previous
+                .iter()
+                .filter(|(id, value)| snapshot.get(*id) != Some(value))
+                .map(|(id, _)| format!("pty:{id}"))
+                .chain(
+                    snapshot
+                        .keys()
+                        .filter(|id| !previous.contains_key(*id))
+                        .map(|id| format!("pty:{id}")),
+                )
+                .collect::<Vec<_>>(),
+            None => state
+                .readers
+                .keys()
+                .filter(|key| key.starts_with("pty:"))
+                .cloned()
+                .collect(),
+        };
+        state.ptys = Some(snapshot);
+        for key in changed {
+            Self::mark_locked(&mut state, &key);
+        }
+    }
+
+    /// Mark the items that read `key` when `value` differs from the value last observed for it.
+    pub fn observe_value(&self, key: &str, value: String) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.values.get(key) != Some(&value) {
+            state.values.insert(key.to_owned(), value);
+            Self::mark_locked(&mut state, key);
+        }
+    }
+
+    fn mark_locked(state: &mut State, key: &str) {
+        let State { items, readers, .. } = state;
+        for item in readers.get(key).into_iter().flatten() {
+            if let Some(item) = items.get_mut(item) {
+                item.dirty = true;
+            }
+        }
     }
 
     /// What `item`'s last evaluation read.

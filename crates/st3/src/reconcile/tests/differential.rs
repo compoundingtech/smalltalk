@@ -13,6 +13,14 @@ use crate::model::MissionRunRequest;
 
 const START: u128 = 1_900_000_000_000;
 
+const SEAT: &str = r#"version 2
+agent "worker" { workspace "/tmp"; command "true" }
+"#;
+
+const STOP_SEAT: &str = r#"version 2
+stop "agent/node.worker"
+"#;
+
 const SOURCE: &str = r#"version 2
 agent "worker" { workspace "/tmp"; command "true" }
 mission "diff/flow" state="ready" timeout="2h" {
@@ -43,6 +51,11 @@ mission "diff/flow" state="ready" timeout="2h" {
     assigned-to "agent/worker"
     depends-on { step "prepare" completed }
   }
+  step "team" {
+    agentless
+    depends-on { step "review" completed }
+    agent "helper" { workspace "/tmp"; command "true"; restart "never" }
+  }
 }
 "#;
 
@@ -68,6 +81,10 @@ struct Side {
     reconciler: Reconciler<FakeRuntime>,
     /// How many of the runtime's starts already have a terminal.
     started: std::cell::Cell<usize>,
+    /// How many of the runtime's stops and kills already ended their terminals.
+    ended: std::cell::Cell<(usize, usize)>,
+    /// Whether terminals ignore a stop and wait for the kill.
+    hang: std::cell::Cell<bool>,
 }
 
 impl Side {
@@ -83,6 +100,8 @@ impl Side {
             runtime,
             reconciler,
             started: std::cell::Cell::new(0),
+            ended: std::cell::Cell::new((0, 0)),
+            hang: std::cell::Cell::new(false),
         }
     }
 
@@ -121,6 +140,21 @@ impl Side {
             });
         }
         self.started.set(started.len());
+        // A stop ends its terminal unless terminals hang; a kill always does.
+        let stops = self.runtime.stops.lock().unwrap().clone();
+        let kills = self.runtime.kills.lock().unwrap().clone();
+        let (stopped, killed) = self.ended.get();
+        let mut ended = kills[killed..].to_vec();
+        if !self.hang.get() {
+            ended.extend_from_slice(&stops[stopped..]);
+        }
+        for pty in ptys.iter_mut() {
+            if ended.contains(&pty.runtime_id) && pty.status == "running" {
+                pty.status = "exited".into();
+                pty.exit_code = Some(0);
+            }
+        }
+        self.ended.set((stops.len(), kills.len()));
     }
 
     /// Every started member's terminal runs again.
@@ -179,7 +213,7 @@ impl Side {
         let id = regex_lite_hex();
         let mut claims = self
             .store
-            .changes_since(0, i64::MAX)
+            .changes_since(0, 0)
             .unwrap()
             .changes
             .into_iter()
@@ -385,7 +419,7 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
         for side in [&full, &incremental] {
             side.store.set_write_clock_at(now).unwrap();
         }
-        let event = draw.below(16);
+        let event = draw.below(20);
         let label = match event {
             0 | 1 => {
                 for side in [&full, &incremental] {
@@ -427,8 +461,8 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
                     30_000,
                     5 * 60_000,
                     11 * 60_000,
+                    20 * 60_000,
                     3_600_000,
-                    3 * 3_600_000,
                 ][draw.below(6) as usize];
                 now += jump;
                 smallclaims::store::set_thread_clock(Some(now));
@@ -442,7 +476,7 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
                 incremental.restart(true);
                 "restart".to_owned()
             }
-            8..=10 => {
+            8..=10 | 18 | 19 => {
                 let action = ["claim", "renew", "progress", "complete", "fail", "release"]
                     [draw.below(6) as usize];
                 for side in [&full, &incremental] {
@@ -468,6 +502,24 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
                         "terminals vanish"
                     }
                 };
+                label.to_owned()
+            }
+            14 => {
+                let hang = draw.below(2) == 0;
+                for side in [&full, &incremental] {
+                    side.hang.set(hang);
+                }
+                format!("terminals hang on stop: {hang}")
+            }
+            15 => {
+                let (source, label) = if draw.below(4) == 0 {
+                    (STOP_SEAT, "stop the seat")
+                } else {
+                    (SEAT, "declare the seat")
+                };
+                for side in [&full, &incremental] {
+                    apply_source(&side.store, source, &format!("{label}:{now}"));
+                }
                 label.to_owned()
             }
             12 | 13 => {
@@ -527,7 +579,7 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
     smallclaims::store::set_thread_clock(None);
     let mut reached = full
         .store
-        .changes_since(0, i64::MAX)
+        .changes_since(0, 0)
         .unwrap()
         .changes
         .into_iter()
@@ -547,10 +599,10 @@ fn incremental_passes_write_what_full_passes_write() {
     let seeds = std::env::var("ST3_DIFFERENTIAL_SEEDS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(12);
+        .unwrap_or(8);
     let mut reached = BTreeSet::new();
     for seed in 1..=seeds {
-        reached.extend(run_sequence(seed, 60));
+        reached.extend(run_sequence(seed, 80));
     }
     // The sequences must keep reaching what they exist to compare.
     for expected in [
@@ -564,6 +616,9 @@ fn incremental_passes_write_what_full_passes_write() {
         "review failed",
         "wait failed",
         "work completed",
+        "runtime.action.requested",
+        "runtime.action.deadline-reached",
+        "runtime.action.succeeded",
         "run completed",
         "run failed",
     ] {
