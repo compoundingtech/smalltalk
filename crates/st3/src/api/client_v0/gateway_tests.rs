@@ -412,6 +412,102 @@ mod gateway_tests {
     }
 
     #[tokio::test]
+    async fn shared_projected_lease_streams_until_last_browser_viewer_closes() {
+        use pty_core::protocol::{MessageType, encode_data, encode_geometry, encode_packet};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let (session, attachment) = viewer_attachment(&state);
+        fs::create_dir_all(&state.pty_root).unwrap();
+        let listener = tokio::net::UnixListener::bind(
+            state.pty_root.join("terminal-runtime.sock"),
+        ).unwrap();
+        let (address, server) = serve(crate::api::fabric_router(state.clone())).await;
+        let protocols = format!(
+            "{TERMINAL_SUBPROTOCOL}, {TERMINAL_CAPABILITY_PROTOCOL_PREFIX}{}",
+            attachment["stream_capability"].as_str().unwrap(),
+        );
+        let path = "/v1/client/terminals/agent%2Fterminal-owner/stream?incarnation=terminal-runtime%3Ai1";
+        let mut first = connect(address, path, &protocols).await;
+        let mut second = connect(address, path, &protocols).await;
+        let (mut pty, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await.unwrap().unwrap();
+        let mut request = [0_u8; 6];
+        pty.read_exact(&mut request).await.unwrap();
+        pty.write_all(&encode_geometry(2, 20)).await.unwrap();
+        pty.write_all(&encode_packet(MessageType::Screen, b"before")).await.unwrap();
+        assert_eq!(next_json(&mut first).await["value"]["lines"][0]["text"], "before");
+        assert_eq!(next_json(&mut second).await["value"]["lines"][0]["text"], "before");
+
+        first.close(None).await.unwrap();
+        let key = (
+            Arc::as_ptr(&state.store) as usize,
+            terminal_attachment_subject(attachment["attachment_id"].as_str().unwrap()).unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while TERMINAL_GATEWAY_VIEWERS.lock().get(&key) != Some(&1) {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert_eq!(
+            terminal_attachment_response(&state, &session, attachment["attachment_id"].as_str().unwrap())
+                .unwrap()["state"],
+            "available",
+        );
+        pty.write_all(&encode_data(b" after")).await.unwrap();
+        assert_eq!(next_json(&mut second).await["value"]["lines"][0]["text"], "before after");
+        second.close(None).await.unwrap();
+        wait_detached(&state, &session, &attachment).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn replacing_terminal_subscription_keeps_its_projected_lease() {
+        use pty_core::protocol::{MessageType, encode_geometry, encode_packet};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let (session, attachment) = viewer_attachment(&state);
+        fs::create_dir_all(&state.pty_root).unwrap();
+        let listener = tokio::net::UnixListener::bind(
+            state.pty_root.join("terminal-runtime.sock"),
+        ).unwrap();
+        let (address, server) = serve(crate::api::fabric_router(state.clone())).await;
+        let mut socket = connect(address, "/v1/client/collections/stream", COLLECTION_SUBPROTOCOL).await;
+        let subscribe = json!({
+            "kind":"subscribe", "id":"viewer", "collection":"terminal",
+            "terminal":"terminal/agent/terminal-owner", "incarnation":"terminal-runtime:i1",
+            "capability":attachment["stream_capability"],
+        }).to_string();
+        socket.send(Message::Text(subscribe.clone().into())).await.unwrap();
+        let (mut pty, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await.unwrap().unwrap();
+        let mut request = [0_u8; 6];
+        pty.read_exact(&mut request).await.unwrap();
+        pty.write_all(&encode_geometry(2, 20)).await.unwrap();
+        pty.write_all(&encode_packet(MessageType::Screen, b"held")).await.unwrap();
+        assert_eq!(next_json(&mut socket).await["value"]["lines"][0]["text"], "held");
+        for _ in 0..10 {
+            socket.send(Message::Text(subscribe.clone().into())).await.unwrap();
+            let frame = next_json(&mut socket).await;
+            assert_eq!(frame["kind"], "screen", "{frame}");
+            assert_eq!(frame["value"]["lines"][0]["text"], "held");
+        }
+        assert_eq!(
+            terminal_attachment_response(&state, &session, attachment["attachment_id"].as_str().unwrap())
+                .unwrap()["state"],
+            "available",
+        );
+        socket.close(None).await.unwrap();
+        wait_detached(&state, &session, &attachment).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn collection_websocket_records_query_parent_and_subscription_override() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());

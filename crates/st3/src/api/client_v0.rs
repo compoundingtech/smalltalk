@@ -79,7 +79,7 @@ struct CollectionSubscribe {
     actor: Option<String>,
     status: Option<String>,
     /// A terminal subscription names the terminal, the incarnation `terminal.attach` fenced,
-    /// and the single-use stream capability that attach returned.
+    /// and the reusable stream lease that attach returned.
     terminal: Option<String>,
     incarnation: Option<String>,
     capability: Option<String>,
@@ -717,7 +717,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         }
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
-                        terminals.remove(&request.id);
+                        // Keep its viewer alive until the replacement has acquired the lease.
+                        let _replaced_terminal = terminals.remove(&request.id);
                         conversations.stop(&request.id);
                         traced.remove(&request.id);
                         if request.collection == "conversation" {
@@ -6136,7 +6137,7 @@ pub(super) async fn terminal_stream(
         }))
 }
 
-/// A terminal viewer, checked and holding its consumed attachment, ready to follow.
+/// A terminal viewer, checked and holding its attachment lease, ready to follow.
 enum TerminalFollow {
     Local {
         id: String,
@@ -6178,7 +6179,7 @@ impl TerminalFollow {
     }
 }
 
-/// Check a viewer's right to follow a terminal and consume its single-use attachment.
+/// Check a viewer's right to follow a terminal and register its gateway lease lifetime.
 fn prepare_terminal_follow(
     state: &AppState,
     session: &ClientSession,
