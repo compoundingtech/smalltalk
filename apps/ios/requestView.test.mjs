@@ -24,3 +24,18 @@ assert.equal(
   '**Recommend:** yes, in three parts.\n\n**Why:** the release run failed.\n\nMy proposal:\n1. Land #1049.\n2. Build on main.\n```\ncargo build\nnext\n```\nAnswer yes and I queue it.',
 );
 assert.equal(spaced('The release run on the Linux runner failed: mold is missing'), 'The release run on the Linux runner failed: mold is missing');
+
+// Words answer a structured request the way it takes them (Nathan, 2026-10-03: words on a custom
+// choice were sent as a bare summary, refused, and the item stayed on Home).
+{
+  const { personAnswer } = await import('./requestView.ts');
+  const options = [{ id: 'works' }, { id: 'broken' }];
+  assert.deepEqual(personAnswer({ type: 'choice', custom: true, answers: options }, undefined, ' it works '), { text: 'it works' });
+  assert.deepEqual(personAnswer({ type: 'choice', custom: true, answers: options }, 'works', 'Works'), { id: 'works' });
+  assert.deepEqual(personAnswer({ type: 'feedback' }, undefined, 'notes'), { text: 'notes' });
+  assert.equal(personAnswer(undefined, undefined, 'notes'), undefined);
+  const decision = { type: 'decision', answers: [{ id: 'land', outcome: 'accept' }, { id: 'hold', outcome: 'decline' }, { id: 'change', outcome: 'request_changes' }] };
+  assert.deepEqual(personAnswer(decision, 'change', 'rename it'), { id: 'change', text: 'rename it' });
+  assert.deepEqual(personAnswer(decision, undefined, 'rename it'), { id: 'change', text: 'rename it' });
+  assert.equal(typeof personAnswer({ type: 'choice', answers: options }, undefined, 'words'), 'string');
+}

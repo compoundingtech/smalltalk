@@ -273,6 +273,8 @@ pub struct Ui {
     pub(crate) said: Option<(String, Result<st3_client::ConversationSearch, String>)>,
     /// The named answer chosen on the focused structured request, before Enter sends it.
     answering: Option<usize>,
+    /// A decision's "request changes" answer, chosen: its id goes with the words typed next.
+    changes_answer: Option<String>,
     /// Voice mode: the speech helper listening for one input.
     pub(crate) voice: Option<voice::VoiceState>,
     /// Inputs whose text came from voice; their next message is tagged `dictated`.
@@ -376,6 +378,7 @@ impl Ui {
             said: None,
             voice: None,
             answering: None,
+            changes_answer: None,
             dictated: HashSet::new(),
             details: true,
             kdl: false,
@@ -757,6 +760,21 @@ impl Ui {
     }
 
     /// The selected agent's newest message that failed or went unconfirmed, by entry id.
+    /// The managed agent whose conversation has the focus in a glass, when its message box is
+    /// what typing reaches: not a terminal, a list, a card or an undeclared session.
+    pub(crate) fn composing_agent(&self) -> Option<String> {
+        self.glasses.as_ref()?;
+        let Some(Pane::Agent(Some(id))) = self.focused_pane() else {
+            return None;
+        };
+        self.world
+            .agents
+            .items()
+            .iter()
+            .any(|agent| agent.id == id && !agent.unmanaged)
+            .then_some(id)
+    }
+
     fn undelivered(&self) -> Option<String> {
         let agent = self.selected_id()?;
         let Some(Load::Ready(entries)) = self.world.conversations.get(&agent) else {
@@ -1112,8 +1130,24 @@ impl Ui {
                 Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
                 None => vec![("1-5", "tabs"), ("↑↓", "select")],
             };
+            // A glass conversation types: its commands are chords.
+            let typing = self.composing_agent().is_some();
+            if typing {
+                for hint in &mut hints {
+                    if hint.0 == "[ ]" {
+                        *hint = ("tab", "tabs");
+                    }
+                }
+            }
             match self.tab {
                 0 => hints.extend([("keys", "on the card"), ("c", "write")]),
+                1 if typing => hints.extend([
+                    ("type", "message"),
+                    ("alt+i", "details"),
+                    ("alt+o", "tools"),
+                    ("end", "latest"),
+                    ("drag", "select + copy"),
+                ]),
                 1 => hints.extend([
                     ("c", "message"),
                     ("i", "details"),
@@ -1124,7 +1158,11 @@ impl Ui {
                 2 => hints.extend([("n", "new mission"), ("t", "tree"), ("x", "system")]),
                 _ => {}
             }
-            hints.extend([("?", "help"), ("q", "quit")]);
+            if typing {
+                hints.extend([("?", "help"), ("ctrl+q", "quit")]);
+            } else {
+                hints.extend([("?", "help"), ("q", "quit")]);
+            }
             hints
         };
         // The build, always at the right edge; the hints give way to it.
@@ -1703,13 +1741,16 @@ impl Ui {
             theme::fg(theme::SURFACE0),
         );
         if !agent.unmanaged && (!narrow || self.composing(&agent.id)) {
+            // In a space, letters type: details is a chord.
+            let key = if self.glasses.is_some() { "alt+i" } else { "i" };
             let label = if narrow {
-                " i details "
+                format!(" {key} details ")
             } else if self.details {
-                " i hide details ▸ "
+                format!(" {key} hide details ▸ ")
             } else {
-                " ◂ i details "
+                format!(" ◂ {key} details ")
             };
+            let label = label.as_str();
             let width = text::width(label) as u16;
             let x = area.x + area.width.saturating_sub(width + 1);
             buf.set_stringn(x, rule_y, label, width as usize, theme::fg(theme::OVERLAY1));
@@ -2363,7 +2404,15 @@ impl Ui {
         }
         if draft.is_empty() && !editing {
             let hint = if self.composing(&agent.id) {
-                format!("Message {} · c or click", agent.name)
+                format!(
+                    "Message {} · {}",
+                    agent.name,
+                    if self.glasses.is_some() {
+                        "type or click"
+                    } else {
+                        "c or click"
+                    }
+                )
             } else {
                 format!("Message {} · click", agent.name)
             };
@@ -2526,21 +2575,27 @@ impl Ui {
         );
         keys(
             &mut right,
-            "a conversation",
+            "a conversation (in a space, letters type; commands are chords)",
             &[
-                ("c or click", "write: a message, feedback, a reply"),
-                ("wheel pgup pgdn", "scroll the pane under the pointer"),
+                ("type", "any letter starts a message to the agent"),
+                ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
                 ("end", "jump to the newest message and follow it"),
-                ("/", "find in this conversation"),
-                ("o", "expand or collapse tool output"),
+                ("ctrl+f", "find in this conversation"),
+                ("alt+o", "expand or collapse tool output"),
                 (
-                    "shift+o",
+                    "alt+shift+o",
                     "simplified view: tool calls fold to a line (this device)",
                 ),
-                ("i", "the agent's details beside it"),
+                ("alt+i", "the agent's details beside it"),
                 ("drag", "select text in one pane; release copies it"),
                 ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
-                ("r  x", "resend or clear a message that was not sent"),
+                (
+                    "alt+r  alt+x",
+                    "resend or clear a message that was not sent",
+                ),
+                ("ctrl+c", "stop the agent (asks first)"),
+                ("tab  shift+tab", "the next or previous tab"),
+                ("ctrl+q", "quit"),
             ],
         );
         keys(
@@ -2640,6 +2695,13 @@ impl Ui {
                 let Some(answer) = request.answers.get(index) else {
                     return true;
                 };
+                // Requesting changes needs the changes in words: write them, then Enter sends both.
+                if answer.outcome.as_deref() == Some("request_changes") {
+                    self.changes_answer = Some(answer.id.clone());
+                    self.editing = true;
+                    self.flash(format!("“{}”: write the changes, then Enter", answer.label));
+                    return true;
+                }
                 if self.live {
                     self.effects.push(Effect::Attention {
                         id,
@@ -2963,7 +3025,10 @@ impl Ui {
                 .get(&key_id)
                 .is_none_or(String::is_empty);
             match key.code {
-                KeyCode::Esc => self.editing = false,
+                KeyCode::Esc => {
+                    self.editing = false;
+                    self.changes_answer = None;
+                }
                 KeyCode::Enter => self.submit(),
                 // Ctrl+R speaks into the input instead of typing.
                 KeyCode::Char('r') if control => self.start_voice(),
@@ -3762,7 +3827,7 @@ impl Ui {
                         id: id.clone(),
                         action: "work.done".into(),
                         reason: Some(draft),
-                        answer: None,
+                        answer: self.changes_answer.take(),
                     }),
                     Some(AttentionKind::Message { from, .. }) => Some(Effect::Reply {
                         id: id.clone(),

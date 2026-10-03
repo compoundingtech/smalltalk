@@ -47,8 +47,8 @@ const GATE_POLL_PASS_INTERVAL: Duration = Duration::from_secs(60);
 const GATE_RECHECK_BASE_MS: u128 = 60_000;
 const GATE_RECHECK_MAX_MS: u128 = 15 * 60_000;
 /// How much of a gate check's output its result and attention item keep, from the end.
-const GATE_OUTPUT_LINES: usize = 40;
-const GATE_OUTPUT_BYTES: usize = 4_000;
+pub(crate) const GATE_OUTPUT_LINES: usize = 40;
+pub(crate) const GATE_OUTPUT_BYTES: usize = 4_000;
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
 // A new harness can spend longer than the retry sequence reading its boot
 // contract before it claims work. Keep the quick delivery retries, but do not
@@ -280,6 +280,20 @@ impl NativeRuntime {
     }
 }
 
+/// The environment a started process gets: `declared` over the account's captured login-shell
+/// environment, with the st3 executable's directory and then the command recorder first on PATH.
+/// Members and `st missions check` both launch with it.
+pub(crate) fn member_environment(
+    declared: &BTreeMap<String, String>,
+    executable: &Path,
+    recorder: Option<&Path>,
+) -> Result<BTreeMap<String, String>> {
+    let mut environment =
+        st_runtime::overlay_environment(crate::environment::snapshot()?, declared, executable)?;
+    record_member_commands(&mut environment, recorder)?;
+    Ok(environment)
+}
+
 /// Puts the recorder directory first on a member's PATH, after the declaration and the st3
 /// executable directory are applied, so no authored PATH can place a program before it.
 fn record_member_commands(
@@ -375,12 +389,8 @@ impl RuntimeControl for NativeRuntime {
 
     fn start(&self, member: &MemberSpec) -> Result<()> {
         let executable = launch_executable()?;
-        let mut environment = st_runtime::overlay_environment(
-            crate::environment::snapshot()?,
-            &member.environment,
-            &executable,
-        )?;
-        record_member_commands(&mut environment, self.recorder.as_deref())?;
+        let environment =
+            member_environment(&member.environment, &executable, self.recorder.as_deref())?;
         let mut launch = st_runtime::Launch::from(&member.launch);
         match &mut launch {
             st_runtime::Launch::Shell(source) => {
@@ -1883,7 +1893,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         if let Some(intake) = intake {
             self.isolate("stage/observers", &daemon, || {
-                self.reconcile_resource_observers(&intake)
+                self.reconcile_resource_observers(&intake, &desired)
             });
             self.isolate("stage/schedules", &daemon, || {
                 self.reconcile_schedules(&intake)
@@ -10335,7 +10345,14 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn reconcile_resource_observers(&self, desired: &[DesiredSubject]) -> Result<()> {
+    /// `agents` is every declaration, so a repository listing can name the agent whose workspace
+    /// has a new pull request's branch checked out; the intake list holds only observers,
+    /// subscriptions, and schedules.
+    fn reconcile_resource_observers(
+        &self,
+        desired: &[DesiredSubject],
+        agents: &[DesiredSubject],
+    ) -> Result<()> {
         let observer_resources = desired
             .iter()
             .filter(|item| item.kind == "observer")
@@ -10365,7 +10382,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         // A repository listing names the agent on this host that opened each new pull request.
         let agent_workspaces = Arc::new(
-            desired
+            agents
                 .iter()
                 .filter(|item| item.kind == "agent")
                 .filter_map(|item| {
@@ -10713,6 +10730,18 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn evaluate_gate(&self, stage: &GateContext, gate: &GateSpec) -> Result<GateOutcome> {
         let outcome = match gate {
+            // A document exists once any version of its name is stored, or its exact version.
+            GateSpec::Exists { subject, .. } if subject.starts_with("doc/") => {
+                let exists = match subject.rsplit_once('@') {
+                    Some((name, hash)) => self.store.get_document(name, hash)?.is_some(),
+                    None => self.store.latest_document_hash(subject)?.is_some(),
+                };
+                if exists {
+                    GateOutcome::Pass
+                } else {
+                    GateOutcome::Pending
+                }
+            }
             GateSpec::Exists { subject, .. } => {
                 self.ensure_file_observation(subject)?;
                 if self.subject_value(subject)?.is_some_and(|actual| {
@@ -11133,30 +11162,11 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Record one finished exec gate check on the gate's result subject and answer for it.
     fn record_gate_check(&self, stage: &GateContext, check: GateCheck<'_>) -> Result<GateOutcome> {
-        let broken = if let Some(reason) = check.start_failure.clone() {
-            Some(reason)
-        } else if !check.calls.is_empty() {
-            Some(format!(
-                "an st call in its check was refused or read part of a listing: {}",
-                check.calls.join("; ")
-            ))
-        } else {
-            match check.exit_code {
-                Some(0 | 1) => None,
-                Some(127) => Some(
-                    "its check exited 127, the shell's status for a command it did not find; an exec gate exits 0 to pass and 1 for not yet"
-                        .into(),
-                ),
-                Some(code) if code > 128 => Some(format!(
-                    "its check exited {code}, as a process killed by signal {} does; an exec gate exits 0 to pass and 1 for not yet",
-                    code - 128
-                )),
-                Some(code) => Some(format!(
-                    "its check exited {code}; an exec gate exits 0 to pass and 1 for not yet"
-                )),
-                None => Some("its check ended without an exit status: something killed it".into()),
-            }
-        };
+        let broken = exec_check_broken(
+            check.exit_code,
+            &check.calls,
+            check.start_failure.as_deref(),
+        );
         let (answer, reason) = match (&broken, check.exit_code) {
             (Some(reason), _) => (
                 "broken",
@@ -12234,7 +12244,7 @@ fn run_variables(
     variables
 }
 
-fn expand_gate(
+pub(crate) fn expand_gate(
     gate: &mut GateSpec,
     variables: &BTreeMap<String, String>,
     run_workspace: &str,
@@ -13170,7 +13180,7 @@ fn gate_result_reason(result: &crate::model::ClaimRecord, default: &str) -> Stri
 }
 
 /// The last `lines` lines of `output`, at most `bytes` long, cut at a character boundary.
-fn output_tail(output: &str, lines: usize, bytes: usize) -> String {
+pub(crate) fn output_tail(output: &str, lines: usize, bytes: usize) -> String {
     let trimmed = output.trim_end();
     let start = trimmed
         .char_indices()
@@ -13190,12 +13200,45 @@ fn output_tail(output: &str, lines: usize, bytes: usize) -> String {
 }
 
 /// `ms` in the largest whole unit a person reads at a glance: `90s`, `10m`, `2h`.
-fn render_duration_ms(ms: u64) -> String {
+pub(crate) fn render_duration_ms(ms: u64) -> String {
     match ms {
         ms if ms >= 3_600_000 && ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
         ms if ms >= 60_000 && ms % 60_000 == 0 => format!("{}m", ms / 60_000),
         ms if ms % 1_000 == 0 => format!("{}s", ms / 1_000),
         ms => format!("{ms}ms"),
+    }
+}
+
+/// Why an exec gate check that ended this way cannot answer, or `None` when its exit status is an
+/// answer: 0 passes and 1 is not yet. `start_failure` says why it never ran to an exit.
+pub(crate) fn exec_check_broken(
+    exit_code: Option<i64>,
+    calls: &[String],
+    start_failure: Option<&str>,
+) -> Option<String> {
+    if let Some(reason) = start_failure {
+        return Some(reason.to_owned());
+    }
+    if !calls.is_empty() {
+        return Some(format!(
+            "an st call in its check was refused or read part of a listing: {}",
+            calls.join("; ")
+        ));
+    }
+    match exit_code {
+        Some(0 | 1) => None,
+        Some(127) => Some(
+            "its check exited 127, the shell's status for a command it did not find; an exec gate exits 0 to pass and 1 for not yet"
+                .into(),
+        ),
+        Some(code) if code > 128 => Some(format!(
+            "its check exited {code}, as a process killed by signal {} does; an exec gate exits 0 to pass and 1 for not yet",
+            code - 128
+        )),
+        Some(code) => Some(format!(
+            "its check exited {code}; an exec gate exits 0 to pass and 1 for not yet"
+        )),
+        None => Some("its check ended without an exit status: something killed it".into()),
     }
 }
 
@@ -20277,6 +20320,66 @@ schedule "unready" {{
     }
 
     #[test]
+    fn a_document_gate_passes_once_its_document_is_stored() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+
+mission "handoff" state="ready" {
+  goal "Publish the handoff."
+  completion { when "all-steps-exhausted" }
+  step "publish" {
+    agentless
+    gate "the handoff is published" { document "doc/example/${ST_MISSION_RUN}/handoff" }
+  }
+}
+"#,
+            "document-gate-source",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "handoff".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "document-gate-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "running"
+        );
+        store
+            .put_document(
+                &format!("doc/example/{}/handoff", run.id),
+                b"The handoff.",
+                &None,
+                "document-gate-put",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
+    }
+
+    #[test]
     fn a_retried_attempt_gets_its_own_gate_result() {
         let stage = |attempt| GateContext {
             subject: "step-run/generation/window".into(),
@@ -24254,6 +24357,83 @@ observer "repo" {
         );
     }
 
+    /// Answers every observation with one open pull request on `branch`.
+    struct OnePullRequestProvider {
+        branch: String,
+    }
+
+    impl ResourceProvider for OnePullRequestProvider {
+        fn observe(
+            &self,
+            _request: ObservationRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::resource::ProviderObservation {
+                    facts: serde_json::json!({"repository_id": 7, "pull_requests": [{
+                        "number": 7, "head": "a".repeat(40), "branch": self.branch,
+                        "state": "open", "draft": false, "title": "Feature",
+                    }]}),
+                    cursor: Some("one".into()),
+                    next_check_unix_ms: now_ms().saturating_add(60_000),
+                })
+            })
+        }
+    }
+
+    /// A reconcile pass hands the repository observer every agent declaration, so the agent
+    /// whose workspace has a new pull request's branch checked out is named its opener. The
+    /// intake stage once passed only observers, subscriptions, and schedules, and no pull request
+    /// was ever named.
+    #[tokio::test]
+    async fn a_reconcile_pass_names_the_agent_with_a_new_pull_requests_branch() {
+        use crate::checkout::test_support::{git, repository};
+        let root = tempfile::tempdir().unwrap();
+        let clone = repository(root.path());
+        git(&clone, &["checkout", "--quiet", "-b", "agent/feature"]);
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+agent "builder" {{ workspace {:?}; command "true" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "acme/garden"; field "pull_requests" }}"#,
+                clone.display().to_string()
+            ),
+            "watch",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(OnePullRequestProvider {
+            branch: "agent/feature".into(),
+        }));
+        reconciler.reconcile_once().unwrap();
+        let facts = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(actual) = store
+                    .latest_actual_value("resource/repo/pull-request/7")
+                    .unwrap()
+                {
+                    break actual["facts"].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the observation recorded the pull request");
+        assert_eq!(facts["opened_by"], "agent/node.builder");
+    }
+
     /// What a scripted observation answers.
     enum ScriptedObservation {
         Observe,
@@ -24768,7 +24948,10 @@ subscription "b" {{
             calls: calls.clone(),
         }));
         reconciler
-            .reconcile_resource_observers(&store.desired_subjects().unwrap())
+            .reconcile_resource_observers(
+                &store.desired_subjects().unwrap(),
+                &store.desired_subjects().unwrap(),
+            )
             .unwrap();
         for _ in 0..100 {
             if calls.load(Ordering::SeqCst) == 2

@@ -1427,12 +1427,7 @@ fn mission_current_work<'a>(
         })
 }
 fn next_action_label(work: &st3_client::Work) -> &'static str {
-    if work
-        .extra
-        .get("agentless")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
+    if work.agentless {
         return "Stewardship active";
     }
     match work.state.as_str() {
@@ -1445,12 +1440,7 @@ fn next_action_label(work: &st3_client::Work) -> &'static str {
     }
 }
 fn work_owner(model: &Model, work: &st3_client::Work) -> String {
-    if work
-        .extra
-        .get("agentless")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
+    if work.agentless {
         return "Agentless step".into();
     }
     let agent_id = work.claimant.as_deref().or_else(|| {
@@ -2103,6 +2093,48 @@ async fn no_longer_asked(client: &Client, source: &str) -> String {
     }
 }
 
+/// The typed answer for a person step: the named answer chosen, or the person's own words where
+/// the request takes them. Words alone on a structured request were refused (`answer-required`),
+/// so an answer typed into a custom choice left the item on Home (Nathan, 2026-10-03).
+fn person_answer(
+    request: Option<&st3_client::StructuredRequest>,
+    chosen: Option<String>,
+    words: &str,
+) -> Result<Option<st3_client::PersonAnswerInput>> {
+    if let Some(id) = chosen {
+        // Requesting changes carries the changes, in the person's words.
+        let changes = request.is_some_and(|request| {
+            request.answers.iter().any(|answer| {
+                answer.id == id && answer.outcome.as_deref() == Some("request_changes")
+            })
+        });
+        return Ok(Some(st3_client::PersonAnswerInput {
+            id: Some(id),
+            text: changes.then(|| words.trim().to_owned()),
+        }));
+    }
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let text = Some(words.trim().to_owned());
+    match request.entry_type.as_str() {
+        "feedback" => Ok(Some(st3_client::PersonAnswerInput { id: None, text })),
+        "choice" if request.custom => Ok(Some(st3_client::PersonAnswerInput { id: None, text })),
+        // A decision takes words as its request for changes, when it offers one.
+        _ => match request
+            .answers
+            .iter()
+            .find(|answer| answer.outcome.as_deref() == Some("request_changes"))
+        {
+            Some(changes) => Ok(Some(st3_client::PersonAnswerInput {
+                id: Some(changes.id.clone()),
+                text,
+            })),
+            None => anyhow::bail!("This asks you to pick one of its answers: a chooses one"),
+        },
+    }
+}
+
 /// Perform `action` on `current`, a card as st showed it, fenced on that card.
 async fn act_on_card(
     client: &Client,
@@ -2148,6 +2180,7 @@ async fn act_on_card(
             let summary = reason
                 .filter(|summary| !summary.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("a person step needs a response"))?;
+            let answer = person_answer(attention.request.as_ref(), answer, &summary)?;
             client
                 .work_done(
                     id,
@@ -2158,10 +2191,7 @@ async fn act_on_card(
                         episode: attention.episode.clone(),
                         summary,
                         evidence: vec![],
-                        answer: answer.map(|id| st3_client::PersonAnswerInput {
-                            id: Some(id),
-                            text: None,
-                        }),
+                        answer,
                     },
                 )
                 .await?
@@ -3355,6 +3385,43 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn words_answer_a_structured_request_the_way_it_takes_them() {
+        let request = |kind: &str, custom: bool, answers: serde_json::Value| -> st3_client::StructuredRequest {
+            serde_json::from_value(serde_json::json!({
+                "version": 1, "type": kind, "question": "Ship it?", "why_person": "You own it.",
+                "custom": custom, "answers": answers
+            }))
+            .unwrap()
+        };
+        let options = serde_json::json!([
+            {"id": "works", "label": "Works", "consequence": "Done."},
+            {"id": "broken", "label": "Broken", "consequence": "Fixed."}
+        ]);
+        // Nathan, 2026-10-03: words on a custom choice were sent as a bare summary and refused.
+        let custom = request("choice", true, options.clone());
+        let answer = person_answer(Some(&custom), None, " found it, works ").unwrap().unwrap();
+        assert_eq!((answer.id, answer.text.as_deref()), (None, Some("found it, works")));
+        // A chosen answer goes by its id.
+        let chosen = person_answer(Some(&custom), Some("works".into()), "Works").unwrap().unwrap();
+        assert_eq!(chosen.id.as_deref(), Some("works"));
+        // Feedback takes words; a free-text ask takes the summary alone.
+        let feedback = request("feedback", false, serde_json::json!([]));
+        assert!(person_answer(Some(&feedback), None, "notes").unwrap().unwrap().text.is_some());
+        assert!(person_answer(None, None, "notes").unwrap().is_none());
+        // A decision takes words as its request for changes; a fixed choice cannot take words.
+        let decision = request("decision", false, serde_json::json!([
+            {"id": "land", "label": "Land", "consequence": "Merged.", "outcome": "accept"},
+            {"id": "hold", "label": "Hold", "consequence": "Nothing.", "outcome": "decline"},
+            {"id": "change", "label": "Change", "consequence": "Revised.", "outcome": "request_changes"}
+        ]));
+        let chosen = person_answer(Some(&decision), Some("change".into()), "rename it").unwrap().unwrap();
+        assert_eq!(chosen.text.as_deref(), Some("rename it"));
+        let changes = person_answer(Some(&decision), None, "rename it").unwrap().unwrap();
+        assert_eq!((changes.id.as_deref(), changes.text.as_deref()), (Some("change"), Some("rename it")));
+        assert!(person_answer(Some(&request("choice", false, options)), None, "words").is_err());
+    }
     use ratatui::backend::TestBackend;
     fn local_machine(model: &mut Model) {
         model.machines.items.push(serde_json::from_str(r#"{"kind":"machine","id":"machine/example-linux","revision":"one","updated_at":"2026-09-25T08:00:00Z","host_id":"host/example-linux","name":"example-linux","state":"local","fleet_id":null,"capacity":{"state":"available","reason":""},"occupancy":{"running_runtimes":1}}"#).unwrap());

@@ -13,6 +13,20 @@ local Unix socket and authenticated paired HTTP over Tailscale or optional Fabri
 clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
 
+`ResourceHeader.operational` describes current versus historical state, actionability, reasons,
+and optional owner-generation/runtime-incarnation identities. Work also exposes `agentless`,
+claim expiry, execution start/elapsed time, and timeout in milliseconds. These fields are optional
+for older servers; an absent expiry/start/timeout and an explicit null both mean no value.
+Mission visualization and message `reply_to` may likewise be null. Agent reachability includes
+`reachable` and `indeterminate`; machines use the `machine` resource kind.
+Mission cards also declare total runs, per-state run counts, and whether their recent-run window
+is truncated. Sessions expose their optional runtime incarnation. Clients need not infer these
+fields from untyped excess-property bags.
+
+The collections socket's `CollectionCommand` and `CollectionFrame` definitions live in the same
+schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
+command/frame definitions, and subscription bound; see [collections](collections.md).
+
 ### Agent activity and human blocking
 
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,
@@ -691,6 +705,7 @@ not change it. A terminal action may use an older snapshot from the same host, w
 and explicit revision fences still apply. Attach/detach do not require a screen sequence fence.
 `revision` digests the rest of
 the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
+The optional `kitty_keyboard` mode carries the active Kitty keyboard enhancement bitmask.
 
 Each line keeps its plain `text`, without trailing spaces, and adds `runs`: styled text from column
 zero. A run has `text` and, when they differ from the terminal default, `fg` and `bg` colors and
@@ -698,6 +713,9 @@ zero. A run has `text` and, when they differ from the terminal default, `fg` and
 a palette index from 0 to 255, where 0 to 15 are the client's ANSI theme colors, or a `#rrggbb`
 string. The runs spell `text`, followed by any trailing blanks that are visible because of their
 background, inverse, or underline. Hidden text is sent as spaces.
+Optional line `wrapped` marks automatic continuation to the next row. Optional run `cells`
+records display width rather than text length; `strikethrough` is present when set, and `link`
+contains the hyperlink `uri`. Generated Rust, Swift, and TypeScript models preserve these fields.
 
 When the terminal's runtime incarnation changes or its process exits, the server sends one
 `stale-fence` error envelope and closes the stream, with the error code as the close reason. Other
@@ -820,8 +838,9 @@ whose capability version they do not understand.
 [`schemas/operations.json`](schemas/operations.json) is the machine-readable route/action/capability
 manifest. [`fixtures/manifest.json`](fixtures/manifest.json) maps every golden fixture to its root
 schema definition. The Rust tests validate fixture coverage, IDs, ordering, fences, timeline links,
-and deterministic preview tokens. Ignored baseline tests exercise the missing implementation and
-are intentionally red until the corresponding server work lands.
+and deterministic preview tokens. Daemon conformance tests validate synthetic collection,
+conversation, and terminal frames with a Draft 2020-12 validator and reject undeclared resource
+fields in the strict test view. No real user data is required for the conformance vectors.
 
 ## Private glasses
 
