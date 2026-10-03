@@ -69,6 +69,11 @@ export type CollectionStream = {
     /** Follow the conversation of an agent or a session. */
     subscribeConversation(id: string, conversation: string): void;
     unsubscribe(id: string): void;
+    /** Open ordered input on a terminal this socket follows; requires `terminal.control`. */
+    openInput(id: string, follow: string): void;
+    /** Send batch `seq`, counting from `input-opened`'s `next_seq`. */
+    sendInput(id: string, seq: number, data: TerminalInputData): void;
+    closeInput(id: string): void;
     close(): void;
 };
 /** A window's rows in display order, as `applyWindow` keeps them. */
@@ -333,6 +338,9 @@ export class St3Client {
             subscribeTerminal: (id, terminal, incarnation, capability) => send({ kind: 'subscribe', id, collection: 'terminal', terminal, incarnation, capability }),
             subscribeConversation: (id, conversation) => send({ kind: 'subscribe', id, collection: 'conversation', conversation }),
             unsubscribe: id => send({ kind: 'unsubscribe', id }),
+            openInput: (id, follow) => send({ kind: 'input-open', id, follow }),
+            sendInput: (id, seq, data) => send({ kind: 'input', id, seq, data }),
+            closeInput: id => send({ kind: 'input-close', id }),
             close: () => { if (!ended) { stop(); socket.close(1000); } },
         };
     }
