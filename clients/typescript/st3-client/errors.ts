@@ -12,6 +12,8 @@ export function plainMessage(code: Code | string | undefined, message: string): 
     case 'stale-fence': return 'st changed while this was on its way, so it was not applied';
     case 'page-cursor-expired':
     case 'cursor-gap': return 'the list changed while it was being read';
+    case 'search-index-building': return 'conversation search is still indexing; try again shortly';
+    case 'search-index-failed': return `conversation search indexing failed: ${message}`;
     case 'remote-unavailable': return host ? `${host} cannot be reached right now` : 'the host this lives on cannot be reached right now';
     case 'rate-limited': return 'st asked to slow down for a moment';
     case 'runtime-authority-indeterminate': return 'st cannot tell yet which host runs this';

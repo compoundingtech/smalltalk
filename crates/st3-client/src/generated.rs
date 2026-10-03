@@ -57,6 +57,8 @@ pub enum ErrorCode {
     RuntimeNotLocal,
     RuntimeAuthorityIndeterminate,
     RemoteUnavailable,
+    SearchIndexBuilding,
+    SearchIndexFailed,
     TerminalUnavailable,
     TerminalEnded,
     TimelineHistoryIncomplete,

@@ -21,7 +21,6 @@ struct IndexState {
     store: std::sync::Weak<Store>,
     index: SearchIndex,
     stamps: BTreeMap<String, String>,
-    sizes: BTreeMap<String, (usize, usize)>,
     incomplete: Vec<String>,
     indexed_at: Option<String>,
     revision: String,
@@ -67,7 +66,6 @@ fn index_for(state: &AppState, session: &ClientSession) -> Result<HeldIndex, Api
         store: Arc::downgrade(&state.store),
         index: SearchIndex::new().map_err(ApiError::internal)?,
         stamps: BTreeMap::new(),
-        sizes: BTreeMap::new(),
         incomplete: Vec::new(),
         indexed_at: None,
         revision: uuid::Uuid::now_v7().to_string(),
@@ -99,71 +97,143 @@ fn searchable_text(value: &Value, output: &mut String) {
     }
 }
 
+// Retain newest entries globally, rather than spending the budget on whole sources.
+// Keys normalize timestamp offsets and use stable identities to break ties.
+struct RecentEntries {
+    entries: BTreeMap<(String, String, String), (String, SearchEntry)>,
+    bytes: usize,
+    max_bytes: usize,
+    max_entries: usize,
+    omitted: BTreeSet<String>,
+    cutoff: Option<(String, String, String)>,
+}
+
+impl RecentEntries {
+    fn new(max_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            bytes: 0,
+            max_bytes,
+            max_entries,
+            omitted: BTreeSet::new(),
+            cutoff: None,
+        }
+    }
+
+    fn advance_cutoff(&mut self, cutoff: (String, String, String)) {
+        if self.cutoff.as_ref().is_some_and(|old| old >= &cutoff) {
+            return;
+        }
+        while self
+            .entries
+            .first_key_value()
+            .is_some_and(|(key, _)| key <= &cutoff)
+        {
+            let (_, (source, entry)) = self.entries.pop_first().unwrap();
+            self.bytes -= entry.text.len();
+            self.omitted.insert(source);
+        }
+        self.cutoff = Some(cutoff);
+    }
+
+    fn insert(&mut self, source: &str, mut entry: SearchEntry) -> anyhow::Result<()> {
+        entry.timestamp = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)?
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        if entry.text.len() > self.max_bytes || self.max_entries == 0 {
+            self.omitted.insert(source.to_owned());
+            return Ok(());
+        }
+        let key = (
+            entry.timestamp.clone(),
+            entry.conversation_id.clone(),
+            entry.entry_id.clone(),
+        );
+        if self.cutoff.as_ref().is_some_and(|cutoff| &key <= cutoff) {
+            self.omitted.insert(source.to_owned());
+            return Ok(());
+        }
+        if let Some((_, previous)) = self.entries.remove(&key) {
+            self.bytes -= previous.text.len();
+        }
+        self.bytes += entry.text.len();
+        self.entries.insert(key, (source.to_owned(), entry));
+        while self.bytes > self.max_bytes || self.entries.len() > self.max_entries {
+            let (key, (source, entry)) = self.entries.pop_first().expect("over budget");
+            self.bytes -= entry.text.len();
+            self.cutoff = Some(key);
+            self.omitted.insert(source);
+        }
+        Ok(())
+    }
+}
+
+fn source_notice(id: &str, item: &Value) -> String {
+    let kind = item["type"].as_str().unwrap_or("error");
+    let body = &item["body"];
+    let code = body["code"].as_str().unwrap_or(kind);
+    let message = body["message"].as_str().or_else(|| body["reason"].as_str());
+    // Do not include transcript content, tool arguments, paths or raw malformed records.
+    let message: String = message
+        .unwrap_or("source did not provide a reason")
+        .chars()
+        .take(256)
+        .collect();
+    format!("{id}: {kind}: {code}: {message}")
+}
+
 fn refresh(
     state: &AppState,
     session: &ClientSession,
     held: &HeldIndex,
     runtime: &tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
+    refresh_with_budget(state, session, held, runtime, TEXT_BYTES, ENTRIES)
+}
+
+fn refresh_with_budget(
+    state: &AppState,
+    session: &ClientSession,
+    held: &HeldIndex,
+    runtime: &tokio::runtime::Handle,
+    max_bytes: usize,
+    max_entries: usize,
+) -> anyhow::Result<()> {
     let snapshot = new_client_snapshot(state);
     let old = held.lock().unwrap().stamps.clone();
-    let old_sizes = held.lock().unwrap().sizes.clone();
-    let mut sizes = BTreeMap::new();
-    let mut budget = TEXT_BYTES;
-    let mut slots = ENTRIES;
-    let mut stamps = BTreeMap::new();
-    let mut changed = Vec::new();
+    let mut recent = RecentEntries::new(max_bytes, max_entries);
     let mut incomplete = Vec::new();
-    // Messages are immutable text. Their access rule is the same private from/to rule as
-    // the messages projection, including archived messages and the person's sent mail.
-    let mail_stamp = state
+    // Messages use the same private from/to rule as the messages projection.
+    for message in state
         .store
-        .conversation_search_mail_stamp(&session.authority_actor, snapshot.store_index)?;
-    stamps.insert("mail".into(), mail_stamp.clone());
-    if old.get("mail") != Some(&mail_stamp) {
-        let mut entries = Vec::new();
-        for message in state
+        .conversation_search_messages(&session.authority_actor, snapshot.store_index)?
+    {
+        if message.from != session.authority_actor && message.to != session.authority_actor {
+            continue;
+        }
+        let claim = state
             .store
-            .conversation_search_messages(&session.authority_actor, snapshot.store_index)?
-        {
-            if message.from != session.authority_actor && message.to != session.authority_actor {
-                continue;
-            }
-            let claim = state
-                .store
-                .claims_for(&message.subject, Some("message.sent"))?
-                .into_iter()
-                .min_by_key(|claim| claim.store_index);
-            let Some(claim) = claim else {
-                continue;
-            };
-            let agent = [&message.from, &message.to]
-                .into_iter()
-                .find(|party| party.starts_with("agent/"))
-                .cloned();
-            let text = format!("{}\n{}", message.title.unwrap_or_default(), message.content);
-            if text.len() > budget || slots == 0 {
-                incomplete.push("mail: search index budget reached".into());
-                continue;
-            }
-            budget -= text.len();
-            slots -= 1;
-            entries.push(SearchEntry {
+            .claims_for(&message.subject, Some("message.sent"))?
+            .into_iter()
+            .min_by_key(|claim| claim.store_index);
+        let Some(claim) = claim else {
+            continue;
+        };
+        let agent = [&message.from, &message.to]
+            .into_iter()
+            .find(|party| party.starts_with("agent/"))
+            .cloned();
+        recent.insert(
+            "mail",
+            SearchEntry {
                 conversation_id: message.subject.clone(),
                 entry_id: message.subject,
                 agent_id: agent,
                 timestamp: client_timestamp(claim.accepted_at_unix_ms),
                 entry_type: "message".into(),
-                text,
-            });
-        }
-        sizes.insert("mail".into(), (TEXT_BYTES - budget, ENTRIES - slots));
-        changed.push(("mail".to_owned(), entries));
-    } else {
-        let size = old_sizes.get("mail").copied().unwrap_or_default();
-        budget = budget.saturating_sub(size.0);
-        slots = slots.saturating_sub(size.1);
-        sizes.insert("mail".into(), size);
+                text: format!("{}\n{}", message.title.unwrap_or_default(), message.content),
+            },
+        )?;
     }
     if crate::external_sessions::discover(state.native_session_home.as_deref(), true)?
         .sessions
@@ -187,78 +257,17 @@ fn refresh(
         let remote = match conversation_owner_host(state, session, id) {
             Ok(remote) => remote,
             Err(error) => {
-                incomplete.push(format!("{id}: {}", error.message));
+                incomplete.push(format!("{id}: {}: {}", error.code, error.message));
                 continue;
             }
         };
-        let mut stamp = resource["revision"].to_string();
-        if !owner.starts_with("agent/") {
-            stamp.push_str(&resource["updated_at"].to_string());
-        }
-        if owner.starts_with("agent/") && remote.is_none() {
-            // Joined Small Talk message entries also change this normalized conversation.
-            stamp.push_str(
-                &state
-                    .store
-                    .conversation_search_mail_stamp(owner, snapshot.store_index)?,
-            );
-            stamp.push_str(&state.store.conversation_search_timeline_stamp(
-                owner,
-                resource["runtime_incarnation"].as_str().unwrap_or_default(),
-                snapshot.store_index,
-            )?);
-            // Driver claims can be quiet while a native transcript grows.
-            if let Some(transcript) = managed_transcript(
-                state,
-                owner,
-                resource["runtime_incarnation"].as_str().unwrap_or_default(),
-            )
-            .map_err(|error| anyhow::anyhow!(error.message))?
-            {
-                stamp.push_str(&transcript.driver);
-                match transcript.transcript {
-                    Ok(transcript) => {
-                        stamp.push_str(&transcript.transcript.to_string_lossy());
-                        if let Ok(metadata) = fs::metadata(&transcript.transcript) {
-                            stamp.push_str(&format!(
-                                ":{}:{:?}",
-                                metadata.len(),
-                                metadata.modified().ok()
-                            ));
-                        }
-                    }
-                    Err(missing) => stamp.push_str(&missing.reason),
-                }
-            }
-        }
-        // The remote transcript may grow without a replicated observation. Recheck it at
-        // each demand refresh rather than pretending its local observation is current.
-        if remote.is_some() {
-            stamp.push_str(&snapshot.id);
-        }
-        stamps.insert(id.to_owned(), stamp.clone());
-        if budget == 0 || slots == 0 {
-            incomplete.push(format!("{id}: search index budget reached"));
-            stamps.remove(id);
-            continue;
-        }
-        if remote.is_none() && old.get(id) == Some(&stamp) {
-            let size = old_sizes.get(id).copied().unwrap_or_default();
-            if size.0 <= budget && size.1 <= slots {
-                budget -= size.0;
-                slots -= size.1;
-                sizes.insert(id.to_owned(), size);
-                continue;
-            }
-        }
         let mut query = ClientListQuery {
             limit: Some(200),
             ..Default::default()
         };
-        let mut entries = Vec::new();
+        // A failed source must not evict usable entries from other sources.
+        let mut source = RecentEntries::new(max_bytes, max_entries);
         let mut unavailable = false;
-        let start_budget = budget;
-        let start_slots = slots;
         loop {
             let read = if let Some(remote) = &remote {
                 runtime
@@ -286,13 +295,12 @@ fn refresh(
                     break;
                 }
             };
-            for item in page["items"].as_array().into_iter().flatten().rev() {
+            for item in page["items"].as_array().into_iter().flatten() {
                 let kind = item["type"].as_str().unwrap_or_default();
                 if matches!(kind, "truncation" | "redaction" | "error") {
-                    incomplete.push(format!("{id}: {kind}"));
+                    incomplete.push(source_notice(id, item));
                 }
-                // A Small Talk message has its canonical mailbox hit; avoid indexing its
-                // duplicated title and content again through each seat's transcript.
+                // Small Talk messages already have their canonical mailbox hit.
                 if !matches!(kind, "content" | "tool_call" | "tool_result") {
                     continue;
                 }
@@ -301,66 +309,66 @@ fn refresh(
                 if text.trim().is_empty() {
                     continue;
                 }
-                if text.len() > budget || slots == 0 {
-                    incomplete.push(format!("{id}: search index budget reached"));
-                    continue;
-                }
-                budget -= text.len();
-                slots -= 1;
-                entries.push(SearchEntry {
+                let entry = SearchEntry {
                     conversation_id: id.to_owned(),
                     entry_id: item["id"].as_str().unwrap_or_default().into(),
                     agent_id: owner.starts_with("agent/").then(|| owner.to_owned()),
                     timestamp: item["timestamp"].as_str().unwrap_or_default().into(),
                     entry_type: kind.into(),
                     text,
-                });
+                };
+                if let Err(error) = source.insert(id, entry) {
+                    incomplete.push(format!("{id}: invalid entry timestamp: {error}"));
+                }
             }
             query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
-            if query.cursor.is_some() && (budget == 0 || slots == 0) {
-                incomplete.push(format!("{id}: search index budget reached"));
-                break;
-            }
             if query.cursor.is_none() {
                 break;
             }
         }
-        // Never leave old searchable text behind after a source becomes unavailable.
-        if unavailable {
-            entries.clear();
-            stamps.remove(id);
-            budget = start_budget;
-            slots = start_slots;
+        if !unavailable {
+            recent.omitted.extend(source.omitted);
+            if let Some(cutoff) = source.cutoff {
+                recent.advance_cutoff(cutoff);
+            }
+            for (_, (_, entry)) in source.entries {
+                recent.insert(id, entry)?;
+            }
         }
-        sizes.insert(id.to_owned(), (start_budget - budget, start_slots - slots));
-        changed.push((id.to_owned(), entries));
     }
+    incomplete.extend(recent.omitted.into_iter().map(|id| {
+        format!("{id}: search index budget reached (newest entries retained across sources)")
+    }));
+    incomplete.sort();
+    incomplete.dedup();
+    let mut selected: BTreeMap<String, Vec<SearchEntry>> = BTreeMap::new();
+    for (_, (source, entry)) in recent.entries {
+        selected.entry(source).or_default().push(entry);
+    }
+    // Fingerprint selected text so unchanged refreshes preserve pagination. Every source
+    // participates in selection again: a formerly excluded conversation may now be newest.
+    let stamps: BTreeMap<String, String> = selected
+        .iter()
+        .map(|(source, entries)| {
+            Ok((
+                source.clone(),
+                hex::encode(Sha256::digest(serde_json::to_vec(entries)?)),
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
     let mut index = held.lock().unwrap();
     for source in old.keys().filter(|source| !stamps.contains_key(*source)) {
         index.index.remove(source)?;
     }
-    let updated = !changed.is_empty();
-    for (source, entries) in changed {
-        index.index.replace(&source, &entries)?;
-    }
-    incomplete.sort();
-    incomplete.dedup();
-    // Unchanged truncated sources retain their warning too.
-    for warning in &index.incomplete {
-        if warning
-            .split_once(": ")
-            .is_some_and(|(source, _)| old.get(source) == stamps.get(source))
-        {
-            incomplete.push(warning.clone());
+    for (source, entries) in selected {
+        if old.get(&source) != stamps.get(&source) {
+            index.index.replace(&source, &entries)?;
         }
     }
-    incomplete.sort();
-    incomplete.dedup();
-    if updated || index.stamps != stamps {
+    if index.stamps != stamps {
         index.revision = uuid::Uuid::now_v7().to_string();
     }
     index.stamps = stamps;
-    index.sizes = sizes;
     index.incomplete = incomplete;
     index.indexed_at = Some(client_timestamp(client_now_ms()));
     Ok(())
@@ -496,11 +504,19 @@ fn search_page(
     let Some(indexed_at) = &index.indexed_at else {
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "remote-unavailable".into(),
+            code: if index.error.is_some() {
+                "search-index-failed"
+            } else {
+                "search-index-building"
+            }
+            .into(),
             message: index.error.clone().unwrap_or_else(|| {
                 "conversation search index is being built; retry shortly".into()
             }),
-            details: Default::default(),
+            details: Box::new(serde_json::Map::from_iter([(
+                "retry_after_ms".into(),
+                json!(1000),
+            )])),
         });
     };
     let mut hits = index
@@ -556,6 +572,100 @@ fn search_page(
 mod tests {
     use super::*;
 
+    fn candidate(source: &str, second: u32, text: &str) -> SearchEntry {
+        SearchEntry {
+            conversation_id: source.into(),
+            entry_id: format!("entry/{second}"),
+            agent_id: None,
+            timestamp: format!("2026-10-03T00:00:{second:02}Z"),
+            entry_type: "content".into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn budget_retains_global_newest_independently_of_source_order() {
+        for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [0, 2, 1]] {
+            let entries = [
+                candidate("a", 1, "older"),
+                candidate("b", 2, "middle!!"),
+                candidate("c", 3, "newer"),
+            ];
+            let mut recent = RecentEntries::new(10, 10);
+            for i in order {
+                recent
+                    .insert(&entries[i].conversation_id, entries[i].clone())
+                    .unwrap();
+            }
+            assert_eq!(recent.entries.len(), 1);
+            assert_eq!(recent.entries.values().next().unwrap().1.text, "newer");
+            assert!(recent.bytes <= 10);
+            assert!(recent.omitted.contains("a") && recent.omitted.contains("b"));
+        }
+        let mut recent = RecentEntries::new(100, 2);
+        recent
+            .insert("first", candidate("first", 1, "old"))
+            .unwrap();
+        recent
+            .insert("first", candidate("first", 2, "middle"))
+            .unwrap();
+        recent
+            .insert("last", candidate("last", 3, "latest"))
+            .unwrap();
+        assert_eq!(recent.entries.len(), 2);
+        assert!(recent.entries.values().any(|(source, _)| source == "last"));
+        assert!(recent.omitted.contains("first"));
+    }
+
+    #[test]
+    fn source_errors_explain_the_reason_without_indexing_it() {
+        let item = json!({"type":"error", "body":{"code":"native-line-unreadable",
+            "message":"st skipped a codex transcript line that is not valid JSON",
+            "details":{"raw":"private raw line"}}});
+        let notice = source_notice("session/test", &item);
+        assert!(notice.contains("native-line-unreadable"));
+        assert!(notice.contains("not valid JSON"));
+        assert!(!notice.contains("private raw line"));
+    }
+
+    #[test]
+    fn cold_search_distinguishes_building_from_failed_index() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::tests::state(root.path());
+        let session = ClientSession::local(Some("person/cold")).unwrap();
+        let held = index_for(&state, &session).unwrap();
+        let building = search_page(
+            &state,
+            &query("orchid", 50),
+            None,
+            held.clone(),
+            "binding".into(),
+            50,
+        )
+        .unwrap_err();
+        assert_eq!(building.code, "search-index-building");
+        let envelope = crate::api::client_error_envelope(
+            building.status,
+            &json!({"code":building.code, "message":building.message}),
+            "search-test",
+        );
+        assert_eq!(envelope["code"], "search-index-building");
+        assert_eq!(envelope["retryable"], true);
+        assert_eq!(building.details["retry_after_ms"], 1000);
+        held.lock().unwrap().error = Some("inventory failed".into());
+        let failed = search_page(
+            &state,
+            &query("orchid", 50),
+            None,
+            held,
+            "binding".into(),
+            50,
+        )
+        .unwrap_err();
+        assert_eq!(failed.code, "search-index-failed");
+        assert!(failed.message.contains("inventory failed"));
+    }
+
     fn claim(state: &AppState, subject: &str, kind: &str, mut fields: Value) {
         if kind == "message.sent" {
             fields["status"] = json!("sent");
@@ -598,6 +708,60 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_budget_includes_later_source_and_preserves_unchanged_cursor_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::tests::state(root.path());
+        for agent in ["agent/a", "agent/z"] {
+            claim(
+                &state,
+                agent,
+                "runtime.observed",
+                json!({"status":"running",
+                "runtime_id":agent, "incarnation_id":"i1", "terminal":false}),
+            );
+            claim(
+                &state,
+                agent,
+                "harness.timeline",
+                json!({"operation":"append",
+                "entry_id":format!("timeline-entry/{agent}"), "revision":1, "role":"assistant",
+                "entry_type":"content", "final":true, "body":{"text":"orchid note"},
+                "incarnation_id":"i1", "sequence":1, "driver":"test"}),
+            );
+        }
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let held = index_for(&state, &session).unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        let build_state = state.clone();
+        let build_held = held.clone();
+        tokio::task::spawn_blocking(move || {
+            refresh_with_budget(&build_state, &session, &build_held, &runtime, 100, 1).unwrap();
+            let revision = build_held.lock().unwrap().revision.clone();
+            refresh_with_budget(&build_state, &session, &build_held, &runtime, 100, 1).unwrap();
+            assert_eq!(revision, build_held.lock().unwrap().revision);
+        })
+        .await
+        .unwrap();
+        let page = search_page(
+            &state,
+            &query("orchid", 50),
+            None,
+            held,
+            "binding".into(),
+            50,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["agent_id"], "agent/z");
+        assert!(
+            page["incomplete_sources"]
+                .to_string()
+                .contains("search index budget reached")
+        );
     }
 
     #[tokio::test]

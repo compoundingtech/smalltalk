@@ -502,6 +502,8 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
             Some(host) => format!("{host} cannot be reached right now"),
             None => "the host this lives on cannot be reached right now".into(),
         },
+        ErrorCode::SearchIndexBuilding => "conversation search is still indexing; try again shortly".into(),
+        ErrorCode::SearchIndexFailed => format!("conversation search indexing failed: {message}"),
         ErrorCode::RateLimited => "st asked to slow down for a moment".into(),
         ErrorCode::RuntimeAuthorityIndeterminate => {
             "st cannot tell yet which host runs this".into()
