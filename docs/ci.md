@@ -314,9 +314,11 @@ on 2026-10-01 recorded the workspace limits with `nsc workspace concurrency --ou
 | macOS arm64 | 96 | 224 GiB |
 
 Namespace limits CPU and memory per platform; a workflow run is not a fixed unit of capacity.
-Each Workspace CI group initially starts three 16-vCPU/32-GiB stage jobs and two
-8-vCPU/16-GiB profile jobs: 64 vCPUs and 128 GiB at peak. Five complete groups fit the Linux
-limit, which matches `max_entries_to_build: 5` in both the generated and live main rulesets.
+With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts three
+8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 40 vCPUs and 80 GiB at peak.
+PR and main runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB.
+Five complete merge-queue groups need 200 vCPUs and 400 GiB, within the Linux pool limit;
+`max_entries_to_build` remains 5 in both the generated and live main rulesets.
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
 are available. The `linux-gate` aggregate starts after the three stage jobs finish, so it does
 not add to the initial peak. macOS uses its own pool.
