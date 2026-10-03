@@ -50,6 +50,8 @@ pub struct HarnessTodoTotals {
     pub in_progress: u64,
     pub completed: u64,
     pub blocked: u64,
+    #[serde(default)]
+    pub abandoned: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -264,8 +266,8 @@ impl Registry {
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
         output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
-        output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Any shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
-        output.push_str("\nOMP's native `abandoned` tasks are omitted rather than relabeled as completed, with `truncated: true`. Their enclosing phase is preserved when it fits. Totals count the full source snapshot's four representable statuses; abandoned tasks do not contribute to a total. Truncation can therefore reflect an unrepresented native status as well as text/list bounds. The OMP producer reserves 4 KiB of the serialized-fields budget for authenticated provenance.\n");
+        output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
+        output.push_str("\nOMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.\n");
         output
     }
 
@@ -3493,7 +3495,9 @@ fn validate_harness_todo(fields: &BTreeMap<String, Value>) -> Result<(), Validat
     }
     let totals = fields.get("totals").and_then(Value::as_object).ok_or_else(invalid)?;
     let truncated = fields.get("truncated").and_then(Value::as_bool).ok_or_else(invalid)?;
-    if totals.len() != statuses.len() {
+    if totals.keys().any(|key| !statuses.contains(&key.as_str()) && key != "abandoned")
+        || totals.get("abandoned").is_some_and(|value| value.as_u64().is_none())
+    {
         return Err(invalid());
     }
     for (index, status) in statuses.iter().enumerate() {
@@ -3564,6 +3568,35 @@ mod tests {
             fields.get_mut("totals").unwrap()["blocked"] = total;
             assert!(validate_todo(&fields).is_err());
         }
+    }
+
+    #[test]
+    fn harness_todo_counts_abandoned_without_truncating_or_adding_a_task_status() {
+        let mut fields = todo_fields();
+        let old_snapshot: HarnessTodoSnapshot =
+            serde_json::from_value(serde_json::to_value(&fields).unwrap()).unwrap();
+        assert_eq!(old_snapshot.totals.abandoned, 0);
+        fields.get_mut("totals").unwrap()["abandoned"] = Value::from(3);
+        validate_todo(&fields).unwrap();
+        let snapshot: HarnessTodoSnapshot =
+            serde_json::from_value(serde_json::to_value(&fields).unwrap()).unwrap();
+        assert_eq!(snapshot.totals.abandoned, 3);
+        assert!(!snapshot.truncated);
+        for count in [Value::from(-1), Value::from(1.5), Value::Null, Value::from("3")] {
+            let mut invalid = fields.clone();
+            invalid.get_mut("totals").unwrap()["abandoned"] = count;
+            assert!(validate_todo(&invalid).is_err());
+        }
+        let mut unknown = fields.clone();
+        unknown.get_mut("totals").unwrap()["dropped"] = Value::from(3);
+        assert!(validate_todo(&unknown).is_err());
+        fields.get_mut("totals").unwrap().as_object_mut().unwrap().remove("pending");
+        assert!(validate_todo(&fields).is_err());
+        let mut task_status = todo_fields();
+        task_status.insert("phases".into(), serde_json::json!([{"name":"Dropped","tasks":[
+            {"content":"Dropped task","status":"abandoned"}
+        ]}]));
+        assert!(validate_todo(&task_status).is_err());
     }
 
     #[test]

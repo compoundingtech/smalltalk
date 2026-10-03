@@ -176,7 +176,18 @@ public struct HarnessTodoSnapshot: Codable, Sendable { public let harness, sessi
 public struct HarnessPhase: Codable, Sendable { public let name: String; public let tasks: [HarnessTask] }
 public struct HarnessTask: Codable, Sendable { public let content: String; public let status: HarnessTaskStatus; public let blocker: String? }
 public enum HarnessTaskStatus: String, Codable, Sendable { case pending, inProgress = "in_progress", completed, blocked }
-public struct HarnessTodoTotals: Codable, Sendable { public let pending, inProgress, completed, blocked: UInt64; enum CodingKeys: String, CodingKey { case pending, inProgress = "in_progress", completed, blocked } }
+public struct HarnessTodoTotals: Codable, Sendable {
+    public let pending, inProgress, completed, blocked, abandoned: UInt64
+    enum CodingKeys: String, CodingKey { case pending, inProgress = "in_progress", completed, blocked, abandoned }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        pending = try values.decode(UInt64.self, forKey: .pending)
+        inProgress = try values.decode(UInt64.self, forKey: .inProgress)
+        completed = try values.decode(UInt64.self, forKey: .completed)
+        blocked = try values.decode(UInt64.self, forKey: .blocked)
+        abandoned = try values.decodeIfPresent(UInt64.self, forKey: .abandoned) ?? 0
+    }
+}
 public struct AgentSuspension: Codable, Sendable { public let action, phase, operationID, updatedAt: String; public let harness, nativeSessionID, incarnationID, suspendedAt, code, reason: String?; public let blocking: [String]; enum CodingKeys: String, CodingKey { case action, phase, operationID = "operation_id", updatedAt = "updated_at", harness, nativeSessionID = "native_session_id", incarnationID = "incarnation_id", suspendedAt = "suspended_at", code, reason, blocking } }
 public struct AgentSubagent: Codable, Sendable { public let id: String; public let subagentType, description: String?; public let driver: String; public let sessionID, workID, startedAt: String?; public let leaseExpiresAt: String; enum CodingKeys: String, CodingKey { case id, subagentType = "subagent_type", description, driver, sessionID = "session_id", workID = "work_id", startedAt = "started_at", leaseExpiresAt = "lease_expires_at" } }
 public struct AgentDelivery: Codable, Sendable { public let state: String; public let reason: String?; public let polledSecondsAgo: UInt64?; public let transport: String?; enum CodingKeys: String, CodingKey { case state, reason, polledSecondsAgo = "polled_seconds_ago", transport } }

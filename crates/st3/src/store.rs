@@ -10898,42 +10898,60 @@ impl Store {
 
     /// The newest claim or local observation of `kind` for `subject`.
     pub fn latest_observation(&self, subject: &str, kind: &str) -> Result<Option<ClaimRecord>> {
-        self.latest_observation_at(subject, kind, i64::MAX as u64)
-    }
-
-    /// The newest accepted claim or local reading within a client's graph snapshot.
-    /// Local observations share their surrounding graph index, rather than advancing it.
-    pub fn latest_observation_at(
-        &self, subject: &str, kind: &str, at_index: u64,
-    ) -> Result<Option<ClaimRecord>> {
         smallclaims::touched::note_read(|| subject.to_owned());
-        let at_index = at_index.min(i64::MAX as u64);
-        let claim = {
-            let connection = self.readers.get();
-            connection.query_row(
-                &canonical_sql(
-                    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
-                    predecessors, accepted_at_unix_ms FROM claims
-                    WHERE subject=?1 AND kind=?2 AND store_index<=?3
-                    ORDER BY CANONICAL_DESC(claims) LIMIT 1"
-                ),
-                params![subject, kind, at_index],
-                claim_from_row,
-            ).optional()?
-        };
+        let claim = self.latest_claim(subject, Some(kind))?;
         let local = {
             let connection = self.readers.get();
             connection
                 .query_row(
                     &format!(
-                        "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 AND after_store_index<=?3 ORDER BY id DESC LIMIT 1"
+                        "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id DESC LIMIT 1"
                     ),
-                    params![subject, kind, at_index],
+                    params![subject, kind],
                     |row| local_observation_from_row(&self.origin, row),
                 )
                 .optional()?
         };
         Ok(claim.into_iter().chain(local).max_by_key(claim_log_order))
+    }
+
+    /// Read replicated todo snapshots and their native-session bindings together at a graph
+    /// snapshot. Each subject/kind lookup stops at the newest indexed claim.
+    pub fn agent_todo_observations_for(
+        &self,
+        subjects: &[String],
+        at_index: u64,
+    ) -> Result<BTreeMap<String, BTreeMap<String, ClaimRecord>>> {
+        if subjects.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {CLAIM_COLUMNS} FROM json_each(?1) subjects
+             CROSS JOIN (
+                 SELECT 'harness.todo.observed' AS kind
+                 UNION ALL SELECT 'harness.session-file'
+             ) kinds
+             JOIN claims ON claims.id=(
+                 SELECT claims.id FROM claims INDEXED BY claims_subject_kind_accepted_index
+                 JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=subjects.value AND claims.kind=kinds.kind
+                   AND +claims.store_index<=?2
+                 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1
+             )
+             JOIN batches ON batches.id=claims.batch_id"
+        ))?;
+        let rows = statement.query_map(
+            params![serde_json::to_string(subjects)?, at_index.min(i64::MAX as u64)],
+            claim_from_row,
+        )?;
+        let mut observations = BTreeMap::<String, BTreeMap<String, ClaimRecord>>::new();
+        for claim in rows {
+            let claim = claim?;
+            observations.entry(claim.subject.clone()).or_default()
+                .insert(claim.kind.clone(), claim);
+        }
+        Ok(observations)
     }
 
     pub fn pending_observer_refresh_attempt(&self, observer: &str) -> Result<Option<String>> {
@@ -45768,6 +45786,14 @@ fn append_latest_observation_fenced(
                 "harness.usage" => {
                     publish_due_usage_tx(transaction, &graph.origin, input, &local, now)?
                 }
+                "harness.todo.observed" => Some(publish_latest_claim_tx(
+                    transaction,
+                    &graph.origin,
+                    &input.subject,
+                    &input.kind,
+                    input.actor.as_deref(),
+                    &json!(input.fields),
+                )?),
                 _ => None,
             };
             Ok((published.unwrap_or(local), true))
@@ -46109,6 +46135,23 @@ mod harness_event_tests {
         assert_eq!(store.append_harness_event(&input).unwrap_err().code, "stale-harness-event-session");
         let current = store.latest_observation(SEAT, "harness.todo.observed").unwrap().unwrap();
         assert_eq!(current.body["fields"]["source_op"], "clear");
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let peer = Store::open_memory("blue").unwrap();
+        store.bind_fleet(FLEET).unwrap();
+        peer.bind_fleet(FLEET).unwrap();
+        let exchange = store.export_replication_exchange(
+            FLEET, &ReplicationInventory::default(),
+        ).unwrap();
+        peer.receive_replication_exchange("amber", FLEET, &exchange).unwrap();
+        peer.validate_replication_backlog().unwrap();
+        peer.apply_replication_repairs().unwrap();
+        assert!(peer.project_replication_backlog().unwrap());
+        let remote = peer.agent_todo_observations_for(
+            &[SEAT.to_owned()], peer.index().unwrap(),
+        ).unwrap();
+        let remote = &remote[SEAT]["harness.todo.observed"];
+        assert_eq!(remote.id, cleared.id);
+        assert_eq!(remote.body["fields"]["source_op"], "clear");
     }
     #[test]
     fn native_event_admission_fences_every_retention_and_replays_lost_acknowledgements() {

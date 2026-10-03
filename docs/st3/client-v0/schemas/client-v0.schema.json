@@ -829,7 +829,8 @@
         "pending": { "type": "integer", "minimum": 0 },
         "in_progress": { "type": "integer", "minimum": 0 },
         "completed": { "type": "integer", "minimum": 0 },
-        "blocked": { "type": "integer", "minimum": 0 }
+        "blocked": { "type": "integer", "minimum": 0 },
+        "abandoned": { "type": "integer", "minimum": 0 }
       }
     },
     "AgentDelivery": {

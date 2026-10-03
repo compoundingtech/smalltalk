@@ -11795,6 +11795,48 @@ fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
     output
 }
 
+/// Provider text is data, never terminal commands or additional output lines.
+fn push_todo_terminal_text(output: &mut String, text: &str) {
+    let mut characters = text.chars();
+    let mut space = false;
+    let mut written = false;
+    while let Some(character) = characters.next() {
+        if matches!(character, '\u{1b}' | '\u{9b}' | '\u{9d}') {
+            let introducer = if character == '\u{1b}' {
+                characters.next()
+            } else if character == '\u{9b}' {
+                Some('[')
+            } else {
+                Some(']')
+            };
+            match introducer {
+                Some('[') => {
+                    for next in characters.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) { break; }
+                    }
+                }
+                Some(']') => {
+                    while let Some(next) = characters.next() {
+                        if next == '\u{7}' || (next == '\u{1b}' && characters.next() == Some('\\')) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if character.is_whitespace() {
+            space = written;
+        } else if !character.is_control() {
+            if space { output.push(' '); }
+            output.push(character);
+            written = true;
+            space = false;
+        }
+    }
+}
+
 fn render_client_agent(
     agent: &st3_client::Agent,
     current_steps: &[StepRunView],
@@ -11819,12 +11861,17 @@ fn render_client_agent(
         if let Some(active) = snapshot.phases.iter().flat_map(|phase| &phase.tasks)
             .find(|task| task.status == st3_client::HarnessTaskStatus::InProgress)
         {
-            let _ = write!(output, "▶ {} · ", active.content);
+            output.push_str("▶ ");
+            push_todo_terminal_text(&mut output, &active.content);
+            output.push_str(" · ");
         }
         let totals = &snapshot.totals;
         let total = u128::from(totals.pending) + u128::from(totals.in_progress)
             + u128::from(totals.completed) + u128::from(totals.blocked);
         let _ = write!(output, "{}/{total} done · {} blocked", totals.completed, totals.blocked);
+        if totals.abandoned > 0 {
+            let _ = write!(output, " · {} abandoned", totals.abandoned);
+        }
         if snapshot.truncated {
             output.push_str(" · truncated");
         }
@@ -11833,6 +11880,7 @@ fn render_client_agent(
         }
         output.push('\n');
     }
+
     if let Some(fault) = &agent.fault {
         let _ = writeln!(output, "FAULT        {fault}");
     }
@@ -16529,6 +16577,42 @@ fn pi_family_session_context(identity: &str, context: &str) -> String {
     )
 }
 
+/// One seat's spool retains its sequence across channel reconnects, but not ended incarnations.
+fn prepare_channel_todo_outbox(root: &Path, subject: &str, incarnation: &str) -> Result<PathBuf> {
+    let seat = hex::encode(Sha256::digest(subject.as_bytes()));
+    let token = hex::encode(Sha256::digest(incarnation.as_bytes()));
+    let seat_dir = root.join(".st3-channel-outbox").join(seat);
+    fs::create_dir_all(&seat_dir)?;
+    for entry in fs::read_dir(&seat_dir)? {
+        let entry = entry?;
+        if entry.file_name() != token.as_str() && entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(seat_dir.join(token))
+}
+
+fn todo_runtime_has_ended(actual: &Value, incarnation: &str) -> bool {
+    let fields = actual.get("fields").unwrap_or(actual);
+    fields["incarnation_id"].as_str().is_some_and(|current| current != incarnation)
+        || matches!(fields["status"].as_str(), Some("absent" | "stopped" | "exited" | "vanished"))
+}
+
+async fn remove_ended_channel_todo_outbox(
+    client: &Client, subject: &str, incarnation: &str, dir: &Path,
+) -> Result<bool> {
+    let status: StatusResponse = client.get(&format!(
+        "/v1/status?subject={}", urlencoding::encode(subject),
+    )).await?;
+    if status.subjects.first().and_then(|seat| seat.actual.as_ref())
+        .is_some_and(|actual| todo_runtime_has_ended(actual, incarnation))
+    {
+        fs::remove_dir_all(dir)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 async fn run_pi_channel(
     client: &Client,
     subject: &str,
@@ -16630,8 +16714,11 @@ async fn run_pi_channel(
         None
     };
     let mut todo_observations = if driver == "omp" && observer.is_none() {
-        let token = hex::encode(Sha256::digest(format!("{subject}:{incarnation}").as_bytes()));
-        let dir = catalog.join(".st3-channel-outbox").join(token);
+        anyhow::ensure!(
+            current_agent_incarnation(client, subject).await?.as_deref() == Some(&incarnation),
+            "todo channel runtime was superseded",
+        );
+        let dir = prepare_channel_todo_outbox(catalog, subject, &incarnation)?;
         st_drivers::harness_events::enable(&dir, &incarnation)?;
         state.todo_outbox = Some(dir.clone());
         Some(NativeObservations::start(&dir, &incarnation)?)
@@ -16663,8 +16750,21 @@ async fn run_pi_channel(
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
+    let mut checked_todo_minute = None;
     loop {
         tokio::select! {
+            wake = async { match todo_observations.as_mut() {
+                Some(observations) => observations.recv().await,
+                None => std::future::pending().await,
+            }} => {
+                if let Err(error) = wake {
+                    warn_pi_channel(subject, &error, &mut last_warning);
+                } else if let Some(observations) = todo_observations.as_mut()
+                    && let Err(error) = observations.drain(client, subject, driver, &mut false).await
+                {
+                    warn_pi_channel(subject, &error, &mut last_warning);
+                }
+            }
             frame = async { match &mut subscription {
                 Some(subscription) => subscription.receiver.recv().await,
                 None => std::future::pending().await,
@@ -16683,7 +16783,14 @@ async fn run_pi_channel(
                         stdout.write_all(format!("{}\n", serde_json::to_string(&frame)?).as_bytes()).await?;
                         stdout.flush().await?;
                     },
-                    Some(st3::mailbox::Frame::Fenced { reason }) => anyhow::bail!("{reason}"),
+                    Some(st3::mailbox::Frame::Fenced { reason }) => {
+                        if let Some(dir) = &state.todo_outbox {
+                            if let Err(error) = fs::remove_dir_all(dir) {
+                                warn_pi_channel(subject, &error.into(), &mut last_warning);
+                            }
+                        }
+                        anyhow::bail!("{reason}");
+                    },
                     None => return Ok(()),
                 }
             }
@@ -16710,7 +16817,14 @@ async fn run_pi_channel(
                                 .await;
                         }
                         if let Some(observations) = todo_observations.as_mut() {
-                            observations.drain(client, subject, driver, &mut false).await?;
+                            if let Err(error) = observations.drain(client, subject, driver, &mut false).await {
+                                warn_pi_channel(subject, &error, &mut last_warning);
+                            }
+                            if let Err(error) = remove_ended_channel_todo_outbox(
+                                client, subject, &incarnation, &observations.dir,
+                            ).await {
+                                warn_pi_channel(subject, &error, &mut last_warning);
+                            }
                         }
                         return Ok(());
                     }
@@ -16734,6 +16848,7 @@ async fn run_pi_channel(
                     }
                 }
                 if let Some(observations) = todo_observations.as_mut()
+                    && observations.retry_pending
                     && let Err(error) = observations.drain(client, subject, driver, &mut false).await
                 {
                     warn_pi_channel(subject, &error, &mut last_warning);
@@ -16927,6 +17042,18 @@ async fn run_pi_channel(
             }
             _ = work_interval.tick() => {
                 let minute = unix_minute()?;
+                if checked_todo_minute != Some(minute) {
+                    checked_todo_minute = Some(minute);
+                    if let Some(observations) = todo_observations.as_ref() {
+                        match remove_ended_channel_todo_outbox(
+                            client, subject, &incarnation, &observations.dir,
+                        ).await {
+                            Ok(true) => return Ok(()),
+                            Ok(false) => {}
+                            Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                        }
+                    }
+                }
                 if renewed_minute != Some(minute) {
                     match renew_claimed_work(client, subject, minute).await {
                         Ok(()) => renewed_minute = Some(minute),
@@ -19314,6 +19441,33 @@ mod tests {
     }
 
     #[test]
+    fn harness_todo_spool_reconnect_preserves_sequence_and_next_incarnation_cleans_only_its_seat() {
+        let root = tempfile::tempdir().unwrap();
+        let current = prepare_channel_todo_outbox(root.path(), "agent/one", "runtime-a").unwrap();
+        st_drivers::harness_events::enable(&current, "runtime-a").unwrap();
+        let fields = json!({
+            "harness":"omp", "incarnation_id":"runtime-a", "session_id":"native",
+            "observed_at":"2026-10-03T15:00:00Z", "source_op":"hydrate", "phases":[],
+            "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0}, "truncated":false,
+        });
+        st_drivers::harness_events::write_channel_todo(&current, "runtime-a", &fields).unwrap();
+        let sequence = st_drivers::harness_events::pending(&current, 10).unwrap()[0].sequence;
+        let resumed = prepare_channel_todo_outbox(root.path(), "agent/one", "runtime-a").unwrap();
+        assert_eq!(resumed, current);
+        st_drivers::harness_events::write_channel_todo(&resumed, "runtime-a", &fields).unwrap();
+        assert!(st_drivers::harness_events::pending(&resumed, 10).unwrap()[1].sequence > sequence);
+        let unrelated = prepare_channel_todo_outbox(root.path(), "agent/two", "runtime-b").unwrap();
+        st_drivers::harness_events::enable(&unrelated, "runtime-b").unwrap();
+        prepare_channel_todo_outbox(root.path(), "agent/one", "runtime-c").unwrap();
+        assert!(!current.exists());
+        assert!(unrelated.exists());
+        assert!(!todo_runtime_has_ended(&json!({"incarnation_id":"a","status":"running"}), "a"));
+        assert!(todo_runtime_has_ended(&json!({"incarnation_id":"a","status":"exited"}), "a"));
+        assert!(todo_runtime_has_ended(&json!({"incarnation_id":"b","status":"running"}), "a"));
+        assert!(!todo_runtime_has_ended(&json!({}), "a"));
+    }
+
+    #[test]
     fn client_api_errors_print_in_plain_words_with_their_code() {
         let api = st3_client::ClientError::Api(
             st3_client::ErrorCode::StaleFence,
@@ -20178,12 +20332,19 @@ mod tests {
         let value = serde_json::to_value(&agent).unwrap();
         assert_eq!(value["todo"]["snapshot"]["phases"][0]["tasks"][1]["blocker"], "Approval");
         assert_eq!(value["todo"]["claim_id"], "claim/todo");
+        agent.todo.as_mut().unwrap().snapshot.phases[0].tasks[0].content =
+            "\u{1b}[31mCompile\u{1b}[0m\nnext\tstep\u{1b}]0;spoofed title\u{7}\u{8}".into();
+        assert!(render_client_agent(&agent, &[], 0)
+            .contains("Todo         ▶ Compile next step · 3/10 done · 1 blocked · truncated\n"));
+        agent.todo.as_mut().unwrap().snapshot.totals.abandoned = 2;
+        assert!(render_client_agent(&agent, &[], 0)
+            .contains("3/10 done · 1 blocked · 2 abandoned · truncated"));
         let todo = agent.todo.as_mut().unwrap();
         todo.stale = true;
         todo.snapshot.phases.clear();
         todo.snapshot.truncated = false;
         todo.snapshot.totals = st3_client::HarnessTodoTotals {
-            pending: 0, in_progress: 0, completed: 0, blocked: 0,
+            pending: 0, in_progress: 0, completed: 0, blocked: 0, abandoned: 0,
         };
         assert!(render_client_agent(&agent, &[], 0).contains("Todo         0/0 done · 0 blocked · stale\n"));
         agent.todo = None;
@@ -24336,5 +24497,11 @@ mission "review" state="ready" {
                 .await
                 .is_err()
         );
+        st_drivers::harness_events::write_channel_todo(root.path(), "runtime", &json!({
+            "harness":"omp", "session_id":"native", "incarnation_id":"runtime",
+            "observed_at":"2026-10-03T15:00:00Z", "source_op":"hydrate", "phases":[],
+            "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0}, "truncated":false,
+        })).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), observations.recv()).await.unwrap().unwrap();
     }
 }

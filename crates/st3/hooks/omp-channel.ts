@@ -100,6 +100,8 @@ type Stash = {
   /** Todo observation state is fenced by the channel binding, not the extension instance. */
   todoFingerprint?: string;
   todoBranchKey?: string;
+  todoLeafKey?: string;
+  todoNextPollAt?: number;
   todoSession?: string;
   todoReady?: boolean;
 
@@ -214,7 +216,7 @@ type TodoTask = { content: string; status: TodoStatus; blocker?: string };
 type TodoPhase = { name: string; tasks: TodoTask[] };
 type TodoSnapshot = {
   phases: TodoPhase[];
-  totals: Record<TodoStatus, number>;
+  totals: Record<TodoStatus | "abandoned", number>;
   truncated: boolean;
 };
 const record = (value: unknown): Record<string, unknown> | undefined =>
@@ -237,7 +239,7 @@ const utf8Prefix = (value: string, limit: number): string => {
 const boundedTodo = (raw: unknown): TodoSnapshot | undefined => {
   if (!Array.isArray(raw)) return undefined;
   const snapshot: TodoSnapshot = {
-    phases: [], totals: { pending: 0, in_progress: 0, completed: 0, blocked: 0 }, truncated: false,
+    phases: [], totals: { pending: 0, in_progress: 0, completed: 0, blocked: 0, abandoned: 0 }, truncated: false,
   };
   let taskCount = 0;
   for (const rawPhase of raw) {
@@ -254,7 +256,7 @@ const boundedTodo = (raw: unknown): TodoSnapshot | undefined => {
         (!todoStatus(task.status) && task.status !== "abandoned") ||
         (task.blocker !== undefined && typeof task.blocker !== "string")) return undefined;
       // OMP's dropped tasks have no corresponding approved claim status. Omit, never relabel.
-      if (task.status === "abandoned") { snapshot.truncated = true; continue; }
+      if (task.status === "abandoned") { snapshot.totals.abandoned++; continue; }
       if (!todoStatus(task.status)) return undefined;
       snapshot.totals[task.status]++;
       if (!includePhase || taskCount >= 100) { snapshot.truncated = true; continue; }
@@ -462,6 +464,8 @@ export default function (pi: ExtensionAPI) {
     state.child = child;
     state.todoFingerprint = undefined;
     state.todoBranchKey = undefined;
+    state.todoLeafKey = undefined;
+    state.todoNextPollAt = undefined;
     state.todoSession = nativeSessionId;
     state.todoReady = false;
 
@@ -506,7 +510,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (legacyChannel) send({ type: "keepalive" });
-        if (state.todoReady) observeTodoBranch(ctx);
+        if (state.todoReady) observeTodoBranch(ctx, false, true);
       }, 1000);
       keepalive.unref?.();
 
@@ -641,14 +645,40 @@ export default function (pi: ExtensionAPI) {
     sendFrame({ type: "todo", session: nativeSession, observed_at: observedAt, source_op: sourceOp, ...snapshot });
     state.todoFingerprint = fingerprint;
   };
-  const observeTodoBranch = (ctx: ExtensionContext, hydrate = false) => {
+  const observeTodoBranch = (ctx: ExtensionContext, hydrate = false, polling = false) => {
+    if (!state.todoReady || !state.child || state.child.stdin?.destroyed) return;
+    const nativeSession = ctx.sessionManager.getSessionId();
+    if (state.todoSession !== nativeSession) {
+      if (!hydrate) return;
+      // A branch hydration binds its observation provenance on the existing channel. It must
+      // not restart delivery, discard held mail, or reset ask/approval authority.
+      sendFrame({ type: "session", sessionId: nativeSession });
+      state.todoSession = nativeSession;
+      state.todoFingerprint = undefined;
+      state.todoBranchKey = undefined;
+      state.todoLeafKey = undefined;
+    }
+    let leafKey: string | undefined;
+    try {
+      // Native OMP exposes this O(1) index lookup on ReadonlySessionManager. /todo appends
+      // user_todo_edit through appendCustomEntry, which advances the same branch leaf.
+      if (typeof ctx.sessionManager.getLeafId === "function") {
+        leafKey = `${nativeSession}:${ctx.sessionManager.getLeafId() ?? ""}`;
+        if (!hydrate && state.todoLeafKey === leafKey) return;
+      }
+    } catch { return; }
+    // Older providers without a leaf indicator still observe events immediately, but never
+    // rebuild an unchanged idle branch every second.
+    if (polling && leafKey === undefined && Date.now() < (state.todoNextPollAt ?? 0)) return;
+    state.todoNextPollAt = Date.now() + 30_000;
     const source = branchTodo(ctx);
     if (source === undefined) return;
+    state.todoLeafKey = leafKey;
     const key = source?.key ?? "";
     if (!hydrate && state.todoBranchKey === key) return;
     state.todoBranchKey = key;
     const snapshot = source?.snapshot ?? {
-      phases: [], totals: { pending: 0, in_progress: 0, completed: 0, blocked: 0 }, truncated: false,
+      phases: [], totals: { pending: 0, in_progress: 0, completed: 0, blocked: 0, abandoned: 0 }, truncated: false,
     };
     emitTodo(ctx, snapshot, source?.observedAt ?? new Date().toISOString(),
       hydrate ? "hydrate" : source?.sourceOp ?? "hydrate", hydrate);
@@ -1105,6 +1135,11 @@ export default function (pi: ExtensionAPI) {
     const snapshot = boundedTodo(details.phases);
     if (!snapshot) return;
     state.todoBranchKey = branchTodo(ctx)?.key ?? "";
+    try {
+      state.todoLeafKey = typeof ctx.sessionManager.getLeafId === "function"
+        ? `${ctx.sessionManager.getSessionId()}:${ctx.sessionManager.getLeafId() ?? ""}`
+        : undefined;
+    } catch { state.todoLeafKey = undefined; }
     emitTodo(ctx, snapshot, new Date().toISOString(), details.op);
   });
 
@@ -1165,8 +1200,7 @@ export default function (pi: ExtensionAPI) {
   });
   for (const event of ["session_tree", "session_branch"]) {
     onWidened(event, async (_event, ctx) => {
-      if (state.todoSession !== ctx.sessionManager.getSessionId()) await open(ctx);
-      else observeTodoBranch(ctx, true);
+      observeTodoBranch(ctx, true);
     });
   }
   onWidened("session_start", async (_event, ctx) => {

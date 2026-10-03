@@ -2753,30 +2753,50 @@ pub(super) async fn missions_tree(
 }
 
 /// Preserve the latest accepted observation even after its session or incarnation changes.
-pub(super) fn agent_todo(
+pub(super) fn agent_todo_value(
+    claim: Option<&ClaimRecord>,
+    session: Option<&ClaimRecord>,
+    incarnation: Option<&str>,
+) -> Value {
+    let Some(claim) = claim else {
+        return Value::Null;
+    };
+    let snapshot = match st3_schema::HarnessTodoSnapshot::deserialize(
+        claim.body.get("fields").unwrap_or(&claim.body),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(subject = %claim.subject, claim_id = %claim.id, %error,
+                "invalid harness todo observation");
+            return Value::Null;
+        }
+    };
+    let session_fields = session.map(|claim| claim.body.get("fields").unwrap_or(&claim.body));
+    let stale = incarnation != Some(snapshot.incarnation_id.as_str())
+        || session_fields.and_then(|fields| fields["session_id"].as_str())
+            != Some(snapshot.session_id.as_str());
+    json!({
+        "snapshot": snapshot,
+        "claim_id": claim.id,
+        "accepted_at": client_timestamp(claim.accepted_at_unix_ms),
+        "stale": stale,
+    })
+}
+
+#[cfg(test)]
+fn agent_todo(
     store: &Store,
     subject: &str,
     incarnation: Option<&str>,
     index: u64,
 ) -> anyhow::Result<Value> {
-    let latest = |kind| store.latest_observation_at(subject, kind, index);
-    let Some(claim) = latest("harness.todo.observed")? else {
-        return Ok(Value::Null);
-    };
-    let snapshot = st3_schema::HarnessTodoSnapshot::deserialize(
-        claim.body.get("fields").unwrap_or(&claim.body),
-    )?;
-    let session = latest("harness.session-file")?;
-    let session_fields = session.as_ref().map(|claim| claim.body.get("fields").unwrap_or(&claim.body));
-    let stale = incarnation != Some(snapshot.incarnation_id.as_str())
-        || session_fields.and_then(|fields| fields["session_id"].as_str())
-            != Some(snapshot.session_id.as_str());
-    Ok(json!({
-        "snapshot": snapshot,
-        "claim_id": claim.id,
-        "accepted_at": client_timestamp(claim.accepted_at_unix_ms),
-        "stale": stale,
-    }))
+    let observations = store.agent_todo_observations_for(&[subject.to_owned()], index)?;
+    let claims = observations.get(subject);
+    Ok(agent_todo_value(
+        claims.and_then(|claims| claims.get("harness.todo.observed")),
+        claims.and_then(|claims| claims.get("harness.session-file")),
+        incarnation,
+    ))
 }
 
 fn desired_child_arg(value: &Value, name: &str) -> Option<String> {
@@ -8701,12 +8721,14 @@ mod tests {
             "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
             "observed_at":"2026-10-03T09:00:00Z", "source_op":"update",
             "phases":[{"name":"Build","tasks":[{"content":"Deploy","status":"blocked","blocker":"Approval"}]}],
-            "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":1}, "truncated":false
+            "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":1,"abandoned":0}, "truncated":false
         });
         let first = append("harness.todo.observed", snapshot.clone());
-        assert!(crate::store::local_observation_position(&first).is_some());
-        assert_eq!(state.store.index().unwrap(), before);
-        let refreshed = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        assert!(crate::store::local_observation_position(&first).is_none());
+        assert!(state.store.index().unwrap() > before);
+        let old = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        assert!(old.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+        let refreshed = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", first.store_index).unwrap();
         assert_eq!(refreshed.iter().find(|agent| agent["id"] == subject).unwrap()["todo"]["snapshot"], snapshot);
         let first_value = agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
         assert_eq!(first_value["snapshot"], snapshot);
@@ -8729,6 +8751,39 @@ mod tests {
             "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
         }));
         assert_eq!(agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"], true);
+    }
+
+    #[test]
+    fn agent_todo_malformed_claim_does_not_break_agent_list() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/malformed-todo";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("runtime.observed", json!({
+            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+        }));
+        let claim = append("harness.todo.observed", json!({
+            "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
+            "observed_at":"2026-10-03T09:00:00Z", "source_op":"clear",
+            "phases":[], "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
+            "truncated":false
+        }));
+        // Simulate an older or corrupt replicated record beyond the typed writer boundary.
+        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
+        connection.execute(
+            "UPDATE claims SET body=json_set(body, '$.fields.unrecognized', 1) WHERE id=?1",
+            [&claim.id],
+        ).unwrap();
+        let items = client_agent_resources(
+            &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
+        ).unwrap();
+        assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
     }
 
     #[tokio::test]

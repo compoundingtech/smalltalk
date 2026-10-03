@@ -538,8 +538,8 @@ fs.rmSync(outboxPath, { force: true });
 
 // st3's dedicated todo observation is deliberately absent from the legacy st2 asset.
 if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo")) {
-  const totals = (pending = 0, in_progress = 0, completed = 0, blocked = 0) =>
-    ({ pending, in_progress, completed, blocked });
+  const totals = (pending = 0, in_progress = 0, completed = 0, blocked = 0, abandoned = 0) =>
+    ({ pending, in_progress, completed, blocked, abandoned });
   const todos = () => readFrames().filter((frame) => frame.type === "todo");
   const sourceTime = "2026-10-03T12:00:00.000Z";
   const phase = (status = "in_progress", content = "Review", blocker) => [{
@@ -557,11 +557,13 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
       message: { role: "toolResult", toolName: "todo", details: { op: "done" } } },
   ];
   let nativeSession = "session-todo";
+  let branchReads = 0;
   const todoCtx = {
     ...bareCtx,
     sessionManager: {
       getSessionId: () => nativeSession,
-      getBranch: () => branch,
+      getLeafId: () => branch.at(-1)?.id ?? null,
+      getBranch: () => { branchReads++; return branch; },
       // A newer result on a different branch MUST NOT seed this binding.
       getEntries: () => [...branch, toolEntry("unrelated", "block", phase("blocked", "Wrong branch", "No"))],
     },
@@ -598,8 +600,11 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
   await pause(50);
   assert.deepStrictEqual(todos().at(-1).phases, phase("blocked", "Review", "Waiting for approval"));
 
-  // /todo writes a custom entry without emitting an extension event. The channel's bounded
-  // polling interval must observe it even while idle, including an explicit clear.
+  const readsBeforeIdle = branchReads;
+  await pause(2100);
+  assert.strictEqual(branchReads, readsBeforeIdle, "unchanged idle leaf never rebuilds the branch");
+  // /todo writes a custom entry without emitting an extension event. Polling its O(1) leaf
+  // indicator must observe it even while idle, including an explicit clear.
   branch.push({ id: "human", type: "custom", customType: "user_todo_edit", timestamp: sourceTime,
     data: { phases: phase("pending", "Human task") } });
   await pause(1100);
@@ -625,6 +630,15 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
   await handlers.get("session_tree")({}, todoCtx);
   await pause(50);
   assert.deepStrictEqual(todos().at(-1).phases, [], "no branch snapshot clears another branch's work");
+  await handlers.get("agent_start")({}, todoCtx);
+  const beforeBranchMail = handedOver.length;
+  fs.appendFileSync(outboxPath, JSON.stringify({
+    type: "message", deliverAs: "steer", content: "held across branch",
+    meta: { messageId: "message/todo-branch" },
+  }) + "\n");
+  await pause(100);
+  assert.strictEqual(handedOver.length, beforeBranchMail, "branch fixture has a held delivery");
+  const pidsBeforeBranch = fs.readFileSync(pidPath, "utf8");
   nativeSession = "session-todo-next";
   const beforeNewSession = readFrames().length;
   await handlers.get("session_branch")({}, todoCtx);
@@ -634,6 +648,16 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
   assert.strictEqual(newSessionFrames[0].sessionId, nativeSession);
   assert.strictEqual(todos().at(-1).session, nativeSession);
   assert.deepStrictEqual(todos().at(-1).totals, totals());
+  assert.strictEqual(fs.readFileSync(pidPath, "utf8"), pidsBeforeBranch, "branch hydration does not reopen delivery");
+  assert.ok(!newSessionFrames.some((frame) => frame.type === "ready"), "branch hydration does not rerun delivery readiness");
+  assert.strictEqual(handedOver.length, beforeBranchMail, "branch hydration preserves held mail");
+  await handlers.get("agent_end")(successfulEnd, todoCtx);
+  await pause(100);
+  assert.deepStrictEqual(handedOver.at(-1), {
+    content: "held across branch",
+  }, "held mail survives native-session provenance binding");
+  assert.strictEqual(acknowledged().filter((id) => id === "message/todo-branch").length, 1);
+  fs.rmSync(outboxPath, { force: true });
 
   // OMP 18.4.4 eval/js/tool-bridge persists committed nested todo calls through the
   // same user_todo_edit path; the enclosing eval event need not expose nested results.
@@ -653,13 +677,13 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
   const large = Array.from({ length: 17 }, (_, index) => ({
     name: "🦀".repeat(40), tasks: Array.from({ length: index === 0 ? 101 : 1 }, () => ({
       content: "Task", status: "pending", blocker: "Waiting",
-    })),
+    })).concat([{ content: "Dropped", status: "abandoned", blocker: "No longer needed" }]),
   }));
   await execute("init", large);
   await pause(50);
   const bounded = todos().at(-1);
   assert.strictEqual(bounded.truncated, true);
-  assert.deepStrictEqual(bounded.totals, totals(117));
+  assert.deepStrictEqual(bounded.totals, totals(117, 0, 0, 0, 17));
   assert.strictEqual(bounded.phases.length, 16);
   assert.strictEqual(bounded.phases.flatMap((item) => item.tasks).length, 100);
   assert.strictEqual(bounded.phases[0].name, "🦀".repeat(32));
@@ -685,8 +709,15 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
   ] }]);
   await pause(50);
   assert.deepStrictEqual(todos().at(-1).phases, [{ name: "Dropped", tasks: [{ content: "Live", status: "pending" }] }]);
-  assert.deepStrictEqual(todos().at(-1).totals, totals(1));
-  assert.strictEqual(todos().at(-1).truncated, true);
+  assert.deepStrictEqual(todos().at(-1).totals, totals(1, 0, 0, 0, 1));
+  assert.strictEqual(todos().at(-1).truncated, false);
+  await execute("drop", [{ name: "Dropped only", tasks: [
+    { content: "Dropped task", status: "abandoned" },
+  ] }]);
+  await pause(50);
+  assert.deepStrictEqual(todos().at(-1).phases, [{ name: "Dropped only", tasks: [] }]);
+  assert.deepStrictEqual(todos().at(-1).totals, totals(0, 0, 0, 0, 1));
+  assert.strictEqual(todos().at(-1).truncated, false);
   await execute("rm", []);
   await pause(50);
   assert.deepStrictEqual(todos().at(-1).phases, []);

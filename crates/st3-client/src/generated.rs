@@ -956,6 +956,8 @@ pub struct HarnessTodoTotals {
     pub in_progress: u64,
     pub completed: u64,
     pub blocked: u64,
+    #[serde(default)]
+    pub abandoned: u64,
 }
 /// Where a seat's latest suspend or resume stands.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

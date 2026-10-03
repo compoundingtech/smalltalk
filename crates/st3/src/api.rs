@@ -1870,7 +1870,19 @@ fn client_agent_resources(
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
     let mut items = store.cached_agent_resources(snapshot_index, history, || {
-        client_agent_resources_uncached(store, history, snapshot_index)
+        let mut items = client_agent_resources_uncached(store, history, snapshot_index)?;
+        let subjects = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
+        for item in &mut items {
+            let claims = observations.get(item["id"].as_str().unwrap_or_default());
+            item["todo"] = client_v0::agent_todo_value(
+                claims.and_then(|claims| claims.get("harness.todo.observed")),
+                claims.and_then(|claims| claims.get("harness.session-file")),
+                item["incarnation_id"].as_str(),
+            );
+        }
+        Ok(items)
     })?;
     let local_host = client_host_id(store.origin());
     for item in &mut items {
@@ -1878,13 +1890,6 @@ fn client_agent_resources(
             item["updated_at"] = Value::String(at.to_owned());
         }
         overlay_delivery_presence(item, &local_host);
-        // Latest-retention local observations can advance without changing the graph cache key.
-        item["todo"] = client_v0::agent_todo(
-            store,
-            item["id"].as_str().unwrap_or_default(),
-            item["incarnation_id"].as_str(),
-            snapshot_index,
-        )?;
     }
     overlay_subagents(store, &mut items)?;
     Ok(items)
