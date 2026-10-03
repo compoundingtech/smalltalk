@@ -195,6 +195,7 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                             )
                             .collect(),
                         step: step.clone().unwrap_or_default(),
+                        feedback: item.review_mode.as_deref() == Some("feedback"),
                     },
                 ),
                 "launch-approval" => (

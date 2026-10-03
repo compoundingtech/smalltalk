@@ -366,6 +366,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work", get(client_work))
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
+        .route("/v1/client/resources", get(client_v0::resources::list))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
         .route(
             "/v1/client/agent-declarations/{*id}",
@@ -1097,6 +1098,14 @@ fn client_error_code(code: Option<&str>) -> String {
         | "missing-ask-owner"
         | "ambiguous-ask-owner"
         | "update-not-asked" => "validation-failed".into(),
+        // A review refusal says why in its message: answered and by whom, or what moved on.
+        "review-not-requested"
+        | "review-target-unknown"
+        | "review-decision-not-offered"
+        | "missing-review-reason"
+        | "invalid-review-decision"
+        | "feedback-gate-needs-step" => "validation-failed".into(),
+        "wrong-reviewer" => "forbidden".into(),
         "stale-work-ask"
         | "stale-subject"
         | "missing-subject-token"
@@ -2542,6 +2551,16 @@ fn insert_attention_target_states(
     Ok(())
 }
 
+/// An attention card's ID: its source, recipient and waiting episode. A source asked again
+/// (a human gate's new request, a person step's new episode) gets a new card.
+fn client_attention_id(subject: &str, person: &str, episode: &str) -> anyhow::Result<String> {
+    let identity = serde_json::to_vec(&(subject, person, episode))?;
+    Ok(format!(
+        "attention/{}",
+        &hex::encode(Sha256::digest(identity))[..32]
+    ))
+}
+
 fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
@@ -2550,8 +2569,7 @@ fn client_attention_resources(
     let current = store.attention_snapshot(person, client_now_ms())?;
     let mut resources = Vec::new();
     for item in current {
-        let identity = serde_json::to_vec(&(&item.subject, &item.person, &item.episode))?;
-        let id = format!("attention/{}", &hex::encode(Sha256::digest(identity))[..32]);
+        let id = client_attention_id(&item.subject, &item.person, &item.episode)?;
         let mut resource = json!({
             "id": id, "kind": "attention", "attention_kind": item.kind,
             "source_id": item.subject, "source_kind": item.kind, "episode": item.episode,
@@ -9454,6 +9472,97 @@ async fn withdraw_attention(
     )))
 }
 
+/// The owner a review decision answers. A step, mission or loop run, or a resource, answers for
+/// itself. An `attention/...` card or a `gate-operation/...` request names its gate's owner, and
+/// a bare `GENERATION/PATH` a step run. Anything else is refused as naming no review, rather
+/// than read as a step run that has none.
+fn review_owner(state: &AppState, target: &str) -> Result<String, ApiError> {
+    if ["resource/", "step-run/", "mission-run/", "loop-run/"]
+        .iter()
+        .any(|prefix| target.starts_with(prefix))
+    {
+        return Ok(target.to_owned());
+    }
+    let unknown = |why: String| ApiError::bad(St3Error::new("review-target-unknown", why));
+    if target.starts_with("attention/") {
+        if let Some(card) = client_attention_resources(&state.store, None, false)
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .find(|card| card["id"] == target)
+        {
+            return match (card["attention_kind"].as_str(), card["source_id"].as_str()) {
+                (Some("human-gate"), Some(owner)) => Ok(owner.to_owned()),
+                (kind, _) => Err(unknown(format!(
+                    "`{target}` is a {} card, not a review; answer it where it asks",
+                    kind.unwrap_or("different")
+                ))),
+            };
+        }
+        // A gate's card closes once it is answered or asked again. Say which, for its owner.
+        for (request, owner, reviewer) in state
+            .store
+            .human_gate_requests()
+            .map_err(ApiError::internal)?
+        {
+            if client_attention_id(&owner, &reviewer, &request).map_err(ApiError::internal)?
+                != target
+            {
+                continue;
+            }
+            let current = state
+                .store
+                .pending_human_reviews(Some(&reviewer))
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .find(|review| review.owner == owner);
+            let why = match current {
+                Some(review) => format!(
+                    "st asked `{owner}` again as `{}`; review that card",
+                    client_attention_id(&owner, &review.reviewer, &review.request)
+                        .map_err(ApiError::internal)?
+                ),
+                None => format!(
+                    "`{owner}` has no pending human review: {}",
+                    state
+                        .store
+                        .human_review_refusal(&owner)
+                        .map_err(ApiError::internal)?
+                ),
+            };
+            return Err(ApiError::bad(St3Error::new(
+                "review-not-requested",
+                format!("`{target}` is not open: {why}"),
+            )));
+        }
+        return Err(unknown(format!("`{target}` names no review card")));
+    }
+    if target.starts_with("gate-operation/") {
+        return state
+            .store
+            .claims_for(target, Some("gate.requested"))
+            .map_err(ApiError::internal)?
+            .last()
+            .and_then(|request| request.body.pointer("/fields/owner"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| unknown(format!("`{target}` names no gate request")));
+    }
+    let step = format!("step-run/{target}");
+    if target.contains('/')
+        && state
+            .store
+            .step_run(&step)
+            .map_err(ApiError::internal)?
+            .is_some()
+    {
+        return Ok(step);
+    }
+    Err(unknown(format!(
+        "`{target}` names no step run, mission run, loop or attention card; \
+         `st attention ls --as PERSON` lists the reviews waiting"
+    )))
+}
+
 async fn post_review(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
@@ -9479,14 +9588,7 @@ async fn post_review(
             "a rejection or request for changes needs a reason",
         )));
     }
-    let subject = if subject.starts_with("resource/")
-        || subject.starts_with("step-run/")
-        || subject.starts_with("mission-run/")
-    {
-        subject
-    } else {
-        format!("step-run/{subject}")
-    };
+    let subject = review_owner(&state, &subject)?;
     let actor = request.actor.map(|actor| {
         if actor.contains('/') {
             actor
@@ -9494,20 +9596,26 @@ async fn post_review(
             format!("person/{actor}")
         }
     });
-    let review_request = if subject.starts_with("step-run/") || subject.starts_with("mission-run/")
+    let review_request = if subject.starts_with("step-run/")
+        || subject.starts_with("mission-run/")
+        || subject.starts_with("loop-run/")
     {
         let pending = state
             .store
             .pending_human_reviews(None)
             .map_err(ApiError::internal)?
             .into_iter()
-            .find(|review| review.owner == subject)
-            .ok_or_else(|| {
-                ApiError::bad(St3Error::new(
-                    "review-not-requested",
-                    format!("`{subject}` has no pending human review"),
-                ))
-            })?;
+            .find(|review| review.owner == subject);
+        let Some(pending) = pending else {
+            let why = state
+                .store
+                .human_review_refusal(&subject)
+                .map_err(ApiError::internal)?;
+            return Err(ApiError::bad(St3Error::new(
+                "review-not-requested",
+                format!("`{subject}` has no pending human review: {why}"),
+            )));
+        };
         let review_request = state
             .store
             .claim_by_id(&pending.request)
@@ -10797,12 +10905,14 @@ async fn revise_mission_run(
             planned.blockers.join("; "),
         )));
     }
+    // The revision records its publisher: a broken gate in it raises attention for them.
     state
         .store
-        .apply(
+        .apply_as(
             &publication,
             &planned.subject_tokens,
             &format!("{}:publish", request.idempotency_key),
+            Some(&actor),
         )
         .map_err(ApiError::bad)?;
     // A failed run has no active work to drain, so it adopts an unreviewed revision now.

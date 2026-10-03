@@ -787,14 +787,14 @@ impl Client {
         self.list_internal_with_filters(collection, cursor, limit, history, &[])
             .await
     }
-    async fn list_internal_with_filters(
+    async fn list_internal_with_filters<T: DeserializeOwned>(
         &self,
         collection: &str,
         cursor: Option<&str>,
         limit: Option<usize>,
         history: bool,
         filters: &[(&str, &str)],
-    ) -> Result<Envelope<Page>, ClientError> {
+    ) -> Result<Envelope<T>, ClientError> {
         let mut query = Vec::new();
         if let Some(cursor) = cursor {
             query.push(format!("cursor={}", percent_encode(cursor)));
@@ -1244,6 +1244,28 @@ impl Client {
     }
     pub async fn work_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("work", id).await
+    }
+    pub async fn resources_list(
+        &self,
+        filters: &ResourcesFilter,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<ResourcesPage>, ClientError> {
+        let values = [
+            ("opened_by", filters.opened_by.as_deref()),
+            ("kind", filters.kind.as_deref()),
+            ("subject_prefix", filters.subject_prefix.as_deref()),
+        ];
+        let mut filters = [("", ""); 3];
+        let mut count = 0;
+        for (name, value) in values {
+            if let Some(value) = value {
+                filters[count] = (name, value);
+                count += 1;
+            }
+        }
+        self.list_internal_with_filters("resources", cursor, limit, false, &filters[..count])
+            .await
     }
     pub async fn agents_list(
         &self,
