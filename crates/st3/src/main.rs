@@ -7833,6 +7833,41 @@ fn render_performance(view: &Value) -> String {
             out.push('\n');
         }
     }
+    if let Some(corrections) = view["incremental_corrections"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        let _ = writeln!(
+            out,
+            "INCREMENTAL CORRECTIONS  count · item (writes an incremental pass would have missed; each is a bug)"
+        );
+        for row in corrections {
+            let _ = writeln!(
+                out,
+                "  {}  {}",
+                row["count"],
+                row["item"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    if let Some(evaluations) = view["incremental_evaluations"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        let _ = writeln!(
+            out,
+            "RECONCILE EVALUATIONS  count · CPU ms · item · whether an incremental pass would run it"
+        );
+        for row in evaluations {
+            let _ = writeln!(
+                out,
+                "  {}  {:.1}  {}",
+                row["count"],
+                row["cpu_ms"].as_f64().unwrap_or(0.0),
+                row["item"].as_str().unwrap_or("?")
+            );
+        }
+    }
     if let Some(wakes) = view["reconciler_wakes"].as_array() {
         let _ = writeln!(
             out,

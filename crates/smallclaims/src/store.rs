@@ -4008,6 +4008,7 @@ impl Store {
     /// index, however many commits land meanwhile. A nested call joins the outer snapshot.
     /// The latest claim of a subject, or of one kind of it, in canonical order.
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
+        crate::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         // With a kind, walk the accepted-time index newest first and sort only claims accepted in
         // the same millisecond, as `newest_claims_of_kind_query` does. Sorting every claim of the
@@ -4299,6 +4300,7 @@ impl Store {
     }
 
     pub fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
+        crate::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         // One statement with `(?2 IS NULL OR kind=?2)` hides the kind from the planner, which then
         // reads every claim of the subject to test it. A busy agent holds thousands of observations,
@@ -4317,6 +4319,7 @@ impl Store {
     }
 
     pub fn latest_document_hash(&self, name: &str) -> Result<Option<String>> {
+        crate::touched::note_read(|| name.to_owned());
         let connection = self.readers.get();
         connection
             .query_row(

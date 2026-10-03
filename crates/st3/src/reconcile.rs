@@ -505,6 +505,10 @@ pub struct Reconciler<R = NativeRuntime> {
     gate_poll_armed: Arc<AtomicBool>,
     /// The gate runners the gate poll watches.
     gate_poll_runtimes: Arc<Mutex<BTreeSet<String>>>,
+    /// What each item's last evaluation read, so a pass can tell what a change affects.
+    incremental: crate::incremental::Incremental,
+    /// Fail a pass that makes a correction an incremental pass would have missed (tests).
+    strict_incremental: bool,
     /// The wake each running step has armed for its timeout or lease expiry, by step subject.
     step_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
@@ -618,6 +622,8 @@ impl Reconciler<NativeRuntime> {
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
             gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
+            incremental: Default::default(),
+            strict_incremental: false,
             step_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
@@ -668,6 +674,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             gate_poll_armed: Arc::new(AtomicBool::new(false)),
             gate_poll_runtimes: Arc::new(Mutex::new(BTreeSet::new())),
+            incremental: Default::default(),
+            strict_incremental: true,
             step_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
@@ -1337,6 +1345,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
+        self.incremental.observe(&self.store)?;
         for runner in self.store.mission_gate_runners()? {
             if runner.retired && runner.host == self.host {
                 let _ = self.isolate("gate", &runner.subject, || {
@@ -4541,6 +4550,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn arm_restart(&self, subject: &str, until: u128) {
+        smallclaims::touched::note_due(until);
         let mut armed = self
             .delayed_restarts
             .lock()
@@ -4627,21 +4637,73 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// Evaluate each active run on its own. A run that fails records a fault on that run, and
     /// every other run, including runs in cleanup, is still evaluated in the same pass.
     fn evaluate_mission_runs(&self) -> Result<()> {
+        self.incremental.observe(&self.store)?;
+        // A gate runner's exit is not a claim: look again at the runners evaluations wait on.
+        self.incremental.observe_execs(|runtime_id| {
+            self.runtime
+                .observe_exec(runtime_id)
+                .ok()
+                .flatten()
+                .map(|observation| observation.status)
+        });
         let ids = self.store.active_mission_run_ids_for_origin(&self.host)?;
         let mut active_generations = BTreeSet::new();
         let mut active_steps = BTreeSet::new();
         let mut changed = false;
         for id in &ids {
             let subject = format!("mission-run/{id}");
-            changed |= self
-                .isolate("mission-run", &subject, || {
-                    let run = self.store.mission_run_for_reconcile(id)?;
-                    active_generations.insert(run.generation.clone());
-                    active_steps.extend(run.steps.iter().map(|step| step.subject.clone()));
-                    self.evaluate_active_mission_run(&run)
+            let needed = self.incremental.needs(&subject, now_ms());
+            let cpu_started = crate::incremental::thread_cpu();
+            let writes = smallclaims::touched::writes();
+            let feed_before =
+                (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+            let mut due = None;
+            let ((evaluated, armed), reads) = smallclaims::touched::record(|| {
+                smallclaims::touched::record_due(|| {
+                    self.isolate("mission-run", &subject, || {
+                        let run = self.store.mission_run_for_reconcile(id)?;
+                        active_generations.insert(run.generation.clone());
+                        active_steps.extend(run.steps.iter().map(|step| step.subject.clone()));
+                        // From the view the evaluation started with: a write it makes changes subjects
+                        // it read, so the next pass evaluates it again and takes the new times.
+                        due = crate::incremental::run_due(&run, now_ms());
+                        self.evaluate_active_mission_run(&run)
+                    })
                 })
-                .unwrap_or(false);
+            });
+            due = match (due, armed) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            changed |= evaluated.unwrap_or(false);
+            crate::performance::record_evaluation(
+                "mission-run",
+                needed,
+                crate::incremental::thread_cpu().saturating_sub(cpu_started),
+            );
+            if !needed && smallclaims::touched::writes() > writes {
+                let wrote: Vec<String> = feed_before
+                    .and_then(Result::ok)
+                    .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
+                    .map(|feed| {
+                        feed.changes
+                            .iter()
+                            .map(|change| format!("{} {}", change.kind, change.subject))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                // Rows that are not claims or observations (caches, capabilities) change no
+                // graph state a later pass would have to catch up with.
+                if !wrote.is_empty() {
+                    self.incremental_correction("mission-run", &subject, &reads, &wrote);
+                }
+            }
+            self.incremental.evaluated(&subject, reads, due);
         }
+        self.incremental.retain(
+            "mission-run/",
+            &ids.iter().map(|id| format!("mission-run/{id}")).collect(),
+        );
         self.materialized_mission_generations
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -4673,6 +4735,26 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.signal_changed();
         }
         Ok(())
+    }
+
+    /// An evaluation of `subject` wrote although nothing it read had changed and nothing was due:
+    /// an incremental pass would have missed this write. Counted, and in tests a failure.
+    fn incremental_correction(
+        &self,
+        item: &str,
+        subject: &str,
+        reads: &BTreeSet<String>,
+        wrote: &[String],
+    ) {
+        crate::performance::record_correction(item);
+        eprintln!(
+            "st3: incremental correction: {subject} wrote {wrote:?} with no change among {} reads",
+            reads.len()
+        );
+        assert!(
+            !self.strict_incremental,
+            "an incremental pass would have missed a write by {subject}: it wrote {wrote:?}; its reads: {reads:?}"
+        );
     }
 
     fn evaluate_active_mission_run(&self, run: &MissionRunView) -> Result<bool> {
@@ -6226,6 +6308,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.stop_gate_runner(&subject, true)?;
                 anyhow::bail!("metric `{}` exceeded {}ms", metric.name, time_limit_ms);
             }
+            smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
             match self.runtime.observe_exec(&runtime_id)? {
                 Some(observation) if observation.status == "running" => {
                     self.arm_gate_poll(&runtime_id);
@@ -8687,6 +8770,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn arm_step_deadline(&self, handle: &tokio::runtime::Handle, step: &str, remaining: u64) {
         let now = now_ms();
         let deadline = now.saturating_add(u128::from(remaining));
+        smallclaims::touched::note_due(deadline);
         {
             let mut armed = self
                 .step_deadlines
@@ -10289,6 +10373,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if elapsed >= *duration_ms as u128 {
                     GateOutcome::Fail(format!("deadline expired after {duration_ms}ms"))
                 } else {
+                    smallclaims::touched::note_due(
+                        stage
+                            .started_at_unix_ms
+                            .saturating_add(*duration_ms as u128),
+                    );
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         let notify = self.notify.clone();
                         let remaining = (*duration_ms as u128).saturating_sub(elapsed) as u64;
@@ -10455,6 +10544,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )?;
                 return Ok(GateOutcome::Fail(reason));
             }
+            smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
             match self.runtime.observe_exec(&runtime_id)? {
                 Some(observation) if observation.status == "running" => {
                     self.arm_gate_poll(&runtime_id);
@@ -10561,6 +10651,8 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// exec state and runs a full pass when one is no longer running: a pass every ten seconds for
     /// as long as a long gate ran was most of an idle member's reconcile work.
     fn arm_gate_poll(&self, runtime_id: &str) {
+        // The runner's exit is not a claim; poll the evaluation that is waiting for it.
+        smallclaims::touched::note_due(now_ms().saturating_add(GATE_POLL_INTERVAL.as_millis()));
         self.gate_poll_runtimes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -10665,8 +10757,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     now_ms().saturating_sub(requested.accepted_at_unix_ms)
                         >= u128::from(time_limit_ms)
                 });
+            smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
             match self.runtime.observe_exec(&runtime_id)? {
                 Some(observation) if observation.status == "running" && !timed_out => {
+                    smallclaims::touched::note_due(now_ms().saturating_add(100));
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         let notify = self.notify.clone();
                         handle.spawn(async move {
@@ -10751,6 +10845,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                     "LLM gate `{name}` exceeded {time_limit_ms}ms"
                 )));
             }
+            smallclaims::touched::note_due(
+                requested
+                    .accepted_at_unix_ms
+                    .saturating_add(time_limit_ms as u128),
+            );
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let notify = self.notify.clone();
                 let remaining = (time_limit_ms as u128).saturating_sub(elapsed) as u64;
@@ -10851,6 +10950,7 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn stop_gate_runner(&self, subject: &str, hard: bool) -> Result<()> {
         let runtime_id = subject.replace('/', ".");
+        smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
         let Some(observation) = self.runtime.observe_exec(&runtime_id)? else {
             return Ok(());
         };
