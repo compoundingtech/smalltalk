@@ -13203,6 +13203,73 @@ impl Store {
         check_mailbox_fence(&self.readers.get(), fence)
     }
 
+    /// What a mailbox stream's snapshot can depend on, read before the snapshot is taken. A change
+    /// after it to any of that brings a new snapshot; see [`Store::mailbox_changed_since`].
+    pub(crate) fn mailbox_watermark(
+        &self,
+        fence: &crate::mailbox::Fence,
+    ) -> Result<MailboxWatermark, St3Error> {
+        let index = self.index().map_err(internal)?;
+        let connection = self.readers.get();
+        let local = connection
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM local_observations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        Ok(MailboxWatermark {
+            index,
+            local,
+            owner: mailbox_owner_key(&connection, fence)?,
+        })
+    }
+
+    /// Whether anything a mailbox stream's snapshot reads changed after `mark`: a claim or local
+    /// observation of the seat (its declaration, runtime and harness), its channel ownership, a
+    /// message sent to it or newly declared, or a claim of a message in its last snapshot. Every
+    /// graph change wakes every stream, and each used to read the seat's whole mailbox again.
+    pub(crate) fn mailbox_changed_since(
+        &self,
+        fence: &crate::mailbox::Fence,
+        mark: &MailboxWatermark,
+        messages: &[String],
+    ) -> Result<bool, St3Error> {
+        let connection = self.readers.get();
+        let recipient = normalize_message_party(&fence.subject);
+        let bare_recipient = recipient
+            .strip_prefix("agent/")
+            .filter(|suffix| !suffix.contains('/'))
+            .unwrap_or(&recipient)
+            .to_owned();
+        let changed: i64 = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND store_index>?2)
+                     OR EXISTS(SELECT 1 FROM claims INDEXED BY claims_message_to_order_index
+                               WHERE kind='message.sent'
+                                 AND json_extract(body, '$.fields.to') IN (?3, ?4)
+                                 AND store_index>?2)
+                     OR EXISTS(SELECT 1 FROM claims
+                               WHERE subject IN (SELECT value FROM json_each(?5))
+                                 AND store_index>?2)
+                     OR EXISTS(SELECT 1 FROM claims
+                               WHERE kind='intent.desired' AND store_index>?2
+                                 AND subject GLOB 'message/*')
+                     OR EXISTS(SELECT 1 FROM local_observations WHERE subject=?1 AND id>?6)",
+                params![
+                    fence.subject,
+                    mark.index,
+                    recipient,
+                    bare_recipient,
+                    serde_json::to_string(messages).map_err(internal)?,
+                    mark.local,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        Ok(changed != 0 || mailbox_owner_key(&connection, fence)? != mark.owner)
+    }
+
     pub fn current_harness(
         &self,
         subject: &str,
@@ -17572,6 +17639,31 @@ fn mailbox_harness_ended(
         }
     }
     Ok(true)
+}
+
+/// See [`Store::mailbox_watermark`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MailboxWatermark {
+    index: u64,
+    local: i64,
+    owner: Option<(String, i64, bool)>,
+}
+
+/// The seat channel's current owner, and whether `fence`'s binding still exists.
+fn mailbox_owner_key(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+) -> Result<Option<(String, i64, bool)>, St3Error> {
+    connection
+        .query_row(
+            "SELECT owner.incarnation, owner.epoch,
+                    EXISTS(SELECT 1 FROM local_mailbox_bindings WHERE token=?3)
+             FROM local_mailbox_owners owner WHERE owner.subject=?1 AND owner.component=?2",
+            params![fence.subject, fence.component, fence.token],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(internal)
 }
 
 fn check_mailbox_fence(
