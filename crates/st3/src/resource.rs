@@ -10,6 +10,7 @@ use anyhow::{Context as _, Result, bail};
 /// What the built-in `merged` and `ci-passed` gates read from GitHub.
 pub mod github_gates;
 mod github_repository;
+pub(crate) use github_repository::{RECENT_COMMENTS, merge_recent_comments};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -32,6 +33,10 @@ pub struct ProviderObservation {
     pub cursor: Option<String>,
     pub next_check_unix_ms: u128,
 }
+
+/// A provider that asks to be polled again within this many milliseconds continues work it could
+/// not finish in one poll, so an observer's declared interval does not delay it.
+pub const PROVIDER_CONTINUE_MS: u128 = 1_000;
 
 /// GitHub refused a request until a known time: a primary or secondary rate limit. It clears
 /// on its own at `retry_at_unix_ms`.
