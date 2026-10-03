@@ -3904,10 +3904,34 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 .unwrap_or("the driver could not resume the native session")
                                 .to_owned(),
                         ),
-                        None => (
-                            "resume-exited".into(),
-                            "the resumed seat exited before it bound its native session".into(),
-                        ),
+                        // Without the driver's refusal, the harness's own last word says why it
+                        // ended: its driver reports the reason on `harness.observed`.
+                        None => match self
+                            .store
+                            .latest_observation(agent, "harness.observed")?
+                            .filter(|claim| {
+                                claim.accepted_at_unix_ms >= suspension.requested_at_unix_ms
+                                    && claim.body.pointer("/fields/state").and_then(Value::as_str)
+                                        == Some("ended")
+                            })
+                            .and_then(|claim| {
+                                claim
+                                    .body
+                                    .pointer("/fields/reason")
+                                    .and_then(Value::as_str)
+                                    .filter(|reason| !reason.is_empty())
+                                    .map(str::to_owned)
+                            }) {
+                            Some(reason) => (
+                                "harness-refused".into(),
+                                format!("the harness ended before it bound the session: {reason}"),
+                            ),
+                            None => (
+                                "resume-exited".into(),
+                                "the resumed seat exited before it bound its native session"
+                                    .into(),
+                            ),
+                        },
                     };
                     self.fail_suspension(agent, suspension, &code, reason, Vec::new())
                 } else if overdue {
