@@ -179,7 +179,10 @@ impl WriterConnection {
             (Some(Err(panic)), _) => std::panic::resume_unwind(panic),
             (Some(Ok(result)), Ok(())) => {
                 crate::touched::note_writes(changed_rows.load(Ordering::Relaxed));
-                for entry in wrote_rows.into_inner().unwrap_or_else(PoisonError::into_inner) {
+                for entry in wrote_rows
+                    .into_inner()
+                    .unwrap_or_else(PoisonError::into_inner)
+                {
                     crate::touched::note_wrote(|| entry);
                 }
                 Ok(result)

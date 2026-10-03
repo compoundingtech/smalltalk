@@ -487,7 +487,10 @@ mod tests {
                 .unwrap();
         });
         assert_eq!(wrote, ["resource.observed resource/own"]);
-        assert!(smallclaims::touched::wrote_since(0).is_empty(), "nothing records outside it");
+        assert!(
+            smallclaims::touched::wrote_since(0).is_empty(),
+            "nothing records outside it"
+        );
     }
 
     #[test]

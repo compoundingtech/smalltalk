@@ -63,7 +63,9 @@ pub fn record_wrote<T>(work: impl FnOnce() -> T) -> (T, Vec<String>) {
             });
         }
     }
-    let scope = Scope(Some(WROTE.with(|wrote| wrote.borrow_mut().replace(Vec::new()))));
+    let scope = Scope(Some(
+        WROTE.with(|wrote| wrote.borrow_mut().replace(Vec::new())),
+    ));
     let result = work();
     let wrote = WROTE.with(|wrote| wrote.borrow().clone().unwrap_or_default());
     drop(scope);
