@@ -1,3 +1,3 @@
-export * from './Models.generated';
-export * from './Client.generated';
-export * from './errors';
+export * from './Models.generated.ts';
+export * from './Client.generated.ts';
+export * from './errors.ts';
