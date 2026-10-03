@@ -10,7 +10,10 @@ use alacritty_terminal::index::{Column, Line as GridLine, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode, viewport_to_point};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{
+    Color as AnsiColor, CursorShape, CursorStyle, NamedColor, Processor,
+};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pty_client::connection::{SessionConnection, SessionEvent};
 use ratatui::buffer::Buffer;
@@ -97,6 +100,8 @@ impl Screen {
     fn new(size: Size, requests: Requests) -> Self {
         let config = Config {
             scrolling_history: HISTORY,
+            // A shape no program can ask for, so stui can tell when none did.
+            default_cursor_style: UNASKED,
             ..Config::default()
         };
         Self {
@@ -389,8 +394,9 @@ impl NativeTerminal {
             .is_some_and(|at| at.elapsed() < Duration::from_millis(250))
     }
 
-    /// Draw the screen, or the history scrolled to, into `area`.
-    pub(crate) fn draw(&self, buf: &mut Buffer, area: Rect) {
+    /// Draw the screen, or the history scrolled to, into `area`. With `real_cursor` the cursor
+    /// is not drawn but returned, for the person's own terminal cursor to show it.
+    pub(crate) fn draw(&self, buf: &mut Buffer, area: Rect, real_cursor: bool) -> Option<Cursor> {
         let screen = self.lock();
         let grid = screen.term.grid();
         let offset = grid.display_offset() as i32;
@@ -432,20 +438,60 @@ impl NativeTerminal {
             }
             buf.set_line(area.x, area.y + row as u16, &Line::from(spans), area.width);
         }
-        // The cursor, when the bottom is shown and the program shows it.
+        // The cursor, when the bottom is shown and the program shows it: the person's own
+        // terminal cursor where it has the keys, so it keeps the shape the program asked for
+        // (vim's bar while inserting), blinks, and places an input method's text; otherwise
+        // an inverted cell.
         let point = grid.cursor.point;
-        let shape = screen.term.cursor_style().shape;
+        let style = screen.term.cursor_style();
         if offset == 0
             && screen.ended.is_none()
             && screen.term.mode().contains(TermMode::SHOW_CURSOR)
-            && shape != CursorShape::Hidden
+            && style.shape != CursorShape::Hidden
             && let (Ok(row), column) = (u16::try_from(point.line.0), point.column.0)
             && row < area.height
             && column < usize::from(area.width)
-            && let Some(cell) = buf.cell_mut((area.x + column as u16, area.y + row))
         {
-            cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            let (x, y) = (area.x + column as u16, area.y + row);
+            if real_cursor {
+                return Some(Cursor {
+                    x,
+                    y,
+                    style: cursor_style(style.shape, style.blinking),
+                });
+            }
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
         }
+        None
+    }
+}
+
+/// The cursor style until a program asks for one: the person's own shape is kept then.
+const UNASKED: CursorStyle = CursorStyle {
+    shape: CursorShape::HollowBlock,
+    blinking: false,
+};
+
+/// Where the terminal's own cursor goes on the screen, and its shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cursor {
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) style: SetCursorStyle,
+}
+
+/// The person's terminal cursor for the shape a program asked of its own.
+fn cursor_style(shape: CursorShape, blinking: bool) -> SetCursorStyle {
+    match (shape, blinking) {
+        (CursorShape::HollowBlock, _) => SetCursorStyle::DefaultUserShape,
+        (CursorShape::Beam, true) => SetCursorStyle::BlinkingBar,
+        (CursorShape::Beam, false) => SetCursorStyle::SteadyBar,
+        (CursorShape::Underline, true) => SetCursorStyle::BlinkingUnderScore,
+        (CursorShape::Underline, false) => SetCursorStyle::SteadyUnderScore,
+        (_, true) => SetCursorStyle::BlinkingBlock,
+        (_, false) => SetCursorStyle::SteadyBlock,
     }
 }
 
@@ -853,7 +899,7 @@ mod tests {
         let shown = |terminal: &NativeTerminal| {
             let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
             let area = buf.area;
-            terminal.draw(&mut buf, area);
+            terminal.draw(&mut buf, area, false);
             buf.content
                 .iter()
                 .map(|cell| cell.symbol())
@@ -906,7 +952,7 @@ mod tests {
         let drawn = |terminal: &NativeTerminal| {
             let mut buf = Buffer::empty(Rect::new(0, 0, 10, 4));
             let area = buf.area;
-            terminal.draw(&mut buf, area);
+            terminal.draw(&mut buf, area, false);
             buf
         };
         let (stui, mut daemon) = UnixStream::pair().unwrap();
@@ -1012,7 +1058,7 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, 20, 4));
             {
                 let area = buf.area;
-                terminal.draw(&mut buf, area);
+                terminal.draw(&mut buf, area, false);
             }
             buf.content
                 .iter()
@@ -1023,7 +1069,7 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 4));
         {
             let area = buf.area;
-            terminal.draw(&mut buf, area);
+            terminal.draw(&mut buf, area, false);
         }
         assert_eq!(buf[(0, 1)].symbol(), "w");
         assert!(buf[(0, 1)].modifier.contains(Modifier::BOLD));
@@ -1050,7 +1096,7 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, 40, 10));
             {
                 let area = buf.area;
-                terminal.draw(&mut buf, area);
+                terminal.draw(&mut buf, area, false);
             }
             buf.content
                 .iter()

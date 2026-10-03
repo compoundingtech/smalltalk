@@ -335,6 +335,9 @@ pub struct Ui {
     pub(crate) terminal_size: Cell<(u16, u16)>,
     /// Where the attached terminal's screen was last drawn, for its mouse.
     terminal_body: Cell<Option<Rect>>,
+    /// Where the attached terminal's cursor is on screen and its shape, when the terminal has
+    /// the keys: the person's own cursor shows it.
+    terminal_cursor: Cell<Option<pty::Cursor>>,
     /// Whether a drag is selecting in the attached terminal.
     terminal_selecting: bool,
     /// The last press in the attached terminal, where and when, and how many in a row: a
@@ -418,6 +421,7 @@ impl Ui {
             cursor: edit::Cursor::default(),
             terminal_size: Cell::new((24, 80)),
             terminal_body: Cell::new(None),
+            terminal_cursor: Cell::new(None),
             terminal_selecting: false,
             terminal_press: None,
             anchors: RefCell::new(HashMap::new()),
@@ -874,6 +878,7 @@ impl Ui {
         let area = frame.area();
         let buf = frame.buffer_mut();
         *self.frame.borrow_mut() = FrameInfo::default();
+        self.terminal_cursor.set(None);
         buf.set_style(area, Style::default().bg(theme::BASE).fg(theme::TEXT));
         if area.width < 20 || area.height < 6 {
             buf.set_stringn(
@@ -912,6 +917,14 @@ impl Ui {
         if self.help {
             self.draw_help(buf, area);
         }
+        if let Some(cursor) = self.terminal_cursor.get() {
+            frame.set_cursor_position((cursor.x, cursor.y));
+        }
+    }
+
+    /// The shape for the person's cursor: the attached terminal's while it has the keys.
+    pub(crate) fn cursor_style(&self) -> Option<crossterm::cursor::SetCursorStyle> {
+        self.terminal_cursor.get().map(|cursor| cursor.style)
     }
 
     /// The sidebar and the main area under the top bar.
@@ -2272,7 +2285,12 @@ impl Ui {
                 .set((body.height.max(1), body.width.max(1)));
             self.terminal_body.set(Some(body));
             native.fit(body.height, body.width);
-            native.draw(buf, body);
+            // The person's own cursor only where nothing is drawn over the terminal.
+            let real = self.terminal_focused()
+                && !self.help
+                && self.popover.is_none()
+                && !self.palette_open();
+            self.terminal_cursor.set(native.draw(buf, body, real));
             return;
         }
         let header = format!(" ← Return · Ctrl+\\   {}", view.title);
@@ -4828,6 +4846,7 @@ impl Drop for Guard {
         }
         let _ = execute!(
             io::stdout(),
+            crossterm::cursor::SetCursorStyle::DefaultUserShape,
             crossterm::event::DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen

@@ -5081,6 +5081,27 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // The person's own cursor stands where the shell's is, in the shape the program asks.
+        let body = ui.terminal_body.get().unwrap();
+        let cursor = ui.terminal_cursor.get().expect("the terminal has the keys");
+        assert_eq!((cursor.x, cursor.y), (body.x + 9, body.y + 1));
+        assert_eq!(
+            ui.cursor_style(),
+            Some(crossterm::cursor::SetCursorStyle::DefaultUserShape),
+            "the person's own shape until the program asks for one"
+        );
+        daemon
+            .write_all(&encode_packet(MessageType::Data, b"\x1b[6 q"))
+            .unwrap();
+        while ui.cursor_style() != Some(crossterm::cursor::SetCursorStyle::SteadyBar) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            screen(&ui);
+        }
+        // Under help the cursor is hidden; help is drawn over the terminal.
+        ui.help = true;
+        screen(&ui);
+        assert_eq!(ui.terminal_cursor.get(), None);
+        ui.help = false;
         // Ctrl+C reaches the shell at once.
         ctrl(&mut ui, 'c');
         let mut packet = next(&mut daemon);
