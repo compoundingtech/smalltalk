@@ -102,6 +102,8 @@ The accepted/refused result and replay invariants above apply to these rows.
 | Command | Verification | Test evidence |
 | --- | --- | --- |
 | `st activity` | real CLI over private Unix socket; disk store reopened between actions | [`cli_reads_preserve_operational_views_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
+| `st admission override` | real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child | [`person_admission_exception_is_local_reversible_and_never_spawns_the_producer`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/client_v0_cli.rs) |
+| `st admission revoke` | real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child | [`person_admission_exception_is_local_reversible_and_never_spawns_the_producer`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/client_v0_cli.rs) |
 | `st agents apply` | real CLI over private Unix socket; disk store reopened between actions | [`cli_agent_and_shell_declarations_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents hold` | real CLI over private Unix socket; disk store reopened between actions | [`cli_local_skill_completions_holds_and_repairs_use_private_files`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents ls` | real CLI over private Unix socket; disk store reopened between actions | [`cli_reads_preserve_operational_views_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
