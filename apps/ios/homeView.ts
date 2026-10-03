@@ -7,16 +7,17 @@ import { theme } from './theme';
 // how urgently someone is waiting. Messages stay in conversations, and st sends a fault to the
 // agent that owns it, so neither is ever on Home.
 
-export const TIERS = ['stopped', 'today'] as const;
+export const TIERS = ['stopped', 'today', 'later'] as const;
 export type Tier = typeof TIERS[number];
 export function tierTitle(tier: Tier): string {
   switch (tier) {
     case 'stopped': return 'somebody is stopped on you';
     case 'today': return 'today';
+    case 'later': return 'when there is time';
   }
 }
 
-export type HomeKind = 'review' | 'launch' | 'revision' | 'request';
+export type HomeKind = 'review' | 'launch' | 'revision' | 'request' | 'update';
 export type HomeRow = {
   item: Attention;
   tier: Tier;
@@ -29,12 +30,13 @@ export type HomeRow = {
   age: string;
 };
 
-type Kindish = Pick<Attention, 'attention_kind' | 'priority'>;
+type Kindish = Pick<Attention, 'attention_kind' | 'priority'> & { update?: Attention['update'] };
 /** Where Home shows an item, or null for a kind that is not a request or a review. */
 export function homeKind(item: Kindish): { tier: Tier; kind: HomeKind } | null {
   switch (item.attention_kind as string) {
     case 'human-gate': return { tier: 'stopped', kind: 'review' };
-    case 'person-step':
+    // Information the person asked for (`st work update`): nothing waits on it.
+    case 'person-step': return item.update ? { tier: 'later', kind: 'update' } : { tier: 'stopped', kind: 'request' };
     case 'agent-request': return { tier: 'stopped', kind: 'request' };
     case 'launch-approval': return { tier: 'today', kind: 'launch' };
     case 'revision-approval': return { tier: 'today', kind: 'revision' };
@@ -42,12 +44,13 @@ export function homeKind(item: Kindish): { tier: Tier; kind: HomeKind } | null {
   }
 }
 
-export function kindGlyph(_kind: HomeKind): { glyph: string; color: string } {
-  return { glyph: '◆', color: theme.person };
+export function kindGlyph(kind: HomeKind): { glyph: string; color: string } {
+  return kind === 'update' ? { glyph: '✦', color: theme.green } : { glyph: '◆', color: theme.person };
 }
 
 export const HOME_LEGEND: ReadonlyArray<{ glyph: string; color: string; word: string }> = [
   { glyph: '◆', color: theme.person, word: 'decide' },
+  { glyph: '✦', color: theme.green, word: 'to read' },
 ];
 
 /** Whether Home shows an item: it is not resolved and, when st names a person, it is for this one. */

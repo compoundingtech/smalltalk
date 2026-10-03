@@ -125,6 +125,7 @@ pub fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
         | AttentionKind::Request { .. } => ("◆", theme::PERSON),
         AttentionKind::Fault { .. } => ("✕", theme::FAULT),
         AttentionKind::Message { .. } => ("✉", theme::SAPPHIRE),
+        AttentionKind::Update { .. } => ("✦", theme::GREEN),
     }
 }
 
@@ -1047,6 +1048,48 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                     &format!(
                         "{from} is waiting on you: answer it, or r if there is nothing for you to do. Either way the step it waits on continues."
                     ),
+                    theme::dim(),
+                ),
+                inner,
+            );
+        }
+        AttentionKind::Update {
+            from,
+            body,
+            about,
+            subjects,
+        } => {
+            card.line(Line::from(vec![
+                span("from  ", theme::dim()),
+                span(from.clone(), theme::strong(theme::PERSON)),
+            ]));
+            card.blank();
+            card.lines(text::markdown(&spaced(body), inner, theme::text()));
+            let links = std::iter::once(("about".to_owned(), about.clone()))
+                .filter(|(_, about)| !about.is_empty())
+                .chain(subjects.iter().cloned());
+            let mut first = true;
+            for (label, target) in links {
+                if first {
+                    card.blank();
+                    first = false;
+                }
+                card.lines(text::wrap(
+                    &[
+                        text::run(label, theme::text()),
+                        text::run(format!("  {target}"), theme::fg(theme::ACCENT)),
+                    ],
+                    inner,
+                    &[text::run(" ↗ ", theme::fg(theme::ACCENT))],
+                    &[text::run("   ", theme::dim())],
+                    None,
+                ));
+            }
+            card.blank();
+            card.buttons(&[("r", "Read", Hit::Key('r'), theme::GREEN)]);
+            card.wrap(
+                &text::inline(
+                    "Nothing waits on this. It clears once you have read it: r, or leave it open a moment.",
                     theme::dim(),
                 ),
                 inner,

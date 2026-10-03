@@ -31,3 +31,12 @@ assert.equal(onHome(item('done', 'human-gate', { state: 'resolved' }), undefined
 // A paired phone acts as person/NAME/session/ID: the person's items are still its own.
 assert.equal(onHome(item('mine', 'review', { person_id: 'person/alex' }), 'person/alex/session/0190abcd'), true);
 assert.equal(onHome(item('theirs', 'review', { person_id: 'person/robin' }), 'person/alex/session/0190abcd'), false);
+
+// An update brings what the person asked for: it sits under "when there is time", after anything
+// that waits on them, and asks nothing.
+const withUpdate = homeRows([
+  item('update', 'person-step', { update: { version: 1, type: 'update', about: 'message/0123456789abcdef' } }),
+  item('ask', 'person-step'),
+], 'person/alex', now);
+assert.deepEqual(withUpdate.map(row => [row.item.id.replace('attention/', ''), row.kind, row.glyph]), [['ask', 'request', '◆'], ['update', 'update', '✦']]);
+assert.deepEqual(homeSections(withUpdate).map(section => section.title), ['somebody is stopped on you', 'when there is time']);
