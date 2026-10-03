@@ -283,6 +283,9 @@ CREATE TABLE IF NOT EXISTS desired (
 );
 CREATE INDEX IF NOT EXISTS desired_owner_step_index ON desired(owner_step, subject);
 CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject);
+-- Deleting a claim checks these references (foreign keys are on); see
+-- `operations_canonical_claim_index`.
+CREATE INDEX IF NOT EXISTS desired_claim_index ON desired(claim_id);
 
 -- A replicated projection finds a mission run tree's runs, generations and proposals from the
 -- claims that create them, without reading every such claim.
@@ -358,6 +361,7 @@ CREATE TABLE IF NOT EXISTS mission_revisions (
     created_index INTEGER NOT NULL,
     PRIMARY KEY(mission_id, revision)
 );
+CREATE INDEX IF NOT EXISTS mission_revisions_claim_index ON mission_revisions(claim_id);
 
 CREATE TABLE IF NOT EXISTS mission_definitions (
     mission_id TEXT PRIMARY KEY,
@@ -365,6 +369,7 @@ CREATE TABLE IF NOT EXISTS mission_definitions (
     state TEXT NOT NULL,
     claim_id TEXT NOT NULL REFERENCES claims(id)
 );
+CREATE INDEX IF NOT EXISTS mission_definitions_claim_index ON mission_definitions(claim_id);
 
 CREATE TABLE IF NOT EXISTS mission_runs (
     id TEXT PRIMARY KEY,
@@ -581,6 +586,9 @@ CREATE TABLE IF NOT EXISTS revision_proposals (
     created_at_unix_ms TEXT NOT NULL,
     updated_at_unix_ms TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS revision_proposals_run_index ON revision_proposals(run_id);
+CREATE INDEX IF NOT EXISTS revision_proposals_generation_index
+ON revision_proposals(source_generation_id);
 CREATE TABLE IF NOT EXISTS planning_sessions (
     id TEXT PRIMARY KEY,
     mission_id TEXT NOT NULL,
@@ -35421,6 +35429,65 @@ version 2
     /// index whose part they read is what they show: one incarnation's claims, the newest
     /// observations, the open runs and steps. None reads or sorts every claim of a kind, every
     /// claim of a subject, or every step and run the store holds.
+    /// Foreign keys are on, so deleting or rekeying a parent row looks up every child that names
+    /// it. A child column without an index made each lookup read the whole child table: deleting
+    /// a claim read every operation, and a checkpoint trim held the writer for an hour.
+    #[test]
+    fn every_foreign_key_column_leads_an_index() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.readers.get();
+        let tables = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut unindexed = Vec::new();
+        for table in tables {
+            let references = connection
+                .prepare(&format!("PRAGMA foreign_key_list(\"{table}\")"))
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>("from")?,
+                        row.get::<_, String>("table")?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for (column, parent) in references {
+                let leading = connection
+                    .prepare(&format!("PRAGMA index_list(\"{table}\")"))
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>("name"))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .into_iter()
+                    .any(|index| {
+                        connection
+                            .query_row(
+                                &format!(
+                                    "SELECT name FROM pragma_index_info('{index}') WHERE seqno=0"
+                                ),
+                                [],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .is_ok_and(|first| first == column)
+                    });
+                if !leading {
+                    unindexed.push(format!("{table}.{column} -> {parent}"));
+                }
+            }
+        }
+        assert!(
+            unindexed.is_empty(),
+            "unindexed foreign keys: {unindexed:?}"
+        );
+    }
+
     #[test]
     fn person_reads_seek_what_they_show() {
         let store = Store::open_memory("node").unwrap();
