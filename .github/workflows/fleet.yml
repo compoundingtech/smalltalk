@@ -73,8 +73,7 @@ jobs:
         run: "nix develop '.#genie' -c genie --check"
   linux-tests:
     name: linux-tests
-    runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
     timeout-minutes: 120
     defaults:
       run:
@@ -170,8 +169,7 @@ jobs:
           if-no-files-found: ignore
   linux-clippy:
     name: linux-clippy
-    runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
     timeout-minutes: 120
     defaults:
       run:
@@ -246,8 +244,7 @@ jobs:
           if-no-files-found: ignore
   linux-fleet-compat:
     name: linux-fleet-compat
-    runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
     timeout-minutes: 120
     defaults:
       run:
