@@ -9,7 +9,8 @@
 //!
 //! `ST3_PERF_NODE` is the member's node name. `ST3_PERF_RUNTIMES` names a JSON list of the member's
 //! running runtimes (`runtime_id`, `incarnation_id`, `terminal`), taken from its
-//! `/v1/client/runtimes`.
+//! `/v1/client/runtimes`. `ST3_PERF_INCREMENTAL=1` times passes that skip mission runs whose
+//! inputs did not change, as a daemon's do between its full passes.
 //!
 //! ```sh
 //! bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --bind COPY_DIR COPY_DIR \
@@ -134,7 +135,8 @@ fn quiet_reconcile_passes_on_a_store_copy() {
         Arc::new(runtime),
         node,
         Arc::new(Notify::new()),
-    );
+    )
+    .skipping_unneeded(std::env::var("ST3_PERF_INCREMENTAL").as_deref() == Ok("1"));
     // Settle: start what is declared and record what changed, until a pass writes nothing.
     for settle in 0..30 {
         let before = store.index().unwrap();

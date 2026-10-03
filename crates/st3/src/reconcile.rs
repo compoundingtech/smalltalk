@@ -752,6 +752,14 @@ impl<R: RuntimeControl> Reconciler<R> {
         self
     }
 
+    /// Skip mission runs whose inputs did not change between full passes, as a daemon does
+    /// unless `ST3_INCREMENTAL=off`.
+    #[doc(hidden)]
+    pub fn skipping_unneeded(mut self, skip: bool) -> Self {
+        self.skip_unneeded = skip;
+        self
+    }
+
     #[doc(hidden)]
     pub fn with_cleanup_deadline(mut self, deadline: Duration) -> Self {
         self.cleanup_deadline = deadline;
