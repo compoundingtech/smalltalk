@@ -2587,6 +2587,12 @@ enum AgentsCommand {
     /// fleet's Claude and Codex seats; `--print-kdl` shows it without applying it. With
     /// `--attach`, this terminal attaches once the harness is ready, from any fleet host.
     New(AgentNewArgs),
+    /// List repositories already used by a host's agents, from replicated graph evidence.
+    Repos {
+        /// Host to suggest repositories for; defaults to the connected member.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Preview and apply one KDL file containing durable agent seats.
     Apply(AgentApplyArgs),
     /// Start a durable seat, patching only explicitly supplied declaration fields. A stopped
@@ -2980,6 +2986,18 @@ struct AgentNewArgs {
     /// to a new directory for the agent below that host's home, `~/st/agents/NAME`.
     #[arg(long)]
     workspace: Option<PathBuf>,
+    /// Existing repository on the selected host to create a Git worktree from.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Ref to start a new branch from; defaults to origin/main.
+    #[arg(long, requires = "repo")]
+    base: Option<String>,
+    /// Git branch; defaults to the simple agent name made safe for Git. Reuses an existing branch.
+    #[arg(long, requires = "repo")]
+    branch: Option<String>,
+    /// Remove a clean worktree after the seat is stopped; keep its branch and unfinished work.
+    #[arg(long, requires = "repo")]
+    remove_at_run_end: bool,
     /// What the agent is for.
     #[arg(long)]
     description: Option<String>,
@@ -10364,6 +10382,19 @@ async fn run_agents(
         AgentsCommand::New(args) => {
             run_agent_new(endpoint, configured_person, args, json_output).await
         }
+        AgentsCommand::Repos { host } => {
+            let response = generated_client(endpoint, None)?
+                .host_repositories(host.as_deref().unwrap_or("local"))
+                .await?;
+            if json_output {
+                return print_value(&response, true);
+            }
+            println!("REPOSITORIES  {}", response.value.host_id);
+            for repository in response.value.repositories {
+                println!("{}\t{}", repository.path, repository.agent_ids.join(", "));
+            }
+            Ok(())
+        }
         AgentsCommand::Apply(args) => {
             let client = cli_client(endpoint);
             let (kdl, source_name) = read_intent(Some(&args.file))?;
@@ -10861,6 +10892,10 @@ fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bo
         description: args.description.clone(),
         workspace: None,
         message: args.message.clone(),
+        repo: args.repo.as_ref().map(|path| path.display().to_string()),
+        base: args.base.clone(),
+        branch: args.branch.clone(),
+        remove_at_run_end: args.remove_at_run_end.then_some(true),
     };
     let key = args
         .message
@@ -10872,10 +10907,30 @@ fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bo
 async fn run_agent_new(
     endpoint: &Endpoint,
     configured_person: Option<&str>,
-    args: AgentNewArgs,
+    mut args: AgentNewArgs,
     json_output: bool,
 ) -> Result<()> {
     let client = cli_client(endpoint);
+    if let Some(repository) = &args.repo {
+        let health: Value = client.get("/v1/health").await?;
+        let local = health["node"]
+            .as_str()
+            .context("the daemon health response has no node")?;
+        let host = args
+            .host
+            .as_deref()
+            .unwrap_or(local)
+            .trim_start_matches("host/");
+        if host == local || host == "local" {
+            args.repo =
+                Some(fs::canonicalize(repository).or_else(|_| std::path::absolute(repository))?);
+        } else {
+            anyhow::ensure!(
+                repository.is_absolute(),
+                "a repository on {host} must be an absolute path on that host"
+            );
+        }
+    }
     let actor = match &args.actor {
         Some(actor) => actor.clone(),
         None => configured_human(None, configured_person, "agents new")?,
@@ -10952,6 +11007,10 @@ async fn run_agent_new(
                     workspace: Some(workspace.clone()),
                     description: args.description.clone(),
                     message: args.message.clone(),
+                    repo: args.repo.as_ref().map(|path| path.display().to_string()),
+                    base: args.base.clone(),
+                    branch: args.branch.clone(),
+                    remove_at_run_end: args.remove_at_run_end.then_some(true),
                 },
             )
             .await?;
@@ -11043,6 +11102,12 @@ async fn agent_new_workspace(
         .context("the daemon health response has no node")?
         .to_owned();
     let host = args.host.clone().unwrap_or_else(|| local.clone());
+    let host = host.trim_start_matches("host/");
+    let host = if host == "local" {
+        local.as_str()
+    } else {
+        host
+    };
     if let Some(workspace) = &args.workspace {
         if host == local {
             if let Ok(existing) = fs::canonicalize(workspace) {
@@ -11205,6 +11270,7 @@ async fn run_agent_inspection(
             return Ok(());
         }
         AgentsCommand::New(_)
+        | AgentsCommand::Repos { .. }
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
@@ -23054,6 +23120,58 @@ mod tests {
             panic!("agents new did not parse");
         };
         args
+    }
+
+    #[test]
+    fn agent_new_cli_declares_checkout_and_preserves_plain_workspace() {
+        let args = agent_new_args(&[
+            "parser",
+            "--repo",
+            "/work/repo",
+            "--base",
+            "main",
+            "--branch",
+            "example/parser",
+            "--remove-at-run-end",
+        ]);
+        let source = agent_new_document(&args, "/work/parser", true);
+        let document: KdlDocument = source.parse().unwrap();
+        let body = document.get("agent").unwrap().children().unwrap();
+        let checkout = body.get("checkout").unwrap();
+        assert_eq!(
+            checkout.get(0).unwrap().as_string(),
+            Some("/work/repo")
+        );
+        assert_eq!(
+            checkout.get("branch").unwrap().as_string(),
+            Some("example/parser")
+        );
+        assert!(body.get("workspace").unwrap().get("create").is_none());
+        let args = agent_new_args(&["parser", "--workspace", "/work/plain"]);
+        let source = agent_new_document(&args, "/work/plain", true);
+        let intent = st3::graph::parse_intent(&source, "example").unwrap();
+        assert_eq!(
+            intent
+                .subjects
+                .values()
+                .next()
+                .unwrap()
+                .member
+                .as_ref()
+                .unwrap()
+                .workspace,
+            "/work/plain"
+        );
+        for flag in ["--base", "--branch"] {
+            assert!(Cli::try_parse_from(["st", "agents", "new", "parser", flag, "main"]).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(["st", "agents", "new", "parser", "--remove-at-run-end"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["st", "agents", "repos", "--host", "host/example", "--json"])
+                .is_ok()
+        );
     }
 
     #[test]

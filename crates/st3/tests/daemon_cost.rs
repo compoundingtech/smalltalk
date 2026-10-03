@@ -476,6 +476,7 @@ const PROBES: &[Probe] = &[
     ),
     get("GET /v1/client/now", "/v1/client/now"),
     get("GET /v1/client/machines", "/v1/client/machines"),
+    get("GET /v1/client/hosts/{*id}", "/v1/client/hosts/local/repositories"),
     get("GET /v1/client/devices", "/v1/client/devices"),
     get("GET /v1/client/attention", "/v1/client/attention"),
     get(

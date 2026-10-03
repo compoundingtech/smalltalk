@@ -11,6 +11,7 @@
     { "id": "collections.stream", "method": "GET", "path": "/v1/client/collections/stream", "websocket_protocol": "st3.client.collections.v0", "command": "CollectionCommand", "frame": "CollectionFrame", "max_subscriptions": 8 }
   ],
   "reads": [
+    { "id": "host.repositories", "method": "GET", "path": "/v1/client/hosts/{id}/repositories", "response": "HostRepositories", "scope": "read.projections" },
     { "id": "sets.list", "method": "GET", "path": "/v1/client/sets", "response": "Page" },
     { "id": "sets.get", "method": "GET", "path": "/v1/client/sets/{id}", "response": "Resource" },
     { "id": "capabilities.get", "method": "GET", "path": "/v1/client/capabilities", "response": "Capabilities" },

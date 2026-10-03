@@ -1502,6 +1502,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "workspace.observed",
+            &["agent"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            None,
+            true,
+            &[],
+        ),
+        (
             "render.applied",
             &["agent", "exec", "pty"],
             WritePolicy::SystemOnly,
@@ -2291,13 +2300,20 @@ fn claim_retention(kind: &str) -> Retention {
         | "runtime.action.deadline-reached" => Retention::SystemLocal,
         // Other nodes read the current harness state and usage: step readiness is judged on
         // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
-        "harness.observed" | "harness.usage" | "harness.todo.observed" => Retention::Latest,
+        "harness.observed" | "harness.usage" | "harness.todo.observed" | "workspace.observed" => {
+            Retention::Latest
+        }
         _ => Retention::Durable,
     }
 }
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
+        "workspace.observed" => &[
+            ("host", required_string()),
+            ("workspace", required_string()),
+            ("repository", string()),
+        ],
         "harness.todo.observed" => &[
             ("harness", required_string()),
             ("session_id", required_string()),
@@ -3886,6 +3902,7 @@ mod tests {
                 "work.released",
                 "work.renewed",
                 "work.submitted",
+                "workspace.observed",
             ]
         );
         assert_eq!(registry.digest().len(), 64);
