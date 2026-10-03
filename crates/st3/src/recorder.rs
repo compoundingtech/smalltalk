@@ -5,6 +5,9 @@
 //! one of those names, it runs the next program of that name on PATH that is not a recorder, waits
 //! for it, appends one JSON line to `<state>/recorder/commands.jsonl`, and exits the way the real
 //! program exited.
+//! Noninteractive `gh issue create` and `gh pr create` output is also copied byte-for-byte while
+//! retaining only a bounded final line. An exact GitHub creation URL is published in the private
+//! receipt spool for later ingestion; the recorder never contacts the daemon.
 //!
 //! A recorder observes; it does not enforce. A program called by its absolute path skips it, so a
 //! quiet log does not prove that nothing ran. A failure to record never fails, delays, or changes
@@ -14,6 +17,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
@@ -35,12 +39,27 @@ const RECORD_SCHEMA: &str = "st3.recorder.command.v1";
 /// `execvp` searches this list when PATH is unset.
 const DEFAULT_PATH: &str = "/usr/bin:/bin";
 const ARGUMENT_LIMIT: usize = 4096;
+const RECEIPT_SCHEMA: &str = "st3.recorder.receipt.v1";
+const RECEIPT_LINE_LIMIT: usize = 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Marker {
     schema: String,
     host: String,
     log: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipts: Option<PathBuf>,
+}
+
+/// A creation URL captured by the recorder for asynchronous daemon ingestion.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Receipt {
+    pub schema: String,
+    pub url: String,
+    pub actor: String,
+    pub mission_run: Option<String>,
+    pub exit_code: Option<i32>,
+    pub at: String,
 }
 
 /// The recorder directory and log that `install` prepared.
@@ -63,6 +82,11 @@ pub fn log_path(state_dir: &Path) -> Result<PathBuf> {
         state_dir.join("recorder").join("commands.jsonl"),
     )?)
 }
+/// The spool of creation receipts for a state directory.
+pub fn receipt_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("recorder").join("receipts")
+}
+
 
 /// Puts the recorder directory first on a PATH and removes its other occurrences.
 pub fn prepend(directory: &Path, path: Option<&OsStr>) -> Result<OsString> {
@@ -83,12 +107,16 @@ pub fn install(
 ) -> Result<Installation> {
     let directory = directory(state_dir)?;
     let log = log_path(state_dir)?;
+    let receipts = std::path::absolute(receipt_path(state_dir))?;
+    fs::create_dir_all(&receipts)
+        .with_context(|| format!("create the receipt directory {}", receipts.display()))?;
     fs::create_dir_all(&directory)
         .with_context(|| format!("create the recorder directory {}", directory.display()))?;
     let marker = serde_json::to_vec_pretty(&Marker {
         schema: MARKER_SCHEMA.into(),
         host: host.into(),
         log: log.clone(),
+        receipts: Some(receipts),
     })?;
     replace_file(&directory.join(MARKER), &marker)?;
     fs::OpenOptions::new()
@@ -188,10 +216,18 @@ pub fn run(program: &'static str) -> ! {
         .ok()
         .and_then(|executable| fs::metadata(executable).ok());
     let real = real_program(program, path.as_deref(), own.as_ref());
+    let capture = marker.as_ref().is_some_and(|marker| marker.receipts.is_some())
+        && program == "gh"
+        && arguments.get(1).is_some_and(|argument| argument == "create")
+        && arguments.first().is_some_and(|argument| argument == "issue" || argument == "pr")
+        && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0;
+    let mut last_line = LastLine::default();
     let outcome = match &real {
         // A bare name stays bare, as a shell would pass it; a path names the real program.
-        Some(real) if argv0.as_bytes().contains(&b'/') => relay(real, real.as_os_str(), &arguments),
-        Some(real) => relay(real, &argv0, &arguments),
+        Some(real) if argv0.as_bytes().contains(&b'/') => {
+            relay(real, real.as_os_str(), &arguments, capture, &mut last_line)
+        }
+        Some(real) => relay(real, &argv0, &arguments, capture, &mut last_line),
         None => {
             eprintln!("st recorder: {program}: command not found after the recorder on PATH");
             Outcome::Exited(127)
@@ -205,6 +241,7 @@ pub fn run(program: &'static str) -> ! {
             outcome: &outcome,
             started_at,
             duration: started.elapsed(),
+            receipt_url: last_line.url(),
         };
         append(&marker, &call);
     }
@@ -343,6 +380,15 @@ const RELAYED: [libc::c_int; 8] = [
 /// The write end of the pipe that carries each received signal number to the wait loop.
 static WAKE: AtomicI32 = AtomicI32::new(-1);
 
+struct WakeGuard;
+
+impl Drop for WakeGuard {
+    fn drop(&mut self) {
+        // Stop handlers from writing signal bytes into a reused fd during log/spool publication.
+        WAKE.store(-1, Ordering::Relaxed);
+    }
+}
+
 extern "C" fn note_signal(
     signal: libc::c_int,
     info: *mut libc::siginfo_t,
@@ -385,20 +431,34 @@ unsafe fn errno_location() -> *mut libc::c_int {
 
 /// Runs the real program as a child in this process group with this process's stdio, working
 /// directory, and environment, and relays signals until it exits.
-fn relay(real: &Path, argv0: &OsStr, arguments: &[OsString]) -> Outcome {
+fn relay(
+    real: &Path,
+    argv0: &OsStr,
+    arguments: &[OsString],
+    capture: bool,
+    last_line: &mut LastLine,
+) -> Outcome {
     let mut command = std::process::Command::new(real);
     command.arg0(argv0).args(arguments);
-    let mut pipe = [-1; 2];
-    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+    let Some((signal_read, signal_write)) = nonblocking_read_pipe() else {
+        return spawn_unrelayed(command, real);
+    };
+    let read_end = signal_read.as_raw_fd();
+    let write_end = signal_write.as_raw_fd();
+    if unsafe { libc::fcntl(write_end, libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
         return spawn_unrelayed(command, real);
     }
-    let [read_end, write_end] = pipe;
-    unsafe {
-        libc::fcntl(read_end, libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(write_end, libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(write_end, libc::F_SETFL, libc::O_NONBLOCK);
-    }
+    // A pipe setup failure leaves stdout inherited and merely disables observation.
+    let mut stdout = if capture {
+        nonblocking_read_pipe().map(|(read, write)| {
+            command.stdout(std::process::Stdio::from(write));
+            read
+        })
+    } else {
+        None
+    };
     WAKE.store(write_end, Ordering::Relaxed);
+    let _wake = WakeGuard;
 
     // Hold every handled signal until the child's pid is known. The child restores the caller's
     // mask and dispositions before it runs the real program.
@@ -420,7 +480,10 @@ fn relay(real: &Path, argv0: &OsStr, arguments: &[OsString]) -> Outcome {
             }
             let mut action = std::mem::zeroed::<libc::sigaction>();
             action.sa_sigaction = note_signal as *const () as libc::sighandler_t;
-            action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            // Captured writes must be interruptible so signals are relayed even under output
+            // backpressure. The uncaptured path keeps its existing restart behavior.
+            action.sa_flags = libc::SA_SIGINFO
+                | if stdout.is_some() { 0 } else { libc::SA_RESTART };
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(signal, &action, std::ptr::null_mut());
             previous.push((signal, current));
@@ -450,6 +513,7 @@ fn relay(real: &Path, argv0: &OsStr, arguments: &[OsString]) -> Outcome {
         });
     }
     let spawned = command.spawn();
+    drop(command);
     unsafe {
         libc::sigprocmask(libc::SIG_SETMASK, &original_mask, std::ptr::null_mut());
     }
@@ -458,36 +522,279 @@ fn relay(real: &Path, argv0: &OsStr, arguments: &[OsString]) -> Outcome {
         Err(error) => return spawn_failure(real, &error),
     };
     let pid = child.id() as libc::pid_t;
-    let mut signals = [0_u8; 64];
+    let mut signaled = false;
     loop {
-        // Only this loop reaps the child, and it signals the pid only before reaping it, so a
-        // relayed signal never reaches a reused pid.
+        // Signals are sent only before reaping. A backpressured copy may cache the child's
+        // status, but returns immediately after doing so, before signaling that pid again.
         match child.try_wait() {
-            Ok(Some(status)) => return Outcome::from_status(status),
+            Ok(Some(status)) => {
+                if let Some(stdout) = &stdout {
+                    drain_stdout(stdout.as_raw_fd(), last_line, read_end);
+                }
+                return Outcome::from_status(status);
+            }
             Ok(None) => {}
             Err(_) => break,
         }
-        let count = unsafe { libc::read(read_end, signals.as_mut_ptr().cast(), signals.len()) };
-        if count < 0 {
+        let mut descriptors = [
+            libc::pollfd { fd: read_end, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: stdout.as_ref().map_or(-1, |stdout| stdout.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        if unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) } < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                signaled |= forward_signals(read_end, Some(pid));
                 continue;
             }
             break;
         }
-        for signal in &signals[..count as usize] {
-            let signal = libc::c_int::from(*signal);
-            if signal != libc::SIGCHLD {
-                unsafe {
-                    libc::kill(pid, signal);
+        signaled |= forward_signals(read_end, Some(pid));
+        if descriptors[1].revents != 0 {
+            if let Some(output) = &stdout {
+                if copy_stdout(
+                    output.as_raw_fd(), 8192, last_line, read_end,
+                    Some(&mut child), &mut signaled,
+                ).is_err() {
+                    // Closing the reader makes the child's next write observe EPIPE naturally.
+                    stdout = None;
                 }
             }
         }
     }
     match child.wait() {
-        Ok(status) => Outcome::from_status(status),
+        Ok(status) => {
+            if let Some(stdout) = &stdout {
+                drain_stdout(stdout.as_raw_fd(), last_line, read_end);
+            }
+            Outcome::from_status(status)
+        }
         Err(_) => Outcome::Exited(1),
     }
 }
+/// The read end is nonblocking; the child keeps an ordinary blocking stdout.
+fn nonblocking_read_pipe() -> Option<(OwnedFd, OwnedFd)> {
+    let mut pipe = [-1; 2];
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: pipe returned two new, uniquely owned file descriptors.
+    let (read, write) = unsafe {
+        (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1]))
+    };
+    if unsafe {
+        libc::fcntl(read.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) == -1
+            || libc::fcntl(write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) == -1
+            || libc::fcntl(read.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) == -1
+    } {
+        return None;
+    }
+    Some((read, write))
+}
+
+fn forward_signals(read_end: libc::c_int, pid: Option<libc::pid_t>) -> bool {
+    let mut signals = [0_u8; 64];
+    let mut relayed = false;
+    loop {
+        let count = unsafe { libc::read(read_end, signals.as_mut_ptr().cast(), signals.len()) };
+        if count <= 0 {
+            return relayed;
+        }
+        if let Some(pid) = pid {
+            for signal in &signals[..count as usize] {
+                let signal = libc::c_int::from(*signal);
+                if signal != libc::SIGCHLD {
+                    unsafe { libc::kill(pid, signal); }
+                    relayed = true;
+                }
+            }
+        }
+    }
+}
+
+/// Copies raw bytes, avoiding stdio buffering or text decoding. Output errors invalidate the
+/// receipt and close the child's stdout reader, rather than masking a broken downstream pipe.
+fn copy_stdout(
+    stdout: libc::c_int,
+    limit: usize,
+    last_line: &mut LastLine,
+    signal_read: libc::c_int,
+    mut child: Option<&mut std::process::Child>,
+    signaled: &mut bool,
+) -> std::io::Result<usize> {
+    let mut bytes = [0_u8; 8192];
+    let count = unsafe { libc::read(stdout, bytes.as_mut_ptr().cast(), limit.min(bytes.len())) };
+    if count < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => Ok(0),
+            _ => { *last_line = LastLine::default(); Err(error) }
+        };
+    }
+    if count == 0 {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    let bytes = &bytes[..count as usize];
+    let mut written = 0;
+    while written < bytes.len() {
+        // Do not make fd1 nonblocking: its open-file flags belong to the caller too. Poll and
+        // write at most PIPE_BUF instead, so an ordinary pipe cannot strand signal forwarding
+        // while its consumer has stopped reading.
+        let pid = child.as_ref().map(|child| child.id() as libc::pid_t);
+        let mut descriptors = [
+            libc::pollfd { fd: signal_read, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: libc::STDOUT_FILENO, events: libc::POLLOUT, revents: 0 },
+        ];
+        if unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                *signaled |= forward_signals(signal_read, pid);
+                continue;
+            }
+            *last_line = LastLine::default();
+            return Err(error);
+        }
+        *signaled |= forward_signals(signal_read, pid);
+        if descriptors[1].revents == 0 {
+            if *signaled {
+                if let Some(child) = child.as_deref_mut() {
+                    if child.try_wait()?.is_some() {
+                        // A caller's terminating signal must still finish a child whose output
+                        // is blocked. try_wait caches the exact status for the enclosing loop.
+                        *last_line = LastLine::default();
+                        return Err(std::io::ErrorKind::Interrupted.into());
+                    }
+                }
+            }
+            continue;
+        }
+        let count = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO, bytes[written..].as_ptr().cast(),
+                (bytes.len() - written).min(libc::PIPE_BUF),
+            )
+        };
+        if count > 0 {
+            written += count as usize;
+            continue;
+        }
+        if count == 0 {
+            *last_line = LastLine::default();
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            *signaled |= forward_signals(signal_read, pid);
+            continue;
+        }
+        *last_line = LastLine::default();
+        return Err(error);
+    }
+    last_line.push(bytes);
+    Ok(bytes.len())
+}
+
+/// Drain only the bytes already queued when the child exits. A descendant retaining or writing
+/// stdout must not keep the recorder alive, nor replace the child's final line later.
+fn drain_stdout(stdout: libc::c_int, last_line: &mut LastLine, signal_read: libc::c_int) {
+    let mut available: libc::c_int = 0;
+    if unsafe { libc::ioctl(stdout, libc::FIONREAD, &mut available) } != 0 {
+        *last_line = LastLine::default();
+        return;
+    }
+    let mut remaining = available.max(0) as usize;
+    let mut signaled = false;
+    while remaining > 0 {
+        match copy_stdout(stdout, remaining, last_line, signal_read, None, &mut signaled) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => remaining -= count,
+        }
+    }
+}
+
+struct LastLine {
+    bytes: [u8; RECEIPT_LINE_LIMIT],
+    len: usize,
+    overflow: bool,
+    ended: bool,
+}
+
+impl Default for LastLine {
+    fn default() -> Self {
+        Self { bytes: [0; RECEIPT_LINE_LIMIT], len: 0, overflow: false, ended: false }
+    }
+}
+
+impl LastLine {
+    fn push(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.ended {
+                self.len = 0;
+                self.overflow = false;
+                self.ended = false;
+            }
+            if byte == b'\n' {
+                self.ended = true;
+            } else if self.len < self.bytes.len() {
+                self.bytes[self.len] = byte;
+                self.len += 1;
+            } else {
+                self.overflow = true;
+            }
+        }
+    }
+
+    fn url(&self) -> Option<&str> {
+        if self.overflow {
+            return None;
+        }
+        let line = std::str::from_utf8(&self.bytes[..self.len]).ok()?;
+        let line = if self.ended { line.strip_suffix('\r').unwrap_or(line) } else { line };
+        let mut parts = line.strip_prefix("https://github.com/")?.split('/');
+        let owner = parts.next()?;
+        let repository = parts.next()?;
+        let kind = parts.next()?;
+        let number = parts.next()?;
+        let name = |value: &str| !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+        (parts.next().is_none()
+            && name(owner)
+            && name(repository)
+            && matches!(kind, "issues" | "pull")
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+            && number.bytes().any(|byte| byte != b'0'))
+            .then_some(line)
+    }
+}
+
+/// Publication is independent of the command log and never talks to the daemon.
+fn publish_receipt(directory: &Path, receipt: &Receipt) {
+    let (Ok(bytes), Ok(elapsed)) = (
+        serde_json::to_vec(receipt),
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH),
+    ) else {
+        return;
+    };
+    let name = format!("{}-{}", elapsed.as_nanos(), std::process::id());
+    let temporary = directory.join(format!(".{name}.tmp"));
+    let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+    else {
+        return;
+    };
+    if file.write_all(&bytes).is_err()
+        || fs::rename(&temporary, directory.join(format!("{name}.json"))).is_err()
+    {
+        let _ = fs::remove_file(&temporary);
+    }
+}
+
 
 /// Without a signal pipe, the real program still runs; signals then reach only this process.
 fn spawn_unrelayed(mut command: std::process::Command, real: &Path) -> Outcome {
@@ -513,6 +820,7 @@ struct Call<'a> {
     outcome: &'a Outcome,
     started_at: SystemTime,
     duration: Duration,
+    receipt_url: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -530,6 +838,8 @@ struct Record<'a> {
     exit_code: Option<i32>,
     signal: Option<i32>,
     duration_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_url: Option<&'a str>,
 }
 
 fn record<'a>(marker: &'a Marker, call: &Call<'a>) -> Record<'a> {
@@ -567,6 +877,7 @@ fn record<'a>(marker: &'a Marker, call: &Call<'a>) -> Record<'a> {
         exit_code,
         signal,
         duration_ms: call.duration.as_micros() as f64 / 1000.0,
+        receipt_url: call.receipt_url,
     }
 }
 
@@ -574,7 +885,20 @@ fn record<'a>(marker: &'a Marker, call: &Call<'a>) -> Record<'a> {
 /// own output and status must not change because of it. O_NONBLOCK keeps a FIFO without a reader
 /// from holding the command open.
 fn append(marker: &Marker, call: &Call<'_>) {
-    let Ok(mut line) = serde_json::to_vec(&record(marker, call)) else {
+    let record = record(marker, call);
+    let line = serde_json::to_vec(&record);
+    if let (Some(directory), Some(url)) = (&marker.receipts, record.receipt_url) {
+        publish_receipt(directory, &Receipt {
+            schema: RECEIPT_SCHEMA.into(),
+            url: url.into(),
+            actor: record.actor,
+            mission_run: std::env::var_os("ST_MISSION_RUN")
+                .map(|value| value.to_string_lossy().into_owned()),
+            exit_code: record.exit_code,
+            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        });
+    }
+    let Ok(mut line) = line else {
         return;
     };
     line.push(b'\n');
@@ -742,6 +1066,10 @@ mod tests {
                 .unwrap();
         assert_eq!(marker.host, "test-host");
         assert_eq!(marker.log, installation.log);
+        let receipts = marker.receipts.unwrap();
+        assert!(receipts.is_absolute());
+        assert_eq!(receipts, receipt_path(&state));
+        assert!(receipts.is_dir());
         assert_eq!(
             fs::metadata(&installation.log)
                 .unwrap()
