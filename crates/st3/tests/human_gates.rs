@@ -861,3 +861,88 @@ async fn each_item_of_a_for_each_loop_takes_its_own_answer() {
     );
     server.abort();
 }
+
+/// Every review st offers a person has a card for them, and a review without a card is not
+/// offered: while the step that started a gate's run has failed, the gate's card is gone and
+/// the review route says why, and both come back once that step is retried.
+#[tokio::test]
+async fn a_review_is_offered_exactly_while_its_card_is_shown() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    apply(
+        &store,
+        r#"version 2
+resource "result" { kind "custom.test.loop-result" }
+mission "rounds" state="ready" {
+  goal "Have a person keep each round."
+  completion { when "all-steps-exhausted" }
+  loop "improve" {
+    max-rounds 2
+    until { gate "ready" { field "state" "resource/result" is "ready" } }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "keep" {
+        agentless
+        gate "keep" type="human" {
+          reviewer "person/avery"
+          question "Keep this round?"
+        }
+      }
+    }
+  }
+}
+"#,
+        "rounds",
+    );
+    let run = start(&store, "rounds", "rounds-run");
+    let looping = run.steps[0].subject.clone();
+    let reconciler = reconciler(&store);
+    reconcile_until(&reconciler, "the round's gate asked", || {
+        !store
+            .pending_human_reviews(Some("person/avery"))
+            .unwrap()
+            .is_empty()
+    });
+    let app = st3::api::router(state);
+    // Each review the reviewers' list offers, and whether the reviewer has a card for it.
+    let offered = async || {
+        let mut offered = Vec::new();
+        for review in store.pending_human_reviews(Some("person/avery")).unwrap() {
+            let shown = card(&app, "person/avery", &review.owner).await.is_some();
+            offered.push((review.owner, shown));
+        }
+        offered
+    };
+    let waiting = offered().await;
+    assert_eq!(waiting.len(), 1, "{waiting:?}");
+    assert!(waiting[0].1, "the round's gate has no card");
+    let gate = waiting[0].0.clone();
+
+    // The loop step fails, as it does when it runs out of time. Nothing the round's gate
+    // decides can matter until the loop is retried.
+    assert!(
+        store
+            .set_step_state(&looping, "failed", Some("the loop ran out of time"))
+            .unwrap()
+    );
+    let hidden = offered().await;
+    assert!(
+        hidden.iter().all(|(_, shown)| *shown),
+        "offered with no card to act on: {hidden:?}"
+    );
+    assert!(hidden.is_empty(), "{hidden:?}");
+    let (status, refused) = review(&app, &gate, "approved", "person/avery", None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let message = refused["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("its parent step `{looping}` is failed")),
+        "{message}"
+    );
+
+    // Retried, the loop matters again, and so does the gate it is waiting on.
+    assert!(store.retry_step(&looping, "more time", 0).unwrap());
+    assert_eq!(offered().await, [(gate.clone(), true)]);
+    let (status, approved) = review(&app, &gate, "approved", "person/avery", None).await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+}

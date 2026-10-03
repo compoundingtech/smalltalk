@@ -18211,6 +18211,11 @@ fn human_review_currency(
     } else {
         return Ok(Err(format!("`{owner}` cannot own a human gate")));
     };
+    // The person's attention shows a review only while its run still matters, so the review is
+    // offered only then: a review with no card would wait on an answer nobody is asked for.
+    if let Err(why) = person_work::run_liveness(connection, &run.subject, None, false)? {
+        return Ok(Err(why));
+    }
     let strings = |name: &str| {
         fields
             .get(name)

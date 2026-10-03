@@ -754,12 +754,20 @@ loop stored before that mode was removed asks an item's metric gate of
 `loop-run/GENERATION/PATH/item/ID` with the item's round as its attempt; that review is current
 until the loop records the item's round.
 
+The review list and each reviewer's attention agree: a review is offered exactly while its card
+is shown. Both need the gate's run, and every run above it, to be open and on the generation of
+the step that started it, each such parent step to be open (a failed one counts as closed until
+it is retried), and a subscription or schedule that delivered the run to still run. While that
+does not hold, an answer could change nothing, so the review is not listed and an answer is
+refused with the reason, such as which parent step failed. It is offered again once that step
+is retried.
+
 `st attention ls --as person/NAME` shows the selected person's pending KDL human gates together
 with their other current decisions and faults.
 
 The human view shows the mission, owner step, question, review targets, age, and exact decision commands. `--json` returns the same current review records as structured data.
 
-The list excludes resolved requests, old generations, changed definitions, old attempts, and terminal owners. A result from a different actor does not resolve a request.
+The list excludes resolved requests, old generations, changed definitions, old attempts, terminal owners, and runs whose parent step or delivering subscription has ended. A result from a different actor does not resolve a request.
 
 ### Human attention inbox
 
