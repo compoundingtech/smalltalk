@@ -1323,6 +1323,7 @@ fn item_data_types(
             "comments" => data_types.insert("comments".to_owned()),
             "reactions" => data_types.insert("reactions".to_owned()),
             "mentions" => data_types.insert("mentions".to_owned()),
+            "recent_comments" => data_types.insert("comments".to_owned()),
             "last_comment" => {
                 let reactions = |value: Option<&Value>| {
                     value
@@ -1428,6 +1429,15 @@ fn item_facts(
                 }
             }
             ("last_comment", Some(known)) if !newer_comment(value, known) => {}
+            // Each comment and review once, by kind and ID; the newest are kept.
+            ("recent_comments", known) => {
+                let merged = crate::resource::merge_recent_comments(
+                    known.and_then(Value::as_array).into_iter().flatten(),
+                    value.as_array().into_iter().flatten(),
+                    Some(crate::resource::RECENT_COMMENTS),
+                );
+                facts.insert(name.into(), Value::Array(merged));
+            }
             ("mentions", Some(Value::Array(known))) => {
                 let mut mentions = BTreeMap::<String, Value>::new();
                 for mention in known.iter().chain(value.as_array().into_iter().flatten()) {

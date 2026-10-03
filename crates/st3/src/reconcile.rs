@@ -10344,7 +10344,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 &agent_workspaces,
                             );
                         }
-                        if let Some(every_ms) = spec.every_ms {
+                        // A declared interval replaces the provider's own deadline, except a
+                        // provider that asks to continue at once, such as a listing longer than
+                        // one read.
+                        if let Some(every_ms) = spec.every_ms
+                            && observation.next_check_unix_ms
+                                > now_ms().saturating_add(crate::resource::PROVIDER_CONTINUE_MS)
+                        {
                             observation.next_check_unix_ms =
                                 now_ms().saturating_add(every_ms as u128);
                         }
@@ -24192,6 +24198,8 @@ observer "repo" {{ resource "resource/repo"; provider "github.repository"; locat
     /// What a scripted observation answers.
     enum ScriptedObservation {
         Observe,
+        /// An observation that asks to continue at once, as a listing longer than one read does.
+        Continue,
         RateLimit,
         Forbidden,
         Fail,
@@ -24239,6 +24247,12 @@ observer "repo" {{ resource "resource/repo"; provider "github.repository"; locat
                         facts: serde_json::json!({"issues": []}),
                         cursor: Some("no-issues".into()),
                         next_check_unix_ms: now_ms().saturating_add(60_000),
+                    }),
+                    ScriptedObservation::Continue => Ok(crate::resource::ProviderObservation {
+                        facts: serde_json::json!({"issues": []}),
+                        cursor: Some("more-issues".into()),
+                        next_check_unix_ms: now_ms()
+                            .saturating_add(crate::resource::PROVIDER_CONTINUE_MS),
                     }),
                     ScriptedObservation::RateLimit => {
                         Err(anyhow::Error::new(crate::resource::ProviderRateLimit {
@@ -24307,6 +24321,51 @@ observer "repo" {
             .into_iter()
             .filter(|item| item.targets == ["observer/repo"])
             .collect()
+    }
+
+    /// An observer's declared interval replaces the provider's next check, except when the
+    /// provider asks to continue at once, such as a listing longer than one read.
+    #[tokio::test]
+    async fn a_declared_interval_does_not_delay_a_provider_that_continues_at_once() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            &SCRIPTED_OBSERVER.replace("field \"issues\"", "field \"issues\"\n  every \"1h\""),
+            "continue-at-once",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(ScriptedResourceProvider::new(
+            calls.clone(),
+            [ScriptedObservation::Continue, ScriptedObservation::Observe],
+        )));
+        let revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let deadline = || {
+            *reconciler
+                .observer_deadlines
+                .lock()
+                .unwrap()
+                .get(&format!("observer/repo:{revision}"))
+                .unwrap()
+        };
+        observe_now(&reconciler, &calls).await;
+        assert!(
+            deadline() <= now_ms() + crate::resource::PROVIDER_CONTINUE_MS,
+            "a continuation keeps its own deadline"
+        );
+        observe_now(&reconciler, &calls).await;
+        assert!(
+            deadline() >= now_ms() + 50 * 60_000,
+            "otherwise the declared hour applies"
+        );
     }
 
     #[tokio::test]
@@ -26361,6 +26420,111 @@ subscription "mentions" { observer "observer/repo"; on "mentions"; to "agent/exa
                 .collect::<Vec<_>>(),
             ["fern", "orchid-bot"]
         );
+    }
+
+    /// Every comment and review an item receives is kept once in `recent_comments`, the newest
+    /// twenty, whichever read saw it. A new one is a comments change, which a pull request
+    /// subscription does not hear, and an unchanged list records nothing.
+    #[test]
+    fn recent_comments_keep_each_comment_and_review_once_as_a_comments_change() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" {
+  resource "resource/repo"; provider "github.repository"; locator "acme/garden"
+  field "pull_requests"; field "issues"; field "comments"
+}
+agent "example.reader" { workspace "/tmp"; command "true" }
+subscription "comments" { observer "observer/repo"; on "comments"; to "agent/example.reader"; delivery "message" }
+subscription "pulls" { observer "observer/repo"; on "pull_requests"; to "agent/example.reader"; delivery "message" }"#,
+            "watch",
+        );
+        let desired = store.desired_subjects().unwrap();
+        let subscriptions = desired
+            .iter()
+            .filter(|item| item.kind == "subscription")
+            .map(|item| {
+                (
+                    item.subject.clone(),
+                    crate::graph::subscription_spec(&item.desired).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let observe = |facts: Value| {
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    &revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &facts,
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap()
+        };
+        let recent = |number: u64| {
+            store
+                .latest_actual_value(&format!("resource/repo/pull-request/{number}"))
+                .unwrap()
+                .unwrap()["facts"]["recent_comments"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| format!("{}:{}", entry["kind"].as_str().unwrap(), entry["id"]))
+                .collect::<Vec<_>>()
+        };
+        let entry = |kind: &str, id: u64, minute: u64| {
+            serde_json::json!({"kind": kind, "id": id, "author": "fern",
+                "at": format!("2026-09-10T05:{minute:02}:00Z")})
+        };
+        observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
+            "number": 7, "head": "a".repeat(40), "state": "open", "draft": false,
+        }]}));
+
+        // Two comments in one poll are two entries, oldest first, and wake only comments.
+        let commented = observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
+            "number": 7, "new": false,
+            "recent_comments": [entry("comment", 92, 2), entry("comment", 91, 1)],
+        }]}));
+        assert_eq!(commented.changed_fields, vec!["comments".to_owned()]);
+        assert_eq!(commented.message_subjects.len(), 1);
+        assert_eq!(recent(7), ["comment:91", "comment:92"]);
+
+        // A review from the pull request read joins the comments; a repeated entry stays once.
+        observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
+            "number": 7, "new": false,
+            "recent_comments": [entry("review", 5001, 3), entry("comment", 92, 2)],
+        }]}));
+        assert_eq!(recent(7), ["comment:91", "comment:92", "review:5001"]);
+
+        // The same entries again record nothing.
+        let before = store.index().unwrap();
+        let unchanged = observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
+            "number": 7, "recent_comments": [entry("comment", 91, 1), entry("review", 5001, 3)],
+        }]}));
+        assert!(unchanged.changed_fields.is_empty());
+        assert_eq!(store.index().unwrap(), before);
+
+        // Only the newest twenty stay.
+        let burst = (0..25)
+            .map(|index| entry("comment", 100 + index, 10 + index))
+            .collect::<Vec<_>>();
+        observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
+            "number": 7, "new": false, "recent_comments": burst,
+        }]}));
+        let kept = recent(7);
+        assert_eq!(kept.len(), crate::resource::RECENT_COMMENTS);
+        assert_eq!(kept.first().unwrap(), "comment:105");
+        assert_eq!(kept.last().unwrap(), "comment:124");
     }
 
     /// The intake pipeline: a new pull request head that a live agent owns reaches that agent as

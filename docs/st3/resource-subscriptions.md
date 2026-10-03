@@ -24,15 +24,29 @@ latest state. The repository resource keeps only its own facts, such as `reposit
 
 | Data type | Facts on each item |
 |---|---|
-| `pull_requests` | `number`, `url`, `title`, `author`, `created_at`, `state`, `merged` once closed, `draft`, `head_sha`, `branch`, `checks_state`, `checks` (each `name`, `status`, `conclusion`), `review_decision`, `reviews` (each reviewer's latest `state` and `commit`), `merge_queue` (`state`, `position`) while queued, and `opened_by`/`opened_by_run` |
+| `pull_requests` | `number`, `url`, `title`, `author`, `created_at`, `state`, `merged` once closed, `draft`, `head_sha`, `branch`, `base`, `checks_state`, `checks` (each `name`, `status`, `conclusion`), `required_checks` (`state`, `source`, `checks`, `failed`), `review_decision`, `reviews` (each reviewer's latest `state` and `commit`), `merge_queue` (`state`, `position`) while queued, and `opened_by`/`opened_by_run` |
 | `issues` | `number`, `url`, `title`, `author`, `created_at`, `state`, `state_reason` |
-| `comments` | `comments` (the count), and `last_comment` (`id`, `author`, `url`, `created_at`, `updated_at`, `body_digest`) |
+| `comments` | `comments` (the count), `last_comment` (`id`, `author`, `url`, `created_at`, `updated_at`, `body_digest`), and `recent_comments`: the newest 20 conversation comments and submitted reviews, oldest first, each `kind` (`comment` or `review`), `id`, `author`, `at`, and a review's `state` |
 | `reactions` | `reactions` (each reaction's count), and `last_comment.reactions` |
 | `mentions` | `mentions`: the newest mention of each GitHub login in the item's body or comments (`login`, `by`, `url`, `at`), up to 50 |
 
 A comment body never enters the graph. `body_digest` tells one body from another, and `url` leads to
 the text. A subscription that selects `comments`, `reactions`, or `mentions` hears a change of that
-type only; a check, a review, or a new head is a `pull_requests` change.
+type only; a check, a review's state, or a new head is a `pull_requests` change, and a new entry in
+`recent_comments`, a comment or a review, is a `comments` change.
+
+`recent_comments` keeps every comment and review once, whichever read saw it, so two comments
+between polls are two entries. An edit keeps its entry. A pull request's reviews join it only on an
+observer that emits `comments`.
+
+`required_checks` says how the checks a pull request's base branch requires stand on its head.
+`checks` names the checks that count. With `source` `rules` they are those the base branch's
+rulesets and classic protection require. A check matches by name, and by app when the rule names
+one. With `source` `all` the base requires none, or GitHub would not show its rules, and every check
+on the head counts. `state` is `pass` when every counted check finished as success, neutral or
+skipped, `fail` when one finished any other way (named in `failed`), `pending` otherwise, including
+while a required check has not appeared, and `none` when nothing counts. Optional checks never
+decide it.
 
 The `github.ref` provider supports `head` and `ancestors`. `head` is the selected branch's commit SHA.
 `ancestors` contains the full `refs/heads/NAME` name of every other repository branch whose head is
@@ -182,8 +196,16 @@ and costs nothing. A read longer than 10 pages records what it read and continue
 Pull request heads, checks, reviews, and merge-queue state come from one GraphQL query for every
 open pull request. GraphQL has no conditional request and spends its own hourly budget, so the
 query runs at the first poll, when the issues listing shows an open pull request changed, while a
-pull request has pending checks or a place in the merge queue, and otherwise every 15 minutes.
-Every observer of the repository on a host shares the answer.
+pull request has pending checks or a place in the merge queue, and otherwise every 15 minutes, but
+never sooner than a minute after the last one unless a refresh asks. A change seen within that
+minute is remembered, and the first poll after it reads. Every observer of the repository on a host
+shares the answer. Submitting a review moves the pull request's update time, so the issues listing
+shows it.
+
+With each GraphQL read, the provider reads the rules of each open pull request's base branch:
+`rules/branches/BASE` and `branches/BASE`, conditionally and with read access. A 403 or a 404 from
+either leaves the other; when GitHub shows neither, every check counts. A refused rule never fails
+the observation.
 
 A reaction changes no update time. With `reactions`, the provider also reads the open issues
 listing, which names each open item's reactions, and the newest 100 comments for theirs.
@@ -202,6 +224,8 @@ there and left the open listing, and records the repository facts without the it
 compares an item against that older listing, so the upgrade starts no review and no triage.
 
 The provider can use a webhook, a stream, or a conditional request. A conditional provider returns one next-check deadline.
+An observer's `every` replaces that deadline, except when the provider asks to continue within a
+second, as a listing longer than one read does.
 
 The daemon records that deadline as a one-shot wake. It does not run a periodic discovery sweep.
 
