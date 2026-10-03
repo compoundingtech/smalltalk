@@ -6633,12 +6633,7 @@ fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms:
 /// Active and finished runs apart, so a mission with one live run and five old ones does not
 /// read as six runs. A daemon that does not report active runs gets the plain total.
 fn render_mission_runs(mission: &st3_client::Mission) -> String {
-    let total = mission
-        .extra
-        .get("total_runs")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(mission.runs.len());
+    let total = mission.total_runs.unwrap_or(mission.runs.len());
     let plural = |count: usize| if count == 1 { "" } else { "s" };
     let Some(active) = mission.active_runs.map(|active| active.min(total)) else {
         return format!("{total} run{}", plural(total));
@@ -6720,7 +6715,7 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                 if let Some(usage) = &item.usage {
                     let _ = writeln!(output, "  usage {}", render_usage(usage));
                 }
-                if item.extra.get("runs_truncated").and_then(Value::as_bool) == Some(true) {
+                if item.runs_truncated {
                     let _ = writeln!(output, "  inspect: st missions show {}", item.header.id);
                 } else if let Some(run) = item.runs.last() {
                     let _ = writeln!(output, "  inspect: st missions show {run}");
@@ -19735,6 +19730,11 @@ mod tests {
         assert_eq!(render(Some(0), 1), "1 finished run");
         assert_eq!(render(Some(0), 0), "0 runs");
         assert_eq!(render(None, 6), "6 runs");
+        // A bounded recent-run window must not replace the daemon's complete run count.
+        mission.total_runs = Some(100);
+        mission.active_runs = Some(1);
+        mission.runs.truncate(2);
+        assert_eq!(render_mission_runs(mission), "1 active · 99 finished");
     }
 
     #[test]
@@ -19789,7 +19789,6 @@ mod tests {
             reasons: vec!["requester-retired".into()],
             owner_generation: None,
             runtime_incarnation: None,
-            runtime_desired_revision: None,
         });
         let rendered = render_product_page("NOW", &page, "st now");
         assert!(

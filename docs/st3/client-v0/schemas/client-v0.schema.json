@@ -135,6 +135,19 @@
         "schemas": { "type": "array", "items": { "type": "string", "format": "uri-reference" }, "minItems": 1 }
       }
     },
+    "Operational": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer", "actionable"],
+      "description": "Whether a projected resource belongs to current operational state or retained history, and which live identity makes it actionable.",
+      "properties": {
+        "layer": { "enum": ["current", "history"] },
+        "actionable": { "type": "boolean" },
+        "reasons": { "type": "array", "items": { "type": "string" } },
+        "owner_generation": { "type": ["string", "null"] },
+        "runtime_incarnation": { "type": ["string", "null"] }
+      }
+    },
     "ResourceHeader": {
       "type": "object",
       "required": ["id", "kind", "revision", "updated_at"],
@@ -142,7 +155,8 @@
         "id": { "$ref": "#/$defs/Id" },
         "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass"] },
         "revision": { "$ref": "#/$defs/Revision" },
-        "updated_at": { "$ref": "#/$defs/Timestamp" }
+        "updated_at": { "$ref": "#/$defs/Timestamp" },
+        "operational": { "$ref": "#/$defs/Operational" }
       }
     },
     "Attention": {
@@ -571,8 +585,11 @@
             "run_details": { "type": "array", "items": { "$ref": "#/$defs/MissionRunSummary" } },
             "must_act": { "enum": ["you", "agent", "system", "blocked", "nobody"] },
             "active_runs": { "type": "integer", "minimum": 0 },
+            "total_runs": { "type": "integer", "minimum": 0 },
+            "run_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+            "runs_truncated": { "type": "boolean" },
             "run_generations": { "type": "object", "additionalProperties": { "$ref": "#/$defs/Id" } },
-            "visualization": { "$ref": "#/$defs/Visualization" },
+            "visualization": { "oneOf": [{ "$ref": "#/$defs/Visualization" }, { "type": "null" }] },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }
           }
         }
@@ -669,6 +686,11 @@
             "readiness_epoch": { "type": "integer", "minimum": 0 },
             "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "claim_incarnation": { "type": ["string", "null"] },
+            "agentless": { "type": "boolean" },
+            "claim_expires_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 },
+            "execution_started_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 },
+            "execution_elapsed_ms": { "type": "integer", "minimum": 0 },
+            "timeout_ms": { "type": ["integer", "null"], "minimum": 0 },
             "blocked_reason": { "type": ["string", "null"] },
             "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "goals": { "type": "array", "items": { "type": "string" } },
@@ -689,7 +711,7 @@
             "kind": { "const": "agent" },
             "name": { "type": "string" },
             "state": { "enum": ["desired", "starting", "running", "waiting", "stopped", "failed", "suspended"], "description": "`suspended`: the seat was stopped at a quiet boundary and resumes its own native session; see `suspension`." },
-            "reachability": { "enum": ["local", "remote", "unreachable", "unknown"] },
+            "reachability": { "enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"] },
             "runtime_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
@@ -1083,6 +1105,7 @@
             "state": { "enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"] },
             "started_at": { "$ref": "#/$defs/Timestamp" },
             "ended_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+            "runtime_incarnation": { "type": ["string", "null"] },
             "timeline_cursor": { "$ref": "#/$defs/Cursor" }
             ,"usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }
           }
@@ -1187,7 +1210,7 @@
     },
     "TimelineMessageBody": {
       "type": "object", "additionalProperties": false, "required": ["message_id"],
-      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": "string" }, "from": { "$ref": "#/$defs/Id" }, "to": { "$ref": "#/$defs/Id" }, "title": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "attachments": { "type": "array", "items": { "$ref": "#/$defs/Attachment" } } }
+      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": ["string", "null"] }, "from": { "$ref": "#/$defs/Id" }, "to": { "$ref": "#/$defs/Id" }, "title": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "attachments": { "type": "array", "items": { "$ref": "#/$defs/Attachment" } } }
     },
     "TimelineContentBody": {
       "type": "object", "additionalProperties": false, "required": ["media_type"],
@@ -1900,6 +1923,132 @@
         "retry_after_ms": { "type": "integer", "minimum": 0 },
         "details": { "type": "object" }
       }
+    },
+    "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses"] },
+    "CollectionCommand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection"],
+          "properties": {
+            "kind": { "const": "subscribe" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "collection": { "$ref": "#/$defs/CollectionName" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+            "person": { "type": "string" },
+            "actor": { "type": "string" },
+            "status": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "terminal", "incarnation", "capability"],
+          "properties": {
+            "kind": { "const": "subscribe" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "collection": { "const": "terminal" },
+            "terminal": { "$ref": "#/$defs/Id" },
+            "incarnation": { "type": "string" },
+            "capability": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "conversation"],
+          "properties": {
+            "kind": { "const": "subscribe" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "collection": { "const": "conversation" },
+            "conversation": { "$ref": "#/$defs/Id" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": { "kind": { "const": "unsubscribe" }, "id": { "type": "string", "minLength": 1, "maxLength": 128 } }
+        }
+      ]
+    },
+    "CollectionFrame": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "snapshot", "items", "order", "has_more"],
+          "properties": {
+            "kind": { "const": "snapshot" },
+            "id": { "type": "string" },
+            "collection": { "$ref": "#/$defs/CollectionName" },
+            "snapshot": { "$ref": "#/$defs/Snapshot" },
+            "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
+            "order": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "has_more": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "snapshot", "upserts", "removes", "order", "has_more"],
+          "properties": {
+            "kind": { "const": "changes" },
+            "id": { "type": "string" },
+            "collection": { "$ref": "#/$defs/CollectionName" },
+            "snapshot": { "$ref": "#/$defs/Snapshot" },
+            "upserts": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
+            "removes": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "order": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "has_more": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "snapshot", "value"],
+          "properties": {
+            "kind": { "const": "screen" },
+            "id": { "type": "string" },
+            "collection": { "const": "terminal" },
+            "snapshot": { "$ref": "#/$defs/Snapshot" },
+            "value": { "$ref": "#/$defs/TerminalScreen" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "session_id", "replace", "items"],
+          "properties": {
+            "kind": { "const": "conversation" },
+            "id": { "type": "string" },
+            "collection": { "const": "conversation" },
+            "session_id": { "$ref": "#/$defs/Id" },
+            "replace": { "type": "boolean" },
+            "items": { "type": "array", "items": { "$ref": "#/$defs/TimelineEntry" } },
+            "has_more": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": { "kind": { "const": "resync" }, "id": { "type": "string" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "message"],
+          "properties": {
+            "kind": { "const": "error" },
+            "id": { "type": "string" },
+            "collection": { "type": "string" },
+            "code": { "type": "string" },
+            "message": { "type": "string" }
+          }
+        }
+      ]
     }
   }
 }

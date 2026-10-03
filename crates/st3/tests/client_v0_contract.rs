@@ -28,6 +28,310 @@ fn fixture(name: &str) -> Value {
     json(asset_root().join("fixtures").join(name))
 }
 
+/// Validate the published wire contract, with closed resources for producer drift proof.
+/// ResourceHeader and resource-specific fields are composed with allOf, so closing either
+/// branch with additionalProperties would reject the other branch's legitimate fields.
+/// Draft 2020-12 unevaluatedProperties closes their union without flattening or duplicating it.
+fn contract_validator(definition: &str) -> jsonschema::Validator {
+    let mut schema = json(asset_root().join("schemas/client-v0.schema.json"));
+    // Consumers can preserve future cases, but this daemon must emit only declared cases.
+    // Tighten the native open-enum pattern in a test-only copy, including named definitions.
+    fn strict_known_cases(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                let known = object.get("anyOf").and_then(Value::as_array).and_then(|cases| {
+                    if cases.len() == 2 && cases[1]["type"] == "string" {
+                        cases[0].get("enum").cloned()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(known) = known {
+                    object.remove("anyOf");
+                    object.insert("enum".into(), known);
+                }
+                for child in object.values_mut() {
+                    strict_known_cases(child);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    strict_known_cases(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    strict_known_cases(&mut schema);
+    if let Some(cases) = schema["$defs"]["Resource"]["oneOf"].as_array_mut() {
+        cases.retain(|case| case["$ref"] != "#/$defs/UnknownResource");
+    }
+    for resource in schema["$defs"].as_object_mut().unwrap().values_mut() {
+        if resource["allOf"].as_array().is_some_and(|branches| {
+            branches
+                .iter()
+                .any(|branch| branch["$ref"] == "#/$defs/ResourceHeader")
+        }) {
+            resource["unevaluatedProperties"] = Value::Bool(false);
+        }
+    }
+    schema.as_object_mut().unwrap().remove("oneOf");
+    schema["$ref"] = Value::String(format!("#/$defs/{definition}"));
+    // Unknown x-st-* annotation keywords are ignored by the standard validator.
+    jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap_or_else(|error| panic!("compile {definition} contract: {error}"))
+}
+
+fn assert_conforms(validator: &jsonschema::Validator, context: &str, value: &Value) {
+    if !validator.is_valid(value) {
+        let errors = validator
+            .iter_errors(value)
+            .map(|error| {
+                format!(
+                    "{} (schema {}): {error}",
+                    error.instance_path, error.schema_path
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!("{context} violates client-v0:\n{errors}\n{value}");
+    }
+}
+
+#[tokio::test]
+async fn strict_daemon_contract_rejects_undeclared_fields_and_unknown_known_cases() {
+    let root = tempfile::tempdir().unwrap();
+    let app = st3::api::router(test_state(root.path()));
+    let (status, emitted) = client_json(app, "/v1/client/machines").await;
+    assert_eq!(status, StatusCode::OK, "{emitted}");
+    let validator = contract_validator("Envelope");
+    assert_conforms(&validator, "emitted machine page", &emitted);
+    let machine = &emitted["value"]["items"][0];
+    assert_eq!(machine["kind"], "machine");
+    assert_eq!(machine["state"], "local");
+
+    // Each negative starts with a real emitted payload that the validator accepted.
+    let mut extra_field = emitted.clone();
+    extra_field["value"]["items"][0]["undeclared_resource_field"] = Value::Bool(true);
+    assert!(
+        !validator.is_valid(&extra_field),
+        "producer-only resource fields must not silently escape the contract"
+    );
+    let mut unknown_state = emitted.clone();
+    unknown_state["value"]["items"][0]["state"] = Value::String("future-state".into());
+    assert!(
+        !validator.is_valid(&unknown_state),
+        "known enum families remain strict in the producer proof"
+    );
+    let mut wrong_kind = emitted;
+    wrong_kind["value"]["items"][0]["kind"] = Value::String("host".into());
+    assert!(
+        !validator.is_valid(&wrong_kind),
+        "Machine must not regress to an undeclared resource kind"
+    );
+}
+
+#[tokio::test]
+async fn daemon_conversation_and_terminal_frames_conform_to_client_v0() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let frame_validator = contract_validator("CollectionFrame");
+    let envelope_validator = contract_validator("Envelope");
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("client.sock");
+    let state = test_state(root.path());
+    let agent = "agent/example/worker";
+    let runtime = "contract-terminal";
+    let incarnation = "contract-terminal:i1";
+    state
+        .store
+        .append_claim(&st3::model::ClaimInput {
+            subject: agent.into(),
+            kind: "runtime.observed".into(),
+            actor: Some(agent.into()),
+            fields: serde_json::from_value(serde_json::json!({
+                "runtime_id": runtime, "incarnation_id": incarnation,
+                "status": "running", "terminal": true, "reachability": "local"
+            }))
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let app = st3::api::router(state.clone());
+    let (status, agents) = client_json(app.clone(), "/v1/client/agents").await;
+    assert_eq!(status, StatusCode::OK, "{agents}");
+    assert_conforms(&envelope_validator, "live terminal agent", &agents);
+    let session_id = agents["value"]["items"][0]["current_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    state
+        .store
+        .append_claim(&st3::model::ClaimInput {
+            subject: "message/contract-first".into(),
+            kind: "message.sent".into(),
+            actor: Some("person/alex".into()),
+            fields: serde_json::from_value(serde_json::json!({
+                "from": "person/alex", "to": agent, "session_id": session_id,
+                "content": "A synthetic request.", "status": "sent"
+            }))
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+
+    let server_socket = socket.clone();
+    let server_app = app.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, server_app)
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let client = st3_client::Client::unix_as(&socket, "person/alex");
+    let mut stream = client.collection_stream().await.unwrap();
+    stream
+        .subscribe_conversation("talk", agent)
+        .await
+        .unwrap();
+    let conversation = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation["kind"], "conversation");
+    assert_eq!(conversation["replace"], true);
+    assert_conforms(&frame_validator, "initial conversation frame", &conversation);
+    let message = conversation["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["type"] == "message")
+        .unwrap();
+    assert_eq!(message["body"]["message_id"], "message/contract-first");
+    assert_eq!(message["body"].get("reply_to"), Some(&Value::Null));
+    let (status, changes) = client_json(
+        app.clone(),
+        &format!("/v1/client/conversations/{}/changes", urlencoding::encode(agent)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{changes}");
+    assert_conforms(&envelope_validator, "conversation changes envelope", &changes);
+
+    state
+        .store
+        .append_claim(&st3::model::ClaimInput {
+            subject: agent.into(),
+            kind: "harness.timeline".into(),
+            actor: Some(agent.into()),
+            fields: serde_json::from_value(serde_json::json!({
+                "operation": "append", "entry_id": "timeline-entry/contract-reply",
+                "revision": 1, "role": "assistant", "entry_type": "content", "final": true,
+                "body": {"media_type": "text/plain", "text": "A synthetic response."},
+                "driver": "codex", "incarnation_id": incarnation, "sequence": 1
+            }))
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    state.event_notify.send(state.store.index().unwrap()).unwrap();
+    let delta = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(delta["kind"], "conversation");
+    assert_eq!(delta["replace"], false);
+    assert_conforms(&frame_validator, "conversation delta frame", &delta);
+    assert!(delta["items"].as_array().unwrap().iter().any(|entry| {
+        entry["id"] == "timeline-entry/contract-reply"
+            && entry["body"]["text"] == "A synthetic response."
+    }));
+    stream.unsubscribe("talk").await.unwrap();
+
+    // Only the PTY byte source is synthetic; the daemon's real emulator and serializers
+    // generate the TerminalScreen, envelope and multiplexed screen frame.
+    std::fs::create_dir_all(&state.pty_root).unwrap();
+    let pty_listener =
+        tokio::net::UnixListener::bind(state.pty_root.join(format!("{runtime}.sock"))).unwrap();
+    let pty = tokio::spawn(async move {
+        let (mut connection, _) = pty_listener.accept().await.unwrap();
+        let mut bytes = [0_u8; 128];
+        let mut reader = pty_core::protocol::PacketReader::new();
+        loop {
+            let count = connection.read(&mut bytes).await.unwrap();
+            assert_ne!(count, 0, "terminal viewer disconnected before PEEK");
+            if reader.feed(&bytes[..count]).unwrap().iter().any(|packet| {
+                packet.type_ == pty_core::protocol::MessageType::Peek
+            }) {
+                break;
+            }
+        }
+        connection
+            .write_all(&pty_core::protocol::encode_screen(
+                b"\x1b[1;31mSynthetic terminal\x1b[0m\r\nSecond line",
+            ))
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let terminal = format!("terminal/{agent}");
+    let (status, screen) = client_json(
+        app.clone(),
+        &format!("/v1/client/terminals/{}/screen", urlencoding::encode(&terminal)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{screen}");
+    assert_conforms(&envelope_validator, "terminal screen envelope", &screen);
+    assert_eq!(screen["value"]["lines"][0]["text"], "Synthetic terminal");
+    assert_eq!(screen["value"]["lines"][0]["runs"][0]["bold"], true);
+    let (status, capabilities) = client_json(app.clone(), "/v1/client/capabilities").await;
+    assert_eq!(status, StatusCode::OK, "{capabilities}");
+    let action = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/contract-attach", "type": "terminal.attach",
+        "idempotency_key": "contract-terminal-attach-0001",
+        "fence": {
+            "snapshot_id": capabilities["snapshot"]["id"], "subject_revisions": {},
+            "runtime_incarnation": incarnation, "terminal_sequence": capabilities["snapshot"]["store_index"]
+        },
+        "parameters": {"target_id": terminal}
+    });
+    let (status, attached) = client_post_json(app, "/v1/client/actions", action).await;
+    assert_eq!(status, StatusCode::OK, "{attached}");
+    let capability = attached["value"]["terminal_attachment"]["stream_capability"]
+        .as_str()
+        .unwrap();
+    stream
+        .subscribe_terminal("term", &terminal, Some(incarnation), capability)
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame["kind"], "screen");
+    assert_conforms(&frame_validator, "multiplexed terminal screen", &frame);
+    assert_eq!(frame["value"]["lines"], screen["value"]["lines"]);
+    stream.close().await;
+    pty.abort();
+    server.abort();
+}
+
 #[test]
 fn manifest_names_existing_json_fixtures_and_schema_definitions() {
     let root = asset_root();
@@ -391,6 +695,7 @@ fn test_state(root: &Path) -> AppState {
 
 #[tokio::test]
 async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() {
+    let validator = contract_validator("CollectionFrame");
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("client.sock");
     let state = test_state(root.path());
@@ -431,6 +736,8 @@ async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() 
     assert_eq!(second["kind"], "snapshot");
     assert_eq!(first["id"], "missions");
     assert_eq!(second["id"], "agents");
+    assert_conforms(&validator, "missions snapshot", &first);
+    assert_conforms(&validator, "agents snapshot", &second);
 
     let source =
         "version 2\nmission \"socket-test\" state=\"ready\" { goal \"Test collection changes\" }\n";
@@ -460,6 +767,7 @@ async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() 
         .unwrap();
     assert_eq!(change["kind"], "changes");
     assert_eq!(change["id"], "missions");
+    assert_conforms(&validator, "mission change", &change);
     assert!(
         change["upserts"]
             .as_array()
@@ -480,6 +788,7 @@ async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() 
         .unwrap()
         .unwrap();
     assert_eq!(fresh["kind"], "snapshot");
+    assert_conforms(&validator, "resubscribed mission window", &fresh);
     assert!(
         fresh["items"]
             .as_array()
@@ -1958,6 +2267,7 @@ mission "client-cancel-demo" state="ready" {
 
 #[tokio::test]
 async fn operational_lists_share_one_versioned_paginated_shape() {
+    let validator = contract_validator("Envelope");
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());
     let store = state.store.clone();
@@ -1989,12 +2299,15 @@ async fn operational_lists_share_one_versioned_paginated_shape() {
         "launches",
         "work",
         "agents",
+        "machines",
+        "runtimes",
         "history",
         "sessions",
     ] {
         let (status, envelope) =
             client_json(app.clone(), &format!("/v1/client/{collection}")).await;
         assert_eq!(status, StatusCode::OK, "{collection}: {envelope}");
+        assert_conforms(&validator, collection, &envelope);
         assert_eq!(envelope["api_version"], "st3.client.v0");
         assert_eq!(envelope["value"]["kind"], "page");
         assert_eq!(envelope["value"]["collection"], collection);
@@ -2003,6 +2316,7 @@ async fn operational_lists_share_one_versioned_paginated_shape() {
     }
 
     let (_, first) = client_json(app.clone(), "/v1/client/agents?limit=1").await;
+    assert_conforms(&validator, "first agents page", &first);
     assert_eq!(first["value"]["items"].as_array().unwrap().len(), 1);
     assert_eq!(first["value"]["page"]["has_more"], true);
     let cursor = first["value"]["page"]["next_cursor"].as_str().unwrap();
@@ -2011,6 +2325,7 @@ async fn operational_lists_share_one_versioned_paginated_shape() {
         urlencoding::encode(cursor)
     );
     let (_, second) = client_json(app.clone(), &uri).await;
+    assert_conforms(&validator, "second agents page", &second);
     assert_eq!(first["snapshot"]["id"], second["snapshot"]["id"]);
     assert_ne!(
         first["value"]["items"][0]["id"],
@@ -2037,23 +2352,14 @@ async fn operational_lists_share_one_versioned_paginated_shape() {
         .unwrap();
     let (status, continued) = client_json(app, &uri).await;
     assert_eq!(status, StatusCode::OK, "{continued}");
+    assert_conforms(&validator, "retained agents page", &continued);
     assert_eq!(first["snapshot"]["id"], continued["snapshot"]["id"]);
     assert_eq!(second["value"]["items"], continued["value"]["items"]);
 }
 
 #[tokio::test]
 async fn step_states_in_every_client_projection_belong_to_the_contract() {
-    let schema = json(asset_root().join("schemas/client-v0.schema.json"));
-    let allowed = schema["$defs"]["WorkState"]["enum"].as_array().unwrap();
-    for state in [
-        &schema["$defs"]["Work"]["allOf"][1]["properties"]["state"],
-        &schema["$defs"]["MissionStep"]["properties"]["state"],
-        &schema["$defs"]["WorkLabel"]["properties"]["state"],
-        &schema["$defs"]["MissionRunSummary"]["properties"]["current_steps"]["items"]["properties"]
-            ["state"],
-    ] {
-        assert_eq!(state["$ref"], "#/$defs/WorkState");
-    }
+    let validator = contract_validator("Envelope");
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());
     let states = [
@@ -2159,17 +2465,10 @@ async fn step_states_in_every_client_projection_belong_to_the_contract() {
         }
     }
     let app = st3::api::router(state);
-    let check = |item: &Value| {
-        assert!(
-            allowed.contains(&item["state"]),
-            "{} emits undeclared state {}",
-            item["id"],
-            item["state"]
-        );
-    };
     for path in ["/v1/client/missions", "/v1/client/missions/state-contract"] {
         let (status, response) = client_json(app.clone(), path).await;
         assert_eq!(status, StatusCode::OK, "{response}");
+        assert_conforms(&validator, path, &response);
         let mission = if path.ends_with("state-contract") {
             &response["value"]
         } else {
@@ -2177,16 +2476,12 @@ async fn step_states_in_every_client_projection_belong_to_the_contract() {
         };
         let run = &mission["run_details"][0];
         for step in run["steps"].as_array().unwrap() {
-            check(step);
             let expected = states
                 .iter()
                 .find(|(internal, _)| step["path"] == *internal)
                 .unwrap()
                 .1;
             assert_eq!(step["state"], expected);
-        }
-        for step in run["current_steps"].as_array().unwrap() {
-            check(step);
         }
         assert!(
             run["current_steps"]
@@ -2198,22 +2493,23 @@ async fn step_states_in_every_client_projection_belong_to_the_contract() {
     }
     let (status, response) = client_json(app.clone(), "/v1/client/work?history=true").await;
     assert_eq!(status, StatusCode::OK, "{response}");
+    assert_conforms(&validator, "work history", &response);
     assert_eq!(
         response["value"]["items"].as_array().unwrap().len(),
         states.len()
     );
     for step in response["value"]["items"].as_array().unwrap() {
-        check(step);
         let (status, detail) = client_json(
             app.clone(),
             &format!("/v1/client/work/{}", step["id"].as_str().unwrap()),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{detail}");
-        check(&detail["value"]);
+        assert_conforms(&validator, "work detail", &detail);
     }
     let (status, response) = client_json(app, "/v1/client/agents").await;
     assert_eq!(status, StatusCode::OK, "{response}");
+    assert_conforms(&validator, "agent work queue", &response);
     let agent = &response["value"]["items"][0];
     assert_eq!(
         agent["current_work"]
@@ -2224,17 +2520,6 @@ async fn step_states_in_every_client_projection_belong_to_the_contract() {
             .unwrap()["state"],
         "claimed"
     );
-    for step in agent["current_work"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .chain(agent["upcoming_work"].as_array().unwrap())
-    {
-        check(step);
-    }
-    if agent["next_work"].is_object() {
-        check(&agent["next_work"]);
-    }
 }
 
 #[tokio::test]
