@@ -2940,6 +2940,14 @@ pub struct AgentCreateParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_at_run_end: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -3297,4 +3305,17 @@ pub struct GlassPut {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct GlassDelete {
     pub base_revision: Option<String>,
+}
+
+/// Repositories already used by a host's declared agents, read from replicated graph evidence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HostRepositories {
+    pub host_id: String,
+    pub repositories: Vec<AgentRepository>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentRepository {
+    pub path: String,
+    pub workspaces: Vec<String>,
+    pub agent_ids: Vec<String>,
 }

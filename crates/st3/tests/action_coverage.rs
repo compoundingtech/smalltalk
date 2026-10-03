@@ -1520,6 +1520,8 @@ async fn cli_reads_preserve_operational_views_after_restart() {
         vec!["now", "--as", PERSON],
         vec!["agents", "ls"],
         vec!["agents", "tree"],
+        vec!["agents", "repos"],
+        vec!["agents", "repos", "--host", "host/other"],
         vec!["agents", "show", WORKER],
         vec!["agents", "queue", WORKER],
         vec!["missions", "ls"],

@@ -1112,6 +1112,16 @@ impl Client {
         .await
     }
 
+    pub async fn host_repositories(
+        &self,
+        host: &str,
+    ) -> Result<Envelope<HostRepositories>, ClientError> {
+        self.get(&format!(
+            "/v1/client/hosts/{}/repositories",
+            percent_encode(host)
+        ))
+        .await
+    }
     pub async fn sets_list(
         &self,
         cursor: Option<&str>,

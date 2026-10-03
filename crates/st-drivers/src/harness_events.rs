@@ -403,6 +403,14 @@ pub fn prepare_publication(
         "INSERT OR IGNORE INTO prepared VALUES (?1,?2,?3)",
         params![sequence, slot, serde_json::to_string(claim)?],
     )?;
+    // Rebuild rejected todo claims from their retained event without keeping the malformed
+    // pre-normalization slot as a retry target. Preparation and retirement commit together.
+    if slot == "harness.todo.observed:normalized" {
+        tx.execute(
+            "DELETE FROM prepared WHERE sequence=?1 AND slot='harness.todo.observed:'",
+            [sequence],
+        )?;
+    }
     let body: String = tx.query_row(
         "SELECT body FROM prepared WHERE sequence=?1 AND slot=?2",
         params![sequence, slot],

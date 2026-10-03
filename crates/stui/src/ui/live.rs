@@ -1583,6 +1583,7 @@ async fn perform(
                         workspace: None,
                         description: None,
                         message,
+                        ..Default::default()
                     },
                 )
                 .await?;

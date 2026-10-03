@@ -16,6 +16,16 @@ final class St3ClientTests: XCTestCase {
         let request = try ActionRequest.agentCreate(id: "action/create", idempotencyKey: "creation-test-key",
             fence: Fence(snapshotID: "snapshot/test"), parameters: parameters)
         XCTAssertEqual(request.parameters["message"], .string("--literal text"))
+        let checkout = AgentCreateParameters(name: "parser", harness: "codex", repo: "/work/repo",
+            base: "origin/main", branch: "parser", removeAtRunEnd: true)
+        let creation = try ActionRequest.agentCreate(id: "action/checkout", idempotencyKey: "checkout-test-key",
+            fence: Fence(snapshotID: "snapshot/test"), parameters: checkout)
+        XCTAssertEqual(creation.parameters["remove_at_run_end"], .bool(true))
+        XCTAssertNil(creation.parameters["removeAtRunEnd"])
+        let repositories = try JSONDecoder().decode(HostRepositories.self, from: Data(
+            #"{"host_id":"host/example","repositories":[{"path":"/work/repo","workspaces":["/work/parser"],"agent_ids":["agent/example.parser"]}]}"#.utf8))
+        XCTAssertEqual(repositories.hostID, "host/example")
+        XCTAssertEqual(repositories.repositories[0].agentIDs, ["agent/example.parser"])
     }
 
     func testGlassFixtureAndNullCreationBase() throws {

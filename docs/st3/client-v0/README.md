@@ -949,11 +949,32 @@ Member daemons replicate the claims; paired clients read them through a member g
 ## Agent and plain-shell creation
 
 `agent.create` takes `name`, `harness` (`claude`, `codex`, `omp`, `pi`, `opencode`), optional `host`,
-`model`, `effort`, `workspace`, `description`, and `message`. Names are stable seat identities as
+`model`, `effort`, `workspace`, `repo`, `base`, `branch`, `remove_at_run_end`, `description`, and `message`. Names are stable seat identities as
 in `st agents new`. Workspace paths are absolute on the selected host; omission asks that host for
 its usual new-agent directory. The host creates missing agent workspaces. OpenCode does not accept
 `effort`. Message text is nonempty, at most 64 KiB, and uses the native harness startup argument.
 An existing active seat requires a different name; a stopped seat may be deliberately recreated.
+
+`repo` is an existing repository's absolute path on the selected host. It adds the existing
+`checkout` declaration and creates the agent workspace as a worktree. `base` defaults to
+`origin/main`; `branch` defaults to the simple agent name with Git-invalid characters replaced
+by dashes. An existing branch is reused. `base`, `branch`, and `remove_at_run_end` require `repo`.
+An optional `workspace` chooses the worktree destination; otherwise the host names it as usual.
+With `remove_at_run_end: true`, stopping a top-level seat removes its clean worktree after its
+runtime stops. A mission seat removes it during run cleanup. The branch stays; changed or shared
+worktrees stay with a diagnostic. A branch in another worktree reports that path and waits for
+a changed declaration instead of repeatedly retrying Git. Missing repositories prevent launch
+and produce an agent fault naming the path. An existing workspace must match the repository and
+branch; a plain directory cannot bypass the checkout.
+
+`GET /v1/client/hosts/{id}/repositories` (`host.repositories`) returns `HostRepositories`:
+`host_id` and `repositories`, each with `path`, `workspaces`, and `agent_ids`. Any member can
+answer for any host from replicated checkout declarations and latest `workspace.observed`
+claims authored by that host. Reconciliation observes Git directories for plain workspaces;
+reads never inspect another host's disk or scan the filesystem. Suggestions include currently
+declared agents only and can be empty before the owning host reconciles a plain workspace.
+Rust exposes `host_repositories`; TypeScript and Swift expose `hostRepositories`.
+The same read is `st agents repos [--host HOST] [--json]`.
 
 `terminal.create` takes a nonempty display `name` (up to 160 bytes), optional `host` and absolute
 `cwd`. An omitted directory uses the selected daemon's directory. It declares a standalone PTY

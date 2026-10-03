@@ -338,6 +338,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
+        .route("/v1/client/hosts/{*id}", get(client_v0::host_repositories))
         .route("/v1/client/devices", get(client_v0::devices))
         .route("/v1/client/attention", get(client_attention))
         .route("/v1/client/attention/{*id}", get(client_attention_detail))
