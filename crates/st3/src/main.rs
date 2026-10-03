@@ -9279,7 +9279,20 @@ async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool
                 if !args.show_env_values {
                     st3::graph::redact_agent_env_values(&mut desired);
                 }
-                print!("{}", st3::graph::render_agent_desired_kdl(&desired)?);
+                let mut uris = BTreeMap::new();
+                for reference in st3::graph::declared_resources(&desired) {
+                    let status = status_for(client, &reference.subject).await?;
+                    if let Some(uri) = status
+                        .subjects
+                        .iter()
+                        .find(|subject| subject.subject == reference.subject)
+                        .and_then(|subject| subject.desired.as_ref())
+                        .and_then(st3::graph::declared_uri)
+                    {
+                        uris.insert(reference.subject, uri.to_owned());
+                    }
+                }
+                print!("{}", st3::graph::render_agent_desired_kdl(&desired, &uris)?);
                 Ok(())
             } else {
                 run_inspect(
