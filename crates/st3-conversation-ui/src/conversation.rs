@@ -637,13 +637,13 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 (Some(error), true) => (
                     rules.unconfirmed.color(theme),
                     format!(
-                        "you · unconfirmed, st did not answer ({error}) · ctrl+r send again · alt+x clear"
+                        "you · unconfirmed, st did not answer ({error}) · ctrl+r send again · backspace edit"
                     ),
                     fg(rules.unconfirmed, theme),
                 ),
                 (Some(error), false) => (
                     rules.failed.color(theme),
-                    format!("you · not sent: {error} · ctrl+r retry · alt+x clear"),
+                    format!("you · not sent: {error} · ctrl+r retry · backspace edit"),
                     fg(rules.failed, theme),
                 ),
             };

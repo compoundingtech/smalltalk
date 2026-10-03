@@ -813,6 +813,32 @@ impl Ui {
             .map(|entry| entry.id.clone())
     }
 
+    /// Take the message st never had back into the box, ahead of anything written since, to
+    /// change and send or delete there: nothing typed is lost.
+    fn take_back_undelivered(&mut self) {
+        let (Some(agent), Some(entry)) = (self.selected_id(), self.undelivered()) else {
+            return;
+        };
+        let Some(Load::Ready(entries)) = self.world.conversations.get(&agent) else {
+            return;
+        };
+        let Some(Body::Pending { text, .. }) = entries
+            .iter()
+            .find(|candidate| candidate.id == entry)
+            .map(|entry| &entry.body)
+        else {
+            return;
+        };
+        let draft = self.conversation_state.drafts.entry(agent).or_default();
+        *draft = if draft.is_empty() {
+            text.clone()
+        } else {
+            format!("{text}\n\n{draft}")
+        };
+        self.editing = true;
+        self.effects.push(Effect::Forget { entry });
+    }
+
     /// The tab and the id selected in it.
     pub fn focus(&self) -> (usize, Option<String>) {
         (self.tab, self.selected_id())
@@ -2541,7 +2567,6 @@ impl Ui {
                     ("ctrl+v  ctrl+x", "split right; split below"),
                     ("ctrl+w", "close the tab"),
                     ("[ ]  ctrl+pgup pgdn", "previous, next tab in the split"),
-                    ("alt+1-9", "a tab by its number"),
                     (
                         "alt+arrows",
                         "move between splits; left of the first is the sidebar",
@@ -2584,20 +2609,20 @@ impl Ui {
                 ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
                 ("end", "jump to the newest message and follow it"),
                 ("ctrl+f", "find in this conversation"),
-                ("ctrl+e  alt+o", "expand or collapse tool output"),
+                ("ctrl+e", "expand or collapse tool output"),
                 (
-                    "ctrl+p  alt+shift+o",
+                    "ctrl+p",
                     "simplified view: tool calls fold to a line (this device)",
                 ),
                 (
-                    "ctrl+d  alt+i",
+                    "ctrl+d",
                     "this agent's details beside it (ctrl+i too, where the terminal tells it from tab)",
                 ),
                 ("drag", "select text in one pane; release copies it"),
                 ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
                 (
-                    "ctrl+r  alt+x",
-                    "resend or clear a message that was not sent (alt+r resends too)",
+                    "ctrl+r  backspace",
+                    "a message that was not sent: send it again; take it back to change",
                 ),
                 ("ctrl+c", "stop the agent (asks first)"),
                 ("tab  shift+tab", "the next or previous tab"),
