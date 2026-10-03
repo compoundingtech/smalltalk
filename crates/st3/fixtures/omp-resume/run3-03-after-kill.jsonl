@@ -1,0 +1,4 @@
+{"type":"session","id":"01a0fc4b-d1d6-7462-8b96-8001f70e0878"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"[redacted canary request]"}]}}
+{"type":"message","message":{"role":"assistant","content":[],"stopReason":"toolUse"}}
+{"type":"custom","customType":"tool_execution_start","data":{"toolCallId":"toolu_0179rsQAbpQmnqiZKiU8WRaA","toolName":"ask","startedAt":"2026-10-02T11:07:07.925Z","intent":"Asking canary color"}}

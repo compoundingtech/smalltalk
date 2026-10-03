@@ -1,0 +1,4 @@
+{"type":"session","id":"01a0fc4c-8426-72f7-9b93-eb58f013ac6d"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"[redacted canary request]"}]}}
+{"type":"message","message":{"role":"assistant","content":[],"stopReason":"toolUse"}}
+{"type":"custom","customType":"tool_execution_start","data":{"toolCallId":"toolu_01JhSu65uZoi3kQCDTQHhtkr","toolName":"ask","startedAt":"2026-10-02T11:07:53.262Z","intent":"Asking heal canary color"}}
