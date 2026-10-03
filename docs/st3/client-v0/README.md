@@ -534,6 +534,9 @@ native binding whose latest `resume_available` flag is true; false honestly indi
 without preserved native context. An assigned but unsaved session is not resumable. A newer
 unavailable binding, including `/new` within one incarnation, never revives an older saved session;
 missing availability is conservatively false.
+Pi and OMP refresh their transcript binding at turn boundaries, so an initially unsaved session
+becomes resumable after its first persisted turn. A captured resume fails if the provider first
+binds a different session; the CLI waits for the replacement's matching native binding.
 Supported native launches are Claude and OMP (`--resume` with the exact native session),
 pi and OpenCode (`--session` with the exact native session), and Codex's controlled app-server
 launch (the exact native thread). Explicit fresh context overrides authored continuation,

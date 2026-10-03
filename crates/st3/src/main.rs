@@ -10161,6 +10161,7 @@ async fn run_agents(
                             anyhow::bail!("`{subject}` could not restart: {fault}");
                         }
                         if agent.state == "waiting"
+                            && agent.blocked_on.as_deref() == Some("human")
                             && agent
                                 .incarnation_id
                                 .as_deref()

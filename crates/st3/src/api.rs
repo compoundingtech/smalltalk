@@ -13314,7 +13314,17 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert!(suspension.holds_seat());
         let (_, body) = ask("/v1/agents/suspend", "again").await;
         assert_eq!(body["code"], "already-suspended");
-        let (_, body) = ask("/v1/agents/restart", "restart").await;
+        let (_, body) = json_request(
+            app,
+            "/v1/agents/restart",
+            json!({
+                "subject": subject,
+                "actor": "person/test",
+                "idempotency_key": "restart",
+                "incarnation_id": incarnation,
+            }),
+        )
+        .await;
         assert_eq!(body["code"], "restart-suspended");
     }
 
@@ -18675,6 +18685,8 @@ mission "agent-health" state="ready" {
                 idempotency_key: Some("agent-health-runtime".into()),
             })
             .unwrap();
+        // Readiness is independent of the daemon-wide mailbox startup grace.
+        delivery_presence::record_legacy(&subject, "codex-channel", std::process::id());
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["state"], "starting");

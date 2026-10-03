@@ -786,6 +786,13 @@ export default function (pi: ExtensionAPI) {
    * neither is not sent.
    */
   const sendContext = (ctx: ExtensionContext, compaction?: Record<string, unknown>) => {
+    // Fresh sessions gain a transcript only after their first persisted turn.
+    // Refresh that evidence at turn boundaries, even when usage is unavailable.
+    sendFrame({
+      type: "session",
+      sessionId: ctx.sessionManager.getSessionId(),
+      path: ctx.sessionManager.getSessionFile?.() ?? null,
+    });
     const reading = usageReading(ctx);
     if (!reading && !compaction) return;
     const frame: Record<string, unknown> = { type: "context" };

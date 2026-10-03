@@ -251,7 +251,7 @@ impl Fixture {
     }
     async fn request(&self, subject: &str, key: &str) -> ClaimRecord {
         let actual = self.store.latest_actual_value(subject).unwrap().unwrap();
-        let incarnation = actual["fields"]["incarnation_id"].as_str().unwrap();
+        let incarnation = actual["incarnation_id"].as_str().unwrap();
         self.client()
             .post(
                 "/v1/agents/restart",
@@ -500,8 +500,8 @@ async fn stale_incarnation_request_does_not_stop_the_current_seat() {
     assert!(rejected.is_err(), "a stale UI must not restart a replacement");
     fixture.reconciler.reconcile_once().unwrap();
     let actual = fixture.store.latest_actual_value(&subject).unwrap().unwrap();
-    assert_eq!(actual["fields"]["incarnation_id"], "fixture:1");
-    assert_eq!(actual["fields"]["status"], "running");
+    assert_eq!(actual["incarnation_id"], "fixture:1");
+    assert_eq!(actual["status"], "running");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -529,7 +529,7 @@ async fn restart_with_context(
     fresh_context: bool,
 ) -> ClaimRecord {
     let actual = fixture.store.latest_actual_value(subject).unwrap().unwrap();
-    let incarnation = actual["fields"]["incarnation_id"].as_str().unwrap();
+    let incarnation = actual["incarnation_id"].as_str().unwrap();
     fixture
         .client()
         .post(
@@ -548,7 +548,7 @@ async fn restart_with_context(
 
 async fn bind_native_session(fixture: &Fixture, subject: &str, session: &str, available: bool) {
     let actual = fixture.store.latest_actual_value(subject).unwrap().unwrap();
-    let incarnation = actual["fields"]["incarnation_id"].as_str().unwrap();
+    let incarnation = actual["incarnation_id"].as_str().unwrap();
     let _: ClaimRecord = fixture
         .client()
         .post(
@@ -567,10 +567,14 @@ async fn bind_native_session(fixture: &Fixture, subject: &str, session: &str, av
         .unwrap();
 }
 
-async fn wait_for_starts(fixture: &Fixture, count: usize) {
+async fn wait_for_starts(fixture: &Fixture, subject: &str, count: usize) {
     for _ in 0..100 {
         fixture.reconciler.reconcile_once().unwrap();
-        if fixture.runtime.starts.lock().unwrap().len() == count {
+        let actual = fixture.store.latest_actual_value(subject).unwrap();
+        if actual.is_some_and(|actual| {
+            actual["status"] == "running"
+                && actual["incarnation_id"] == format!("fixture:{count}")
+        }) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -586,7 +590,7 @@ async fn person_restart_resumes_only_a_saved_conversation_and_fresh_overrides_it
     let request = restart_with_context(&fixture, &subject, "resume", false).await;
     assert_eq!(request.actor.as_deref(), Some("person/avery"));
     assert_eq!(request.body["fields"]["native_session_id"], "saved-conversation");
-    wait_for_starts(&fixture, 2).await;
+    wait_for_starts(&fixture, &subject, 2).await;
     assert_eq!(
         restart_environment(&fixture.runtime.starts.lock().unwrap()[1]),
         (Some("saved-conversation"), None)
@@ -597,13 +601,13 @@ async fn person_restart_resumes_only_a_saved_conversation_and_fresh_overrides_it
     bind_native_session(&fixture, &subject, "unsaved-new", false).await;
     let request = restart_with_context(&fixture, &subject, "unsaved", false).await;
     assert!(request.body["fields"]["native_session_id"].is_null());
-    wait_for_starts(&fixture, 3).await;
+    wait_for_starts(&fixture, &subject, 3).await;
     assert_eq!(restart_environment(&fixture.runtime.starts.lock().unwrap()[2]), (None, None));
 
     bind_native_session(&fixture, &subject, "context-to-drop", true).await;
     let request = restart_with_context(&fixture, &subject, "fresh", true).await;
     assert!(request.body["fields"]["native_session_id"].is_null());
-    wait_for_starts(&fixture, 4).await;
+    wait_for_starts(&fixture, &subject, 4).await;
     assert_eq!(
         restart_environment(&fixture.runtime.starts.lock().unwrap()[3]),
         (None, Some("1"))
