@@ -351,8 +351,14 @@ observation or a restart sends nothing twice, and the baseline sends nothing. Wh
 delivers a wake about a comment or review, it reads the text from GitHub by its ID and shows the
 first 600 characters; the text is never stored in the graph.
 
-The host that declared a watch ends it without a wake when its seat's declaration ends, and with a
-final wake when its deadline passes, and then stops its declaration.
+A watch survives a seat's stop and start, suspend and resume, and daemon or host restarts. Wakes
+queue as ordinary mail while the seat is stopped. The repository observer keeps polling while
+any watch is alive, including a stopped seat's watch, and stops when the last watch ends.
+
+The host that declared a watch ends it without a wake when the seat is retired (its declaration
+is removed) or explicitly starts a fresh conversation (`fresh-context`). Ending a mission run
+or stopping its seat does not itself remove the watch. A deadline gives one final wake and ends
+the watch even while the seat is stopped. Each ending also stops that watch's declaration.
 
 Every fleet agent posts as one GitHub login, so a login cannot say which seat wrote a comment.
 `st gh comment OWNER/REPO#N --body-file FILE` posts through the seat's daemon, records the new
