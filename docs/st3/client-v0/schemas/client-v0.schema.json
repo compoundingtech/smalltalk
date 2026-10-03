@@ -623,7 +623,8 @@
             "runs_truncated": { "type": "boolean" },
             "run_generations": { "propertyNames": {"$ref": "#/$defs/MissionRunId"}, "type": "object", "additionalProperties": { "$ref": "#/$defs/RunGenerationId" } },
             "visualization": { "oneOf": [{ "$ref": "#/$defs/Visualization" }, { "type": "null" }] },
-            "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }
+            "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
+            "resources": { "type": "array", "items": { "$ref": "#/$defs/DeclaredResource" }, "description": "The resources the current published revision names, in authored order. Read-only. An older daemon omits the field." }
           }
         }
       ]
@@ -772,7 +773,8 @@
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
             "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present for local native seats that are running or waiting, including human-blocked harnesses; a stale path makes a running agent `waiting`." },
             "subagents": { "type": "array", "items": { "$ref": "#/$defs/AgentSubagent" }, "description": "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." },
-            "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." }
+            "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." },
+            "resources": { "type": "array", "items": { "$ref": "#/$defs/DeclaredResource" }, "description": "The resources the seat's current declaration names, in authored order. Read-only. An older daemon omits the field." }
           }
         }
       ]
@@ -884,6 +886,18 @@
       "required": ["agent_id"],
       "properties": {
         "agent_id": { "$ref": "#/$defs/Id" },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "DeclaredResource": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A named edge from a seat or mission declaration to an ordinary resource subject in the graph.",
+      "required": ["name", "subject", "uri"],
+      "properties": {
+        "name": { "type": "string", "description": "Unique within the declaration." },
+        "subject": { "$ref": "#/$defs/Id", "description": "The `uri.reference` resource subject: `resource/uri/` followed by the SHA-256 of the exact URI. Every declaration of one URI names the same subject." },
+        "uri": { "type": ["string", "null"], "description": "The exact absolute URI, any scheme. Null while the referenced subject has not reached this host." },
         "reason": { "type": ["string", "null"] }
       }
     },

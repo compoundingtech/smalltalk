@@ -547,6 +547,7 @@ fn validate_surfaces(
         "UsageLimit",
         "LaunchPreview",
         "MissionRunSummary",
+        "DeclaredResource",
         "AgentQueue",
         "AgentQueueRun",
         "AgentQueueMove",

@@ -829,6 +829,14 @@ fn build_registry() -> Registry {
 fn resource_specs() -> BTreeMap<String, ResourceSpec> {
     let mut resources = BTreeMap::new();
     resources.insert(
+        "uri.reference".into(),
+        resource(
+            "uri.reference",
+            "An external resource addressed by an opaque absolute URI.",
+            &[("uri", immutable_string())],
+        ),
+    );
+    resources.insert(
         "vcs.repository".into(),
         resource(
             "vcs.repository",
@@ -3745,6 +3753,7 @@ mod tests {
                 "filesystem.file",
                 "harness.session-file",
                 "human.review",
+                "uri.reference",
                 "vcs.commit",
                 "vcs.issue",
                 "vcs.pull-request",
