@@ -149,10 +149,10 @@ with its description. No match, a daemon that does not answer within 2 s, or a n
 keeps `<namespace>/<word>` (R10), so a local attach works while the daemon is down.
 
 ```
-$ st terminals attach eu-ci        → agent/dev3.eu-ci-bottleneck
+$ st terminals attach ci-w         → agent/host-a.ci-watcher
 $ st terminals attach interactive
 st: `interactive` matches 9 subjects; name one exactly:
-  agent/interactive/dev3/43b16cd2-ec69-44  running · dev3 · omp · idle · up 2h
+  agent/interactive/host-a/43b16cd2-ec69-44  running · host-a · omp · idle · up 2h
   …
 ```
 

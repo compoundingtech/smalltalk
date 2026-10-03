@@ -41,7 +41,7 @@ question with its options and evidence.
 
 ## Evidence and Argument
 
-- A prototype on dev3 (2026-09-30) used clap_complete 4.6 `unstable-dynamic`. It returned live
+- A prototype on a shared build host (2026-09-30) used clap_complete 4.6 `unstable-dynamic`. It returned live
   terminals with descriptions in fish (`complete -C`), zsh, and bash, and it completed through the
   `pty` alias.
 - hyperfine, load average 167: an entity TAB took 22 ms, a subcommand TAB 2 ms, and a list call to

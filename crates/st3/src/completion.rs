@@ -723,10 +723,10 @@ mod tests {
 
     fn fleet() -> Vec<Candidate> {
         [
-            "agent/dotfiles/steward",
-            "agent/dev3.eu-ci-bottleneck",
-            "agent/interactive/dev3/a13d6263-3bb5-4b",
-            "agent/interactive/dev3/43b16cd2-ec69-44",
+            "agent/project/steward",
+            "agent/host-a.ci-watcher",
+            "agent/interactive/host-a/a13d6263-3bb5-4b",
+            "agent/interactive/host-a/43b16cd2-ec69-44",
         ]
         .map(candidate)
         .to_vec()
@@ -739,12 +739,12 @@ mod tests {
             Resolution::Subject(subject) => subject,
             other => panic!("{word}: {other:?}"),
         };
-        assert_eq!(subject("steward"), "agent/dotfiles/steward");
-        assert_eq!(subject("a13d"), "agent/interactive/dev3/a13d6263-3bb5-4b");
-        assert_eq!(subject("eu-ci"), "agent/dev3.eu-ci-bottleneck");
+        assert_eq!(subject("steward"), "agent/project/steward");
+        assert_eq!(subject("a13d"), "agent/interactive/host-a/a13d6263-3bb5-4b");
+        assert_eq!(subject("ci-w"), "agent/host-a.ci-watcher");
         assert_eq!(subject("agent/other"), "agent/other");
-        // Step 3 wins before step 4: `dev3` prefixes one last segment.
-        assert_eq!(subject("dev3"), "agent/dev3.eu-ci-bottleneck");
+        // Step 3 wins before step 4: `host-a` prefixes one last segment.
+        assert_eq!(subject("host-a"), "agent/host-a.ci-watcher");
         let Resolution::Ambiguous(matches) = resolve("interactive", "agent", &fleet) else {
             panic!("interactive names two subjects");
         };
@@ -756,7 +756,7 @@ mod tests {
     fn exact_namespace_subject_wins_over_segments() {
         let fleet = vec![
             candidate("pty/steward"),
-            candidate("agent/dotfiles/steward"),
+            candidate("agent/project/steward"),
         ];
         assert_eq!(
             resolve("steward", "pty", &fleet),
