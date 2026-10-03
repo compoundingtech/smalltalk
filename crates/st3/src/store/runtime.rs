@@ -42,11 +42,13 @@ impl Runtime for SmalltalkRuntime {
         connection.execute_batch(SCHEMA)?;
         migrate_local_usage_seen(connection)?;
         backfill_message_index(connection)?;
-        resources::create_schema(connection)
+        resources::create_schema(connection)?;
+        glass_heads::create_schema(connection)
     }
 
     fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()> {
         resources::open(transaction)?;
+        glass_heads::open(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -151,6 +153,7 @@ impl Runtime for SmalltalkRuntime {
 
     fn after_projection(&self, transaction: &Transaction<'_>) -> Result<(), St3Error> {
         resources::flush(transaction).map_err(internal)?;
+        glass_heads::flush(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
     }
 
