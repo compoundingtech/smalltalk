@@ -333,21 +333,33 @@ pub fn thread_cpu() -> std::time::Duration {
 /// When a run's result could next change with time alone: the earliest lease expiry, retry
 /// backoff, step timeout or run deadline still ahead of `now`.
 pub fn run_due(run: &crate::model::MissionRunView, now: u128) -> Option<u128> {
-    let mut times = Vec::new();
-    times.extend(run.deadline_at_unix_ms);
-    for step in &run.steps {
-        times.extend(step.claim_expires_at_unix_ms);
-        times.extend(step.not_before_unix_ms);
-        if let (Some(started), Some(timeout)) = (step.execution_started_at_unix_ms, step.timeout_ms)
-        {
-            times.push(
+    run.deadline_at_unix_ms
+        .filter(|time| *time > now)
+        .into_iter()
+        .chain(run.steps.iter().filter_map(|step| step_due(step, now)))
+        .min()
+}
+
+/// When a step's view could next change with time alone: its lease expiry, retry backoff or
+/// timeout, whichever comes first after `now`.
+pub fn step_due(step: &crate::model::StepRunView, now: u128) -> Option<u128> {
+    let timeout =
+        step.execution_started_at_unix_ms
+            .zip(step.timeout_ms)
+            .map(|(started, timeout)| {
                 started
                     .saturating_add(u128::from(timeout))
-                    .saturating_add(u128::from(step.timeout_extension_ms)),
-            );
-        }
-    }
-    times.into_iter().filter(|time| *time > now).min()
+                    .saturating_add(u128::from(step.timeout_extension_ms))
+            });
+    [
+        step.claim_expires_at_unix_ms,
+        step.not_before_unix_ms,
+        timeout,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|time| *time > now)
+    .min()
 }
 
 #[cfg(test)]

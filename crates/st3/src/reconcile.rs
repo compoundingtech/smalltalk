@@ -1911,9 +1911,14 @@ impl<R: RuntimeControl> Reconciler<R> {
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
         let _work_messages_span = crate::profile::span("pass/work-messages");
+        let skip_wakes = self.skip_unneeded && !self.incremental.take_full_pass("wake", now_ms());
+        let mut wakes = BTreeSet::new();
         for (agent, incarnation, member) in work_message_agents {
-            let result =
-                caught(|| self.reconcile_work_messages(&agent, &incarnation, Some(&member)));
+            let item = format!("wake:{agent}@{incarnation}");
+            wakes.insert(item.clone());
+            let result = self.reconcile_wake_item(&item, skip_wakes, || {
+                self.reconcile_work_messages(&agent, &incarnation, Some(&member))
+            });
             let result = match deferred_member_faults.remove(&agent) {
                 Some(error) => Err(error),
                 None => result,
@@ -1922,6 +1927,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 diagnostic_errors.push(format!("{agent}: {error:#}"));
             }
         }
+        self.incremental.retain("wake:", &wakes);
         diagnostic_errors.append(
             &mut self
                 .unrecorded_faults
@@ -2747,6 +2753,50 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(false)
     }
 
+    /// Deliver one running agent's work wakes, or skip them when `skip` and nothing they read
+    /// changed and no retry is due. A write by an unmarked agent is counted as a correction.
+    fn reconcile_wake_item(
+        &self,
+        item: &str,
+        skip: bool,
+        work: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let needed = self.incremental.needs(item, now_ms());
+        if skip && !needed {
+            return Ok(());
+        }
+        let cpu_started = crate::incremental::thread_cpu();
+        let writes = smallclaims::touched::writes();
+        let feed_before = (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+        let ((result, due), reads) =
+            smallclaims::touched::record(|| smallclaims::touched::record_due(|| caught(work)));
+        crate::performance::record_evaluation(
+            "wake",
+            needed,
+            crate::incremental::thread_cpu().saturating_sub(cpu_started),
+        );
+        if !needed && smallclaims::touched::writes() > writes {
+            let wrote: Vec<String> = feed_before
+                .and_then(Result::ok)
+                .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
+                .map(|feed| {
+                    feed.changes
+                        .iter()
+                        .map(|change| format!("{} {}", change.kind, change.subject))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !wrote.is_empty() {
+                self.incremental_correction("wake", item, &reads, &wrote);
+            }
+        }
+        // A failed delivery is tried again on the next pass, as before.
+        if result.is_ok() {
+            self.incremental.evaluated(item, reads, due);
+        }
+        result
+    }
+
     fn reconcile_work_messages(
         &self,
         agent: &str,
@@ -2760,6 +2810,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         let messages = self.store.work_wake_messages_for_reconcile(agent)?;
         let work = self.store.work_for_reconcile(agent)?;
         let harness = self.store.current_harness(agent)?;
+        let now = now_ms();
+        for step in &work {
+            if let Some(due) = crate::incremental::step_due(step, now) {
+                smallclaims::touched::note_due(due);
+            }
+        }
 
         if !harness.as_ref().is_some_and(CurrentHarnessView::is_ready) {
             return Ok(());
@@ -2936,7 +2992,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                         self.signal_changed();
                     }
                 }
-                WorkWakeDecision::Wait => {}
+                WorkWakeDecision::Wait => {
+                    // The next attempt, or the end of the grace before exhaustion.
+                    let next = if attempt_count < WORK_WAKE_MAX_ATTEMPTS {
+                        attempts
+                            .last()
+                            .map(|(last, _)| last.saturating_add(WORK_WAKE_RETRY_MS))
+                    } else {
+                        attempts
+                            .first()
+                            .map(|(first, _)| first.saturating_add(WORK_WAKE_EXHAUST_GRACE_MS))
+                    };
+                    if let Some(next) = next {
+                        smallclaims::touched::note_due(next);
+                    }
+                }
             }
         }
         anyhow::ensure!(

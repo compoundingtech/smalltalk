@@ -339,17 +339,67 @@ fn work(store: &Store, action: &str, at: u128) {
         }) else {
             continue;
         };
-        let request = crate::model::WorkRequest {
-            actor: Some("agent/node.worker".into()),
-            incarnation: Some("current".into()),
-            // A bare renewal writes no claim, only the lease: a change the feed never shows.
-            summary: (action != "renew").then(|| format!("{action} at {at}")),
-            reason: None,
-            evidence: Vec::new(),
-            idempotency_key: format!("{action}:{at}"),
+        // `take` claims and reports progress at once, as a worker that starts at once does, and
+        // `give back` claims and releases.
+        let actions = match action {
+            "take" => vec!["claim", "progress"],
+            "give back" => vec!["claim", "release"],
+            action => vec![action],
         };
-        let _ = store.work_action(&step.subject, action, &request);
+        for action in actions {
+            let request = crate::model::WorkRequest {
+                actor: Some("agent/node.worker".into()),
+                incarnation: Some("current".into()),
+                // A bare renewal writes no claim, only the lease: a change the feed never shows.
+                summary: (action != "renew").then(|| format!("{action} at {at}")),
+                reason: None,
+                evidence: Vec::new(),
+                idempotency_key: format!("{action}:{at}"),
+            };
+            let _ = store.work_action(&step.subject, action, &request);
+        }
         return;
+    }
+}
+
+/// The worker's harness reports its state, as its driver does on every turn edge.
+fn harness(store: &Store, state: &str, at: u128) {
+    store
+        .append_claim(&ClaimInput {
+            subject: "agent/node.worker".into(),
+            kind: "harness.observed".into(),
+            actor: Some("agent/node.worker".into()),
+            fields: BTreeMap::from([
+                ("state".into(), Value::String(state.into())),
+                ("driver".into(), Value::String("claude".into())),
+                ("incarnation_id".into(), Value::String("current".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("harness:{state}:{at}")),
+        })
+        .unwrap();
+}
+
+/// The worker takes the next step of each open message to it: delivered, then read.
+fn read_mail(store: &Store, at: u128) {
+    for message in store.messages(Some("agent/node.worker"), false).unwrap() {
+        let (kind, status) = match message.status.as_str() {
+            "sent" | "staged" => ("message.delivered", "delivered"),
+            "delivered" => ("message.read", "read"),
+            _ => continue,
+        };
+        store
+            .append_claim(&ClaimInput {
+                subject: message.subject.clone(),
+                kind: kind.into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("{kind}:{}:{at}", message.subject)),
+            })
+            .unwrap();
     }
 }
 
@@ -419,7 +469,7 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
         for side in [&full, &incremental] {
             side.store.set_write_clock_at(now).unwrap();
         }
-        let event = draw.below(20);
+        let event = draw.below(23);
         let label = match event {
             0 | 1 => {
                 for side in [&full, &incremental] {
@@ -476,9 +526,17 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
                 incremental.restart(true);
                 "restart".to_owned()
             }
-            8..=10 | 18 | 19 => {
-                let action = ["claim", "renew", "progress", "complete", "fail", "release"]
-                    [draw.below(6) as usize];
+            8..=10 | 18 | 19 | 22 => {
+                let action = [
+                    "claim",
+                    "take",
+                    "give back",
+                    "renew",
+                    "progress",
+                    "complete",
+                    "fail",
+                    "release",
+                ][draw.below(8) as usize];
                 for side in [&full, &incremental] {
                     work(&side.store, action, now);
                 }
@@ -503,6 +561,19 @@ fn run_sequence(seed: u64, events: usize) -> BTreeSet<String> {
                     }
                 };
                 label.to_owned()
+            }
+            16 if draw.below(2) == 0 => {
+                let state = ["ready", "working", "idle"][draw.below(3) as usize];
+                for side in [&full, &incremental] {
+                    harness(&side.store, state, now);
+                }
+                format!("harness {state}")
+            }
+            17 => {
+                for side in [&full, &incremental] {
+                    read_mail(&side.store, now);
+                }
+                "worker reads its mail".to_owned()
             }
             14 => {
                 let hang = draw.below(2) == 0;
@@ -602,10 +673,10 @@ fn incremental_passes_write_what_full_passes_write() {
         .unwrap_or(8);
     let mut reached = BTreeSet::new();
     for seed in 1..=seeds {
-        reached.extend(run_sequence(seed, 80));
+        reached.extend(run_sequence(seed, 100));
     }
     // The sequences must keep reaching what they exist to compare.
-    for expected in [
+    let missing = [
         "gate.result",
         "resource.observed",
         "runtime.observed",
@@ -619,12 +690,17 @@ fn incremental_passes_write_what_full_passes_write() {
         "runtime.action.requested",
         "runtime.action.deadline-reached",
         "runtime.action.succeeded",
+        "harness.observed",
+        "message.delivered",
+        "message.read",
         "run completed",
         "run failed",
-    ] {
-        assert!(
-            reached.contains(expected),
-            "no sequence reached {expected}: {reached:#?}"
-        );
-    }
+    ]
+    .into_iter()
+    .filter(|expected| !reached.contains(*expected))
+    .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "no sequence reached {missing:?}: {reached:#?}"
+    );
 }

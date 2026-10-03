@@ -5666,7 +5666,17 @@ impl Store {
     /// timing and wake annotations. Those annotations scan immutable history and
     /// are intentionally too expensive for the daemon's inner control loop.
     pub fn work_for_reconcile(&self, actor: &str) -> Result<Vec<StepRunView>> {
-        self.work_at_snapshot_internal(Some(actor), true, now_ms(), false)
+        let work = self.work_at_snapshot_internal(Some(actor), true, now_ms(), false)?;
+        // A step joins a seat's work when a generation creates it or another seat lets it go;
+        // after that its changes are written on the step and its run.
+        smallclaims::touched::note_read(|| format!("actor:{actor}"));
+        smallclaims::touched::note_read(|| "kind:run-generation.created".to_owned());
+        smallclaims::touched::note_read(|| "kind:step-run.state".to_owned());
+        for step in &work {
+            smallclaims::touched::note_read(|| step.subject.clone());
+            smallclaims::touched::note_read(|| step.run.clone());
+        }
+        Ok(work)
     }
 
     /// Fetch current work without the presentation-only wake history. The
@@ -5741,6 +5751,7 @@ impl Store {
 
     /// The live mission runs queued for one seat, in seat-queue order.
     pub fn seat_run_order(&self, agent: &str) -> Result<Vec<String>> {
+        smallclaims::touched::note_read(|| format!("kind:{}", seat_queue::MOVED_CLAIM));
         let agent = normalize_seat(agent);
         let connection = self.readers.get();
         Ok(seat_run_orders_tx(&connection, Some(&agent))?
@@ -10477,6 +10488,11 @@ impl Store {
             }
         }
         sort_messages_canonically(&connection, &mut messages)?;
+        smallclaims::touched::note_read(|| format!("mailbox:{recipient}"));
+        smallclaims::touched::note_read(|| format!("mailbox:{bare_recipient}"));
+        for message in &messages {
+            smallclaims::touched::note_read(|| message.subject.clone());
+        }
         Ok(messages)
     }
 
