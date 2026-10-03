@@ -721,8 +721,13 @@ impl ClientRelay {
         let path = format!("{RAW_TERMINAL_PATH}?person={}&terminal={}&incarnation={}&mode={mode}",
             urlencoding::encode(person), urlencoding::encode(terminal_id), urlencoding::encode(incarnation));
         let mut last = None;
-        for peer in self.next_hops(target, &[self.node.clone()]).into_iter().filter(|peer| peer.name == target) {
+        let profile = crate::profile::current();
+        let route_span = profile.as_ref().map(|op| op.wall_span("raw/route"));
+        let peers = self.next_hops(target, &[self.node.clone()]);
+        drop(route_span);
+        for peer in peers.into_iter().filter(|peer| peer.name == target) {
             let result = async {
+                let dial_span = profile.as_ref().map(|op| op.wall_span("raw/dial"));
                 let url = match parse_route(&peer.url).context("invalid raw terminal route")? {
                     Route::Http(url) => url,
                     Route::Fabric { node, protocol } => {
@@ -730,16 +735,30 @@ impl ClientRelay {
                         format!("http://{address}")
                     }
                 };
+                drop(dial_span);
                 let base = url.strip_prefix("http://").context("peer byte transport requires HTTP")?;
                 let mut request = format!("ws://{}{path}", base.trim_end_matches('/')).into_client_request()?;
                 request.headers_mut().extend(self.auth.request_headers_method("GET", &path, &self.node, &[])?);
                 let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
                     .max_message_size(Some(64 * 1024)).max_frame_size(Some(64 * 1024));
-                let (socket, response) = tokio::time::timeout(CLIENT_READ_TIMEOUT, tokio_tungstenite::connect_async_with_config(request, Some(config), false)).await??;
+                let (socket, response) = tokio::time::timeout(CLIENT_READ_TIMEOUT, async {
+                    let host = request.uri().host().context("raw terminal route has no host")?
+                        .trim_matches(['[', ']']);
+                    let port = request.uri().port_u16().unwrap_or(80);
+                    let tcp_span = profile.as_ref().map(|op| op.wall_span("raw/tcp-dial"));
+                    let tcp = tokio::net::TcpStream::connect((host, port)).await?;
+                    drop(tcp_span);
+                    let upgrade_span = profile.as_ref().map(|op| op.wall_span("raw/peer-upgrade"));
+                    let result = tokio_tungstenite::client_async_with_config(request, tcp, Some(config)).await?;
+                    drop(upgrade_span);
+                    Ok::<_, anyhow::Error>(result)
+                }).await??;
+                let verify_span = crate::profile::span("raw/peer-verify");
                 let sender = self.auth.verify_sender(response.headers(), "RESPONSE", &path, &[], Some(&peer.name), Some(&FleetAuth::body_digest(&[])))?;
                 let view = self.links.as_ref().and_then(|store| store.fleet_view_sealed().ok()).unwrap_or_default();
                 crate::fleet::accept(&view, &sender, self.peers.iter().any(|peer| peer.name == sender.name), self.legacy)
                     .map_err(|refusal| anyhow::anyhow!("raw terminal member refused: {refusal:?}"))?;
+                drop(verify_span);
                 let (client, bridge) = tokio::net::UnixStream::pair()?;
                 let bridge = bridge.into_std()?;
                 let monitor = tokio::io::unix::AsyncFd::new(bridge.try_clone()?)?;
@@ -888,24 +907,35 @@ async fn receive_raw_terminal(
     Query(query): Query<RawTerminalQuery>,
     headers: HeaderMap,
 ) -> Response {
+    let profile = crate::profile::Op::start("GET /v1/peer/raw-terminal", None);
     let path = uri.path_and_query().map_or(uri.path(), |value| value.as_str());
     if path.len() > 16_384 || !query.person.starts_with("person/") || query.person.matches('/').count() != 1 {
         return (StatusCode::BAD_REQUEST, "invalid raw terminal route").into_response();
     }
+    let auth_span = profile.as_ref().map(|op| op.wall_span("raw/peer-authenticate"));
     let _sender = match state.auth().verify_sender(&headers, "GET", path, &[], None, None) {
         Ok(sender) if state.accept(&sender).is_ok() => sender,
         _ => return (StatusCode::UNAUTHORIZED, "untrusted raw terminal member").into_response(),
     };
+    drop(auth_span);
     // The owner daemon validates its current graph incarnation and person authority, then
     // connects once. The peer worker carries that one connection, not synthetic screens.
     let client = st3_client::Client::unix_as(state.backend().socket(), &query.person);
     let transport = async {
+        let attachment_span = profile.as_ref().map(|op| op.wall_span("raw/owner-attachment"));
         let attachment = client.raw_terminal_attachment(&query.terminal, &query.incarnation, query.mode).await?;
+        drop(attachment_span);
         if attachment.owner_host_id != format!("host/{}", state.node()) {
             return Err(st3_client::ClientError::Protocol("raw terminal route is not owner-local".into()));
         }
-        client.raw_terminal_stream(&attachment).await
+        let open_span = profile.as_ref().map(|op| op.wall_span("raw/owner-open"));
+        let transport = client.raw_terminal_stream(&attachment).await;
+        drop(open_span);
+        transport
     }.await;
+    if let Some(profile) = profile {
+        profile.finish();
+    }
     let transport = match transport {
         Ok(transport) => transport,
         Err(st3_client::ClientError::Api(_, _, _)) => return (StatusCode::CONFLICT, "owner rejected raw terminal incarnation or authority").into_response(),
