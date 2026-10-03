@@ -31,3 +31,17 @@ The channel reports idle only after `ctx.isIdle()` proves that the native turn h
 It keeps sampling through slow final unwind rather than abandoning the idle edge after a
 timeout. New activity, session replacement, or channel replacement retires the old sampler;
 an outstanding human ask or approval keeps its blocking observation, including on reconnect.
+
+## Channel telemetry
+
+The managed channel forwards `timeline` and `context` frames to the shared pi-family
+normalizers. Response usage comes from `timeline` / `message_end`, including the provider's
+token buckets, model, and reported cost; context occupancy is a separate measurement.
+A `turn` frame carries a terminal result, not usage: provider errors become timeline errors.
+`session` and `ready` frames report the native session ID and transcript for resume.
+
+Unsupported frames, including `pre_compact`, produce a structured debug event with
+`frame_type` and `observer_enabled`; frame payloads are not logged. When the managed observation
+outbox is unavailable, unforwarded `timeline`, `context`, and `turn` frames produce the same
+diagnostic. The managed route does not perform the standalone channel's pre-compaction context
+recovery stub.
