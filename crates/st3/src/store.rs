@@ -175,6 +175,9 @@ const SCHEMA: &str = r#"
 CREATE INDEX IF NOT EXISTS claims_terminal_history_index ON claims(store_index)
 WHERE kind IN ('mission-run.state','step-run.state','work.failed')
   AND json_extract(body,'$.fields.status') IN ('failed','cancelled','completed');
+CREATE INDEX IF NOT EXISTS claims_terminal_capability_hash_index
+ON claims(json_extract(body, '$.fields.capability_hash'), store_index)
+WHERE kind='custom.client.terminal-attached';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -13546,6 +13549,31 @@ impl Store {
         }
         result.sort_by(|a, b| b["total_tokens"].as_u64().cmp(&a["total_tokens"].as_u64()));
         Ok(result)
+    }
+
+    /// Resolve a terminal capability and its current-head fence with two indexed seeks, in
+    /// one SQLite snapshot. Unrelated fleet history cannot hide an unexpired capability.
+    pub fn terminal_attachment_for_capability_hash(
+        &self,
+        digest: &str,
+    ) -> Result<Option<(ClaimRecord, bool)>> {
+        let connection = self.readers.get();
+        Ok(connection
+            .prepare_cached(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms,
+                        NOT EXISTS (
+                            SELECT 1 FROM claims AS newer
+                            WHERE newer.subject=claims.subject
+                              AND newer.store_index>claims.store_index
+                        )
+                 FROM claims
+                 WHERE kind='custom.client.terminal-attached'
+                   AND json_extract(body, '$.fields.capability_hash')=?1
+                 ORDER BY store_index DESC LIMIT 1",
+            )?
+            .query_row([digest], |row| Ok((claim_from_row(row)?, row.get(10)?)))
+            .optional()?)
     }
 
     /// Bounded claim history for one subject/kind projection, backed by the composite index.
@@ -28080,6 +28108,40 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn terminal_capability_lookup_fences_the_subject_head_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.db");
+        let store = Store::open(&path, "node").unwrap();
+        let append = |subject: &str, kind: &str| {
+            store.append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: None,
+                fields: BTreeMap::from([("capability_hash".into(), json!("secret-digest"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap()
+        };
+        let attached = append("custom/client/attachment-a", "custom.client.terminal-attached");
+        append("custom/client/decoy", "custom.client.other");
+        assert_eq!(
+            store.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+                .map(|(claim, current)| (claim.id, current)),
+            Some((attached.id.clone(), true)),
+        );
+        assert!(store.terminal_attachment_for_capability_hash("unknown").unwrap().is_none());
+        append("custom/client/attachment-a", "custom.client.terminal-consumed");
+        drop(store);
+        let reopened = Store::open(&path, "node").unwrap();
+        assert_eq!(
+            reopened.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+                .map(|(claim, current)| (claim.id, current)),
+            Some((attached.id, false)),
+        );
+    }
 
     mod mailbox_fence_tests {
         use super::*;

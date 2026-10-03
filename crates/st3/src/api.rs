@@ -749,10 +749,16 @@ async fn response_envelope(
         let auth_state = state.clone();
         let transport = transport.as_str();
         let auth_profile = profile.clone();
+        let admission_queue = profile.as_ref().map(|op| op.wall_span("admission/queue"));
         let admitted = tokio::task::spawn_blocking(move || {
+            drop(admission_queue);
             let _entered = crate::profile::enter(auth_profile.as_ref());
+            let authentication_span = crate::profile::span("admission/authenticate");
             let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+            drop(authentication_span);
+            let snapshot_span = crate::profile::span("admission/snapshot");
             let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
+            drop(snapshot_span);
             (authentication, snapshot)
         })
         .await;
@@ -781,7 +787,9 @@ async fn response_envelope(
             let handler_profile = profile.clone();
             let cpu_kind = request_route.clone();
             let cpu_client = caller.clone();
+            let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
             match tokio::task::spawn_blocking(move || {
+                drop(handler_queue);
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
