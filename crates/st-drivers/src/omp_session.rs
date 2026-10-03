@@ -1200,8 +1200,18 @@ pub fn run_native(
     identity: String,
     runtime_id: String,
     argv: Vec<String>,
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    extra_environment: &[(String, String)],
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 ) -> Result<()> {
     let environment = paths.environment(&identity);
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    let environment = {
+        let mut environment = environment;
+        environment.extend_from_slice(extra_environment);
+        environment
+    };
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     pi_family_session::run_for_paths(
         &paths.root,
         &paths.agent_dir,

@@ -15253,6 +15253,9 @@ async fn run_st2_native_driver(
     };
     // A resumed seat relaunches its harness on the session it suspended on, or not at all. Any
     // other relaunch continues the seat's last session when the harness can, or starts anew.
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    let mut selected_session = None;
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     let argv = if let Some(session) = st3::native_resume::requested() {
         if driver == "claude" {
             let path = std::env::var_os(st3::rollout::RESUME_PATH_ENV).map(PathBuf::from);
@@ -15273,7 +15276,12 @@ async fn run_st2_native_driver(
             }
         }
         match select(argv, &session)? {
-            Ok(argv) => argv,
+            Ok(argv) => {
+                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                selected_session = Some(session);
+                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                argv
+            }
             Err(refusal) => {
                 return Err(
                     refuse_native_resume(client, subject, &incarnation, driver, refusal).await,
@@ -15291,7 +15299,12 @@ async fn run_st2_native_driver(
             );
         }
         match select(argv.clone(), &session)? {
-            Ok(argv) => argv,
+            Ok(argv) => {
+                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                selected_session = Some(session);
+                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                argv
+            }
             Err(refusal) => {
                 skip_native_continue(client, subject, &incarnation, driver, &session, refusal)
                     .await;
@@ -15301,6 +15314,32 @@ async fn run_st2_native_driver(
     } else {
         argv
     };
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    let mut provider_environment = Vec::new();
+    if driver == "omp" {
+        let sessions = paths.session_dir.join("provider-sessions");
+        if let Some(tool_call_id) =
+            st3::omp_ask_resume::pending_for_selected(&sessions, selected_session.as_deref())
+        {
+            // Fail open: bridge I/O or diagnostics must never prevent native continuation.
+            match st3::omp_ask_resume::heal(
+                &argv[0],
+                &sessions,
+                selected_session.as_deref().expect("pending ask has a selected session"),
+            )
+            .await
+            {
+                Ok(output) => {
+                    let _ = write_driver_log(subject, &output);
+                    provider_environment.push(("ST3_OMP_PENDING_ASK".into(), tool_call_id));
+                }
+                Err(error) => {
+                    let _ = write_driver_log(subject, &json!({"type":"omp_pending_ask_heal_failed","error":format!("{error:#}")}).to_string());
+                }
+            }
+        }
+    }
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     if driver == "opencode" {
         // The predecessor's bound session is not this launch's, and the driver reports this file.
         let _ = fs::remove_file(
@@ -15316,7 +15355,16 @@ async fn run_st2_native_driver(
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
         ..NativeLoopState::default()
     };
-    let task = spawn_st2_provider(driver, &paths, ProviderStart::Launch(argv));
+    let task = spawn_st2_provider(
+        driver,
+        &paths,
+        ProviderStart::Launch(
+            argv,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            provider_environment,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        ),
+    );
     drive_st2_native(
         client,
         subject,
@@ -15436,7 +15484,12 @@ impl NativePaths {
 }
 
 enum ProviderStart {
-    Launch(Vec<String>),
+    Launch(
+        Vec<String>,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        Vec<(String, String)>,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    ),
     Adopt(st_drivers::provider_session::DetachedSession),
 }
 
@@ -15452,7 +15505,12 @@ fn spawn_st2_provider(
         st_drivers::push_mailbox::register(&paths.agent_dir);
     }
     tokio::task::spawn_blocking(move || match start {
-        ProviderStart::Launch(argv) => match driver.as_str() {
+        ProviderStart::Launch(
+            argv,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            environment,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        ) => match driver.as_str() {
             "claude" => st_drivers::claude_session::run_controlled_paths(
                 &paths.resolved(),
                 paths.identity,
@@ -15470,6 +15528,9 @@ fn spawn_st2_provider(
                 paths.identity,
                 paths.runtime_id,
                 argv,
+                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                &environment,
+                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
             ),
             "opencode" => st_drivers::opencode_session::run_with_paths(
                 &paths.resolved(),
@@ -17240,12 +17301,18 @@ fn accept_managed_channel_frame(
     state: &mut PiChannelResume,
     observer: &mut Option<st_drivers::pi_channel::EventObserver>,
     line: &str,
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    subject: &str,
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 ) -> Result<bool> {
     if let Ok(frame) = serde_json::from_str::<Value>(line) {
         let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("unknown");
         let handled = match frame_type {
             "state" | "session" | "ready" | "delivered" | "read" | "failed" | "todo" => true,
             "timeline" | "context" | "turn" => observer.is_some(),
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            "delivery_ready" | "retry_pending_ask" | "diagnostic" => true,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
             _ => false,
         };
         if !handled {
@@ -17263,6 +17330,9 @@ fn accept_managed_channel_frame(
             }
         }
     }
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    state.apply_ask_bridge_frame(subject, line);
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     let publish = state.accept_frame(line);
     if observer.is_some() {
         state.pending.state = None;
@@ -17552,7 +17622,12 @@ async fn run_pi_channel(
                     Some(st_drivers::reexec::StdinChunk::Bytes(bytes)) => {
                         state.lines.push(&bytes);
                         while let Some(line) = state.lines.next_line() {
-                            match accept_managed_channel_frame(&mut state, &mut observer, &line) {
+                            match accept_managed_channel_frame(
+                                &mut state, &mut observer, &line,
+                                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                                subject,
+                                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                            ) {
                                 Ok(changed) => publish |= changed,
                                 Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
                             }
@@ -17561,7 +17636,12 @@ async fn run_pi_channel(
                     // The extension ends the pipe when its session ends.
                     Some(st_drivers::reexec::StdinChunk::Eof) | None => {
                         if let Some(line) = state.lines.finish()
-                            && accept_managed_channel_frame(&mut state, &mut observer, &line)?
+                            && accept_managed_channel_frame(
+                                &mut state, &mut observer, &line,
+                                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                                subject,
+                                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                            )?
                         {
                             let _ = state
                                 .pending
@@ -17752,7 +17832,12 @@ async fn run_pi_channel(
                         }
                     }
                     while let Some(line) = state.lines.next_line() {
-                        publish |= accept_managed_channel_frame(&mut state, &mut observer, &line)?;
+                        publish |= accept_managed_channel_frame(
+                            &mut state, &mut observer, &line,
+                            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                            subject,
+                            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+                        )?;
                     }
                     if publish {
                         let _ = state
@@ -17856,6 +17941,10 @@ struct PiChannelResume {
     // harness's latest state, so each waits here and is sent again on the next tick.
     pending: PiFamilyReports,
     lines: st_drivers::reexec::LineBuffer,
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    #[serde(default)]
+    pending_ask_retry_sent: bool,
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 }
 
 impl PiChannelResume {
@@ -17869,6 +17958,40 @@ impl PiChannelResume {
         Ok(())
     }
 
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    fn take_pending_ask_retry(&mut self, frame: &Value, expected: Option<&str>) -> Option<String> {
+        let id = frame["toolCallId"].as_str()?;
+        if frame["type"] != "retry_pending_ask"
+            || self.pending_ask_retry_sent
+            || expected != Some(id)
+        {
+            return None;
+        }
+        self.pending_ask_retry_sent = true;
+        Some(id.to_owned())
+    }
+
+    fn apply_ask_bridge_frame(&mut self, subject: &str, line: &str) {
+        let Ok(frame) = serde_json::from_str::<Value>(line) else { return };
+        let expected = std::env::var("ST3_OMP_PENDING_ASK").ok();
+        if let Some(id) = self.take_pending_ask_retry(&frame, expected.as_deref()) {
+            let sent = (|| -> Result<()> {
+                let root = std::env::var_os("PTY_ROOT").context("pending ask retry has no PTY_ROOT")?;
+                let session = std::env::var("PTY_SESSION").context("pending ask retry has no PTY_SESSION")?;
+                st_runtime::PtyRuntime::new(root.into()).send_raw_if(&session, b"\x1b[15~", None)?;
+                Ok(())
+            })();
+            let record = match sent {
+                Ok(()) => json!({"type":"omp_pending_ask_retry","toolCallId":id}),
+                Err(error) => json!({"type":"omp_pending_ask_retry_failed","toolCallId":id,"error":format!("{error:#}")}),
+            };
+            let _ = write_driver_log(subject, &record.to_string());
+        }
+        if frame["type"] == "diagnostic" {
+            let _ = write_driver_log(subject, &frame.to_string());
+        }
+    }
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
     /// Apply one frame from the extension. Returns whether it left a report to publish.
     fn accept_frame(&mut self, line: &str) -> bool {
         let Ok(frame) = serde_json::from_str::<Value>(line) else {
@@ -17887,6 +18010,13 @@ impl PiChannelResume {
                 }
                 true
             }
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            Some("delivery_ready") => {
+                // Delivery readiness is independent of the reopened picker's human-blocked state.
+                self.first_idle_seen = true;
+                false
+            }
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
             Some("state") => {
                 let Some(state) = frame.get("state").and_then(Value::as_str) else {
                     return false;
@@ -18346,7 +18476,12 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
         subject,
         argv,
         incarnation,
-        ProviderStart::Launch(Vec::new()),
+        ProviderStart::Launch(
+            Vec::new(),
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            Vec::new(),
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        ),
         NativeLoopState::default(),
     )
     .await
@@ -18371,7 +18506,12 @@ fn spawn_codex_provider(
     tokio::task::spawn_blocking(move || match start {
         // A resumed seat's launch environment names the thread it suspended on, and any other
         // relaunch the thread it continues.
-        ProviderStart::Launch(_) => {
+        ProviderStart::Launch(
+            _,
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+            _,
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+        ) => {
             let thread = st3::native_resume::requested().or_else(|| codex_continued_thread(&argv));
             st_drivers::codex_app_server::run_controlled_paths(
                 &paths.driver_root,
@@ -18420,12 +18560,22 @@ async fn drive_codex_native(
     start: ProviderStart,
     mut loop_state: NativeLoopState,
 ) -> Result<()> {
-    let mut paths = if matches!(start, ProviderStart::Launch(_)) {
+    let mut paths = if matches!(start, ProviderStart::Launch(
+        _,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        _,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    )) {
         NativePaths::prepare(subject, "codex")?
     } else {
         NativePaths::resumed(subject, "codex", loop_state.paths.clone())?
     };
-    if matches!(start, ProviderStart::Launch(_)) {
+    if matches!(start, ProviderStart::Launch(
+        _,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        _,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    )) {
         st_drivers::harness_events::enable(&paths.agent_dir, &incarnation)?;
     }
     loop_state.paths = Some(paths.resolved());
@@ -18438,7 +18588,12 @@ async fn drive_codex_native(
     let root = paths.state_root();
     let state_dir = paths.session_dir.clone();
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
-    if matches!(start, ProviderStart::Launch(_)) {
+    if matches!(start, ProviderStart::Launch(
+        _,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        _,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    )) {
         // The path can still hold the predecessor's terminal record. It is the predecessor's, never
         // this incarnation's: only a byte change after this point is the new wrapper's claim.
         loop_state.predecessor_harness_record = fs::read(&harness_state_path).ok();
@@ -18459,7 +18614,12 @@ async fn drive_codex_native(
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
     // The thread this launch continues; a refusal of it ends the wrapper before it binds.
-    let continued = matches!(start, ProviderStart::Launch(_))
+    let continued = matches!(start, ProviderStart::Launch(
+        _,
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+        _,
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+    ))
         .then(|| codex_continued_thread(&argv))
         .flatten();
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
@@ -20219,6 +20379,36 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 mod tests {
     use super::*;
 
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    #[test]
+    fn omp_pending_ask_retry_is_bound_to_the_expected_call_and_sent_once_across_reexec() {
+        let mut state = PiChannelResume::default();
+        let frame = json!({"type":"retry_pending_ask","toolCallId":"X"});
+        assert!(state.take_pending_ask_retry(&frame, None).is_none());
+        assert!(state.take_pending_ask_retry(&frame, Some("Y")).is_none());
+        assert!(state.take_pending_ask_retry(&json!({"type":"state","toolCallId":"X"}), Some("X")).is_none());
+        assert_eq!(state.take_pending_ask_retry(&frame, Some("X")).as_deref(), Some("X"));
+        assert!(state.take_pending_ask_retry(&frame, Some("X")).is_none());
+        let mut restored: PiChannelResume =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(restored.take_pending_ask_retry(&frame, Some("X")).is_none());
+    }
+
+    #[test]
+    fn omp_delivery_readiness_does_not_clear_the_reopened_human_block() {
+        let mut state = PiChannelResume::default();
+        assert!(state.accept_frame(r#"{"type":"state","state":"active","blockedOn":"human","ask":"question"}"#));
+        assert!(!state.first_idle_seen);
+        assert!(!state.accept_frame(r#"{"type":"delivery_ready"}"#));
+        assert!(state.first_idle_seen);
+        assert_eq!(state.pending.blocked_on.as_deref(), Some("human"));
+        assert_eq!(state.pending.ask.as_deref(), Some("question"));
+        assert_eq!(state.pending.state.as_ref().map(|(status, _)| status.as_str()), Some("working"));
+        assert!(state.accept_frame(r#"{"type":"state","state":"idle"}"#));
+        assert!(state.pending.blocked_on.is_none());
+    }
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+
     #[test]
     fn clients_and_devices_say_who_is_connected_and_when_others_were_seen() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
@@ -20996,6 +21186,7 @@ mod tests {
                         &mut state,
                         &mut None,
                         &json!({"type": frame_type, "private_payload": "not logged"}).to_string(),
+                        "agent/test/seat",
                     )
                     .unwrap()
                 );

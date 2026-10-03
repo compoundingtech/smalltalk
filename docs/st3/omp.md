@@ -45,3 +45,78 @@ Unsupported frames, including `pre_compact`, produce a structured debug event wi
 outbox is unavailable, unforwarded `timeline`, `context`, and `turn` frames produce the same
 diagnostic. The managed route does not perform the standalone channel's pre-compaction context
 recovery stub.
+
+## Interrupted ask bridge
+
+Native session continuation belongs to the shared driver mechanism: the daemon names a relaunch's
+session in `ST3_NATIVE_CONTINUE_SESSION`, and `native_resume::continued()` selects that exact
+session when available. Suspension resume uses `native_resume::requested()` and refuses if it cannot
+bind the named session. The bridge below inspects only the OMP session successfully selected by
+one of those paths. Without a selected session, including a `native-continue-unavailable` fallback,
+there is no bridge; it never chooses a transcript or session itself.
+
+OMP 18.4.10 needs a temporary, token-free recovery bridge for an open `ask` picker:
+`arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge`
+([migration registry](https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf)).
+When the selected transcript has an unresolved last ask, st first runs a bounded RPC heal pass
+with closed stdin, then launches the interactive session with `ST3_OMP_PENDING_ASK` naming its
+pending toolCall id. `--no-extensions` disables discovery, but a fleet launcher can still prepend
+explicit `-e` extensions. The heal clears `PTY_SESSION`, `PTY_ROOT`, `PTY_SESSION_DIR`, and inherited
+`ST3_*`, `ST2_*`, and `ST_*` environment variables (except the launcher's required `ST_AGENT`
+identity) so those extensions cannot reach the seat's PTY or st channel. The bridge's transcript
+read logs I/O failures, fails open, and decodes bytes lossily; read, heal, retry, or diagnostic
+failures do not stop native continuation.
+The extension holds mailbox delivery, waits for its ready frame and first idle, and requests one
+raw F5 from the Rust channel. For OMP's native interrupted result, the same toolCall id, questions,
+and options reopen without a model turn or human action. Delivery resumes when that ask starts
+again, or after a 120-second timeout with a diagnostic. Both exits send `delivery_ready` to release
+the Rust channel's first-idle delivery gate independently of activity; a reopened picker remains
+blocked on the person, not falsely idle. Shared native continuation does not depend on the bridge.
+
+The contraction criterion is behavioral, not a version equality assertion. The standalone
+`crates/st3/fixtures/omp-resume/native-reopen-probe.py` copies its adjacent public canary fixture into
+a disposable native session directory, renders native resume in a PTY under an empty HOME with no
+auth or extensions, and never sends F5 or a prompt. It requires `OMP_BIN` pointing at the raw pinned
+OMP executable (not a fleet launcher); `--omp` overrides that variable. Optional `--fixture`,
+`--timeout` (seconds, default 30), and `--screen-out` select the capture and output. Exit codes:
+**0** means the F5-to-retry UI rendered without native reopening (bridge still needed);
+**1** means the original picker reopened natively (contract this migration);
+**2** means probe error, not evidence either way.
+
+Smalltalk does not provide OMP in its checks: the native Rust test runs this probe only with
+`OMP_BIN` set and otherwise prints an explicit skip. The hermetic gate belongs to the dotfiles
+OMP pin, `flakes/external/omp`: run the same script and fixture verbatim as a flake check on
+**every** OMP bump, including patches. That is where native reopening must fail the bridge-retaining
+check with `arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge`; remove the marked bridge when it
+fires. The fixture keeps the canary prompt, actual tool arguments and interruption records, but
+no machine paths, hosts, credentials or usage/account metadata.
+
+The detector treats an error tool result for the pending toolCall id as interrupted when its text
+starts with `Previous OMP process exited before this tool returned`, or when it follows a
+`custom/session_exit` whose `pendingToolCalls` lists that id, with no intervening user or
+non-aborted assistant message. Other results, including a person's cancellation without that exit
+context, answer the ask. The bridge does not change shutdown timing.
+
+OMP 18.4.10 can persist `Ask input was cancelled` after a signal ends a picker which F5 already
+reopened. Direct `--resume` plus F5, both with and without a preceding heal pass, has been observed
+to reopen that cancelled ask under the same toolCall id with no model turn.
+
+The isolated managed smoke on 2026-10-03 still reported `Nothing to retry` on the second relaunch,
+with policy, PTY-events, and status explicitly loaded and the heal's PTY/channel environment
+cleared. Its transcript ended on the cancelled toolResult **without a following aborted assistant
+boundary**. Bare `--resume` plus F5 on an unchanged copy failed the same way: OMP 18.4.10's retry
+predicate requires a failed/aborted assistant tail, looking past synthetic results. In contrast,
+standalone SIGTERM runs, both bare and with those fleet extensions, persisted an aborted assistant
+boundary after the cancellation. The same missing-boundary shape occurred with the st3 channel
+loaded when only the native OMP PID received SIGTERM, so it is not solely the heal environment or
+managed process-group stop. A standalone extension registering only an async, no-op `context`
+handler reproduced the missing boundary; a no-op `tool_result` observer did not. In OMP 18.4.10,
+[`emitContext`](https://github.com/can1357/oh-my-pi/blob/v18.4.10/packages/coding-agent/src/extensibility/extensions/runner.ts#L1935-L2008)
+throws on the aborted signal when context handlers exist. That abort occurs before the next
+provider stream; the aborted-error catch in
+[`Agent`](https://github.com/can1357/oh-my-pi/blob/v18.4.10/packages/agent/src/agent.ts#L2060-L2064)
+emits only `agent_end`, not the `message_end` needed to persist the aborted assistant boundary.
+The st3 channel registers such a context handler for read receipts. These captures establish a
+context-handler-dependent native persistence failure, not a general limit on reopening cancelled
+asks. No transcript rewrite, new toolCall id, model turn, context-handler removal, or
+shutdown-timing workaround is applied.
