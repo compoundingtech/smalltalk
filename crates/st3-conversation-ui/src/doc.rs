@@ -63,11 +63,12 @@ impl<H> Doc<H> {
             self.lines.extend(other.lines);
         } else {
             let pad = " ".repeat(indent as usize);
-            self.lines.extend(other.lines.into_iter().map(|line| {
-                let mut spans = vec![Span::raw(pad.clone())];
-                spans.extend(line.spans);
-                Line::from(spans)
-            }));
+            self.lines.extend(
+                other
+                    .lines
+                    .into_iter()
+                    .map(|line| crate::text::prefixed(vec![Span::raw(pad.clone())], line)),
+            );
         }
     }
 }

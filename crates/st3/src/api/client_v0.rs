@@ -63,7 +63,7 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
     if collection == "glasses" { return !kind.starts_with("glass."); }
-    matches!(kind, "daemon.diagnostic" | "transport.observed")
+    matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
 
@@ -1160,6 +1160,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
@@ -2752,6 +2753,53 @@ pub(super) async fn missions_tree(
     Ok(Json(json!({ "snapshot": snapshot, "value": view })))
 }
 
+/// Preserve the latest accepted observation even after its session or incarnation changes.
+pub(super) fn agent_todo_value(
+    claim: Option<&ClaimRecord>,
+    session: Option<&ClaimRecord>,
+    incarnation: Option<&str>,
+) -> Value {
+    let Some(claim) = claim else {
+        return Value::Null;
+    };
+    let snapshot = match st3_schema::HarnessTodoSnapshot::deserialize(
+        claim.body.get("fields").unwrap_or(&claim.body),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(subject = %claim.subject, claim_id = %claim.id, %error,
+                "invalid harness todo observation");
+            return Value::Null;
+        }
+    };
+    let session_fields = session.map(|claim| claim.body.get("fields").unwrap_or(&claim.body));
+    let stale = incarnation != Some(snapshot.incarnation_id.as_str())
+        || session_fields.and_then(|fields| fields["session_id"].as_str())
+            != Some(snapshot.session_id.as_str());
+    json!({
+        "snapshot": snapshot,
+        "claim_id": claim.id,
+        "accepted_at": client_timestamp(claim.accepted_at_unix_ms),
+        "stale": stale,
+    })
+}
+
+#[cfg(test)]
+fn agent_todo(
+    store: &Store,
+    subject: &str,
+    incarnation: Option<&str>,
+    index: u64,
+) -> anyhow::Result<Value> {
+    let observations = store.agent_todo_observations_for(&[subject.to_owned()], index)?;
+    let claims = observations.get(subject);
+    Ok(agent_todo_value(
+        claims.and_then(|claims| claims.get("harness.todo.observed")),
+        claims.and_then(|claims| claims.get("harness.session-file")),
+        incarnation,
+    ))
+}
+
 fn desired_child_arg(value: &Value, name: &str) -> Option<String> {
     value
         .get("children")?
@@ -3049,6 +3097,29 @@ pub(super) async fn machines(
         move |state, snapshot| machine_resources(state, history, snapshot, &session),
     )
     .await
+}
+
+pub(super) async fn host_repositories(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let host = id
+        .strip_suffix("/repositories")
+        .ok_or_else(|| ApiError::not_found("host read not found"))?
+        .trim_start_matches("host/");
+    let host = if host == "local" {
+        state.node.clone()
+    } else {
+        host.to_owned()
+    };
+    creation_string(&host, "host", 160)?;
+    let value =
+        blocking_store(move || crate::repositories::host_repositories(&state.store, &host)).await?;
+    Ok(Json(
+        serde_json::to_value(value).map_err(ApiError::internal)?,
+    ))
 }
 
 fn device_resources(
@@ -7208,6 +7279,8 @@ async fn create_agent(
         serde_json::from_value(request.parameters.clone())
             .map_err(|error| validation(error.to_string()))?;
     creation_string(&parameters.name, "name", 160)?;
+    crate::creation::validate_agent_checkout(&parameters)
+        .map_err(|error| validation(error.to_string()))?;
     if !crate::skill::HARNESSES.contains(&parameters.harness.as_str()) {
         return Err(validation("unknown harness"));
     }
@@ -7216,6 +7289,9 @@ async fn create_agent(
         ("effort", &parameters.effort),
         ("host", &parameters.host),
         ("description", &parameters.description),
+        ("repo", &parameters.repo),
+        ("base", &parameters.base),
+        ("branch", &parameters.branch),
     ] {
         if let Some(value) = value {
             creation_string(value, field, 4096)?;
@@ -8680,6 +8756,98 @@ mod tests {
         assert_collection_frame_conforms(&json!({"kind":"resync", "id":"minimal"}));
     }
 
+    #[test]
+    fn agent_todo_projection_selects_latest_at_snapshot_and_fences_native_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/todo-worker";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: fields.as_object().unwrap().iter()
+                    .map(|(key, value)| (key.clone(), value.clone())).collect(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        assert!(agent_todo(&state.store, subject, Some("one"), state.store.index().unwrap()).unwrap().is_null());
+        append("runtime.observed", json!({
+            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+        }));
+        append("harness.session-file", json!({
+            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/session"
+        }));
+        let before = state.store.index().unwrap();
+        let cached = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        assert!(cached.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+        let snapshot = json!({
+            "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
+            "observed_at":"2026-10-03T09:00:00Z", "source_op":"update",
+            "phases":[{"name":"Build","tasks":[{"content":"Deploy","status":"blocked","blocker":"Approval"}]}],
+            "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":1,"abandoned":0}, "truncated":false
+        });
+        let first = append("harness.todo.observed", snapshot.clone());
+        assert!(crate::store::local_observation_position(&first).is_none());
+        assert!(state.store.index().unwrap() > before);
+        let old = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        assert!(old.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+        let refreshed = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", first.store_index).unwrap();
+        assert_eq!(refreshed.iter().find(|agent| agent["id"] == subject).unwrap()["todo"]["snapshot"], snapshot);
+        let first_value = agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
+        assert_eq!(first_value["snapshot"], snapshot);
+        assert_eq!(first_value["claim_id"], first.id);
+        assert_eq!(first_value["stale"], false);
+        assert_eq!(agent_todo(&state.store, subject, Some("two"), first.store_index).unwrap()["stale"], true);
+        let mut empty = snapshot;
+        empty["phases"] = json!([]);
+        empty["totals"]["blocked"] = json!(0);
+        empty["truncated"] = json!(true);
+        append("harness.session-file", json!({
+            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/fence"
+        }));
+        let second = append("harness.todo.observed", empty.clone());
+        let latest = agent_todo(&state.store, subject, Some("one"), second.store_index).unwrap();
+        assert_eq!(latest["snapshot"], empty);
+        assert_eq!(latest["claim_id"], second.id);
+        assert_eq!(agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"], first.id);
+        let changed = append("harness.session-file", json!({
+            "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
+        }));
+        assert_eq!(agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"], true);
+    }
+
+    #[test]
+    fn agent_todo_malformed_claim_does_not_break_agent_list() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/malformed-todo";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("runtime.observed", json!({
+            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+        }));
+        let claim = append("harness.todo.observed", json!({
+            "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
+            "observed_at":"2026-10-03T09:00:00Z", "source_op":"clear",
+            "phases":[], "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
+            "truncated":false
+        }));
+        // Simulate an older or corrupt replicated record beyond the typed writer boundary.
+        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
+        connection.execute(
+            "UPDATE claims SET body=json_set(body, '$.fields.unrecognized', 1) WHERE id=?1",
+            [&claim.id],
+        ).unwrap();
+        let items = client_agent_resources(
+            &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
+        ).unwrap();
+        assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+    }
+
     #[tokio::test]
     async fn steady_collection_retries_a_failed_first_read_without_another_command_or_write() {
         use futures_util::{SinkExt as _, StreamExt as _};
@@ -9390,6 +9558,71 @@ subscription "watch/source" {
             .0;
             assert_eq!(retry["affected_ids"], result["affected_ids"]);
         }
+    }
+
+    #[tokio::test]
+    async fn agent_create_checkout_fields_are_durable_and_invalid_choices_do_not_write() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "example");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        let request = |parameters: Value| ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/worktree".into(),
+            action_type: "agent.create".into(),
+            idempotency_key: "agent-worktree-fields".into(),
+            fence: Fence::default(),
+            parameters,
+        };
+        for parameters in [
+            json!({"name":"parser", "harness":"codex", "branch":"parser"}),
+            json!({"name":"parser", "harness":"codex", "remove_at_run_end":true}),
+            json!({"name":"parser", "harness":"codex", "repo":"relative/repo"}),
+            json!({"name":"parser", "harness":"codex", "repo":"/work/repo", "branch":"--unsafe"}),
+        ] {
+            let index = state.store.index().unwrap();
+            assert!(
+                create_agent(
+                    &state,
+                    &new_client_snapshot(&state),
+                    &session,
+                    &request(parameters)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(state.store.index().unwrap(), index);
+        }
+        // The selected host owns these paths. A gateway does not probe its own disk for them.
+        let input = request(
+            json!({"name":"example/parser", "harness":"codex", "host":"host/other", "workspace":"/work/parser", "repo":"/work/repo", "base":"main", "branch":"example/parser", "remove_at_run_end":true}),
+        );
+        let ids = create_agent(&state, &new_client_snapshot(&state), &session, &input)
+            .await
+            .unwrap();
+        assert_eq!(ids, ["agent/example/parser"]);
+        let desired = state.store.desired_subjects().unwrap().remove(0);
+        assert_eq!(desired.member.as_ref().unwrap().host, "other");
+        assert!(!desired.member.as_ref().unwrap().workspace_create);
+        let checkout = crate::checkout::Checkout::from_desired(&desired.desired).unwrap();
+        assert_eq!(checkout.repository, Path::new("/work/repo"));
+        assert_eq!(checkout.base, "main");
+        assert_eq!(checkout.branch, "example/parser");
+        assert!(checkout.remove_at_run_end);
+        let read = host_repositories(
+            State(state.clone()),
+            Extension(session.clone()),
+            AxumPath("host/other/repositories".into()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(read["repositories"][0]["path"], "/work/repo");
+        assert_eq!(
+            create_agent(&state, &new_client_snapshot(&state), &session, &input)
+                .await
+                .unwrap(),
+            ids
+        );
     }
 
     #[tokio::test]

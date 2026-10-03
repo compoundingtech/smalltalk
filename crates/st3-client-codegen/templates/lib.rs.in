@@ -1029,6 +1029,11 @@ impl Client {
         let body = serde_json::to_vec(value).map_err(|e| ClientError::Protocol(e.to_string()))?;
         self.request_with_key(method, &format!("/v1/client/glasses/{}", percent_encode(id.rsplit('/').next().unwrap_or(id))), Some(body), Some(key)).await
     }
+    /// Inspect the publication receipt and current rollout for one source commit.
+    pub async fn sets_status(&self, id: &str, sha: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.get(&format!("/v1/client/sets/{}?sha={}", percent_encode(id), percent_encode(sha))).await
+    }
+
     // @st3-codegen:rust-operation-methods
     pub async fn pairing_begin(
         &self,

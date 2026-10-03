@@ -228,7 +228,7 @@ fn current_token(connection: &Connection) -> Result<Option<String>> {
 
 pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     anyhow::ensure!(
-        matches!(kind, "harness-state" | "harness-context"),
+        matches!(kind, "harness-state" | "harness-context" | "harness-todo"),
         "unsupported observation kind"
     );
     let value: Value = serde_json::from_slice(body)?;
@@ -252,10 +252,10 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     }
     // Context writers used to have no ownership fence. Refuse a delayed predecessor now that
     // its snapshot and event are admitted in the same transaction as the ownership check.
-    if kind == "harness-context" {
+    if matches!(kind, "harness-context" | "harness-todo") {
         anyhow::ensure!(
             current_token(&tx)?.as_deref() == value["incarnation"].as_str(),
-            "harness context owner was superseded"
+            "harness observation owner was superseded"
         );
     }
     tx.execute(
@@ -264,6 +264,32 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         params![kind, body],
     )?;
     append_event(&tx, kind, &value)?;
+    tx.commit()?;
+    signal_wake(agent_dir);
+    Ok(())
+}
+
+/// Graph-native channels have no provider record writer. Their spool is scoped to one
+/// authenticated runtime incarnation; daemon publication still applies the runtime fence.
+pub fn write_channel_todo(agent_dir: &Path, runtime: &str, fields: &Value) -> Result<()> {
+    let mut value = fields.clone();
+    value["incarnation"] = runtime.into();
+    let mut connection = open(agent_dir)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let bound: String = tx.query_row(
+        "SELECT value FROM metadata WHERE key='runtime'", [], |row| row.get(0),
+    )?;
+    anyhow::ensure!(bound == runtime, "channel todo runtime was superseded");
+    tx.execute(
+        "INSERT OR IGNORE INTO metadata(key,value) VALUES (?1,?2)",
+        params![format!("provider-runtime:{runtime}"), runtime],
+    )?;
+    append_event(&tx, "harness-todo", &value)?;
+    tx.execute(
+        "INSERT INTO snapshots VALUES ('harness-todo',?1)
+        ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
+        [serde_json::to_vec(&value)?],
+    )?;
     tx.commit()?;
     signal_wake(agent_dir);
     Ok(())
@@ -377,6 +403,14 @@ pub fn prepare_publication(
         "INSERT OR IGNORE INTO prepared VALUES (?1,?2,?3)",
         params![sequence, slot, serde_json::to_string(claim)?],
     )?;
+    // Rebuild rejected todo claims from their retained event without keeping the malformed
+    // pre-normalization slot as a retry target. Preparation and retirement commit together.
+    if slot == "harness.todo.observed:normalized" {
+        tx.execute(
+            "DELETE FROM prepared WHERE sequence=?1 AND slot='harness.todo.observed:'",
+            [sequence],
+        )?;
+    }
     let body: String = tx.query_row(
         "SELECT body FROM prepared WHERE sequence=?1 AND slot=?2",
         params![sequence, slot],

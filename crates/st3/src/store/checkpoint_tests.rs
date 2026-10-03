@@ -605,6 +605,40 @@ fn step_events(sealed: &mut Sealed, events: &[(&str, u128, Option<u128>)]) -> Ve
         .collect()
 }
 
+#[test]
+fn a_work_extension_is_the_last_lease_anchor_for_live_and_checkpoint_timing() {
+    let store = Store::open_memory("alder").unwrap();
+    let subject = "step-run/s/build";
+    for (kind, at, expires) in [
+        ("work.claimed", T, T + 10),
+        ("work.extended", T + 5, T + 20),
+    ] {
+        store.set_write_clock_at(at).unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        append_claim_tx(
+            &transaction,
+            &store.origin,
+            subject,
+            kind,
+            None,
+            &json!({"fields": work(kind, 1, Some(expires))}),
+            &[],
+            None,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+    }
+    let connection = store.readers.get();
+    assert_eq!(
+        step_execution_timing_at(&connection, subject, 1, T + 15, true).unwrap(),
+        (Some(T), 15)
+    );
+    let answers = subject_answers(&connection, subject, T + 15).unwrap();
+    let timing = answers["timing"]["1"].as_array().unwrap();
+    assert!(timing.contains(&json!([T.to_string(), "15"])));
+}
+
 /// No renewal goes. The timing fold closes an interval when the next event arrives after the
 /// expiry that stands, so a late lease event from a writer outside the sealed set, landing
 /// before a renewal, would make that renewal decide the answer. This is the case proptest

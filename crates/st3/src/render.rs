@@ -321,6 +321,10 @@ pub fn apply_all(
         {
             continue;
         }
+        if let Err(error) = store.owned_desired_guard(subject) {
+            results.insert(subject.subject.clone(), Err(error.into()));
+            continue;
+        }
         match prepare_member(store, subject)
             .with_context(|| format!("render for {}", subject.subject))
         {
@@ -414,6 +418,11 @@ pub fn apply_all(
         .collect::<BTreeMap<_, _>>();
     for (subject, (writes, mut warnings)) in plans {
         if results.contains_key(&subject) {
+            continue;
+        }
+        if let Some(declaration) = desired.iter().find(|d| d.subject == subject)
+            && let Err(error) = store.owned_desired_guard(declaration) {
+            results.insert(subject, Err(error.into()));
             continue;
         }
         if let Some(workspace) = native_workspaces.get(subject.as_str()) {

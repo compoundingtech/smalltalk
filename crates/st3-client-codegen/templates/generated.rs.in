@@ -880,6 +880,8 @@ pub struct Agent {
     #[serde(default)]
     pub current_session_id: Option<String>,
     #[serde(default)]
+    pub todo: Option<AgentTodo>,
+    #[serde(default)]
     pub current_work_ids: Vec<String>,
     #[serde(default)]
     pub active_work_count: u64,
@@ -908,6 +910,54 @@ pub struct Agent {
     /// The seat's latest suspend or resume and its phase. An older daemon omits it.
     #[serde(default)]
     pub suspension: Option<AgentSuspension>,
+}
+/// The latest accepted harness todo observation, including its provenance and freshness.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentTodo {
+    pub snapshot: HarnessTodoSnapshot,
+    pub claim_id: String,
+    pub accepted_at: String,
+    pub stale: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessTodoSnapshot {
+    pub harness: String,
+    pub session_id: String,
+    pub incarnation_id: String,
+    pub observed_at: String,
+    pub source_op: String,
+    pub phases: Vec<HarnessPhase>,
+    pub totals: HarnessTodoTotals,
+    pub truncated: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessPhase {
+    pub name: String,
+    pub tasks: Vec<HarnessTask>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessTask {
+    pub content: String,
+    pub status: HarnessTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessTaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessTodoTotals {
+    pub pending: u64,
+    pub in_progress: u64,
+    pub completed: u64,
+    pub blocked: u64,
+    #[serde(default)]
+    pub abandoned: u64,
 }
 /// Where a seat's latest suspend or resume stands.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1266,6 +1316,19 @@ pub struct ResourcesPage {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct OwnedSet {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub claim: String,
+    pub receipt: Value,
+    pub blockers: Vec<String>,
+    pub members_status: Vec<Value>,
+    pub visibility: Value,
+    #[serde(default)]
+    pub commit_status: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Resource {
     Attention(Attention),
@@ -1287,6 +1350,7 @@ pub enum Resource {
     History(History),
     Session(Session),
     Glass(Glass),
+    OwnedSet(OwnedSet),
 }
 
 impl Resource {
@@ -1311,6 +1375,7 @@ impl Resource {
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,
             Self::Glass(v) => &v.header,
+            Self::OwnedSet(v) => &v.header,
         }
     }
 }
@@ -2143,6 +2208,14 @@ pub struct AgentCreateParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_at_run_end: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -2476,3 +2549,16 @@ pub struct Glass {
 pub struct GlassPut { pub body: GlassBody, pub base_revision: Option<String> }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct GlassDelete { pub base_revision: Option<String> }
+
+/// Repositories already used by a host's declared agents, read from replicated graph evidence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HostRepositories {
+    pub host_id: String,
+    pub repositories: Vec<AgentRepository>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentRepository {
+    pub path: String,
+    pub workspaces: Vec<String>,
+    pub agent_ids: Vec<String>,
+}
