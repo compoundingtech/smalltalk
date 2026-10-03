@@ -253,14 +253,24 @@ impl Store {
     pub fn watches(&self, agent: Option<&str>) -> Result<Vec<Value>, St3Error> {
         let now = now_ms();
         let mut views = Vec::new();
-        for desired in self
-            .desired_subjects()
-            .map_err(internal)?
-            .into_iter()
-            .filter(|desired| {
-                desired.kind == "subscription" && desired.subject.starts_with("subscription/watch/")
-            })
-        {
+        // Use the subject primary key to read only watches: unrelated fleet declarations must
+        // not make listing a seat's watches more expensive.
+        let desired = {
+            let connection = self.readers.get();
+            let mut statement = connection
+                .prepare_cached(
+                    "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+                     FROM desired WHERE subject >= 'subscription/watch/'
+                       AND subject < 'subscription/watch0' ORDER BY subject",
+                )
+                .map_err(internal)?;
+            statement
+                .query_map([], desired_from_row)
+                .map_err(internal)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(internal)?
+        };
+        for desired in desired {
             if let Some(agent) = agent
                 && github_watch::watch_parts(&desired.subject)
                     .is_none_or(|(_, owner)| owner != agent)

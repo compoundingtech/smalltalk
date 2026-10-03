@@ -378,6 +378,30 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    // A watch validates the thread with GitHub first; measure its store work directly so the
+    // cost check needs neither network access nor a live seat process. Each attempt declares a
+    // new watch, and the ending probe ends a different one rather than measuring a replay.
+    direct("POST /v1/github/watch", |store, fixture, attempt| {
+        let thread = st3::github_watch::ThreadRef::parse(&format!("acme/garden#{}", attempt + 1))
+            .map_err(|error| error.message)?;
+        store
+            .declare_watch(&thread, &fixture.subjects.seats[0], None)
+            .map_err(|error| error.message)
+    }),
+    direct("GET /v1/github/watches", |store, fixture, _| {
+        store
+            .watches(Some(&fixture.subjects.seats[0]))
+            .map(|views| json!(views))
+            .map_err(|error| error.message)
+    }),
+    direct("POST /v1/github/unwatch", |store, fixture, attempt| {
+        let thread = st3::github_watch::ThreadRef::parse(&format!("acme/garden#{}", attempt + 1))
+            .map_err(|error| error.message)?;
+        store
+            .end_watch(&thread.watch(&fixture.subjects.seats[0]), "unwatched", None)
+            .map(|ended| json!({"ended": ended}))
+            .map_err(|error| error.message)
+    }),
     get("GET /v1/health", "/v1/health"),
     get("GET /v1/schema", "/v1/schema"),
     get("GET /v1/client/capabilities", "/v1/client/capabilities"),
