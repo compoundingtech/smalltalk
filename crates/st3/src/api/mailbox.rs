@@ -334,6 +334,129 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn a_restarted_native_mailbox_delivers_a_watch_wake_queued_while_the_seat_was_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        let seat = "agent/eval.worker";
+        let source = "version 2\nagent \"eval.worker\" { workspace \"/tmp\"; command \"true\"; }\n";
+        let apply = |source: &str, key: &str| {
+            state
+                .store
+                .apply_internal(
+                    &crate::graph::parse_test_intent(source, "node").unwrap(),
+                    key,
+                )
+                .unwrap();
+        };
+        apply(source, "declare");
+        crate::mailbox::tests::ready(&state.store, "before-stop");
+        let thread = crate::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+        state.store.declare_watch(&thread, seat, None).unwrap();
+        let observe = |comments: Value| {
+            let subscriptions = state
+                .store
+                .desired_subjects()
+                .unwrap()
+                .into_iter()
+                .filter_map(|desired| {
+                    crate::graph::subscription_spec(&desired.desired)
+                        .filter(|spec| !spec.stopped)
+                        .map(|spec| (desired.subject, spec))
+                })
+                .collect::<Vec<_>>();
+            state.store.record_resource_observation(
+                &thread.observer(), &state.store.selected_desired_revision(&thread.observer()).unwrap().unwrap(),
+                None, &thread.resource(), None,
+                &json!({"repository_id": 7, "issues": [{"number": 12, "new": false, "state": "open", "recent_comments": comments}]}),
+                0, &subscriptions,
+            ).unwrap();
+        };
+        observe(json!([]));
+        apply("version 2\nstop \"agent/eval.worker\"\n", "stop");
+        let reconciler = crate::reconcile::Reconciler::new(
+            state.store.clone(),
+            Arc::new(crate::reconcile::NativeRuntime::new(
+                root.path(),
+                None,
+                Path::new("pty"),
+            )),
+            "node".into(),
+            state.notify.clone(),
+        );
+        let reconcile = || {
+            reconciler
+                .reconcile_github_watches(&state.store.desired_subjects().unwrap())
+                .unwrap()
+        };
+        reconcile();
+        observe(
+            json!([{"kind": "comment", "id": 91, "author": "fern-example", "at": chrono::Utc::now().to_rfc3339()}]),
+        );
+        let queued = state.store.messages(Some(seat), false).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].status, "sent");
+        apply(source, "start");
+        crate::mailbox::tests::ready(&state.store, "after-start");
+        reconcile();
+        assert_eq!(
+            state
+                .store
+                .watch_view(&thread.watch(seat))
+                .unwrap()
+                .unwrap()["state"],
+            "active"
+        );
+
+        let peer = NativeDeliveryPeer {
+            agent: seat.into(),
+            transport: "claude-channel",
+            pid: 37,
+            archives_inbox: false,
+        };
+        let app = router(state.clone()).layer(Extension(peer));
+        let path = root.path().join("daemon.sock");
+        let server_path = path.clone();
+        let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
+        let client = Client::new(Endpoint::Unix(path.clone()));
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let fence: Fence = client
+            .post(
+                "/v1/mailbox/bind",
+                &Fence::new(seat, "after-start", "delivery"),
+            )
+            .await
+            .unwrap();
+        let mut mailbox = client.open_mailbox(&fence).await.unwrap();
+        assert!(matches!(next(&mut mailbox).await, Frame::Seat { .. }));
+        assert!(
+            matches!(next(&mut mailbox).await, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == queued[0].subject)
+        );
+        let _: ClaimRecord = client
+            .post(
+                "/v1/mailbox/receipts",
+                &Receipt {
+                    fence,
+                    message: queued[0].subject.clone(),
+                    lifecycle: "delivered".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state.store.messages(Some(seat), false).unwrap()[0].status,
+            "delivered"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn every_harness_replays_and_receipts_over_a_real_unix_push_stream_without_files() {
         for transport in [

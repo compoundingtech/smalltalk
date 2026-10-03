@@ -490,6 +490,9 @@ failure tests rather than publishing a fake fault.
 Why: a seat that asked a question on GitHub, or opened a pull request, needs to hear the answer and
 the checks without polling. A watch wakes it once for each comment or review by anyone else, each
 time the required checks on the head turn pass or fail, and when the thread closes or merges.
+The watch survives stop/start, suspend/resume and daemon restarts; wakes wait as mail while the
+seat is stopped. Retirement or an explicit fresh conversation ends it silently, and the deadline
+sends a final wake. The shared observer keeps polling until the last watch ends.
 
 ```sh
 st gh --help

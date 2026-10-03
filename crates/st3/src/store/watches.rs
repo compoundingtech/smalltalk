@@ -173,6 +173,52 @@ impl Store {
         person_work::declaration_live(&connection, agent).map_err(internal)
     }
 
+    /// A stopped seat still owns its conversation and watches. Only removing the declaration
+    /// or explicitly starting a fresh conversation ends them silently.
+    pub(crate) fn watch_seat_ended(
+        &self,
+        subject: &str,
+        agent: &str,
+        watch: &crate::model::WatchSpec,
+    ) -> Result<bool, St3Error> {
+        if self
+            .desired_subjects_named(&[agent.to_owned()])
+            .map_err(internal)?
+            .is_empty()
+        {
+            return Ok(true);
+        }
+        let resets = self
+            .observations_for(agent, "runtime.action.requested")
+            .map_err(internal)?
+            .into_iter()
+            .filter(|claim| {
+                claim.body["fields"]["action"] == "fresh-context"
+                    && claim.accepted_at_unix_ms >= watch.since_unix_ms
+            })
+            .collect::<Vec<_>>();
+        if resets.is_empty() {
+            return Ok(false);
+        }
+        // A deadline edit keeps the original conversation. Use the first declaration of this
+        // watch, rather than the latest edit; log order also distinguishes writes in one ms.
+        let began = self
+            .claims_for(subject, Some("intent.desired"))
+            .map_err(internal)?
+            .into_iter()
+            .filter(|claim| {
+                crate::graph::subscription_spec(&claim.body["desired"])
+                    .and_then(|spec| spec.watch)
+                    .is_some_and(|prior| prior.since_unix_ms == watch.since_unix_ms)
+            })
+            .map(|claim| claim_log_order(&claim))
+            .min();
+        Ok(resets.iter().any(|claim| {
+            claim.accepted_at_unix_ms > watch.since_unix_ms
+                || began.is_some_and(|began| claim_log_order(claim) > began)
+        }))
+    }
+
     /// One watch as `st gh ls` shows it, if it was ever declared.
     pub fn watch_view(&self, subject: &str) -> Result<Option<Value>, St3Error> {
         let Some(desired) = self
