@@ -503,6 +503,10 @@ CREATE TABLE IF NOT EXISTS local_observations (
 );
 CREATE INDEX IF NOT EXISTS local_observations_subject_kind_index
 ON local_observations(subject, kind, id);
+-- "Anything newer for this subject": a mailbox stream asks it on every graph change, and the
+-- subject-and-kind index made it read every observation the seat ever had.
+CREATE INDEX IF NOT EXISTS local_observations_subject_id_index
+ON local_observations(subject, id);
 CREATE INDEX IF NOT EXISTS local_observations_time_index
 ON local_observations(observed_at_unix_ms);
 CREATE UNIQUE INDEX IF NOT EXISTS local_observations_dedupe_index
@@ -37583,6 +37587,28 @@ version 2
     /// index whose part they read is what they show: one incarnation's claims, the newest
     /// observations, the open runs and steps. None reads or sorts every claim of a kind, every
     /// claim of a subject, or every step and run the store holds.
+    /// A mailbox stream asks on every graph change whether its seat has a newer local observation
+    /// (`mailbox_changed_since`). That seeks the seat's newest observations; by subject and kind
+    /// it read every observation the seat ever had, 1.3 ms for a seat with 36,000 of them, about
+    /// 160 times a second on a busy member.
+    #[test]
+    fn a_mailbox_stream_seeks_its_seats_newer_local_observations() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM local_observations
+                 WHERE subject=?1 AND id>?2)",
+            )
+            .unwrap()
+            .query_map(params!["agent/example", 0], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("; ");
+        assert!(plan.contains("(subject=? AND id>?)"), "{plan}");
+    }
+
     /// Foreign keys are on, so deleting or rekeying a parent row looks up every child that names
     /// it. A child column without an index made each lookup read the whole child table: deleting
     /// a claim read every operation, and a checkpoint trim held the writer for an hour.
