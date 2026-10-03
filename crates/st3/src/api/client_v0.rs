@@ -8520,6 +8520,56 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
+    fn assert_collection_frame_conforms(frame: &Value) {
+        let mut schema: Value = serde_json::from_str(include_str!(
+            "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+        ))
+        .unwrap();
+        schema.as_object_mut().unwrap().remove("oneOf");
+        schema["$ref"] = json!("#/$defs/CollectionFrame");
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&schema)
+            .unwrap();
+        let errors: Vec<_> = validator
+            .iter_errors(frame)
+            .map(|error| error.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{frame}: {errors:?}");
+        let mut extra = frame.clone();
+        extra["undeclared"] = json!(true);
+        assert!(!validator.is_valid(&extra));
+        let mut bad_retry = frame.clone();
+        bad_retry["retryable"] = json!("yes");
+        assert!(!validator.is_valid(&bad_retry));
+    }
+
+    #[tokio::test]
+    async fn conversation_failure_and_recovery_frames_conform_to_collection_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for (remote, expected_kind) in [(Some("host/offline"), "resync"), (None, "error")] {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let follower = tokio::spawn(follow_conversation(
+                state.clone(),
+                ClientSession::local(None).unwrap(),
+                "chat".into(),
+                "session/missing".into(),
+                remote.map(str::to_owned),
+                sender,
+            ));
+            let (_, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            follower.abort();
+            assert_eq!(frame["kind"], expected_kind, "{frame}");
+            assert_eq!(frame["retryable"], expected_kind == "resync");
+            assert_collection_frame_conforms(&frame);
+        }
+        assert_collection_frame_conforms(&json!({"kind":"resync", "id":"minimal"}));
+    }
+
     #[tokio::test]
     async fn steady_collection_retries_a_failed_first_read_without_another_command_or_write() {
         use futures_util::{SinkExt as _, StreamExt as _};
@@ -8541,7 +8591,9 @@ mod tests {
                             move |state, session, request| {
                                 let reads = reads.clone();
                                 async move {
-                                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    if request.id == "refused" {
+                                        Err(validation("unknown collection subscription"))
+                                    } else if reads.fetch_add(1, Ordering::SeqCst) == 0 {
                                         Err(ApiError::internal("injected first read failure"))
                                     } else {
                                         collection_items(&state, &session, &request).await
@@ -8573,6 +8625,7 @@ mod tests {
             serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(first["kind"], "resync");
         assert_eq!(first["retryable"], true);
+        assert_collection_frame_conforms(&first);
         let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
             .await
             .unwrap()
@@ -8582,6 +8635,23 @@ mod tests {
         assert_eq!(recovered["kind"], "snapshot");
         assert_eq!(recovered["id"], "agents");
         assert!(reads.load(Ordering::SeqCst) >= 2);
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe", "id":"refused", "collection":"agents"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let refused: Value = serde_json::from_str(refused.to_text().unwrap()).unwrap();
+        assert_eq!(refused["kind"], "error");
+        assert_eq!(refused["retryable"], false);
+        assert_collection_frame_conforms(&refused);
         socket.close(None).await.unwrap();
         server.abort();
     }

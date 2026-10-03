@@ -72,3 +72,18 @@ void dictatedTags;
 
 const searchHit: import('./Models.generated').ConversationSearchHit = { conversation_id: 'session/scribe', entry_id: 'timeline-entry/note', agent_id: 'agent/scribe', timestamp: '2026-10-02T00:00:00Z', entry_type: 'content', excerpt: 'orchid' };
 void searchHit;
+
+// Rust None and TypeScript omission are both supported wire shapes.
+import type { CollectionCommand, CollectionFrame } from './Models.generated';
+const nullFilters: CollectionCommand = { kind: 'subscribe', id: 'agents', collection: 'agents', person: null, actor: null, status: null };
+const currentTerminal: CollectionCommand = { kind: 'subscribe', id: 'term', collection: 'terminal', terminal: 'terminal/example', capability: 'proof' };
+const nullIncarnation: CollectionCommand = { ...currentTerminal, incarnation: null };
+const collectionResync: CollectionFrame = { kind: 'resync', id: 'agents', code: 'internal', message: 'Retry', retryable: true };
+const conversationResync: CollectionFrame = { kind: 'resync', id: 'chat', collection: 'conversation', retryable: true };
+const terminalError: CollectionFrame = { kind: 'error', id: 'term', collection: 'terminal', message: 'Restarted', retryable: false };
+void [nullFilters, currentTerminal, nullIncarnation, collectionResync, conversationResync, terminalError];
+// @ts-expect-error Terminal capability remains required.
+const missingTerminalCapability: CollectionCommand = { kind: 'subscribe', id: 'term', collection: 'terminal', terminal: 'terminal/example' };
+// @ts-expect-error Failure metadata is explicitly declared; arbitrary properties remain closed.
+const extraResyncProperty: CollectionFrame = { kind: 'resync', id: 'agents', undeclared: true };
+void [missingTerminalCapability, extraResyncProperty];

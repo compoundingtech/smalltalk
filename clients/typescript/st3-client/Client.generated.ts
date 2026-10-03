@@ -3,9 +3,9 @@ import { API_VERSION } from './Models.generated';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    SubjectDefinition, UsagePeriod,
+    SubjectDefinition, UsagePeriod, CollectionName, CollectionFrame,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
-    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelineEntry, TimelinePage,
+    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated';
 
 export type PageOptions = { cursor?: string; limit?: number };
@@ -42,20 +42,8 @@ export type TerminalStreamOptions = {
 };
 export type TerminalStream = { close(): void };
 
-/** The bounded current collections one socket can hold windows of. */
-export type CollectionName = 'missions' | 'attention' | 'agents' | 'work' | 'glasses';
 /** `person` applies to attention, `actor` to work, and `status` to agents. */
-export type CollectionFilters = { person?: string; actor?: string; status?: string };
-/** One frame from the collections socket. `snapshot` and `changes` describe a window,
- * `screen` a followed terminal, and `conversation` a followed conversation. `resync` asks for
- * that subscription again (`code` and `message` say why, when a temporary failure caused it); `error` ends the subscription it names. */
-export type CollectionFrame =
-    | { kind: 'snapshot'; id: string; collection: CollectionName; snapshot: Snapshot; items: Resource[]; order: string[]; has_more: boolean }
-    | { kind: 'changes'; id: string; collection: CollectionName; snapshot: Snapshot; upserts: Resource[]; removes: string[]; order: string[]; has_more: boolean }
-    | { kind: 'screen'; id: string; collection: 'terminal'; snapshot: Snapshot; value: TerminalScreen }
-    | { kind: 'conversation'; id: string; collection: 'conversation'; session_id: string; replace: boolean; items: TimelineEntry[]; has_more?: boolean }
-    | { kind: 'resync'; id: string; code?: string; message?: string }
-    | { kind: 'error'; id?: string; collection?: string; code?: string; message: string };
+export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null };
 /** The WebSocket surface the collections socket uses: a terminal socket that also sends. */
 export type CollectionSocket = TerminalSocket & {
     onopen: (() => void) | null;
@@ -74,7 +62,7 @@ export type CollectionStream = {
     subscribeGlasses(id: string): void;
     subscribe(id: string, collection: CollectionName, limit?: number, filters?: CollectionFilters): void;
     /** Follow a terminal with the incarnation and single-use capability `terminal.attach` returned. */
-    subscribeTerminal(id: string, terminal: string, incarnation: string, capability: string): void;
+    subscribeTerminal(id: string, terminal: string, incarnation: string | null | undefined, capability: string): void;
     /** Follow the conversation of an agent or a session. */
     subscribeConversation(id: string, conversation: string): void;
     unsubscribe(id: string): void;

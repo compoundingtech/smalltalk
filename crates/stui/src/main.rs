@@ -1427,12 +1427,7 @@ fn mission_current_work<'a>(
         })
 }
 fn next_action_label(work: &st3_client::Work) -> &'static str {
-    if work
-        .extra
-        .get("agentless")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
+    if work.agentless {
         return "Stewardship active";
     }
     match work.state.as_str() {
@@ -1445,12 +1440,7 @@ fn next_action_label(work: &st3_client::Work) -> &'static str {
     }
 }
 fn work_owner(model: &Model, work: &st3_client::Work) -> String {
-    if work
-        .extra
-        .get("agentless")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
+    if work.agentless {
         return "Agentless step".into();
     }
     let agent_id = work.claimant.as_deref().or_else(|| {

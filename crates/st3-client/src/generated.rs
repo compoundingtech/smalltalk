@@ -263,8 +263,6 @@ pub struct Operational {
     pub owner_generation: Option<String>,
     #[serde(default)]
     pub runtime_incarnation: Option<String>,
-    #[serde(default)]
-    pub runtime_desired_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -713,6 +711,12 @@ pub struct Mission {
     #[serde(default)]
     pub active_runs: Option<usize>,
     #[serde(default)]
+    pub total_runs: Option<usize>,
+    #[serde(default)]
+    pub run_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub runs_truncated: bool,
+    #[serde(default)]
     pub run_generations: BTreeMap<String, String>,
     #[serde(default)]
     pub visualization: Option<Visualization>,
@@ -812,6 +816,16 @@ pub struct Work {
     pub readiness_epoch: u64,
     pub claimant: Option<String>,
     pub claim_incarnation: Option<String>,
+    #[serde(default)]
+    pub agentless: bool,
+    #[serde(default)]
+    pub claim_expires_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub execution_started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub execution_elapsed_ms: u64,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     pub blocked_reason: Option<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
@@ -1210,6 +1224,8 @@ pub struct Session {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub timeline_cursor: String,
+    #[serde(default)]
+    pub runtime_incarnation: Option<String>,
     #[serde(default)]
     pub usage: Option<UsageSummary>,
 }
