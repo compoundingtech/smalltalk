@@ -223,6 +223,9 @@ public struct OwnedSetResource: Codable, Sendable, Identifiable {
 }
 public enum Resource: Codable, Sendable, Identifiable {
     case attention(AttentionResource), message(MessageResource), launch(LaunchResource), launchVariant(LaunchVariantResource), launchDecision(LaunchDecisionResource), launchApproval(LaunchApprovalResource), mission(MissionResource), work(WorkResource), agent(AgentResource), runtime(RuntimeResource), observer(ObserverResource), subscription(SubscriptionResource), lane(LaneResource), machine(MachineResource), device(DeviceResource), operation(OperationResource), history(HistoryResource), session(SessionResource), glass(GlassResource), ownedSet(OwnedSetResource)
+    /// A kind this client does not know, from a member newer than it: kept whole so an older
+    /// client skips it or shows it plainly instead of failing the page it came in.
+    case unknown(UnknownResource)
     private struct Discriminator: Decodable { let kind: String }
     public init(from decoder: Decoder) throws {
         switch try Discriminator(from: decoder).kind {
@@ -246,11 +249,26 @@ public enum Resource: Codable, Sendable, Identifiable {
         case "session": self = .session(try SessionResource(from: decoder))
         case "glass": self = .glass(try GlassResource(from: decoder))
         case "owned-set": self = .ownedSet(try OwnedSetResource(from: decoder))
-        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown Resource kind"))
+        default: self = .unknown(try UnknownResource(from: decoder))
         }
     }
-    public func encode(to encoder: Encoder) throws { switch self { case .attention(let v): try v.encode(to: encoder); case .message(let v): try v.encode(to: encoder); case .launch(let v): try v.encode(to: encoder); case .launchVariant(let v): try v.encode(to: encoder); case .launchDecision(let v): try v.encode(to: encoder); case .launchApproval(let v): try v.encode(to: encoder); case .mission(let v): try v.encode(to: encoder); case .work(let v): try v.encode(to: encoder); case .agent(let v): try v.encode(to: encoder); case .runtime(let v): try v.encode(to: encoder); case .observer(let v): try v.encode(to: encoder); case .subscription(let v): try v.encode(to: encoder); case .lane(let v): try v.encode(to: encoder); case .machine(let v): try v.encode(to: encoder); case .device(let v): try v.encode(to: encoder); case .operation(let v): try v.encode(to: encoder); case .history(let v): try v.encode(to: encoder); case .session(let v): try v.encode(to: encoder); case .glass(let v): try v.encode(to: encoder); case .ownedSet(let v): try v.encode(to: encoder) } }
-    public var id: String { switch self { case .attention(let v): v.id; case .message(let v): v.id; case .launch(let v): v.id; case .launchVariant(let v): v.id; case .launchDecision(let v): v.id; case .launchApproval(let v): v.id; case .mission(let v): v.id; case .work(let v): v.id; case .agent(let v): v.id; case .runtime(let v): v.id; case .observer(let v): v.id; case .subscription(let v): v.id; case .lane(let v): v.id; case .machine(let v): v.id; case .device(let v): v.id; case .operation(let v): v.id; case .history(let v): v.id; case .session(let v): v.id; case .glass(let v): v.id; case .ownedSet(let v): v.id } }
+    public func encode(to encoder: Encoder) throws { switch self { case .attention(let v): try v.encode(to: encoder); case .message(let v): try v.encode(to: encoder); case .launch(let v): try v.encode(to: encoder); case .launchVariant(let v): try v.encode(to: encoder); case .launchDecision(let v): try v.encode(to: encoder); case .launchApproval(let v): try v.encode(to: encoder); case .mission(let v): try v.encode(to: encoder); case .work(let v): try v.encode(to: encoder); case .agent(let v): try v.encode(to: encoder); case .runtime(let v): try v.encode(to: encoder); case .observer(let v): try v.encode(to: encoder); case .subscription(let v): try v.encode(to: encoder); case .lane(let v): try v.encode(to: encoder); case .machine(let v): try v.encode(to: encoder); case .device(let v): try v.encode(to: encoder); case .operation(let v): try v.encode(to: encoder); case .history(let v): try v.encode(to: encoder); case .session(let v): try v.encode(to: encoder); case .glass(let v): try v.encode(to: encoder); case .ownedSet(let v): try v.encode(to: encoder); case .unknown(let v): try v.encode(to: encoder) } }
+    public var id: String { switch self { case .attention(let v): v.id; case .message(let v): v.id; case .launch(let v): v.id; case .launchVariant(let v): v.id; case .launchDecision(let v): v.id; case .launchApproval(let v): v.id; case .mission(let v): v.id; case .work(let v): v.id; case .agent(let v): v.id; case .runtime(let v): v.id; case .observer(let v): v.id; case .subscription(let v): v.id; case .lane(let v): v.id; case .machine(let v): v.id; case .device(let v): v.id; case .operation(let v): v.id; case .history(let v): v.id; case .session(let v): v.id; case .glass(let v): v.id; case .ownedSet(let v): v.id; case .unknown(let v): v.id } }
+}
+/// A resource of a kind this client does not model: its header, and every field as sent.
+public struct UnknownResource: Codable, Sendable, Identifiable {
+    public let kind, id, revision, updatedAt: String
+    public let fields: [String: JSONValue]
+    private enum HeaderKeys: String, CodingKey { case kind, id, revision, updatedAt = "updated_at" }
+    public init(from decoder: Decoder) throws {
+        let header = try decoder.container(keyedBy: HeaderKeys.self)
+        kind = try header.decode(String.self, forKey: .kind)
+        id = try header.decode(String.self, forKey: .id)
+        revision = try header.decode(String.self, forKey: .revision)
+        updatedAt = try header.decode(String.self, forKey: .updatedAt)
+        fields = try [String: JSONValue](from: decoder)
+    }
+    public func encode(to encoder: Encoder) throws { try fields.encode(to: encoder) }
 }
 public struct ResourceObservation: Codable, Sendable, Identifiable {
     public let id, kind, observedAt: String

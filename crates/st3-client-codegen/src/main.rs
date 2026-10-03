@@ -531,6 +531,30 @@ fn validate_surfaces(
             bail!("Resource discriminator `{definition}` is absent from a generated client");
         }
     }
+    // An older client reads a newer kind as unknown; the kinds it knows are the schema's.
+    let known = schema["$defs"]["UnknownResource"]["allOf"][1]["properties"]["kind"]["not"]["enum"]
+        .as_array()
+        .context("UnknownResource names the known kinds")?;
+    for kind in known {
+        let kind = kind.as_str().context("a resource kind")?;
+        if !rust.contains(&format!("    \"{kind}\",\n")) {
+            bail!("KNOWN_RESOURCE_KINDS lacks `{kind}`");
+        }
+        if !swift.contains(&format!("case \"{kind}\": self = .")) {
+            bail!("Swift Resource does not decode `{kind}`");
+        }
+    }
+    let listed = rust
+        .split("pub const KNOWN_RESOURCE_KINDS: &[&str] = &[")
+        .nth(1)
+        .and_then(|rest| rest.split("];").next())
+        .context("KNOWN_RESOURCE_KINDS")?
+        .matches('"')
+        .count()
+        / 2;
+    if listed != known.len() {
+        bail!("KNOWN_RESOURCE_KINDS has {listed} kinds; the schema knows {}", known.len());
+    }
     for definition in [
         "ResourceObservation",
         "ResourcesFilter",

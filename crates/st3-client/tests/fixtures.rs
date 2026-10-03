@@ -429,3 +429,42 @@ fn creation_actions_round_trip_typed_parameters() {
         serde_json::from_value(value["fence"].clone()).unwrap(), parameters).unwrap();
     assert_eq!(serde_json::to_value(generated).unwrap(), serde_json::to_value(action).unwrap());
 }
+
+#[test]
+fn a_kind_this_client_does_not_know_reads_as_unknown_and_the_page_still_reads() {
+    // A newer member sends a kind this build has never heard of, beside one it knows.
+    let page: Page = serde_json::from_value(serde_json::json!({
+        "kind": "page", "collection": "resources", "filters": {},
+        "items": [
+            {"kind": "example-arrangement", "id": "example-arrangement/person/avery/1",
+             "revision": "r1", "updated_at": "2026-10-04T08:00:00Z",
+             "name": "Pinned", "folders": {"inbox": {"name": "Inbox"}}},
+            {"kind": "device", "id": "device/0011", "revision": "r2",
+             "updated_at": "2026-10-04T08:00:00Z", "person_id": "person/avery",
+             "name": "Pocket", "session_actor": "person/avery/session/0011", "state": "active",
+             "scopes": ["read.projections"], "expires_at": "2026-11-04T08:00:00Z"}
+        ],
+        "page": {"limit": 50, "has_more": false}
+    }))
+    .unwrap();
+    let Resource::Unknown(unknown) = &page.items[0] else {
+        panic!("an unknown kind is kept as unknown: {:?}", page.items[0])
+    };
+    assert_eq!(unknown.kind, "example-arrangement");
+    assert_eq!(page.items[0].header().id, "example-arrangement/person/avery/1");
+    assert_eq!(unknown.fields["name"], "Pinned");
+    assert!(matches!(page.items[1], Resource::Device(_)));
+    // It goes back out as it came.
+    let again = serde_json::to_value(&page.items[0]).unwrap();
+    assert_eq!(again["kind"], "example-arrangement");
+    assert_eq!(again["folders"]["inbox"]["name"], "Inbox");
+    assert_eq!(again["revision"], "r1");
+    // A known kind that does not match its model is still an error, never unknown.
+    assert!(
+        serde_json::from_value::<Resource>(serde_json::json!({
+            "kind": "device", "id": "device/0011", "revision": "r2",
+            "updated_at": "2026-10-04T08:00:00Z"
+        }))
+        .is_err()
+    );
+}
