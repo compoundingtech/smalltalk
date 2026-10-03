@@ -12,7 +12,12 @@ module StFabricRust {
 }
 MAP
 for target in aarch64-apple-ios aarch64-apple-ios-sim; do
-  cargo build --manifest-path rust/Cargo.toml --release --locked --target "$target"
+  case "$target" in
+    aarch64-apple-ios) fabric_minimum_flag=-miphoneos-version-min=16.4 ;;
+    aarch64-apple-ios-sim) fabric_minimum_flag=-mios-simulator-version-min=16.4 ;;
+  esac
+  # blake3 tracks CFLAGS but not Apple's deployment environment when reusing C objects.
+  CFLAGS="${CFLAGS:-} $fabric_minimum_flag" cargo build --manifest-path rust/Cargo.toml --release --locked --target "$target"
 done
 # Other native projects share this host. Never overlap their xcodebuild process.
 while pgrep -x xcodebuild >/dev/null; do sleep 10; done
