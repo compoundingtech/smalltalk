@@ -39,7 +39,9 @@ while a window is read neither tear it nor delay it; they arrive in the next
 An `error` frame reports a permanent refusal and ends that subscription. A
 `resync` frame with `retryable: true` reports a temporary read failure; the server
 keeps the subscription and retries after its reread interval, including when the
-first snapshot failed. Clients may resubscribe with the same ID to request a
+first snapshot failed. A followed conversation's `resync` also carries the failure's
+`code` and `message`, such as `remote-unavailable` while the owner's host cannot be
+reached, so a client still showing its last copy can say that copy is stale. Clients may resubscribe with the same ID to request a
 fresh snapshot. If the socket closes, including during a daemon
 restart, open a new socket and subscribe again; the new snapshot is authoritative.
 Each socket subscribes to store changes before taking its first snapshot, so a

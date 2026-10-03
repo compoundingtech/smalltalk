@@ -12,7 +12,9 @@ stand-in keeps its sessions the way its harness does, so `suspend` proves that a
 back on the session it suspended on. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
 
-Every scenario also checks that the native driver creates no `catalog.kdl` or `agent.kdl`.
+Every fresh scenario also checks that the native driver creates no `catalog.kdl`, `agent.kdl`,
+or polled `harness-state`, `harness-context`, and `harness-timeline` records, and that each seat
+has its st-owned observation outbox.
 Re-execution must preserve the provider processes as well as the seat incarnation. To check a
 rolling upgrade, give `run` the predecessor binary and use `--replacement-binary` for the new
 binary with the `reexec` scenario. That mode allows predecessor catalogs, but checks their bytes
@@ -39,7 +41,8 @@ so races the real ones hide are hit every time.
 
 The evidence directory holds `result.json` (the verdict and the seat's last state), `daemon.log`,
 `terminal-*.txt` (the seat's screen), `trace-*.jsonl` (its claims), `receipts-*.jsonl` (what the
-stand-in saw and did) and the harness-state record. Read the trace first: it shows which side
+stand-in saw and did), and `observation-outboxes.json` (pending event sequences and driver
+diagnostics). Predecessor adoption can also leave legacy harness records. Read the trace first: it shows which side
 wrote what, in what order. Fix the product on main; do not slow a stand-in to hide a race. The
 canaries found these when they were written: Codex ending its session before the daemon's first
 mailbox replay, Codex publishing its predecessor's `ended` record as the new incarnation's, and a

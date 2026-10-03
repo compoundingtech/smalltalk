@@ -62,6 +62,7 @@ mod client_blobs;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
+mod harness_events;
 mod mailbox;
 mod terminal_view;
 
@@ -511,6 +512,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/page", get(list_messages_page))
         .route("/v1/mailbox", get(mailbox::subscribe))
+        .route("/v1/harness-events", post(harness_events::publish))
         .route("/v1/mailbox/bind", post(mailbox::bind))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
@@ -9036,6 +9038,17 @@ async fn post_claim(
     let kind = request.kind.clone();
     let (response, appended) =
         blocking_action(move || store.append_client_claim_outcome(&request)).await?;
+    finish_claim_publication(&state, &kind, response, appended).await
+}
+
+// Both claim transports must publish response-usage rollups, even on replay after the original
+// observation committed but a later step failed. Keep visibility wakes identical as well.
+async fn finish_claim_publication(
+    state: &AppState,
+    kind: &str,
+    response: ClaimRecord,
+    appended: bool,
+) -> Result<Json<ClaimRecord>, ApiError> {
     // Publish only the cumulative buckets. The response detail and turn ID remain local.
     let store = state.store.clone();
     let rollup_response = response.clone();
@@ -9046,14 +9059,14 @@ async fn post_claim(
         let (_, updated) =
             blocking_action(move || store.append_client_claim_outcome(&rollup)).await?;
         if updated {
-            signal_visible_change(&state);
+            signal_visible_change(state);
         }
     }
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
-            signal_local_change(&state);
+            signal_local_change(state);
         } else if kind == "harness.usage" || kind == "subagent.renewed" {
-            signal_visible_change(&state);
+            signal_visible_change(state);
         } else if kind.starts_with("message.") {
             let store = state.store.clone();
             let subject = response.subject.clone();
@@ -9063,9 +9076,9 @@ async fn post_claim(
                 .ok()
                 .flatten()
                 .is_none_or(|message| is_work_wake(&message.tags));
-            signal_message_changed(&state, &kind, work_wake);
+            signal_message_changed(state, kind, work_wake);
         } else {
-            signal_claim_changed(&state, &kind);
+            signal_claim_changed(state, kind);
         }
     }
     Ok(Json(response))
@@ -20138,5 +20151,96 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, exact) = get_request(app, "/v1/messages/read/message%2Fpage-204").await;
         assert_eq!(status, StatusCode::OK, "{exact}");
         assert_eq!(exact["content"], "body 204");
+    }
+    #[tokio::test]
+    async fn harness_event_endpoint_requires_this_native_seats_local_peer_and_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let subject = "agent/example/event-api";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("incarnation_id".into(), json!("runtime-a")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let request = json!({"runtime_incarnation":"runtime-a", "sequence":1,
+            "claim":{"subject":subject,"kind":"harness.observed","actor":subject,
+                "fields":{"state":"idle","driver":"claude","incarnation_id":"runtime-a"},
+                "evidence":[],"idempotency_key":"fixture-event"}});
+        let app = router(state);
+        let (status, _) = json_request(app.clone(), "/v1/harness-events", request.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let peer = NativeDeliveryPeer {
+            agent: "agent/example/foreign".into(),
+            transport: "claude-channel",
+            pid: 7,
+            archives_inbox: true,
+        };
+        let (status, _) = json_request(
+            app.clone().layer(Extension(peer)),
+            "/v1/harness-events",
+            request.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let peer = NativeDeliveryPeer {
+            agent: subject.into(),
+            transport: "claude-channel",
+            pid: 7,
+            archives_inbox: true,
+        };
+        let app = app.layer(Extension(peer));
+        let (status, first) =
+            json_request(app.clone(), "/v1/harness-events", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let (status, replay) =
+            json_request(app.clone(), "/v1/harness-events", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(first["body"]["fields"], replay["body"]["fields"]);
+        let mut usage = request.clone();
+        usage["sequence"] = json!(2);
+        usage["claim"]["kind"] = json!("harness.timeline");
+        usage["claim"]["fields"] = json!({
+            "operation":"append", "entry_id":"response-a", "source_id":"source/response-a",
+            "sequence":1, "revision":1, "role":"system", "entry_type":"usage", "final":true,
+            "driver":"claude", "incarnation_id":"runtime-a", "observed_at_unix_ms":1,
+            "body":{"semantics":"response", "driver":"claude", "model":"fixture-model",
+                "input_tokens":10, "output_tokens":5, "cached_tokens":2, "total_tokens":17}
+        });
+        usage["claim"]["fields"]["observed_at_unix_ms"] = json!(client_now_ms() as u64);
+        for _ in 0..2 {
+            let (status, body) =
+                json_request(app.clone(), "/v1/harness-events", usage.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, rollup) = get_request(
+            app.clone(),
+            &format!("/v1/usage?since_ms=0&until_ms={}", client_now_ms() + 60_000),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rollup}");
+        assert_eq!(
+            rollup["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["total_tokens"].as_u64().unwrap_or(0))
+                .sum::<u64>(),
+            17,
+            "{rollup}"
+        );
+        let mut stale = request;
+        stale["runtime_incarnation"] = json!("retired-runtime");
+        let (status, body) = json_request(app, "/v1/harness-events", stale).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
 }

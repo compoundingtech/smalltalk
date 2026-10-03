@@ -7379,6 +7379,7 @@ async fn follow_conversation(
         .subscribe_conversation("conversation", target)
         .await?;
     let mut seen = BTreeMap::new();
+    let mut stalled: Option<String> = None;
     loop {
         match stream.next_event().await? {
             None => anyhow::bail!("st closed the conversation stream"),
@@ -7388,6 +7389,7 @@ async fn follow_conversation(
                 items,
                 ..
             }) => {
+                stalled = None;
                 // The first page shows its newest `limit` entries; later pages only what changed.
                 let items = if replace && seen.is_empty() {
                     items[items.len().saturating_sub(limit)..].to_vec()
@@ -7402,6 +7404,18 @@ async fn follow_conversation(
             }
             Some(st3_client::CollectionEvent::Error { message, .. }) => {
                 anyhow::bail!("st could not show this conversation: {message}")
+            }
+            // st retries on its own; say why once, so a quiet follow is not read as a quiet agent.
+            Some(st3_client::CollectionEvent::Resync {
+                code,
+                message: Some(message),
+                ..
+            }) => {
+                let message = st3_client::plain_message(code.as_ref(), &message);
+                if stalled.as_deref() != Some(message.as_str()) {
+                    eprintln!("st: {message} · trying again");
+                    stalled = Some(message);
+                }
             }
             Some(_) => {}
         }
@@ -13531,6 +13545,7 @@ async fn run_st2_native_driver(
                 .join(st_drivers::opencode_session::NATIVE_SESSION_FILE),
         );
     }
+    st_drivers::harness_events::enable(&paths.agent_dir, &incarnation)?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&paths.agent_dir);
     let loop_state = NativeLoopState {
         paths: Some(paths.resolved()),
@@ -13968,7 +13983,9 @@ async fn drive_st2_native(
         runtime_id,
         ..
     } = paths.clone();
-    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
+    let mut mailbox =
+        NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
+    let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
@@ -14003,6 +14020,12 @@ async fn drive_st2_native(
             frame = mailbox.recv() => {
                 mailbox.accept(frame, &runtime_id)?;
             }
+            wake = observations.recv() => {
+                wake?;
+                if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+            }
             result = &mut task => {
                 let outcome = result?;
                 if let Some(session) = detached_session(&outcome) {
@@ -14018,6 +14041,9 @@ async fn drive_st2_native(
                     loop_state = resume.loop_state;
                     task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
                     continue;
+                }
+                if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 // The harness is gone, and its subagents with it. The reconciler ends any this
                 // cannot record once it sees the runtime exit.
@@ -14057,22 +14083,36 @@ async fn drive_st2_native(
                 return outcome;
             }
             _ = interval.tick() => {
+                if let Err(error) = observations.expire_due() {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+
+                if observations.retry_pending {
+                    if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                }
+
                 if driver == "opencode" {
                     if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths).await {
                         note_driver_tick_failure(subject, error, &mut last_control_warning);
                     }
                 }
+                let provider_incarnation = if observations.enabled {
+                    observations.provider_incarnation.clone()
+                } else {
                 let current_record = fs::read(&harness_state_path).ok();
                 loop_state.harness_record_started = harness_record_belongs_to_current_session(
                     loop_state.harness_record_started,
                     loop_state.predecessor_harness_record.as_deref(),
                     current_record.as_deref(),
                 );
-                let provider_incarnation = if loop_state.harness_record_started {
+                if loop_state.harness_record_started {
                     st_drivers::harness_state::read(&harness_state_path, None)
                         .and_then(|observed| observed.evidence_incarnation)
                 } else {
                     None
+                }
                 };
                 let bound = match driver {
                     // Claude writes the transcript a resume needs only with its first turn.
@@ -14180,6 +14220,7 @@ async fn drive_st2_native(
                 }
                 }
                 let tick: Result<()> = async {
+                    if observations.enabled { return Ok(()) }
                     if native_file_may_override_channel(driver)
                         && loop_state.harness_record_started
                         && let Some(observed) = st_drivers::harness_state::read(&harness_state_path, None)
@@ -14223,7 +14264,7 @@ async fn drive_st2_native(
                                 loop_state.ready = true;
                             }
                             publish_harness_activity(
-                                client,
+                                &ObservationClient { client, event: None },
                                 subject,
                                 driver,
                                 if driver == "claude" {
@@ -14256,24 +14297,27 @@ async fn drive_st2_native(
                             } else {
                                 last_capacity_fingerprint = None;
                             }
-                            publish_harness_usage(
-                                client,
+                            if let Some(context) = st_drivers::harness_context::read(
+                                &st_drivers::harness_context::harness_context_path(&agent_dir)) {
+                    publish_harness_usage(
+                                &ObservationClient { client, event: None },
                                 subject,
                                 driver,
                                 &incarnation,
-                                &agent_dir,
+                                &context,
                                 &mut last_usage_fingerprint,
                             )
                             .await?;
                             publish_harness_limits(
-                                client,
+                                &ObservationClient { client, event: None },
                                 subject,
                                 driver,
                                 &incarnation,
-                                &agent_dir,
+                                &context,
                                 &mut last_limits_fingerprint,
                             )
                             .await?;
+                            }
                         }
                     }
                     publish_harness_timeline(
@@ -14436,8 +14480,293 @@ fn harness_activity_state(activity: st_drivers::harness_state::Activity) -> &'st
     }
 }
 
+/// A pipe wake follows a durable spool commit. The timer
+/// retries a known pending publication only; it does not poll state/context/timeline records.
+struct NativeObservations {
+    dir: PathBuf,
+    runtime: String,
+    enabled: bool,
+    provider_incarnation: Option<String>,
+    evidence_deadline: Option<serde_json::Value>,
+    retry_pending: bool,
+    initial_wake: bool,
+    pipe: Option<tokio::io::unix::AsyncFd<std::fs::File>>,
+}
+impl NativeObservations {
+    fn start(dir: &Path, runtime: &str) -> Result<Self> {
+        let enabled = st_drivers::harness_events::enabled(dir);
+        let pipe = if enabled {
+            Some(tokio::io::unix::AsyncFd::new(
+                st_drivers::harness_events::bind_wake_pipe(dir)?,
+            )?)
+        } else {
+            None
+        };
+        let provider_incarnation = if enabled {
+            st_drivers::harness_state::read(
+                &st_drivers::harness_state::harness_state_path(dir),
+                None,
+            )
+            .and_then(|state| state.evidence_incarnation)
+        } else {
+            None
+        };
+        let evidence_deadline = if enabled {
+            st_drivers::harness_events::read_snapshot(dir, "harness-state")?
+                .and_then(|raw| serde_json::from_slice(&raw).ok())
+        } else {
+            None
+        };
+        Ok(Self {
+            dir: dir.into(),
+            runtime: runtime.into(),
+            enabled,
+            provider_incarnation,
+            evidence_deadline,
+            retry_pending: enabled,
+            initial_wake: enabled,
+            pipe,
+        })
+    }
+    async fn recv(&mut self) -> Result<()> {
+        if self.initial_wake {
+            self.initial_wake = false;
+            return Ok(());
+        }
+        let Some(pipe) = &self.pipe else {
+            return std::future::pending().await;
+        };
+        loop {
+            let mut ready = pipe.readable().await?;
+            match ready.try_io(|descriptor| {
+                use std::io::Read as _;
+                let mut file = descriptor.get_ref();
+                let mut bytes = [0; 256];
+                file.read(&mut bytes)
+            }) {
+                Ok(Ok(count)) if count > 0 => return Ok(()),
+                Ok(Ok(_)) => anyhow::bail!("event wake pipe closed"),
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => continue,
+            }
+        }
+    }
+    fn expire_due(&mut self) -> Result<()> {
+        if let Some(state) = &self.evidence_deadline {
+            let stamp = state["writtenAtMs"]
+                .as_u64()
+                .context("state evidence has no timestamp")?;
+            let stale = st_drivers::harness_state::HARNESS_STATE_STALE.as_millis() as u64;
+            if current_unix_ms()? >= u128::from(stamp.saturating_add(stale)) {
+                st_drivers::harness_events::expire_state(&self.dir, state)?;
+                self.evidence_deadline = None;
+                self.retry_pending = true;
+            }
+        }
+        Ok(())
+    }
+    async fn drain(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.retry_pending = true;
+        // Bound a wake's work so a backlog does not hold back native delivery.
+        let events = st_drivers::harness_events::pending(&self.dir, 64)?;
+        for event in &events {
+            let publisher = ObservationClient {
+                client,
+                event: Some((&self.runtime, event.sequence, &self.dir)),
+            };
+            let raw = serde_json::to_vec(&event.payload)?;
+            let source_driver = event.payload["harness"]
+                .as_str()
+                .or_else(|| event.payload["driver"].as_str())
+                .context("event has no source driver")?;
+            anyhow::ensure!(
+                matches!(
+                    source_driver,
+                    "claude" | "codex" | "pi" | "omp" | "opencode"
+                ),
+                "unknown event driver"
+            );
+            match event.kind.as_str() {
+                "harness-state" | "harness-state-expired" => {
+                    let measured = event.payload["writtenAtMs"]
+                        .as_u64()
+                        .context("state event has no timestamp")?;
+                    let decode_at = if event.kind == "harness-state-expired" {
+                        measured.saturating_add(
+                            st_drivers::harness_state::HARNESS_STATE_STALE.as_millis() as u64,
+                        )
+                    } else {
+                        event.queued_at_ms
+                    };
+                    let observed = st_drivers::harness_state::read_raw_at(&raw, None, decode_at);
+                    if event.runtime_incarnation == self.runtime && source_driver == driver {
+                        self.provider_incarnation = observed.evidence_incarnation.clone();
+                        self.evidence_deadline =
+                            (event.kind != "harness-state-expired").then(|| event.payload.clone());
+                    }
+                    let placeholder = observed.state
+                        == st_drivers::harness_state::Activity::Unknown
+                        && observed.reason.as_deref() == Some("claimed");
+                    if !placeholder {
+                        publish_harness_activity(
+                            &publisher,
+                            subject,
+                            source_driver,
+                            match source_driver {
+                                "claude" => "claude-channel",
+                                "codex" => "app-server",
+                                "pi" => "pi-channel",
+                                "omp" => "omp-channel",
+                                _ => "native",
+                            },
+                            Some(&event.runtime_incarnation),
+                            &observed,
+                            &mut None,
+                        )
+                        .await?;
+                        if driver != "codex"
+                            && event.runtime_incarnation == self.runtime
+                            && source_driver == driver
+                            && !matches!(
+                                observed.state,
+                                st_drivers::harness_state::Activity::Unknown
+                                    | st_drivers::harness_state::Activity::Ended
+                            )
+                        {
+                            *ready = true;
+                        }
+                        if observed.reason.as_deref() == Some("providerCapacity") {
+                            let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
+                                source_driver,
+                                observed.since_ms,
+                                observed.reason.as_deref(),
+                            ))?));
+                            publish_provider_capacity_diagnostic(
+                                client,
+                                subject,
+                                &event.runtime_incarnation,
+                                observed.since_ms,
+                                &fingerprint,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                "harness-context" => {
+                    let observed =
+                        st_drivers::harness_context::read_raw_at(&raw, event.queued_at_ms)
+                            .context("invalid context event")?;
+                    publish_harness_usage(
+                        &publisher,
+                        subject,
+                        source_driver,
+                        &event.runtime_incarnation,
+                        &observed,
+                        &mut None,
+                    )
+                    .await?;
+                    publish_harness_limits(
+                        &publisher,
+                        subject,
+                        source_driver,
+                        &event.runtime_incarnation,
+                        &observed,
+                        &mut None,
+                    )
+                    .await?;
+                }
+                "harness-timeline" => {
+                    let operation: st_drivers::harness_timeline::Operation =
+                        serde_json::from_slice(&raw)?;
+
+                    let fields = timeline_claim_fields(operation, &event.runtime_incarnation);
+                    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
+                    let _: ClaimRecord = publisher
+                        .post(
+                            "/v1/claims",
+                            &ClaimInput {
+                                subject: subject.into(),
+                                kind: "harness.timeline".into(),
+                                actor: Some(subject.into()),
+                                fields,
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: Some(format!(
+                                    "harness-timeline:{subject}:{digest}"
+                                )),
+                            },
+                        )
+                        .await?;
+                }
+                other => anyhow::bail!("unsupported harness event `{other}`"),
+            }
+            st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
+        }
+        self.retry_pending = events.len() == 64;
+        self.initial_wake = self.retry_pending;
+        Ok(())
+    }
+}
+
+struct ObservationClient<'a> {
+    client: &'a Client,
+    event: Option<(&'a str, u64, &'a Path)>,
+}
+impl std::ops::Deref for ObservationClient<'_> {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        self.client
+    }
+}
+impl ObservationClient<'_> {
+    async fn post<O: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        claim: &ClaimInput,
+    ) -> Result<O> {
+        if let Some((runtime, sequence, dir)) = self.event {
+            let slot = format!(
+                "{}:{}",
+                claim.kind,
+                claim
+                    .fields
+                    .get("semantics")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            );
+            let claim = serde_json::from_value(st_drivers::harness_events::prepare_publication(
+                dir,
+                sequence,
+                &slot,
+                &serde_json::to_value(claim)?,
+            )?)?;
+            self.client
+                .post(
+                    "/v1/harness-events",
+                    &st3::harness_events::Publication {
+                        runtime_incarnation: runtime.into(),
+                        sequence,
+                        claim,
+                    },
+                )
+                .await
+        } else {
+            self.client.post(path, claim).await
+        }
+    }
+}
+
 async fn publish_harness_activity(
-    client: &Client,
+    client: &ObservationClient<'_>,
     subject: &str,
     driver: &str,
     transport: &str,
@@ -14542,18 +14871,13 @@ async fn publish_harness_activity(
 /// Readers take the freshest reading per account across the fleet, so the reading keeps the time
 /// the harness measured it, not when st published it.
 async fn publish_harness_limits(
-    client: &Client,
+    client: &ObservationClient<'_>,
     subject: &str,
     driver: &str,
     incarnation: &str,
-    agent_dir: &Path,
+    observed: &st_drivers::harness_context::Observed,
     last_fingerprint: &mut Option<String>,
 ) -> Result<()> {
-    let Some(observed) = st_drivers::harness_context::read(
-        &st_drivers::harness_context::harness_context_path(agent_dir),
-    ) else {
-        return Ok(());
-    };
     let limits = observed.rate_limits;
     if limits.five_hour.is_none() && limits.seven_day.is_none() {
         return Ok(());
@@ -14610,18 +14934,13 @@ async fn publish_harness_limits(
 }
 
 async fn publish_harness_usage(
-    client: &Client,
+    client: &ObservationClient<'_>,
     subject: &str,
     driver: &str,
     incarnation: &str,
-    agent_dir: &Path,
+    observed: &st_drivers::harness_context::Observed,
     last_fingerprint: &mut Option<String>,
 ) -> Result<()> {
-    let Some(observed) =
-        st_drivers::harness_context::read(&st_drivers::harness_context::harness_context_path(agent_dir))
-    else {
-        return Ok(());
-    };
     // A context-window occupancy reading and cumulative session spend are
     // different measurements. Publish them as distinct durable records; never
     // manufacture response-token buckets from occupancy.
@@ -15031,6 +15350,23 @@ fn pi_family_message_frame(
     })
 }
 
+fn accept_managed_channel_frame(
+    state: &mut PiChannelResume,
+    observer: &mut Option<st_drivers::pi_channel::EventObserver>,
+    line: &str,
+) -> Result<bool> {
+    if let Some(observer) = observer.as_mut()
+        && let Ok(frame) = serde_json::from_str(line)
+    {
+        observer.observe(&frame)?;
+    }
+    let publish = state.accept_frame(line);
+    if observer.is_some() {
+        state.pending.state = None;
+    }
+    Ok(publish)
+}
+
 /// Session-start context for a pi-family seat: only the seat's saved context, which the extension
 /// adds without starting a turn. st adds no instructions of its own, so a new seat stays idle until
 /// a person types or a message is posted.
@@ -15109,6 +15445,41 @@ async fn run_pi_channel(
     };
     let incarnation = state.incarnation.clone();
     let session = state.session.clone();
+    let observation_paths = st_drivers::driver_paths::Paths::from_environment(identity, &|name| {
+        std::env::var(name).ok()
+    })?;
+    let mut observer = if let Some(paths) = observation_paths
+        && st_drivers::harness_events::enabled(&paths.agent_dir)
+    {
+        let (seq_env, runtime_env, driver_name) = if driver == "omp" {
+            (
+                st_drivers::omp_session::CHANNEL_SEQ,
+                st_drivers::omp_session::CHANNEL_RUNTIME_ID,
+                "omp",
+            )
+        } else {
+            (
+                st_drivers::pi_session::CHANNEL_SEQ,
+                st_drivers::pi_session::CHANNEL_RUNTIME_ID,
+                "pi",
+            )
+        };
+        let seq = st_drivers::contracts::env(seq_env)
+            .context("managed channel has no ownership sequence")?
+            .parse()?;
+        let runtime = st_drivers::contracts::env(runtime_env)
+            .context("managed channel has no provider runtime")?;
+        Some(st_drivers::pi_channel::EventObserver::new(
+            &paths.agent_dir,
+            identity,
+            driver_name,
+            &session,
+            seq,
+            &runtime,
+        )?)
+    } else {
+        None
+    };
     let transport = format!("{driver}-channel");
     if push_mailbox_enabled() && state.pending.fence.is_none() {
         state.pending.fence = Some(st3::mailbox::Fence::new(subject, &incarnation, "delivery"));
@@ -15163,13 +15534,16 @@ async fn run_pi_channel(
                     Some(st_drivers::reexec::StdinChunk::Bytes(bytes)) => {
                         state.lines.push(&bytes);
                         while let Some(line) = state.lines.next_line() {
-                            publish |= state.accept_frame(&line);
+                            match accept_managed_channel_frame(&mut state, &mut observer, &line) {
+                                Ok(changed) => publish |= changed,
+                                Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                            }
                         }
                     }
                     // The extension ends the pipe when its session ends.
                     Some(st_drivers::reexec::StdinChunk::Eof) | None => {
                         if let Some(line) = state.lines.finish()
-                            && state.accept_frame(&line)
+                            && accept_managed_channel_frame(&mut state, &mut observer, &line)?
                         {
                             let _ = state
                                 .pending
@@ -15192,6 +15566,11 @@ async fn run_pi_channel(
                 }
             }
             _ = interval.tick() => {
+                if let Some(observer) = observer.as_mut() {
+                    if let Err(error) = observer.heartbeat() {
+                        warn_pi_channel(subject, &error, &mut last_warning);
+                    }
+                }
                 if let Err(error) = state
                     .pending
                     .publish(client, subject, driver, &incarnation, &session)
@@ -15339,7 +15718,7 @@ async fn run_pi_channel(
                         }
                     }
                     while let Some(line) = state.lines.next_line() {
-                        publish |= state.accept_frame(&line);
+                        publish |= accept_managed_channel_frame(&mut state, &mut observer, &line)?;
                     }
                     if publish {
                         let _ = state
@@ -15921,6 +16300,9 @@ async fn drive_codex_native(
     } else {
         NativePaths::resumed(subject, "codex", loop_state.paths.clone())?
     };
+    if matches!(start, ProviderStart::Launch(_)) {
+        st_drivers::harness_events::enable(&paths.agent_dir, &incarnation)?;
+    }
     loop_state.paths = Some(paths.resolved());
     let NativePaths {
         agent_dir,
@@ -15942,7 +16324,9 @@ async fn drive_codex_native(
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
-    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state).await?;
+    let mut mailbox =
+        NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state).await?;
+    let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
     if push_mailbox_enabled() {
         st_drivers::push_mailbox::register(&agent_dir);
     }
@@ -15975,6 +16359,12 @@ async fn drive_codex_native(
         tokio::select! {
             frame = mailbox.recv() => { mailbox.accept(frame, &runtime_id)?; }
 
+            wake = observations.recv() => {
+                wake?;
+                if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+            }
             result = &mut task => {
                 let outcome = result.context("joining the Codex driver")?;
                 if let Some(session) = detached_session(&outcome) {
@@ -15990,6 +16380,9 @@ async fn drive_codex_native(
                     loop_state = resume.loop_state;
                     task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
                     continue;
+                }
+                if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 // The harness is gone, and its subagents with it.
                 let _ = tokio::time::timeout(
@@ -16014,19 +16407,36 @@ async fn drive_codex_native(
                         expected_subject: None,
                         idempotency_key: Some(format!("codex-driver-failed:{subject}:{incarnation}")),
                     }).await;
-                    // A resume that ended before its thread bound was refused by Codex itself,
-                    // such as a thread with no rollout.
-                    if reported_session.is_none() && st3::native_resume::requested().is_some() {
-                        let refusal = st3::native_resume::Refusal {
-                            code: "harness-refused",
-                            reason: format!("{error:#}").chars().take(2_000).collect(),
-                        };
-                        let _ = refuse_native_resume(client, subject, &incarnation, "codex", refusal).await;
-                    }
+                }
+                // A resume that ended before its thread bound was refused by Codex itself, such
+                // as a thread with no rollout. The wrapper can end cleanly and leave the reason
+                // in its harness record.
+                if reported_session.is_none() && st3::native_resume::requested().is_some() {
+                    let reason = match &outcome {
+                        Err(error) => format!("{error:#}"),
+                        Ok(()) => st_drivers::harness_state::read(&harness_state_path, None)
+                            .and_then(|observed| observed.reason)
+                            .unwrap_or_else(|| "Codex ended before it bound the resumed thread".into()),
+                    };
+                    let refusal = st3::native_resume::Refusal {
+                        code: "harness-refused",
+                        reason: reason.chars().take(2_000).collect(),
+                    };
+                    let _ = refuse_native_resume(client, subject, &incarnation, "codex", refusal).await;
                 }
                 return outcome;
             },
             _ = interval.tick() => {
+                if let Err(error) = observations.expire_due() {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+
+                if observations.retry_pending {
+                    if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                }
+
                 if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
@@ -16090,6 +16500,7 @@ async fn drive_codex_native(
                     {
                         note_driver_tick_failure(subject, error, &mut last_control_warning);
                     }
+                    if observations.enabled { return Ok(()) }
                     let current_record = fs::read(&harness_state_path).ok();
                     loop_state.harness_record_started = harness_record_belongs_to_current_session(
                         loop_state.harness_record_started,
@@ -16102,7 +16513,7 @@ async fn drive_codex_native(
                         .flatten()
                     {
                         publish_harness_activity(
-                            client,
+                            &ObservationClient { client, event: None },
                             subject,
                             "codex",
                             "app-server",
@@ -16134,24 +16545,27 @@ async fn drive_codex_native(
                             last_capacity_fingerprint = None;
                         }
                     }
+                    if let Some(context) = st_drivers::harness_context::read(
+                        &st_drivers::harness_context::harness_context_path(&agent_dir)) {
                     publish_harness_usage(
-                        client,
+                        &ObservationClient { client, event: None },
                         subject,
                         "codex",
                         &incarnation,
-                        &agent_dir,
+                        &context,
                         &mut last_usage_fingerprint,
                     )
                     .await?;
                     publish_harness_limits(
-                        client,
+                        &ObservationClient { client, event: None },
                         subject,
                         "codex",
                         &incarnation,
-                        &agent_dir,
+                        &context,
                         &mut last_limits_fingerprint,
                     )
                     .await?;
+                    }
                     // The Codex runtime stamps its timeline with its own incarnation, which
                     // outlives st's runtime incarnation when a resident Codex is adopted.
                     let codex_incarnation = st_drivers::codex_app_server::current_runtime_incarnation(
@@ -22322,5 +22736,129 @@ mission "review" state="ready" {
             format!("Started mission/arrival revision {second}.")
         );
         server.abort();
+    }
+    #[tokio::test]
+    async fn committed_observations_survive_daemon_outage_lost_ack_and_driver_reexec() {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse as _, routing::post};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let seq =
+            st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-a")
+                .unwrap();
+        let mut writer = st_drivers::harness_state::Writer::new(
+            root.path(),
+            "example/seat",
+            "claude",
+            Some("pty".into()),
+        )
+        .with_ownership("provider-a", seq);
+        writer
+            .observe(st_drivers::harness_state::Observation::new(
+                st_drivers::harness_state::Activity::Active,
+                st_drivers::harness_state::BlockedOn::None,
+                st_drivers::harness_state::InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = Client::new(st3::client::Endpoint::Http(format!("http://{address}")));
+        let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
+        let mut ready = false;
+        assert!(
+            observations
+                .drain(&client, "agent/example/seat", "claude", &mut ready)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .len(),
+            1
+        ); // Only the non-observation claim placeholder was acknowledged locally.
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let store = Arc::new(Store::open_memory("amber").unwrap());
+        let refuse_once = Arc::new(AtomicBool::new(true));
+        let app = Router::new().route(
+            "/v1/harness-events",
+            post({
+                let captured = captured.clone();
+                let store = store.clone();
+                move |Json(request): Json<st3::harness_events::Publication>| {
+                    let captured = captured.clone();
+                    let store = store.clone();
+                    let refuse_once = refuse_once.clone();
+                    async move {
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::to_value(&request).unwrap());
+                        let record = store.append_claim(&request.claim).unwrap();
+                        if refuse_once.swap(false, Ordering::SeqCst) {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({"error":"acknowledgement lost"})),
+                            )
+                                .into_response()
+                        } else {
+                            Json(json!({"api_version":"st3.v1","value":record})).into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert!(
+            observations
+                .drain(&client, "agent/example/seat", "claude", &mut ready)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(observations); // A replacement image reconstructs all pending work from the outbox.
+        let mut replacement = NativeObservations::start(root.path(), "runtime-a").unwrap();
+        replacement
+            .drain(&client, "agent/example/seat", "claude", &mut ready)
+            .await
+            .unwrap();
+        assert!(ready);
+        assert!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .is_empty()
+        );
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0], captured[1]);
+        assert_eq!(store.local_observations_tail(100).unwrap().len(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn reading_the_outbox_does_not_wake_an_idle_driver() {
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime").unwrap();
+        let mut observations = NativeObservations::start(root.path(), "runtime").unwrap();
+        observations.recv().await.unwrap();
+        assert!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), observations.recv())
+                .await
+                .is_err()
+        );
     }
 }

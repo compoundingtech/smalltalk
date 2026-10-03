@@ -445,7 +445,8 @@ async fn follow_conversation(
             Ok(start) => start,
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
-                    if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true}))).is_err() { return; }
+                    // Say why, so a client showing its last copy can say that copy is stale.
+                    if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true, "code":error.code, "message":error.message}))).is_err() { return; }
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     continue;
                 }
@@ -457,7 +458,8 @@ async fn follow_conversation(
             Ok(page) => page,
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
-                    if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true}))).is_err() { return; }
+                    // Say why, so a client showing its last copy can say that copy is stale.
+                    if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true, "code":error.code, "message":error.message}))).is_err() { return; }
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     continue;
                 }

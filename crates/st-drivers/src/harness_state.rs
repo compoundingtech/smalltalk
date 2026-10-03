@@ -601,7 +601,7 @@ pub enum SessionLiveness {
 /// observed this agent, which is different from `unknown`. `probe` is the optional same-host
 /// liveness cross-check for the record's pty session; pass `None` for cross-host reads.
 pub fn read(path: &Path, probe: Option<&dyn Fn(&str) -> SessionLiveness>) -> Option<Observed> {
-    let raw = match fs::read(path) {
+    let raw = match crate::harness_events::read_record(path) {
         Ok(raw) => raw,
         // Only proven absence is absence; a record that exists but cannot be read is
         // indeterminate, never silently "no observation".
@@ -611,7 +611,7 @@ pub fn read(path: &Path, probe: Option<&dyn Fn(&str) -> SessionLiveness>) -> Opt
     Some(read_raw_at(&raw, probe, crate::message::now_ms()))
 }
 
-fn read_raw_at(
+pub fn read_raw_at(
     raw: &[u8],
     probe: Option<&dyn Fn(&str) -> SessionLiveness>,
     now_ms: u64,
@@ -693,7 +693,7 @@ enum StoredRecord {
 }
 
 fn read_stored(path: &Path) -> StoredRecord {
-    match fs::read(path) {
+    match crate::harness_events::read_record(path) {
         // Only proven absence is absence: a file that exists but cannot be read (permissions,
         // IO) is somebody's record — treating it as a virgin seat would let a token-only write
         // or a wrapperless claim rename over live state it never saw.
@@ -744,6 +744,19 @@ pub(crate) fn write_json_atomic<T: Serialize>(
     tmp_prefix: &str,
 ) -> anyhow::Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
+    if let Some(dir) = path.parent()
+        && crate::harness_events::enabled(dir)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "harness-state" | "harness-context"))
+    {
+        let kind = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("record name")?;
+        return crate::harness_events::write_snapshot(dir, kind, &bytes);
+    }
     bytes.push(b'\n');
     crate::fsatomic::replace(
         path,

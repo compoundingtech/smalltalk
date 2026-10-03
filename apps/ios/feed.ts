@@ -254,7 +254,10 @@ export class Feed {
       const items = next.items.filter(item => item.kind === KINDS[name]) as FeedLists[typeof name];
       this.handlers.onWindow(name, items, next.hasMore, next.snapshot);
     } else if (frame.kind === 'resync') {
-      if (frame.id === GLASSES && this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); }
+      // st keeps a conversation's subscription and retries it itself; it says why, so the last
+      // copy shown can say it is stale (the owner's host is away).
+      if (id === CONVERSATION && this.conversation) { if (frame.message) this.conversation.handlers.onIssue(`${plainMessage(frame.code, frame.message)} · trying again`); }
+      else if (frame.id === GLASSES && this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); }
       else if (frame.id in FEED_WINDOWS) this.subscribeWindow(frame.id as FeedWindow);
     } else if (frame.kind === 'screen') {
       if (id === TERMINAL) this.terminal?.screen(frame.value);
