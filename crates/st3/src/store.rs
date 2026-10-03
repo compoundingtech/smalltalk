@@ -1032,6 +1032,7 @@ pub struct EndedDeclaration {
 /// whether it includes history, and the status.
 type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MissionGateRunner {
     pub subject: String,
     pub host: String,
@@ -5247,6 +5248,10 @@ impl Store {
     /// cannot be built does not hide the others.
     /// Live work that `seat` holds or is assigned in a run outside the root of `owner_run`.
     pub fn seat_work_in_other_runs(&self, seat: &str, owner_run: &str) -> Result<Vec<String>> {
+        // Any step or run can come to hold or release this seat's work.
+        smallclaims::touched::note_read(|| format!("actor:{seat}"));
+        smallclaims::touched::note_read(|| "kind:step-run.state".to_owned());
+        smallclaims::touched::note_read(|| "kind:mission-run.state".to_owned());
         let owner = owner_run.strip_prefix("mission-run/").unwrap_or(owner_run);
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -5674,7 +5679,17 @@ impl Store {
     /// timing and wake annotations. Those annotations scan immutable history and
     /// are intentionally too expensive for the daemon's inner control loop.
     pub fn work_for_reconcile(&self, actor: &str) -> Result<Vec<StepRunView>> {
-        self.work_at_snapshot_internal(Some(actor), true, now_ms(), false)
+        let work = self.work_at_snapshot_internal(Some(actor), true, now_ms(), false)?;
+        // A step joins a seat's work when a generation creates it or another seat lets it go;
+        // after that its changes are written on the step and its run.
+        smallclaims::touched::note_read(|| format!("actor:{actor}"));
+        smallclaims::touched::note_read(|| "kind:run-generation.created".to_owned());
+        smallclaims::touched::note_read(|| "kind:step-run.state".to_owned());
+        for step in &work {
+            smallclaims::touched::note_read(|| step.subject.clone());
+            smallclaims::touched::note_read(|| step.run.clone());
+        }
+        Ok(work)
     }
 
     /// Fetch current work without the presentation-only wake history. The
@@ -5749,6 +5764,7 @@ impl Store {
 
     /// The live mission runs queued for one seat, in seat-queue order.
     pub fn seat_run_order(&self, agent: &str) -> Result<Vec<String>> {
+        smallclaims::touched::note_read(|| format!("kind:{}", seat_queue::MOVED_CLAIM));
         let agent = normalize_seat(agent);
         let connection = self.readers.get();
         Ok(seat_run_orders_tx(&connection, Some(&agent))?
@@ -10127,7 +10143,18 @@ impl Store {
             ))
         })? {
             let (subject, host, owner) = row?;
+            // A runner leaves this list once its stop is observed on it.
+            smallclaims::touched::note_read(|| subject.clone());
             requests.entry(owner).or_default().push((subject, host));
+        }
+        // New requests, and owners that finish or move on.
+        for kind in [
+            "gate.requested",
+            "step-run.state",
+            "mission-run.state",
+            "run-generation.state",
+        ] {
+            smallclaims::touched::note_read(|| format!("kind:{kind}"));
         }
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -10437,6 +10464,11 @@ impl Store {
                 Some(cursor) => after = Some(cursor),
                 None => {
                     sort_messages_canonically(&self.readers.get(), &mut all)?;
+                    // A message's lifecycle (staged, delivered, read, closed) is written on the
+                    // message, not the mailbox.
+                    for message in &all {
+                        smallclaims::touched::note_read(|| message.subject.clone());
+                    }
                     return Ok(all);
                 }
             }
@@ -10480,6 +10512,11 @@ impl Store {
             }
         }
         sort_messages_canonically(&connection, &mut messages)?;
+        smallclaims::touched::note_read(|| format!("mailbox:{recipient}"));
+        smallclaims::touched::note_read(|| format!("mailbox:{bare_recipient}"));
+        for message in &messages {
+            smallclaims::touched::note_read(|| message.subject.clone());
+        }
         Ok(messages)
     }
 
@@ -11206,6 +11243,10 @@ impl Store {
         let subjects = statement
             .query_map([actor, origin], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        smallclaims::touched::note_read(|| "kind:attention.requested".to_owned());
+        for subject in &subjects {
+            smallclaims::touched::note_read(|| subject.clone());
+        }
         subjects
             .iter()
             .filter_map(|subject| attention_request_view_tx(&connection, subject).transpose())
@@ -11554,6 +11595,7 @@ impl Store {
     /// `selected_actual_source_at`'s preference for a runtime observation over later
     /// non-runtime claims, without reducing the subject's entire history.
     pub fn selected_actual_origin(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         // Walk the accepted-time index newest first: sorting every runtime observation of the
         // subject cost each settled stop, checked on every pass, a tenth of a millisecond.
@@ -12558,6 +12600,7 @@ impl Store {
     }
 
     pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
         // Every pass asks this for every subscription. The finished requests are listed once, not
         // scanned for each request: a correlated NOT EXISTS read every finished claim once per

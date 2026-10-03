@@ -67,8 +67,15 @@ const CHECKOUT_RETRY_MS: u128 = 30_000;
 // are late by at most this much.
 const DEADLINE_SOURCE_RETRY_MS: u128 = 5_000;
 
+/// When a seat's retention was last checked, why the seat is held (if it is), and what the
+/// check read.
+type SeatRetention = (u128, Option<String>, BTreeSet<String>);
+
 // A seat kept running past its run is checked again this soon for unread mail and other work.
-const SEAT_RETENTION_CHECK_MS: u128 = 10_000;
+// Reading a conversation message does not wake the reconciler, so this check is what lets the
+// stop go ahead. Each check is a pass: at 10 s, held seats were the most frequent wake on a busy
+// member. A held seat stops at most a minute after its last reason goes.
+const SEAT_RETENTION_CHECK_MS: u128 = 60_000;
 // Run cleanup ends this long after it began even if an owned runtime never reports stopped.
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const DECLARED_CHECKOUT_LIMIT: usize = 4096;
@@ -574,8 +581,10 @@ pub struct Reconciler<R = NativeRuntime> {
     raised_broken_gates: Mutex<BTreeSet<String>>,
     /// The wait before an exec gate's second check; see [`GATE_RECHECK_BASE_MS`].
     gate_recheck_base_ms: u128,
-    /// Each seat's last retention reading: when it was taken and why the seat stays.
-    seat_retention: Mutex<HashMap<String, (u128, Option<String>)>>,
+    /// Each seat's last retention reading.
+    seat_retention: Mutex<HashMap<String, SeatRetention>>,
+    /// The gate runners the last read found, kept until a change they depend on.
+    gate_runners: Mutex<Option<Vec<crate::store::MissionGateRunner>>>,
     fault_injection: Option<Arc<dyn FaultInjection>>,
     /// Reads free space for the disk stage. Without one the stage does nothing.
     disk_probe: Option<DiskProbe>,
@@ -686,6 +695,7 @@ impl Reconciler<NativeRuntime> {
             raised_broken_gates: Mutex::new(BTreeSet::new()),
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
+            gate_runners: Mutex::new(None),
             fault_injection: None,
             disk_probe: Some(Arc::new(crate::disk::disk_space)),
             disk_paths: vec![state_dir.to_path_buf()],
@@ -742,6 +752,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             raised_broken_gates: Mutex::new(BTreeSet::new()),
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
+            gate_runners: Mutex::new(None),
             fault_injection: None,
             disk_probe: None,
             disk_paths: Vec::new(),
@@ -1255,6 +1266,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    /// [`Self::next_reconcile_deadline`], for the quiet-pass benchmark.
+    #[doc(hidden)]
+    pub fn next_deadline(&self) -> Option<u128> {
+        self.next_reconcile_deadline()
+    }
+
     /// The earliest time the reconciler must wake. Each deadline source is read on its own. One
     /// that fails records a fault on the daemon and asks to be read again shortly, so the other
     /// sources keep their deadlines.
@@ -1268,10 +1285,26 @@ impl<R: RuntimeControl> Reconciler<R> {
             read("deadline/missions", &|| {
                 self.store.next_active_mission_deadline(&self.host)
             }),
-            read("deadline/work-wakes", &|| self.next_work_wake_deadline()),
-            read("deadline/provider-capacity-retries", &|| {
-                self.next_provider_capacity_retry_deadline()
+            // Skipping passes keep each wake's and capacity retry's due time, so these need
+            // no scan of every local agent's work and diagnostics after every pass. The next
+            // full pass bounds what a missing due time could delay.
+            read("deadline/work-wakes", &|| {
+                if self.skip_unneeded {
+                    Ok(self.incremental.next_due("wake:"))
+                } else {
+                    self.next_work_wake_deadline()
+                }
             }),
+            read("deadline/provider-capacity-retries", &|| {
+                if self.skip_unneeded {
+                    Ok(self.incremental.next_due("capacity:"))
+                } else {
+                    self.next_provider_capacity_retry_deadline()
+                }
+            }),
+            self.skip_unneeded
+                .then(|| self.incremental.next_full_pass())
+                .flatten(),
             read("deadline/subscription-retries", &|| {
                 self.store.next_subscription_mission_retry_deadline()
             }),
@@ -1400,8 +1433,11 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
+        let observe_span = crate::profile::span("pass/changes");
         self.incremental.observe(&self.store)?;
-        for runner in self.store.mission_gate_runners()? {
+        drop(observe_span);
+        let _runners_span = crate::profile::span("pass/gate-runners");
+        for runner in self.gate_runners()? {
             if runner.retired && runner.host == self.host {
                 let _ = self.isolate("gate", &runner.subject, || {
                     let runtime_id = runner.subject.replace('/', ".");
@@ -1419,6 +1455,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 });
             }
         }
+        drop(_runners_span);
         let desired_span = crate::profile::span("pass/desired");
         let mut desired = self.store.desired_subjects()?;
         let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
@@ -1464,6 +1501,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                 None
             }
         };
+
+        self.incremental.observe_ptys(ptys.as_ref().map(|ptys| {
+            ptys.iter()
+                .map(|(id, item)| {
+                    let state = format!(
+                        "{} {:?} {:?}",
+                        item.status, item.incarnation_id, item.exit_code
+                    );
+                    (id.clone(), state)
+                })
+                .collect()
+        }));
 
         let active = desired.iter().collect::<Vec<_>>();
         let mut member_errors = BTreeMap::new();
@@ -1578,52 +1627,56 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|member| member.workspace.as_str())
             .collect::<BTreeSet<_>>();
         drop(render_span);
+        self.incremental.observe_value(
+            "live-workspaces",
+            live_workspaces
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        // A settled stop is evaluated again only when something it read changed or its time came,
+        // and on every full pass. Without a PTY snapshot every stop waits on the next one anyway.
+        // Seen first: what this pass already wrote, such as render receipts.
+        self.incremental.observe(&self.store)?;
+        let skip_stops = self.skip_unneeded
+            && ptys.is_some()
+            && !self.incremental.take_full_pass("stop", now_ms());
+        let mut stops = BTreeSet::new();
         let mut work_message_agents = Vec::new();
         let mut deferred_member_faults = BTreeMap::new();
         let mut diagnostic_errors = Vec::new();
+        let unreadable_span = crate::profile::span("pass/unreadable-members");
         self.record_unreadable_members(&active, &mut diagnostic_errors);
+        drop(unreadable_span);
         let members_span = crate::profile::span("pass/members");
         for subject in &active {
-            let _member_span = crate::profile::span(if subject.kind == "stop" {
-                "pass/member stop"
-            } else {
-                "pass/member live"
-            });
-            // A stop's actual origin is read once a pass here and reused by `reconcile_stop`:
-            // every settled stop a host ever declared is checked on every pass.
-            let mut actual_origin = None;
-            let owner = if let Some(member) = &subject.member {
-                Ok(Some(member.host.clone()))
-            } else if subject.kind == "stop" {
-                self.store
-                    .selected_actual_origin(&subject.subject)
-                    .and_then(|origin| {
-                        actual_origin = Some(origin.clone());
-                        Ok(origin.or(self.store.selected_desired_origin(&subject.subject)?))
-                    })
-            } else {
-                Ok(None)
-            };
-            match owner {
-                Ok(Some(owner)) if owner == self.host => {}
-                Ok(_) => continue,
-                Err(error) => {
-                    diagnostic_errors.push(format!(
-                        "{}: determine member owner: {error:#}",
-                        subject.subject
-                    ));
-                    continue;
-                }
+            if subject.kind == "stop" {
+                let _member_span = crate::profile::span("pass/member stop");
+                let item = format!("stop:{}", subject.subject);
+                stops.insert(item.clone());
+                self.reconcile_stop_item(
+                    subject,
+                    &item,
+                    skip_stops,
+                    ptys.as_ref(),
+                    &live_workspaces,
+                    &mut diagnostic_errors,
+                );
+                continue;
+            }
+            let _member_span = crate::profile::span("pass/member live");
+            if subject
+                .member
+                .as_ref()
+                .is_none_or(|member| member.host != self.host)
+            {
+                continue;
             }
             let result = caught(|| -> Result<()> {
                 // A workspace or render failure blocks only a start or restart. A running member
                 // is still observed, checked, and given its work.
                 let mut blocked = member_errors.remove(&subject.subject);
-                if subject.kind == "stop" {
-                    self.reconcile_stop_with_origin(subject, ptys.as_ref(), actual_origin)?;
-                    self.remove_checkout_after_run(subject, &live_workspaces)?;
-                    return Ok(());
-                }
                 let Some(member) = &subject.member else {
                     return Ok(());
                 };
@@ -1842,6 +1895,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         drop(members_span);
+        self.incremental.retain("stop:", &stops);
         // Each later stage runs on its own. A stage that fails records a fault on this daemon and
         // the stages after it still run, so no intake item can hold back mission evaluation, run
         // cleanup, or work delivery on this host.
@@ -1900,9 +1954,18 @@ impl<R: RuntimeControl> Reconciler<R> {
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
+        let _work_messages_span = crate::profile::span("pass/work-messages");
+        // Earlier stages of this pass can change what a wake reads, such as a step a mission
+        // cancelled, so see their changes first.
+        self.incremental.observe(&self.store)?;
+        let skip_wakes = self.skip_unneeded && !self.incremental.take_full_pass("wake", now_ms());
+        let mut wakes = BTreeSet::new();
         for (agent, incarnation, member) in work_message_agents {
-            let result =
-                caught(|| self.reconcile_work_messages(&agent, &incarnation, Some(&member)));
+            let item = format!("wake:{agent}@{incarnation}");
+            wakes.insert(item.clone());
+            let result = self.reconcile_item("wake", &item, skip_wakes, || {
+                self.reconcile_work_messages(&agent, &incarnation, Some(&member))
+            });
             let result = match deferred_member_faults.remove(&agent) {
                 Some(error) => Err(error),
                 None => result,
@@ -1911,6 +1974,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 diagnostic_errors.push(format!("{agent}: {error:#}"));
             }
         }
+        self.incremental.retain("wake:", &wakes);
         diagnostic_errors.append(
             &mut self
                 .unrecorded_faults
@@ -2014,7 +2078,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_provider_capacity_retries(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.incremental.observe(&self.store)?;
         let now = now_ms();
+        let skip = self.skip_unneeded && !self.incremental.take_full_pass("capacity", now);
+        let mut items = BTreeSet::new();
         for subject in desired.iter().filter(|subject| {
             subject.kind == "agent"
                 && subject
@@ -2022,110 +2089,124 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .as_ref()
                     .is_some_and(|member| member.host == self.host)
         }) {
-            for claim in self
-                .store
-                .claims_for(&subject.subject, Some("harness.diagnostic"))?
+            let item = format!("capacity:{}", subject.subject);
+            items.insert(item.clone());
+            self.reconcile_item("capacity", &item, skip, || {
+                self.reconcile_provider_capacity_retry(subject, now)
+            })?;
+        }
+        self.incremental.retain("capacity:", &items);
+        Ok(())
+    }
+
+    /// Retry the provider-capacity backoffs of one local agent that have elapsed.
+    fn reconcile_provider_capacity_retry(&self, subject: &DesiredSubject, now: u128) -> Result<()> {
+        for claim in self
+            .store
+            .claims_for(&subject.subject, Some("harness.diagnostic"))?
+        {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            if fields.get("code").and_then(Value::as_str) != Some("provider-capacity")
+                || fields.get("status").and_then(Value::as_str) != Some("waiting")
             {
-                let fields = claim.body.get("fields").unwrap_or(&claim.body);
-                if fields.get("code").and_then(Value::as_str) != Some("provider-capacity")
-                    || fields.get("status").and_then(Value::as_str) != Some("waiting")
-                {
-                    continue;
+                continue;
+            }
+            let Some(due) = fields.get("retry_after_unix_ms").and_then(Value::as_u64) else {
+                continue;
+            };
+            let retry_key = provider_capacity_retry_key(&claim.id);
+            if u128::from(due) > now {
+                if self.store.operation_claim(&retry_key)?.is_none() {
+                    smallclaims::touched::note_due(u128::from(due));
                 }
-                let Some(due) = fields.get("retry_after_unix_ms").and_then(Value::as_u64) else {
-                    continue;
-                };
-                if u128::from(due) > now {
-                    continue;
-                }
-                let retry_key = provider_capacity_retry_key(&claim.id);
-                if self.store.operation_claim(&retry_key)?.is_some() {
-                    continue;
-                }
-                let incarnation = fields
-                    .get("incarnation_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let same_capacity_session = self
-                    .store
+                continue;
+            }
+            if self.store.operation_claim(&retry_key)?.is_some() {
+                continue;
+            }
+            let incarnation = fields
+                .get("incarnation_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let same_capacity_session =
+                self.store
                     .current_harness(&subject.subject)?
                     .is_some_and(|harness| {
                         harness.incarnation_id == incarnation
                             && harness.state == "idle"
                             && harness.reason.as_deref() == Some("providerCapacity")
                     });
-                if !same_capacity_session {
-                    self.store.append_claim(&ClaimInput {
-                        subject: subject.subject.clone(),
-                        kind: "publication.operation".into(),
-                        actor: None,
-                        fields: BTreeMap::from([
-                            (
-                                "operation".into(),
-                                Value::String("provider-capacity-retry".into()),
-                            ),
-                            (
-                                "action".into(),
-                                Value::String("skip-stale-incarnation".into()),
-                            ),
-                            ("status".into(), Value::String("accepted".into())),
-                        ]),
-                        evidence: vec![claim.id],
-                        expected_subject: None,
-                        idempotency_key: Some(retry_key),
-                    })?;
-                    self.signal_changed();
-                    continue;
-                }
-                let attempt = fields
-                    .get("retry_attempt")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1);
-                let step = fields.get("step_run").and_then(Value::as_str);
-                let message_id = &hex::encode(sha2::Sha256::digest(retry_key.as_bytes()))[..16];
-                let message_subject = format!("message/{message_id}");
-                let work_context = step
-                    .map(|step| format!(" Continue the claimed work `{step}`."))
-                    .unwrap_or_default();
+            if !same_capacity_session {
                 self.store.append_claim(&ClaimInput {
-                    subject: message_subject,
-                    kind: "message.sent".into(),
-                    actor: Some("daemon/runtime".into()),
+                    subject: subject.subject.clone(),
+                    kind: "publication.operation".into(),
+                    actor: None,
                     fields: BTreeMap::from([
-                        ("from".into(), Value::String("daemon/runtime".into())),
-                        ("to".into(), Value::String(subject.subject.clone())),
                         (
-                            "content".into(),
-                            Value::String(format!(
-                                "The provider-capacity backoff elapsed.{work_context} Resume in this existing session; do not create a replacement worker."
-                            )),
+                            "operation".into(),
+                            Value::String("provider-capacity-retry".into()),
                         ),
                         (
-                            "status".into(),
-                            Value::String("sent".into()),
+                            "action".into(),
+                            Value::String("skip-stale-incarnation".into()),
                         ),
-                        (
-                            "title".into(),
-                            Value::String(format!(
-                                "Provider capacity retry {attempt}"
-                            )),
-                        ),
-                        ("in_reply_to".into(), Value::Null),
-                        (
-                            "tags".into(),
-                            Value::Array(vec![
-                                Value::String("st3-provider-capacity-retry".into()),
-                                Value::String(format!("st3-retry-attempt:{attempt}")),
-                                Value::String(format!("diagnostic-claim:{}", claim.id)),
-                            ]),
-                        ),
+                        ("status".into(), Value::String("accepted".into())),
                     ]),
                     evidence: vec![claim.id],
                     expected_subject: None,
                     idempotency_key: Some(retry_key),
                 })?;
                 self.signal_changed();
+                continue;
             }
+            let attempt = fields
+                .get("retry_attempt")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let step = fields.get("step_run").and_then(Value::as_str);
+            let message_id = &hex::encode(sha2::Sha256::digest(retry_key.as_bytes()))[..16];
+            let message_subject = format!("message/{message_id}");
+            let work_context = step
+                .map(|step| format!(" Continue the claimed work `{step}`."))
+                .unwrap_or_default();
+            self.store.append_claim(&ClaimInput {
+                subject: message_subject,
+                kind: "message.sent".into(),
+                actor: Some("daemon/runtime".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), Value::String("daemon/runtime".into())),
+                    ("to".into(), Value::String(subject.subject.clone())),
+                    (
+                        "content".into(),
+                        Value::String(format!(
+                            "The provider-capacity backoff elapsed.{work_context} Resume in this existing session; do not create a replacement worker."
+                        )),
+                    ),
+                    (
+                        "status".into(),
+                        Value::String("sent".into()),
+                    ),
+                    (
+                        "title".into(),
+                        Value::String(format!(
+                            "Provider capacity retry {attempt}"
+                        )),
+                    ),
+                    ("in_reply_to".into(), Value::Null),
+                    (
+                        "tags".into(),
+                        Value::Array(vec![
+                            Value::String("st3-provider-capacity-retry".into()),
+                            Value::String(format!("st3-retry-attempt:{attempt}")),
+                            Value::String(format!("diagnostic-claim:{}", claim.id)),
+                        ]),
+                    ),
+                ]),
+                evidence: vec![claim.id],
+                expected_subject: None,
+                idempotency_key: Some(retry_key),
+            })?;
+            self.signal_changed();
         }
         Ok(())
     }
@@ -2736,6 +2817,52 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(false)
     }
 
+    /// Evaluate one item of `section` (a running agent's work wakes, a subscription), or skip
+    /// it when `skip` and nothing it read changed and nothing is due. A write by an item that was
+    /// not marked is counted as an incremental correction.
+    fn reconcile_item(
+        &self,
+        section: &'static str,
+        item: &str,
+        skip: bool,
+        work: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let needed = self.incremental.needs(item, now_ms());
+        if skip && !needed {
+            return Ok(());
+        }
+        let cpu_started = crate::incremental::thread_cpu();
+        let writes = smallclaims::touched::writes();
+        let feed_before = (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+        let ((result, due), reads) =
+            smallclaims::touched::record(|| smallclaims::touched::record_due(|| caught(work)));
+        crate::performance::record_evaluation(
+            section,
+            needed,
+            crate::incremental::thread_cpu().saturating_sub(cpu_started),
+        );
+        if !needed && smallclaims::touched::writes() > writes {
+            let wrote: Vec<String> = feed_before
+                .and_then(Result::ok)
+                .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
+                .map(|feed| {
+                    feed.changes
+                        .iter()
+                        .map(|change| format!("{} {}", change.kind, change.subject))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !wrote.is_empty() {
+                self.incremental_correction(section, item, &reads, &wrote);
+            }
+        }
+        // A failed delivery is tried again on the next pass, as before.
+        if result.is_ok() {
+            self.incremental.evaluated(item, reads, due);
+        }
+        result
+    }
+
     fn reconcile_work_messages(
         &self,
         agent: &str,
@@ -2749,6 +2876,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         let messages = self.store.work_wake_messages_for_reconcile(agent)?;
         let work = self.store.work_for_reconcile(agent)?;
         let harness = self.store.current_harness(agent)?;
+        let now = now_ms();
+        for step in &work {
+            if let Some(due) = crate::incremental::step_due(step, now) {
+                smallclaims::touched::note_due(due);
+            }
+        }
 
         if !harness.as_ref().is_some_and(CurrentHarnessView::is_ready) {
             return Ok(());
@@ -2925,7 +3058,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                         self.signal_changed();
                     }
                 }
-                WorkWakeDecision::Wait => {}
+                WorkWakeDecision::Wait => {
+                    // The next attempt, or the end of the grace before exhaustion.
+                    let next = if attempt_count < WORK_WAKE_MAX_ATTEMPTS {
+                        attempts
+                            .last()
+                            .map(|(last, _)| last.saturating_add(WORK_WAKE_RETRY_MS))
+                    } else {
+                        attempts
+                            .first()
+                            .map(|(first, _)| first.saturating_add(WORK_WAKE_EXHAUST_GRACE_MS))
+                    };
+                    if let Some(next) = next {
+                        smallclaims::touched::note_due(next);
+                    }
+                }
             }
         }
         anyhow::ensure!(
@@ -3020,6 +3167,114 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Reconcile a stop. `actual_origin` is the subject's selected actual origin when the caller
     /// already read it in this pass.
+    /// Gate runners, read again only when a request, a runner's stop, or an owner's state
+    /// changed, and on each full pass. A full pass that finds the kept list stale although
+    /// nothing marked it counts an incremental correction.
+    fn gate_runners(&self) -> Result<Vec<crate::store::MissionGateRunner>> {
+        const ITEM: &str = "gate-runners";
+        let now = now_ms();
+        let full = !self.skip_unneeded || self.incremental.take_full_pass(ITEM, now);
+        let needed = self.incremental.needs(ITEM, now);
+        let mut kept = self
+            .gate_runners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !full
+            && !needed
+            && let Some(kept) = kept.as_ref()
+        {
+            return Ok(kept.clone());
+        }
+        let (fresh, reads) = smallclaims::touched::record(|| self.store.mission_gate_runners());
+        let fresh = fresh?;
+        if !needed && kept.as_ref().is_some_and(|kept| *kept != fresh) {
+            self.incremental_correction(ITEM, ITEM, &reads, &["a changed runner list".into()]);
+        }
+        self.incremental.evaluated(ITEM, reads, None);
+        *kept = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    /// Evaluate one stop this host owns, or skip it when `skip` and nothing it read changed and
+    /// its time has not come. As with mission runs, an evaluation that writes a claim although its
+    /// stop was not marked is counted as an incremental correction.
+    fn reconcile_stop_item(
+        &self,
+        subject: &DesiredSubject,
+        item: &str,
+        skip: bool,
+        ptys: Option<&HashMap<String, RuntimeObservation>>,
+        live_workspaces: &BTreeSet<&str>,
+        diagnostic_errors: &mut Vec<String>,
+    ) {
+        let needed = self.incremental.needs(item, now_ms());
+        if skip && !needed {
+            return;
+        }
+        let cpu_started = crate::incremental::thread_cpu();
+        let writes = smallclaims::touched::writes();
+        let feed_before = (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+        let ((outcome, due), reads) = smallclaims::touched::record(|| {
+            smallclaims::touched::record_due(|| -> Result<Option<Result<()>>> {
+                // A stop's actual origin is read once here and reused by `reconcile_stop`.
+                let (owner, actual_origin) = match &subject.member {
+                    Some(member) => (Some(member.host.clone()), None),
+                    None => {
+                        let origin = self.store.selected_actual_origin(&subject.subject)?;
+                        let owner = match origin.clone() {
+                            Some(origin) => Some(origin),
+                            None => self.store.selected_desired_origin(&subject.subject)?,
+                        };
+                        (owner, Some(origin))
+                    }
+                };
+                if owner.as_deref() != Some(self.host.as_str()) {
+                    return Ok(None);
+                }
+                Ok(Some(caught(|| -> Result<()> {
+                    self.reconcile_stop_with_origin(subject, ptys, actual_origin)?;
+                    self.remove_checkout_after_run(subject, live_workspaces)
+                })))
+            })
+        });
+        crate::performance::record_evaluation(
+            "stop",
+            needed,
+            crate::incremental::thread_cpu().saturating_sub(cpu_started),
+        );
+        if !needed && smallclaims::touched::writes() > writes {
+            let wrote: Vec<String> = feed_before
+                .and_then(Result::ok)
+                .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
+                .map(|feed| {
+                    feed.changes
+                        .iter()
+                        .map(|change| format!("{} {}", change.kind, change.subject))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !wrote.is_empty() {
+                self.incremental_correction("stop", item, &reads, &wrote);
+            }
+        }
+        match outcome {
+            Err(error) => diagnostic_errors.push(format!(
+                "{}: determine member owner: {error:#}",
+                subject.subject
+            )),
+            Ok(None) => self.incremental.evaluated(item, reads, due),
+            Ok(Some(result)) => {
+                // A failed stop is tried again on the next pass, as before.
+                if result.is_ok() {
+                    self.incremental.evaluated(item, reads, due);
+                }
+                if let Err(error) = self.record_member_reconcile_result(&subject.subject, result) {
+                    diagnostic_errors.push(format!("{}: {error:#}", subject.subject));
+                }
+            }
+        }
+    }
+
     fn reconcile_stop_with_origin(
         &self,
         subject: &DesiredSubject,
@@ -3074,12 +3329,14 @@ impl<R: RuntimeControl> Reconciler<R> {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let observation = if terminal {
+            smallclaims::touched::note_read(|| format!("pty:{runtime_id}"));
             // Without a snapshot the PTY may still run, so the stop waits for the next one.
             let Some(ptys) = ptys else {
                 return Ok(());
             };
             ptys.get(runtime_id).cloned()
         } else {
+            smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
             self.runtime.observe_exec(runtime_id)?
         };
         // A stopped projection is only a record of the last observation. The same
@@ -3202,6 +3459,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some((checkout, workspace)) = self.finished_run_checkout(subject)? else {
             return Ok(());
         };
+        smallclaims::touched::note_read(|| "live-workspaces".to_owned());
         self.remove_finished_checkout(
             &subject.subject,
             &checkout,
@@ -3299,16 +3557,18 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         let now = now_ms();
-        if self
+        if let Some((retry_at, _)) = self
             .checkout_retries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
-            .is_some_and(|(retry_at, _)| *retry_at > now)
+            .filter(|(retry_at, _)| *retry_at > now)
         {
+            smallclaims::touched::note_due(*retry_at);
             return Ok(());
         }
         if let Err(error) = checkout.remove(workspace) {
+            smallclaims::touched::note_due(now.saturating_add(CHECKOUT_RETRY_MS));
             let reason = format!("kept worktree {}: {error:#}", workspace.display());
             self.checkout_retries
                 .lock()
@@ -4822,7 +5082,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut active_generations = BTreeSet::new();
         let mut active_steps = BTreeSet::new();
         let mut changed = false;
-        let full = !self.skip_unneeded || self.incremental.take_full_pass(now_ms());
+        let full = !self.skip_unneeded || self.incremental.take_full_pass("mission-run", now_ms());
         for id in &ids {
             let subject = format!("mission-run/{id}");
             let needed = self.incremental.needs(&subject, now_ms());
@@ -9027,40 +9287,50 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(None);
         }
         let now = now_ms();
-        if let Some((at, reason)) = self
+        if let Some((at, reason, reads)) = self
             .seat_retention
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(seat)
             && now.saturating_sub(*at) < SEAT_RETENTION_CHECK_MS
         {
+            // The cached answer stands until the next check, and depends on what that check read.
+            for key in reads {
+                smallclaims::touched::note_read(|| key.clone());
+            }
+            if reason.is_some() {
+                smallclaims::touched::note_due(at.saturating_add(SEAT_RETENTION_CHECK_MS));
+            }
             return Ok(reason.clone());
         }
-        let unread = self
-            .store
-            .messages(Some(seat), false)?
-            .into_iter()
-            .any(|message| {
-                matches!(message.status.as_str(), "sent" | "staged" | "delivered")
-                    && !message.tags.iter().any(|tag| {
-                        tag.starts_with("st3-work:") || tag.starts_with("st3-wake-source:")
-                    })
-            });
-        let reason = if unread {
-            Some("the seat holds a message nobody has read".to_owned())
-        } else if !self
-            .store
-            .seat_work_in_other_runs(seat, owner_run)?
-            .is_empty()
-        {
-            Some("the seat holds work for another run".to_owned())
-        } else {
-            None
-        };
+        let (reason, reads) = smallclaims::touched::record(|| -> Result<Option<String>> {
+            let unread = self
+                .store
+                .messages(Some(seat), false)?
+                .into_iter()
+                .any(|message| {
+                    matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+                        && !message.tags.iter().any(|tag| {
+                            tag.starts_with("st3-work:") || tag.starts_with("st3-wake-source:")
+                        })
+                });
+            Ok(if unread {
+                Some("the seat holds a message nobody has read".to_owned())
+            } else if !self
+                .store
+                .seat_work_in_other_runs(seat, owner_run)?
+                .is_empty()
+            {
+                Some("the seat holds work for another run".to_owned())
+            } else {
+                None
+            })
+        });
+        let reason = reason?;
         self.seat_retention
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(seat.to_owned(), (now, reason.clone()));
+            .insert(seat.to_owned(), (now, reason.clone(), reads));
         if reason.is_some() {
             self.arm_restart(
                 &format!("retain:{seat}"),
@@ -9638,16 +9908,35 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_subscription_missions(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.incremental.observe(&self.store)?;
+        // Read once for every subscription: it lists the whole host's open attention requests.
+        let held = self
+            .store
+            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .into_iter()
+            .filter(|request| request.title == "A subscription is holding mission requests")
+            .collect::<Vec<_>>();
+        let skip = self.skip_unneeded && !self.incremental.take_full_pass("subscription", now_ms());
+        let mut items = BTreeSet::new();
         for item in desired.iter().filter(|item| item.kind == "subscription") {
+            let key = format!("subscription:{}", item.subject);
+            items.insert(key.clone());
             self.isolate("subscription", &item.subject, || {
-                self.reconcile_subscription_mission(item)
+                self.reconcile_item("subscription", &key, skip, || {
+                    self.reconcile_subscription_mission(item, &held)
+                })
             });
         }
+        self.incremental.retain("subscription:", &items);
         Ok(())
     }
 
     /// Start the missions that this subscription's deliveries requested.
-    fn reconcile_subscription_mission(&self, item: &DesiredSubject) -> Result<()> {
+    fn reconcile_subscription_mission(
+        &self,
+        item: &DesiredSubject,
+        held: &[crate::model::AttentionRequestView],
+    ) -> Result<()> {
         let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
             return Ok(());
         };
@@ -9660,7 +9949,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
-        self.retire_legacy_held_subscription_attention(&item.subject)?;
+        self.retire_legacy_held_subscription_attention(&item.subject, held)?;
         if spec.stopped {
             self.cancel_unstarted_subscription_requests(&item.subject)?;
             return Ok(());
@@ -9932,6 +10221,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .saturating_add(u128::from(every_ms))
         });
         if due > now_ms() {
+            smallclaims::touched::note_due(due);
             deadlines.insert(item.subject.clone(), due);
             return Ok(());
         }
@@ -10081,14 +10371,15 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     /// Retire stored attention from the old burst cap. Queued requests now start automatically.
-    fn retire_legacy_held_subscription_attention(&self, subscription: &str) -> Result<()> {
-        for request in self
-            .store
-            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
-        {
-            if request.targets == [subscription]
-                && request.title == "A subscription is holding mission requests"
-            {
+    fn retire_legacy_held_subscription_attention(
+        &self,
+        subscription: &str,
+        held: &[crate::model::AttentionRequestView],
+    ) -> Result<()> {
+        smallclaims::touched::note_read(|| "kind:attention.requested".to_owned());
+        for request in held {
+            smallclaims::touched::note_read(|| request.subject.clone());
+            if request.targets == [subscription] {
                 self.store.resolve_attention_automatically(
                     &request.subject,
                     "subscription requests now wait in an automatic queue",
