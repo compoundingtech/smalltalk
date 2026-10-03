@@ -73,8 +73,8 @@ type SeatRetention = (u128, Option<String>, BTreeSet<String>);
 
 // A seat kept running past its run is checked again this soon for unread mail and other work.
 // Reading a conversation message does not wake the reconciler, so this check is what lets the
-// stop go ahead; each check is a pass, and at 10 s held seats were a hetz daemon's most frequent
-// wake. A held seat stops at most a minute after its last reason goes.
+// stop go ahead. Each check is a pass: at 10 s, held seats were the most frequent wake on a busy
+// member. A held seat stops at most a minute after its last reason goes.
 const SEAT_RETENTION_CHECK_MS: u128 = 60_000;
 // Run cleanup ends this long after it began even if an owned runtime never reports stopped.
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
