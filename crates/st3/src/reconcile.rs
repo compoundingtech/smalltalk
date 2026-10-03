@@ -67,6 +67,10 @@ const CHECKOUT_RETRY_MS: u128 = 30_000;
 // are late by at most this much.
 const DEADLINE_SOURCE_RETRY_MS: u128 = 5_000;
 
+// A skipped seat's terminal is looked at again this often for a login or trust prompt. A prompt
+// draws no graph change, and a pass used to read every running seat's screen.
+const SCREEN_POLL_EVERY_MS: u128 = 10_000;
+
 /// When a seat's retention was last checked, why the seat is held (if it is), and what the
 /// check read.
 type SeatRetention = (u128, Option<String>, BTreeSet<String>);
@@ -585,6 +589,10 @@ pub struct Reconciler<R = NativeRuntime> {
     seat_retention: Mutex<HashMap<String, SeatRetention>>,
     /// The gate runners the last read found, kept until a change they depend on.
     gate_runners: Mutex<Option<Vec<crate::store::MissionGateRunner>>>,
+    /// The work wake each live agent's last evaluation queued, queued again while it is skipped.
+    member_wakes: Mutex<HashMap<String, (String, String, MemberSpec)>>,
+    /// How often a skipped member's terminal screen is looked at again for a prompt.
+    screen_poll_every_ms: u128,
     fault_injection: Option<Arc<dyn FaultInjection>>,
     /// Reads free space for the disk stage. Without one the stage does nothing.
     disk_probe: Option<DiskProbe>,
@@ -696,6 +704,7 @@ impl Reconciler<NativeRuntime> {
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
             gate_runners: Mutex::new(None),
+            member_wakes: Mutex::new(HashMap::new()),
             fault_injection: None,
             disk_probe: Some(Arc::new(crate::disk::disk_space)),
             disk_paths: vec![state_dir.to_path_buf()],
@@ -703,6 +712,7 @@ impl Reconciler<NativeRuntime> {
             disk_check_every_ms: DISK_CHECK_EVERY_MS,
             fault_delivery: Mutex::new(None),
             fault_delivery_every_ms: FAULT_DELIVERY_EVERY_MS,
+            screen_poll_every_ms: SCREEN_POLL_EVERY_MS,
             subagent_low_water: Mutex::new(0),
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
@@ -753,6 +763,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
             seat_retention: Mutex::new(HashMap::new()),
             gate_runners: Mutex::new(None),
+            member_wakes: Mutex::new(HashMap::new()),
             fault_injection: None,
             disk_probe: None,
             disk_paths: Vec::new(),
@@ -760,6 +771,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             disk_check_every_ms: 0,
             fault_delivery: Mutex::new(None),
             fault_delivery_every_ms: 0,
+            screen_poll_every_ms: 0,
             subagent_low_water: Mutex::new(0),
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
@@ -1643,6 +1655,30 @@ impl<R: RuntimeControl> Reconciler<R> {
             && ptys.is_some()
             && !self.incremental.take_full_pass("stop", now_ms());
         let mut stops = BTreeSet::new();
+        // A live member is evaluated again when a claim it read, its runtime, its exec state or
+        // its screen changed, when its time came, or when its workspace or render failed.
+        let skip_members = self.skip_unneeded
+            && ptys.is_some()
+            && !self.incremental.take_full_pass("member", now_ms());
+        self.incremental.observe_execs(|runtime_id| {
+            self.runtime
+                .observe_exec(runtime_id)
+                .ok()
+                .flatten()
+                .map(|observation| observation.status)
+        });
+        self.incremental.poll_values(
+            "screen:",
+            self.screen_poll_every_ms,
+            now_ms(),
+            |runtime_id| {
+                self.runtime
+                    .screen(runtime_id)
+                    .ok()
+                    .map(|screen| screen_digest(&screen))
+            },
+        );
+        let mut members = BTreeSet::new();
         let mut work_message_agents = Vec::new();
         let mut deferred_member_faults = BTreeMap::new();
         let mut diagnostic_errors = Vec::new();
@@ -1673,213 +1709,301 @@ impl<R: RuntimeControl> Reconciler<R> {
             {
                 continue;
             }
-            let result = caught(|| -> Result<()> {
-                // A workspace or render failure blocks only a start or restart. A running member
-                // is still observed, checked, and given its work.
-                let mut blocked = member_errors.remove(&subject.subject);
-                let Some(member) = &subject.member else {
-                    return Ok(());
-                };
-                if member.host != self.host {
-                    return Ok(());
-                }
-                let observed = if member.terminal {
-                    // An unavailable snapshot is unknown, not an empty runtime set, so a terminal
-                    // member is neither started nor judged until the snapshot returns.
-                    let Some(ptys) = ptys.as_ref() else {
-                        return blocked.map_or(Ok(()), Err);
-                    };
-                    ptys.get(&member.runtime_id).cloned()
-                } else {
-                    self.runtime.observe_exec(&member.runtime_id)?
-                };
-                if subject.kind == "agent"
-                    && let Some(suspension) =
-                        crate::suspension::current(&self.store, &subject.subject)?
-                    && suspension.holds_seat()
+            let item = format!("member:{}", subject.subject);
+            members.insert(item.clone());
+            let needed = self.incremental.needs(&item, now_ms())
+                || member_errors.contains_key(&subject.subject);
+            if skip_members && !needed {
+                // Its last evaluation stands, the work wake it queued included.
+                if let Some(wake) = self
+                    .member_wakes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&subject.subject)
                 {
-                    return self.reconcile_suspension(
-                        subject,
-                        member,
-                        observed.as_ref(),
-                        blocked,
-                        &suspension,
-                    );
+                    work_message_agents.push(wake.clone());
                 }
-                if self.reconcile_requested_restart(
-                    subject,
-                    member,
-                    observed.as_ref(),
-                    blocked.as_ref(),
-                )? {
-                    return Ok(());
-                }
-                match observed {
-                    Some(observation) if observation.status == "running" => {
-                        self.record_member(subject, &observation, true)?;
-                        if let Some(changes) =
-                            self.declared_launch_changes(subject, member, &observation)?
-                        {
-                            // Rendering must succeed before we shut down a still-running seat.
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
-                            }
-                            self.record_once(
-                                &subject.subject,
-                                "runtime.reconcile-decision",
-                                BTreeMap::from([
-                                    ("decision".into(), Value::String("restart".into())),
-                                    ("reachability".into(), Value::String("reachable".into())),
-                                    (
-                                        "reason".into(),
-                                        Value::String(format!(
-                                            "the declared {} changed",
-                                            changes.join(" and ")
-                                        )),
-                                    ),
-                                ]),
-                            )?;
-                            self.reconcile_runtime_stop(
-                                &subject.subject,
-                                &member.runtime_id,
-                                member.terminal,
-                                observation.incarnation_id.as_deref(),
-                                member.shutdown_timeout_ms,
-                                Some(&observation),
-                            )?;
+                continue;
+            }
+            let queued_before = work_message_agents.len();
+            let cpu_started = crate::incremental::thread_cpu();
+            let writes = smallclaims::touched::writes();
+            let feed_before =
+                (!needed).then(|| self.store.changes_since(i64::MAX as u64, i64::MAX));
+            let ((result, due), reads) = smallclaims::touched::record(|| {
+                smallclaims::touched::record_due(|| {
+                    caught(|| -> Result<()> {
+                        // A workspace or render failure blocks only a start or restart. A running member
+                        // is still observed, checked, and given its work.
+                        let mut blocked = member_errors.remove(&subject.subject);
+                        let Some(member) = &subject.member else {
+                            return Ok(());
+                        };
+                        if member.host != self.host {
                             return Ok(());
                         }
-                        self.reconcile_claude_auth_screen(subject, member, &observation)?;
-                        self.reconcile_claude_trust_screen(
+                        let observed = if member.terminal {
+                            smallclaims::touched::note_read(|| {
+                                format!("pty:{}", member.runtime_id)
+                            });
+                            // An unavailable snapshot is unknown, not an empty runtime set, so a terminal
+                            // member is neither started nor judged until the snapshot returns.
+                            let Some(ptys) = ptys.as_ref() else {
+                                return blocked.map_or(Ok(()), Err);
+                            };
+                            ptys.get(&member.runtime_id).cloned()
+                        } else {
+                            smallclaims::touched::note_read(|| {
+                                format!("exec:{}", member.runtime_id)
+                            });
+                            self.runtime.observe_exec(&member.runtime_id)?
+                        };
+                        if subject.kind == "agent"
+                            && let Some(suspension) =
+                                crate::suspension::current(&self.store, &subject.subject)?
+                            && suspension.holds_seat()
+                        {
+                            return self.reconcile_suspension(
+                                subject,
+                                member,
+                                observed.as_ref(),
+                                blocked,
+                                &suspension,
+                            );
+                        }
+                        if self.reconcile_requested_restart(
                             subject,
                             member,
-                            &observation,
-                            now_ms(),
-                        )?;
-                        self.reconcile_driver_readiness(subject, member, &observation, now_ms())?;
-                        if subject.kind == "agent"
-                            && let Some(incarnation) = observation.incarnation_id.as_deref()
-                        {
-                            work_message_agents.push((
-                                subject.subject.clone(),
-                                incarnation.to_owned(),
-                                member.clone(),
-                            ));
-                        }
-                    }
-                    Some(observation)
-                        if matches!(observation.status.as_str(), "exited" | "vanished") =>
-                    {
-                        self.record_member(subject, &observation, false)?;
-                        if !self.member_was_launched_for_selected_desired(&subject.subject)? {
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
-                            }
-                            self.perform_start(
-                                subject,
-                                member,
-                                "the desired member revision changed",
-                            )?;
+                            observed.as_ref(),
+                            blocked.as_ref(),
+                        )? {
                             return Ok(());
                         }
-                        let restart = match member.restart {
-                            RestartType::Always => true,
-                            RestartType::OnFailure => observation.exit_code != Some(0),
-                            RestartType::Never => false,
-                        };
-                        // A trust-prompt recovery stopped this incarnation in order to replace it,
-                        // whatever the member's own exit policy says.
-                        let recovering = self
-                            .claude_trust_recovery_stopped(&subject.subject, &observation)?
-                            || self
-                                .fresh_context_recovery_stopped(&subject.subject, &observation)?;
-                        if (restart || recovering) && member.lifecycle == MemberLifecycle::Service {
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
+                        match observed {
+                            Some(observation) if observation.status == "running" => {
+                                self.record_member(subject, &observation, true)?;
+                                if let Some(changes) =
+                                    self.declared_launch_changes(subject, member, &observation)?
+                                {
+                                    // Rendering must succeed before we shut down a still-running seat.
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.record_once(
+                                        &subject.subject,
+                                        "runtime.reconcile-decision",
+                                        BTreeMap::from([
+                                            ("decision".into(), Value::String("restart".into())),
+                                            (
+                                                "reachability".into(),
+                                                Value::String("reachable".into()),
+                                            ),
+                                            (
+                                                "reason".into(),
+                                                Value::String(format!(
+                                                    "the declared {} changed",
+                                                    changes.join(" and ")
+                                                )),
+                                            ),
+                                        ]),
+                                    )?;
+                                    self.reconcile_runtime_stop(
+                                        &subject.subject,
+                                        &member.runtime_id,
+                                        member.terminal,
+                                        observation.incarnation_id.as_deref(),
+                                        member.shutdown_timeout_ms,
+                                        Some(&observation),
+                                    )?;
+                                    return Ok(());
+                                }
+                                self.reconcile_claude_auth_screen(subject, member, &observation)?;
+                                self.reconcile_claude_trust_screen(
+                                    subject,
+                                    member,
+                                    &observation,
+                                    now_ms(),
+                                )?;
+                                self.reconcile_driver_readiness(
+                                    subject,
+                                    member,
+                                    &observation,
+                                    now_ms(),
+                                )?;
+                                if subject.kind == "agent"
+                                    && let Some(incarnation) = observation.incarnation_id.as_deref()
+                                {
+                                    work_message_agents.push((
+                                        subject.subject.clone(),
+                                        incarnation.to_owned(),
+                                        member.clone(),
+                                    ));
+                                }
                             }
-                            self.reconcile_restart(subject, member, &observation)?;
-                        }
-                    }
-                    Some(observation) => {
-                        self.record_member(subject, &observation, false)?;
-                    }
-                    None if member.lifecycle == MemberLifecycle::AdoptOnly => {
-                        self.record_once(
-                            &subject.subject,
-                            "runtime.observed",
-                            member_fields(member, "absent", None, false),
-                        )?;
-                    }
-                    None => {
-                        let prior = self.store.latest_actual_value(&subject.subject)?;
-                        if prior.is_some()
-                            && !self.member_was_launched_for_selected_desired(&subject.subject)?
-                        {
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
-                            }
-                            self.perform_start(
-                                subject,
-                                member,
-                                "the desired member revision changed",
-                            )?;
-                            return Ok(());
-                        }
-                        if prior.as_ref().is_some_and(|actual| {
-                            matches!(
-                                actual_field(actual, "status").and_then(Value::as_str),
-                                Some(
-                                    "running"
-                                        | "ready"
-                                        | "working"
-                                        | "idle"
-                                        | "starting"
-                                        | "exited"
-                                        | "vanished"
-                                )
-                            )
-                        }) {
-                            let observation = RuntimeObservation {
-                                runtime_id: member.runtime_id.clone(),
-                                terminal: member.terminal,
-                                status: "vanished".into(),
-                                exit_code: prior
-                                    .as_ref()
-                                    .and_then(|actual| actual_field(actual, "exit_code"))
-                                    .and_then(Value::as_i64),
-                                incarnation_id: prior
-                                    .as_ref()
-                                    .and_then(|actual| actual_field(actual, "incarnation_id"))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned),
-                            };
-                            self.record_member(subject, &observation, false)?;
-                            let restart = match member.restart {
-                                RestartType::Always => true,
-                                RestartType::OnFailure => observation.exit_code != Some(0),
-                                RestartType::Never => false,
-                            };
-                            if restart
-                                || self.fresh_context_recovery_stopped(
+                            Some(observation)
+                                if matches!(observation.status.as_str(), "exited" | "vanished") =>
+                            {
+                                self.record_member(subject, &observation, false)?;
+                                if !self
+                                    .member_was_launched_for_selected_desired(&subject.subject)?
+                                {
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.perform_start(
+                                        subject,
+                                        member,
+                                        "the desired member revision changed",
+                                    )?;
+                                    return Ok(());
+                                }
+                                let restart = match member.restart {
+                                    RestartType::Always => true,
+                                    RestartType::OnFailure => observation.exit_code != Some(0),
+                                    RestartType::Never => false,
+                                };
+                                // A trust-prompt recovery stopped this incarnation in order to replace it,
+                                // whatever the member's own exit policy says.
+                                let recovering = self.claude_trust_recovery_stopped(
                                     &subject.subject,
                                     &observation,
-                                )?
-                            {
-                                if let Some(error) = blocked.take() {
-                                    return Err(error);
+                                )? || self.fresh_context_recovery_stopped(
+                                    &subject.subject,
+                                    &observation,
+                                )?;
+                                if (restart || recovering)
+                                    && member.lifecycle == MemberLifecycle::Service
+                                {
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.reconcile_restart(subject, member, &observation)?;
                                 }
-                                self.reconcile_restart(subject, member, &observation)?;
                             }
-                        } else {
-                            if let Some(error) = blocked.take() {
-                                return Err(error);
+                            Some(observation) => {
+                                self.record_member(subject, &observation, false)?;
                             }
-                            self.perform_start(subject, member, "the desired member is absent")?;
+                            None if member.lifecycle == MemberLifecycle::AdoptOnly => {
+                                self.record_once(
+                                    &subject.subject,
+                                    "runtime.observed",
+                                    member_fields(member, "absent", None, false),
+                                )?;
+                            }
+                            None => {
+                                let prior = self.store.latest_actual_value(&subject.subject)?;
+                                if prior.is_some()
+                                    && !self.member_was_launched_for_selected_desired(
+                                        &subject.subject,
+                                    )?
+                                {
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.perform_start(
+                                        subject,
+                                        member,
+                                        "the desired member revision changed",
+                                    )?;
+                                    return Ok(());
+                                }
+                                if prior.as_ref().is_some_and(|actual| {
+                                    matches!(
+                                        actual_field(actual, "status").and_then(Value::as_str),
+                                        Some(
+                                            "running"
+                                                | "ready"
+                                                | "working"
+                                                | "idle"
+                                                | "starting"
+                                                | "exited"
+                                                | "vanished"
+                                        )
+                                    )
+                                }) {
+                                    let observation = RuntimeObservation {
+                                        runtime_id: member.runtime_id.clone(),
+                                        terminal: member.terminal,
+                                        status: "vanished".into(),
+                                        exit_code: prior
+                                            .as_ref()
+                                            .and_then(|actual| actual_field(actual, "exit_code"))
+                                            .and_then(Value::as_i64),
+                                        incarnation_id: prior
+                                            .as_ref()
+                                            .and_then(|actual| {
+                                                actual_field(actual, "incarnation_id")
+                                            })
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned),
+                                    };
+                                    self.record_member(subject, &observation, false)?;
+                                    let restart = match member.restart {
+                                        RestartType::Always => true,
+                                        RestartType::OnFailure => observation.exit_code != Some(0),
+                                        RestartType::Never => false,
+                                    };
+                                    if restart
+                                        || self.fresh_context_recovery_stopped(
+                                            &subject.subject,
+                                            &observation,
+                                        )?
+                                    {
+                                        if let Some(error) = blocked.take() {
+                                            return Err(error);
+                                        }
+                                        self.reconcile_restart(subject, member, &observation)?;
+                                    }
+                                } else {
+                                    if let Some(error) = blocked.take() {
+                                        return Err(error);
+                                    }
+                                    self.perform_start(
+                                        subject,
+                                        member,
+                                        "the desired member is absent",
+                                    )?;
+                                }
+                            }
                         }
-                    }
-                }
-                blocked.map_or(Ok(()), Err)
+                        blocked.map_or(Ok(()), Err)
+                    })
+                })
             });
+            crate::performance::record_evaluation(
+                "member",
+                needed,
+                crate::incremental::thread_cpu().saturating_sub(cpu_started),
+            );
+            if !needed && smallclaims::touched::writes() > writes {
+                let wrote: Vec<String> = feed_before
+                    .and_then(Result::ok)
+                    .and_then(|feed| self.store.changes_since(feed.index, feed.local).ok())
+                    .map(|feed| {
+                        feed.changes
+                            .iter()
+                            .map(|change| format!("{} {}", change.kind, change.subject))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !wrote.is_empty() {
+                    self.incremental_correction("member", &item, &reads, &wrote);
+                }
+            }
+            {
+                let mut wakes = self
+                    .member_wakes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match work_message_agents[queued_before..].last() {
+                    Some(wake) => wakes.insert(subject.subject.clone(), wake.clone()),
+                    None => wakes.remove(&subject.subject),
+                };
+            }
+            // A failed member is evaluated again on the next pass, as before.
+            if result.is_ok() {
+                self.incremental.evaluated(&item, reads, due);
+            }
             // A running agent's member pass also includes deferred work delivery, so its result
             // is recorded with that delivery.
             let deferred = work_message_agents
@@ -1896,6 +2020,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         drop(members_span);
         self.incremental.retain("stop:", &stops);
+        self.incremental.retain("member:", &members);
+        self.member_wakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|subject, _| members.contains(&format!("member:{subject}")));
         // Each later stage runs on its own. A stage that fails records a fault on this daemon and
         // the stages after it still run, so no intake item can hold back mission evaluation, run
         // cleanup, or work delivery on this host.
@@ -2410,6 +2539,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    /// A member's terminal screen, read as an input: a later pass looks at it again (see
+    /// [`SCREEN_POLL_EVERY_MS`]) and evaluates the member when it changed.
+    fn member_screen(&self, runtime_id: &str) -> Result<String> {
+        let screen = self.runtime.screen(runtime_id)?;
+        let key = format!("screen:{runtime_id}");
+        smallclaims::touched::note_read(|| key.clone());
+        self.incremental
+            .saw_value(&key, screen_digest(&screen), now_ms());
+        Ok(screen)
+    }
+
     fn reconcile_claude_auth_screen(
         &self,
         subject: &DesiredSubject,
@@ -2425,7 +2565,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
         // Claude's login prompt does not emit a StopFailure hook. The initialized MCP channel
         // remains alive, so hook-only observation incorrectly reports this session as ready.
-        let Ok(screen) = self.runtime.screen(&member.runtime_id) else {
+        let Ok(screen) = self.member_screen(&member.runtime_id) else {
             return Ok(());
         };
         let (fence, key) = self.claude_auth_fence(&subject.subject, incarnation)?;
@@ -2567,7 +2707,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             else {
                 return Ok(());
             };
-            let Ok(screen) = self.runtime.screen(&member.runtime_id) else {
+            let Ok(screen) = self.member_screen(&member.runtime_id) else {
                 return Ok(());
             };
             if !claude_trust_prompt(&screen) {
@@ -12806,6 +12946,11 @@ fn restart_wake_kind(key: &str) -> &str {
         None if key.starts_with("stage/") || !key.contains('/') => key,
         None => "member",
     }
+}
+
+/// What a polled screen is compared by.
+fn screen_digest(screen: &str) -> String {
+    hex::encode(sha2::Sha256::digest(screen.as_bytes()))
 }
 
 fn deadline_sleep_ms(deadline: u128, now: u128, quiet_pass_started: Option<u128>) -> u64 {
