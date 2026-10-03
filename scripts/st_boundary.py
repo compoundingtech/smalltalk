@@ -5,6 +5,9 @@ from pathlib import Path
 
 IMPORT = re.compile(r"\b(?:r#)?st2\s*::|\bextern\s+crate\s+(?:r#)?st2\b")
 LEGACY = re.compile("st2", re.IGNORECASE)
+# A stored value names st2 as its own token: a label, schema, path or program. Keys, signatures,
+# nonces and other base64 that st stores hold the letters st2 inside longer runs by chance.
+TOKEN = re.compile(r"(?<![a-z0-9])st2(?![a-z0-9])", re.IGNORECASE)
 
 
 def source_findings(root):
@@ -50,13 +53,13 @@ def launch_findings(argv, environment):
                 yield f"st2 program/path in launch: {token}"
 
 
-def record_findings(label, value):
+def record_findings(label, value, pattern=LEGACY):
     if isinstance(value, bytes):
         try:
             value = value.decode("utf-8")
         except UnicodeError:
             return
-    if isinstance(value, str) and LEGACY.search(value):
+    if isinstance(value, str) and pattern.search(value):
         yield f"st2 in {label}"
 
 
@@ -76,7 +79,9 @@ def sqlite_findings(path):
                     if (name, column) in {("replica_envelopes", "payload"),
                                           ("replica_envelope_signatures", "signature")}:
                         continue
-                    yield from record_findings(f"SQLite record {path.name}/{name}/{column}", value)
+                    yield from record_findings(
+                        f"SQLite record {path.name}/{name}/{column}", value, TOKEN
+                    )
 
 
 def output_findings(root):
