@@ -2685,7 +2685,7 @@ pub fn run_controlled_paths(
     let resume_thread = match restart {
         crate::restart_context::Context::Ordinary => resume_thread.or(retired),
         crate::restart_context::Context::Fresh => None,
-        crate::restart_context::Context::Resume(thread) => Some(thread),
+        crate::restart_context::Context::Resume { id: thread, .. } => Some(thread),
     };
     if let Some(thread) = &resume_thread {
         anyhow::ensure!(

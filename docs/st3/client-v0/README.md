@@ -538,12 +538,14 @@ Pi and OMP refresh their transcript binding at turn boundaries, so an initially 
 becomes resumable after its first persisted turn. A captured resume fails if the provider first
 binds a different session; the CLI waits for the replacement's matching native binding.
 Supported native launches are Claude and OMP (`--resume` with the exact native session),
-pi and OpenCode (`--session` with the exact native session), and Codex's controlled app-server
-launch (the exact native thread). Explicit fresh context overrides authored continuation,
-fork, and session selectors, and discards Codex's stale binding; ordinary daemon adoption
-and residency do not acquire either restart override. Missing current native evidence makes
-`restart_will_resume` false. Session identity does not require a transcript file path:
-`harness.session-file.path` can be null when the provider only publishes its exact session ID.
+OpenCode (`--session` with the exact native session), pi (`--session` with its captured
+transcript path, not its session ID), and Codex's controlled app-server launch (the exact native
+thread). A pi binding without a saved transcript path is not resumable; a captured transcript
+that disappears before launch fails closed rather than creating a file named after its ID.
+Explicit fresh context overrides authored continuation, fork, and session selectors, and
+discards Codex's stale binding; ordinary daemon adoption and residency do not acquire either
+restart override. Missing current native evidence makes `restart_will_resume` false.
+Other providers may publish a null `harness.session-file.path` when they can resume by exact ID.
 Rust exposes `ActionRequest::agent_restart`; Swift and TypeScript expose `agentRestart`.
 The CLI equivalent is `st agents restart NAME --as person/NAME [--fresh-context]`; it obtains
 the current incarnation and declaration fences before submitting `/v1/agents/restart`.

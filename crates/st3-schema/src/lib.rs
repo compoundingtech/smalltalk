@@ -2640,6 +2640,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("terminal", boolean()),
             ("incarnation_id", string()),
             ("native_session_id", string()),
+            ("native_session_path", string()),
             ("fresh_context", boolean()),
             ("deadline_unix_ms", string()),
             ("signal", string()),

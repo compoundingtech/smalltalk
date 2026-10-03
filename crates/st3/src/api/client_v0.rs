@@ -9243,7 +9243,8 @@ subscription "watch/source" {
             "runtime_id": "restart-runtime", "incarnation_id": "current", "status": "running"
         }));
         append("harness.session-file", json!({
-            "harness": "codex", "session_id": "current-thread", "incarnation_id": "current", "resume_available": true
+            "harness": "codex", "session_id": "current-thread", "incarnation_id": "current", "resume_available": true,
+            "path": "/tmp/current-transcript.jsonl",
         }));
         // A newer record for an old incarnation cannot replace the current binding.
         append("harness.session-file", json!({
@@ -9283,6 +9284,8 @@ subscription "watch/source" {
                 assert_eq!(claim.body["fields"]["fresh_context"], fresh);
                 assert_eq!(claim.body["fields"]["native_session_id"],
                     if fresh { Value::Null } else { json!("current-thread") });
+                assert_eq!(claim.body["fields"]["native_session_path"],
+                    if fresh { Value::Null } else { json!("/tmp/current-transcript.jsonl") });
             }
         }
         // /new can bind an unsaved conversation inside the same runtime incarnation.

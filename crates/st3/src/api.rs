@@ -8453,7 +8453,7 @@ fn request_agent_restart(
             "the seat's desired revision changed",
         )));
     }
-    let native_session_id = if request.fresh_context {
+    let native_session = if request.fresh_context {
         None
     } else {
         restart_native_session(
@@ -8473,7 +8473,8 @@ fn request_agent_restart(
                     Value::String(member.runtime_id.clone()),
                 ),
                 ("incarnation_id".into(), Value::String(incarnation.into())),
-                ("native_session_id".into(), json!(native_session_id)),
+                ("native_session_id".into(), json!(native_session.as_ref().map(|(id, _)| id))),
+                ("native_session_path".into(), json!(native_session.as_ref().and_then(|(_, path)| path.as_deref()))),
                 ("fresh_context".into(), Value::Bool(request.fresh_context)),
             ]),
             evidence: vec![token],
@@ -8492,7 +8493,7 @@ fn restart_native_session(
     incarnation: &str,
     driver: Option<&str>,
     snapshot_index: Option<u64>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<(String, Option<String>)>> {
     let Some(driver @ ("claude" | "codex" | "omp" | "pi" | "opencode")) = driver else {
         return Ok(None);
     };
@@ -8509,8 +8510,14 @@ fn restart_native_session(
                 if fields.get("resume_available").and_then(Value::as_bool) != Some(true) {
                     return Ok(None);
                 }
-                return Ok(fields.get("session_id").and_then(Value::as_str)
-                    .filter(|id| !id.is_empty()).map(str::to_owned));
+                let Some(id) = fields.get("session_id").and_then(Value::as_str)
+                    .filter(|id| !id.is_empty()) else { return Ok(None) };
+                let path = fields.get("path").and_then(Value::as_str)
+                    .filter(|path| !path.is_empty()).map(str::to_owned);
+                if driver == "pi" && path.is_none() {
+                    return Ok(None);
+                }
+                return Ok(Some((id.to_owned(), path)));
             }
         }
         let Some(cursor) = page.next_cursor else { return Ok(None) };

@@ -1831,7 +1831,7 @@ impl Delivery {
     fn select_restart_session(&mut self, client: &Client) -> Result<()> {
         let native_id = match &self.restart_context {
             crate::restart_context::Context::Ordinary => return Ok(()),
-            crate::restart_context::Context::Resume(expected) => {
+            crate::restart_context::Context::Resume { id: expected, .. } => {
                 let native = client.get_json(&format!("/session/{expected}"))?;
                 let id = native.get("id").and_then(Value::as_str)
                     .context("OpenCode resumed session has no native id")?;
@@ -3179,7 +3179,7 @@ mod tests {
         server.listed_sessions.lock().extend(["ses_exact".into(), "ses_other".into()]);
         let client = Client::new(server.port, "pw");
         let (mut delivery, _) = delivery_fixture(tmp.path(), tmp.path().join("ledger.json"));
-        delivery.restart_context = crate::restart_context::Context::Resume("ses_exact".into());
+        delivery.restart_context = crate::restart_context::Context::Resume { id: "ses_exact".into(), path: None };
         delivery.select_restart_session(&client).unwrap();
         delivery.saw_session("ses_other");
         delivery.pump(&client);
@@ -3197,7 +3197,7 @@ mod tests {
         let client = Client::new(server.port, "pw");
         let (mut delivery, _) = delivery_fixture(tmp.path(), tmp.path().join("ledger.json"));
         delivery.observed_session = None;
-        delivery.restart_context = crate::restart_context::Context::Resume("ses_missing".into());
+        delivery.restart_context = crate::restart_context::Context::Resume { id: "ses_missing".into(), path: None };
         assert!(delivery.select_restart_session(&client).is_err());
         assert!(delivery.observed_session.is_none());
         assert!(server.selected_sessions.lock().is_empty());

@@ -75,7 +75,7 @@ const DECLARED_CHECKOUT_LIMIT: usize = 4096;
 
 /// Context selection applies only to a person-requested launch, never daemon adoption.
 enum RestartContext<'a> {
-    Resume(&'a str),
+    Resume { session: &'a str, path: Option<&'a str> },
     Fresh,
 }
 
@@ -3608,12 +3608,18 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         launch_member.environment.remove("ST3_RESTART_NATIVE_SESSION");
+        launch_member.environment.remove("ST3_RESTART_NATIVE_SESSION_PATH");
         launch_member.environment.remove("ST3_RESTART_FRESH_CONTEXT");
         match restart_context {
-            Some(RestartContext::Resume(session)) => {
+            Some(RestartContext::Resume { session, path }) => {
                 launch_member
                     .environment
                     .insert("ST3_RESTART_NATIVE_SESSION".into(), session.into());
+                if let Some(path) = path {
+                    launch_member
+                        .environment
+                        .insert("ST3_RESTART_NATIVE_SESSION_PATH".into(), path.into());
+                }
             }
             Some(RestartContext::Fresh) => {
                 launch_member
@@ -4261,7 +4267,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             request.body["fields"]["native_session_id"]
                 .as_str()
                 .filter(|session| !session.is_empty())
-                .map(RestartContext::Resume)
+                .map(|session| RestartContext::Resume {
+                    session,
+                    path: request.body["fields"]["native_session_path"].as_str(),
+                })
         };
         self.perform_start(subject, member, "an explicit seat restart was requested", context)?;
         let after = self

@@ -6,6 +6,7 @@
 use anyhow::Result;
 
 pub const NATIVE_SESSION_ENV: &str = "ST3_RESTART_NATIVE_SESSION";
+pub const NATIVE_SESSION_PATH_ENV: &str = "ST3_RESTART_NATIVE_SESSION_PATH";
 pub const FRESH_CONTEXT_ENV: &str = "ST3_RESTART_FRESH_CONTEXT";
 /// Hook-only proof of the first native session selected by a restart launch.
 pub const EXPECTED_SESSION_ENV: &str = "ST_RESTART_EXPECTED_NATIVE_SESSION";
@@ -15,7 +16,10 @@ pub enum Context {
     #[default]
     Ordinary,
     Fresh,
-    Resume(String),
+    Resume {
+        id: String,
+        path: Option<String>,
+    },
 }
 
 impl Context {
@@ -23,14 +27,22 @@ impl Context {
         Self::from_values(
             std::env::var(FRESH_CONTEXT_ENV).ok().as_deref(),
             std::env::var(NATIVE_SESSION_ENV).ok().as_deref(),
+            std::env::var(NATIVE_SESSION_PATH_ENV).ok().as_deref(),
         )
     }
 
-    pub fn from_values(fresh: Option<&str>, native_session: Option<&str>) -> Self {
+    pub fn from_values(
+        fresh: Option<&str>,
+        native_session: Option<&str>,
+        path: Option<&str>,
+    ) -> Self {
         if fresh == Some("1") {
             Self::Fresh
         } else if let Some(id) = native_session.filter(|id| !id.is_empty()) {
-            Self::Resume(id.to_owned())
+            Self::Resume {
+                id: id.to_owned(),
+                path: path.filter(|path| !path.is_empty()).map(str::to_owned),
+            }
         } else {
             Self::Ordinary
         }
@@ -38,7 +50,7 @@ impl Context {
 
     pub fn native_session(&self) -> Option<&str> {
         match self {
-            Self::Resume(id) => Some(id),
+            Self::Resume { id, .. } => Some(id),
             Self::Ordinary | Self::Fresh => None,
         }
     }
@@ -90,16 +102,48 @@ impl Context {
             }
             // Keep values opaque, even when prompt text or a model name happens to spell a
             // session selector. Provider-specific short flags have different meanings.
-            let takes_unrelated_value = matches!(name,
-                "--model" | "--system-prompt" | "--append-system-prompt" | "--system-prompt-file"
-                | "--append-system-prompt-file" | "--mcp-config" | "--settings" | "--permission-mode"
-                | "--session-dir" | "--provider" | "--thinking" | "--extension" | "-e"
-                | "--config" | "--profile" | "--cd" | "--sandbox" | "--ask-for-approval"
-                | "--enable" | "--disable" | "--add-dir" | "--remote" | "--remote-auth"
-                | "--image" | "-i" | "-m" | "--agent" | "--prompt" | "--port" | "--hostname"
-            ) || (harness == "codex" && matches!(name,
-                "-c" | "-p" | "-C" | "-s" | "-a" | "--local-provider" | "--remote-auth-token-env"
-            ));
+            let takes_unrelated_value = matches!(
+                name,
+                "--model"
+                    | "--system-prompt"
+                    | "--append-system-prompt"
+                    | "--system-prompt-file"
+                    | "--append-system-prompt-file"
+                    | "--mcp-config"
+                    | "--settings"
+                    | "--permission-mode"
+                    | "--session-dir"
+                    | "--provider"
+                    | "--thinking"
+                    | "--extension"
+                    | "-e"
+                    | "--config"
+                    | "--profile"
+                    | "--cd"
+                    | "--sandbox"
+                    | "--ask-for-approval"
+                    | "--enable"
+                    | "--disable"
+                    | "--add-dir"
+                    | "--remote"
+                    | "--remote-auth"
+                    | "--image"
+                    | "-i"
+                    | "-m"
+                    | "--agent"
+                    | "--prompt"
+                    | "--port"
+                    | "--hostname"
+            ) || (harness == "codex"
+                && matches!(
+                    name,
+                    "-c" | "-p"
+                        | "-C"
+                        | "-s"
+                        | "-a"
+                        | "--local-provider"
+                        | "--remote-auth-token-env"
+                ));
             if takes_unrelated_value {
                 preserve_value = !arg.contains('=');
                 return true;
@@ -111,7 +155,8 @@ impl Context {
                     _ => None,
                 },
                 "omp" => match name {
-                    "-c" | "--continue" | "--no-session" | "--fork" | "--from-claude" | "--from-codex" => Some(false),
+                    "-c" | "--continue" | "--no-session" | "--fork" | "--from-claude"
+                    | "--from-codex" => Some(false),
                     "-r" | "--resume" | "--session" => Some(true),
                     _ => None,
                 },
@@ -148,7 +193,22 @@ impl Context {
                 _ => anyhow::bail!("{harness} does not support native restart context"),
             };
             if let Some(selector) = selector {
-                argv.splice(1..1, [selector.to_owned(), id.to_owned()]);
+                let value = if harness == "pi" {
+                    let Self::Resume {
+                        path: Some(path), ..
+                    } = self
+                    else {
+                        anyhow::bail!("pi restart requires its saved transcript path");
+                    };
+                    anyhow::ensure!(
+                        std::path::Path::new(path).is_file(),
+                        "pi restart transcript is missing: {path}"
+                    );
+                    path.as_str()
+                } else {
+                    id
+                };
+                argv.splice(1..1, [selector.to_owned(), value.to_owned()]);
             }
         }
         Ok(argv)
@@ -157,12 +217,19 @@ impl Context {
 
 /// These controls are for the wrapper's one launch, never the provider or its future children.
 pub fn remove_launch_environment(command: &mut std::process::Command) {
-    command.env_remove(NATIVE_SESSION_ENV).env_remove(FRESH_CONTEXT_ENV).env_remove(EXPECTED_SESSION_ENV);
+    command
+        .env_remove(NATIVE_SESSION_ENV)
+        .env_remove(NATIVE_SESSION_PATH_ENV)
+        .env_remove(FRESH_CONTEXT_ENV)
+        .env_remove(EXPECTED_SESSION_ENV);
 }
 
 pub fn verify_native_session(expected: Option<&str>, actual: &str) -> Result<()> {
     if let Some(expected) = expected {
-        anyhow::ensure!(actual == expected, "native restart bound session {actual:?}, expected {expected:?}");
+        anyhow::ensure!(
+            actual == expected,
+            "native restart bound session {actual:?}, expected {expected:?}"
+        );
     }
     Ok(())
 }
@@ -177,9 +244,15 @@ mod tests {
 
     #[test]
     fn restart_context_fresh_overrides_capture_and_authored_selection() {
-        assert_eq!(Context::from_values(Some("1"), Some("captured")), Context::Fresh);
+        assert_eq!(
+            Context::from_values(Some("1"), Some("captured"), Some("transcript")),
+            Context::Fresh
+        );
         for (harness, selection) in [
-            ("claude", argv(&["--resume=old", "--fork-session", "--session-id", "other"])),
+            (
+                "claude",
+                argv(&["--resume=old", "--fork-session", "--session-id", "other"]),
+            ),
             ("omp", argv(&["-r", "old", "--continue", "--from-codex"])),
             ("pi", argv(&["--session", "old", "-r", "--continue"])),
             ("codex", argv(&["resume", "old", "--last"])),
@@ -188,37 +261,155 @@ mod tests {
             let mut input = argv(&[harness, "--model", "keep"]);
             input.extend(selection);
             input.extend(argv(&["--", "--resume", "literal prompt"]));
-            assert_eq!(Context::Fresh.apply_argv(harness, input).unwrap(), argv(&[harness, "--model", "keep", "--", "--resume", "literal prompt"]));
+            assert_eq!(
+                Context::Fresh.apply_argv(harness, input).unwrap(),
+                argv(&[
+                    harness,
+                    "--model",
+                    "keep",
+                    "--",
+                    "--resume",
+                    "literal prompt"
+                ])
+            );
         }
     }
 
     #[test]
     fn restart_context_resume_selects_exact_capture_without_forking() {
-        for (harness, selector) in [("claude", "--resume"), ("omp", "--resume"), ("pi", "--session"), ("opencode", "--session")] {
+        for (harness, selector) in [
+            ("claude", "--resume"),
+            ("omp", "--resume"),
+            ("opencode", "--session"),
+        ] {
             let input = argv(&[harness, "--continue", "--model", "keep"]);
-            assert_eq!(Context::Resume("exact".into()).apply_argv(harness, input).unwrap(), argv(&[harness, selector, "exact", "--model", "keep"]));
+            assert_eq!(
+                Context::Resume {
+                    id: "exact".into(),
+                    path: None
+                }
+                .apply_argv(harness, input)
+                .unwrap(),
+                argv(&[harness, selector, "exact", "--model", "keep"])
+            );
         }
-        assert_eq!(Context::Resume("exact".into()).apply_argv("codex", argv(&["codex", "fork", "other", "--model", "keep"])).unwrap(), argv(&["codex", "--model", "keep"]));
+        assert_eq!(
+            Context::Resume {
+                id: "exact".into(),
+                path: None
+            }
+            .apply_argv(
+                "codex",
+                argv(&["codex", "fork", "other", "--model", "keep"])
+            )
+            .unwrap(),
+            argv(&["codex", "--model", "keep"])
+        );
+    }
+
+    #[test]
+    fn restart_context_pi_resumes_the_saved_transcript_not_a_file_named_after_the_id() {
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        let path = transcript.path().to_str().unwrap().to_owned();
+        let context = Context::from_values(None, Some("native-exact"), Some(&path));
+        assert_eq!(context.native_session(), Some("native-exact"));
+        assert_eq!(
+            context
+                .apply_argv(
+                    "pi",
+                    argv(&["pi", "--session", "authored", "--model", "keep"])
+                )
+                .unwrap(),
+            vec![
+                "pi".to_owned(),
+                "--session".to_owned(),
+                path,
+                "--model".to_owned(),
+                "keep".to_owned()
+            ],
+        );
+        transcript.close().unwrap();
+        assert!(context.apply_argv("pi", argv(&["pi"])).is_err());
+        assert!(
+            Context::from_values(None, Some("native-exact"), None)
+                .apply_argv("pi", argv(&["pi"]))
+                .is_err()
+        );
     }
 
     #[test]
     fn restart_context_ordinary_does_not_change_authored_selection() {
         let input = argv(&["pi", "--session", "authored", "--model", "keep"]);
-        assert_eq!(Context::Ordinary.apply_argv("pi", input.clone()).unwrap(), input);
-        assert_eq!(Context::from_values(None, None), Context::Ordinary);
+        assert_eq!(
+            Context::Ordinary.apply_argv("pi", input.clone()).unwrap(),
+            input
+        );
+        assert_eq!(Context::from_values(None, None, None), Context::Ordinary);
     }
 
     #[test]
     fn restart_context_keeps_unrelated_option_values_opaque() {
         for (harness, input) in [
-            ("claude", argv(&["claude", "--system-prompt", "--resume", "--resume", "old", "--mcp-config", "keep"])),
-            ("codex", argv(&["codex", "--model", "resume", "-c", "fork", "resume", "old", "--sandbox", "keep"])),
-            ("pi", argv(&["pi", "--session-dir", "/keep", "--session", "old", "--model", "keep"])),
-            ("omp", argv(&["omp", "--from-codex", "unrelated prompt", "--model", "keep"])),
+            (
+                "claude",
+                argv(&[
+                    "claude",
+                    "--system-prompt",
+                    "--resume",
+                    "--resume",
+                    "old",
+                    "--mcp-config",
+                    "keep",
+                ]),
+            ),
+            (
+                "codex",
+                argv(&[
+                    "codex",
+                    "--model",
+                    "resume",
+                    "-c",
+                    "fork",
+                    "resume",
+                    "old",
+                    "--sandbox",
+                    "keep",
+                ]),
+            ),
+            (
+                "pi",
+                argv(&[
+                    "pi",
+                    "--session-dir",
+                    "/keep",
+                    "--session",
+                    "old",
+                    "--model",
+                    "keep",
+                ]),
+            ),
+            (
+                "omp",
+                argv(&["omp", "--from-codex", "unrelated prompt", "--model", "keep"]),
+            ),
         ] {
             let expected = match harness {
-                "claude" => argv(&["claude", "--system-prompt", "--resume", "--mcp-config", "keep"]),
-                "codex" => argv(&["codex", "--model", "resume", "-c", "fork", "--sandbox", "keep"]),
+                "claude" => argv(&[
+                    "claude",
+                    "--system-prompt",
+                    "--resume",
+                    "--mcp-config",
+                    "keep",
+                ]),
+                "codex" => argv(&[
+                    "codex",
+                    "--model",
+                    "resume",
+                    "-c",
+                    "fork",
+                    "--sandbox",
+                    "keep",
+                ]),
                 "omp" => argv(&["omp", "unrelated prompt", "--model", "keep"]),
                 _ => argv(&["pi", "--session-dir", "/keep", "--model", "keep"]),
             };
@@ -229,11 +420,24 @@ mod tests {
     #[test]
     fn restart_context_keeps_codex_provider_auth_and_variadic_images_opaque() {
         let input = argv(&[
-            "codex", "--local-provider", "resume", "--remote-auth-token-env", "fork",
-            "--image", "resume", "fork", "--", "literal prompt",
+            "codex",
+            "--local-provider",
+            "resume",
+            "--remote-auth-token-env",
+            "fork",
+            "--image",
+            "resume",
+            "fork",
+            "--",
+            "literal prompt",
         ]);
         assert_eq!(
-            Context::Resume("exact".into()).apply_argv("codex", input.clone()).unwrap(),
+            Context::Resume {
+                id: "exact".into(),
+                path: None
+            }
+            .apply_argv("codex", input.clone())
+            .unwrap(),
             input,
         );
     }
