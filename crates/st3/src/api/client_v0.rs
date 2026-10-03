@@ -1510,7 +1510,7 @@ fn mission_resources_filtered(
     let scope = selected_id
         .map(|selected| vec![selected.to_owned()])
         .or_else(|| page_ids.map(|ids| ids.to_vec()));
-    // A detail reads its runs' current steps with their headers, two reads for every run.
+    // Base cards use headers and current-step summaries; only a selected detail enriches below.
     let runs = if let Some(selected) = selected_id {
         store.mission_run_summaries_for_missions(&[selected.to_owned()])?
     } else if let Some(ids) = page_ids {
@@ -1638,10 +1638,12 @@ fn mission_resources_filtered(
             let run_details = runs
                 .iter()
                 .map(|header| {
-                    // A detail shows each step's effective state and latest progress, and none of
-                    // the timing and wake history a work view reads for every step.
+                    // Only a detail reads loop, timing and wake history, through the same
+                    // enriched store read as the trusted mission-run endpoint.
                     let run = if selected_id.is_some() {
-                        store.with_step_states(header.clone(), true)?
+                        store.mission_run(&header.id)?.ok_or_else(|| {
+                            anyhow::anyhow!("mission run {} disappeared during detail read", header.id)
+                        })?
                     } else {
                         header.clone()
                     };
@@ -1727,6 +1729,20 @@ fn mission_resources_filtered(
                         run.steps
                             .iter()
                             .map(|step| {
+                                let loop_run = run.loops.iter().find(|loop_run| {
+                                    loop_run.step_run == step.subject
+                                });
+                                let wake = step.wake.as_ref().map(|wake| {
+                                    json!({
+                                        "assignee": wake.assignee,
+                                        "assignee_state": wake.assignee_state,
+                                        "incarnation_id": wake.incarnation_id,
+                                        "attempts": wake.attempts,
+                                        "last_attempt_at": wake.last_attempt_at_unix_ms.map(client_timestamp),
+                                        "acknowledged_by": wake.acknowledged_by,
+                                        "failure": wake.failure,
+                                    })
+                                });
                                 json!({
                                     "id": step.subject,
                                     "path": step.step,
@@ -1742,6 +1758,14 @@ fn mission_resources_filtered(
                                     "blockers": step.blockers,
                                     "goals": step.goals,
                                     "constraints": step.constraints,
+                                    "loop_round": loop_run.map(|loop_run| loop_run.round),
+                                    "loop_max_rounds": loop_run.map(|loop_run| loop_run.max_rounds),
+                                    "loop_reason": loop_run.and_then(|loop_run| loop_run.reason.as_deref()),
+                                    "next_wake_at": step.not_before_unix_ms.map(client_timestamp),
+                                    "wake_reason": step.blocked_reason.as_deref().filter(|_| step.not_before_unix_ms.is_some())
+                                        .or_else(|| step.wake.as_ref().and_then(|wake| wake.failure.as_deref())),
+                                    "wake": wake,
+                                    "claim_expires_at": step.claim_expires_at_unix_ms.map(client_timestamp),
                                 })
                             })
                             .collect::<Vec<_>>()
@@ -10923,11 +10947,9 @@ mission "example/looped" state="ready" {
         );
     }
 
-    /// A mission detail and the missions tree show each step's state and latest progress
-    /// without reading the timing, wake and definition history a work view reads for every
-    /// step: they enrich no step, and they show what the enriched runs show.
+    /// A mission detail and the missions tree agree on effective step state and progress.
     #[test]
-    fn mission_detail_and_the_tree_read_no_step_history() {
+    fn mission_detail_and_the_tree_show_effective_steps() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "steps-node");
         let publish = |source: &str, key: &str| {
@@ -11020,11 +11042,9 @@ mission "example/steps" state="ready" {
         }
         let index = state.store.index().unwrap();
 
-        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
         let detail =
             mission_resources(&state.store, index, true, Some("mission/example/steps")).unwrap();
         let tree = missions_tree_value(&state.store, "now", index).unwrap();
-        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 0);
 
         let shown = |run: &crate::model::MissionRunView| {
             run.steps
