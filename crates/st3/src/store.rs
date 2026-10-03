@@ -8295,7 +8295,9 @@ impl Store {
             .map_err(|error| St3Error::new("internal", error))?
     }
 
-    pub(crate) fn append_harness_event(
+    /// Append a native driver's observation, as `POST /v1/harness-events` does once it has
+    /// bound the caller to its seat. The daemon tests call it directly, without a driver.
+    pub fn append_harness_event(
         &self,
         publication: &crate::harness_events::Publication,
     ) -> Result<(ClaimRecord, bool), St3Error> {

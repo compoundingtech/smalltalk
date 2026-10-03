@@ -505,6 +505,106 @@ pub fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
     }
 }
 
+/// Record every statement `connection` runs: its time in the profile, and with `test-support`,
+/// its work in [`work`].
+pub fn observe(connection: &mut Connection) {
+    #[cfg(any(test, feature = "test-support"))]
+    work::count(connection);
+    connection.profile(Some(record_sqlite_time));
+}
+
+/// The work SQLite did for every statement this process ran, read from each statement's own
+/// counters as it finishes, so a test can see whether a request's work grows with the store.
+/// Timings vary from machine to machine; these counts do not.
+#[cfg(any(test, feature = "test-support"))]
+pub mod work {
+    use std::ffi::{c_int, c_uint, c_void};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use rusqlite::{Connection, ffi};
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct SqliteWork {
+        pub statements: u64,
+        /// Virtual machine instructions, which every row read, compared or written costs.
+        pub vm_steps: u64,
+        /// Steps forward through a table without an index.
+        pub fullscan_steps: u64,
+        /// Sorts SQLite ran because no index gave the order.
+        pub sorts: u64,
+        /// Rows put into indexes SQLite built for one statement because none existed.
+        pub autoindex_rows: u64,
+    }
+
+    impl std::ops::Sub for SqliteWork {
+        type Output = SqliteWork;
+
+        fn sub(self, before: SqliteWork) -> SqliteWork {
+            SqliteWork {
+                statements: self.statements - before.statements,
+                vm_steps: self.vm_steps - before.vm_steps,
+                fullscan_steps: self.fullscan_steps - before.fullscan_steps,
+                sorts: self.sorts - before.sorts,
+                autoindex_rows: self.autoindex_rows - before.autoindex_rows,
+            }
+        }
+    }
+
+    static STATEMENTS: AtomicU64 = AtomicU64::new(0);
+    static VM_STEPS: AtomicU64 = AtomicU64::new(0);
+    static FULLSCAN_STEPS: AtomicU64 = AtomicU64::new(0);
+    static SORTS: AtomicU64 = AtomicU64::new(0);
+    static AUTOINDEX_ROWS: AtomicU64 = AtomicU64::new(0);
+
+    /// Everything counted so far, in every connection of this process.
+    pub fn total() -> SqliteWork {
+        SqliteWork {
+            statements: STATEMENTS.load(Ordering::Relaxed),
+            vm_steps: VM_STEPS.load(Ordering::Relaxed),
+            fullscan_steps: FULLSCAN_STEPS.load(Ordering::Relaxed),
+            sorts: SORTS.load(Ordering::Relaxed),
+            autoindex_rows: AUTOINDEX_ROWS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Count `connection`'s statements. SQLite reports each one when it finishes, also when a
+    /// trigger or a foreign-key check did the work inside it.
+    pub(super) fn count(connection: &Connection) {
+        // SAFETY: the callback only reads the finished statement's counters, and the handle
+        // stays valid for the connection's life, which ends the registration with it.
+        unsafe {
+            ffi::sqlite3_trace_v2(
+                connection.handle(),
+                ffi::SQLITE_TRACE_PROFILE as c_uint,
+                Some(finished),
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    unsafe extern "C" fn finished(
+        _event: c_uint,
+        _context: *mut c_void,
+        statement: *mut c_void,
+        _elapsed: *mut c_void,
+    ) -> c_int {
+        let statement = statement.cast::<ffi::sqlite3_stmt>();
+        // Reading with the reset flag set leaves a cached statement's counters at zero for its
+        // next run.
+        // SAFETY: SQLite passes the statement that just finished.
+        let take = |counter: c_int| unsafe { ffi::sqlite3_stmt_status(statement, counter, 1) };
+        let add = |total: &AtomicU64, counter: c_int| {
+            total.fetch_add(u64::try_from(take(counter)).unwrap_or(0), Ordering::Relaxed);
+        };
+        STATEMENTS.fetch_add(1, Ordering::Relaxed);
+        add(&VM_STEPS, ffi::SQLITE_STMTSTATUS_VM_STEP);
+        add(&FULLSCAN_STEPS, ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP);
+        add(&SORTS, ffi::SQLITE_STMTSTATUS_SORT);
+        add(&AUTOINDEX_ROWS, ffi::SQLITE_STMTSTATUS_AUTOINDEX);
+        0
+    }
+}
+
 pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {
     let flags = if shared_memory {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
@@ -513,7 +613,7 @@ pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connecti
     };
     let mut connection = Connection::open_with_flags(path, flags)
         .with_context(|| format!("open st read connection {}", path.display()))?;
-    connection.profile(Some(record_sqlite_time));
+    observe(&mut connection);
     connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     connection.execute_batch(
         "PRAGMA busy_timeout = 5000;

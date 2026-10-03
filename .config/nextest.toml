@@ -14,7 +14,8 @@ final-status-level = "flaky"
 # used by st3), its catalog, eval-run, resync, nomad-survival, event and resource-profile
 # supervisor tests, and st-drivers' catalog, resync and resource-profile supervisor modules.
 # `transport_isolation` needs real systemd user scopes; the isolation-vm job runs it in a
-# NixOS VM. See docs/ci.md.
+# NixOS VM. The cost check and the load test (`daemon_cost`, `daemon_load`) run in their own
+# perf jobs, so they never lengthen this one (scripts/ci-perf). See docs/ci.md.
 # scripts/ci-nextest also omits entirely excluded st2 targets from Cargo's build selection;
 # keep its retained target list in sync when changing the binary-level exclusions below.
 default-filter = '''
@@ -26,6 +27,7 @@ not (
   ))
   or (package(=st-drivers) and kind(lib)
     and test(/^(catalog[^:]*|resync|resource_profile_supervisor)::/))
+  or (package(=st3) and test(/^daemon_(cost|load)::/))
 )
 '''
 

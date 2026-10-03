@@ -180,6 +180,47 @@ a pass. Do not silently fall back to hosted or fleet runners.
 `CI_RUN_ID` keeps the messaging-fault evidence under `target/messaging-faults/`, which is
 uploaded with the stage logs.
 
+### Performance gate
+
+Two jobs check the daemon's rules that reads are instant, writes are short, and no query's cost
+grows with the whole store. Neither is part of `linux-gate`; making one required is a decision
+for the repository's owner. Both run `scripts/ci-perf` on the stage runners' 16x32 shape, and
+`.config/nextest.toml` keeps their tests out of `linux-tests`.
+
+`perf-cost` runs `daemon_cost::` (`crates/st3/tests/daemon_cost.rs`) on every pull request, queue
+entry and `main` push. It generates a store at scale 0.01 and one at 0.1 with the
+`daemon_bench` generator, serves each from an in-process daemon, and counts the SQLite work of
+every route: virtual machine steps, steps through a table without an index, sorts and
+auto-index rows, read from each statement's counters as it finishes
+(`smallclaims::sqlite::work`, built only with `test-support`). A request fails when its work at
+the larger scale is more than three times its work at the smaller, after dividing by how much its
+answer grew. It also measures a replication round as the worker runs it (summary, push, receive)
+and a checkpoint trim, per deleted row. Counts do not depend on the machine, so the job builds
+with `opt-level = 1` only to generate the stores faster.
+
+- Every route `api.rs` declares is measured or listed in `NOT_MEASURED` with its reason; a new
+  route fails `the_cost_check_covers_every_route` until it is one or the other.
+- `KNOWN_GROWTH` lists the routes whose work already grew with the store when the check
+  landed, each with a ceiling of half again its measured growth. A listed route fails if it grows
+  past its ceiling, and fails once fixed until it leaves the list.
+- The check failed on both regressions that reached production: the shape of #814 (a correlated
+  canonical-order subquery in the document reads; `GET /v1/documents` went from 84,865 to
+  8,007,288 steps for a store ten times larger) and the foreign-key columns #1103 indexed (a trim's
+  work per deleted row grew 7.3 times, its full-scan steps 9.3 times).
+
+`perf-load` runs `daemon_load::` in a release build: a store the size of a busy host's (scale 1),
+the request mix and rates that host's daemon reported in its busiest five-minute window, and the
+reconciler. It fails when a request's p99 or the daemon's CPU passes its budget, or is more than
+20% worse than main's last report. Main's successful runs save their report as the next baseline
+(`perf-load-baseline-*` in the Actions cache); a run without one checks only the budgets.
+
+Run either locally with `TMPDIR=/var/tmp`; `ST_BENCH_DIR` keeps the generated stores between runs:
+
+```sh
+cargo test -p st3 --test integration daemon_cost:: -- --nocapture --test-threads 1
+ST_LOAD_GATE=1 cargo test --release -p st3 --test integration daemon_load:: -- --nocapture
+```
+
 ## Generated files and existing workflows
 
 All workflow YAML and `.github/repo-settings.json` are generated from neighboring `.genie.ts`
