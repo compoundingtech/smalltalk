@@ -1365,7 +1365,7 @@ async fn perform_steadily(
     let mut wait = Duration::from_millis(50);
     for _ in 0..7 {
         match perform(client, person, model, effect.clone(), sent).await {
-            Err(error) if not_applied(&error) => {
+            Err(error) if not_applied(&error, &effect) => {
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_secs(2));
             }
@@ -1376,19 +1376,18 @@ async fn perform_steadily(
 }
 
 /// Whether st refused a request in a way that guarantees it applied nothing and a fresh try
-/// may succeed.
-fn not_applied(error: &anyhow::Error) -> bool {
+/// may succeed. An attention action already moved to its source's current card once on a
+/// stale fence (`crate::attention_action`); trying its old card again cannot help.
+fn not_applied(error: &anyhow::Error, effect: &Effect) -> bool {
+    let attention = matches!(effect, Effect::Attention { .. });
     error
         .chain()
         .filter_map(|cause| cause.downcast_ref::<ClientError>())
-        .any(|error| {
-            matches!(
-                error,
-                ClientError::Api(
-                    st3_client::ErrorCode::StaleFence | st3_client::ErrorCode::RateLimited,
-                    ..
-                ) | ClientError::Unreachable(_)
-            )
+        .any(|error| match error {
+            ClientError::Api(st3_client::ErrorCode::StaleFence, ..) => !attention,
+            ClientError::Api(st3_client::ErrorCode::RateLimited, ..)
+            | ClientError::Unreachable(_) => true,
+            _ => false,
         })
 }
 
@@ -1508,7 +1507,8 @@ async fn perform(
             reason,
             answer,
         } => {
-            crate::attention_action(client, person, &id, &action, reason, answer)
+            let seen = model.attention().find(|card| card.header.id == id);
+            crate::attention_action(client, person, &id, seen, &action, reason, answer)
                 .await
                 .map(|notice| (notice, None))
         }
@@ -1844,6 +1844,48 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale fence is retried for an action that reads a fresh one each try, but not for an
+    /// attention action: it already moved once to its source's current card. A busy or absent
+    /// st is retried for both.
+    #[test]
+    fn an_attention_action_is_not_retried_on_a_stale_fence() {
+        let refused = |code: st3_client::ErrorCode| {
+            anyhow::Error::new(ClientError::Api(
+                code.clone(),
+                "refused".into(),
+                Box::new(st3_client::ErrorEnvelope {
+                    api_version: "st3.client.v0".into(),
+                    error_version: "st3.client.error.v0".into(),
+                    request_id: "request/1".into(),
+                    code,
+                    message: "refused".into(),
+                    retryable: false,
+                    retry_after_ms: None,
+                    details: BTreeMap::new(),
+                }),
+            ))
+        };
+        let attention = Effect::Attention {
+            id: "attention/one".into(),
+            action: "review.approve".into(),
+            reason: None,
+            answer: None,
+        };
+        let terminal = Effect::CreateTerminal {
+            name: "shell".into(),
+        };
+        let stale = refused(st3_client::ErrorCode::StaleFence);
+        assert!(!not_applied(&stale, &attention));
+        assert!(not_applied(&stale, &terminal));
+        let busy = refused(st3_client::ErrorCode::RateLimited);
+        assert!(not_applied(&busy, &attention));
+        assert!(not_applied(&busy, &terminal));
+        assert!(!not_applied(
+            &refused(st3_client::ErrorCode::ValidationFailed),
+            &attention
+        ));
+    }
 
     #[test]
     fn read_receipt_retries_survive_navigation_and_serialize_snapshot_changes() {

@@ -25,8 +25,7 @@ stays behind.
 The move goes through the user manager (`StartTransientUnit` with the server's pid), so systemd
 owns both scopes and collects each one when its last process exits. The server scope also sets
 `MemoryLow=64M`, which takes effect only once the user manager itself has a memory.low (see
-below). Stopping a session still stops the whole tree: pty signals the server's process tree and
-its process groups, which do not depend on cgroups.
+below). The move does not change what a stop ends; see [Stopping a session](#stopping-a-session).
 
 The daemon moves a PTY server that an older release started, the first time its reconciler
 observes it. It moves only a process that is still in the exact scope st recorded for that
@@ -76,6 +75,42 @@ under `/usr/sbin/taskpolicy -c utility`. That clamps the program and every child
 utility QoS class, which schedules below the default class and throttles its disk IO. The
 `background` clamp would confine builds to efficiency cores, so st does not use it.
 
+## Stopping a session
+
+Stopping a seat, or an exec task such as a gate, ends every process it started.
+
+On Linux with a systemd user manager, everything a harness or exec task starts stays in its work
+scope, `st3-RUNTIME-DAEMONPID-N.scope`: a process whose parent exited, one that started a session
+or process group of its own, such as each test `cargo nextest` runs, and one started while the stop
+runs. A stop ends that scope.
+
+1. For a PTY session, pty stops the PTY server, then signals the process tree and process groups
+   it measured before the signal. st then sends SIGTERM to every process still in the work scope
+   (`systemctl --user kill`), waits up to two seconds, and sends SIGKILL.
+2. For an exec task, the whole work scope gets SIGTERM, not only the task's process group.
+3. At the shutdown deadline, a kill sends SIGKILL to the terminal's or the task's process group and
+   to the whole work scope. A PTY server still in the work scope leaves it first, so it outlives
+   its harness and records the exit.
+4. A harness can exit on its own and leave processes behind, and its session's record then removes
+   itself. st keeps the name of each launch's work scope beside the session's spawn lock. It ends
+   that scope, SIGTERM and then SIGKILL as above, when the reconciler next finds the stopped
+   runtime not running, when the session is removed, and before a restart launches the next
+   incarnation. An exec task's record names its scope, and the same three moments end it. Each
+   launch has a scope of its own, so ending an old one never reaches the next incarnation.
+
+A unit that is no longer loaded has ended: systemd collects a work scope once its last process
+exits. st never ends a PTY server's own scope, a service, or the unit it runs in.
+
+Without a systemd user manager, on macOS and on Linux without a user bus such as many CI runners,
+st has no scope to end. A stop ends the PTY server's process tree and the process groups pty
+measured before the signal, and an exec task's process group. Three kinds of process keep
+running: one that left that tree before the stop because its parent exited (`nohup`, `setsid`, a
+tool's background task), a process group started after pty measured the tree, and whatever a
+harness left behind when it exited on its own.
+
+A session that a release before this one started records no scope beside its spawn lock. Its
+leftovers end when it is stopped while it runs, or while its own record still names the scope.
+
 ## Checking a host
 
 `st doctor` reports a `priority` check. On Linux it warns when the daemon's own weights are below
@@ -96,6 +131,8 @@ done
 
 - The st CLI runs in its caller's cgroup. An agent that runs `st` from its own seat shares that
   seat's weight with its own build.
+- A process that a harness moves out of its work scope itself, such as one it starts with
+  `systemd-run --user`, is no longer in that scope and outlives a stop of the seat.
 - Remote attach also crosses `fabric.service`, which st does not install. Give it the live weights
   with `systemctl --user set-property fabric.service CPUWeight=1000 IOWeight=1000`.
 - Weights share a resource under contention. They cannot make a disk that is queued for seconds

@@ -1,4 +1,5 @@
 mod glasses;
+mod resources;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -2341,6 +2342,7 @@ impl Store {
         let transaction = connection.transaction()?;
         rebuild_operations_tx(&transaction)?;
         rebuild_planning_tx(&transaction)?;
+        resources::rebuild(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -3441,6 +3443,42 @@ impl Store {
             revision: revision.to_owned(),
             claim_id: claim.id,
         }))
+    }
+
+    /// The actor that published the mission revision `run` works to: a broken gate's attention
+    /// goes to it. A nested run works to its root run's revision.
+    pub(crate) fn mission_run_publisher(&self, run: &str) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let id = run.strip_prefix("mission-run/").unwrap_or(run);
+        let Some(header) = mission_run_header_tx(&connection, id).optional()? else {
+            return Ok(None);
+        };
+        let root_id = header
+            .root_mission_run
+            .strip_prefix("mission-run/")
+            .unwrap_or(&header.root_mission_run);
+        let root = if root_id == header.id {
+            header
+        } else {
+            let Some(root) = mission_run_header_tx(&connection, root_id).optional()? else {
+                return Ok(None);
+            };
+            root
+        };
+        let mission = root
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&root.mission);
+        Ok(connection
+            .query_row(
+                "SELECT claims.actor FROM mission_revisions
+                 JOIN claims ON claims.id=mission_revisions.claim_id
+                 WHERE mission_revisions.mission_id=?1 AND mission_revisions.revision=?2",
+                params![mission, root.revision],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn mission_run(&self, run: &str) -> Result<Option<MissionRunView>> {
@@ -7308,7 +7346,7 @@ impl Store {
                     "create"
                 }
                 .into(),
-                old_revision: current.map(|row| row.revision),
+                old_revision: current.as_ref().map(|row| row.revision.clone()),
                 new_revision: revision,
             });
             if desired.kind == "stop" {
@@ -7317,11 +7355,30 @@ impl Store {
                     action: "stop".into(),
                     reason: "the desired state explicitly stops this member".into(),
                 });
-            } else if desired.member.is_some() {
-                actions.push(PlannedAction {
-                    subject: subject.clone(),
-                    action: "observe-or-start".into(),
-                    reason: "the desired member is active".into(),
+            } else if let Some(member) = &desired.member {
+                // A seat restarts when its declared launch changes; say so before it does.
+                let changes = current
+                    .as_ref()
+                    .filter(|row| row.kind == "agent")
+                    .and_then(|row| row.member.as_deref())
+                    .and_then(|launched| serde_json::from_str::<crate::model::MemberSpec>(launched).ok())
+                    .map(|launched| member.launch_changes(&launched))
+                    .unwrap_or_default();
+                actions.push(if changes.is_empty() {
+                    PlannedAction {
+                        subject: subject.clone(),
+                        action: "observe-or-start".into(),
+                        reason: "the desired member is active".into(),
+                    }
+                } else {
+                    PlannedAction {
+                        subject: subject.clone(),
+                        action: "restart".into(),
+                        reason: format!(
+                            "the declared {} changed; a running seat restarts on its last session",
+                            changes.join(" and ")
+                        ),
+                    }
                 });
             }
         }
@@ -10697,6 +10754,36 @@ impl Store {
         pending_human_reviews_tx(&connection, reviewer)
     }
 
+    /// Every human gate request as (request, owner, reviewer): the episodes a human gate's
+    /// attention card can name, open or long closed.
+    pub fn human_gate_requests(&self) -> Result<Vec<(String, String, String)>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, json_extract(body, '$.fields.owner'), json_extract(body, '$.fields.reviewer')
+             FROM claims INDEXED BY claims_human_gate_request_index
+             WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL
+               AND json_extract(body, '$.fields.owner') IS NOT NULL",
+        )?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// The reviewer's answer to the human gate request `request`, by the same rule that takes
+    /// an answered request off `pending_human_reviews`.
+    pub fn human_review_answer(&self, request: &str) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        human_review_answer_tx(&connection, request)
+    }
+
+    /// Why `owner` has no pending human review: answered (how, by whom), stale (which of
+    /// generation, revision, definition, attempt or state moved on), or never asked.
+    pub fn human_review_refusal(&self, owner: &str) -> Result<String> {
+        let connection = self.readers.get();
+        human_review_refusal_tx(&connection, owner)
+    }
+
     /// Request attention for a condition the daemon watches itself. The daemon closes it once
     /// that condition clears.
     /// Retained for historical import and audit fixtures. Current requests use `ask_person`.
@@ -11167,6 +11254,12 @@ impl Store {
     ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
         items.extend(self.person_attention_items(person, as_of)?);
+        // A person who published a broken gate is the one to correct it.
+        items.extend(
+            self.broken_gate_items(person, as_of)?
+                .into_iter()
+                .filter(|item| item.person.starts_with("person/")),
+        );
         self.current_attention(items, as_of)
     }
 
@@ -11177,6 +11270,11 @@ impl Store {
     pub fn fault_snapshot(&self, as_of: u128) -> Result<Vec<FaultView>> {
         let mut items = self.subscription_fault_items(as_of)?;
         items.extend(self.operational_attention_items(None, as_of)?);
+        items.extend(
+            self.broken_gate_items(None, as_of)?
+                .into_iter()
+                .filter(|item| !item.person.starts_with("person/")),
+        );
         items.extend(self.checkpoint_attention_items(None, as_of)?);
         let fallback = self.fleet_fault_agent()?;
         self.current_attention(items, as_of)?
@@ -17261,6 +17359,9 @@ fn append_claim_tx(
         forced_batch,
     )?;
     insert_event(transaction, record.store_index, kind, subject, body)?;
+    if kind == "resource.observed" {
+        resources::refresh(transaction, subject)?;
+    }
     normalize_local_projection_timestamps_tx(
         transaction,
         subject,
@@ -18316,43 +18417,128 @@ fn current_human_review(
     connection: &Connection,
     request: ClaimRecord,
 ) -> Result<Option<HumanReviewView>> {
+    Ok(human_review_currency(connection, request)?.ok())
+}
+
+/// The step that runs a loop, from the subject a loop's gates are asked of:
+/// `loop-run/GENERATION/PATH`, or a subject under it such as `.../round/N/candidate/M` for a
+/// person's choice between candidates. The longest step run that prefixes it is the loop's.
+fn loop_step_tx(connection: &Connection, owner: &str) -> Result<Option<StepRunView>> {
+    let Some(path) = owner.strip_prefix("loop-run/") else {
+        return Ok(None);
+    };
+    let mut prefix = path;
+    // GENERATION/PATH: a step run has at least two segments.
+    while prefix.contains('/') {
+        if let Some(step) = step_run_row_tx(connection, &format!("step-run/{prefix}"))? {
+            return Ok(Some(step));
+        }
+        prefix = prefix.rsplit_once('/').map_or("", |(head, _)| head);
+    }
+    Ok(None)
+}
+
+/// Item `item` of the for-each loop `loop_run` (a loop from before such loops were removed):
+/// the round it runs in, its place in the loop's item snapshot, and whether the loop has
+/// recorded that round's result.
+fn loop_item_round_tx(
+    connection: &Connection,
+    loop_run: &str,
+    item: &str,
+) -> Result<Option<(u32, bool)>> {
+    let items: Option<String> = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT json_extract(claims.body, '$.fields.items') FROM claims
+                 WHERE claims.subject=?1 AND claims.kind='loop.state'
+                   AND json_extract(claims.body, '$.fields.items') IS NOT NULL
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+            ),
+            [loop_run],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(items) = items else {
+        return Ok(None);
+    };
+    let Some(index) = serde_json::from_str::<Vec<Value>>(&items)?
+        .iter()
+        .position(|candidate| candidate.get("id").and_then(Value::as_str) == Some(item))
+    else {
+        return Ok(None);
+    };
+    let round = u32::try_from(index + 1)?;
+    let recorded = connection
+        .query_row(
+            "SELECT 1 FROM claims
+             WHERE subject=?1 AND kind='loop.round-result'
+               AND json_extract(body, '$.fields.round')=?2
+               AND json_extract(body, '$.fields.candidate') IS NULL",
+            params![loop_run, round],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(Some((round, recorded)))
+}
+
+/// A step run's own row, without its queue and wake enrichment.
+fn step_run_row_tx(connection: &Connection, subject: &str) -> Result<Option<StepRunView>> {
+    connection
+        .query_row(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee,
+                    available_to, agentless, title, goals, worker_reported, lease_owner,
+                    lease_incarnation, lease_expires_at_unix_ms, blocked_reason,
+                    not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms,
+                    readiness_epoch, constraints
+             FROM step_runs WHERE subject=?1",
+            [subject],
+            step_run_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// The review a human gate request asks, while its gate still waits on it, or why it no longer
+/// does. A request is current while its owner (a step, mission or loop run) is open on the
+/// generation, revision, definition and attempt it was asked for. An answer does not make a
+/// request stale: the reviewers' list leaves out answered requests separately.
+fn human_review_currency(
+    connection: &Connection,
+    request: ClaimRecord,
+) -> Result<std::result::Result<HumanReviewView, String>> {
     let fields = request.body.get("fields").unwrap_or(&request.body);
-    let Some(owner) = fields.get("owner").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(reviewer) = fields.get("reviewer").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(mission_revision) = fields.get("mission_revision").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(step_definition) = fields.get("step_definition").and_then(Value::as_str) else {
-        return Ok(None);
+    let text = |name: &str| fields.get(name).and_then(Value::as_str);
+    let (Some(owner), Some(reviewer), Some(mission_revision), Some(step_definition)) = (
+        text("owner"),
+        text("reviewer"),
+        text("mission_revision"),
+        text("step_definition"),
+    ) else {
+        return Ok(Err(
+            "its request does not name the exact owner, reviewer and revision it asks about".into(),
+        ));
     };
     let Some(attempt) = fields
         .get("attempt")
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
     else {
-        return Ok(None);
+        return Ok(Err("its request does not name an attempt".into()));
     };
+    let short = |revision: &str| revision.chars().take(12).collect::<String>();
     // Only the run's header decides whether a review is current: its steps' queue and wake
     // enrichment is the costliest read in st and would run for every open review.
-    let (run, step, title) = if owner.starts_with("step-run/") {
-        let step = connection
-            .query_row(
-                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee,
-                        available_to, agentless, title, goals, worker_reported, lease_owner,
-                        lease_incarnation, lease_expires_at_unix_ms, blocked_reason,
-                        not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms,
-                        readiness_epoch, constraints
-                 FROM step_runs WHERE subject=?1",
-                [owner],
-                step_run_from_row,
-            )
-            .optional()?;
+    let (run, step, title) = if owner.starts_with("step-run/") || owner.starts_with("loop-run/") {
+        // A loop's gates are asked of its loop subject; the step running the loop decides
+        // whether one is current.
+        let step = if owner.starts_with("loop-run/") {
+            loop_step_tx(connection, owner)?
+        } else {
+            step_run_row_tx(connection, owner)?
+        };
         let Some(step) = step else {
-            return Ok(None);
+            return Ok(Err(format!("`{owner}` names no step run")));
         };
         let run = mission_run_header_tx(
             connection,
@@ -18360,16 +18546,60 @@ fn current_human_review(
         )
         .optional()?;
         let Some(run) = run else {
-            return Ok(None);
+            return Ok(Err(format!("its mission run `{}` is gone", step.run)));
         };
-        let current = step.generation == run.generation
-            && mission_revision == run.revision
-            && step_definition == step.definition_hash
-            && attempt == step.attempt
-            && !is_terminal_run_state(&run.status)
-            && !is_terminal_run_state(&step.status);
-        if !current {
-            return Ok(None);
+        if is_terminal_run_state(&run.status) {
+            return Ok(Err(format!("its mission run is {}", run.status)));
+        }
+        if is_terminal_run_state(&step.status) {
+            return Ok(Err(format!("the step is {}", step.status)));
+        }
+        if step.generation != run.generation {
+            return Ok(Err(format!(
+                "its mission run moved on to {}, which asks for its own review",
+                run.generation
+            )));
+        }
+        if mission_revision != run.revision {
+            return Ok(Err(format!(
+                "it was asked for mission revision {}, and the run is on {}",
+                short(mission_revision),
+                short(&run.revision)
+            )));
+        }
+        if step_definition != step.definition_hash {
+            return Ok(Err(
+                "the step's definition changed since it was asked".into()
+            ));
+        }
+        // A for-each loop runs each item as its own round and asks the item's gates with
+        // that round as their attempt, whatever attempt the step is on.
+        let loop_run = format!(
+            "loop-run/{}",
+            step.subject
+                .strip_prefix("step-run/")
+                .unwrap_or(&step.subject)
+        );
+        if let Some(item) = owner.strip_prefix(&format!("{loop_run}/item/")) {
+            match loop_item_round_tx(connection, &loop_run, item)? {
+                None => return Ok(Err(format!("its loop has no item `{item}`"))),
+                Some((round, _)) if round != attempt => {
+                    return Ok(Err(format!(
+                        "it was asked for round {attempt}, and item `{item}` runs in round {round}"
+                    )));
+                }
+                Some((round, true)) => {
+                    return Ok(Err(format!(
+                        "the loop already recorded item `{item}` (round {round})"
+                    )));
+                }
+                Some((_, false)) => {}
+            }
+        } else if attempt != step.attempt {
+            return Ok(Err(format!(
+                "it was asked for attempt {attempt}, and the step is on attempt {} ({})",
+                step.attempt, step.status
+            )));
         }
         let title = step.title.clone();
         (run, Some(step.step), title)
@@ -18380,19 +18610,32 @@ fn current_human_review(
         )
         .optional()?;
         let Some(run) = run else {
-            return Ok(None);
+            return Ok(Err(format!("`{owner}` names no mission run")));
         };
-        let current = mission_revision == run.revision
-            && step_definition == run.revision
-            && attempt == 1
-            && !is_terminal_run_state(&run.status);
-        if !current {
-            return Ok(None);
+        if is_terminal_run_state(&run.status) {
+            return Ok(Err(format!("the mission run is {}", run.status)));
+        }
+        if mission_revision != run.revision || step_definition != run.revision {
+            return Ok(Err(format!(
+                "it was asked for mission revision {}, and the run is on {}",
+                short(mission_revision),
+                short(&run.revision)
+            )));
+        }
+        if attempt != 1 {
+            return Ok(Err(format!(
+                "it was asked for attempt {attempt}, and a mission gate has one"
+            )));
         }
         (run, None, None)
     } else {
-        return Ok(None);
+        return Ok(Err(format!("`{owner}` cannot own a human gate")));
     };
+    // The person's attention shows a review only while its run still matters, so the review is
+    // offered only then: a review with no card would wait on an answer nobody is asked for.
+    if let Err(why) = person_work::run_liveness(connection, &run.subject, None, false)? {
+        return Ok(Err(why));
+    }
     let strings = |name: &str| {
         fields
             .get(name)
@@ -18406,7 +18649,7 @@ fn current_human_review(
             })
             .unwrap_or_default()
     };
-    Ok(Some(HumanReviewView {
+    Ok(Ok(HumanReviewView {
         operation: fields
             .get("operation")
             .and_then(Value::as_str)
@@ -18437,12 +18680,90 @@ fn current_human_review(
     }))
 }
 
+/// Whether claim `result` answers the human gate request `request`: a `gate.result` on the
+/// request's operation, by its reviewer, bound to it, with a verdict. The reviewers' list and
+/// the gate both read answers by this rule, so a review the list no longer offers is always one
+/// whose answer the gate acts on.
+fn reviewer_answer_sql(result: &str) -> String {
+    format!(
+        "{result}.subject=request.subject
+         AND {result}.kind='gate.result'
+         AND json_extract({result}.body, '$.fields.request')=request.id
+         AND {result}.actor=json_extract(request.body, '$.fields.reviewer')
+         AND json_extract({result}.body, '$.fields.verdict') IN ('pass','fail','feedback')"
+    )
+}
+
+/// The reviewer's answer to the human gate request `request`, the first one by
+/// `reviewer_answer_sql` when a race left two.
+fn human_review_answer_tx(connection: &Connection, request: &str) -> Result<Option<ClaimRecord>> {
+    connection
+        .query_row(
+            &canonical_sql(&format!(
+                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject,
+                        claims.kind, claims.origin, claims.actor, claims.body,
+                        claims.predecessors, claims.accepted_at_unix_ms
+                 FROM claims request JOIN claims ON {}
+                 WHERE request.id=?1 AND request.kind='gate.requested'
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+                reviewer_answer_sql("claims")
+            )),
+            [request],
+            claim_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Why `owner` has no human review waiting, in words for the person who tried to answer it:
+/// its newest request was answered (how, and by whom), no longer matches the owner, or st never
+/// asked one.
+fn human_review_refusal_tx(connection: &Connection, owner: &str) -> Result<String> {
+    let request = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT request.id, request.store_index, request.batch_id, request.subject,
+                        request.kind, request.origin, request.actor, request.body,
+                        request.predecessors, request.accepted_at_unix_ms
+                 FROM claims request
+                 WHERE request.kind='gate.requested'
+                   AND json_extract(request.body, '$.fields.owner')=?1
+                   AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
+                 ORDER BY CANONICAL_DESC(request) LIMIT 1",
+            ),
+            [owner],
+            claim_from_row,
+        )
+        .optional()?;
+    let Some(request) = request else {
+        return Ok("st has asked no person to review it".into());
+    };
+    if let Some(answer) = human_review_answer_tx(connection, &request.id)? {
+        let fields = answer.body.get("fields").unwrap_or(&answer.body);
+        let decision = fields.get("decision").and_then(Value::as_str).unwrap_or(
+            match fields.get("verdict").and_then(Value::as_str) {
+                Some("pass") => "approved",
+                Some("feedback") => "changes-requested",
+                _ => "rejected",
+            },
+        );
+        return Ok(format!(
+            "it was already answered: {decision} by {}",
+            answer.actor.as_deref().unwrap_or("its reviewer")
+        ));
+    }
+    Ok(match human_review_currency(connection, request)? {
+        Err(why) => format!("its review is no longer current: {why}"),
+        Ok(review) => format!("its review waits on {}", review.reviewer),
+    })
+}
+
 fn pending_human_reviews_tx(
     connection: &Connection,
     reviewer: Option<&str>,
 ) -> Result<Vec<HumanReviewView>> {
     let requests = {
-        let mut statement = connection.prepare(&canonical_sql(
+        let mut statement = connection.prepare(&canonical_sql(&format!(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
@@ -18450,16 +18771,10 @@ fn pending_human_reviews_tx(
              WHERE request.kind='gate.requested'
                AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
                AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
-               AND NOT EXISTS (
-                 SELECT 1 FROM claims result
-                 WHERE result.subject=request.subject
-                   AND result.kind='gate.result'
-                   AND json_extract(result.body, '$.fields.request')=request.id
-                   AND result.actor=json_extract(request.body, '$.fields.reviewer')
-                   AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail','feedback')
-               )
+               AND NOT EXISTS (SELECT 1 FROM claims result WHERE {})
              ORDER BY CANONICAL_ASC(request)",
-        ))?;
+            reviewer_answer_sql("result")
+        )))?;
         statement
             .query_map([reviewer], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()?
@@ -20011,6 +20326,10 @@ fn operational_annotation(
 
 /// How long a mission whose run failed or was cancelled stays in the current missions view.
 pub(crate) const RECENTLY_ENDED_MS: u128 = 24 * 60 * 60 * 1000;
+
+/// The condition of a broken exec gate's operational failure. Its item goes to the publisher of
+/// the run's mission revision: a person reads it in their attention, an agent as a fault.
+pub(crate) const GATE_BROKEN_CONDITION: &str = "gate-broken";
 
 /// The earliest end that still counts as recent.
 pub(crate) fn recently_ended_since() -> u128 {
@@ -22602,6 +22921,7 @@ fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3
     project_replicated_base_claims(transaction)?;
     project_replicated_mission_runs(transaction)?;
     rebuild_planning_tx(transaction).map_err(internal)?;
+    resources::rebuild(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -24623,10 +24943,13 @@ fn carried_revision_step_paths(
 ) -> BTreeSet<String> {
     let old_definitions = flattened_step_definition_hashes(old);
     let new_definitions = flattened_step_definition_hashes(new);
+    let regated = regated_submitted_steps(old, new, current);
     let dependencies = flattened_dependencies(new);
     let mut unstable = new_definitions
         .iter()
-        .filter(|(path, hash)| old_definitions.get(*path) != Some(*hash))
+        .filter(|(path, hash)| {
+            old_definitions.get(*path) != Some(*hash) && !regated.contains(*path)
+        })
         .map(|(path, _)| path.clone())
         .collect::<BTreeSet<_>>();
     loop {
@@ -24654,6 +24977,51 @@ fn carried_revision_step_paths(
             .map(|step| step.step.clone()),
     );
     compatible
+}
+
+/// The steps a revision changes only in their gates while their worker's submitted work waits
+/// on those gates, as it does behind a broken gate. They keep the submission: the successor
+/// generation checks the work against the revised gates rather than asking for it again.
+fn regated_submitted_steps(
+    old: &MissionSpec,
+    new: &MissionSpec,
+    current: &[StepRunView],
+) -> BTreeSet<String> {
+    let old_steps = flatten_mission_step_specs(old)
+        .into_iter()
+        .map(|step| (step.path.as_str(), step))
+        .collect::<BTreeMap<_, _>>();
+    flatten_mission_step_specs(new)
+        .into_iter()
+        .filter(|step| {
+            current.iter().any(|view| {
+                view.step == step.path && view.status == "verifying" && view.worker_reported
+            }) && old_steps.get(step.path.as_str()).is_some_and(|old| {
+                old.definition_hash != step.definition_hash
+                    && step_definition_without_gates(old) == step_definition_without_gates(step)
+            })
+        })
+        .map(|step| step.path.clone())
+        .collect()
+}
+
+/// A step's definition with its gates, and the gates and definition hashes of any steps nested
+/// in it, left out.
+fn step_definition_without_gates(step: &crate::model::StepSpec) -> Value {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(fields) => {
+                fields.remove("gates");
+                fields.remove("definition_hash");
+                fields.values_mut().for_each(strip);
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(step).unwrap_or(Value::Null);
+    strip(&mut value);
+    value
 }
 
 fn flattened_step_definition_hashes(mission: &MissionSpec) -> BTreeMap<String, String> {
@@ -33174,7 +33542,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: runtime::compatibility_digest(&st3_schema::registry().digest()),
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
@@ -33245,7 +33613,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: runtime::compatibility_digest(&st3_schema::registry().digest()),
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
@@ -33293,7 +33661,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             projection_digests: Default::default(),
             peer: peer.into(),
             fleet_id: TEST_FLEET.into(),
-            schema_digest: st3_schema::registry().digest(),
+            schema_digest: runtime::compatibility_digest(&st3_schema::registry().digest()),
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
@@ -40954,6 +41322,92 @@ version 2
     }
 
     #[test]
+    fn a_gate_only_revision_keeps_submitted_work_and_any_other_change_starts_it_again() {
+        let store = Store::open_memory("node").unwrap();
+        let source = |gate: &str, goal: &str| {
+            format!(
+                r#"
+version 2
+
+  mission "carry" state="ready" {{
+    goal "Keep submitted work across a gate revision."
+    step "work" {{
+      assigned-to "agent/worker"
+      goal {goal:?}
+      gate "checked" {{ exec {gate:?}; host "node"; workspace "/tmp" }}
+    }}
+  }}
+"#
+            )
+        };
+        publish_carry(&store, &source("exit 2", "Do the work."), "regate-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "regate-run".into(),
+            })
+            .unwrap();
+        let work = |run: &MissionRunView| {
+            run.steps
+                .iter()
+                .find(|step| step.step == "work")
+                .unwrap()
+                .clone()
+        };
+        let first = work(&run).subject;
+        store.set_step_state(&first, "ready", None).unwrap();
+        store
+            .work_action(&first, "claim", &carry_request("one", "regate-claim"))
+            .unwrap();
+        let submitted = store
+            .work_action(&first, "complete", &carry_request("one", "regate-complete"))
+            .unwrap();
+        assert_eq!(submitted.status, "verifying");
+
+        let regated = publish_carry(&store, &source("exit 0", "Do the work."), "regate-two");
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &regated,
+                "person/requester",
+                "the gate was broken",
+                "regate-revision",
+            )
+            .unwrap();
+        let carried = work(&adopted);
+        assert_ne!(carried.subject, first);
+        assert_eq!(
+            (
+                carried.status.as_str(),
+                carried.worker_reported,
+                carried.attempt
+            ),
+            ("verifying", true, 1)
+        );
+
+        let rewritten = publish_carry(&store, &source("exit 0", "Do other work."), "regate-three");
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &rewritten,
+                "person/requester",
+                "the work changed",
+                "regate-goal-revision",
+            )
+            .unwrap();
+        let restarted = work(&adopted);
+        assert_eq!(
+            (restarted.status.as_str(), restarted.worker_reported),
+            ("pending", false)
+        );
+    }
+
+    #[test]
     fn a_person_revises_a_run_from_outside_its_graph_location() {
         let store = Store::open_memory("node").unwrap();
         publish_carry(&store, CARRY_SOURCE, "carry-one");
@@ -44539,6 +44993,7 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("documents", &["created_index"]),
     ("desired", &[]),
     ("message_index", &["created_index"]),
+    ("resource_observations", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),
