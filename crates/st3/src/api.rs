@@ -7931,12 +7931,9 @@ async fn cancel_planning_session(
 }
 
 fn required_planning_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
-    let id = launch_session_id(id);
-    state
-        .store
-        .planning_session(id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("launch `{id}` does not exist")))
+    // Legacy CLI launch IDs can themselves begin with `launch/`. Resolve the exact stored
+    // ID before treating that prefix as the client resource namespace.
+    client_launch_session(state, id)
 }
 
 fn normalize_planning_reviewer(value: &str) -> String {

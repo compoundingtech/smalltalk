@@ -6911,7 +6911,13 @@ fn validate_work_fence(state: &AppState, target: &str, fence: &Fence) -> Result<
         || fence
             .runtime_incarnation
             .as_deref()
-            .is_some_and(|incarnation| work.claim_incarnation.as_deref() != Some(incarnation))
+            .is_some_and(|incarnation| {
+                // A ready step has no lease incarnation yet. Claim dispatch separately
+                // checks the caller's current runtime before acquiring the lease.
+                work.claim_incarnation
+                    .as_deref()
+                    .is_some_and(|claimed| claimed != incarnation)
+            })
     {
         return Err(stale(format!(
             "the execution fence for `{}` is stale",
@@ -7701,6 +7707,22 @@ async fn dispatch_action(
         | "work.release") => {
             let target = parameter_string(p, "target_id")?;
             validate_work_fence(state, &target, &request.fence)?;
+            if action == "work.claim" {
+                let expected = request
+                    .fence
+                    .runtime_incarnation
+                    .as_deref()
+                    .ok_or_else(|| validation("work claim requires a runtime incarnation fence"))?;
+                let live = state
+                    .store
+                    .current_harness(authority_actor)
+                    .map_err(ApiError::internal)?;
+                if !live.as_ref().is_some_and(|harness| {
+                    harness.incarnation_id == expected && harness.state != "ended"
+                }) {
+                    return Err(stale("the claiming agent's runtime incarnation changed"));
+                }
+            }
             let result = state
                 .store
                 .work_action(
@@ -7809,6 +7831,14 @@ async fn dispatch_action(
                 return Err(stale("the revision proposal generation fence is stale"));
             }
             if decision == "mission.approve-revision" {
+                if request
+                    .fence
+                    .preview_token
+                    .as_deref()
+                    .is_some_and(|preview| proposal.preview_hash.as_deref() != Some(preview))
+                {
+                    return Err(stale("the revision proposal preview fence is stale"));
+                }
                 let result = approve_revision_proposal(
                     State(state.clone()),
                     AxumPath(target),

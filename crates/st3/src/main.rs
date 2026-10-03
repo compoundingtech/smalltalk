@@ -21586,6 +21586,42 @@ mod tests {
     }
 
     #[test]
+    fn every_offered_cli_command_has_an_action_coverage_row() {
+        fn walk(
+            command: &clap::Command,
+            prefix: &str,
+            output: &mut std::collections::BTreeSet<String>,
+        ) {
+            let children = command
+                .get_subcommands()
+                .filter(|child| !child.is_hide_set() && child.get_name() != "help")
+                .collect::<Vec<_>>();
+            if prefix != "st" && (children.is_empty() || !command.is_subcommand_required_set()) {
+                output.insert(prefix.to_owned());
+            }
+            for child in children {
+                walk(child, &format!("{prefix} {}", child.get_name()), output);
+            }
+        }
+        let mut command = Cli::command();
+        command.build();
+        let mut offered = std::collections::BTreeSet::new();
+        walk(&command, "st", &mut offered);
+        let inventory: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/st3/action-coverage.json")).unwrap();
+        let documented = inventory["cli"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["command"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            offered, documented,
+            "Update the inventory and its end-to-end coverage when the CLI changes"
+        );
+    }
+
+    #[test]
     fn mission_start_help_shows_the_run_subject_an_id_names() {
         use clap::CommandFactory as _;
         let mut command = Cli::command();

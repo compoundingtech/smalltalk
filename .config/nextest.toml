@@ -43,3 +43,8 @@ priority = 100
 filter = 'package(st3) and (test(/^boot_canaries::/) or test(/^no_st2_seat::/))'
 retries = 0
 priority = 100
+
+# Product action admission and restart races must fail visibly, rather than pass on retry.
+[[profile.ci.overrides]]
+filter = 'package(st3) and (test(/^action_coverage::/) or test(/^fleet::action_coverage_/))'
+retries = 0

@@ -1594,7 +1594,13 @@ async fn perform(
             let Resource::Attention(attention) = &current.value else {
                 anyhow::bail!("This launch changed; look again");
             };
-            let launch = client.launches_get(&attention.source_id).await?;
+            let launch_id = attention.launch_id.as_deref().unwrap_or_else(|| {
+                attention
+                    .source_id
+                    .strip_prefix("planning-session/")
+                    .unwrap_or(&attention.source_id)
+            });
+            let launch = client.launches_get(launch_id).await?;
             let Resource::Launch(resource) = launch.value else {
                 anyhow::bail!("The launch is gone");
             };
@@ -1921,6 +1927,274 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_sends_retries_discussions_and_creation_survive_daemon_restarts() {
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("daemon.sock");
+        async fn serve(
+            root: &std::path::Path,
+            socket: &std::path::Path,
+        ) -> (Arc<st3::store::Store>, tokio::task::JoinHandle<()>) {
+            let store =
+                Arc::new(st3::store::Store::open(&root.join("graph.db"), "ui-actions").unwrap());
+            let state = st3::api::AppState {
+                store: store.clone(),
+                notify: Arc::new(tokio::sync::Notify::new()),
+                event_notify: tokio::sync::watch::channel(0_u64).0,
+                node: "ui-actions".into(),
+                state_dir: root.into(),
+                pty_root: root.join("pty"),
+                pty_binary: "pty".into(),
+                fleet_id: None,
+                configured_peers: vec![],
+                client_relay: None,
+                native_session_home: None,
+                planner_default: Default::default(),
+            };
+            let path = socket.to_owned();
+            let server = tokio::spawn(async move {
+                st3::api::serve_unix(&path, st3::api::router(state))
+                    .await
+                    .unwrap();
+            });
+            for _ in 0..100 {
+                if socket.exists() {
+                    Client::unix_as(socket, "person/avery")
+                        .capabilities()
+                        .await
+                        .unwrap();
+                    return (store, server);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("private UI daemon did not listen");
+        }
+        let (mut store, mut server) = serve(root.path(), &socket).await;
+        let client = Client::unix_as(&socket, "person/avery");
+        let model = Model::default();
+        let image = root.path().join("copper.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nproof").unwrap();
+        let sent = Mutex::new(None);
+        let send = Effect::Send {
+            agent: "agent/example/worker".into(),
+            text: "Copper proof".into(),
+            tags: vec![],
+            images: vec![image],
+        };
+        let (_, message) = perform(&client, "person/avery", &model, send.clone(), Some(&sent))
+            .await
+            .unwrap();
+        let message = message.unwrap();
+        assert_eq!(
+            store.message(&message).unwrap().unwrap().attachments.len(),
+            1
+        );
+        let index = store.index().unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(&socket).unwrap();
+        (store, server) = serve(root.path(), &socket).await;
+        // This is the live loop's resend path: replay the preserved request first.
+        let replay = send_message(
+            &client,
+            "agent/example/worker",
+            "Copper proof".into(),
+            None,
+            None,
+            None,
+            vec![],
+            store
+                .message(&message)
+                .unwrap()
+                .unwrap()
+                .attachments
+                .iter()
+                .map(|a| st3_client::AttachmentInput {
+                    blob: format!("blob/{}", a.sha256),
+                    media_type: a.media_type.clone(),
+                    name: a.name.clone(),
+                })
+                .collect(),
+            Some(&sent),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.as_deref(), Some(message.as_str()));
+        assert_eq!(store.index().unwrap(), index);
+        for effect in [
+            Effect::Discuss {
+                to: "agent/example/worker".into(),
+                title: "Copper discussion".into(),
+                text: "Record the evidence".into(),
+            },
+            Effect::CreateAgent {
+                name: "example/copper".into(),
+                harness: "claude".into(),
+                model: None,
+                effort: None,
+                host: None,
+                message: None,
+            },
+            Effect::CreateTerminal {
+                name: "Copper shell".into(),
+            },
+            Effect::CreateLaunch {
+                title: "Copper launch".into(),
+                request: "Prepare the copper proof".into(),
+                mission: "mission/example/copper".into(),
+                workspace: root.path().display().to_string(),
+            },
+        ] {
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+            std::fs::remove_file(&socket).unwrap();
+            (store, server) = serve(root.path(), &socket).await;
+            perform(&client, "person/avery", &model, effect, None)
+                .await
+                .unwrap();
+        }
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .any(|item| item.subject == "agent/example/copper")
+        );
+        assert_eq!(store.planning_sessions(true).unwrap().len(), 1);
+        let launch = store.planning_sessions(true).unwrap().pop().unwrap();
+        let transport = st3::client::Client::unix_as(&socket, "person/avery").unwrap();
+        let _: serde_json::Value = transport.post(&format!("/v1/launches/{}/variants/default/submit", launch.id), &st3::model::PlanningCandidateSubmitRequest {
+            actor: launch.planner.clone(), markdown: b"Copper proof".to_vec(),
+            kdl: b"version 2\nmission \"example/copper\" state=\"ready\" { goal \"Record the copper proof.\"; step \"proof\" { agentless } }\n".to_vec(),
+            idempotency_key: "ui-prepare-candidate".into(),
+        }).await.unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(&socket).unwrap();
+        (store, server) = serve(root.path(), &socket).await;
+        let attention: serde_json::Value = transport.get("/v1/client/attention").await.unwrap();
+        let review = attention["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["source_id"] == launch.subject)
+            .unwrap();
+        perform(
+            &client,
+            "person/avery",
+            &model,
+            Effect::LaunchRevise {
+                id: review["id"].as_str().unwrap().into(),
+                feedback: "Name the copper evidence".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.planning_session(&launch.id).unwrap().unwrap().status,
+            "revision-requested"
+        );
+        let challenge: serde_json::Value = transport.post("/v1/client/pairings", &serde_json::json!({"api_version": "st3.client.v0", "device_name": "Copper phone", "person_id": "person/avery", "full_control": true})).await.unwrap();
+        let paired: serde_json::Value = transport.post(&format!("/v1/client/pairings/{}/complete", challenge["pairing_id"].as_str().unwrap().trim_start_matches("pairing/")), &serde_json::json!({"api_version": "st3.client.v0", "code": challenge["code"], "device_public_key": "copper-phone-key-000000000000000000000000"})).await.unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(&socket).unwrap();
+        (store, server) = serve(root.path(), &socket).await;
+        perform(
+            &client,
+            "person/avery",
+            &model,
+            Effect::RevokeDevice {
+                id: paired["device_id"].as_str().unwrap().into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            Client::unix_gateway(&socket, paired["credential"].as_str().unwrap())
+                .capabilities()
+                .await
+                .is_err()
+        );
+        // A retired/changed Home message card cannot accidentally send a reply.
+        let index = store.index().unwrap();
+        assert!(
+            perform(
+                &client,
+                "person/avery",
+                &model,
+                Effect::Reply {
+                    id: "attention/absent-card".into(),
+                    to: "agent/example/worker".into(),
+                    text: "Copper reply".into()
+                },
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(store.index().unwrap(), index);
+        let source = "version 2\nmission \"example/cancel\" state=\"ready\" { goal \"Record the proof.\"; step \"proof\" { agentless } }\n";
+        let intent = st3::parse_intent(source, "ui-actions").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "ui-cancel-definition",
+                Some("person/avery"),
+            )
+            .unwrap();
+        let run = store
+            .create_mission_run(&st3::model::MissionRunRequest {
+                mission: "example/cancel".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/avery".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "ui-cancel-run".into(),
+            })
+            .unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(&socket).unwrap();
+        (store, server) = serve(root.path(), &socket).await;
+        let mut current = Model::default();
+        current.reload(&client).await.unwrap();
+        perform(
+            &client,
+            "person/avery",
+            &current,
+            Effect::CancelRun {
+                mission: "mission/example/cancel".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .step_run(&run.steps[0].subject)
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        server.abort();
+    }
 
     /// A stale fence is retried for an action that reads a fresh one each try, but not for an
     /// attention action: it already moved once to its source's current card. A busy or absent

@@ -2732,3 +2732,255 @@ async fn a_backlog_of_several_pages_is_fetched_without_waiting_for_the_quiet_win
     }
     eprintln!("caught up {:?} after returning", started.elapsed());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts() {
+    let root = tempfile::tempdir().unwrap();
+    let mut amber = anchor(root.path(), "fixture-amber").await;
+    let mut cobalt = joined(root.path(), &amber, "fixture-cobalt", &[]).await;
+    amber.st_ok(&[
+        "claim",
+        "custom/fleet-test/coverage-before-restart",
+        NOTE,
+        "--actor",
+        PERSON,
+        "--field",
+        "text=durable",
+    ]);
+    cobalt.st_ok(&["fleet", "wait", "--timeout", "60s"]);
+    amber.restart().await;
+    cobalt.restart().await;
+    for node in [&amber, &cobalt] {
+        node.wait_listening().await;
+        if node.name != "fixture-amber" {
+            node.st_ok(&["fleet", "wait", "--timeout", "60s"]);
+        }
+        node.st_json(&["fleet", "status"]);
+        node.st_json(&["replication", "status"]);
+        node.st_json(&["replication", "invalid"]);
+    }
+    amber.st_json(&["replication", "diff", "fixture-cobalt"]);
+    cobalt.st_ok(&["fleet", "mode", "dial-out", "--no-service"]);
+    cobalt.restart().await;
+    assert!(
+        fs::read_to_string(cobalt.state_dir().join("fleet/fleet.toml"))
+            .unwrap()
+            .contains("dial-out")
+    );
+    let port = cobalt.port.to_string();
+    cobalt.st_ok(&[
+        "fleet",
+        "mode",
+        "listening",
+        "--port",
+        &port,
+        "--no-service",
+    ]);
+    cobalt.restart().await;
+    cobalt.wait_listening().await;
+    let code = amber.invite("fixture-revoked", &[]);
+    let invitations = amber.st_json(&["fleet", "invites"]);
+    let id = invitations
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|invite| invite["name"] == "fixture-revoked")
+        .unwrap()["invite"]
+        .as_str()
+        .unwrap();
+    amber.st_ok(&[
+        "fleet",
+        "invites",
+        "revoke",
+        id,
+        "--as",
+        PERSON,
+        "--reason",
+        "The fixture invitation is withdrawn.",
+    ]);
+    for _ in 0..2 {
+        amber.restart().await;
+        amber.wait_listening().await;
+        let refused = Node::new(root.path(), "fixture-revoked").join(&code, &[]);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("refused this code"));
+    }
+    amber.st_json(&["replication", "checkpoint", "plan", "--cut", "2026-10-01"]);
+    amber.st_json(&[
+        "replication",
+        "checkpoint",
+        "excuse",
+        "fixture-cobalt",
+        "--as",
+        PERSON,
+        "--reason",
+        "The fixture writer may be offline.",
+    ]);
+    amber.restart().await;
+    amber.st_json(&["replication", "checkpoint", "status"]);
+    amber.st_json(&[
+        "replication",
+        "checkpoint",
+        "resume",
+        "--as",
+        PERSON,
+        "--reason",
+        "The fixture projection was checked.",
+    ]);
+    amber.restart().await;
+    amber.wait_listening().await;
+    cobalt.st_ok(&[
+        "fleet",
+        "leave",
+        "--no-service",
+        "--wait",
+        "60s",
+        "--as",
+        PERSON,
+    ]);
+    cobalt.restart().await;
+    assert!(!cobalt.state_dir().join("fleet").exists());
+    let mut jade = joined(root.path(), &amber, "fixture-jade", &[]).await;
+    jade.st_ok(&["fleet", "wait", "--timeout", "60s"]);
+    amber.st_ok(&[
+        "fleet",
+        "remove",
+        "fixture-jade",
+        "--as",
+        PERSON,
+        "--reason",
+        "The fixture member is removed.",
+    ]);
+    amber.restart().await;
+    wait_until(
+        "jade records its removal after the sponsor restarted",
+        60,
+        || async {
+            fs::read_to_string(jade.state_dir().join("fleet/fleet.toml"))
+                .is_ok_and(|file| file.contains("[removed]"))
+        },
+    )
+    .await;
+    jade.restart().await;
+    assert_eq!(
+        jade.st_json(&["fleet", "status"])["removed"]["code"],
+        "member-removed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", http.local_addr().unwrap());
+    let posts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let posted_bodies = posts.clone();
+    let app = axum::Router::new().fallback(
+        axum::routing::get(|uri: axum::http::Uri| async move {
+            let issue = json!({"number": 12, "state": "open", "title": "Copper proof", "html_url": "https://example.org/copper", "updated_at": "2026-10-01T00:00:00Z", "user": {"login": "fixture-author"}});
+            let path = uri.path();
+            axum::Json(if path.ends_with("/issues/12") {
+                issue
+            } else if path.ends_with("/issues") {
+                json!([issue])
+            } else if path == "/user" {
+                json!({"login": "fixture-bot"})
+            } else if path.ends_with("/issues/comments/801") {
+                json!({"id": 801, "html_url": "https://github.com/fixture/app/issues/12#issuecomment-801", "user": {"login": "fixture-bot"}})
+            } else if path.ends_with("/pulls/12/reviews/802") {
+                json!({"id": 802, "html_url": "https://github.com/fixture/app/pull/12#pullrequestreview-802", "user": {"login": "fixture-bot"}})
+            } else if path.ends_with("/issues/comments/902") {
+                json!({"id": 902, "user": {"login": "fixture-other"}})
+            } else {
+                json!([])
+            })
+        }).post(move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| {
+            let posts = posted_bodies.clone();
+            async move {
+                posts.lock().unwrap().push(body);
+                axum::Json(if uri.path().ends_with("/reviews") {
+                    json!({"id": 802, "html_url": "https://github.com/fixture/app/pull/12#pullrequestreview-802", "user": {"login": "fixture-bot"}})
+                } else {
+                    json!({"id": 801, "html_url": "https://github.com/fixture/app/issues/12#issuecomment-801", "user": {"login": "fixture-bot"}})
+                })
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(http, app).await.unwrap(); });
+    let mut node = Node::new(root.path(), "fixture-watch");
+    node.env.push(("GH_TOKEN".into(), "fixture-token".into()));
+    node.env.push(("ST3_GITHUB_API_URL".into(), api));
+    node.start().await;
+    let file = node.root.join("seat.kdl");
+    fs::write(&file, format!("version 2\nagent \"example/watch\" {{ host \"fixture-watch\"; workspace {:?}; command \"true\"; restart \"never\" }}\n", node.root)).unwrap();
+    node.st_ok(&["agents", "apply", file.to_str().unwrap(), "--as", PERSON]);
+    let cli = |args: &[&str]| -> Value {
+        let output = node.command(args).env("ST_AGENT", "agent/example/watch").output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stderr), node.logs());
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let first = cli(&["--json", "gh", "watch", "fixture/app#12", "--until", "1h", "--as", "agent/example/watch"]);
+    let subject = first["subject"].as_str().unwrap().to_owned();
+    assert_eq!(first["state"], "active");
+    let refused = node.command(&["--json", "gh", "comment", "fixture/app#12", "--body", "Foreign actor", "--as", "agent/example/other"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("agent/example/watch"));
+    assert!(posts.lock().unwrap().is_empty());
+    let posted = cli(&["--json", "gh", "comment", "fixture/app#12", "--body", "Copper proof", "--as", "agent/example/watch"]);
+    assert_eq!(posted["kind"], "comment");
+    assert_eq!(posted["id"], 801);
+    assert_eq!(posted["watch"]["subject"], subject);
+    node.restart().await;
+    let output = node.command(&["--json", "gh", "ls", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().iter().filter(|watch| watch["subject"] == subject).count(), 1);
+    let foreign_url = "https://github.com/fixture/app/issues/12#issuecomment-902";
+    let refused = node.command(&["--json", "gh", "own", foreign_url, "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("github-post-not-ours"));
+    node.restart().await;
+    for _ in 0..2 {
+        let output = node.command(&["--json", "gh", "own", "https://github.com/fixture/app/issues/12#issuecomment-801", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let owned: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(owned["id"], 801);
+        assert_eq!(owned["agent"], "agent/example/watch");
+        node.restart().await;
+    }
+    let review_file = node.root.join("review.txt");
+    fs::write(&review_file, "The Copper proof is ready.").unwrap();
+    let output = node.command(&["--json", "gh", "comment", "fixture/app#12", "--body-file", review_file.to_str().unwrap(), "--review", "approve", "--no-watch", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let review: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(review["kind"], "review");
+    assert_eq!(review["id"], 802);
+    node.restart().await;
+    let output = node.command(&["--json", "gh", "own", "https://github.com/fixture/app/pull/12#pullrequestreview-802", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let store = st3::store::Store::open(&node.state_dir().join("claims.sqlite3"), "fixture-watch").unwrap();
+    for (kind, id) in [("comment", 801), ("review", 802)] {
+        let subject = st3::github_watch::github_post_subject("fixture/app", kind, id);
+        assert_eq!(store.claims_for(&subject, Some("github.posted")).unwrap().len(), 1);
+        assert_eq!(store.github_post_agent("fixture/app", kind, id).unwrap().as_deref(), Some("agent/example/watch"));
+    }
+    assert_eq!(store.github_post_agent("fixture/app", "comment", 902).unwrap(), None);
+    drop(store);
+    {
+        let bodies = posts.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["body"], "Copper proof");
+        assert_eq!(bodies[1]["body"], "The Copper proof is ready.");
+        assert_eq!(bodies[1]["event"], "APPROVE");
+    }
+    for _ in 0..2 {
+        let output = node.command(&["--json", "gh", "unwatch", "fixture/app#12", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        node.restart().await;
+    }
+    let listed = node.st_json(&["gh", "ls", "--all", "--as", PERSON]);
+    let ended = listed.as_array().unwrap().iter().find(|watch| watch["subject"] == subject).unwrap();
+    assert_eq!(ended["state"], "ended");
+    assert_eq!(ended["ended"], "unwatched");
+    server.abort();
+}
