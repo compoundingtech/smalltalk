@@ -282,6 +282,7 @@
         "id": "attention/1",
         "kind": {
           "because": "cut-over cannot start until you answer; the old store stays read-only meanwhile",
+          "feedback": false,
           "kind": "review",
           "look_at": [
             [
