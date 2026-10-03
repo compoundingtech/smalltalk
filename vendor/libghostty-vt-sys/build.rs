@@ -79,7 +79,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DEBUG");
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
-    println!("cargo:rerun-if-changed=crates/libghostty-vt-sys/build.rs");
+    // Relative to this package. Upstream names its path in the libghostty-rs workspace, which
+    // does not exist here, and Cargo runs a build script whose watched file is missing every time.
+    println!("cargo:rerun-if-changed=build.rs");
 
     // An explicit source override should stay authoritative even when the
     // pkg-config feature is enabled, so local Ghostty checkouts remain easy to
