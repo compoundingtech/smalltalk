@@ -794,7 +794,7 @@ mod tests {
         LocalTarget {
             socket: "/nonexistent".into(),
             caller: caller.map(str::to_owned),
-            person: Some("person/johannes".into()),
+            person: Some("person/operator".into()),
         }
     }
 
@@ -867,7 +867,7 @@ mod tests {
             ["step-run/claimed-agent/me"]
         );
         assert_eq!(
-            subjects(WorkFilter::Claimed, Some("person/johannes")).len(),
+            subjects(WorkFilter::Claimed, Some("person/operator")).len(),
             2
         );
         assert_eq!(subjects(WorkFilter::Any, None).len(), 4);
@@ -911,15 +911,15 @@ mod tests {
         let listed = Listed {
             items: vec![
                 fixture("attention", |item| {
-                    item["person_id"] = "person/johannes".into()
+                    item["person_id"] = "person/operator".into()
                 }),
                 fixture("attention", |item| {
-                    item["person_id"] = "person/nathan".into()
+                    item["person_id"] = "person/reviewer".into()
                 }),
             ],
             agents: vec![fixture("agent", |item| item["id"] = "agent/me".into())],
             devices: vec![fixture("device", |item| {
-                item["person_id"] = "person/nathan".into()
+                item["person_id"] = "person/reviewer".into()
             })],
         };
         let subjects = |entity| {
@@ -930,9 +930,9 @@ mod tests {
         };
         assert_eq!(
             subjects(Entity::Person),
-            ["person/johannes", "person/nathan"]
+            ["person/operator", "person/reviewer"]
         );
-        assert_eq!(subjects(Entity::Actor), ["person/johannes", "agent/me"]);
+        assert_eq!(subjects(Entity::Actor), ["person/operator", "agent/me"]);
     }
 
     #[tokio::test]

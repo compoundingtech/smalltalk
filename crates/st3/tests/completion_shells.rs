@@ -39,7 +39,7 @@ fn observe(store: &Store, subject: &str, status: &str) {
 }
 
 fn fleet_subject(index: usize) -> String {
-    format!("agent/fleet/worker-{index:03}")
+    format!("agent/load/worker-{index:03}")
 }
 
 /// A daemon on `ROOT/st3.sock` with `RUNNING` fleet terminals, one solo terminal, and one
