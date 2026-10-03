@@ -2575,7 +2575,10 @@ impl Ui {
                     "alt+shift+o",
                     "simplified view: tool calls fold to a line (this device)",
                 ),
-                ("alt+i", "the agent's details beside it"),
+                (
+                    "alt+i  ctrl+i",
+                    "the agent's details beside it (ctrl+i where the terminal tells it from tab)",
+                ),
                 ("drag", "select text in one pane; release copies it"),
                 ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
                 (
