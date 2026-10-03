@@ -5038,6 +5038,41 @@ mod tests {
         assert!(screen(&ui).contains("echo in the shell"));
     }
 
+
+    #[test]
+    fn text_on_home_over_the_glass_selects_and_copies() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut ui = glass();
+        ui.open_home();
+        let shown = screen(&ui);
+        let (row, line) = shown
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("1,204,881 rows"))
+            .expect("Home shows the selected request");
+        let start = line.find("1,204,881").unwrap();
+        let column = line[..start].chars().count() as u16;
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.mouse(mouse(MouseEventKind::Down(MouseButton::Left), column));
+        ui.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), column + 13));
+        screen(&ui);
+        assert_eq!(ui.selected_text().as_deref(), Some("1,204,881 rows"));
+        ui.mouse(mouse(MouseEventKind::Up(MouseButton::Left), column + 13));
+        assert!(ui.home_open(), "a drag on Home keeps it open");
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text == "Copied 1 line"),
+            "{:?}",
+            ui.flash
+        );
+    }
+
     #[test]
     fn home_opens_over_an_attached_shell_without_detaching_it() {
         let mut ui = glass();
