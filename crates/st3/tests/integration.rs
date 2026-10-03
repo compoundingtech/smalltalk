@@ -34,6 +34,7 @@ mod messaging_faults;
 mod mission_cancellation;
 mod no_st2_seat;
 mod operational_state_contract;
+mod owned_sets;
 mod reconcile_pass_perf;
 mod recorder_report;
 mod seat_queue_perf;

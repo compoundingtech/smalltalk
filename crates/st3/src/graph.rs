@@ -66,7 +66,14 @@ struct ParseContext {
 }
 
 pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent, St3Error> {
-    let intent = parse_intent_with_owner(source, default_host, None, false)?;
+    let intent = parse_intent_with_owner(source, default_host, None, false, false)?;
+    validate_mission_runtimes(&intent, default_host)?;
+    Ok(intent)
+}
+
+/// Empty membership is meaningful only on the owned-set route; apply still requires explicit intent.
+pub fn parse_owned_set_intent(source: &str, default_host: &str) -> Result<NormalizedIntent, St3Error> {
+    let intent = parse_intent_with_owner(source, default_host, None, true, true)?;
     validate_mission_runtimes(&intent, default_host)?;
     Ok(intent)
 }
@@ -75,7 +82,7 @@ pub(crate) fn parse_internal_intent(
     source: &str,
     default_host: &str,
 ) -> Result<NormalizedIntent, St3Error> {
-    parse_intent_with_owner(source, default_host, None, true)
+    parse_intent_with_owner(source, default_host, None, true, false)
 }
 
 #[cfg(test)]
@@ -95,7 +102,7 @@ pub(crate) fn parse_execution_intent(
         "mission-run/{}",
         run_id.strip_prefix("mission-run/").unwrap_or(run_id)
     );
-    parse_intent_with_owner(source, default_host, Some(&owner), true)
+    parse_intent_with_owner(source, default_host, Some(&owner), true, false)
 }
 
 /// The placeholder variables a mission's declarations are interpolated with when they are
@@ -238,6 +245,7 @@ fn parse_intent_with_owner(
     default_host: &str,
     owner_run: Option<&str>,
     allow_execution_root: bool,
+    allow_empty: bool,
 ) -> Result<NormalizedIntent, St3Error> {
     if source.len() > 16 * 1024 * 1024 {
         return Err(St3Error::new(
@@ -259,7 +267,7 @@ fn parse_intent_with_owner(
         .iter()
         .filter(|node| node.name().value() != "version")
         .collect::<Vec<_>>();
-    if declarations.is_empty() {
+    if declarations.is_empty() && !allow_empty {
         return Err(St3Error::new(
             "invalid-root",
             "an st publication must contain at least one declaration after `version 2`",

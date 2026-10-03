@@ -1,4 +1,7 @@
 mod glasses;
+pub mod owned_sets;
+#[cfg(test)]
+mod owned_sets_tests;
 mod resources;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -3142,6 +3145,7 @@ impl Store {
                 "an embedded loop mission can start only through its parent loop",
             ));
         }
+        owned_sets::guard_mission_start(&self.readers.get(), mission_id)?;
         let mission = self
             .mission_spec(mission_id, request.revision.as_deref())
             .map_err(internal)?
@@ -3196,6 +3200,7 @@ impl Store {
             return serde_json::from_str(&response).map_err(internal);
         }
         let transaction = connection.transaction().map_err(internal)?;
+        owned_sets::guard_mission_start(&transaction, mission_id)?;
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
         enforce_mission_run_capacity(&transaction, &mission)?;
         let run_id = self
@@ -4712,6 +4717,7 @@ impl Store {
         let retired = crate::mission::retired_mission(current)?;
         let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
+        owned_sets::refuse_unmanaged(&transaction, &format!("mission/{mission_id}"))?;
         let active = transaction
             .query_row(
                 "SELECT id FROM mission_runs
@@ -7744,8 +7750,28 @@ impl Store {
         idempotency_key: &str,
         actor: Option<&str>,
     ) -> Result<ApplyResponse, St3Error> {
+        self.apply_as_impl(intent, expected, idempotency_key, actor, None)
+    }
+
+    fn apply_as_impl(
+        &self,
+        intent: &NormalizedIntent,
+        expected: &BTreeMap<String, Vec<String>>,
+        idempotency_key: &str,
+        actor: Option<&str>,
+        owned: Option<&owned_sets::Options>,
+    ) -> Result<ApplyResponse, St3Error> {
         self.connection
             .batched(|transaction| -> Result<ApplyResponse, St3Error> {
+                if let Some(options) = owned {
+                    let digest = canonical_hash(&(intent, options, actor)).map_err(internal)?;
+                    let cache_key = opaque_cache_key(&format!("owned-set-request:{idempotency_key}"));
+                    let prior: Option<String> = transaction.query_row("SELECT response FROM idempotency WHERE operation_id=?1", [&cache_key], |row|row.get(0)).optional().map_err(internal)?;
+                    if prior.as_deref().is_some_and(|prior|prior != digest) {
+                        return Err(St3Error::new("idempotency-mismatch", "owned-set request key was used with different input"));
+                    }
+                    transaction.execute("INSERT OR IGNORE INTO idempotency(operation_id,response) VALUES (?1,?2)", params![cache_key,digest]).map_err(internal)?;
+                }
                 if let Some(response) = transaction
                     .query_row(
                         "SELECT response FROM idempotency WHERE operation_id = ?1",
@@ -7757,6 +7783,23 @@ impl Store {
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
+                let owned_plan = owned.map(|options| owned_sets::plan_tx(transaction, intent, options)).transpose()?;
+                if let (Some(plan), Some(options)) = (&owned_plan, owned) {
+                    owned_sets::validate_apply(plan, options)?;
+                    if plan.preview.noop {
+                        return Ok(ApplyResponse {
+                            changed: false, store_index: current_index_tx(transaction).map_err(internal)?,
+                            batch_id: None, claim_ids: Vec::new(), subject_tokens: BTreeMap::new(),
+                            reconcile_subjects: Vec::new(), resolved_kdl: String::new(), operations: Vec::new(),
+                        });
+                    }
+                } else {
+                    for subject in intent.subjects.keys().chain(intent.missions.values().map(|m| &m.subject)) {
+                        owned_sets::refuse_unmanaged(transaction, subject)?;
+                    }
+                }
+                let intent = owned_plan.as_ref().map_or(intent, |p| &p.intent);
+                let expected = owned_plan.as_ref().map_or(expected, |p| &p.preview.expected_subjects);
                 validate_documents(transaction, &intent.document_refs)?;
                 for desired in intent
                     .subjects
@@ -8038,7 +8081,7 @@ impl Store {
                 for repair in &intent.replica_repairs {
                     operations_changed |= validate_replica_repair(transaction, repair)?;
                 }
-                let changed = desired_changed || missions_changed || operations_changed;
+                let changed = desired_changed || missions_changed || operations_changed || owned_plan.is_some();
                 if !changed {
                     let store_index = current_index_tx(transaction).map_err(internal)?;
                     let mut subject_tokens = intent
@@ -8128,7 +8171,8 @@ impl Store {
                 for (subject, desired) in &intent.subjects {
                     let revision = desired_revision(desired);
                     let current = current_desired_row_tx(transaction, subject).map_err(internal)?;
-                    if current.as_ref().is_some_and(|row| row.revision == revision) {
+                    if current.as_ref().is_some_and(|row| row.revision == revision)
+                        && !owned_plan.as_ref().is_some_and(|p| p.materialize.contains(subject)) {
                         tokens.insert(
                             subject.clone(),
                             intent_leaves_tx(transaction, subject).map_err(internal)?,
@@ -8136,7 +8180,8 @@ impl Store {
                         continue;
                     }
                     let predecessors = intent_leaves_tx(transaction, subject).map_err(internal)?;
-                    let body = serde_json::to_value(desired).map_err(internal)?;
+                    let mut body = serde_json::to_value(desired).map_err(internal)?;
+                    if let Some(plan) = &owned_plan { body["owned_set"] = json!(plan.preview.set); }
                     // The claim records its writer as its actor.
                     let claim_id = claim_hash(
                         &batch_id,
@@ -8207,7 +8252,8 @@ impl Store {
                     }
                     let predecessors =
                         mission_definition_token_tx(transaction, &mission.id).map_err(internal)?;
-                    let body = serde_json::to_value(mission).map_err(internal)?;
+                    let mut body = serde_json::to_value(mission).map_err(internal)?;
+                    if let Some(plan) = &owned_plan { body["owned_set"] = json!(plan.preview.set); }
                     // The publication records its publisher, as a declaration records its writer.
                     let claim_id = claim_hash(
                         &batch_id,
@@ -8518,6 +8564,12 @@ impl Store {
                         reason: "the replacement claim resolved the invalid record".into(),
                     });
                 }
+                if let Some(plan) = &owned_plan {
+                    let receipt = owned_sets::commit_tx(transaction, &self.origin, plan, actor, &batch_id)?;
+                    tokens.insert(plan.preview.set.clone(), vec![receipt.id.clone()]);
+                    claim_ids.push(receipt.id);
+                }
+                owned_sets::project_tx(transaction)?;
                 let store_index = current_index_tx(transaction).map_err(internal)?;
                 let response = ApplyResponse {
                     changed: true,
@@ -14715,6 +14767,7 @@ fn create_declared_mission_run_tx(
     if exists {
         return Ok(Vec::new());
     }
+    owned_sets::guard_mission_start(transaction, &creation.mission)?;
     let mission: Option<MissionSpec> = transaction
         .query_row(
             "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
@@ -15944,6 +15997,9 @@ fn desired_row_at(
     let Some(at_index) = at_index else {
         return current_desired_row(connection, subject);
     };
+    if owned_sets::owner(connection, subject, Some(at_index)).map_err(anyhow::Error::new)?.is_some() {
+        return owned_sets::desired_at(connection, subject, at_index);
+    }
     let mut statement = connection.prepare_cached(&canonical_sql(
         "SELECT id, body, predecessors FROM claims
          WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
@@ -17683,9 +17739,13 @@ fn append_claim_tx(
     predecessors: &[String],
     forced_batch: Option<&str>,
 ) -> Result<ClaimRecord> {
+    if matches!(kind, "intent.desired" | "mission.published") {
+        owned_sets::refuse_unmanaged(transaction, subject).map_err(anyhow::Error::new)?;
+    }
     st3_schema::owned_terminals::validate_declaration_owner(subject, kind, actor)
         .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
+    if kind == "owned-set.revised" { owned_sets::validate_receipt(subject, body).map_err(anyhow::Error::new)?; }
     let fields = schema_fields_for_body(kind, body)?;
     let claim_spec = st3_schema::registry()
         .validate_claim(subject, kind, &fields)
@@ -18680,6 +18740,9 @@ fn desired_conflicts_at(
     winner: Option<&str>,
     at_index: Option<u64>,
 ) -> Result<Vec<String>> {
+    if let Some(conflicts) = owned_sets::conflicts_at(connection, subject, at_index)? {
+        return Ok(conflicts);
+    }
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let mut statement = connection.prepare_cached(&canonical_sql(
         "SELECT id, predecessors FROM claims
@@ -22397,6 +22460,7 @@ fn classify_replicated_claim_with_registry(
             ),
         ));
     }
+    if claim.kind == "owned-set.revised" { owned_sets::validate_receipt(&claim.subject, &claim.body)?; }
     st3_schema::owned_terminals::validate_declaration_owner(
         &claim.subject,
         &claim.kind,
@@ -22476,6 +22540,7 @@ fn replay_projects_kind(kind: &str) -> bool {
     matches!(
         kind,
         "intent.desired"
+            | "owned-set.revised"
             | "doc.bound"
             | "mission.published"
             | "mission-run.created"
@@ -22509,7 +22574,7 @@ enum Aggregate {
 /// Whether claims of `kind` belong to a mission run tree.
 fn run_tree_kind(kind: &str) -> bool {
     replay_projects_kind(kind)
-        && !matches!(kind, "intent.desired" | "doc.bound" | "mission.published")
+        && !matches!(kind, "intent.desired" | "owned-set.revised" | "doc.bound" | "mission.published")
         && !kind.starts_with("planning-session.")
 }
 
@@ -23357,6 +23422,7 @@ fn try_project_simple_replication_tx(
     if rebuild_planning {
         rebuild_planning_tx(transaction).map_err(internal)?;
     }
+    owned_sets::project_tx(transaction)?;
     Ok(true)
 }
 
@@ -23567,7 +23633,7 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
             Ok(())
         })?;
     }
-    Ok(())
+    owned_sets::project_tx(transaction)
 }
 
 /// Project one replicated claim on its own. A claim whose projection fails is rolled back alone
@@ -23628,6 +23694,9 @@ fn select_replicated_desired(
     claim: &ClaimRecord,
     desired: &DesiredSubject,
 ) -> Result<(), St3Error> {
+    if claim.body.get("owned_set").is_some() || owned_sets::owner(transaction, &claim.subject, None)?.is_some() {
+        return Ok(());
+    }
     let current = current_desired_row_tx(transaction, &claim.subject).map_err(internal)?;
     let revision = desired_revision(desired);
     let select = if let Some(row) = &current {
@@ -24660,6 +24729,9 @@ fn select_replicated_mission(
                 params![mission.id, mission.revision, claim.id],
             )
             .map_err(internal)?;
+    }
+    if claim.body.get("owned_set").is_some() || owned_sets::owner(transaction, &claim.subject, None)?.is_some() {
+        return Ok(());
     }
     let current: Option<(String, String)> = transaction
         .query_row(
@@ -45396,6 +45468,7 @@ impl Store {
                 .map_err(internal)?;
         }
         rebuild_operations_tx(&transaction).map_err(internal)?;
+        owned_sets::project_tx(&transaction)?;
         project_replicated_mission_runs(&transaction)?;
         rebuild_planning_tx(&transaction).map_err(internal)?;
         let accepted_heads = replica_heads(&transaction).map_err(internal)?;

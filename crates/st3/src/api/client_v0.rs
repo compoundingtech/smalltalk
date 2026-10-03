@@ -1160,6 +1160,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");

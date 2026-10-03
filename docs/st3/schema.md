@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `8282e4800a05b2d3833c5bda12437aa1cc3217049021a21bcf747ee2e9db5865`
+Digest: `e9255f418a08c4015dedc8a02c80f1f679091ec628157ffdd16b8eea944486f2`
 
 ## Subject families
 
@@ -30,6 +30,7 @@ Digest: `8282e4800a05b2d3833c5bda12437aa1cc3217049021a21bcf747ee2e9db5865`
 | `mission` | `mission/ID` | no | An immutable mission revision lineage. |
 | `mission-run` | `mission-run/ID` | no | A mission execution. |
 | `observer` | `observer/RUN/LOCAL_ID` | no | A mission-run resource observer. |
+| `owned-set` | `owned-set/NAME` | no | A graph-owned set of declarations with source ordering and omission retirement. |
 | `person` | `person/IDENTITY` | no | A human actor. |
 | `planning-session` | `planning-session/ID` | no | A durable planning session. |
 | `pty` | `pty/RUN/LOCAL_ID` | no | A mission-run terminal runtime. |
@@ -72,7 +73,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `checkpoint.sealed` | `checkpoint` | `system-only` | `append` | `durable` | `build:string`, `checkpoint_protocol!:integer`, `cut_unix_ms!:integer`, `participants:array`, `rules_digest!:string`, `sealed_count!:integer`, `sealed_digest!:string` |  |
 | `checkpoint.verified` | `checkpoint` | `system-only` | `append` | `durable` | `build:string`, `checkpoint_protocol!:integer`, `cut_unix_ms!:integer`, `drop_digest!:string`, `dropped_claims!:integer`, `dropped_envelopes!:integer`, `graph_digest!:string`, `participants:array`, `reader_digest!:string`, `retained_digest!:string`, `rules_digest!:string`, `sealed_digest!:string` |  |
 | `daemon.diagnostic` | `daemon` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `severity!:string`, `status:string` |  |
-| `daemon.started` | `daemon` | `system-only` | `append` | `durable` | `pid:integer`, `schema:string`, `schema_digest:string`, `status!:string`, `version:string` | `reset` |
+| `daemon.started` | `daemon` | `system-only` | `append` | `durable` | `features:object`, `pid:integer`, `schema:string`, `schema_digest:string`, `status!:string`, `version:string` | `reset` |
 | `delivery.hold` | `agent` | `authorized-requester` | `state-transition` | `durable` | `held!:boolean`, `legacy_adoption:boolean`, `reason!:string`, `until_unix_ms!:integer` |  |
 | `doc.bound` | `doc` | `authorized-requester` | `append` | `durable` | `executable:boolean`, `hash:string`, `name:string`, `size:integer` | `doc` |
 | `eval.verdict` | `mission-run` | `system-only` | `once` | `durable` | `reason:string`, `residue:array`, `verdict!:string` |  |
@@ -121,6 +122,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `observer.state` | `observer` | `system-only` | `state-transition` | `durable` | `attempt:string`, `error_code:string`, `next_check_unix_ms:string`, `reason:string`, `revision:string`, `state!:string` | `observer` |
 | `operational.failure` | `agent`, `exec`, `pty`, `observer`, `subscription`, `schedule`, `daemon`, `machine`, `step-run`, `mission-run`, `loop-run`, `resource`, `checkpoint` | `system-only` | `append` | `durable` | `condition:string`, `episode:string`, `incarnation:string`, `reason:string`, `reviewer:subject-reference`, `severity:string`, `source_revision:string`, `targets:array`, `title:string` |  |
 | `operational.recovered` | `agent`, `exec`, `pty`, `observer`, `subscription`, `schedule`, `daemon`, `machine`, `step-run`, `mission-run`, `loop-run`, `resource`, `checkpoint` | `system-only` | `append` | `durable` | `episode:string`, `failure:string`, `reason:string` |  |
+| `owned-set.revised` | `owned-set` | `system-only` | `append` | `durable` | `body!:object`, `revision!:string` |  |
 | `planning-session.approved` | `planning-session` | `authorized-requester` | `once` | `durable` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `mission_revision:string`, `preview_hash:string`, `preview_token:string`, `requester:subject-reference`, `variant:string` |  |
 | `planning-session.cancelled` | `planning-session` | `authorized-requester` | `once` | `durable` | `reason:string`, `requester:subject-reference` | `cancellation` |
 | `planning-session.candidate-submitted` | `planning-session` | `authorized-participant` | `append` | `durable` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `mission_revision:string`, `revision:integer`, `variant:string` |  |

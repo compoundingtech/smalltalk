@@ -1266,6 +1266,19 @@ pub struct ResourcesPage {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct OwnedSet {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub claim: String,
+    pub receipt: Value,
+    pub blockers: Vec<String>,
+    pub members_status: Vec<Value>,
+    pub visibility: Value,
+    #[serde(default)]
+    pub commit_status: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Resource {
     Attention(Attention),
@@ -1287,6 +1300,7 @@ pub enum Resource {
     History(History),
     Session(Session),
     Glass(Glass),
+    OwnedSet(OwnedSet),
 }
 
 impl Resource {
@@ -1311,6 +1325,7 @@ impl Resource {
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,
             Self::Glass(v) => &v.header,
+            Self::OwnedSet(v) => &v.header,
         }
     }
 }
