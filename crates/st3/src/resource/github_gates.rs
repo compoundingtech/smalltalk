@@ -13,15 +13,13 @@ pub use crate::gate_kinds::GateAnswer;
 
 use super::{
     GITHUB_AUTH_REMEDY, ProviderForbidden, ProviderRateLimit, ProviderUnauthenticated,
-    github_client, github_json, github_token,
+    github_api_base, github_client, github_json, github_token,
 };
-
-const GITHUB_API: &str = "https://api.github.com";
 
 /// Whether pull request `locator` (`OWNER/REPO#NUMBER`) has merged.
 pub async fn pull_request_merged(locator: &str) -> GateAnswer {
     let token = github_token().await.ok();
-    pull_request_merged_at(locator, GITHUB_API, token.as_deref()).await
+    pull_request_merged_at(locator, &github_api_base(), token.as_deref()).await
 }
 
 pub(crate) async fn pull_request_merged_at(
@@ -68,7 +66,7 @@ fn pull_request_answer(locator: &str, pull: &Value) -> GateAnswer {
 /// branch of `repository` (`OWNER/REPO`).
 pub async fn check_passed(repository: &str, reference: &str, check: &str) -> GateAnswer {
     let token = github_token().await.ok();
-    check_passed_at(repository, reference, check, GITHUB_API, token.as_deref()).await
+    check_passed_at(repository, reference, check, &github_api_base(), token.as_deref()).await
 }
 
 pub(crate) async fn check_passed_at(
