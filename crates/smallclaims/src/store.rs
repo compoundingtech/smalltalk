@@ -1054,6 +1054,7 @@ pub fn insert_claim(
         principals::rules_gate_tx(transaction, origin, actor, kind, subject)?;
     }
     promote_claim_blobs(transaction, body)?;
+    crate::touched::note_wrote(|| format!("{kind} {subject}"));
     transaction.execute(
         "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",

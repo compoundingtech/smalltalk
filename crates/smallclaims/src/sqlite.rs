@@ -134,12 +134,26 @@ impl WriterConnection {
         let slot = &outcome;
         let changed_rows = AtomicU64::new(0);
         let changed = &changed_rows;
+        // The job runs on the writer thread; what it wrote is handed back to this one.
+        let capture = crate::touched::recording_wrote();
+        let wrote_rows = Mutex::new(Vec::new());
+        let wrote = &wrote_rows;
         let run: Box<dyn FnOnce(&Transaction<'_>) -> bool + Send + '_> = Box::new(move |tx| {
             let before = tx.total_changes();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(tx)));
+            let (result, written) = if capture {
+                crate::touched::record_wrote(|| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(tx)))
+                })
+            } else {
+                (
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(tx))),
+                    Vec::new(),
+                )
+            };
             let succeeded = matches!(result, Ok(Ok(_)));
             if succeeded {
                 changed.store(tx.total_changes().saturating_sub(before), Ordering::Relaxed);
+                *wrote.lock().unwrap_or_else(PoisonError::into_inner) = written;
             }
             *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
             succeeded
@@ -165,6 +179,9 @@ impl WriterConnection {
             (Some(Err(panic)), _) => std::panic::resume_unwind(panic),
             (Some(Ok(result)), Ok(())) => {
                 crate::touched::note_writes(changed_rows.load(Ordering::Relaxed));
+                for entry in wrote_rows.into_inner().unwrap_or_else(PoisonError::into_inner) {
+                    crate::touched::note_wrote(|| entry);
+                }
                 Ok(result)
             }
             // The batch failed to begin or to commit, or failed before it ran this write.
