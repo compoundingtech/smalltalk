@@ -3,9 +3,11 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { personAnswer } from './requestView';
 import { isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView } from './sessionView';
+import { base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from './deviceSigning';
+import { createDeviceKey, removeDeviceKey, signWithDeviceKey } from './modules/st-device-key';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
 import { listCollectionPages } from './collectionPages';
 import { rememberBounded } from './boundedCache';
@@ -27,6 +29,9 @@ export type Status = 'setup' | 'connecting' | 'online' | 'offline';
 export type Planner = 'codex' | 'claude' | 'pi' | 'omp' | 'opencode';
 
 const URL_KEY = 'st3.gateway.url', ORDER_KEY = 'st3.tabs.order', CREDENTIAL_KEY = 'st3.device.credential';
+// The enrolled signing key's public half, the person it signs as and its grant chain (the private
+// half stays in the native module).
+const SIGNING_KEY = 'st3.device.signing';
 // Glasses are an experiment (mission fleet/stui/glass): off unless the person turns them on here.
 const GLASSES_KEY = 'st3.experiments.glasses';
 // Simplified conversations: this phone's own choice, on unless turned off, never synced.
@@ -34,7 +39,30 @@ const SIMPLE_KEY = 'st3.conversation.simple';
 
 /** An error as a person reads it: st's errors in plain words (the SDK's plainError). */
 export function errorText(error: unknown): string {
+  if (error instanceof ClientError) {
+    const refused = signatureRefusal(error.response.code);
+    if (refused) return refused;
+  }
   return plainError(error);
+}
+
+/** `parameters` for message.send `id`, signed with this phone's key when it has an enrolled one. */
+async function signMessage<P extends { to: string; content: string; session_id?: string; tags?: string[] }>(id: string, parameters: P): Promise<P> {
+  const stored = await SecureStore.getItemAsync(SIGNING_KEY);
+  if (!stored) return parameters;
+  const signing = JSON.parse(stored) as DeviceKey;
+  const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, id, { encoding: Crypto.CryptoEncoding.HEX });
+  const message: Unsigned = {
+    subject: messageSubject(digest),
+    signer: signing.person,
+    fields: { content: parameters.content, from: signing.person, in_reply_to: null, session_id: parameters.session_id ?? null, tags: parameters.tags ?? [], title: null, to: parameters.to },
+    key: signing.key,
+    chain: signing.chain,
+    // A fresh one-time number for each new send; a retry of the same send reuses the request.
+    nonce: base64url(Crypto.getRandomBytes(16)),
+    signedAt: Date.now(),
+  };
+  return { ...parameters, signature: signatureParameter(message, await signWithDeviceKey(signedBytes(message))) };
 }
 function currentAgent(agent: { operational?: { layer?: string } }) { return agent.operational?.layer !== 'history'; }
 function items<K extends Resource['kind']>(page: { items: Resource[] }, kind: K): Extract<Resource, { kind: K }>[] {
@@ -202,10 +230,21 @@ function useAppStore() {
   }
 
   async function completePairing(gatewayClient: St3Client, id: string, code: string, gateway?: string) {
-    const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
-    const result = await gatewayClient.completePairing(id, { api_version: API_VERSION, code, device_public_key: publicKey });
+    // Each pairing enrolls a new signing key (docs/st3/device-signing.md). A build without the key
+    // module, or a phone that cannot make one, pairs unsigned as before.
+    const made = await createDeviceKey().catch(() => null);
+    const publicKey = made?.key ?? Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
+    const result = await gatewayClient.completePairing(id, { api_version: API_VERSION, code, device_public_key: publicKey, ...(made ? { key_storage: made.storage } : {}) });
     await clearCachedProjection();
     await SecureStore.setItemAsync(CREDENTIAL_KEY, result.value.credential, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+    // An older st enrolls nothing (no chain): this phone then sends unsigned.
+    const chain = result.value.device_key_chain ?? [];
+    if (made && chain.length) {
+      const signing: DeviceKey = { key: made.key, storage: made.storage, person: result.value.person_id, chain };
+      await SecureStore.setItemAsync(SIGNING_KEY, JSON.stringify(signing), { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+    } else {
+      await SecureStore.deleteItemAsync(SIGNING_KEY);
+    }
     if (gateway) { await AsyncStorage.setItem(URL_KEY, gateway); setUrl(gateway); setUrlDraft(gateway); }
     setCredential(result.value.credential); setPairingIssue(''); setError('');
   }
@@ -230,7 +269,7 @@ function useAppStore() {
       try { await completePairing(new St3Client({ baseUrl: gateway }), id, code, gateway); } catch (e) { setPairingIssue(`Pairing failed: ${errorText(e)}`); } finally { setBusy(false); }
     },
     async forget() {
-      await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await clearCachedProjection();
+      await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await SecureStore.deleteItemAsync(SIGNING_KEY); await removeDeviceKey(); await clearCachedProjection();
       setCredential(null); setCaps(null); setPairingIssue(''); setHistoricalSessions([]); setStatus('setup');
     },
     /** Complete a person step; `answer` is a structured request's named answer, by id. */
@@ -271,7 +310,17 @@ function useAppStore() {
         // Each try is a new request on a fresh fence, made only after st said the last applied nothing.
         await retryTransient(8, async () => {
           const id = actionId();
-          await client.messageSend({ id, idempotency_key: id, fence: await fence(), parameters: { to, content, ...(sessionId ? { session_id: sessionId } : {}), ...(tags?.length ? { tags } : {}), ...(attachments.length ? { attachments } : {}) } });
+          const parameters = await signMessage(id, { to, content, ...(sessionId ? { session_id: sessionId } : {}), ...(tags?.length ? { tags } : {}), ...(attachments.length ? { attachments } : {}) });
+          const request = { id, idempotency_key: id, fence: await fence(), parameters };
+          try {
+            await client.messageSend(request);
+          } catch (e) {
+            if (e instanceof ClientError || !isTransient(e)) throw e;
+            // st's answer was lost, so the message may have arrived. The identical request (same
+            // key, signature and nonce) gets st's first answer, never a second message.
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            await client.messageSend(request);
+          }
         }, notApplied);
         return null;
       } catch (e) { return errorText(e); }
