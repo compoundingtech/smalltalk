@@ -10573,7 +10573,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             let deferral = self
                 .store
                 .subscription_mission_deferral(&item.subject, &request.id)?;
-            if deferral.is_some_and(|(deadline, _)| deadline > now_ms()) {
+            if let Some((deadline, _)) = deferral
+                && deadline > now_ms()
+            {
+                smallclaims::touched::note_due(deadline);
                 capacity_waiting.insert(mission.to_owned());
                 continue;
             }
@@ -10631,6 +10634,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         not_before,
                         attempt,
                     )?;
+                    smallclaims::touched::note_due(not_before);
                     continue;
                 }
                 // The request stays pending and starts once replication delivers what it names.
@@ -26512,6 +26516,12 @@ subscription "reviews" {{
             .unwrap();
         assert_eq!(attempts, 1);
         assert!(deadline > now_ms());
+        let subscription_key = "subscription:subscription/reviews";
+        assert!(!reconciler.incremental.needs(subscription_key, deadline - 1));
+        assert!(
+            reconciler.incremental.needs(subscription_key, deadline),
+            "a capacity retry must run when its deadline arrives"
+        );
         reconciler
             .reconcile_subscription_missions(&desired)
             .unwrap();
@@ -26521,6 +26531,10 @@ subscription "reviews" {{
                 .unwrap()
                 .unwrap(),
             (deadline, 1)
+        );
+        assert!(
+            reconciler.incremental.needs(subscription_key, deadline),
+            "reading an existing deferral must keep its retry deadline"
         );
         for _ in 0..5 {
             reconciler.evaluate_mission_runs().unwrap();
