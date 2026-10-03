@@ -1,1 +1,10 @@
 evals/**/_git/objects/** binary
+# Written by st3-client-codegen: collapsed in GitHub reviews. After a merge conflict, take either
+# side and regenerate (docs/st3/client-v0/README.md).
+crates/st3-client/src/generated.rs linguist-generated=true
+crates/st3-client/src/contract.rs linguist-generated=true
+crates/st3-client/src/lib.rs linguist-generated=true
+clients/typescript/st3-client/*.generated.ts linguist-generated=true
+clients/swift/St3Client/Sources/St3Client/*.generated.swift linguist-generated=true
+clients/swift/St3Client/Sources/St3Client/Models.swift linguist-generated=true
+clients/swift/St3Client/Sources/St3Client/Client.swift linguist-generated=true

@@ -12,6 +12,11 @@ local Unix socket and authenticated paired HTTP over Tailscale or optional Fabri
 [`clients/typescript/st3-client`](../../../clients/typescript/st3-client). Regenerate all three
 clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
+The contract digest is written once, in `crates/st3-client/src/contract.rs`. When generated
+client files conflict in a merge, resolve the schema and template files, take either side of every
+generated file (`git checkout --theirs -- clients crates/st3-client/src/contract.rs
+crates/st3-client/src/generated.rs`), and run the generator again; never edit generated files by
+hand.
 
 `ResourceHeader.operational` describes current versus historical state, actionability, reasons,
 and optional owner-generation/runtime-incarnation identities. Work also exposes `agentless`,
