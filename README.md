@@ -1,5 +1,7 @@
 # Small Talk
 
+**[Get started](docs/getting-started.md)** — install Small Talk and give your first agent a mission.
+
 ## Continuous integration
 
 Small Talk runs pull request CI and every push to `main` on GitHub Actions with Namespace runners.
