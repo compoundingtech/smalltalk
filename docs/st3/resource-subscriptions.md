@@ -200,7 +200,8 @@ and costs nothing. A read longer than 10 pages records what it read and continue
 Pull request heads, checks, reviews, and merge-queue state come from one GraphQL query for every
 open pull request. GraphQL has no conditional request and spends its own hourly budget, so the
 query runs at the first poll, when the issues listing shows an open pull request changed, while a
-pull request has pending checks or a place in the merge queue, and otherwise every 15 minutes, but
+pull request has pending checks, failed required checks that a rerun may fix, or a place in the
+merge queue, and otherwise every 15 minutes, but
 never sooner than a minute after the last one unless a refresh asks. A change seen within that
 minute is remembered, and the first poll after it reads. Every observer of the repository on a host
 shares the answer. Submitting a review moves the pull request's update time, so the issues listing
