@@ -1196,6 +1196,86 @@ mission "release" state="ready" {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_review_uses_its_public_launch_and_selected_variant_after_restart() {
+        for action in ["launch.approve", "launch.cancel"] {
+            let mut gate = WaitingGate::start().await;
+            let snapshot = gate.client.capabilities().await.unwrap().snapshot.id;
+            gate.client
+                .launch_create(
+                    "action/ui-launch",
+                    "ui-create-launch",
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    st3_client::LaunchCreateParameters {
+                        title: "Copper launch".into(),
+                        request: "Prepare the copper proof".into(),
+                        target: st3_client::LaunchTarget::NewMission {
+                            mission_id: "mission/example/copper".into(),
+                            workspace: gate._root.path().display().to_string(),
+                        },
+                        provider: None,
+                        model: None,
+                        effort: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let session = gate.store.planning_sessions(true).unwrap().pop().unwrap();
+            let transport = st3::client::Client::unix_as(&gate.socket, "person/avery").unwrap();
+            for variant in ["default", "alternate"] {
+                let _: serde_json::Value = transport.post(&format!("/v1/launches/{}/variants/{variant}/submit", session.id), &st3::model::PlanningCandidateSubmitRequest {
+                    actor: session.planner.clone(), markdown: b"Copper proof".to_vec(),
+                    kdl: b"version 2\nmission \"example/copper\" state=\"ready\" { goal \"Record copper proof.\"; step \"proof\" { agentless } }\n".to_vec(), idempotency_key: format!("ui-submit-{variant}"),
+                }).await.unwrap();
+            }
+            let card = gate
+                .client
+                .attention_list(None, Some(100), false)
+                .await
+                .unwrap()
+                .value
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Resource::Attention(card) if card.source_id == session.subject => {
+                        Some(card.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                card.variant_id.as_deref(),
+                Some(format!("launch-variant/{}/default", session.id).as_str())
+            );
+            gate.restart().await;
+            attention_action(
+                &gate.client,
+                "person/avery",
+                &card.header.id,
+                Some(&card),
+                action,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            gate.restart().await;
+            let result = gate.store.planning_session(&session.id).unwrap().unwrap();
+            assert_eq!(
+                result.status,
+                if action == "launch.approve" {
+                    "approved"
+                } else {
+                    "cancelled"
+                }
+            );
+            assert_eq!(result.candidate.unwrap().variant, "default");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn approving_a_gate_asked_again_acts_once_on_its_current_card() {
         let mut gate = WaitingGate::start().await;
         let seen = gate.card().await.expect("the gate has a card");
