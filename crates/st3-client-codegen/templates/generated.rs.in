@@ -725,6 +725,9 @@ pub struct Mission {
     pub visualization: Option<Visualization>,
     #[serde(default)]
     pub usage: Option<UsageSummary>,
+    /// The resources the current published revision names. An older daemon omits them.
+    #[serde(default)]
+    pub resources: Vec<DeclaredResource>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MissionRunSummary {
@@ -910,6 +913,36 @@ pub struct Agent {
     /// The seat's latest suspend or resume and its phase. An older daemon omits it.
     #[serde(default)]
     pub suspension: Option<AgentSuspension>,
+    /// The resources the seat's current declaration names. An older daemon omits them.
+    #[serde(default)]
+    pub resources: Vec<DeclaredResource>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceReferenceKind {
+    Uri,
+    Subject,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceReferenceResolution {
+    Resolved,
+    Unresolved,
+    NotApplicable,
+}
+/// A named, read-only edge from a seat or mission declaration to an ordinary resource subject.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DeclaredResource {
+    pub name: String,
+    /// The ordinary graph resource subject targeted by this edge.
+    pub subject: String,
+    pub kind: ResourceReferenceKind,
+    pub resolution: ResourceReferenceResolution,
+    /// Present only for resolved URI references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 /// The latest accepted harness todo observation, including its provenance and freshness.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

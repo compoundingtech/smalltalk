@@ -6,6 +6,7 @@ const SHARED_TABLES: &[(&str, &[&str])] = &[
     ("blobs", &[]),
     ("documents", &["created_index"]),
     ("desired", &[]),
+    ("declared_resource_edges", &[]),
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("mission_revisions", &["created_index"]),
@@ -488,7 +489,7 @@ fn write_audit_history(source: &Store) {
     publish_takeover(
         source,
         &format!(
-            "{TAKEOVER_SOURCE}\nagent \"alder.worker\" {{ workspace \"/tmp/audit\"; command \"true\" }}"
+            "{TAKEOVER_SOURCE}\nagent \"alder.worker\" {{ workspace \"/tmp/audit\"; command \"true\"; resource \"change\" subject=\"resource/audit/pull-request/1\" reason=\"Review the change.\" }}"
         ),
         "audit-desired",
     );
@@ -1087,6 +1088,9 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             let transaction = connection.transaction().unwrap();
             let expression = if *table == "operations" && column == "state" {
                 "CASE state WHEN 'active' THEN 'conflict' ELSE 'active' END".to_owned()
+            } else if *table == "desired" && column == "body" {
+                // Declaration-edge triggers read this JSON during the same update.
+                "(json_set(body,'$.__audit_digest_change',1)||'')".to_owned()
             } else if kind == "INTEGER" {
                 format!("COALESCE({column},0)+1")
             } else if kind == "BLOB" {
