@@ -311,6 +311,8 @@ CREATE INDEX IF NOT EXISTS claims_person_ask_run_index ON claims(json_extract(bo
 WHERE kind='work.person-asked';
 CREATE INDEX IF NOT EXISTS claims_person_ask_owner_index ON claims(json_extract(body, '$.fields.owner_run'))
 WHERE kind='work.person-asked';
+CREATE INDEX IF NOT EXISTS claims_person_ask_origin_step_index ON claims(json_extract(body, '$.fields.origin_step'))
+WHERE kind='work.person-asked';
 
 CREATE TABLE IF NOT EXISTS mission_run_requests (
     operation_id TEXT PRIMARY KEY,

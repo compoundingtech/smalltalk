@@ -368,6 +368,11 @@ pub(super) fn enrich_responses(
           json_extract(request.body,'$.fields.origin_step')=?1 FROM claims resolution JOIN claims request
         ON request.subject=resolution.subject AND request.kind='work.person-asked'
         WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
+          -- Only asks this step made, or the step's own ask: an index walk, not every answer.
+          AND resolution.subject IN (
+            SELECT subject FROM claims WHERE kind='work.person-asked'
+              AND json_extract(body,'$.fields.origin_step')=?1
+            UNION SELECT ?1)
           AND ((json_extract(request.body,'$.fields.origin_step')=?1
                 AND json_extract(request.body,'$.fields.origin_attempt')=?2)
             OR (resolution.subject=?1 AND json_extract(resolution.body,'$.fields.attempt')=?2))
