@@ -47,14 +47,23 @@ export type CollectionName = 'missions' | 'attention' | 'agents' | 'work' | 'gla
 export type CollectionFilters = { person?: string; actor?: string; status?: string };
 /** One frame from the collections socket. `snapshot` and `changes` describe a window,
  * `screen` a followed terminal, and `conversation` a followed conversation. `resync` asks for
- * that subscription again; `error` ends the subscription it names. */
+ * that subscription again; `error` ends the subscription it names. `input-opened`, `input-ack`
+ * and `input-closed` report a terminal input session; after `input-closed` nothing more of it
+ * is written and nothing is resent. */
 export type CollectionFrame =
     | { kind: 'snapshot'; id: string; collection: CollectionName; snapshot: Snapshot; items: Resource[]; order: string[]; has_more: boolean }
     | { kind: 'changes'; id: string; collection: CollectionName; snapshot: Snapshot; upserts: Resource[]; removes: string[]; order: string[]; has_more: boolean }
     | { kind: 'screen'; id: string; collection: 'terminal'; snapshot: Snapshot; value: TerminalScreen }
     | { kind: 'conversation'; id: string; collection: 'conversation'; session_id: string; replace: boolean; items: TimelineEntry[]; has_more?: boolean }
     | { kind: 'resync'; id: string }
-    | { kind: 'error'; id?: string; collection?: string; code?: string; message: string };
+    | { kind: 'error'; id?: string; collection?: string; code?: string; message: string }
+    | { kind: 'input-opened'; id: string; follow: string; next_seq: number }
+    | { kind: 'input-ack'; id: string; seq: number }
+    | { kind: 'input-closed'; id: string; reason: TerminalInputClosedReason; message: string };
+/** Why a terminal input session closed. */
+export type TerminalInputClosedReason = 'incarnation-changed' | 'revoked' | 'detached' | 'gap' | 'rejected';
+/** One input batch: text is written as UTF-8, `bytes_b64` as the bytes it encodes. */
+export type TerminalInputData = { text: string } | { bytes_b64: string };
 /** The WebSocket surface the collections socket uses: a terminal socket that also sends. */
 export type CollectionSocket = TerminalSocket & {
     onopen: (() => void) | null;
@@ -77,6 +86,11 @@ export type CollectionStream = {
     /** Follow the conversation of an agent or a session. */
     subscribeConversation(id: string, conversation: string): void;
     unsubscribe(id: string): void;
+    /** Open ordered input on a terminal this socket follows; requires `terminal.control`. */
+    openInput(id: string, follow: string): void;
+    /** Send batch `seq`, counting from `input-opened`'s `next_seq`. */
+    sendInput(id: string, seq: number, data: TerminalInputData): void;
+    closeInput(id: string): void;
     close(): void;
 };
 /** A window's rows in display order, as `applyWindow` keeps them. */
@@ -303,6 +317,9 @@ export class St3Client {
             subscribeTerminal: (id, terminal, incarnation, capability) => send({ kind: 'subscribe', id, collection: 'terminal', terminal, incarnation, capability }),
             subscribeConversation: (id, conversation) => send({ kind: 'subscribe', id, collection: 'conversation', conversation }),
             unsubscribe: id => send({ kind: 'unsubscribe', id }),
+            openInput: (id, follow) => send({ kind: 'input-open', id, follow }),
+            sendInput: (id, seq, data) => send({ kind: 'input', id, seq, data }),
+            closeInput: id => send({ kind: 'input-close', id }),
             close: () => { if (!ended) { stop(); socket.close(1000); } },
         };
     }

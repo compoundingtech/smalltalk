@@ -67,6 +67,39 @@ owner, I/O or viewer-idle failure returns `terminal-unavailable` with
 closing the socket, stops following; `terminal.detach` still ends the viewer
 record. After a dropped socket, attach again and subscribe on the new socket.
 
+### Terminal input
+
+A device with `terminal.control` writes to a terminal it follows on the same
+socket by opening input on that follow:
+
+```json
+{"kind":"input-open","id":"keys","follow":"term"}
+{"kind":"input","id":"keys","seq":0,"data":{"text":"ls\r"}}
+{"kind":"input","id":"keys","seq":1,"data":{"bytes_b64":"Gw=="}}
+{"kind":"input-close","id":"keys"}
+```
+
+The input inherits the follow's consumed viewer and fenced incarnation, so it
+needs no second capability. `input-opened` carries `id`, `follow`, and
+`next_seq`, the first sequence to send. Each batch holds exactly one of `text`
+(written as its UTF-8 bytes) or `bytes_b64`, 1 to 16384 bytes with no NUL byte,
+and is acknowledged with `input-ack` (`id`, `seq`) once written. A `seq` below
+`next_seq` is a repeat: it is acknowledged again and never written. Sequences
+apply in order: a `seq` above `next_seq` closes the input with `gap`.
+
+Before every batch the server checks that the device is still paired, the
+viewer was not detached, and the terminal still runs the follow's incarnation.
+`input-closed` (`id`, `reason`, `message`) ends the input, and nothing more is
+written: `incarnation-changed` when the incarnation changed or the process
+ended, `revoked` when the pairing was revoked or expired, `detached` when the
+viewer was detached or its follow ended or was unsubscribed or replaced, `gap`,
+and `rejected` for a refused open or batch, including a device without
+`terminal.control`, a follow another host owns, or a follow that already has
+input. Batches for a closed input are dropped without a frame. The server never
+resends; after a close, attach again and open a new input with fresh bytes.
+`input-close` ends an input without a frame. An input ID held again replaces
+the earlier input.
+
 ## Conversations
 
 A conversation is one more subscription too. Name an agent or a session:
