@@ -383,6 +383,9 @@ pub fn harness_quiescence(
 /// Add the driver's quiescence report to a `harness.observed` claim's fields, read from the
 /// state the same claim already carries. Every driver publishes through this.
 pub fn annotate_quiescence(fields: &mut std::collections::BTreeMap<String, Value>) {
+    if let Ok(operation) = std::env::var(crate::rollout::OPERATION_ENV) {
+        fields.insert("rollout_operation".into(), Value::String(operation));
+    }
     let text = |name: &str| {
         fields
             .get(name)

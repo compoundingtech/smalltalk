@@ -3,6 +3,7 @@ pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
 mod resources;
+mod rollouts;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -6630,6 +6631,9 @@ impl Store {
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
+                if action == "claim" && rollouts::intake_held(transaction, &actor, &subject)? {
+                    return Err(St3Error::new("seat-rollout-draining", "the seat holds new work intake while its rollout drains; existing work may finish"));
+                }
                 let current = transaction
                     .query_row(
                         "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
@@ -7601,7 +7605,9 @@ impl Store {
                     .as_ref()
                     .filter(|row| row.kind == "agent")
                     .and_then(|row| row.member.as_deref())
-                    .and_then(|launched| serde_json::from_str::<crate::model::MemberSpec>(launched).ok())
+                    .and_then(|launched| {
+                        serde_json::from_str::<crate::model::MemberSpec>(launched).ok()
+                    })
                     .map(|launched| member.launch_changes(&launched))
                     .unwrap_or_default();
                 actions.push(if changes.is_empty() {
@@ -18199,7 +18205,9 @@ fn message_view_tx(
         attachments: actual
             .get("attachments")
             .cloned()
-            .and_then(|value| serde_json::from_value::<Vec<crate::model::MessageAttachment>>(value).ok())
+            .and_then(|value| {
+                serde_json::from_value::<Vec<crate::model::MessageAttachment>>(value).ok()
+            })
             .unwrap_or_default()
             .into_iter()
             .filter(|attachment| {
@@ -46399,6 +46407,9 @@ fn append_claim_with_fences(
                 let message = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
                 if message.to != fence.subject || input.actor.as_deref() != Some(&fence.subject) {
                     return Err(St3Error::new("wrong-message-recipient", "receipt belongs to another seat"));
+                }
+                if input.kind == "message.staged" && !rollouts::message_allowed(transaction, &message)? {
+                    return Err(St3Error::new("seat-rollout-draining", "new independent delivery waits for the seat rollout"));
                 }
                 matches!((input.kind.as_str(), message.status.as_str()),
                     ("message.staged", "delivered" | "read" | "closed") | ("message.delivered", "read" | "closed") | ("message.read", "closed"))

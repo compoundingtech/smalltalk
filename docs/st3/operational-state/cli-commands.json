@@ -68,6 +68,7 @@
     { "path": "st eval", "purpose_id": "debug", "disposition": "demote-expert" },
     { "path": "st graph", "purpose_id": "missions", "disposition": "merge-into-missions-show" },
     { "path": "st status", "purpose_id": "now", "disposition": "rename-now-no-alias" },
+    { "path": "st agents rollout", "purpose_id": "owned-sets", "disposition": "add-canonical" },
     { "path": "st agents", "purpose_id": "agents", "disposition": "canonicalize-subcommands" },
     { "path": "st runtime", "purpose_id": "debug", "disposition": "demote-expert" },
     { "path": "st context", "purpose_id": "subject", "disposition": "merge-into-subject" },

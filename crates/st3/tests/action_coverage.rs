@@ -18,6 +18,129 @@ const NODE: &str = "action-coverage";
 const PERSON: &str = "person/avery";
 const WORKER: &str = "agent/example/worker";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_owned_seat_rollout_captures_fences_and_survives_restart() {
+    use st3::store::owned_sets::{Options, Source};
+    let mut daemon = Daemon::new().await;
+    let seat = "agent/garden/maple";
+    let path = daemon.root.path().join("seats.kdl");
+    let mut first_token = String::new();
+    for sequence in 1..=2_u64 {
+        let text = format!(
+            "version 2\nagent \"garden/maple\" {{ host {NODE:?}; workspace {:?}; harness \"claude\" {{ model {:?}; }} }}",
+            daemon.root.path().display().to_string(),
+            format!("model-{sequence}")
+        );
+        std::fs::write(&path, &text).unwrap();
+        let options = Options {
+            set: "maples".into(),
+            source: Source {
+                repository: "acme/maples".into(),
+                r#ref: "refs/heads/main".into(),
+                sha: format!("{sequence:040x}"),
+                sequence,
+            },
+            expected_set: daemon
+                .store()
+                .owned_sets()
+                .unwrap()
+                .first()
+                .map_or("absent".into(), |set| set.revision.clone()),
+            rollout: if sequence == 2 {
+                Some(st3::rollout::Policy::when_idle(1_800_000, false))
+            } else {
+                None
+            },
+            adopt: Default::default(),
+            allow_empty: false,
+            confirm_retire: None,
+            expected_subjects: Default::default(),
+        };
+        let mut args = vec![
+            "apply",
+            "--set",
+            "maples",
+            path.to_str().unwrap(),
+            "--repository",
+            "acme/maples",
+            "--ref",
+            "refs/heads/main",
+            "--sha",
+            &options.source.sha,
+            "--source-sequence",
+            if sequence == 1 { "1" } else { "2" },
+            "--expect-set",
+            &options.expected_set,
+            "--as",
+            PERSON,
+        ];
+        if sequence == 2 {
+            args.extend(["--rollout", "when-idle", "--rollout-deadline", "30m"]);
+        }
+        cli_value(daemon.cli(PERSON, &args).await);
+        if sequence == 1 {
+            first_token = daemon
+                .store()
+                .selected_desired_token(seat)
+                .unwrap()
+                .unwrap();
+            daemon.claim(seat,"runtime.observed",json!({"status":"running","runtime_id":"maple","host":NODE,"incarnation_id":"maple-original"}));
+            daemon.claim(seat,"runtime.action.succeeded",json!({"action":"start","desired_token":first_token,"incarnation_id":"maple-original"}));
+        }
+        daemon.restart().await;
+    }
+    let request = json!({"subject":seat,"actor":PERSON,"expected_desired":first_token,"expected_incarnation":"maple-original",
+        "policy":st3::rollout::Policy::when_idle(5000,false),"idempotency_key":"stale-maple"});
+    let before = daemon.store().index().unwrap();
+    let stale = daemon
+        .transport()
+        .post::<_, Value>("/v1/agents/rollout", &request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        st3::client::api_error_code(&stale),
+        Some("stale-rollout-target")
+    );
+    assert_eq!(before, daemon.store().index().unwrap());
+    let response = cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "agents",
+                    "rollout",
+                    seat,
+                    "--deadline",
+                    "5s",
+                    "--as",
+                    PERSON,
+                ],
+            )
+            .await,
+    );
+    let operation = daemon.store().rollout(seat).unwrap().unwrap();
+    assert_eq!(operation.id, response["id"].as_str().unwrap());
+    assert_eq!(operation.policy.deadline_ms, 5000);
+    assert_eq!(operation.old_incarnation, "maple-original");
+    daemon.restart().await;
+    let saved = daemon.store().rollout(seat).unwrap().unwrap();
+    assert_eq!(saved.id, operation.id);
+    assert_eq!(saved.deadline_unix_ms, operation.deadline_unix_ms);
+    let status = cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &["sets", "status", "maples", "--sha", &format!("{:040x}", 2)],
+            )
+            .await,
+    );
+    assert_eq!(status["value"]["commit_status"]["satisfied"], false);
+    assert_eq!(
+        status["value"]["members_status"][0]["operation"]["phase"],
+        "draining"
+    );
+}
+
 struct Daemon {
     root: tempfile::TempDir,
     state: AppState,

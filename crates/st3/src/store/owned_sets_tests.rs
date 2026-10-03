@@ -31,6 +31,7 @@ fn options(store: &Store, sequence: u64) -> Options {
             sequence,
         },
         expected_set: current.map_or("absent".into(), |s| s.revision),
+        rollout: None,
         adopt: Default::default(),
         allow_empty: false,
         confirm_retire: None,
@@ -403,6 +404,100 @@ fn signed_fleet() -> Vec<Store> {
     }
     stores
 }
+
+#[test]
+fn rollout_policy_preserves_legacy_hashes_and_requires_every_active_daemon() {
+    let stores = signed_fleet();
+    let input = bundle("unchanged", false);
+    apply(&stores[0], &input, 10);
+    let legacy = serde_json::to_value(&stores[0].owned_sets().unwrap()[0].receipt).unwrap();
+    assert!(legacy.get("rollout").is_none());
+    let restored: owned_sets::Revision = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(
+        canonical_hash(&restored).unwrap(),
+        canonical_hash(&legacy).unwrap()
+    );
+    let mut opts = options(&stores[0], 20);
+    opts.rollout = Some(crate::rollout::Policy::when_idle(1_800_000, false));
+    let blocked = stores[0].owned_set_preview(&input, &opts).unwrap();
+    assert_eq!(
+        blocked
+            .blockers
+            .iter()
+            .filter(|reason| reason.contains("seat-rollout support"))
+            .count(),
+        3
+    );
+    for from in &stores {
+        from.append_claim(&ClaimInput {
+            subject: format!("daemon/{}", from.origin),
+            kind: "daemon.started".into(),
+            actor: None,
+            fields: serde_json::from_value(
+                json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1}}),
+            )
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+        for to in &stores {
+            signed_share(from, to);
+        }
+    }
+    let ready = stores[0].owned_set_preview(&input, &opts).unwrap();
+    assert!(ready.blockers.is_empty(), "{:?}", ready.blockers);
+    opts.expected_subjects = ready.expected_subjects;
+    stores[0]
+        .apply_owned_set(&input, &opts, "rollout-policy", "person/operator")
+        .unwrap();
+    let same_source = options(&stores[0], 20);
+    let preview = stores[0].owned_set_preview(&input, &same_source).unwrap();
+    assert!(
+        !preview.noop,
+        "changing policy is not an equal-source retry"
+    );
+    assert!(
+        preview
+            .blockers
+            .iter()
+            .any(|b| b.contains("source sequence"))
+    );
+}
+
+#[test]
+fn rollout_preview_refuses_host_harness_and_authored_session_transitions() {
+    let store = Store::open_memory("amber").unwrap();
+    let native = |host: &str, harness: &str, args: &str| {
+        crate::graph::parse_owned_set_intent(&format!(
+        "version 2\nagent \"garden/orchard\" {{ host {host:?}; workspace \".\"; harness {harness:?} {{ {args} }} }}"),"amber").unwrap()
+    };
+    apply(&store, &native("amber", "claude", "model \"first\";"), 10);
+    for (host, harness, args) in [
+        ("cobalt", "claude", "model \"second\";"),
+        ("amber", "codex", "model \"second\";"),
+        ("amber", "claude", "args \"--resume\" \"authored-session\";"),
+    ] {
+        let mut opts = options(&store, 20);
+        opts.rollout = Some(crate::rollout::Policy::when_idle(1_800_000, false));
+        let preview = store
+            .owned_set_preview(&native(host, harness, args), &opts)
+            .unwrap();
+        assert!(!preview.blockers.is_empty(), "{host} {harness} {args}");
+        assert!(
+            store
+                .apply_owned_set(
+                    &native(host, harness, args),
+                    &opts,
+                    "unsupported",
+                    "person/operator"
+                )
+                .is_err()
+        );
+        assert_eq!(store.owned_sets().unwrap()[0].receipt.source.sequence, 10);
+    }
+}
 fn signed_share(from: &Store, to: &Store) {
     let fleet = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
     let exchange = from
@@ -756,5 +851,54 @@ fn equal_source_content_conflicts_hold_effects_until_a_higher_source_resolves_th
         assert_eq!(view.receipt.source.sequence, 30);
         assert!(view.blockers.is_empty());
         assert!(store.owned_member_guard("agent/garden/orchard").is_ok());
+    }
+}
+
+#[test]
+fn rollout_signed_partition_heal_keeps_the_winning_owner_operation_and_status() {
+    let stores = signed_fleet();
+    for from in &stores {
+        from.append_claim(&ClaimInput {
+            subject: format!("daemon/{}", from.origin), kind: "daemon.started".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1}})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        for to in &stores { signed_share(from, to); }
+    }
+    let (amber, cobalt, ivory) = (&stores[0], &stores[1], &stores[2]);
+    let native = |model: &str| crate::graph::parse_owned_set_intent(&format!(
+        "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace \".\"; harness \"claude\" {{ model {model:?}; }} }}"), "amber").unwrap();
+    apply(amber, &native("initial"), 10);
+    let old = amber.desired_subjects_named(&["agent/garden/orchard".into()]).unwrap().remove(0).member.unwrap();
+    amber.append_claim(&ClaimInput {
+        subject: "agent/garden/orchard".into(), kind: "runtime.observed".into(), actor: Some("person/operator".into()),
+        fields: serde_json::from_value(json!({"status":"running","host":"amber","runtime_id":old.runtime_id,"incarnation_id":"original-one"})).unwrap(),
+        evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    signed_share(amber, cobalt); signed_share(amber, ivory);
+    let policy = crate::rollout::Policy::when_idle(1_800_000, false);
+    for (store, sequence, model) in [(amber, 30, "winner"), (cobalt, 20, "stale")] {
+        let mut opts = options(store, sequence); opts.rollout = Some(policy.clone());
+        let input = native(model);
+        let preview = store.owned_set_preview(&input, &opts).unwrap();
+        assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+        opts.expected_subjects = preview.expected_subjects;
+        store.apply_owned_set(&input, &opts, &format!("partition-{sequence}"), "person/operator").unwrap();
+    }
+    let token = amber.selected_desired_token("agent/garden/orchard").unwrap().unwrap();
+    let request = amber.request_rollout("agent/garden/orchard", &token, &old, "original-one", "person/operator", &policy, "winner-operation").unwrap();
+    let operation = amber.rollout("agent/garden/orchard").unwrap().unwrap();
+    crate::rollout::phase(amber, "agent/garden/orchard", &operation, "held", Some("busy at deadline"), &["claimed-work".into()]).unwrap();
+    signed_share(cobalt, ivory); signed_share(amber, ivory);
+    signed_share(cobalt, amber); signed_share(amber, cobalt);
+    for store in &stores {
+        let selected = store.rollout_selection("agent/garden/orchard").unwrap().unwrap();
+        let operation = store.rollout("agent/garden/orchard").unwrap().unwrap();
+        assert_eq!(selected.source.sequence, 30);
+        assert_eq!(operation.id, request.id);
+        assert_eq!(operation.phase, "held");
+        assert_eq!(operation.old_incarnation, "original-one");
+        assert_eq!(operation.deadline_unix_ms, operation.requested_at_unix_ms + 1_800_000);
+        assert_eq!(operation.blocking, vec!["claimed-work"]);
     }
 }

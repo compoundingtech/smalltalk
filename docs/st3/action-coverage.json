@@ -473,6 +473,12 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st agents rollout",
+      "description": "Retry a published owned-seat cutover with fresh desired and incarnation fences.",
+      "tests": ["crates/st3/tests/action_coverage.rs::cli_owned_seat_rollout_captures_fences_and_survives_restart"],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
       "command": "st agents stop",
       "description": "Stop one exact durable seat and every process it started.",
       "tests": [

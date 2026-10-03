@@ -2778,6 +2778,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "runtime.action.requested" => &[
             ("action", string()),
+            ("rollout", object()),
             ("operation", string()),
             ("runtime_id", string()),
             ("terminal", boolean()),
@@ -2790,6 +2791,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         | "runtime.action.failed"
         | "runtime.action.deadline-reached" => &[
             ("action", string()),
+            ("rollout", object()),
             ("operation", string()),
             ("runtime_id", string()),
             ("terminal", boolean()),
@@ -2872,6 +2874,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("ownership_sequence", integer()),
             ("transition_sequence", integer()),
             ("evidence_incarnation", string()),
+            ("rollout_operation", string()),
             ("quiescent", boolean()),
             ("blocking", array()),
         ],
