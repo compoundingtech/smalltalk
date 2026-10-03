@@ -6,6 +6,10 @@ For now, each person runs their own fleet. Start with one machine; [add your sec
 
 ## 1. Install
 
+Choose one route. If you already use Nix, go straight to [With Nix](#with-nix).
+
+### Prebuilt release
+
 Use a terminal running Bash or Zsh. The prebuilt tools support Linux x86_64 with glibc 2.35+ (Ubuntu 22.04+), and Apple Silicon with macOS 15+; you need `curl` and `tar`, plus Python 3 on macOS. On a fresh Ubuntu machine, install the prerequisites:
 
 ```sh
@@ -13,7 +17,7 @@ sudo apt-get update
 sudo apt-get install -y curl ca-certificates git
 ```
 
-**On macOS — not yet verified on a fresh Mac:** Python 3 is required. Both source and release installs put `st3` and `stui` inside `~/Applications/SmallTalk.app`, with links in your bin directory. macOS ties permissions, such as the microphone for stui's voice mode, to this stable app identity so grants can survive updates. Without a signing identity, the app is ad-hoc signed and macOS may ask again after each update. An optional Developer ID setting avoids that repeated approval; configure it **before installing**, using [macOS signing](st3/macos-installation.md).
+**On macOS — not yet verified on a fresh Mac:** Python 3 is required. The source installer (`scripts/install`) and extracted release installer put `st3` and `stui` inside `~/Applications/SmallTalk.app`, with links in your bin directory. macOS ties permissions, such as the microphone for stui's voice mode, to this stable app identity so grants can survive updates. Without a signing identity, the app is ad-hoc signed and macOS may ask again after each update. An optional Developer ID setting avoids that repeated approval; configure it **before installing**, using [macOS signing](st3/macos-installation.md).
 
 The optional voice helper, `StListen.app`, needs Xcode with the macOS 26 SDK to build. You can use st without it; voice mode says when the helper is missing.
 
@@ -49,28 +53,32 @@ case "$SHELL" in
 esac
 ```
 
-**Already use Nix?** Instead of downloading the archive, install the same tools from source (this can take a while):
+### With Nix
+
+Install the same tools from source (this can take a while):
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' profile install github:compoundingtech/smalltalk
+command -v st stui pty
 ```
+
+Nix builds `st3`, its `st` alias, `stui`, and `st3-migrate`, and supplies the pinned `pty` runtime and build dependencies. You do not need a separate Rust toolchain or PTY install. Use this **instead of** the archive route; the commands below are the same. Check that the paths above belong to your Nix profile, then continue with the daemon setup.
+
+For a declarative setup, use the [Home Manager module](../README.md#home-manager): it installs the tools, writes the person configuration, and starts the user daemon on Linux or macOS. If that module owns your daemon, configure its person there and skip the manual config/service-install block in step 3. Lingering on Linux, macOS permissions, harness login, and fleet joining remain host setup. Nix profile installs use store paths; the macOS app-bundle setup above belongs to the source/release installers.
 
 See [binary releases](st3/binary-releases.md) for pinned versions and upgrades, and [macOS installation](st3/macos-installation.md) for Python, signing, and permission setup.
 
-## 2. Log in to a coding harness
+## 2. Prepare your workspace
 
-A seat uses a separate coding tool and its account. This walkthrough uses [Claude Code](https://code.claude.com/docs/en/setup); install and log in as the same OS user who will run `st`:
+A seat uses a separate coding tool and its account. This walkthrough assumes you already installed and logged in to [Claude Code](https://code.claude.com/docs/en/setup) as the OS user who will run `st`. Create the example workspace:
 
 ```sh
-curl -fsSL https://claude.ai/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
 mkdir -p ~/st/garden
 cd ~/st/garden
 git init
-claude
 ```
 
-Follow the login and workspace trust prompts. Once you reach Claude's prompt, type `/exit` to return to your shell. Install Small Talk's Claude message channel (it may ask for your administrator password):
+Install Small Talk's Claude message channel (it may ask for your administrator password). Finish any workspace trust prompt when you attach to the seat in step 4:
 
 ```sh
 st claude-channel install
@@ -184,6 +192,7 @@ st agents stop agent/garden/worker --as person/ada
 - [Two machines](two-machines.md): connect your machines and check graph replication.
 - [Missions in practice](missions-in-practice.md): revise work, queue runs, and ask for human decisions.
 - [Talking to agents](talking-to-agents.md): UI, phone, CLI, attachments, and structured requests.
+- [Build and run the iOS app](ios-app.md): local simulator and iPhone builds, then gateway pairing.
 - [Seat lifecycle](seat-lifecycle.md): restart, suspend/resume, native sessions, and stopped seats.
 - [Upgrading st](upgrading-st.md): install the same build everywhere and check recovery options.
 - [GitHub integration](github-integration.md): repository intake, review, triage, and landing work.

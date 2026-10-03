@@ -100,6 +100,18 @@
       "page": "when-something-is-wrong",
       "result": "passed diagnostics",
       "evidence": "doctor, services, missions show, agents show/queue, bounded subject history, terminals peek, usage by agent/mission and repair dry-run executed. Dry-run found no operational repairs. Optional tool/login/IO warnings distinguished from failed checks."
+    },
+    {
+      "page": "getting-started",
+      "result": "passed expanded Nix tool-path check",
+      "evidence": "With the installed Nix profile selected on beacon, command -v st stui pty resolves all three under /home/ada/.nix-profile/bin."
+    },
+    {
+      "page": "ios-app",
+      "result": "passed native-independent steps on fresh Linux guest",
+      "source": "bbe5bbb17632deba2b8fc5a9e46ae483bba62198",
+      "tools": "Nix nodejs_24: Node 24.21.0, npm 11.19.0",
+      "evidence": "Shallow repository clone, npm ci, typecheck, 31 tests passed / zero failed, iOS Expo prebuild --clean --no-install generated smalltalk.xcodeproj and smalltalk.xcscheme, export:ios bundled 928 modules and exported dist. CocoaPods evaluates as 1.16.2 for aarch64-darwin; package is Mac-only, so no unsupported Linux build attempted."
     }
   ],
   "known_failures": [
@@ -121,8 +133,18 @@
     "Fresh macOS installation/signing/permission prompts and voice helper build: explicitly marked in getting-started.",
     "Fresh browser OAuth login: native login prompts checked, then existing account auth reused.",
     "Physical phone composer/pairing end-to-end: pairing CLI checked, client behavior sourced from existing phone documentation.",
-    "Incompatible schema rollback: intentionally not exercised."
+    "Incompatible schema rollback: intentionally not exercised.",
+    "iOS native CocoaPods installation, Xcode build/signing, simulator launch, and physical device run: explicitly marked not yet verified on a fresh Mac in ios-app.md."
   ],
   "backup_feature_at_review": "Claim-backup mission still running and not merged when checked; guide uses SQLite copy and one-line coming note.",
-  "private_receipts": "/tmp/st-getting-started-vm on rehearsal host; includes bounded signature/claim evidence and VM wrappers. Credentials and pairing invitations are deliberately excluded from this public receipt."
+  "private_receipts": "/tmp/st-getting-started-vm on rehearsal host; includes bounded signature/claim evidence and VM wrappers. Credentials and pairing invitations are deliberately excluded from this public receipt.",
+  "newcomer_feedback": {
+    "message": "message/24115236206dcf25",
+    "revisions": [
+      "Assume harness login is known; retain Small Talk channel setup and workspace preparation.",
+      "Give Nix a direct route and explain bundled tools/build dependencies and Home Manager ownership.",
+      "Add docs/ios-app.md for local simulator/device builds and pairing."
+    ],
+    "installer_recommendation": "A focused prerequisite-aware bootstrap follow-up; release/Nix already install the core tools. No new bootstrap tool is claimed by this docs PR."
+  }
 }
