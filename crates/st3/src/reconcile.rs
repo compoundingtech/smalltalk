@@ -4562,7 +4562,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&subject);
-            crate::performance::record_wake("timer restart", None);
+            crate::performance::record_wake("timer restart", Some(restart_wake_kind(&subject)));
             notify.notify_one();
         });
     }
@@ -11893,6 +11893,17 @@ fn work_wake_deadline(
 /// began, and that pass changed nothing, cannot be acted on yet, so the loop backs off instead of
 /// spinning. A deadline that fell due during or after that pass has not been evaluated, so it
 /// runs at once: a mission timeout must not wait out the back-off.
+/// What a delayed restart key is for, without the subject it names, so the performance report's
+/// wake table stays small: `stop`, `checkout`, `stage/faults`, or `member` for a member's own
+/// restart backoff.
+fn restart_wake_kind(key: &str) -> &str {
+    match key.split_once(':') {
+        Some((kind, _)) => kind,
+        None if key.starts_with("stage/") || !key.contains('/') => key,
+        None => "member",
+    }
+}
+
 fn deadline_sleep_ms(deadline: u128, now: u128, quiet_pass_started: Option<u128>) -> u64 {
     if quiet_pass_started.is_some_and(|started| deadline <= started) {
         WORK_WAKE_RETRY_MS as u64
@@ -12555,6 +12566,18 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn restart_wakes_are_named_by_what_they_are_for() {
+        assert_eq!(restart_wake_kind("stop:agent/example/seat"), "stop");
+        assert_eq!(
+            restart_wake_kind("readiness:agent/example/seat:1:2"),
+            "readiness"
+        );
+        assert_eq!(restart_wake_kind("stage/faults"), "stage/faults");
+        assert_eq!(restart_wake_kind("runtime-snapshot"), "runtime-snapshot");
+        assert_eq!(restart_wake_kind("agent/example/seat"), "member");
     }
 
     #[tokio::test(start_paused = true)]
