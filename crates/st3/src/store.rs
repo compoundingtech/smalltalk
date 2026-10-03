@@ -1616,9 +1616,11 @@ fn discovered_collection_items(
             if resource.as_ref() == Some(&facts) {
                 return None;
             }
+            // Creation receipts establish identity and attribution, not observer state.
+            let observed_prior = prior.filter(|prior| prior.get("state").is_some());
             let new_item =
-                prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
-            let deliver = match (field, prior) {
+                observed_prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
+            let deliver = match (field, observed_prior) {
                 ("pull_requests", Some(prior)) => pull_request_needs_review(Some(prior), &facts),
                 (_, Some(_)) => false,
                 ("pull_requests", None) => new_item && pull_request_needs_review(None, &facts),
@@ -16880,6 +16882,20 @@ fn normalize_resource_observation(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| previous.as_object().cloned().unwrap_or_default());
+        // A creation receipt contributes attribution only. Merge under the writer transaction
+        // so an observer publishing newer facts concurrently cannot have those facts erased.
+        if input
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("receipt:"))
+            && matches!(kind.as_str(), "vcs.issue" | "vcs.pull-request")
+        {
+            if previous.contains_key("opened_by") || previous.contains_key("opened_by_run") {
+                facts.remove("opened_by");
+                facts.remove("opened_by_run");
+            }
+            facts.extend(previous.clone());
+        }
         // Issue and pull request attribution belongs to its publisher, not to the latest
         // observer or fixer. Keep each named field, including a mission-run-only opener, across
         // observations, so a partial snapshot such as a merge never erases it.
@@ -44388,6 +44404,76 @@ mission "review-guardrail" state="ready" {
             "{:?}",
             planned.warnings
         );
+    }
+
+    #[test]
+    fn receipt_born_resources_receive_first_observer_issue_and_review_delivery() {
+        let store = Store::open_memory("node").unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        let repository = "resource/github/acme/demo";
+        for (field, path, segment) in [
+            ("issues", "issues", "issue"),
+            ("pull_requests", "pull", "pull-request"),
+        ] {
+            let receipt = crate::recorder::Receipt {
+                schema: "st3.recorder.receipt.v1".into(),
+                url: format!("https://github.com/acme/demo/{path}/8"),
+                actor: "agent/node.builder".into(),
+                mission_run: Some("created".into()),
+                exit_code: Some(0),
+                at: "2026-10-03T12:00:00Z".into(),
+            };
+            std::fs::write(
+                spool.path().join(format!("{field}.json")),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(),
+                1
+            );
+            let subject = format!("{repository}/{segment}/8");
+            let recorded = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
+            assert!(recorded.get("state").is_none());
+            let previous = json!({"repository_id": 1, field: []});
+            let current = json!({"repository_id": 1, field: [{
+                "number": 8, "state": "open", "draft": false,
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }]});
+            let items = discovered_collection_items(
+                repository, field, Some(&previous), &current,
+                &mut |_| Some(recorded.clone()),
+            );
+            assert_eq!(items.len(), 1);
+            assert!(items[0].deliver, "{field} must deliver its first observed state");
+            assert_eq!(items[0].facts["opened_by"], "agent/node.builder");
+            assert_eq!(items[0].facts["opened_by_run"], "mission-run/created");
+            let observed = items[0].facts.clone();
+            assert!(
+                discovered_collection_items(
+                    repository, field, Some(&current), &current,
+                    &mut |_| Some(observed.clone()),
+                )
+                .is_empty(),
+                "the same sighting must not deliver twice"
+            );
+            assert!(
+                !discovered_collection_items(
+                    repository, field, None, &current,
+                    &mut |_| Some(recorded.clone()),
+                )[0].deliver,
+                "a repository baseline must not deliver receipt-born items"
+            );
+            let mut old_item = current.clone();
+            old_item[field][0]["new"] = Value::Bool(false);
+            assert!(
+                !discovered_collection_items(
+                    repository, field, Some(&previous), &old_item,
+                    &mut |_| Some(recorded.clone()),
+                )[0].deliver,
+                "an explicitly historical item must not deliver"
+            );
+        }
     }
 
     #[test]
