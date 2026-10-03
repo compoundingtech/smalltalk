@@ -400,6 +400,14 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st agents repos",
+      "description": "List repositories already used by a host's agents, from replicated graph evidence",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
       "command": "st agents new",
       "description": "Declare one new agent seat, start its harness, and wait until it is ready.",
       "tests": [

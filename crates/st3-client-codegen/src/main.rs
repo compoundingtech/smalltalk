@@ -201,6 +201,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {{ self.capabilities_internal().await }}"
             )?;
+        } else if id == "host.repositories" {
+            writeln!(
+                out,
+                "    pub async fn host_repositories(&self, host: &str) -> Result<Envelope<HostRepositories>, ClientError> {{ self.get(&format!(\"/v1/client/hosts/{{}}/repositories\", percent_encode(host))).await }}"
+            )?;
         } else if id == "subject.definition" {
             writeln!(
                 out,
@@ -335,6 +340,11 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func agentDeclarationGet(id: String, revision: String? = nil, showEnvValues: Bool = false) async throws -> Envelope<AgentDeclaration> {{ var query: [URLQueryItem] = [.init(name: \"show_env_values\", value: showEnvValues ? \"true\" : \"false\")]; if let revision {{ query.append(.init(name: \"revision\", value: revision)) }}; return try await get(\"v1/client/agent-declarations/\\(id)\", query: query) }}"
+            )?;
+        } else if id == "host.repositories" {
+            writeln!(
+                out,
+                "    public func hostRepositories(id: String) async throws -> Envelope<HostRepositories> {{ try await get(\"v1/client/hosts/\\(id)/repositories\") }}"
             )?;
         } else if id == "subject.definition" {
             writeln!(
@@ -528,6 +538,8 @@ fn validate_surfaces(
         "AttentionTargetState",
         "DocumentContent",
         "AgentDeclaration",
+        "AgentRepository",
+        "HostRepositories",
         "CanonicalNode",
         "SubjectDefinition",
         "UsagePeriod",
@@ -1074,6 +1086,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query({{ revision, show_env_values: showEnvValues }})); }}"
+            )?;
+        } else if id == "host.repositories" {
+            writeln!(
+                out,
+                "    async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> {{ return this.get(`{route}`); }}"
             )?;
         } else if id == "subject.definition" {
             writeln!(

@@ -292,6 +292,7 @@ CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject
 -- Deleting a claim checks these references (foreign keys are on); see
 -- `operations_canonical_claim_index`.
 CREATE INDEX IF NOT EXISTS desired_claim_index ON desired(claim_id);
+CREATE INDEX IF NOT EXISTS desired_agent_host_index ON desired(json_extract(member, '$.host'), subject) WHERE kind='agent';
 
 -- A replicated projection finds a mission run tree's runs, generations and proposals from the
 -- claims that create them, without reading every such claim.
@@ -9854,6 +9855,38 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Repository candidates on one host, excluding members with neither a checkout nor any
+    /// published workspace evidence. Uses the host index rather than walking the fleet graph.
+    pub(crate) fn agent_repository_subjects(&self, host: &str) -> Result<Vec<DesiredSubject>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired
+             WHERE kind='agent' AND json_extract(member, '$.host')=?1
+               AND (EXISTS (SELECT 1 FROM json_each(body, '$.children') child WHERE json_extract(child.value, '$.name')='checkout')
+                    OR EXISTS (SELECT 1 FROM claims WHERE claims.subject=desired.subject AND claims.kind='workspace.observed'))
+             ORDER BY subject",
+        )?;
+        let rows = statement.query_map([host], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn workspace_observation_from_host(
+        &self,
+        subject: &str,
+        host: &str,
+    ) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        connection
+            .prepare_cached(&format!(
+                "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='workspace.observed' AND claims.origin=?2
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1",
+            ))?
+            .query_row(params![subject, host], smallclaims::store::claim_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Read an exact immutable declaration, or the revision selected by the desired projection.
     pub fn agent_declaration(
         &self,
@@ -14357,6 +14390,7 @@ impl Store {
                 | "daemon.started"
                 | "transport.observed"
                 | "render.applied"
+                | "workspace.observed"
                 | "work.claimed"
                 | "work.renewed"
                 | "work.progress"
@@ -46496,7 +46530,7 @@ fn append_latest_observation_fenced(
                 "harness.usage" => {
                     publish_due_usage_tx(transaction, &graph.origin, input, &local, now)?
                 }
-                "harness.todo.observed" => Some(publish_latest_claim_tx(
+                "harness.todo.observed" | "workspace.observed" => Some(publish_latest_claim_tx(
                     transaction,
                     &graph.origin,
                     &input.subject,
