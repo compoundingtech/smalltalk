@@ -7,6 +7,7 @@ const SHARED_TABLES: &[(&str, &[&str])] = &[
     ("documents", &["created_index"]),
     ("desired", &[]),
     ("message_index", &["created_index"]),
+    ("resource_observations", &[]),
     ("mission_revisions", &["created_index"]),
     ("mission_definitions", &[]),
     ("mission_runs", &[]),
@@ -53,6 +54,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_usage_responses",
         "local_limit_stops",
         "local_latest_slots",
+        "local_resource_projection_pending",
         "graph_generation",
         "projection_digest_state",
         "projection_digest_generation",
@@ -747,6 +749,22 @@ message "audit-declared" {
                 "semantics": "response_rollup", "incarnation_id": "audit-incarnation",
                 "model": "audit-model", "owner_run": "", "owner_step": "", "host": "alder",
                 "total_tokens": 30, "input_tokens": 20, "output_tokens": 10, "observed_at_unix_ms": 2000
+            }),
+        ),
+        (
+            "resource/audit/pull-request/1",
+            "resource.observed",
+            json!({
+                "kind": "vcs.pull-request",
+                "facts": {"number": 1, "state": "open", "opened_by": "agent/alder.worker", "opened_by_run": "mission-run/audit"}
+            }),
+        ),
+        (
+            "resource/audit/pull-request/1",
+            "resource.observed",
+            json!({
+                "kind": "vcs.pull-request",
+                "facts": {"number": 1, "state": "merged", "opened_by": "agent/alder.worker", "opened_by_run": "mission-run/audit"}
             }),
         ),
     ];

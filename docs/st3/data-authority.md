@@ -160,6 +160,8 @@ order from the same admitted claims.
 | `documents` | Projection | `doc.bound` claims and blobs |
 | `desired` | Projection | Selected `intent.desired` heads |
 | `events` | Projection | Effective accepted claims |
+| `resource_observations` | Shared projection | Latest canonical `resource.observed` claim per resource subject; indexed by resource kind and opener |
+| `local_resource_projection_pending` | Local projection work queue | Resource subjects whose admitted observations changed in the current transaction; flushed before commit |
 | `mission_revisions` | Projection | `mission.published` claims |
 | `mission_definitions` | Projection | Selected `mission.published` heads |
 | `mission_runs` | Projection | `mission-run.*` claims |
@@ -188,6 +190,10 @@ order from the same admitted claims.
 | `peer_replica_cursors` | Legacy test state | The removed cursor protocol; production does not use this table |
 
 The store rebuilds operation and planning projections when it opens.
+The resource observation projection is backfilled once on the first open with its projection
+version and rebuilt from admitted claims during graph replay. Updates, out-of-order replication,
+repair, and retained-claim deletion refresh only affected resource subjects. Neither the
+projection nor its pending-subject queue is independent authority.
 
 Replication receipt stores an envelope before admission decodes its payload.
 
