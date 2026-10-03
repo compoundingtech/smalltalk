@@ -112,6 +112,10 @@ struct Demo {
 /// A request the live loop sends to st. The demo never produces these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    /// Read an image a message carries from st, keep it here, and show it.
+    OpenImage {
+        image: st3_conversation_ui::MailImage,
+    },
     Attention {
         id: String,
         action: String,
@@ -3646,6 +3650,7 @@ impl Ui {
                     body: text,
                     delivered: false,
                     dictated: false,
+                    images: Vec::new(),
                 },
             });
             entries.push(Entry {
@@ -3658,6 +3663,7 @@ impl Ui {
                     body: "Good question. Here is what I know, and what I would need from you to go on. (demo reply)".into(),
                     delivered: false,
                     dictated: false,
+                    images: Vec::new(),
                 },
             });
         }
@@ -3784,6 +3790,7 @@ impl Ui {
                             body: draft,
                             delivered: false,
                             dictated: false,
+                            images: Vec::new(),
                         },
                     });
                 }
@@ -4207,6 +4214,13 @@ impl Ui {
                 self.conversation_state.expand(id);
             }
             Hit::Pane(PaneIntent::Open(id)) => self.open(&id),
+            Hit::Pane(PaneIntent::Image(image)) => {
+                self.flash(format!(
+                    "Reading {} from st…",
+                    image.name.as_deref().unwrap_or("the image")
+                ));
+                self.effects.push(Effect::OpenImage { image });
+            }
             Hit::Pane(PaneIntent::Send(text)) => {
                 if let Some(key) = self.draft_key() {
                     self.conversation_state.drafts.insert(key, text);
