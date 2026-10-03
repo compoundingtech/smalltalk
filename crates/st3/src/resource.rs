@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, bail};
 /// What the built-in `merged` and `ci-passed` gates read from GitHub.
 pub mod github_gates;
 mod github_repository;
-pub(crate) use github_repository::{RECENT_COMMENTS, merge_recent_comments};
+pub(crate) use github_repository::{RECENT_COMMENTS, merge_recent_comments, recent_comment_key};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -208,6 +208,21 @@ const GITHUB_REQUEST_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(60)
 };
 
+/// Where the daemon reaches GitHub's API: `https://api.github.com`, or `ST3_GITHUB_API_URL` when
+/// the daemon's environment names another, such as a test's.
+pub(crate) fn github_api_base() -> String {
+    std::env::var("ST3_GITHUB_API_URL")
+        .ok()
+        .map(|base| base.trim().trim_end_matches('/').to_owned())
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned())
+}
+
+/// The HTTP client every GitHub request of this daemon shares.
+pub(crate) fn github_api_client() -> reqwest::Client {
+    github_client()
+}
+
 fn github_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
@@ -283,8 +298,10 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
     let client = github_client();
     let token = github_token().await?;
     let base = format!(
-        "https://api.github.com/repos/{}/{}",
-        locator.owner, locator.repository
+        "{}/repos/{}/{}",
+        github_api_base(),
+        locator.owner,
+        locator.repository
     );
     let branch = github_json(
         &client,
@@ -394,7 +411,7 @@ fn normalize_github_ref(
 
 async fn observe_github_repository(request: ObservationRequest) -> Result<ProviderObservation> {
     let token = github_token().await?;
-    observe_github_repository_at(request, "https://api.github.com", Some(&token)).await
+    observe_github_repository_at(request, &github_api_base(), Some(&token)).await
 }
 
 async fn observe_github_repository_at(
@@ -1052,7 +1069,7 @@ fn observe_local_file(request: ObservationRequest) -> Result<ProviderObservation
 
 async fn observe_github_pull_request(request: ObservationRequest) -> Result<ProviderObservation> {
     let token = github_token().await?;
-    observe_github_pull_request_at(request, "https://api.github.com", Some(&token)).await
+    observe_github_pull_request_at(request, &github_api_base(), Some(&token)).await
 }
 
 async fn observe_github_pull_request_at(

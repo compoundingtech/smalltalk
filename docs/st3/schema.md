@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `11c5513217c71afb2a6a97cf62c4e22371ff4b702d2118bb77f8381d85bb28e1`
+Digest: `7073d20d4b56b904016360a315855951a5c6d24c1731c47ee9d4813a8e73e40e`
 
 ## Subject families
 
@@ -173,6 +173,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `subscription.mission-requested` | `subscription` | `system-only` | `append` | `durable` | `delivery_key:string`, `discovery!:string`, `held:boolean`, `mission!:subject-reference(mission)`, `mission_revision:string`, `requester:subject-reference(agent|person)`, `resource!:subject-reference(resource)`, `resource_input!:string`, `text:string`, `text_input:string`, `workspace!:string` | `subscription` |
 | `subscription.mission-started` | `subscription` | `system-only` | `append` | `durable` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `subscription` |
 | `subscription.state` | `subscription` | `system-only` | `state-transition` | `durable` | `fields:array`, `observer:subject-reference`, `reason:string`, `state!:string`, `to:subject-reference` | `subscription` |
+| `subscription.watch-ended` | `subscription` | `system-only` | `append` | `durable` | `message:subject-reference(message)`, `reason!:string`, `since_unix_ms!:string` | `subscription` |
 | `terminal.input.requested` | `agent`, `pty` | `authorized-requester` | `append` | `durable` | `byte_count:integer`, `incarnation_id:string`, `intent:string`, `mode:string`, `runtime_id:string`, `sequence:integer`, `sha256:string` |  |
 | `terminal.input.result` | `agent`, `pty` | `system-only` | `append` | `durable` | `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string`, `sequence:integer` |  |
 | `transport.observed` | `host` | `system-only` | `append` | `durable` | `last_success_at:integer`, `protocol:string`, `reason:string`, `remote_heads:object`, `status!:string` |  |

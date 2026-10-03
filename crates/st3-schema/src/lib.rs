@@ -1901,6 +1901,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["subscription"],
         ),
         (
+            "subscription.watch-ended",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
             "subscription.batch-sent",
             &["subscription"],
             WritePolicy::SystemOnly,
@@ -3092,6 +3101,20 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("entries", required_array()),
             ("delivery_key", required_string()),
         ],
+        "subscription.watch-ended" => &[
+            (
+                "reason",
+                required_enum(&[
+                    "closed",
+                    "merged",
+                    "deadline",
+                    "unwatched",
+                    "seat-ended",
+                ]),
+            ),
+            ("since_unix_ms", required_string()),
+            ("message", reference_to(&["message"])),
+        ],
         "subscription.batch-sent" => &[
             ("through", required_string()),
             ("message", required_reference_to(&["message"])),
@@ -3504,6 +3527,7 @@ mod tests {
                 "subscription.mission-requested",
                 "subscription.mission-started",
                 "subscription.state",
+                "subscription.watch-ended",
                 "terminal.input.requested",
                 "terminal.input.result",
                 "transport.observed",

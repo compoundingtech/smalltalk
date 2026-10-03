@@ -189,6 +189,12 @@ enum Command {
         #[command(subcommand)]
         command: SubjectCommand,
     },
+    /// Watch GitHub issues and pull requests: each comment, review, required-check result and
+    /// close wakes this seat once.
+    Gh {
+        #[command(subcommand)]
+        command: GhCommand,
+    },
     /// Publish one registered typed observation.
     Claim(ClaimArgs),
     /// Report a harness failure as this agent through the authorized diagnostic path.
@@ -2903,6 +2909,53 @@ struct AgentRestartArgs {
     timeout: String,
 }
 
+#[derive(Subcommand)]
+enum GhCommand {
+    /// Watch an issue or pull request. Each new comment or review that this seat did not post,
+    /// each time the required checks on its current head turn pass or fail, and its close or
+    /// merge wake this seat once; the close or merge, or the deadline, ends the watch. Watching
+    /// it again keeps the watch and takes the new deadline.
+    #[command(
+        after_help = "Examples:\n  st gh watch acme/garden#12\n  st gh watch https://github.com/acme/garden/pull/12 --until 4h"
+    )]
+    Watch(GhWatchArgs),
+    /// End this seat's watch on an issue or pull request.
+    Unwatch(GhUnwatchArgs),
+    /// List this seat's watches, running and ended in the last day, or every seat's with --all.
+    Ls(GhLsArgs),
+}
+
+#[derive(Args)]
+struct GhWatchArgs {
+    /// OWNER/REPO#NUMBER, or the issue or pull request URL.
+    thread: String,
+    /// End the watch at this time: a duration such as 4h, or an RFC 3339 time.
+    #[arg(long)]
+    until: Option<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+}
+
+#[derive(Args)]
+struct GhUnwatchArgs {
+    /// OWNER/REPO#NUMBER, or the issue or pull request URL.
+    thread: String,
+    /// The seat whose watch a person ends; a seat ends its own.
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+}
+
+#[derive(Args)]
+struct GhLsArgs {
+    /// Every seat's watches, not only this seat's.
+    #[arg(long)]
+    all: bool,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+}
+
 #[derive(Args)]
 struct ClaimArgs {
     subject: String,
@@ -3861,6 +3914,7 @@ async fn run(cli: Cli) -> Result<()> {
             run_devices(endpoint.clone(), config.person.as_deref(), args, cli.json).await
         }
         Command::Work { command } => run_work(&client, &endpoint, command, cli.json).await,
+        Command::Gh { command } => run_gh(&client, command, cli.json).await,
         Command::Lanes { command } => {
             run_lanes(&client, config.person.as_deref(), command, cli.json).await
         }
@@ -4053,6 +4107,11 @@ fn guard_mutating_cli_actor(
         },
         Command::Claim(args) => args.actor.as_deref(),
         Command::Diagnostic(args) => Some(args.actor.as_str()),
+        Command::Gh { command } => match command {
+            GhCommand::Watch(args) => Some(args.actor.as_str()),
+            GhCommand::Unwatch(args) => Some(args.actor.as_str()),
+            GhCommand::Ls(_) => None,
+        },
         _ => None,
     };
     if let Some(actor) = actor {
@@ -4063,6 +4122,108 @@ fn guard_mutating_cli_actor(
         }
         if let Some(message) = foreign_agent_actor(actor, Some(own), mission_run) {
             anyhow::bail!(message);
+        }
+    }
+    Ok(())
+}
+
+/// One watch as one line: thread, state, deadline or ending, and title.
+fn gh_watch_line(view: &Value, with_agent: bool) -> String {
+    let text = |name: &str| view.get(name).and_then(Value::as_str).unwrap_or_default();
+    let state = match text("state") {
+        "ended" => format!("ended ({})", text("ended")),
+        "degraded" => format!("degraded: {}", text("reason")),
+        state => state.to_owned(),
+    };
+    let until = view
+        .get("until")
+        .and_then(Value::as_str)
+        .map(|until| format!(" until {until}"))
+        .unwrap_or_default();
+    let title = view
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|title| format!(" \"{title}\""))
+        .unwrap_or_default();
+    let agent = if with_agent {
+        format!(" {}", text("agent"))
+    } else {
+        String::new()
+    };
+    format!("{}{agent}  {state}{until}{title}", text("thread"))
+}
+
+async fn run_gh(client: &st3::client::Client, command: GhCommand, json: bool) -> Result<()> {
+    match command {
+        GhCommand::Watch(args) => {
+            let view: Value = client
+                .post(
+                    "/v1/github/watch",
+                    &json!({"actor": args.actor, "thread": args.thread, "until": args.until}),
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&view)?);
+                return Ok(());
+            }
+            let thread = view
+                .get("thread")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            println!("Watching {}", gh_watch_line(&view, false));
+            println!(
+                "Each new comment or review that this seat did not post, each time the required checks on its head turn pass or fail, and its close or merge wake this seat once."
+            );
+            println!("To stop: st gh unwatch {thread}");
+        }
+        GhCommand::Unwatch(args) => {
+            let outcome: Value = client
+                .post(
+                    "/v1/github/unwatch",
+                    &json!({"actor": args.actor, "thread": args.thread, "agent": args.agent}),
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+                return Ok(());
+            }
+            let thread = outcome
+                .get("thread")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let agent = outcome
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if outcome.get("ended") == Some(&Value::Bool(true)) {
+                println!("Ended the watch of {agent} on {thread}.");
+            } else {
+                println!("{agent} has no running watch on {thread}.");
+            }
+        }
+        GhCommand::Ls(args) => {
+            let agent = if args.all {
+                None
+            } else {
+                Some(args.actor.clone().context(
+                    "outside an agent seat, list every seat's watches with --all or name one with --as",
+                )?)
+            };
+            let path = agent.as_deref().map_or_else(
+                || "/v1/github/watches".to_owned(),
+                |agent| format!("/v1/github/watches?agent={}", urlencoding::encode(agent)),
+            );
+            let views: Vec<Value> = client.get(&path).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&views)?);
+                return Ok(());
+            }
+            if views.is_empty() {
+                println!("No watches.");
+            }
+            for view in &views {
+                println!("{}", gh_watch_line(view, agent.is_none()));
+            }
         }
     }
     Ok(())
@@ -19418,6 +19579,22 @@ mod tests {
                 "test",
                 "--reason",
                 "test",
+            ],
+            &[
+                "st3",
+                "gh",
+                "watch",
+                "acme/garden#12",
+                "--as",
+                "person/operator",
+            ],
+            &[
+                "st3",
+                "gh",
+                "unwatch",
+                "acme/garden#12",
+                "--as",
+                "agent/peer",
             ],
         ];
         for arguments in cases {

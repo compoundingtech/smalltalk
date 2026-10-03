@@ -967,6 +967,94 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    /// Keep each GitHub watch this host declared true to its seat and deadline: stop the
+    /// declaration of a watch that ended, end one whose seat is gone without a wake, end one whose
+    /// deadline passed with a final wake, and start the repository's standing observer again when
+    /// a running watch has none. Stop each standing observer this host declared once no running
+    /// watch uses it, and look again at the next deadline.
+    fn reconcile_github_watches(&self, desired: &[DesiredSubject]) -> Result<()> {
+        let now = now_ms();
+        let mut next_deadline: Option<u128> = None;
+        let mut used_observers = BTreeSet::new();
+        let watches = desired
+            .iter()
+            .filter(|subject| {
+                subject.kind == "subscription" && subject.subject.starts_with("subscription/watch/")
+            })
+            .filter_map(|subject| {
+                let spec = crate::graph::subscription_spec(&subject.desired)?;
+                let watch = spec.watch.clone()?;
+                (!spec.stopped).then_some((subject, spec, watch))
+            })
+            .collect::<Vec<_>>();
+        for (subject, spec, watch) in watches {
+            let Some((thread, _)) = crate::github_watch::watch_parts(&subject.subject) else {
+                continue;
+            };
+            if self.store.watch_ended(&subject.subject, &watch)?.is_some() {
+                if self
+                    .store
+                    .selected_desired_origin(&subject.subject)?
+                    .as_deref()
+                    == Some(self.host.as_str())
+                {
+                    self.store.stop_watch_declaration(&subject.subject)?;
+                }
+                continue;
+            }
+            used_observers.insert(spec.observer.clone());
+            if self
+                .store
+                .selected_desired_origin(&subject.subject)?
+                .as_deref()
+                != Some(self.host.as_str())
+            {
+                continue;
+            }
+            if !self.store.seat_live(&spec.to)? {
+                self.store.end_watch(&subject.subject, "seat-ended", None)?;
+                continue;
+            }
+            if let Some(until) = watch.until_unix_ms {
+                if until <= now {
+                    let wake =
+                        crate::github_watch::deadline_wake(&subject.subject, &watch, &thread)?;
+                    self.store
+                        .end_watch(&subject.subject, "deadline", Some(&wake))?;
+                    continue;
+                }
+                next_deadline = Some(next_deadline.map_or(until, |next| next.min(until)));
+            }
+            self.store.ensure_watch_observer(&thread)?;
+        }
+        for observer in desired.iter().filter(|subject| {
+            subject.kind == "observer"
+                && subject.owner_run.is_none()
+                && subject.subject.starts_with("observer/github/")
+        }) {
+            // Only a standing repository observer, as a watch declares it, is this stage's.
+            let running = crate::graph::observer_spec(&observer.desired).is_some_and(|spec| {
+                !spec.stopped
+                    && spec.provider == "github.repository"
+                    && crate::github_watch::is_standing_observer(&observer.subject, &spec.resource)
+            });
+            if running
+                && !used_observers.contains(&observer.subject)
+                && self
+                    .store
+                    .selected_desired_origin(&observer.subject)?
+                    .as_deref()
+                    == Some(self.host.as_str())
+            {
+                self.store.stop_watch_declaration(&observer.subject)?;
+            }
+        }
+        if let Some(next) = next_deadline {
+            self.arm_restart("stage/github-watches", next.saturating_add(1));
+        }
+        Ok(())
+    }
+
     fn deliver_faults(&self, desired: &[DesiredSubject]) -> Result<()> {
         let local_agents = desired
             .iter()
@@ -1944,6 +2032,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         self.isolate("stage/faults", &daemon, || self.deliver_faults(&desired));
         self.isolate("stage/subagents", &daemon, || self.end_stale_subagents());
+        self.isolate("stage/github-watches", &daemon, || {
+            self.reconcile_github_watches(&desired)
+        });
         self.file_watchers_used
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -27170,6 +27261,299 @@ subscription "pulls" { observer "observer/repo"; on "pull_requests"; to "agent/e
         assert_eq!(kept.len(), crate::resource::RECENT_COMMENTS);
         assert_eq!(kept.first().unwrap(), "comment:105");
         assert_eq!(kept.last().unwrap(), "comment:124");
+    }
+
+    /// The observation writes and their watches, on one store: what `record_resource_observation`
+    /// sends each watch of the standing observer.
+    struct WatchFixture {
+        store: Arc<Store>,
+        observer: String,
+        resource: String,
+    }
+
+    impl WatchFixture {
+        fn new() -> Self {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            apply_source(
+                &store,
+                r#"version 2
+agent "example.planner" { workspace "/tmp"; command "true" }
+agent "example.reviewer" { workspace "/tmp"; command "true" }"#,
+                "watch-seats",
+            );
+            let thread = crate::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+            Self {
+                observer: thread.observer(),
+                resource: thread.resource(),
+                store,
+            }
+        }
+
+        fn watch(&self, thread: &str, agent: &str) -> String {
+            let thread = crate::github_watch::ThreadRef::parse(thread).unwrap();
+            self.store.declare_watch(&thread, agent, None).unwrap();
+            thread.watch(agent)
+        }
+
+        fn observe(&self, facts: Value) -> crate::model::ResourceObservationOutcome {
+            let subscriptions = self
+                .store
+                .desired_subjects()
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.kind == "subscription")
+                .filter_map(|item| {
+                    Some((
+                        item.subject.clone(),
+                        crate::graph::subscription_spec(&item.desired)?,
+                    ))
+                })
+                .filter(|(_, spec)| !spec.stopped)
+                .collect::<Vec<_>>();
+            let revision = self
+                .store
+                .selected_desired_revision(&self.observer)
+                .unwrap()
+                .unwrap();
+            self.store
+                .record_resource_observation(
+                    &self.observer,
+                    &revision,
+                    None,
+                    &self.resource,
+                    None,
+                    &facts,
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap()
+        }
+
+        /// The wakes each seat has, oldest first, as their titles.
+        fn wakes(&self, agent: &str) -> Vec<String> {
+            self.store
+                .messages(Some(agent), true)
+                .unwrap()
+                .into_iter()
+                .filter(|message| message.tags.iter().any(|tag| tag == "github-watch"))
+                .map(|message| message.title.unwrap_or_default())
+                .collect()
+        }
+    }
+
+    fn watched_pull(number: u64, extra: Value) -> Value {
+        let mut pull = serde_json::json!({
+            "number": number, "title": format!("Pull {number}"),
+            "url": format!("https://github.com/acme/garden/pull/{number}"),
+            "head": "a".repeat(40), "state": "open", "draft": false,
+            "required_checks": {"state": "pending", "source": "rules", "checks": ["build"], "failed": []},
+        });
+        for (name, value) in extra.as_object().unwrap() {
+            pull[name] = value.clone();
+        }
+        pull
+    }
+
+    fn just_now(seconds_ago: i64) -> String {
+        (Utc::now() - chrono::Duration::seconds(seconds_ago))
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    /// A seat's watch wakes it once for each comment and review anyone else posts, once for each
+    /// move of the required checks into pass or fail on the current head, and a last time when
+    /// the pull request merges, which ends that watch only. The baseline and a repeated
+    /// observation wake nobody.
+    #[test]
+    fn a_watch_wakes_once_per_comment_review_and_check_move_and_ends_on_merge() {
+        let fixture = WatchFixture::new();
+        let planner = "agent/example.planner";
+        let reviewer = "agent/example.reviewer";
+        let watch = fixture.watch("acme/garden#12", planner);
+        fixture.watch("acme/garden#13", reviewer);
+        let comment = |id: u64, seconds_ago: i64| serde_json::json!({"kind": "comment", "id": id, "author": "fern", "at": just_now(seconds_ago)});
+
+        // The first observation is the baseline.
+        let baseline = fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [
+            watched_pull(12, serde_json::json!({"recent_comments": [comment(90, 3_600)]})),
+            watched_pull(13, serde_json::json!({})),
+        ]}));
+        assert!(baseline.baseline);
+        assert!(fixture.wakes(planner).is_empty());
+
+        // Two comments in one poll are two wakes.
+        let both = serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [comment(92, 20), comment(91, 30)]}))]});
+        fixture.observe(both.clone());
+        assert_eq!(
+            fixture.wakes(planner),
+            [
+                "@fern commented on acme/garden#12",
+                "@fern commented on acme/garden#12"
+            ]
+        );
+        // The same observation again, and the same comments seen again, wake nobody.
+        fixture.observe(both);
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [comment(91, 30), comment(92, 20)]}))]}));
+        assert_eq!(fixture.wakes(planner).len(), 2);
+        assert!(
+            fixture.wakes(reviewer).is_empty(),
+            "another thread's watch hears nothing"
+        );
+
+        // A review.
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+            "new": false, "recent_comments": [{"kind": "review", "id": 5001, "author": "moss",
+                "at": just_now(10), "state": "changes_requested"}]}))]}));
+        assert_eq!(
+            fixture.wakes(planner).last().unwrap(),
+            "@moss requested changes on acme/garden#12"
+        );
+
+        // The required checks fail, are rerun, and fail again on the same head: two wakes. A new
+        // head that passes is one more.
+        let checks = |head: &str, state: &str| {
+            serde_json::json!({"repository_id": 7, "pull_requests": [watched_pull(12, serde_json::json!({
+                "new": false, "head": head,
+                "required_checks": {"state": state, "source": "rules", "checks": ["build"],
+                    "failed": if state == "fail" { serde_json::json!(["build"]) } else { serde_json::json!([]) }}}))]})
+        };
+        for (head, state) in [
+            ("a", "fail"),
+            ("a", "pending"),
+            ("a", "fail"),
+            ("b", "pending"),
+            ("b", "pass"),
+        ] {
+            fixture.observe(checks(&head.repeat(40), state));
+        }
+        let wakes = fixture.wakes(planner);
+        assert_eq!(
+            wakes[3..],
+            [
+                "Required checks failed on acme/garden#12",
+                "Required checks failed on acme/garden#12",
+                "Required checks passed on acme/garden#12",
+            ]
+        );
+
+        // The merge is the last wake, and ends that watch only.
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [
+            {"number": 12, "state": "closed", "merged": true},
+        ]}));
+        assert_eq!(
+            fixture.wakes(planner).last().unwrap(),
+            "acme/garden#12 merged"
+        );
+        let ended = fixture
+            .store
+            .claims_for(&watch, Some("subscription.watch-ended"))
+            .unwrap();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].body["fields"]["reason"], "merged");
+        let after_merge = fixture.wakes(planner).len();
+        fixture.observe(serde_json::json!({"repository_id": 7, "pull_requests": [
+            watched_pull(12, serde_json::json!({"new": false, "state": "closed", "merged": true,
+                "recent_comments": [comment(93, 5)]})),
+            watched_pull(13, serde_json::json!({"new": false, "recent_comments": [comment(94, 5)]})),
+        ]}));
+        assert_eq!(
+            fixture.wakes(planner).len(),
+            after_merge,
+            "an ended watch hears nothing"
+        );
+        assert_eq!(
+            fixture.wakes(reviewer),
+            ["@fern commented on acme/garden#13"],
+            "the other seat's watch goes on"
+        );
+        let view = fixture.store.watch_view(&watch).unwrap().unwrap();
+        assert_eq!(view["state"], "ended");
+        assert_eq!(view["ended"], "merged");
+    }
+
+    /// The host that declared a watch ends it when its deadline passes, with a final wake, and
+    /// when its seat stops, without one, and stops each ended watch's declaration. The
+    /// repository's standing observer stops once no running watch uses it.
+    #[tokio::test]
+    async fn a_watch_ends_at_its_deadline_or_with_its_seat_and_the_last_one_stops_the_observer() {
+        let fixture = WatchFixture::new();
+        let planner = "agent/example.planner";
+        let reviewer = "agent/example.reviewer";
+        let twelve = crate::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
+        let deadline = fixture
+            .store
+            .declare_watch(&twelve, planner, Some(now_ms() + 80))
+            .unwrap();
+        assert_eq!(deadline["state"], "active");
+        let planner_watch = twelve.watch(planner);
+        let reviewer_watch = fixture.watch("acme/garden#13", reviewer);
+        let reconciler = Reconciler::new(
+            fixture.store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            fixture.wakes(planner).is_empty(),
+            "the deadline has not passed"
+        );
+        let running = |subject: &str| {
+            fixture
+                .store
+                .desired_subjects_named(&[subject.to_owned()])
+                .unwrap()
+                .into_iter()
+                .next()
+                .is_some_and(|desired| !desired.desired["children"][0]["name"].eq("stop"))
+        };
+        assert!(running(&fixture.observer));
+
+        apply_source(
+            &fixture.store,
+            "version 2\nstop \"agent/example.reviewer\"\n",
+            "reviewer-stops",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            fixture.wakes(planner),
+            ["Your watch on acme/garden#12 reached its deadline"]
+        );
+        let reason = |subject: &str| {
+            fixture
+                .store
+                .claims_for(subject, Some("subscription.watch-ended"))
+                .unwrap()
+                .last()
+                .map(|claim| claim.body["fields"]["reason"].clone())
+        };
+        assert_eq!(reason(&planner_watch), Some(serde_json::json!("deadline")));
+        assert_eq!(
+            reason(&reviewer_watch),
+            Some(serde_json::json!("seat-ended"))
+        );
+        assert!(
+            fixture.wakes(reviewer).is_empty(),
+            "a stopped seat gets no wake"
+        );
+        assert!(!running(&planner_watch) && !running(&reviewer_watch));
+
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            !running(&fixture.observer),
+            "no running watch uses the observer"
+        );
+        assert_eq!(
+            fixture.store.watches(Some(planner)).unwrap()[0]["state"],
+            "ended"
+        );
+
+        // Watching again begins a new watch and starts the observer again.
+        let again = fixture.store.declare_watch(&twelve, planner, None).unwrap();
+        assert_eq!(again["state"], "active");
+        assert!(running(&fixture.observer) && running(&planner_watch));
     }
 
     /// The intake pipeline: a new pull request head that a live agent owns reaches that agent as

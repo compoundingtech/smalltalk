@@ -62,6 +62,7 @@ mod client_blobs;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
+mod github_watch;
 mod harness_events;
 mod mailbox;
 mod terminal_view;
@@ -631,6 +632,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(cancel_revision_proposal),
         )
         .route("/v1/work/ask", post(ask_person))
+        .route("/v1/github/watch", post(github_watch::watch))
+        .route("/v1/github/unwatch", post(github_watch::unwatch))
+        .route("/v1/github/watches", get(github_watch::watches))
         .route("/v1/work/done", post(done_person_step))
         .route("/v1/work/cancel-ask", post(cancel_person_ask))
         .route("/v1/work", get(list_work))
@@ -4734,6 +4738,7 @@ async fn guard_bound_request(
         "/v1/delivery/hold",
         "/v1/lane-changes",
         "/v1/work/",
+        "/v1/github/",
         "/v1/attention",
         "/v1/launches",
         "/v1/mission-runs/",

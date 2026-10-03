@@ -77,9 +77,9 @@ The local file provider supports `status`, `path`, `content_hash`, `size`, `mode
 
 ## Authored watch operation
 
-A planner or authorized producing agent authors the watch as a mission graph. The public CLI does
-not expose a standalone resource-watch mutation. The delivery target is explicit in the mission;
-it is never inferred from a caller's terminal environment.
+A planner or authorized producing agent authors the watch as a mission graph. The delivery target
+is explicit in the mission; it is never inferred from a caller's terminal environment. The one
+standalone watch is a seat's watch on a GitHub issue or pull request (`st gh watch`, below).
 
 The subscription key includes the provider kind, provider locator, selected fields, target, and delivery type. An exact retry returns the same subjects.
 
@@ -200,7 +200,8 @@ and costs nothing. A read longer than 10 pages records what it read and continue
 Pull request heads, checks, reviews, and merge-queue state come from one GraphQL query for every
 open pull request. GraphQL has no conditional request and spends its own hourly budget, so the
 query runs at the first poll, when the issues listing shows an open pull request changed, while a
-pull request has pending checks or a place in the merge queue, and otherwise every 15 minutes, but
+pull request has pending checks, failed required checks that a rerun may fix, or a place in the
+merge queue, and otherwise every 15 minutes, but
 never sooner than a minute after the last one unless a refresh asks. A change seen within that
 minute is remembered, and the first poll after it reads. Every observer of the repository on a host
 shares the answer. Submitting a review moves the pull request's update time, so the issues listing
@@ -306,6 +307,52 @@ Each item has a stable delivery key: the subscription's local name, the reposito
 and its head or the mention. An owner's message takes its subject from the key, and a batch
 records the keys it carries, so a repeated observation, a replacement watch, or a daemon restart
 delivers nothing more. A review or triage request keeps the key as before.
+
+## A seat's GitHub watch
+
+`st gh watch OWNER/REPO#N` gives the seat that runs it one watch on that issue or pull request. The
+seat wakes once for each new comment or review on it, each time the required checks on its current
+head move into pass or fail, and a last time when it closes or merges, which ends the watch.
+
+```kdl
+subscription "watch/acme/garden/12/example/planner" {
+  observer "observer/github/acme/garden"
+  to "agent/example/planner"
+  on "comments"
+  on "issues"
+  on "pull_requests"
+  delivery "watch" { item 12; since "2026-10-03T14:00:00.000Z"; until "2026-10-03T18:00:00.000Z" }
+}
+```
+
+The daemon declares the watch for the seat, which owns it; no mission run does. Watching a thread
+twice keeps the one watch and takes the new deadline. `st gh unwatch` ends a seat's own watch, and a
+person ends any seat's with `--agent`. `st gh ls` lists a seat's watches, running and ended in the
+last day, and `--all` every seat's.
+
+Every watch of a repository, from any host, uses one standing observer,
+`observer/github/OWNER/REPO` on `resource/github/OWNER/REPO`, which no mission run owns. The first
+watch of the repository declares it on its host, which polls it every 30 seconds while a watch uses
+it; the host stops it once no running watch does. No issue or pull request has a poller of its own.
+
+The write that records an observation decides each watch's wakes from its item's prior facts:
+
+- each `recent_comments` entry the item did not know is one wake, when it was made no earlier than
+  five minutes before the watch began, so two comments between polls are two wakes; an edit keeps
+  its entry and wakes nobody;
+- a move of `required_checks.state` into `pass` or `fail`, or a new head first seen there, is one
+  wake; a new head starts over, and a rerun that fails again on the same head wakes again;
+- the item closing or merging is the last wake, and `subscription.watch-ended` records it in the
+  same write, so nothing follows it. Only that watch ends.
+
+Each wake is one `message.sent` from the observing host to the seat, in prose: who did what where,
+with the link. Its subject comes from the watch, when it began, and the event, so a repeated
+observation or a restart sends nothing twice, and the baseline sends nothing. When the seat's host
+delivers a wake about a comment or review, it reads the text from GitHub by its ID and shows the
+first 600 characters; the text is never stored in the graph.
+
+The host that declared a watch ends it without a wake when its seat's declaration ends, and with a
+final wake when its deadline passes, and then stops its declaration.
 
 ## Retention
 
