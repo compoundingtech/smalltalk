@@ -348,10 +348,20 @@ connects straight to the PTY session, so a busy daemon cannot stall it. If the d
 answer within a second, st attaches to the seat's newest PTY session on that host without it and
 says so.
 
-A running seat keeps its current process when you apply a changed declaration; launch changes
-take effect the next time it starts. Use `st agents restart agent/example/worker --as person/ada`
-to apply those changes now. Restart preserves the declaration, works for top-level and mission
-seats, and waits for a new running incarnation. `--timeout 2m` changes the default ten-minute
+A running seat restarts when you apply a declaration that changes how it launches: its
+workspace, harness, model, effort, arguments or command. A change to its label, environment or
+restart policy keeps the running process and takes effect the next time it starts; use `st agents
+restart agent/example/worker --as person/ada` to apply it now. Restart preserves the declaration,
+works for top-level and mission seats, and waits for a new running incarnation.
+
+Every relaunch of a seat continues its harness's last native session: `st agents restart`, a
+changed launch, a harness that hung up or crashed, a daemon restart, and a stop followed by a
+start. Claude, Codex, pi, omp and OpenCode each resume the session their driver last reported for
+the seat, and a Claude seat whose workspace changed carries its transcript into the new
+workspace's project. A harness that cannot continue that session (its transcript is gone, or the
+declaration selects its own session) starts a new one and records a
+`native-continue-unavailable` warning; later relaunches do not try that session again. Only a
+mission step with `fresh-context` starts a seat on a new session on purpose. `--timeout 2m` changes the default ten-minute
 wait; a failure or timeout explains why the seat is not running again. `st agents stop
 agent/example/worker --as person/ada` stops a seat until you apply its file again. A mission
 seat you stop stays stopped while its run's generation lasts, across daemon restarts, and `st

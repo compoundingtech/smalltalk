@@ -7308,7 +7308,7 @@ impl Store {
                     "create"
                 }
                 .into(),
-                old_revision: current.map(|row| row.revision),
+                old_revision: current.as_ref().map(|row| row.revision.clone()),
                 new_revision: revision,
             });
             if desired.kind == "stop" {
@@ -7317,11 +7317,30 @@ impl Store {
                     action: "stop".into(),
                     reason: "the desired state explicitly stops this member".into(),
                 });
-            } else if desired.member.is_some() {
-                actions.push(PlannedAction {
-                    subject: subject.clone(),
-                    action: "observe-or-start".into(),
-                    reason: "the desired member is active".into(),
+            } else if let Some(member) = &desired.member {
+                // A seat restarts when its declared launch changes; say so before it does.
+                let changes = current
+                    .as_ref()
+                    .filter(|row| row.kind == "agent")
+                    .and_then(|row| row.member.as_deref())
+                    .and_then(|launched| serde_json::from_str::<crate::model::MemberSpec>(launched).ok())
+                    .map(|launched| member.launch_changes(&launched))
+                    .unwrap_or_default();
+                actions.push(if changes.is_empty() {
+                    PlannedAction {
+                        subject: subject.clone(),
+                        action: "observe-or-start".into(),
+                        reason: "the desired member is active".into(),
+                    }
+                } else {
+                    PlannedAction {
+                        subject: subject.clone(),
+                        action: "restart".into(),
+                        reason: format!(
+                            "the declared {} changed; a running seat restarts on its last session",
+                            changes.join(" and ")
+                        ),
+                    }
                 });
             }
         }

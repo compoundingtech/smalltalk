@@ -80,8 +80,9 @@ usual rules. A label change does not end it.
 ## Limits
 
 - A seat resumes only on the host where it suspended. Moving it is planned in #901.
-- Outside suspend and resume, a relaunch still starts a new native session for every harness
-  except omp, which resumes on relaunch once #1048 merges.
+- Every other relaunch continues the seat's last native session when its harness can, and
+  otherwise starts a new one: it names the session in `ST3_NATIVE_CONTINUE_SESSION`, which a
+  driver may refuse without ending the launch. Only a resume must come back on its exact session.
 - Mail does not wake a suspended seat. Only `st agents resume` does.
 - OpenCode delivery follows the session the server reports most recently. A seat whose OpenCode
   session ran a subagent session last may record that session.
