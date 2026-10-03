@@ -279,6 +279,11 @@ function useAppStore() {
       if (typeof typed === 'string') { setError(typed); return false; }
       return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }); });
     },
+    /** Mark a message read from Home: it leaves the person's attention. */
+    async markRead(item: Attention) {
+      if (!client) return false;
+      return runAction(async () => { const id = actionId(); return client.messageRead({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id } }); });
+    },
     /** An image a message carries, as a data URI; st reads it from the member that has it. */
     image(image: { sha256: string; message: string; mediaType: string }): Promise<string> {
       const known = imageCache.current.get(image.sha256);

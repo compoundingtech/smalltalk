@@ -2615,6 +2615,7 @@ impl Ui {
                 ("x", "Missions: show st's own missions"),
                 ("n", "Agents: a new agent; Missions: a new mission"),
                 ("y", "confirm what a card asks; Enter never does"),
+                ("x", "Home: dismiss a request, update or message"),
                 (
                     "b p",
                     "Usage: group by agent, mission, step...; change the period",
@@ -3335,6 +3336,18 @@ impl Ui {
                     return;
                 };
                 match (kind, key) {
+                    // x dismisses whatever can be dismissed, one key for every kind (Nathan,
+                    // 2026-10-03): a request is closed with word to its asker that there is
+                    // nothing for the person to do, after a y; an update or a message is read.
+                    ("request", 'x') => self.confirm = Some('r'),
+                    ("update", 'x') => self.read_update(),
+                    ("message", 'x') => self.act('m'),
+                    ("fault", 'x') => self.flash(
+                        "A fault clears when the agent that owns it retries or cancels; open it with g",
+                    ),
+                    (word, 'x') => self.flash(format!(
+                        "A {word} waits on your decision, so x cannot dismiss it: answer it with the keys on its card"
+                    )),
                     (_, 'g') => self.go_to_subject(),
                     (_, 't') => self.start_chat(),
                     ("message", 'l') => {
@@ -5408,9 +5421,9 @@ mod tests {
         // Open, but only just: not read yet.
         ui.read_open_update();
         assert!(ui.effects.is_empty());
-        // r reads it, once.
-        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        // x dismisses it: it is read, once.
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(
             matches!(&ui.effects[..], [Effect::Attention { id, answer: Some(answer), .. }]
                 if id == "attention/update" && answer == "read"),
@@ -5426,6 +5439,97 @@ mod tests {
         ));
         ui.read_open_update();
         assert_eq!(ui.effects.len(), 1);
+    }
+
+    #[test]
+    fn x_dismisses_whatever_on_home_can_be_dismissed() {
+        let mut world = demo::world();
+        if let Load::Ready(items) = &mut world.attention {
+            for item in items.iter_mut() {
+                if item.kind.word() == "message" {
+                    item.actions = vec!["message.read".into()];
+                }
+            }
+            items.insert(
+                0,
+                Attention {
+                    id: "attention/request".into(),
+                    tier: Tier::Stopped,
+                    title: "Which runner should take the release?".into(),
+                    waiting: Some("Planner on lark".into()),
+                    age: "2m".into(),
+                    mission: None,
+                    agent: Some("agent/example/planner".into()),
+                    kind: AttentionKind::Request {
+                        from: "Planner".into(),
+                        from_id: "agent/example/planner".into(),
+                        question: "Name the runner.".into(),
+                        structured: None,
+                    },
+                    actions: vec!["work.done".into()],
+                    related: Vec::new(),
+                    raised_by: None,
+                },
+            );
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let pick = |ui: &mut Ui, kind: &str| {
+            let at = ui
+                .listing(60)
+                .ids
+                .iter()
+                .position(|id| {
+                    ui.world
+                        .attention
+                        .items()
+                        .iter()
+                        .any(|item| &item.id == id && item.kind.word() == kind)
+                })
+                .unwrap_or_else(|| panic!("the demo has a {kind}"));
+            ui.select(at);
+            ui.effects.clear();
+            ui.flash = None;
+            ui.attention_focus().unwrap()
+        };
+        let x = |ui: &mut Ui| ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        // A request asks first, then tells its asker there is nothing to do.
+        let request = pick(&mut ui, "request");
+        x(&mut ui);
+        assert!(ui.effects.is_empty());
+        assert!(
+            frame(&ui, 140, 50)
+                .join("\n")
+                .contains("there is nothing for you to do")
+        );
+        ui.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, action, .. }]
+                if *id == request && action == "work.done"),
+            "{:?}",
+            ui.effects
+        );
+        // A message is marked read.
+        let message = pick(&mut ui, "message");
+        x(&mut ui);
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, action, .. }]
+                if *id == message && action == "message.read"),
+            "{:?}",
+            ui.effects
+        );
+        // A review waits on a decision: x says so and sends nothing.
+        pick(&mut ui, "review");
+        x(&mut ui);
+        assert!(ui.effects.is_empty());
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("x cannot dismiss it")),
+            "{:?}",
+            ui.flash
+        );
     }
 
     #[test]
