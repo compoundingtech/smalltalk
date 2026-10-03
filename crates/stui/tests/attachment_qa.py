@@ -1,66 +1,47 @@
 #!/usr/bin/env python3
-"""Prove that both exit controls leave a live attached terminal without input to it."""
+"""Prove that both exit controls leave a live attached terminal without input to it: Ctrl+\\
+and a click on the terminal's header line, in stui's spaces."""
 
-import os
-import subprocess
 import sys
 import time
-import uuid
 
 sys.dont_write_bytecode = True
-from interaction_qa import PTY, click, screen, send, wait_screen
+from interaction_qa import click, open_agent, screen, send, start, stop, wait_screen
+
+HEADER = "← Ctrl+\\"  # the attached terminal's header line
 
 
-def main(binary: str, label: str) -> None:
-    session = f"stui-attach-qa-{uuid.uuid4().hex[:10]}"
-    actor = os.environ.get("ST3_PERSON", "person/alex")
-    subprocess.run(
-        [PTY, "run", "-d", "-e", "--id", session,
-         "--env", f"ST3_PERSON={actor}", "--env", "TERM=xterm-256color",
-         "--", os.path.abspath(binary), "--old"],
-        check=True, capture_output=True, text=True,
-    )
+def attached(value: str) -> bool:
+    return HEADER in value
+
+
+def main(binary: str, name: str) -> None:
+    session = start(binary, "stui-attach-qa")
     try:
-        wait_screen(session, lambda value: "Now" in value, "first frame")
-        send(session, "2")
-        wait_screen(session, lambda value: "History [h]" in value, "Chat")
-        for _ in range(120):
-            footer = screen(session).splitlines()[-1]
-            if label.lower() in footer.lower() and "Enter terminal" in footer:
-                break
-            send(session, "\x1b[B")
-            time.sleep(0.03)
-        else:
-            raise AssertionError(f"no selectable terminal for {label}")
+        open_agent(session, name)
         for _ in range(3):
-            wait_screen(session, lambda value: "● Online" in value.splitlines()[0], "online")
-            send(session, "\r")
+            send(session, "\x1d")  # Ctrl+]
             try:
-                wait_screen(session, lambda value: "Return to Smalltalk" in value
-                            and "Interactive terminal" in value, "attached terminal", seconds=3)
+                wait_screen(session, attached, "attached terminal", seconds=5)
                 break
             except AssertionError:
                 time.sleep(1)
         else:
-            lines = screen(session).splitlines()
-            raise AssertionError(f"attach failed; header={lines[0]!r} footer={lines[-1]!r}")
-        send(session, "\x1c")
-        wait_screen(session, lambda value: "Return to Smalltalk" not in value
-                    and "History [h]" in value, "Ctrl+\\ detach")
-        send(session, "\r")
-        wait_screen(session, lambda value: "Return to Smalltalk" in value, "reattached terminal")
-        click(session, 5, 1)
-        wait_screen(session, lambda value: "Return to Smalltalk" not in value
-                    and "History [h]" in value, "click Return detach")
-        print(f"Attachment QA passed for {label}: Ctrl+\\ and click Return detach")
+            raise AssertionError(f"attach failed for {name}")
+        send(session, "\x1c")  # Ctrl+\
+        wait_screen(session, lambda value: not attached(value), "Ctrl+\\ detach")
+        send(session, "\x1d")
+        value = wait_screen(session, attached, "attached again")
+        row = next(index for index, line in enumerate(value.splitlines()) if HEADER in line)
+        column = value.splitlines()[row].index(HEADER)
+        click(session, column + 2, row + 1)
+        wait_screen(session, lambda value: not attached(value), "click on the header detaches")
+        print(f"Attachment QA passed for {name}: Ctrl+\\ and a click on the header detach")
     finally:
-        try:
-            send(session, "q")
-        except subprocess.CalledProcessError:
-            pass
-        subprocess.run([PTY, "kill", session], capture_output=True, text=True)
-        subprocess.run([PTY, "rm", session], capture_output=True, text=True)
+        stop(session)
 
 
 if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        raise SystemExit("usage: attachment_qa.py STUI AGENT_NAME")
     main(sys.argv[1], sys.argv[2])
