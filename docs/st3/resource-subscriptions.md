@@ -24,7 +24,7 @@ latest state. The repository resource keeps only its own facts, such as `reposit
 
 | Data type | Facts on each item |
 |---|---|
-| `pull_requests` | `number`, `url`, `title`, `author`, `created_at`, `state`, `merged` once closed, `draft`, `head_sha`, `branch`, `base`, `checks_state`, `checks` (each `name`, `status`, `conclusion`), `required_checks` (`state`, `source`, `checks`, `failed`), `review_decision`, `reviews` (each reviewer's latest `state` and `commit`), `merge_queue` (`state`, `position`) while queued, and `opened_by`/`opened_by_run` |
+| `pull_requests` | `number`, `url`, `title`, `author`, `created_at`, `state`, `merged` once closed, `draft`, `head_sha`, `branch`, `base_branch`, `checks_state`, `checks` (each `name`, `status`, `conclusion`), `required_checks` (`state`, `source`, `checks`, `failed`), `review_decision`, `reviews` (each reviewer's latest `state` and `commit`), `merge_queue` (`state`, `position`) while queued, and `opened_by`/`opened_by_run` |
 | `issues` | `number`, `url`, `title`, `author`, `created_at`, `state`, `state_reason` |
 | `comments` | `comments` (the count), `last_comment` (`id`, `author`, `url`, `created_at`, `updated_at`, `body_digest`), and `recent_comments`: the newest 20 conversation comments and submitted reviews, oldest first, each `kind` (`comment` or `review`), `id`, `author`, `at`, and a review's `state` |
 | `reactions` | `reactions` (each reaction's count), and `last_comment.reactions` |
@@ -41,8 +41,9 @@ observer that emits `comments`.
 
 `required_checks` says how the checks a pull request's base branch requires stand on its head.
 `checks` names the checks that count. With `source` `rules` they are those the base branch's
-rulesets and classic protection require. A check matches by name, and by app when the rule names
-one. With `source` `all` the base requires none, or GitHub would not show its rules, and every check
+rulesets and classic protection require. A check matches by name, and, when the rule names an
+app, only a check run from that app counts; a commit status names no app, so it counts only for a
+rule that names none. With `source` `all` the base requires none, or GitHub would not show its rules, and every check
 on the head counts. `state` is `pass` when every counted check finished as success, neutral or
 skipped, `fail` when one finished any other way (named in `failed`), `pending` otherwise, including
 while a required check has not appeared, and `none` when nothing counts. Optional checks never

@@ -26486,9 +26486,30 @@ subscription "pulls" { observer "observer/repo"; on "pull_requests"; to "agent/e
             serde_json::json!({"kind": kind, "id": id, "author": "fern",
                 "at": format!("2026-09-10T05:{minute:02}:00Z")})
         };
+        // What the pull request read adds is valid item facts.
         observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
             "number": 7, "head": "a".repeat(40), "state": "open", "draft": false,
+            "base_branch": "main",
+            "required_checks": {"state": "pending", "source": "rules", "checks": ["build"], "failed": []},
         }]}));
+        let pull = store
+            .latest_actual_value("resource/repo/pull-request/7")
+            .unwrap()
+            .unwrap()["facts"]
+            .clone();
+        assert_eq!(pull["base_branch"], "main");
+        assert_eq!(pull["required_checks"]["state"], "pending");
+        st3_schema::registry()
+            .validate_resource_facts(
+                "vcs.pull-request",
+                &pull
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            )
+            .unwrap();
 
         // Two comments in one poll are two entries, oldest first, and wake only comments.
         let commented = observe(serde_json::json!({"repository_id": 7, "pull_requests": [{
@@ -26505,6 +26526,22 @@ subscription "pulls" { observer "observer/repo"; on "pull_requests"; to "agent/e
             "recent_comments": [entry("review", 5001, 3), entry("comment", 92, 2)],
         }]}));
         assert_eq!(recent(7), ["comment:91", "comment:92", "review:5001"]);
+        let pull = store
+            .latest_actual_value("resource/repo/pull-request/7")
+            .unwrap()
+            .unwrap()["facts"]
+            .clone();
+        st3_schema::registry()
+            .validate_resource_facts(
+                "vcs.pull-request",
+                &pull
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            )
+            .unwrap();
 
         // The same entries again record nothing.
         let before = store.index().unwrap();

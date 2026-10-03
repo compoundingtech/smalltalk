@@ -482,18 +482,22 @@ fn check_outcome(context: &Value) -> (String, Option<u64>, CheckOutcome) {
 }
 
 /// How the checks a head must pass stand together. With rules that require checks, only those
-/// count: each must be present, and a check from another app than the rule names does not count.
+/// count: each must be present, and when a rule names an app only a check run that app reported
+/// counts, as GitHub requires; a commit status carries no app, so it counts only for a rule that
+/// names none.
 /// Without them, because the base requires none or its rules could not be read, every check on
-/// the head counts. `pass` needs every counted check finished and passing, `fail` needs one
-/// finished and failing, and anything else is `pending`; `none` says there is nothing to count.
+/// the head counts. `fail` needs one counted check finished and failing, `pass` needs every one
+/// finished and passing, and anything else is `pending`; `none` says there is nothing to count.
 fn required_checks(contexts: &[Value], required: Option<&[RequiredCheck]>) -> Value {
     let checks = contexts.iter().map(check_outcome).collect::<Vec<_>>();
+    // Every check and status that shares a counted name must pass, so one that finished and
+    // failed decides it, whatever else of that name still runs.
     let combine = |outcomes: &mut dyn Iterator<Item = CheckOutcome>| {
         let outcomes = outcomes.collect::<Vec<_>>();
-        if outcomes.is_empty() || outcomes.contains(&CheckOutcome::Pending) {
-            CheckOutcome::Pending
-        } else if outcomes.contains(&CheckOutcome::Failed) {
+        if outcomes.contains(&CheckOutcome::Failed) {
             CheckOutcome::Failed
+        } else if outcomes.is_empty() || outcomes.contains(&CheckOutcome::Pending) {
+            CheckOutcome::Pending
         } else {
             CheckOutcome::Passed
         }
@@ -505,8 +509,7 @@ fn required_checks(contexts: &[Value], required: Option<&[RequiredCheck]>) -> Va
                 .iter()
                 .map(|rule| {
                     let outcome = combine(&mut checks.iter().filter_map(|(name, app, outcome)| {
-                        (*name == rule.context
-                            && (rule.app.is_none() || app.is_none() || *app == rule.app))
+                        (*name == rule.context && (rule.app.is_none() || *app == rule.app))
                             .then_some(*outcome)
                     }));
                     (rule.context.clone(), outcome)
@@ -567,7 +570,7 @@ fn open_pull_request(
     insert(&mut facts, "created_at", node.get("createdAt"));
     insert(&mut facts, "head", node.get("headRefOid"));
     insert(&mut facts, "branch", node.get("headRefName"));
-    insert(&mut facts, "base", node.get("baseRefName"));
+    insert(&mut facts, "base_branch", node.get("baseRefName"));
     facts.insert("state".into(), Value::String("open".into()));
     facts.insert(
         "draft".into(),
@@ -1889,12 +1892,33 @@ mod tests {
                 "main",
                 json!([run("build", Some("SUCCESS"), 15368), legacy])
             ),
-            // A check of the required name from another app does not count.
+            // A check of the required name from another app does not count, and neither does a
+            // commit status, which names no app.
             pull(
                 4,
                 "main",
                 json!([
                     run("build", Some("SUCCESS"), 999),
+                    run("test", Some("SUCCESS"), 15368),
+                    legacy
+                ])
+            ),
+            // A failed status and a running check run of one counted name: the failure decides.
+            pull(
+                8,
+                "main",
+                json!([
+                    run("build", Some("SUCCESS"), 15368),
+                    run("test", Some("SUCCESS"), 15368),
+                    {"__typename": "StatusContext", "context": "garden/legacy", "state": "FAILURE"},
+                    run("garden/legacy", None, 15368)
+                ])
+            ),
+            pull(
+                7,
+                "main",
+                json!([
+                    {"__typename": "StatusContext", "context": "build", "state": "SUCCESS"},
                     run("test", Some("SUCCESS"), 15368),
                     legacy
                 ])
@@ -1929,12 +1953,20 @@ mod tests {
         );
         assert_eq!(required(3)["state"], "pending");
         assert_eq!(required(4)["state"], "pending");
+        assert_eq!(required(7)["state"], "pending");
+        assert_eq!(
+            required(8),
+            json!({"state": "fail", "source": "rules", "checks": main_checks, "failed": ["garden/legacy"]})
+        );
         assert_eq!(
             required(5),
             json!({"state": "fail", "source": "all", "checks": ["build", "lint"], "failed": ["lint"]})
         );
         assert_eq!(required(6)["state"], "none");
-        assert_eq!(item(&observed.facts, "pull_requests", 5)["base"], "release");
+        assert_eq!(
+            item(&observed.facts, "pull_requests", 5)["base_branch"],
+            "release"
+        );
     }
 
     /// A pull request change seen within a minute of the last GraphQL read waits for the minute,

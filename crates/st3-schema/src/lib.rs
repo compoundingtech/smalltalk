@@ -826,6 +826,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("opened_by", reference()),
                 ("opened_by_run", reference()),
                 ("base", reference()),
+                ("base_branch", string()),
                 ("state", string()),
                 ("draft", boolean()),
                 ("merged", boolean()),
