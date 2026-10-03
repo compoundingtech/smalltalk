@@ -2039,7 +2039,14 @@ impl Ui {
     fn pane_title(&self, pane: &Pane) -> String {
         let find = |id: &Option<String>| id.clone().unwrap_or_default();
         match pane {
-            Pane::Terminal(id) if id.starts_with("terminal/") => "shell".into(),
+            // A shell is named by the title its program gives, as a terminal's tab is.
+            Pane::Terminal(id) if id.starts_with("terminal/") => self
+                .terminal
+                .as_ref()
+                .filter(|view| &view.agent == id)
+                .and_then(|view| view.native.as_ref())
+                .and_then(pty::NativeTerminal::title)
+                .unwrap_or_else(|| "shell".into()),
             Pane::Agent(Some(id)) | Pane::Terminal(id) => self
                 .world
                 .agents
@@ -5019,6 +5026,90 @@ mod tests {
         // Back on its tab, the shell shows again.
         ui.open_in_glass(Pane::Terminal(shell), Open::Here);
         assert!(screen(&ui).contains("echo in the shell"));
+    }
+
+    #[test]
+    fn a_shell_works_as_a_terminal_ctrl_c_at_once_drag_copies_title_names_the_tab() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use pty_core::protocol::{MessageType, PacketReader, encode_packet};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let mut ui = glass();
+        ui.live = true;
+        let shell = "terminal/example-shell".to_owned();
+        ui.open_in_glass(Pane::Terminal(shell.clone()), Open::Tab);
+        let (stui, mut daemon) = UnixStream::pair().unwrap();
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: shell.clone(),
+            title: "shell".into(),
+            name: "shell".into(),
+            lines: Vec::new(),
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: Some(crate::ui::pty::NativeTerminal::spawn(
+                stui,
+                "example-shell",
+                "one".into(),
+                24,
+                80,
+            )),
+        });
+        let mut reader = PacketReader::new();
+        let mut packets = Vec::new();
+        let mut next = |daemon: &mut UnixStream| {
+            while packets.is_empty() {
+                let mut bytes = [0_u8; 256];
+                let count = daemon.read(&mut bytes).unwrap();
+                packets.extend(reader.feed(&bytes[..count]).unwrap());
+            }
+            packets.remove(0)
+        };
+        assert_eq!(next(&mut daemon).type_, MessageType::Attach);
+        daemon
+            .write_all(&encode_packet(MessageType::Screen, b"$ ls\r\nnotes.txt"))
+            .unwrap();
+        daemon
+            .write_all(&encode_packet(MessageType::Data, b"\x1b]2;vim notes\x07"))
+            .unwrap();
+        let start = std::time::Instant::now();
+        while !screen(&ui).contains("vim notes") {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "{}",
+                screen(&ui)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Ctrl+C reaches the shell at once.
+        ctrl(&mut ui, 'c');
+        let mut packet = next(&mut daemon);
+        while packet.type_ != MessageType::Data {
+            packet = next(&mut daemon);
+        }
+        assert_eq!(packet.payload, b"\x03");
+        // A drag across what the shell printed selects it and copies it on release.
+        let body = ui.terminal_body.get().unwrap();
+        let mouse = |kind, column: u16| MouseEvent {
+            kind,
+            column: body.x + column,
+            row: body.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0));
+        ui.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4));
+        ui.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4));
+        assert_eq!(
+            ui.native_terminal().unwrap().selected().as_deref(),
+            Some("notes")
+        );
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text == "Copied 1 line"),
+            "{:?}",
+            ui.flash
+        );
     }
 
     #[test]

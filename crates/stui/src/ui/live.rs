@@ -1138,6 +1138,7 @@ pub fn run(context: Context) -> Result<()> {
         {
             reattach_tries = 0;
         }
+        ui.terminal_requests();
         // While an attached terminal's output flows, or voice listens, draw it as it comes.
         let flowing = ui.voice.is_some()
             || ui
