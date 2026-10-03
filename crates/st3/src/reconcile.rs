@@ -13699,12 +13699,17 @@ fn terminal_exec_field_gate_failure(
         let lineage = store.launch_lineage(subject)?;
         let observed = store.latest_claim(subject, Some("runtime.observed"))?;
         if !observed.is_some_and(|claim| {
-            claim.body["evidence"].as_array().is_some_and(|evidence| {
-                evidence
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .any(|token| lineage.iter().any(|desired| desired == token))
-            })
+            // An observation may arrive between reading actual state and its evidence.
+            // Never combine an older exit with proof belonging to a newer observation.
+            ["status", "exit_code", "incarnation_id"]
+                .iter()
+                .all(|path| actual_field(actual, path) == actual_field(&claim.body, path))
+                && claim.body["evidence"].as_array().is_some_and(|evidence| {
+                    evidence
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|token| lineage.iter().any(|desired| desired == token))
+                })
         }) {
             return Ok(None);
         }
@@ -14438,6 +14443,10 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
                 reconciler.evaluate_gate(&stage, &status_gate).unwrap(),
                 GateOutcome::Pending
             ));
+            let previous_actual = store
+                .latest_actual_value("exec/orchid/probe")
+                .unwrap()
+                .unwrap();
             // A revised declaration must be allowed to launch again, even with restart never.
             apply_source(
                 &store,
@@ -14452,6 +14461,31 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
                     GateOutcome::Pending
                 ));
             }
+            reconciler.reconcile_once().unwrap();
+            let revised = store
+                .desired_subject_with_writer("exec/orchid/probe")
+                .unwrap()
+                .unwrap()
+                .0;
+            reconciler
+                .record_member(
+                    &revised,
+                    &RuntimeObservation {
+                        runtime_id: revised.member.as_ref().unwrap().runtime_id.clone(),
+                        terminal: false,
+                        status: "running".into(),
+                        exit_code: None,
+                        incarnation_id: None,
+                    },
+                    false,
+                )
+                .unwrap();
+            assert!(
+                terminal_exec_field_gate_failure(&store, &gate, &previous_actual)
+                    .unwrap()
+                    .is_none(),
+                "an older exit must not use a newer launch's evidence"
+            );
         }
     }
 
