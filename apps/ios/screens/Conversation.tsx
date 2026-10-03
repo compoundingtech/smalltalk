@@ -127,6 +127,14 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     });
   }, [navigation, title, agent, status, actions]);
 
+  // st follows the session an agent had when the subscription started. After the agent restarts
+  // into a new session, subscribe again, once per new session, or this would keep showing the old
+  // one (and a message sent to the new one would never show up here).
+  const [followed, setFollowed] = useState<string | undefined>(undefined);
+  const currentSession = agent?.current_session_id ?? undefined;
+  useEffect(() => {
+    if (currentSession && timeline.sessionId && timeline.sessionId !== currentSession && followed !== currentSession) setFollowed(currentSession);
+  }, [currentSession, timeline.sessionId, followed]);
   // The socket sends the newest page, then each change; it never polls. Only while visible.
   useFocusEffect(useCallback(() => {
     if (!feed || unresolved) return;
@@ -142,7 +150,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       onIssue: setIssue,
     });
     return () => follow.close();
-  }, [feed, target, unresolved, conversationCache]));
+  }, [feed, target, unresolved, conversationCache, followed]));
 
   const names = useMemo(() => {
     const map = new Map(data.agents.map(candidate => [candidate.id, agentName(candidate)]));
