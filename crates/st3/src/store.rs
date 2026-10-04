@@ -19281,8 +19281,13 @@ fn current_harness_at(
     let Some((mut state, claim, observed_at_unix_ms, _)) = current else {
         return Ok(None);
     };
-    if !auth_restored && optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
-        state = "needs-login".into();
+    if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
+        if auth_restored {
+            // Sparse successful reports must not inherit an older credential-refusal reason.
+            optional.insert("reason", None);
+        } else {
+            state = "needs-login".into();
+        }
     }
     Ok(Some(crate::model::CurrentHarnessView {
         state,
