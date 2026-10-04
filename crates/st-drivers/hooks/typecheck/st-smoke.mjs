@@ -30,12 +30,14 @@ for (const [key, value] of Object.entries({BIN:recorder,CATALOG:"/test/catalog",
 }
 const events = new Map();
 let title = "Stale saved title";
+const titleChanges = [];
 let nativeSession = "native-1";
 let synchronousContext = false;
 const handoffs = [];
 const api = {
   on:(event,callback)=>events.set(event,callback),
-  setSessionName:(label)=>{title=label;},
+  getSessionName:()=>title,
+  setSessionName:(label)=>{titleChanges.push(label);title=label;},
   sendMessage:()=>{},
   sendUserMessage:async(content)=>{
     handoffs.push(content);
@@ -52,8 +54,15 @@ await events.get("session_start")({},ctx);
 await until(()=>title==="Quartz[gen]");
 assert.ok(events.has("session_switch"),"OMP /new uses session_switch");
 const meta={messageId:"message/quartz-1"};
+const titleChangesBeforeReplay = titleChanges.length;
+for (let i = 0; i < 2; i++) {
+  send({type:"seat",seat:{subject:"agent/eval.worker",desired:{display_name:"Quartz"}}});
+}
 send({type:"message",content:"QUARTZ SIGNAL",meta});
 await until(()=>read().some(frame=>frame.type==="delivered"&&frame.meta?.messageId===meta.messageId));
+if (driver === "omp") {
+  assert.equal(titleChanges.length,titleChangesBeforeReplay,"replaying the same Seat twice must not rewrite the session name");
+}
 assert.equal(read().filter(frame=>frame.type==="read").length,0,"native queue acceptance is not read evidence");
 await events.get("context")({messages:[{role:"user",content:"QUARTZ SIGNAL"}]},ctx);
 await until(()=>read().some(frame=>frame.type==="read"&&frame.meta?.messageId===meta.messageId));

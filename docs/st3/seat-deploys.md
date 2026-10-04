@@ -62,6 +62,8 @@ and seats that were already running on the legacy path continue to use ordinary 
 
 Seat updates carry `desired.display_name` and the member record, including the persona suffix.
 They update the PTY title and pi/omp session name on reconnect, `session_start`, and `session_switch`.
+OMP compares the declared label with its current session name before writing it, so replaying an
+unchanged Seat on reconnect does not append a title change or rewrite the saved title timestamp.
 Claude's status line reads the same graph authority on each render and chains the existing renderer.
 Native `/rename` is temporary: the next authority update restores the declared name.
 
