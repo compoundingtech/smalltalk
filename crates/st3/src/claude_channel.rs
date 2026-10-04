@@ -40,7 +40,6 @@ pub async fn run(
 ) -> Result<()> {
     let agent_dir = &paths.agent_dir;
     let ledger_path = agent_dir.join("native-channel-handoffs.json");
-    let mut replay_delivered = BTreeSet::new();
     let mut state = if let Some(path) =
         st_drivers::reexec::resume_path(st_drivers::reexec::CHANNEL_RESUME_ENV)
     {
@@ -56,9 +55,6 @@ pub async fn run(
         // before any new offer; absence of proof gets a typed diagnostic, never an
         // unconditional replay of instructions whose consumption is uncertain.
         let ledger = ledger.unwrap_or_default();
-        if ledger.incarnation != incarnation {
-            replay_delivered = ledger.attempted.clone();
-        }
         State {
             fence: Fence::new(subject, incarnation, "delivery"),
             attempted: ledger.attempted,
@@ -132,13 +128,39 @@ pub async fn run(
                     "channel":{"pid":std::process::id(),"image":st_drivers::reexec::running_identity().map(|i| i.token()),"age_ms":0},
                     "ready":state.initialized}));
                 if state.initialized && replayed {
-                    for message in &messages {
-                        if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") { continue; }
-                        let previous_attempt = replay_delivered.remove(&message.subject);
-                        if message.status == "delivered" && previous_attempt
-                            && !state.confirmed.contains(&message.subject) {
-                            state.attempted.remove(&message.subject);
+                    // The stream grants eligibility only to live mail. Retained handoffs can
+                    // still acquire missing receipts from native proof, without another offer.
+                    let live: BTreeSet<_> = messages.iter().map(|message| message.subject.clone()).collect();
+                    let mut tracked = messages.clone();
+                    let mut dirty = false;
+                    let pending: BTreeSet<_> = state.attempted.iter().chain(&state.accepted).chain(&state.confirmed).cloned().collect();
+                    for message in pending {
+                        if live.contains(&message) { continue; }
+                        let key = format!("recovery:{message}");
+                        if !retry_ready(&retries, &key) { continue; }
+                        match client.get::<MessageView>(&format!("/v1/messages/read/{message}")).await {
+                            Ok(view) if view.to == subject && matches!(view.status.as_str(), "sent" | "staged" | "delivered") => {
+                                tracked.push(view);
+                                retries.remove(&key);
+                            },
+                            Ok(_) => {
+                                dirty |= state.attempted.remove(&message);
+                                dirty |= state.accepted.remove(&message);
+                                dirty |= state.confirmed.remove(&message);
+                                content.remove(&message);
+                                unconfirmed_since.remove(&message);
+                                retries.remove(&key);
+                            },
+                            Err(error) => {
+                                retry_failed(&mut retries, &key);
+                                diagnostic(client, &state.fence, &message, "claude-handoff-status-unavailable",
+                                    &format!("{message}: retained handoff status could not be read; receipt recovery retries with backoff up to 30s: {error:#}"),
+                                    &mut diagnostics).await;
+                            },
                         }
+                    }
+                    for message in &tracked {
+                        if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") { continue; }
                         if content.contains_key(&message.subject) || !retry_ready(&retries, &message.subject) { continue; }
                         let prepared = async {
                             if !state.attempted.contains(&message.subject)
@@ -170,7 +192,6 @@ pub async fn run(
                     }
                     // User meta records and explicit mid-turn absorption are native
                     // consumption proof. An enqueue or writing stdout is not a receipt.
-                    let mut dirty = false;
                     if !content.is_empty() && retry_ready(&retries, "transcript") {
                         let records = (|| {
                             let path = st_drivers::claude_session::channel_transcript_recovering(paths, identity, runtime_id, &wrapper)?
@@ -201,7 +222,7 @@ pub async fn run(
                             },
                         }
                     }
-                    for message in &messages {
+                    for message in &tracked {
                         let Some(envelope) = content.get(&message.subject) else { continue; };
                         if state.attempted.contains(&message.subject) {
                             let since = unconfirmed_since.entry(message.subject.clone()).or_insert_with(Instant::now);
@@ -212,6 +233,7 @@ pub async fn run(
                             }
                             continue;
                         }
+                        if !live.contains(&message.subject) { continue; }
                         // Persist the handoff before stdout. A broken pipe cannot authorize
                         // repeating an uncertain notification. Restart first checks native proof.
                         state.attempted.insert(message.subject.clone());
@@ -251,16 +273,6 @@ pub async fn run(
                             },
                         }
                     }
-                    // Closed graph messages are also durable proof, including a receipt applied
-                    // before the HTTP response disappeared.
-                    let active: BTreeSet<_> = messages.iter().map(|message| message.subject.clone()).collect();
-                    let before = state.attempted.len();
-                    state.attempted.retain(|message| active.contains(message));
-                    state.confirmed.retain(|message| active.contains(message));
-                    state.accepted.retain(|message| active.contains(message));
-                    content.retain(|message, _| active.contains(message));
-                    unconfirmed_since.retain(|message, _| active.contains(message));
-                    dirty |= before != state.attempted.len();
                     if dirty { save_handoffs(&ledger_path, &state)?; }
                 }
                 if let Some(binary) = watch.as_mut().and_then(|watch| tokio::task::block_in_place(|| watch.ready())) {
@@ -459,8 +471,8 @@ async fn body(client: &Client, message: &MessageView) -> Result<String> {
         Ok(message.content.clone())
     }
 }
-// Only read/closed settles graph mail. Delivered-unread mail remains eligible;
-// native handoff proof decides whether this channel needs to offer it again.
+// Only read/closed settles graph mail. Stream eligibility authorizes new offers;
+// retained handoffs are prepared exclusively to recover their native receipts.
 async fn prepare_handoff(client: &Client, fence: &Fence, message: &MessageView) -> Result<bool> {
     match message.status.as_str() {
         "sent" => Ok(receipt(client, fence, &message.subject, "staged")
@@ -541,7 +553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_unread_replay_needs_no_backward_receipt_and_read_or_closed_mail_is_final() {
+    async fn claude_receipt_preparation_needs_no_backward_transition_and_read_or_closed_mail_is_final() {
         let client = Client::new(crate::client::Endpoint::Unix(std::path::PathBuf::from(
             "/absent-st889-daemon.sock",
         )));

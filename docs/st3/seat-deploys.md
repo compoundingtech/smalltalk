@@ -46,8 +46,8 @@ For already-staged Claude mail, durable native proof repairs the missing receipt
 handoff stays queued and retains its attempt ledger across restart; after 30 seconds without proof,
 `claude-handoff-unconfirmed` explains why another notification is held. Preparation, transcript
 lookup, and receipt publication failures have separate diagnostics and retry with backoff capped
-at 30 seconds. Delivered-but-unread mail remains eligible for a fresh runtime offer when its
-current native transcript does not already prove acceptance or consumption.
+at 30 seconds. Retained handoffs are inspected only to recover missing receipts from exact native
+proof. Boot and reconnect never authorize a fresh offer of delivered-but-unread mail.
 
 Epochs are allocated by the daemon, independently of wall-clock time. An initial bind has a stable
 request token; a lost acknowledgement retries that same epoch, and retired tokens cannot allocate
