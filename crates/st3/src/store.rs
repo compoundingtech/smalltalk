@@ -13984,34 +13984,47 @@ impl Store {
             next_cursor,
         })
     }
-    /// Find a retained append independently of the bounded operation window.
-    /// Local IDs, not just store indices, decide whether it precedes that window.
-    pub(crate) fn timeline_entry_append_at(
+    /// Resolve retained appends in one incarnation scan, without loading their bodies.
+    /// Full store/local positions distinguish query omission from a missing append.
+    pub(crate) fn timeline_entry_append_positions_at(
         &self,
         subject: &str,
         incarnation: &str,
-        entry: &str,
+        entries: &BTreeSet<String>,
         before_index: Option<u64>,
-    ) -> Result<Option<ClaimRecord>> {
+    ) -> Result<BTreeMap<String, (u64, u64)>> {
         let connection = self.readers.get();
-        let filter = "subject=?1 AND kind='harness.timeline'
-            AND json_extract(body, '$.fields.incarnation_id')=?2
-            AND json_extract(body, '$.fields.entry_id')=?3
-            AND json_extract(body, '$.fields.operation')='append'";
-        let claim = connection.query_row(
-            &format!("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-                FROM claims WHERE {filter} AND (?4 IS NULL OR store_index<?4)
-                ORDER BY store_index LIMIT 1"),
-            params![subject, incarnation, entry, before_index],
-            claim_from_row,
-        ).optional()?;
-        let local = connection.query_row(
-            &format!("{LOCAL_OBSERVATION_COLUMNS} WHERE {filter}
-                AND (?4 IS NULL OR after_store_index<?4) ORDER BY id LIMIT 1"),
-            params![subject, incarnation, entry, before_index],
-            |row| local_observation_from_row(&self.origin, row),
-        ).optional()?;
-        Ok(claim.into_iter().chain(local).min_by_key(claim_log_order))
+        let mut statement = connection.prepare(
+            "WITH operations AS (
+                SELECT json_extract(body, '$.fields.entry_id') AS entry_id,
+                    store_index, 0 AS local_id
+                FROM claims
+                WHERE subject=?1 AND kind='harness.timeline'
+                    AND json_extract(body, '$.fields.incarnation_id')=?2
+                    AND json_extract(body, '$.fields.operation')='append'
+                    AND json_extract(body, '$.fields.entry_id') IN (SELECT value FROM json_each(?3))
+                    AND (?4 IS NULL OR store_index<?4)
+                UNION ALL
+                SELECT json_extract(body, '$.fields.entry_id') AS entry_id,
+                    after_store_index AS store_index, id AS local_id
+                FROM local_observations
+                WHERE subject=?1 AND kind='harness.timeline'
+                    AND json_extract(body, '$.fields.incarnation_id')=?2
+                    AND json_extract(body, '$.fields.operation')='append'
+                    AND json_extract(body, '$.fields.entry_id') IN (SELECT value FROM json_each(?3))
+                    AND (?4 IS NULL OR after_store_index<?4)
+            )
+            SELECT entry_id, store_index, local_id FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY entry_id ORDER BY store_index, local_id
+                ) AS position FROM operations
+            ) WHERE position=1",
+        )?;
+        let rows = statement.query_map(
+            params![subject, incarnation, serde_json::to_string(entries)?, before_index],
+            |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))),
+        )?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
     /// The newest local timeline observation for one incarnation at or before a snapshot.

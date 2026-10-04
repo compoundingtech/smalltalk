@@ -4153,44 +4153,48 @@ pub(super) fn timeline_value(
     let prefix_unavailable =
         !timeline_retention_is_explicit(&timeline_claims, missing_prefix_through);
     let window_start = timeline_claims.first().map(crate::store::claim_log_order);
-    let mut omitted_updates = BTreeSet::new();
-    let mut retained_entries = BTreeSet::new();
-    for claim in &timeline_claims {
-        let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        let Some(entry_id) = fields.get("entry_id").and_then(Value::as_str) else {
-            continue;
-        };
-        if omitted_updates.contains(entry_id) {
-            continue;
-        }
-        let operation = fields.get("operation").and_then(Value::as_str);
-        if !retained_entries.contains(entry_id) && operation != Some("append") {
-            let append = if has_older_timeline {
-                state.store.timeline_entry_append_at(
-                    owner, incarnation.unwrap_or_default(), entry_id, before,
-                ).map_err(ApiError::internal)?
-            } else {
-                None
-            };
-            if let Some(append) = append
-                && window_start.is_some_and(|start| crate::store::claim_log_order(&append) < start)
-            {
-                // This entry is outside this view, not absent from retained storage.
-                // Do not reconstruct a latest revision without its intervening operations.
-                omitted_updates.insert(entry_id.to_owned());
+    let missing_appends = {
+        let mut retained_entries = BTreeSet::new();
+        let mut missing = BTreeSet::new();
+        for claim in &timeline_claims {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            let Some(entry_id) = fields.get("entry_id").and_then(Value::as_str) else {
                 continue;
+            };
+            if retained_entries.insert(entry_id)
+                && fields.get("operation").and_then(Value::as_str) != Some("append")
+            {
+                missing.insert(entry_id.to_owned());
             }
-            return Err(ApiError {
-                status: StatusCode::GONE,
-                code: "timeline-history-incomplete".into(),
-                message: "the retained transcript start is incomplete: an entry's append operation is missing".into(),
-                details: Box::new(serde_json::Map::from_iter([
-                    ("full_resync".into(), Value::Bool(false)),
-                    ("retained_history_incomplete".into(), Value::Bool(true)),
-                ])),
-            });
         }
-        retained_entries.insert(entry_id.to_owned());
+        missing
+    };
+    let appends = if has_older_timeline && !missing_appends.is_empty() {
+        state.store.timeline_entry_append_positions_at(
+            owner, incarnation.unwrap_or_default(), &missing_appends, before,
+        ).map_err(ApiError::internal)?
+    } else {
+        BTreeMap::new()
+    };
+    let mut omitted_updates = BTreeSet::new();
+    for entry_id in missing_appends {
+        if appends.get(&entry_id).is_some_and(|append| {
+            window_start.is_some_and(|start| *append < start)
+        }) {
+            // An entry outside this view is not absent from retained storage.
+            // Never fabricate its latest revision without intervening operations.
+            omitted_updates.insert(entry_id);
+            continue;
+        }
+        return Err(ApiError {
+            status: StatusCode::GONE,
+            code: "timeline-history-incomplete".into(),
+            message: "the retained transcript start is incomplete: an entry's append operation is missing".into(),
+            details: Box::new(serde_json::Map::from_iter([
+                ("full_resync".into(), Value::Bool(false)),
+                ("retained_history_incomplete".into(), Value::Bool(true)),
+            ])),
+        });
     }
     timeline_claims.retain(|claim| {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
@@ -4733,6 +4737,14 @@ fn conversation_read_now(
                 return item["sequence"]
                     .as_u64()
                     .is_some_and(|sequence| sequence > native_sequence);
+            }
+            // These entries belong to the projection, not to a persisted claim ID.
+            // Crossing the bound must also notify an already-followed conversation.
+            if matches!(
+                item["body"]["code"].as_str(),
+                Some("timeline-query-limited" | "timeline-history-incomplete")
+            ) {
+                return !explicit_ids.is_empty() || !changed_indexes.is_empty();
             }
             explicit_ids.contains(id)
                 || item["sequence"]
@@ -14024,7 +14036,7 @@ mission "example/zero-run" state="ready" {
         // One entry more than a timeline read returns, in one commit: a commit for each entry
         // took minutes on a busy disk.
         state.store.append_local_observations_for_test(
-            &(1..=4_097)
+            &(1..=4_096)
                 .map(|sequence| {
                     entry(
                         sequence,
@@ -14048,6 +14060,15 @@ mission "example/zero-run" state="ready" {
             .as_str()
             .unwrap()
             .to_owned();
+        let before_bound = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        state.store.append_claim(&entry(4_097, "status", json!({"status":"running"}))).unwrap();
+        let changes = conversation_read_now(
+            &state, &session, &session_id, before_bound["next_cursor"].as_str(),
+        ).unwrap();
+        assert!(changes["items"].as_array().unwrap().iter().any(|item| {
+            item["body"]["code"] == "timeline-query-limited"
+        }));
+        let snapshot = new_client_snapshot(&state);
         let read = |snapshot: &ClientSnapshot| {
             timeline_value(
                 &state,
@@ -14071,6 +14092,10 @@ mission "example/zero-run" state="ready" {
         update.fields.insert("revision".into(), json!(2));
         update.idempotency_key = None;
         state.store.append_claim(&update).unwrap();
+        let gap = conversation_read_now(
+            &state, &session, &session_id, changes["next_cursor"].as_str(),
+        ).unwrap_err();
+        assert_eq!(gap.code, "cursor-gap");
         let page = read(&new_client_snapshot(&state));
         assert!(page["items"].as_array().unwrap().iter().any(|item| {
             item["body"]["code"] == "timeline-query-limited"
@@ -14078,6 +14103,15 @@ mission "example/zero-run" state="ready" {
         }));
         assert!(!page["items"].as_array().unwrap().iter().any(|item| {
             item["body"]["code"] == "invalid-timeline-transition"
+        }));
+        update.fields.insert("entry_id".into(), json!("timeline-entry/retention-2"));
+        update.fields.insert("sequence".into(), json!(2));
+        update.fields.insert("operation".into(), json!("finalize"));
+        state.store.append_claim(&update).unwrap();
+        let page = read(&new_client_snapshot(&state));
+        assert!(page["items"].as_array().unwrap().iter().any(|item| {
+            item["body"]["code"] == "timeline-query-limited"
+                && item["body"]["details"]["omitted_updated_entries"] == 2
         }));
         update.fields.insert("entry_id".into(), json!("timeline-entry/actually-missing"));
         update.idempotency_key = None;
