@@ -87,6 +87,15 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
 /// Routes the check does not measure, and why. Keep this list short: a route here can grow with
 /// the store unnoticed.
 const NOT_MEASURED: &[(&str, &str)] = &[
+    // Sekrets: neither reads the claim store beyond one primary-key lookup.
+    (
+        "POST /v1/sekrets/attest",
+        "needs a calling process in a seat's cgroup scope; reads the terminal registry and one declaration by key",
+    ),
+    (
+        "GET /v1/sekrets/node",
+        "returns the node key held in memory",
+    ),
     // Streams and terminals: they stay open, or need a live `pty`.
     (
         "GET /v1/mailbox",
@@ -492,7 +501,10 @@ const PROBES: &[Probe] = &[
     ),
     get("GET /v1/client/now", "/v1/client/now"),
     get("GET /v1/client/machines", "/v1/client/machines"),
-    get("GET /v1/client/hosts/{*id}", "/v1/client/hosts/local/repositories"),
+    get(
+        "GET /v1/client/hosts/{*id}",
+        "/v1/client/hosts/local/repositories",
+    ),
     get("GET /v1/client/devices", "/v1/client/devices"),
     get("GET /v1/client/attention", "/v1/client/attention"),
     get(
