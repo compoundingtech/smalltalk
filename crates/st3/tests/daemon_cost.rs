@@ -499,6 +499,10 @@ const PROBES: &[Probe] = &[
         "GET /v1/client/attention/{*id}",
         "/v1/client/attention/{attention}",
     ),
+    get("GET /v1/client/mail-backlog", "/v1/client/mail-backlog"),
+    post("POST /v1/messages/cleanup", "/v1/messages/cleanup", |_, _| {
+        json!({ "all": true, "older_than_ms": 1, "dry_run": true })
+    }),
     get("GET /v1/client/messages", "/v1/client/messages"),
     get(
         "GET /v1/client/messages/{*id}",

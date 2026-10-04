@@ -344,6 +344,9 @@ CREATE TABLE IF NOT EXISTS message_index (
     closed INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS message_index_open ON message_index(closed, created_index);
+-- Periodic backlog counts start at aged sent claims, without loading every message body.
+CREATE INDEX IF NOT EXISTS claims_message_sent_time_index
+ON claims(CAST(accepted_at_unix_ms AS INTEGER), subject) WHERE kind='message.sent';
 CREATE TRIGGER IF NOT EXISTS message_index_claim_insert AFTER INSERT ON claims
 WHEN NEW.subject LIKE 'message/%'
 BEGIN
@@ -10744,6 +10747,28 @@ impl Store {
             messages.push(self.message_view_cached(&connection, &subject, index)?);
         }
         Ok(messages)
+    }
+
+    pub fn unread_mail_count_before(&self, before_unix_ms: u128) -> Result<u64> {
+        smallclaims::touched::note_read(|| "kind:message.sent".to_owned());
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(&canonical_sql(
+            "WITH candidates AS (
+                 SELECT DISTINCT subject FROM claims INDEXED BY claims_message_sent_time_index
+                 WHERE kind='message.sent' AND CAST(accepted_at_unix_ms AS INTEGER)<?1
+             )
+             SELECT COUNT(*) FROM candidates
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM claims terminal WHERE terminal.subject=candidates.subject
+                   AND terminal.kind IN ('message.read','message.closed')
+             ) AND (
+                 SELECT CAST(claims.accepted_at_unix_ms AS INTEGER) FROM claims
+                 WHERE claims.subject=candidates.subject AND claims.kind='message.sent'
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1
+             )<?1",
+        ))?;
+        let before = i64::try_from(before_unix_ms).unwrap_or(i64::MAX);
+        Ok(statement.query_row([before], |row| row.get(0))?)
     }
 
     pub fn messages(

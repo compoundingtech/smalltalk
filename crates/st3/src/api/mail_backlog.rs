@@ -19,6 +19,17 @@ fn overdue(
         {
             continue;
         }
+        // A later projection must not make an already read or closed message eligible again.
+        if store
+            .latest_claim(&message.subject, Some("message.closed"))?
+            .is_some()
+            || (store
+                .latest_claim(&message.subject, Some("message.read"))?
+                .is_some()
+                && !(resume_archives && unfinished_archive(store, &message)?))
+        {
+            continue;
+        }
         let Some(sent) = store.latest_claim(&message.subject, Some("message.sent"))? else {
             continue;
         };
@@ -46,7 +57,7 @@ fn unfinished_archive(store: &Store, message: &MessageView) -> anyhow::Result<bo
 
 pub(super) fn report(store: &Store, now: u128) -> anyhow::Result<st3_client::MailBacklog> {
     Ok(st3_client::MailBacklog {
-        count: overdue(store, now, THRESHOLD_MS, None, false)?.len() as u64,
+        count: store.unread_mail_count_before(now.saturating_sub(u128::from(THRESHOLD_MS)))?,
         threshold_ms: THRESHOLD_MS,
         cleanup_command: CLEANUP_COMMAND.into(),
     })
