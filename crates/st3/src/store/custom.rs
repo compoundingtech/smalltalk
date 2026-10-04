@@ -162,8 +162,18 @@ pub(super) fn flush(tx: &Transaction<'_>) -> Result<()> {
         |r| r.get(0),
     )?;
     if registry_dirty {
+        let before = registration_rows(tx)?;
         refresh_registrations(tx)?;
-        tx.execute("INSERT OR IGNORE INTO local_custom_dirty SELECT DISTINCT subject FROM claims WHERE subject LIKE 'custom/%' AND subject NOT LIKE 'custom/client/%' AND subject NOT LIKE 'custom/st3-kinds/%'",[])?;
+        let after = registration_rows(tx)?;
+        let changed = before
+            .iter()
+            .chain(&after)
+            .filter(|(id, _)| before.get(*id) != after.get(*id))
+            .map(|(_, (prefix, _))| prefix.clone())
+            .collect::<BTreeSet<_>>();
+        for prefix in changed {
+            tx.execute("INSERT OR IGNORE INTO local_custom_dirty SELECT DISTINCT subject FROM claims WHERE subject>=?1 AND subject<?2",params![prefix,prefix_end(&prefix)])?;
+        }
     }
     let dirty=tx.prepare("SELECT subject FROM local_custom_dirty WHERE subject LIKE 'custom/%' AND subject NOT LIKE 'custom/client/%' AND subject NOT LIKE 'custom/st3-kinds/%' ORDER BY subject")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     // Build dependency edges before checking cycles, so arrival order cannot choose health.
@@ -181,6 +191,33 @@ pub(super) fn flush(tx: &Transaction<'_>) -> Result<()> {
     }
     tx.execute("DELETE FROM local_custom_dirty", [])?;
     Ok(())
+}
+fn prefix_end(prefix: &str) -> String {
+    // Validated prefixes end in '/', whose ASCII successor bounds the subject index.
+    format!("{}0", prefix.strip_suffix('/').unwrap_or(prefix))
+}
+fn registration_rows(connection: &Connection) -> Result<BTreeMap<String, (String, Value)>> {
+    connection
+        .prepare(
+            "SELECT subject,prefix,hash,manifest,claim_id,state,error FROM custom_registrations",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (
+                    row.get::<_, String>(1)?,
+                    json!([
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?
+                    ]),
+                ),
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(Into::into)
 }
 fn refresh_registrations(tx: &Transaction<'_>) -> Result<()> {
     tx.execute("DELETE FROM custom_registrations", [])?;
@@ -702,7 +739,8 @@ impl Store {
                 return Err(fail("kind/version is immutable; publish a new version"));
             }
             let overlapping:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM custom_registrations WHERE substr(prefix,1,length(?1))=?1 OR substr(?1,1,length(prefix))=prefix)",[&m.subject_prefix],|r|r.get(0)).map_err(internal)?;
-            let populated:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM claims WHERE substr(subject,1,length(?1))=?1)",[&m.subject_prefix],|r|r.get(0)).map_err(internal)?;
+            let upper = prefix_end(&m.subject_prefix);
+            let populated:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM claims WHERE subject>=?1 AND subject<?2)",params![m.subject_prefix,upper],|r|r.get(0)).map_err(internal)?;
             if overlapping||populated {return Err(fail("subject prefix overlaps a registration or existing untyped facts"));}
             smallclaims::store::principals::rules_gate_tx(tx,&self.origin,&request.actor,schema::REGISTERED,&m.subject()).map_err(internal)?;
             append_claim_tx(tx,&self.origin,&m.subject(),schema::REGISTERED,Some(&request.actor),&json!({"fields":{"document":format!("{name}@{hash}")}}),&[],None).map_err(internal)?;
