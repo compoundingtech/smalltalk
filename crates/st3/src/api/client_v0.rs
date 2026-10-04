@@ -5091,8 +5091,10 @@ pub(super) async fn conversation_stream(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ConversationQuery>,
     headers: HeaderMap,
-    uri: axum::http::Uri,
-    web: Option<Extension<Arc<super::client_web::ClientWeb>>>,
+    (uri, web): (
+        axum::http::Uri,
+        Option<Extension<Arc<super::client_web::ClientWeb>>>,
+    ),
 ) -> Result<Response, ApiError> {
     let started = super::client_web::unix_nanos();
     require_scope(&session, "read.projections")?;
@@ -6148,8 +6150,10 @@ pub(super) async fn terminal_stream(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<TerminalStreamQuery>,
     headers: HeaderMap,
-    uri: axum::http::Uri,
-    web: Option<Extension<Arc<super::client_web::ClientWeb>>>,
+    (uri, web): (
+        axum::http::Uri,
+        Option<Extension<Arc<super::client_web::ClientWeb>>>,
+    ),
 ) -> Result<Response, ApiError> {
     let started = super::client_web::unix_nanos();
     require_scope(&session, "terminal.read")?;

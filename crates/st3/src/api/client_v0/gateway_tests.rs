@@ -340,7 +340,7 @@ mod gateway_tests {
             let root = tempfile::tempdir().unwrap();
             let state = test_state(root.path());
             let (mut session, attachment) = viewer_attachment(&state);
-            session.transport = transport.into();
+            session.transport = transport;
             let open = || prepare_terminal_follow(
                 &state,
                 &session,
