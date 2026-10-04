@@ -1143,8 +1143,7 @@ order, and each old tab’s title goes to its first pane. The original claims an
 and replay. A subsequent version-1 write stores the new body and records the old revision it
 replaced. New client writes require the version-1 shape and bounds. An empty legacy body at
 the old byte limit can project slightly above 64 KiB; the next write must fit the current limit.
-The response ceiling is
-8 MiB, allowing a complete 100-glass subscription window at these bounds.
+The negotiated client response ceiling is 1 MiB.
 
 Local creation is refused when the member already sees 100 live glasses. Concurrent creates
 on separate members are all retained as immutable claims. After synchronization, the earliest
@@ -1170,6 +1169,136 @@ Generated clients expose Rust `list_glasses`, `get_glass`, `put_glass`, `delete_
 `putGlass`, `deleteGlass`, and `glassesStream`. Each supplies typed bodies and recursive layouts.
 Mutation methods take an explicit idempotency key so a retry uses the original key and input.
 Member daemons replicate the claims; paired clients read them through a member gateway.
+
+## Person arrangements
+
+An arrangement is shared sidebar organization, not a private pane workspace. Discover
+`arrangements` capability version 1 and the `read.arrangements` / `control.arrangements`
+scopes. Glass identity, pane bodies, and privacy are unchanged. Authenticated persons and
+trusted fleet agents read and write in today's free mode as their **real actor**; an agent
+never impersonates the owner. Ownership is permanently the person in
+`arrangement/person/NAME/lowercase-UUIDv7`, independent of run or session lifetime.
+Restriction belongs to the upstream principals/grants system, not an arrangement-specific
+opt-in or ACL. Anonymous access is refused. A paired person selects only their own
+collection; a trusted local fleet agent explicitly selects a fleet person.
+
+Read `GET /v1/client/arrangements?person=person%2FNAME` (ordinary cursor/limit pagination)
+or `GET /v1/client/arrangements/{person_name}/{uuid}`. The owner selector is mandatory:
+an agent identity is not an implicit collection owner. Lists contain typed `Arrangement`
+resources in an ordinary page. Live details contain `id`, `kind: "arrangement"`, `owner`,
+`revision`, `updated_at`, `deleted: false`, and this versioned body:
+
+```ts
+type Register<T> = { value: T; revision: string }; // winning ClaimId
+type ArrangementBody = {
+  version: 1;
+  name: Register<string>;
+  folders: Record<string, {
+    name: Register<string>;
+    position: Register<{ parent: string | null; key: string }>;
+    tombstone: Register<true> | null;
+  }>;
+  placements: Record<string, Register<{ folder: string | null; key: string }>>;
+};
+```
+
+Folder IDs are stable lowercase UUIDv7. Placement keys are graph subjects, never PTY or
+session IDs. An optional `resolved: {parents, folders}` supplies effective folder parents
+and placement folders; null means root/unfiled. It does not rewrite raw registers.
+Names are nonblank, contain no control characters, and are bounded to 256 UTF-8 bytes; canonical base-62 fractional-indexing
+keys are bounded to 128 bytes (for example `a0`, `a1`, `Zz`). Integer-part lengths must
+be canonical and fractional suffixes cannot end in zero. Each edit has 1–1,024 operations
+and its compact UTF-8 JSON operations array is at most 1 MiB, locally and on replication.
+Local full projected resources (including headers, register revisions and resolved
+locations) are bounded to 512 KiB (`max_arrangement_resource_bytes`), 1,024 folders
+(including tombstones), and 4,096 placements. Local creation admits at most 100 live
+arrangements per person. These cumulative quotas apply only to local admission, not to
+a remotely replicated concurrent union. Heads retain that union without arrival-dependent
+dropping or canonical-cap truncation. Retirement bypasses cumulative overflow so an
+oversized remote union can still be retired. Per-operation shape, name, key, ID and claim
+bounds still apply on replication. Clients must not treat a lexical JSON Schema key
+pattern as the full fractional-key validator.
+
+Submit `POST /v1/client/actions` with `type: "arrangement.edit"` and typed parameters
+`{subject, owner, operations}`. `owner` is required on every edit and must equal the
+immutable person in the subject. Operations are tagged by `op`:
+
+| `op` | Required fields besides `op` |
+| --- | --- |
+| `create` | `name` |
+| `rename` | `name` |
+| `folder.create` | `id`, `name`, `parent: null \| folder ID`, `key` |
+| `folder.rename` | `id`, `name` |
+| `folder.move` | `id`, `parent: null \| folder ID`, `key` |
+| `folder.delete` | `id` |
+| `subject.place` | `subject`, `folder: null \| folder ID`, `key` |
+| `retire` | none |
+
+Each atomic edit may touch a register at most once; retirement must be its only operation.
+
+Creation declares the name and may atomically include folders and placements. Null
+placement folders unfile subjects; changing the key reorders them. Include any necessary
+rekeys in the same atomic edit. Only touched registers change: stale layout revisions
+merge rather than replace unrelated fields. The target arrangement's entry in
+`fence.subject_revisions` is a layout base, not a compare-and-swap precondition. The
+existing action ID, snapshot fence, and session-scoped idempotency key remain required;
+stale graph identity/authority and launch revision fences for other subjects refuse the edit
+atomically in the writer transaction. Attention episodes and external native-session revisions
+retain the existing projected preflight checks; external filesystem state is not governed by
+SQLite admission and cannot be made transactionally atomic with graph writes.
+Exact retry of the original input and key returns the saved receipt, even after later
+edits; changing any input with the same key returns `idempotency-conflict`. A completed
+result's `affected_ids` names only the arrangement and `arrangement_revision` identifies
+the accepted claim, not a promise that its registers will remain winners.
+
+`arrangement.edited` claims are durable. Each register uses canonical maximum
+`(accepted_at_unix_ms, batch origin, replica_sequence, batch_id, record position, claim_id)`,
+including the canonical legacy position fallback, rather than client HLC or arrival
+order. Offline writes therefore order by admission. Rename and move survive each other.
+Folder tombstones are remove-wins and final for that folder ID; they retain position
+and never delete subjects. Children and placements resolve through deleted folders to
+the nearest live ancestor, or root; unknown folders resolve root/unfiled. Missing roster
+subjects retain their placement for their return. Local self/descendant moves are refused.
+Concurrent cycles cut the greatest canonical position-register winner (folder ID
+tie-break) to root. Sort siblings by `(key, folder_id)` and members by `(key, subject)`.
+Retirement is permanent for an arrangement ID; it disappears from live reads and streams.
+Ending a reference never retires an arrangement or deletes a referenced subject.
+
+Admission transactions materialize register heads, tombstones and owner-indexed current
+rows. List/detail and write validation read these heads, never edit history. Replay may
+rebuild them once; projection digests and checkpoint proofs include the same read answers.
+There is **no new checkpoint drop rule**: agent-authored edits are durable too.
+
+Subscribe on `st3.client.collections.v0` with
+`{kind: "subscribe", id, collection: "arrangements", person: "person/NAME", limit: 100}`.
+Person is required and grants are checked on every read. Bounded authoritative snapshots,
+full resource upserts, removed IDs, complete order, and reconnect snapshots follow the
+ordinary collection contract.
+Arrangement list and stream windows also fit a byte budget: the 1,048,576-byte response
+ceiling reserves 128,000 bytes for the envelope. A byte-shortened window sets `has_more`
+and retains full resources, not truncated registers or placements. A replicated full
+resource above the remaining 920,576-byte budget returns explicit `validation-failed`
+rather than silently omitting part of its layout. Detail reads enforce the same single
+resource bound. Reconnect takes a new authoritative bounded snapshot; paired-session
+revocation, grant changes and expiry are checked again on each read.
+
+Generated Rust exposes `arrangements_list`, `arrangements_get`, `arrangement_edit`, and
+`CollectionStream::subscribe_arrangements`; TypeScript exposes `arrangementsList`,
+`arrangementsGet`, `arrangementEdit`, and `CollectionStream.subscribeArrangements`;
+Swift exposes `arrangementsList`, `arrangementsGet`, `arrangementEdit`, and
+`arrangementsStream`. Detail methods take the person name and UUID separately.
+Rust operations reuse `st3_schema::arrangements::Operation`; TypeScript and Swift have
+typed operation unions, not arbitrary JSON bodies. Regenerate all clients with
+`cargo run -p st3-client-codegen`; verify freshness with
+`cargo run -p st3-client-codegen -- --check`.
+
+Fractal migration is client-owned: discover capability, pause legacy writers, fold old
+`custom.fractal.sidebar` HLC history once, and durably stage the snapshot, target ID,
+exact typed operations and idempotency key. Preserve stable IDs, keys, tombstones and
+placements. Retry that exact staged request until acknowledged and readable, then switch
+exclusively to arrangements. Old stamps remain provenance, not live ordering. Keep staged
+state on failure, leave immutable custom history, and never dual-write. There is no
+upstream Fractal-specific importer.
 
 ## Agent and plain-shell creation
 

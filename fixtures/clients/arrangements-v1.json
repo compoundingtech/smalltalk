@@ -1,0 +1,228 @@
+{
+  "resource": {
+    "id": "arrangement/person/ada/019a0000-0000-7000-8000-000000000001",
+    "kind": "arrangement",
+    "owner": "person/ada",
+    "revision": "claim/arrangement-delete-folder",
+    "updated_at": "2026-10-04T00:00:00.000Z",
+    "deleted": false,
+    "body": {
+      "version": 1,
+      "name": {
+        "value": "Fleet",
+        "revision": "claim/arrangement-create"
+      },
+      "folders": {
+        "019a0000-0000-7000-8000-000000000002": {
+          "name": {
+            "value": "Work",
+            "revision": "claim/arrangement-create"
+          },
+          "position": {
+            "value": {
+              "parent": null,
+              "key": "a0"
+            },
+            "revision": "claim/arrangement-create"
+          },
+          "tombstone": {
+            "value": true,
+            "revision": "claim/arrangement-delete-folder"
+          }
+        },
+        "019a0000-0000-7000-8000-000000000003": {
+          "name": {
+            "value": "Review",
+            "revision": "claim/arrangement-child"
+          },
+          "position": {
+            "value": {
+              "parent": "019a0000-0000-7000-8000-000000000002",
+              "key": "a0"
+            },
+            "revision": "claim/arrangement-child"
+          },
+          "tombstone": null
+        }
+      },
+      "placements": {
+        "agent/ada/worker": {
+          "value": {
+            "folder": "019a0000-0000-7000-8000-000000000002",
+            "key": "a0"
+          },
+          "revision": "claim/arrangement-place"
+        },
+        "agent/ada/offline": {
+          "value": {
+            "folder": "019a0000-0000-7000-8000-000000000003",
+            "key": "a1"
+          },
+          "revision": "claim/arrangement-place"
+        }
+      }
+    },
+    "resolved": {
+      "parents": {
+        "019a0000-0000-7000-8000-000000000003": null
+      },
+      "folders": {
+        "agent/ada/worker": null,
+        "agent/ada/offline": "019a0000-0000-7000-8000-000000000003"
+      }
+    }
+  },
+  "edit": {
+    "api_version": "st3.client.v0",
+    "id": "action/arrangement-import",
+    "type": "arrangement.edit",
+    "idempotency_key": "arrangement-import-ada-0001",
+    "fence": {
+      "snapshot_id": "snapshot/host-a/1842/2fc9",
+      "subject_revisions": {}
+    },
+    "parameters": {
+      "subject": "arrangement/person/ada/019a0000-0000-7000-8000-000000000001",
+      "owner": "person/ada",
+      "operations": [
+        {
+          "op": "create",
+          "name": "Fleet"
+        },
+        {
+          "op": "folder.create",
+          "id": "019a0000-0000-7000-8000-000000000002",
+          "name": "Work",
+          "parent": null,
+          "key": "a0"
+        },
+        {
+          "op": "subject.place",
+          "subject": "agent/ada/worker",
+          "folder": "019a0000-0000-7000-8000-000000000002",
+          "key": "a0"
+        },
+        {
+          "op": "folder.delete",
+          "id": "019a0000-0000-7000-8000-000000000002"
+        }
+      ]
+    }
+  },
+  "subscription": {
+    "kind": "subscribe",
+    "id": "sidebar",
+    "collection": "arrangements",
+    "person": "person/ada",
+    "limit": 100
+  },
+  "snapshot": {
+    "kind": "snapshot",
+    "id": "sidebar",
+    "collection": "arrangements",
+    "snapshot": {
+      "id": "snapshot/host-a/1842/2fc9",
+      "host_id": "host/host-a",
+      "store_index": 1842,
+      "projection_version": "client-projection.v0",
+      "created_at": "2026-10-04T00:00:00.000Z"
+    },
+    "items": [
+      {
+        "id": "arrangement/person/ada/019a0000-0000-7000-8000-000000000001",
+        "kind": "arrangement",
+        "owner": "person/ada",
+        "revision": "claim/arrangement-delete-folder",
+        "updated_at": "2026-10-04T00:00:00.000Z",
+        "deleted": false,
+        "body": {
+          "version": 1,
+          "name": {
+            "value": "Fleet",
+            "revision": "claim/arrangement-create"
+          },
+          "folders": {
+            "019a0000-0000-7000-8000-000000000002": {
+              "name": {
+                "value": "Work",
+                "revision": "claim/arrangement-create"
+              },
+              "position": {
+                "value": {
+                  "parent": null,
+                  "key": "a0"
+                },
+                "revision": "claim/arrangement-create"
+              },
+              "tombstone": {
+                "value": true,
+                "revision": "claim/arrangement-delete-folder"
+              }
+            },
+            "019a0000-0000-7000-8000-000000000003": {
+              "name": {
+                "value": "Review",
+                "revision": "claim/arrangement-child"
+              },
+              "position": {
+                "value": {
+                  "parent": "019a0000-0000-7000-8000-000000000002",
+                  "key": "a0"
+                },
+                "revision": "claim/arrangement-child"
+              },
+              "tombstone": null
+            }
+          },
+          "placements": {
+            "agent/ada/worker": {
+              "value": {
+                "folder": "019a0000-0000-7000-8000-000000000002",
+                "key": "a0"
+              },
+              "revision": "claim/arrangement-place"
+            },
+            "agent/ada/offline": {
+              "value": {
+                "folder": "019a0000-0000-7000-8000-000000000003",
+                "key": "a1"
+              },
+              "revision": "claim/arrangement-place"
+            }
+          }
+        },
+        "resolved": {
+          "parents": {
+            "019a0000-0000-7000-8000-000000000003": null
+          },
+          "folders": {
+            "agent/ada/worker": null,
+            "agent/ada/offline": "019a0000-0000-7000-8000-000000000003"
+          }
+        }
+      }
+    ],
+    "order": [
+      "arrangement/person/ada/019a0000-0000-7000-8000-000000000001"
+    ],
+    "has_more": false
+  },
+  "retired": {
+    "kind": "changes",
+    "id": "sidebar",
+    "collection": "arrangements",
+    "snapshot": {
+      "id": "snapshot/host-a/1842/2fc9",
+      "host_id": "host/host-a",
+      "store_index": 1842,
+      "projection_version": "client-projection.v0",
+      "created_at": "2026-10-04T00:00:00.000Z"
+    },
+    "upserts": [],
+    "removes": [
+      "arrangement/person/ada/019a0000-0000-7000-8000-000000000001"
+    ],
+    "order": [],
+    "has_more": false
+  }
+}
