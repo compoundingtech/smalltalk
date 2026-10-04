@@ -357,8 +357,14 @@ Performance uses the small `.#perf` Nix shell and the opt-in `perf_load` test ta
 all integration fixtures. Successful main runs retain seven-day build snapshots containing
 Cargo outputs, registry/git sources, a local sccache, and a signed Nix binary cache including the
 small shell closure. The build recipe includes the lockfiles, shell, manifests and Cargo config.
-Generated-store snapshots have a separate exact generator/schema key. PRs restore these trusted
-main artifacts, then let Cargo and sccache validate source changes. They never upload cache copies.
+Generated-store snapshots have a separate exact generator/schema key. PRs prefer their own
+successful snapshots, then fall back to trusted main artifacts. A PR snapshot must match the head
+repository and branch and a commit in the current PR; it cannot supply main's caches or anyone's
+baseline. A rerun verifies the previous successful attempt explicitly, since the current run is
+in progress. Cargo and sccache validate source changes, preserving each build's real source identity.
+PR snapshots also remain for seven days, outside the shared dependency-cache pool.
+The compiler-cache server stays alive during cold store generation; publication does not require
+stopping it after the workload has finished writing compiler outputs.
 Main report artifacts remain for thirty days. `scripts/ci-perf-cache-test` checks provenance,
 workload compatibility, report selection and required PR baselines.
 
@@ -366,7 +372,8 @@ These snapshots avoid the repository's shared dependency-cache eviction: on 2026
 10 GB pool had already evicted main's just-saved Performance build and stores. A cold PR took
 25m21s, including 837s generating stores; a cache-hit PR still took about eleven minutes, including
 5m16s compiling the whole integration target and almost three minutes setting up unrelated tools.
-Every missing snapshot is flagged P0. A new store recipe generates its source stores on RAM-backed
+The first new-recipe PR passed in 17m51s (4m22s compiling, 584s generating), comparing two real
+main reports. Every missing snapshot is flagged P0. A new store recipe generates its source stores on RAM-backed
 scratch space; the harness copies them to ordinary runner disk before measuring. `perf-cost`
 continues using the Actions cache with the same generator/schema keys.
 

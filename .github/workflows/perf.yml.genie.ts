@@ -1,7 +1,7 @@
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep, plainFlakeSetupSteps } from '../../repos/effect-utils/genie/external.ts'
 import { buildEnv, linuxStageRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
 
-const onMain = "success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'"
+const snapshotSuccess = "success() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')"
 const paths = [
   'crates/smallclaims/**',
   'crates/st3/src/**',
@@ -20,7 +20,7 @@ const paths = [
 ]
 
 // Performance always stays on Namespace. Main's successful runs seed durable snapshots and
-// real baseline reports; PRs read them without adding branch copies to the dependency-cache pool.
+// real baseline reports. Each PR can also reuse its own snapshots, outside the dependency-cache pool.
 export default githubWorkflow({
   name: 'Performance',
   on: {
@@ -29,7 +29,7 @@ export default githubWorkflow({
     pull_request: { paths },
     workflow_dispatch: {},
   },
-  permissions: { contents: 'read', actions: 'read' },
+  permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' },
   concurrency: {
     group: 'perf-${{ github.event.pull_request.number || github.run_id }}',
     'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
@@ -44,7 +44,12 @@ export default githubWorkflow({
       'runs-on': linuxStageRunner,
       'timeout-minutes': 30,
       defaults: { run: { shell: 'bash' } },
-      env: buildEnv,
+      env: {
+        ...buildEnv,
+        SCCACHE_IDLE_TIMEOUT: '0',
+        PERF_PR_NUMBER: '${{ github.event.pull_request.number }}',
+        PERF_HEAD_REPOSITORY: '${{ github.event.pull_request.head.repo.full_name }}',
+      },
       steps: [
         { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
         {
@@ -56,7 +61,7 @@ export default githubWorkflow({
           run: 'printf "PERF_BUILD_SNAPSHOT=%s\\nPERF_STORES_SNAPSHOT=%s\\n" "$PERF_BUILD_SNAPSHOT" "$PERF_STORES_SNAPSHOT" >> "$GITHUB_ENV"',
         },
         {
-          name: 'Restore main build, Nix, stores and baseline snapshots',
+          name: 'Restore compatible build, Nix, stores and main baseline snapshots',
           env: { GH_TOKEN: '${{ github.token }}' },
           run: 'python3 scripts/ci-perf-cache restore',
         },
@@ -77,31 +82,30 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
         },
         nixDevelopStep({ name: 'Run the release load test', flake: '.#perf', command: ['bash', 'scripts/ci-perf', 'load'] }),
         {
-          name: 'Save main build and Nix snapshots',
-          if: onMain,
+          name: 'Save build and Nix snapshots',
+          if: snapshotSuccess,
           run: `nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
-nix develop .#perf -c sccache --show-stats
-nix develop .#perf -c sccache --stop-server
+nix develop .#perf -c env TMPDIR="$RUNNER_TEMP" sccache --show-stats
 CI_PERF_SHELL_ROOT="$RUNNER_TEMP/perf-shell" bash scripts/ci-nix-cache save
 python3 scripts/ci-perf-cache pack`,
         },
         {
-          name: 'Retain the main build and Nix cache',
-          if: onMain,
+          name: 'Retain the build and Nix cache',
+          if: snapshotSuccess,
           uses: 'actions/upload-artifact@v4',
-          with: { name: '${{ env.PERF_BUILD_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/build.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error' },
+          with: { name: '${{ env.PERF_BUILD_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/build.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error', overwrite: true },
         },
         {
-          name: 'Retain the main generated stores',
-          if: onMain,
+          name: 'Retain the generated stores',
+          if: snapshotSuccess,
           uses: 'actions/upload-artifact@v4',
-          with: { name: '${{ env.PERF_STORES_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/stores.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error' },
+          with: { name: '${{ env.PERF_STORES_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/stores.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error', overwrite: true },
         },
         {
           name: 'Retain the load report, log and timing',
           uses: 'actions/upload-artifact@v4',
           if: 'always()',
-          with: { name: 'perf-load-logs', path: '${{ runner.temp }}/perf/', 'retention-days': 30, 'if-no-files-found': 'ignore' },
+          with: { name: 'perf-load-logs', path: '${{ runner.temp }}/perf/', 'retention-days': 30, 'if-no-files-found': 'ignore', overwrite: true },
         },
       ],
     },

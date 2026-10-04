@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Durable Performance snapshots and real baselines from successful main runs only."""
+"""Main baselines and durable main/same-PR Performance snapshots."""
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -21,13 +22,26 @@ def trusted(run):
 
 def valid_report(report):
     # Never substitute tiny fixture reports or measurements with a different workload.
-    return (report.get('scale') == 1 and report.get('seconds', 0) >= 120
-            and report.get('claims', 0) > 0 and report.get('long_poll_seats') == 30
-            and isinstance(report.get('daemon_cores'), (int, float))
-            and bool(report.get('paths')) and isinstance(report.get('failed'), dict)
-            and all(isinstance(path, dict) and all(key in path for key in
+    def number(value):
+        return (type(value) is int or type(value) is float and math.isfinite(value)) and value >= 0
+    return (isinstance(report, dict) and number(report.get('scale')) and report['scale'] == 1
+            and number(report.get('seconds')) and report['seconds'] >= 120
+            and type(report.get('claims')) is int and report['claims'] > 0
+            and report.get('long_poll_seats') == 30 and number(report.get('daemon_cores'))
+            and isinstance(report.get('paths'), dict) and bool(report['paths'])
+            and isinstance(report.get('failed'), dict)
+            and all(isinstance(path, dict) and all(number(path.get(key)) for key in
                     ('count', 'p50_ms', 'p99_ms', 'max_ms', 'budget_ms'))
                     for path in report['paths'].values()))
+
+
+def own_pr(run, number, repository, branch, commits):
+    return (run.get('event') == 'pull_request' and run.get('conclusion') == 'success'
+            and run.get('path') == '.github/workflows/perf.yml'
+            and (run.get('head_repository') or {}).get('full_name') == repository
+            and run.get('head_branch') == branch and run.get('head_sha') in commits
+            and (not run.get('pull_requests') or
+                 any(pr.get('number') == number for pr in run['pull_requests'])))
 
 
 def download(repo, run, name, dest):
@@ -57,29 +71,64 @@ def restore():
               'stores': os.environ['PERF_STORES_SNAPSHOT']}
     found = set()
     reports = 0
+    def snapshots(run, names, dest, origin):
+        for kind, name in wanted.items():
+            if kind in found or name not in names:
+                continue
+            download(repo, run, name, dest / kind)
+            roots = ('target', 'cargo-home', 'perf-sccache', 'st-ci-cache') if kind == 'build' else ('st-bench',)
+            unpack(dest / kind / f'{kind}.tar.zst', dest, roots)
+            for root in roots:
+                source = dest / root
+                if not source.is_dir():
+                    raise ValueError(f'incomplete {kind} snapshot: missing {root}')
+                target = (work if root == 'target' else temp) / root
+                shutil.rmtree(target, ignore_errors=True)
+                shutil.move(source, target)
+            found.add(kind)
+            print(f"Performance {kind} cache HIT: {origin} run {run['id']}", flush=True)
+
+    def artifact_names(run):
+        artifacts = api(f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100")
+        return {item['name'] for item in artifacts['artifacts'] if not item['expired']}
+
+    # PR snapshots can be reused only by that same PR, never by main or another PR.
+    # A rerun changes the current run's status: verify its previous successful attempt directly.
+    if os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
+        number = int(os.environ['PERF_PR_NUMBER'])
+        branch = os.environ['GITHUB_HEAD_REF']
+        repository = os.environ['PERF_HEAD_REPOSITORY']
+        commits = set()
+        page = 1
+        while True:
+            entries = api(f'repos/{repo}/pulls/{number}/commits?per_page=100&page={page}')
+            commits.update(entry['sha'] for entry in entries)
+            if len(entries) < 100:
+                break
+            page += 1
+        candidates = []
+        attempt = int(os.environ['GITHUB_RUN_ATTEMPT'])
+        if attempt > 1:
+            previous = api(f"repos/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{attempt - 1}")
+            candidates.append(previous)
+        from urllib.parse import quote
+        candidates += api(f'repos/{repo}/actions/workflows/perf.yml/runs?event=pull_request&branch={quote(branch, safe="")}&status=success&per_page=100')['workflow_runs']
+        for run in candidates:
+            if not own_pr(run, number, repository, branch, commits):
+                continue
+            with tempfile.TemporaryDirectory(dir=temp) as tmp:
+                snapshots(run, artifact_names(run), Path(tmp), 'this PR')
+            if len(found) == 2:
+                break
     # Bound discovery; seven days of snapshots and thirty days of reports fit comfortably.
     runs = api(f'repos/{repo}/actions/workflows/perf.yml/runs?branch=main&status=success&per_page=100')
     for run in runs['workflow_runs']:
         if not trusted(run):
             continue
-        artifacts = api(f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100")
-        names = {item['name'] for item in artifacts['artifacts'] if not item['expired']}
+        names = artifact_names(run)
         with tempfile.TemporaryDirectory(dir=temp) as tmp:
             dest = Path(tmp)
-            for kind, name in wanted.items():
-                if kind in found or name not in names:
-                    continue
-                download(repo, run, name, dest / kind)
-                roots = ('target', 'cargo-home', 'perf-sccache', 'st-ci-cache') if kind == 'build' else ('st-bench',)
-                unpack(dest / kind / f'{kind}.tar.zst', dest, roots)
-                for root in roots:
-                    source = dest / root
-                    if source.exists():
-                        target = (work if root == 'target' else temp) / root
-                        shutil.rmtree(target, ignore_errors=True)
-                        shutil.move(source, target)
-                found.add(kind)
-                print(f"Performance {kind} cache HIT: main run {run['id']}", flush=True)
+            snapshots(run, names, dest, 'main')
             if reports < 5 and 'perf-load-logs' in names:
                 download(repo, run, 'perf-load-logs', dest / 'report')
                 files = list((dest / 'report').rglob('load.json'))

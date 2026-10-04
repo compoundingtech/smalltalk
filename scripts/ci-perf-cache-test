@@ -25,8 +25,21 @@ for field, value in [('head_branch', 'example-branch'), ('conclusion', 'failure'
                      ('event', 'pull_request'), ('path', '.github/workflows/fleet.yml')]:
     assert not module.trusted(dict(run, **{field: value}))
 assert module.valid_report(report)
-for field, value in [('scale', 0.1), ('claims', 0), ('seconds', 5), ('long_poll_seats', 1), ('paths', {})]:
+for field, value in [('scale', 0.1), ('claims', 0), ('seconds', 5), ('long_poll_seats', 1),
+                     ('paths', {}), ('paths', []), ('daemon_cores', float('nan')),
+                     ('daemon_cores', True), ('seconds', None)]:
     assert not module.valid_report(dict(report, **{field: value}))
+assert not module.valid_report([]) and not module.valid_report(None)
+pr_run = dict(run, id=10, event='pull_request', head_branch='example-branch',
+              head_repository=dict(full_name='example/project'), head_sha='b' * 40,
+              pull_requests=[])
+commits = {'b' * 40}
+assert module.own_pr(pr_run, 1, 'example/project', 'example-branch', commits)
+for field, value in [('head_branch', 'other-branch'), ('head_sha', 'c' * 40),
+                     ('head_repository', dict(full_name='example/fork')),
+                     ('head_repository', None), ('conclusion', 'failure'),
+                     ('pull_requests', [dict(number=2)])]:
+    assert not module.own_pr(dict(pr_run, **{field: value}), 1, 'example/project', 'example-branch', commits)
 
 with tempfile.TemporaryDirectory() as tmp:
     temp = Path(tmp)
@@ -35,7 +48,9 @@ with tempfile.TemporaryDirectory() as tmp:
     os.environ.update(GITHUB_REPOSITORY='example/project', GITHUB_EVENT_NAME='pull_request',
                       GITHUB_WORKSPACE=str(work), RUNNER_TEMP=str(temp),
                       GITHUB_STEP_SUMMARY=str(temp / 'summary'),
-                      PERF_BUILD_SNAPSHOT='build-recipe', PERF_STORES_SNAPSHOT='stores-recipe')
+                      PERF_BUILD_SNAPSHOT='build-recipe', PERF_STORES_SNAPSHOT='stores-recipe',
+                      PERF_PR_NUMBER='1', PERF_HEAD_REPOSITORY='example/project',
+                      GITHUB_HEAD_REF='example-branch', GITHUB_RUN_ATTEMPT='1', GITHUB_RUN_ID='10')
     # Exercise real archives: both workspace outputs and temp caches survive a round trip.
     for name in ('cargo-home/registry', 'cargo-home/git', 'perf-sccache', 'st-ci-cache', 'st-bench'):
         directory = temp / name
@@ -54,8 +69,16 @@ with tempfile.TemporaryDirectory() as tmp:
     # API ordering includes untrusted entries: none may supply caches or a baseline.
     runs = [dict(run, id=9, event='pull_request')] + [dict(run, id=i) for i in range(8, 0, -1)]
     downloads = []
+    candidates = []
+    previous = pr_run
 
     def api(path):
+        if '/pulls/1/commits?' in path:
+            return [dict(sha='b' * 40)]
+        if '/attempts/' in path:
+            return previous
+        if 'event=pull_request' in path:
+            return dict(workflow_runs=candidates)
         if '/workflows/' in path:
             return dict(workflow_runs=runs)
         assert '/runs/9/' not in path
@@ -63,7 +86,10 @@ with tempfile.TemporaryDirectory() as tmp:
                               ('build-recipe', 'stores-recipe', 'perf-load-logs')])
 
     def download(repo, selected, name, dest):
-        assert repo == 'example/project' and module.trusted(selected)
+        assert repo == 'example/project'
+        assert module.trusted(selected) or module.own_pr(selected, 1, repo, 'example-branch', commits)
+        if name == 'perf-load-logs':
+            assert module.trusted(selected), 'PR reports must never become baselines'
         downloads.append((selected['id'], name))
         dest.mkdir(parents=True)
         if name == 'perf-load-logs':
@@ -82,6 +108,33 @@ with tempfile.TemporaryDirectory() as tmp:
     assert sorted(p.name for p in (temp / 'perf-baseline').iterdir()) == [f'load-{i}.json' for i in range(4, 9)]
     assert (work / 'target/cached').read_text() == 'snapshot'
     assert (temp / 'st-ci-cache/cached').exists() and (temp / 'st-bench/cached').exists()
+    # Reruns may reuse their successful previous attempt despite the current in-progress status.
+    os.environ['GITHUB_RUN_ATTEMPT'] = '2'
+    downloads.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.restore()
+    assert downloads[:2] == [(10, 'build-recipe'), (10, 'stores-recipe')]
+    assert downloads[2:] == [(i, 'perf-load-logs') for i in range(8, 3, -1)]
+    # Main must not promote PR snapshots, even when a same-PR cache exists.
+    os.environ['GITHUB_EVENT_NAME'] = 'push'
+    candidates.append(pr_run)
+    downloads.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.restore()
+    assert all(selected != 10 for selected, _ in downloads)
+    os.environ.update(GITHUB_EVENT_NAME='pull_request', GITHUB_RUN_ATTEMPT='1')
+    candidates.clear()
+    def incomplete(archive, destination, names):
+        (destination / names[0]).mkdir()
+    module.unpack = incomplete
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.restore()
+    except ValueError as error:
+        assert 'incomplete build snapshot' in str(error)
+    else:
+        raise AssertionError('partial snapshot must not claim a cache hit')
+    module.unpack = unpack
     runs.clear()
     try:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -106,4 +159,4 @@ with tempfile.TemporaryDirectory() as tmp:
         else:
             raise AssertionError('unexpected archive root accepted')
 
-print('Performance cache tests passed: trusted main, five real reports, PR baseline required, snapshot paths')
+print('Performance cache tests passed: main baselines, same-PR snapshots, rerun provenance, archive completeness')
