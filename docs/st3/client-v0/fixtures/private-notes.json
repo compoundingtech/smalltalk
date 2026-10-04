@@ -1,0 +1,19 @@
+{
+  "ref": "dev.schickling.agent-private-notes://alder/worker",
+  "family": "private-notes",
+  "schema": "st3.private-notes@1",
+  "data": {
+    "uri": "dev.schickling.agent-private-notes://alder/worker",
+    "markdown": "Owner-authored context.\n",
+    "fence": { "carrier_generation": "generation-a", "revision": "revision-a" }
+  },
+  "actions": [{
+    "id": "private-notes.write",
+    "fence": {
+      "snapshot_id": "snapshot/alder:1",
+      "subject_revisions": {},
+      "private_notes": { "carrier_generation": "generation-a", "revision": "revision-a" }
+    }
+  }],
+  "live": null
+}

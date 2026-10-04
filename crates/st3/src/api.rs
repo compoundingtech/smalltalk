@@ -760,6 +760,9 @@ async fn response_envelope(
             .body(Body::empty())
             .expect("the incoming request has a valid method and URI");
         *auth_request.headers_mut() = request.headers().clone();
+        if request.extensions().get::<VerifiedNotesPrincipal>().is_some() {
+            auth_request.extensions_mut().insert(VerifiedNotesPrincipal);
+        }
         let auth_state = state.clone();
         let transport = transport.as_str();
         let auth_profile = profile.clone();
@@ -21250,6 +21253,44 @@ agent "seat" { workspace "/tmp"; command "true" }
         stale["runtime_incarnation"] = json!("retired-runtime");
         let (status, body) = json_request(app, "/v1/harness-events", stale).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+
+    #[tokio::test]
+    async fn unavailable_notes_catalog_does_not_stall_native_observations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.private_notes = Arc::new(crate::private_notes::Authority {
+            person: Some("person/operator".into()),
+            catalogs: vec![root.path().join("unavailable-catalog")],
+        });
+        let source = format!("version 2\nagent \"notes-worker\" {{\n host \"node\"\n workspace {:?}\n harness \"claude\" {{}}\n}}\n", root.path().display().to_string());
+        let declared = apply_request(&state, &source, "person/operator", "notes-producer");
+        let app = router(state.clone());
+        let (status, body) = json_request(app.clone(), "/v1/intent/apply", serde_json::to_value(declared).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let subject = "agent/notes-worker";
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: Some(subject.into()),
+            fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("notes-runtime"))]),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let app = app.layer(Extension(NativeDeliveryPeer {
+            agent: subject.into(), transport: "claude-channel", pid: 7, archives_inbox: true,
+        }));
+        for (sequence, activity) in [(1, "idle"), (2, "working")] {
+            let event = json!({"runtime_incarnation":"notes-runtime", "sequence":sequence,
+                "claim":{"subject":subject,"kind":"harness.observed","actor":subject,
+                    "fields":{"state":activity,"driver":"claude","incarnation_id":"notes-runtime"},
+                    "evidence":[],"idempotency_key":format!("notes-observation-{sequence}")}});
+            let (status, published) = json_request(app.clone(), "/v1/harness-events", event.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{published}");
+            let (status, replay) = json_request(app.clone(), "/v1/harness-events", event).await;
+            assert_eq!(status, StatusCode::OK, "{replay}");
+            assert_eq!(published["id"], replay["id"]);
+        }
+        assert_eq!(state.store.latest_claim(subject, Some("harness.observed")).unwrap().unwrap().body["fields"]["state"], "working");
+        let denied = state.private_notes.read("node", "dev.schickling.agent-private-notes://node/notes-worker").unwrap_err();
+        assert_eq!(denied.code, "private-notes-unreachable");
     }
 }
 
