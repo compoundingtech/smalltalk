@@ -92,6 +92,41 @@ pub fn world() -> World {
         quiet_missions: 6,
         usage: Load::Ready(usage()),
         usage_limits: usage_limits(),
+        clients: Load::Ready(vec![
+            Connected {
+                client: s("stui 0.1.0+1ecae71"),
+                who: s("person/robin"),
+                device: None,
+                member: s("lark"),
+                via: s("local"),
+                connected: true,
+                when: s("since 2h"),
+                follows: vec![s("glass:main"), s("conversation:agent/lark/planner")],
+                older: false,
+            },
+            Connected {
+                client: s("smalltalk-ios 1.0 (42)"),
+                who: s("person/robin"),
+                device: Some(s("Robin's phone")),
+                member: s("lark"),
+                via: s("gateway"),
+                connected: true,
+                when: s("since 12m"),
+                follows: vec![s("now"), s("terminal:terminal/agent/lark/planner")],
+                older: false,
+            },
+            Connected {
+                client: s("stui 0.0.9+77d0a13"),
+                who: s("person/robin"),
+                device: None,
+                member: s("lark"),
+                via: s("tailscale"),
+                connected: false,
+                when: s("seen 3m ago"),
+                follows: Vec::new(),
+                older: true,
+            },
+        ]),
     }
 }
 
@@ -112,6 +147,7 @@ pub fn loading() -> World {
         quiet_missions: 0,
         usage: Load::Loading,
         usage_limits: Vec::new(),
+        clients: Load::Loading,
     }
 }
 

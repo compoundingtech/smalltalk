@@ -471,6 +471,50 @@
       }
     ]
   },
+  "clients": {
+    "state": "ready",
+    "value": [
+      {
+        "client": "stui 0.1.0+1ecae71",
+        "connected": true,
+        "device": null,
+        "follows": [
+          "glass:main",
+          "conversation:agent/lark/planner"
+        ],
+        "member": "lark",
+        "older": false,
+        "via": "local",
+        "when": "since 2h",
+        "who": "person/robin"
+      },
+      {
+        "client": "smalltalk-ios 1.0 (42)",
+        "connected": true,
+        "device": "Robin's phone",
+        "follows": [
+          "now",
+          "terminal:terminal/agent/lark/planner"
+        ],
+        "member": "lark",
+        "older": false,
+        "via": "gateway",
+        "when": "since 12m",
+        "who": "person/robin"
+      },
+      {
+        "client": "stui 0.0.9+77d0a13",
+        "connected": false,
+        "device": null,
+        "follows": [],
+        "member": "lark",
+        "older": true,
+        "via": "tailscale",
+        "when": "seen 3m ago",
+        "who": "person/robin"
+      }
+    ]
+  },
   "conversations": {
     "agent/example/atlas/builder": {
       "state": "ready",
