@@ -636,6 +636,9 @@ obsolete prefix-unavailable notice when an interval establishes complete prefix 
 These session-stable projection notices are not evidence of overlap between a refreshed newest
 window and retained older pages. Clients preserve paged history only when real transcript
 entries connect those windows; a notice shared by otherwise disconnected windows does not.
+Projection notices also do not determine the oldest real entry of an incoming window.
+When preserving a genuinely overlapping older prefix, discard held projection notices:
+the authoritative replacement frame alone supplies their current presence.
 
 When the physical retained prefix starts after sequence one without a covering typed truncation
 interval, a non-retryable `timeline-history-incomplete` system error entry explains that earlier

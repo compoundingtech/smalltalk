@@ -133,9 +133,9 @@ export function applyConversation<T extends Entry>(
   else if (frame.replace) {
     live = frame.hasMore;
     const held = previous && !otherSession ? previous.entries : [];
-    const meets = frame.items.some(item => !isProjectionNotice(item) && held.some(entry => entry.id === item.id));
-    const oldest = [...frame.items].sort(before)[0];
-    if (older.paged && (meets || !frame.hasMore)) base = held.filter(entry => oldest && before(entry, oldest) < 0);
+    const meets = frame.items.some(item => !isProjectionNotice(item) && held.some(entry => !isProjectionNotice(entry) && entry.id === item.id));
+    const oldest = frame.items.filter(item => !isProjectionNotice(item)).sort(before)[0];
+    if (older.paged && (meets || !frame.hasMore)) base = held.filter(entry => !isProjectionNotice(entry) && oldest && before(entry, oldest) < 0);
     else older = noOlder;
   }
   const found = new Map<string, T>(base.map(entry => [entry.id, entry]));

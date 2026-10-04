@@ -1,5 +1,11 @@
 use st3_client::{TimelineBody, TimelineEntry};
 
+fn is_projection_notice(entry: &TimelineEntry) -> bool {
+    matches!(&entry.body, TimelineBody::Error(error)
+        if matches!(error.code.as_str(),
+            "timeline-query-limited" | "timeline-history-incomplete"))
+}
+
 /// Metadata and entries from a native conversation frame, preserved at the UI boundary.
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
@@ -53,21 +59,23 @@ impl Timeline {
             // entries could be missing between the two, and a gap must never look whole.
             // Session-stable availability notices cannot establish history continuity.
             let meets = frame.items.iter().any(|item| {
-                !matches!(&item.body, TimelineBody::Error(error)
-                    if matches!(error.code.as_str(),
-                        "timeline-query-limited" | "timeline-history-incomplete"))
-                    && self.items.iter().any(|held| held.id == item.id)
+                !is_projection_notice(item)
+                    && self.items.iter().any(|held| {
+                        !is_projection_notice(held) && held.id == item.id
+                    })
             });
             let oldest = frame
                 .items
-                .first()
-                .map(|first| (first.timestamp.clone(), first.sequence));
+                .iter()
+                .find(|item| !is_projection_notice(item))
+                .map(|first| (first.timestamp.as_str(), first.sequence));
             if self.older.paged && !other_session && (meets || !frame.has_more) {
                 let mut items = std::mem::take(&mut self.items);
                 items.retain(|held| {
-                    oldest.as_ref().is_some_and(|(at, sequence)| {
-                        (&held.timestamp, held.sequence) < (at, *sequence)
-                    })
+                    !is_projection_notice(held)
+                        && oldest.is_some_and(|(at, sequence)| {
+                            (held.timestamp.as_str(), held.sequence) < (at, sequence)
+                        })
                 });
                 items.extend(frame.items);
                 self.items = items;

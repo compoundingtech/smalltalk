@@ -181,6 +181,41 @@ fn projection_notices_do_not_connect_disconnected_history_windows() {
 }
 
 #[test]
+fn projection_notice_is_removed_from_preserved_older_prefix() {
+    let notice = |code: &str, timestamp: &str| serde_json::from_value(serde_json::json!({
+        "id": format!("timeline-entry/session/a/{code}"),
+        "sequence": 0, "revision": 1,
+        "timestamp": timestamp, "role": "system", "final": true,
+        "type": "error", "body": {
+            "code": code,
+            "message": "Projection availability changed", "retryable": false,
+            "details": {}
+        }
+    })).unwrap();
+    let window = |items| Frame {
+        replace: true, has_more: true, items, session_id: Some("session/a".into()),
+    };
+    let mut timeline = Timeline::default();
+    timeline.apply(window(vec![
+        notice("timeline-history-incomplete", "2026-09-30T09:00:00Z"),
+        item("c", 3, 1, "c"), item("d", 4, 1, "d"),
+    ]));
+    timeline.older_page(
+        "session/a", vec![item("a", 1, 1, "a"), item("b", 2, 1, "b")], false, None,
+    );
+    timeline.apply(window(vec![item("d", 4, 1, "d"), item("e", 5, 1, "e")]));
+    assert_eq!(ids(&timeline), ["a", "b", "c", "d", "e"]);
+    assert!(timeline.older.paged);
+    timeline.apply(window(vec![
+        notice("timeline-query-limited", "2026-09-30T09:30:00Z"),
+        item("e", 5, 1, "e"), item("f", 6, 1, "f"),
+    ]));
+    assert_eq!(ids(&timeline), [
+        "a", "b", "c", "d", "timeline-entry/session/a/timeline-query-limited", "e", "f",
+    ]);
+}
+
+#[test]
 fn an_earlier_page_from_another_session_is_dropped_and_a_new_session_starts_over() {
     let mut timeline = Timeline::default();
     timeline.apply(Frame {
