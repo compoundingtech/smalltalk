@@ -3885,7 +3885,7 @@ fn managed_omp_transcript(
         fields["harness"] == "omp"
             && fields["agent"] == owner
             && fields["incarnation_id"].as_str() == Some(incarnation)
-    }).or_else(|| bindings.iter().rev().find(|claim| {
+    }).or_else(|| bindings.last().filter(|claim| {
         // Import provenance is a separate binding authority, not a synthesized incarnation.
         let fields = fields_of(claim);
         fields["harness"] == "omp"
@@ -13151,6 +13151,35 @@ mission "example/zero-run" state="ready" {
         std::fs::write(&path, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
         assert!(managed_omp_transcript(&state, owner, incarnation).is_err());
         std::fs::remove_file(&path).unwrap();
+        assert!(managed_omp_transcript(&state, owner, incarnation).is_err());
+    }
+
+    #[test]
+    fn a_native_binding_supersedes_import_authority_without_reviving_old_imports() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "omp-import-superseded");
+        let owner = "agent/import-superseded";
+        let incarnation = "123:2026-10-04T13:11:17.532Z";
+        let path = root.path().join("import.jsonl");
+        std::fs::write(&path, format!("{}\n",
+            json!({"type":"session","id":"imported","timestamp":"2026-10-01T14:31:46.246Z"}))).unwrap();
+        let mut fields = BTreeMap::from([
+            ("harness".into(), json!("omp")), ("agent".into(), json!(owner)),
+            ("session_id".into(), json!("imported")), ("path".into(), json!(path)),
+            ("source_session".into(), json!("external/omp/imported")),
+        ]);
+        let append = |fields| {
+            state.store.append_claim(&ClaimInput {
+                subject: owner.into(), kind: "harness.session-file".into(), actor: Some(owner.into()),
+                fields, evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append(fields.clone());
+        assert_eq!(managed_omp_transcript(&state, owner, incarnation).unwrap().native_id, "imported");
+        fields.remove("source_session");
+        fields.insert("incarnation_id".into(), json!("124:2026-10-04T14:00:00Z"));
+        fields.insert("session_id".into(), json!("replacement"));
+        append(fields);
         assert!(managed_omp_transcript(&state, owner, incarnation).is_err());
     }
 

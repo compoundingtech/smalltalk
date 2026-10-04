@@ -18568,16 +18568,28 @@ impl PiFamilyReports {
                     Some(verified)
                 }
                 None => {
-                    if std::env::var_os(st_drivers::driver_paths::SESSION_DIR_ENV).is_some_and(|dir| {
-                        st3::native_resume::pi_family_transcript(
-                            &PathBuf::from(dir).join("provider-sessions"),
+                    let recovered = if driver == "omp" {
+                        st3::native_resume::omp_process_transcript(
+                            subject,
+                            incarnation,
                             &native,
+                            std::env::var("ST3_ACCOUNT").ok().filter(|value| !value.is_empty()).as_deref(),
                         )
-                        .is_none()
-                    }) {
+                    } else {
+                        None
+                    };
+                    if recovered.is_none()
+                        && std::env::var_os(st_drivers::driver_paths::SESSION_DIR_ENV).is_some_and(|dir| {
+                            st3::native_resume::pi_family_transcript(
+                                &PathBuf::from(dir).join("provider-sessions"),
+                                &native,
+                            )
+                            .is_none()
+                        })
+                    {
                         return Ok(());
                     }
-                    None
+                    recovered
                 }
             };
             let reported: Result<ClaimRecord> = client

@@ -72,6 +72,19 @@ incarnation. An externally resumed file need not live under managed `provider-se
 Conversation replay consumes this exact-incarnation binding, so a resumed transcript
 created before the current incarnation is readable without guessing a file by cwd or age.
 
+On Linux, an older loaded hook that reports only its current native ID can also bind
+an explicit launch path without a restart. The publisher checks the incarnation's
+runtime PID and kernel start time, the exact subject's managed OMP driver and its direct
+provider child, the account, and the provider's absolute `--resume` path. That file's
+header must match the hook's **current** native ID; launch argv alone is never sufficient.
+Process lifetimes and parent links are checked again before accepting the path. A
+different current session, ambiguous provider, or missing ownership evidence refuses
+recovery rather than searching for another transcript.
+
+An import's provenance remains binding authority only while it is the latest binding.
+A later native-session report supersedes it; querying an incarnation without its own
+binding must not revive a historical import.
+
 Ordinary continuation passes the recorded path through `ST3_NATIVE_CONTINUE_PATH`.
 Rollout restoration passes it through `ST3_NATIVE_RESUME_PATH`. Suspend/resume recovers
 the path from the durable binding for the suspended incarnation and snapshot's native
