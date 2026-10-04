@@ -3916,7 +3916,77 @@ fn main() -> ExitCode {
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
     }
+    match driver_environment_incarnation(&cli) {
+        Ok(Some(incarnation)) => {
+            // SAFETY: the single-threaded lookup runtime has been dropped; run_cli starts
+            // the multi-threaded runtime only after this environment update.
+            unsafe { std::env::set_var("ST3_INCARNATION", incarnation) };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("st: {error:#}");
+            return ExitCode::FAILURE;
+        }
+    }
     run_cli(cli)
+}
+
+/// Export the runtime fence before any provider or runtime worker thread starts. Fresh
+/// launches replace an inherited fence; an in-place driver re-exec keeps the saved runtime.
+fn driver_environment_incarnation(cli: &Cli) -> Result<Option<String>> {
+    let Command::Driver(args) = &cli.command else {
+        return Ok(None);
+    };
+    let subject = args
+        .subject
+        .clone()
+        .or_else(|| args.identity.as_deref().map(normalize_agent_subject));
+    let Some(subject) = subject.as_deref() else {
+        return Ok(None);
+    };
+    // The exec driver also runs gates and resource tasks. Those processes do not own
+    // an agent runtime and must start without waiting for a seat incarnation.
+    if !subject.starts_with("agent/") {
+        return Ok(None);
+    }
+    if let Some(path) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV) {
+        let resume: DriverResume = st_drivers::reexec::peek_state(&path)?;
+        anyhow::ensure!(
+            resume.subject == subject && resume.driver == args.driver,
+            "the driver resume state belongs to another seat or driver"
+        );
+        return Ok(Some(resume.incarnation));
+    }
+    if let Some(path) = st_drivers::reexec::resume_path(st_drivers::reexec::CHANNEL_RESUME_ENV) {
+        let resume: Value = st_drivers::reexec::peek_state(&path)?;
+        let incarnation = resume
+            .get("incarnation")
+            .or_else(|| resume.pointer("/fence/incarnation"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("the channel resume state has no runtime incarnation")?;
+        return Ok(Some(incarnation.to_owned()));
+    }
+    let config = Config::load_unvalidated(None)?;
+    let endpoint = cli
+        .endpoint
+        .clone()
+        .or_else(|| std::env::var("ST3_ENDPOINT").ok())
+        .as_deref()
+        .map(Endpoint::parse)
+        .unwrap_or_else(|| Endpoint::Unix(config.client_socket()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    // Exec seats share the daemon's environment but do not have a PTY entry.
+    let use_local_pty_registry = args.driver != "exec" && has_local_pty_registry();
+    runtime
+        .block_on(wait_for_agent_incarnation_from(
+            &Client::new(endpoint),
+            subject,
+            use_local_pty_registry,
+        ))
+        .map(Some)
 }
 
 /// Print a usage error and exit. Inside a gate check the refusal also reaches the gate's
@@ -13805,17 +13875,27 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
     Ok(pty_observation_incarnation(actor, &observations))
 }
 
+fn has_local_pty_registry() -> bool {
+    std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty())
+}
+
 async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<String> {
+    wait_for_agent_incarnation_from(client, actor, has_local_pty_registry()).await
+}
+
+async fn wait_for_agent_incarnation_from(
+    client: &Client,
+    actor: &str,
+    use_local_pty_registry: bool,
+) -> Result<String> {
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut outage_logged = false;
-    let has_local_pty_registry =
-        std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty());
     loop {
         // A restarted provider process can begin before the reconciler has projected its new PTY
         // observation. Reading the graph immediately would then bind this new driver to the old
         // incarnation forever. The local registry already contains the process executing us and
         // is the exact source from which the reconciler will derive the graph incarnation.
-        if has_local_pty_registry {
+        if use_local_pty_registry {
             if let Some(incarnation) = current_local_pty_incarnation(actor)? {
                 return Ok(incarnation);
             }

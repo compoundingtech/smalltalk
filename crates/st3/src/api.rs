@@ -4730,6 +4730,41 @@ fn record_legacy_poll(
 #[derive(Clone, Debug)]
 pub struct BoundAgent(pub String);
 
+/// Only a locally bound harness may recover a missing work fence from its own runtime.
+/// Explicit fences are retained so the action's validation can refuse stale callers.
+fn bind_work_incarnation(
+    state: &AppState,
+    bound: Option<&Extension<BoundAgent>>,
+    actor: Option<&str>,
+    incarnation: &mut Option<String>,
+) -> Result<Option<String>, ApiError> {
+    let Some(bound) = bound else { return Ok(None) };
+    let seat = &bound.0.0;
+    if actor.and_then(normalized_agent_actor).as_deref() != Some(seat.as_str()) {
+        return Err(ApiError::bad(St3Error::new(
+            "foreign-agent-actor",
+            format!(
+                "this harness is `{seat}` and cannot act as `{}`",
+                actor.unwrap_or("<none>")
+            ),
+        )));
+    }
+    let current = state
+        .store
+        .latest_claim(seat, Some("runtime.observed"))
+        .map_err(ApiError::internal)?
+        .filter(|runtime| runtime.body["fields"]["status"] == "running")
+        .and_then(|runtime| {
+            runtime.body["fields"]["incarnation_id"]
+                .as_str()
+                .map(str::to_owned)
+        });
+    if incarnation.is_none() {
+        *incarnation = current.clone();
+    }
+    Ok(current)
+}
+
 async fn guard_bound_request(
     request: Request<Body>,
     bound_agent: Option<&str>,
@@ -9658,8 +9693,29 @@ struct AttentionQuery {
 
 async fn ask_person(
     State(state): State<AppState>,
-    Json(request): Json<PersonAskRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<PersonAskRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    let expected = bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        Some(&request.actor),
+        &mut request.incarnation,
+    )?;
+    if bound.is_some()
+        && request.step.is_some()
+        && request.new_run.is_none()
+        && request.incarnation != expected
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-work-ask",
+            format!(
+                "only the current claimant and incarnation of live work can ask a person; expected incarnation `{}`, given `{}`",
+                expected.as_deref().unwrap_or("<none>"),
+                request.incarnation.as_deref().unwrap_or("<none>")
+            ),
+        )));
+    }
     let result = state.store.ask_person(&request).map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(result))
@@ -11712,8 +11768,15 @@ fn person_or_agent_actor(actor: &str, code: &'static str) -> Result<String, ApiE
 async fn publish_work_mission(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
-    Json(request): Json<MissionProductionRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<MissionProductionRequest>,
 ) -> Result<Json<MissionOutputView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        Some(&request.actor),
+        &mut request.incarnation,
+    )?;
     let step = state
         .store
         .step_run(&subject)
@@ -11947,8 +12010,15 @@ fn normalized_agent_actor(actor: &str) -> Option<String> {
 async fn post_work_action(
     State(state): State<AppState>,
     AxumPath((action, subject)): AxumPath<(String, String)>,
-    Json(request): Json<WorkRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<WorkRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        request.actor.as_deref(),
+        &mut request.incarnation,
+    )?;
     work_action_response(state, action, subject, request, None).await
 }
 
@@ -11956,8 +12026,15 @@ async fn post_work_action(
 async fn extend_work(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
-    Json(request): Json<crate::model::WorkExtendRequest>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(mut request): Json<crate::model::WorkExtendRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    bind_work_incarnation(
+        &state,
+        bound.as_ref(),
+        request.actor.as_deref(),
+        &mut request.incarnation,
+    )?;
     let extend_ms = request.by_ms;
     let request = WorkRequest {
         actor: request.actor,
@@ -20914,3 +20991,6 @@ agent "seat" { workspace "/tmp"; command "true" }
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
 }
+
+#[cfg(test)]
+mod work_incarnation_tests;
