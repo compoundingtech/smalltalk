@@ -65,3 +65,10 @@ assert.deepEqual(compactFolders([
   'fleet/cos/standing/cos'.split('/'),
   ['solo'],
 ]), [['fleet', 'smalltalk', 'operations/2026-10-01'], ['fleet', 'smalltalk', 'ci'], ['fleet', 'cos/standing'], []]);
+
+// Signed out of its provider: needs login, said how, and it clears once signed in again.
+import { agentState as stateOf, loginGuidance } from './agentsView.ts';
+assert.equal(stateOf({ state: 'waiting', harness_state: 'unauthenticated', fault: null, delivery: null }), 'needs-login');
+assert.equal(stateOf({ state: 'waiting', harness_state: 'idle', reason: 'providerAuth', fault: null, delivery: null }), 'needs-login');
+assert.equal(stateOf({ state: 'running', harness_state: 'idle', fault: null, delivery: null }), 'idle');
+assert.match(loginGuidance({ driver: 'claude', host_id: 'host/harbor' }), /Claude login required on harbor: open its terminal and run \/login/);

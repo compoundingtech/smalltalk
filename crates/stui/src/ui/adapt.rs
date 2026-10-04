@@ -498,6 +498,12 @@ fn agents(model: &Model) -> Vec<Agent> {
                     AgentState::Fault
                 }
                 ("failed", _) => AgentState::Fault,
+                // Signed out of its provider (Claude "Not logged in · Run /login"): a login on
+                // its host fixes it, not a restart (Nathan, 2026-10-04).
+                ("waiting", Some("unauthenticated")) => AgentState::NeedsLogin,
+                ("waiting", _) if agent.reason.as_deref() == Some("providerAuth") => {
+                    AgentState::NeedsLogin
+                }
                 ("running", Some("working")) => AgentState::Working,
                 ("running", _) => AgentState::Idle,
                 ("waiting", Some("ready" | "working" | "idle"))
@@ -505,7 +511,7 @@ fn agents(model: &Model) -> Vec<Agent> {
                 {
                     AgentState::NeedsYou
                 }
-                ("waiting", Some("unauthenticated" | "blocked")) => AgentState::NeedsYou,
+                ("waiting", Some("blocked")) => AgentState::NeedsYou,
                 ("waiting" | "starting" | "desired", _) => AgentState::Starting,
                 ("stopped", _) => AgentState::Stopped,
                 _ => AgentState::Unknown,
@@ -1456,6 +1462,39 @@ mod tests {
         assert_eq!(agents(&model)[0].state, AgentState::Fault);
         model.agents = window(vec![resource("waiting", "indeterminate", Some("human"))]);
         assert_eq!(agents(&model)[0].state, AgentState::Starting);
+    }
+
+    #[test]
+    fn a_signed_out_harness_needs_login_and_clears_once_signed_in() {
+        let mut model = Model::default();
+        let resource = |state: &str, harness: &str, reason: Option<&str>| {
+            serde_json::json!({
+                "id": "agent/fleet/example/seat", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-04T12:00:00Z", "name": "fleet/example/seat",
+                "state": state, "reachability": "local", "harness_state": harness,
+                "blocked_on": "human", "reason": reason, "driver": "claude",
+                "host_id": "host/harbor", "runtime_ids": ["runtime/seat"], "under": [],
+            })
+        };
+        model.agents = window(vec![resource("waiting", "unauthenticated", Some("providerAuth"))]);
+        let agent = &agents(&model)[0];
+        assert_eq!(agent.state, AgentState::NeedsLogin);
+        let guidance = super::super::screens::login_guidance(agent);
+        assert!(guidance.contains("Claude login required on harbor"), "{guidance}");
+        assert!(guidance.contains("/login") && guidance.contains("without a restart"), "{guidance}");
+        let header = super::super::screens::agent_header(&super::super::demo::world(), agent, 100, "⠋")
+            .lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(header.contains("needs login") && header.contains("run /login"), "{header}");
+        // st's reason alone says so too.
+        model.agents = window(vec![resource("waiting", "idle", Some("providerAuth"))]);
+        assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
+        // Signed in again on the same run: it is simply idle, with nothing to restart.
+        model.agents = window(vec![resource("running", "idle", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::Idle);
     }
 
     #[test]
