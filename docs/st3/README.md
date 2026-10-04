@@ -12,6 +12,7 @@ Use these documents for implementation details:
 - [Free mode](kdl-lifecycle.md#free-mode): within a fleet, an agent may do anything the person who
   runs the fleet may do, as itself, until principals and grants land.
 - [Schema registry](schema.md) lists the generated public subject, resource, and claim vocabulary.
+- [Typed custom subjects](custom-subjects.md) defines immutable registrations, generic reads and replies, and derived-state freshness.
 - [Data authority](data-authority.md) separates durable facts from projections and caches.
 - [Claim backups](backups.md) explains live snapshots, offline restore, and recovered writer identities.
 - [Founder signing audit](founder-signing-audit.md) explains read-only capture, preserved unsealed

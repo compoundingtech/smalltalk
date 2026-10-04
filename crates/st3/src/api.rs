@@ -61,6 +61,7 @@ use crate::store::Store;
 mod client_blobs;
 mod client_presence;
 mod client_v0;
+mod custom;
 mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
@@ -459,6 +460,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::raw_terminal::stream),
         )
         .route("/v1/schema", get(schema))
+        .route(
+            "/v1/schema/registrations",
+            get(custom::registrations).post(custom::register),
+        )
+        .route("/v1/custom/reply", post(custom::reply))
+        .route("/v1/custom/basis", get(custom::basis))
+        .route("/v1/client/custom-subjects", get(custom::list))
+        .route("/v1/client/custom-subjects/{*id}", get(custom::read))
         .route("/v1/intent/mission", post(mission))
         .route("/v1/gate-checks", post(start_gate_check))
         .route("/v1/gate-checks/{id}", get(read_gate_check))
@@ -2636,6 +2645,9 @@ fn snapshot_time_ms(timestamp: &str) -> u128 {
 }
 
 fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'static str> {
+    if kind.starts_with("custom.") {
+        return vec!["custom.reply"];
+    }
     match kind {
         "human-gate" if review_mode == Some("feedback") => {
             vec!["review.approve", "review.request-changes"]
@@ -2719,6 +2731,14 @@ fn client_attention_resources(
         }
         if let Some(mode) = item.review_mode {
             resource["review_mode"] = json!(mode);
+        }
+        if item.kind.starts_with("custom.")
+            && let Some(source) = store.custom_subject(&item.subject)?
+        {
+            resource["source_kind"] = json!("custom");
+            resource["revision"] = source["revision"].clone();
+            resource["custom_form"] = source["attention"]["reply"].clone();
+            resource["action_parameters"] = json!({"custom.reply":{"target_id":item.subject,"registration":source["registration"],"revision":source["revision"],"episode":item.episode}});
         }
         if item.kind == "person-step" {
             resource["action_parameters"] =
@@ -4959,6 +4979,8 @@ async fn guard_bound_request(
         "/v1/subscription-requests/",
         "/v1/reviews/",
         "/v1/claims",
+        "/v1/schema/registrations",
+        "/v1/custom/reply",
         "/v1/diagnostic",
         "/v1/rules/",
     ]
@@ -13827,6 +13849,8 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/missions/example%2Fdemo/retire",
             "/v1/subscription-requests/release/subscription-request%2Fexample",
             "/v1/reviews/step-run/example",
+            "/v1/schema/registrations",
+            "/v1/custom/reply",
         ] {
             for actor in ["agent/peer", "person/operator"] {
                 let request = Request::builder()

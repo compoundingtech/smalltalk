@@ -269,6 +269,8 @@ pub struct Operational {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Attention {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_form: Option<Value>,
     #[serde(default)]
     pub episode: String,
     #[serde(default)]
@@ -1956,6 +1958,8 @@ pub struct Fence {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum ActionType {
+    #[serde(rename = "custom.reply")]
+    CustomReply,
     #[serde(rename = "attention.resolve")]
     AttentionResolve,
     #[serde(rename = "review.approve")]
@@ -2187,6 +2191,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::AttentionResolve,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn custom_reply(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: CustomReplyParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::CustomReply,
             idempotency_key,
             fence,
             &parameters,
@@ -3481,4 +3499,14 @@ pub struct AgentRepository {
     pub path: String,
     pub workspaces: Vec<String>,
     pub agent_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomReplyParameters {
+    pub target_id: String,
+    pub registration: String,
+    pub revision: String,
+    pub episode: String,
+    pub fields: BTreeMap<String, Value>,
 }

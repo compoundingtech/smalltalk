@@ -11,6 +11,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "agent.stop",
     "agent.suspend",
     "attention.resolve",
+    "custom.reply",
     "lane.approve",
     "lane.join",
     "lane.leave",
@@ -59,6 +60,8 @@ pub const ACTION_NAMES: &[&str] = &[
 ];
 #[rustfmt::skip]
 pub const READ_OPERATIONS: &[(&str, &str)] = &[
+    ("custom-subjects.list", "/v1/client/custom-subjects"),
+    ("custom-subjects.get", "/v1/client/custom-subjects/{id}"),
     ("host.repositories", "/v1/client/hosts/{id}/repositories"),
     ("sets.list", "/v1/client/sets"),
     ("sets.get", "/v1/client/sets/{id}"),

@@ -39,13 +39,19 @@ fn contract_validator(definition: &str) -> jsonschema::Validator {
     fn strict_known_cases(value: &mut Value) {
         match value {
             Value::Object(object) => {
-                let known = object.get("anyOf").and_then(Value::as_array).and_then(|cases| {
-                    if cases.len() == 2 && cases[1]["type"] == "string" {
-                        cases[0].get("enum").cloned()
-                    } else {
-                        None
-                    }
-                });
+                let known = object
+                    .get("anyOf")
+                    .and_then(Value::as_array)
+                    .and_then(|cases| {
+                        if cases.len() == 2
+                            && cases[1]["type"] == "string"
+                            && cases[1].get("pattern").is_none()
+                        {
+                            cases[0].get("enum").cloned()
+                        } else {
+                            None
+                        }
+                    });
                 if let Some(known) = known {
                     object.remove("anyOf");
                     object.insert("enum".into(), known);
