@@ -289,6 +289,13 @@ An owned-set publication (`st apply --set NAME`) publishes these shared URI targ
 its declarations, but excludes them from the set's membership and ownership. Dropping edges
 or retiring the seats and missions that name them never retires the targets.
 
+Mission-only planning candidates, run revisions, and produced-mission outputs publish the
+shared URI targets synthesized from that mission's own references. They still reject explicit
+immediate declarations, including an explicit declaration of the same URI target.
+Run materialization preserves the complete authored resource metadata: names, reasons, and
+explicit subject targets are not run-local aliases. For example, `worker` and `agent/worker`
+remain distinct resource names even when the mission declares a local agent named `worker`.
+
 To inspect incoming edges, run `st subject show RESOURCE --references` (add the global
 `--json` flag for JSON), or request `GET /v1/resource-references/{subject}`. Each incoming
 reference contains `owner`, local `name`, and nullable `reason`. The lookup covers current agent
