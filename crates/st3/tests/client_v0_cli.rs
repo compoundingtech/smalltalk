@@ -2038,16 +2038,6 @@ mission "reported-work" state="ready" {
         String::from_utf8_lossy(&mission.stderr)
     );
     let mission = String::from_utf8(mission.stdout).unwrap();
-    assert!(
-        mission.contains("  progress: Tests pass; opening the pull request\n"),
-        "{mission}"
-    );
-    assert!(
-        mission.contains("  done: Published the guide\n"),
-        "{mission}"
-    );
-    assert!(!mission.contains("Drafting the guide"), "{mission}");
-
     let json = value(&run_cli(&socket, &["missions", "show", &run.subject]).await);
     let steps = json["steps"].as_array().unwrap();
     let reported = |path: &str| steps.iter().find(|step| step["step"] == path).unwrap();
@@ -2060,6 +2050,42 @@ mission "reported-work" state="ready" {
     assert_eq!(
         reported("docs")["completion_summary"],
         "Published the guide"
+    );
+
+    for (path, field, label, summary) in [
+        (
+            "build",
+            "progress_report",
+            "Progress",
+            "Tests pass; opening the pull request",
+        ),
+        ("docs", "progress_report", "Progress", "Drafting the guide"),
+        (
+            "docs",
+            "completion_report",
+            "Completion reported",
+            "Published the guide",
+        ),
+    ] {
+        let report = &reported(path)[field];
+        assert_eq!(report["summary"], summary);
+        assert_eq!(report["attempt"], 1);
+        assert_eq!(report["evidence"], serde_json::json!([]));
+        let claim = report["claim_id"].as_str().unwrap();
+        assert_eq!(claim.len(), 64);
+        let at = chrono::DateTime::from_timestamp_millis(report["at_unix_ms"].as_i64().unwrap())
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert!(
+            mission.contains(&format!("{label} (attempt 1, {at}): {summary}\n")),
+            "{mission}"
+        );
+        assert!(mission.contains(&format!("claim: {claim}\n")), "{mission}");
+    }
+    assert!(reported("build")["completion_report"].is_null());
+    assert!(
+        mission.find("Drafting the guide").unwrap() < mission.find("Published the guide").unwrap(),
+        "progress stays visible before the distinct completion report: {mission}"
     );
 
     server.abort();
