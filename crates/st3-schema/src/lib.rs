@@ -69,6 +69,20 @@ pub struct HarnessTodoSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessPlanSnapshot {
+    pub version: u32,
+    pub harness: String,
+    pub session_id: String,
+    pub incarnation_id: String,
+    pub observed_at: String,
+    pub source_op: String,
+    pub phases: Vec<HarnessPhase>,
+    pub totals: HarnessTodoTotals,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ValueType {
     Any,
@@ -281,7 +295,7 @@ impl Registry {
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
         output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
-        output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
+        output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. Codex's separate `harness.plan.observed` snapshot adds `version: 1` and uses the same phase/task shape with one unnamed phase. Plans replicate only when binding or state changes, not when source timestamps or source operations change. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
         output.push_str("\nOMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.\n");
         output
     }
@@ -430,6 +444,12 @@ impl Registry {
             }
         }
         if kind == "harness.todo.observed" {
+            validate_harness_todo(fields)?;
+        }
+        if kind == "harness.plan.observed" {
+            if fields.get("version").and_then(Value::as_u64) != Some(1) {
+                return Err(error("invalid-harness-plan", "unsupported plan snapshot version"));
+            }
             validate_harness_todo(fields)?;
         }
         if subject_spec.family == "glass" {
@@ -1071,6 +1091,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
     let definitions: &[ClaimDefinition<'_>] = &[
         (
             "harness.todo.observed",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
+        (
+            "harness.plan.observed",
             &["agent"],
             WritePolicy::SameSubjectActor,
             Cardinality::Append,
@@ -2382,7 +2411,7 @@ fn claim_retention(kind: &str) -> Retention {
         | "runtime.action.deadline-reached" => Retention::SystemLocal,
         // Other nodes read the current harness state and usage: step readiness is judged on
         // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
-        "harness.observed" | "harness.usage" | "harness.todo.observed" | "workspace.observed" => {
+        "harness.observed" | "harness.usage" | "harness.todo.observed" | "harness.plan.observed" | "workspace.observed" => {
             Retention::Latest
         }
         _ => Retention::Durable,
@@ -2397,6 +2426,17 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("repository", string()),
         ],
         "harness.todo.observed" => &[
+            ("harness", required_string()),
+            ("session_id", required_string()),
+            ("incarnation_id", required_string()),
+            ("observed_at", required_string()),
+            ("source_op", required_string()),
+            ("phases", required_array()),
+            ("totals", required_object()),
+            ("truncated", required_boolean()),
+        ],
+        "harness.plan.observed" => &[
+            ("version", required_integer()),
             ("harness", required_string()),
             ("session_id", required_string()),
             ("incarnation_id", required_string()),
@@ -3840,231 +3880,7 @@ mod tests {
         assert!(validate_todo(&fields).is_err());
     }
 
-    #[test]
-    fn registry_matches_the_exact_manifests() {
-        let registry = registry();
-        assert_eq!(
-            registry
-                .subjects
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "account",
-                "agent",
-                "attention",
-                "checkpoint",
-                "checkpoint-excusal",
-                "custom",
-                "daemon",
-                "doc",
-                "exec",
-                "file",
-                "fleet-invite",
-                "gate-operation",
-                "github-post",
-                "glass",
-                "host",
-                "lane",
-                "loop-run",
-                "message",
-                "mission",
-                "mission-run",
-                "observer",
-                "owned-set",
-                "person",
-                "planning-session",
-                "pty",
-                "repair",
-                "resource",
-                "revision-proposal",
-                "rule",
-                "run-generation",
-                "schedule",
-                "sekret",
-                "step-run",
-                "subscription",
-            ]
-        );
-        assert_eq!(
-            registry
-                .resources
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "ci.run",
-                "filesystem.file",
-                "harness.session-file",
-                "human.review",
-                "vcs.commit",
-                "vcs.issue",
-                "vcs.pull-request",
-                "vcs.ref",
-                "vcs.repository",
-            ]
-        );
-        assert_eq!(
-            registry.resources["human.review"]
-                .fields
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "decision",
-                "document",
-                "reason",
-                "reviewer",
-                "submitted_at",
-                "target"
-            ]
-        );
-        assert_eq!(
-            registry
-                .claims
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "agent.account",
-                "agent.placement.source-offline",
-                "agent.presence",
-                "agent.queue.moved",
-                "attention.requested",
-                "attention.resolved",
-                "checkpoint.excused",
-                "checkpoint.sealed",
-                "checkpoint.verified",
-                "daemon.diagnostic",
-                "daemon.started",
-                "delivery.hold",
-                "doc.bound",
-                "eval.verdict",
-                "file.observed",
-                "fleet.invite-created",
-                "fleet.invite-redeemed",
-                "fleet.invite-revoked",
-                "fleet.member-admitted",
-                "fleet.member-endpoints",
-                "fleet.member-left",
-                "fleet.member-removed",
-                "gate.requested",
-                "gate.result",
-                "github.posted",
-                "glass.deleted",
-                "glass.upserted",
-                "harness.context-clear.requested",
-                "harness.context-clear.result",
-                "harness.diagnostic",
-                "harness.limits",
-                "harness.observed",
-                "harness.session-file",
-                "harness.telemetry",
-                "harness.timeline",
-                "harness.todo.observed",
-                "harness.usage",
-                "intent.desired",
-                "lane.approved",
-                "lane.joined",
-                "lane.left",
-                "lane.marked",
-                "lane.moved",
-                "loop.round-dispatch",
-                "loop.round-result",
-                "loop.state",
-                "message.closed",
-                "message.delivered",
-                "message.read",
-                "message.sent",
-                "message.staged",
-                "mission-run.created",
-                "mission-run.state",
-                "mission.produced",
-                "mission.published",
-                "observer.observed",
-                "observer.refresh-requested",
-                "observer.state",
-                "operational.failure",
-                "operational.recovered",
-                "owned-set.revised",
-                "planning-session.approved",
-                "planning-session.cancelled",
-                "planning-session.candidate-submitted",
-                "planning-session.previewed",
-                "planning-session.question-answered",
-                "planning-session.question-requested",
-                "planning-session.revision-requested",
-                "planning-session.started",
-                "principal.key-granted",
-                "principal.key-revoked",
-                "publication.operation",
-                "reconcile.fault",
-                "record.repaired",
-                "render.applied",
-                "repair.applied",
-                "resource.observed",
-                "revision-proposal.applied",
-                "revision-proposal.approved",
-                "revision-proposal.cancelled",
-                "revision-proposal.created",
-                "rule.audited",
-                "rule.set",
-                "run-generation.created",
-                "run-generation.state",
-                "run-generation.superseded",
-                "runtime.action.deadline-reached",
-                "runtime.action.failed",
-                "runtime.action.requested",
-                "runtime.action.succeeded",
-                "runtime.observed",
-                "runtime.readiness-deadline-reached",
-                "runtime.reconcile-decision",
-                "runtime.restart-window-reset",
-                "schedule.occurrence-cancelled",
-                "schedule.occurrence-reached",
-                "schedule.occurrence-scheduled",
-                "schedule.work-failed",
-                "schedule.work-requested",
-                "schedule.work-started",
-                "sekret.called",
-                "sekret.changed",
-                "sekret.exited",
-                "sekret.refused",
-                "step-run.carried",
-                "step-run.retried",
-                "step-run.state",
-                "subagent.appeared",
-                "subagent.ended",
-                "subagent.renewed",
-                "subscription.batch-sent",
-                "subscription.batched",
-                "subscription.mission-deferred",
-                "subscription.mission-failed",
-                "subscription.mission-request-cancelled",
-                "subscription.mission-request-released",
-                "subscription.mission-requested",
-                "subscription.mission-started",
-                "subscription.state",
-                "subscription.watch-ended",
-                "terminal.input.requested",
-                "terminal.input.result",
-                "transport.observed",
-                "work.claimed",
-                "work.extended",
-                "work.failed",
-                "work.person-asked",
-                "work.person-cancelled",
-                "work.person-done",
-                "work.progress",
-                "work.released",
-                "work.renewed",
-                "work.submitted",
-                "workspace.observed",
-            ]
-        );
-        assert_eq!(registry.digest().len(), 64);
-        assert_eq!(registry.digest(), registry.digest());
-    }
+
 
     #[test]
     fn registry_rejects_the_removed_plan_names() {

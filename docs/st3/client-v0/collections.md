@@ -10,8 +10,10 @@ Send one JSON command per subscription:
 {"kind":"subscribe","id":"missions-tab","collection":"missions","limit":50}
 ```
 
-Collections are `missions`, `attention`, `agents`, and `work`, plus `terminal` (below). The optional
-`actor` filter applies to work, `person` to attention, and `status` to agents.
+Collections are `missions`, `attention`, `agents`, `work`, `glasses`, and `harness`,
+plus `terminal` and `conversation` (below). The optional `actor` filter applies to work,
+`person` to attention, and `status` to agents. Harness requires an `agent` subject filter
+and rejects all other filters; see [focused harness state](README.md#focused-harness-state).
 A window contains 1–200 current items. History remains on the
 corresponding paged HTTP reads. Send `{"kind":"unsubscribe","id":"missions-tab"}`
 to remove a subscription. IDs are chosen by the client and unique on the socket.
@@ -46,6 +48,10 @@ fresh snapshot. If the socket closes, including during a daemon
 restart, open a new socket and subscribe again; the new snapshot is authoritative.
 Each socket subscribes to store changes before taking its first snapshot, so a
 write racing that snapshot is visible in the snapshot or a subsequent frame.
+Each subscription tracks its own pending reread, including delayed refreshes: a plan change
+for a focused harness does not reread other windows sharing its socket. Harness binding or
+schema replacement emits a whole new `snapshot` frame, not a continuity `changes` frame.
+
 
 ## Terminals
 

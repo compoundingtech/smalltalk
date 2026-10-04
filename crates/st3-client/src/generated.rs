@@ -1038,6 +1038,41 @@ pub struct AgentTodo {
     pub accepted_at: String,
     pub stale: bool,
 }
+/// One seat's accepted read-only harness state, independent of fleet row shape.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessState {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub schema: String,
+    pub agent_id: String,
+    pub incarnation_id: Option<String>,
+    pub session_id: Option<String>,
+    pub state: Option<String>,
+    pub driver: Option<String>,
+    pub todo: Option<AgentTodo>,
+    pub plan: Option<AgentPlan>,
+    pub usage: Option<UsageSummary>,
+    pub subagents: Vec<AgentSubagent>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentPlan {
+    pub snapshot: HarnessPlanSnapshot,
+    pub claim_id: String,
+    pub accepted_at: String,
+    pub stale: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HarnessPlanSnapshot {
+    pub version: u32,
+    pub harness: String,
+    pub session_id: String,
+    pub incarnation_id: String,
+    pub observed_at: String,
+    pub source_op: String,
+    pub phases: Vec<HarnessPhase>,
+    pub totals: HarnessTodoTotals,
+    pub truncated: bool,
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct HarnessTodoSnapshot {
     pub harness: String,
@@ -1480,6 +1515,7 @@ pub enum Resource {
     Mission(Mission),
     Work(Work),
     Agent(Agent),
+    HarnessState(HarnessState),
     Runtime(Runtime),
     Observer(Observer),
     Subscription(Subscription),
@@ -1509,6 +1545,7 @@ pub const KNOWN_RESOURCE_KINDS: &[&str] = &[
     "mission",
     "work",
     "agent",
+    "harness-state",
     "runtime",
     "observer",
     "subscription",
@@ -1572,6 +1609,7 @@ impl Resource {
             Self::Mission(v) => &v.header,
             Self::Work(v) => &v.header,
             Self::Agent(v) => &v.header,
+            Self::HarnessState(v) => &v.header,
             Self::Runtime(v) => &v.header,
             Self::Observer(v) => &v.header,
             Self::Subscription(v) => &v.header,

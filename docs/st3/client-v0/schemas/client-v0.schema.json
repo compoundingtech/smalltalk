@@ -48,7 +48,7 @@
     "AgentReachability": {"anyOf": [{"enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"]}, {"type": "string"}], "description": "Whether the daemon can currently reach the agent runtime."},
     "TimelineStatus": {"anyOf": [{"enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Run status reported in a timeline `status` entry."},
     "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`."},
-    "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "owned-set"]}}}}]},
+    "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "harness-state", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "owned-set"]}}}}]},
     "OwnedSet": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "claim", "receipt", "blockers", "members_status", "visibility"], "properties": {"kind": {"const": "owned-set"}, "claim": {"type": "string"}, "receipt": {"type": "object"}, "blockers": {"type": "array", "items": {"type": "string"}}, "members_status": {"type": "array", "items": {"type": "object"}}, "visibility": {"type": "object"}, "commit_status": {"type": ["object", "null"]}}}]},
     "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "First child share; absent means 0.5. Requires glasses capability version 2."}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
     "GlassTab": {"type": "object", "additionalProperties": false, "required": ["pane"], "properties": {"title": {"type": "string"}, "pane": {"type": "string", "minLength": 1}}},
@@ -892,6 +892,53 @@
         }
       ]
     },
+    "HarnessState": {
+      "allOf": [
+        { "$ref": "#/$defs/ResourceHeader" },
+        {
+          "type": "object",
+          "required": ["kind", "schema", "agent_id", "incarnation_id", "session_id", "state", "driver", "todo", "plan", "usage", "subagents"],
+          "properties": {
+            "kind": { "const": "harness-state" },
+            "schema": { "const": "harness-state.v1" },
+            "agent_id": { "$ref": "#/$defs/AgentId" },
+            "incarnation_id": { "type": ["string", "null"] },
+            "session_id": { "type": ["string", "null"] },
+            "state": { "type": ["string", "null"] },
+            "driver": { "type": ["string", "null"] },
+            "todo": { "oneOf": [{ "$ref": "#/$defs/AgentTodo" }, { "type": "null" }] },
+            "plan": { "oneOf": [{ "$ref": "#/$defs/AgentPlan" }, { "type": "null" }] },
+            "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
+            "subagents": { "type": "array", "items": { "$ref": "#/$defs/AgentSubagent" } }
+          }
+        }
+      ]
+    },
+    "AgentPlan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["snapshot", "claim_id", "accepted_at", "stale"],
+      "properties": {
+        "snapshot": { "$ref": "#/$defs/HarnessPlanSnapshot" },
+        "claim_id": { "type": "string" },
+        "accepted_at": { "$ref": "#/$defs/Timestamp" },
+        "stale": { "type": "boolean" }
+      }
+    },
+    "HarnessPlanSnapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "harness", "session_id", "incarnation_id", "observed_at", "source_op", "phases", "totals", "truncated"],
+      "properties": {
+        "version": { "const": 1 },
+        "harness": { "type": "string" },
+        "session_id": { "type": "string" },
+        "incarnation_id": { "type": "string" },
+        "observed_at": { "$ref": "#/$defs/Timestamp" },
+        "source_op": { "type": "string" },
+        "phases": { "type": "array", "items": { "$ref": "#/$defs/HarnessPhase" } },
+        "totals": { "$ref": "#/$defs/HarnessTodoTotals" },
+        "truncated": { "type": "boolean" }
+      }
+    },
     "AgentTodo": {
       "type": "object",
       "additionalProperties": false,
@@ -1422,7 +1469,7 @@
       }
     },
     "Resource": {
-      "oneOf": [{"$ref": "#/$defs/Attention"}, {"$ref": "#/$defs/Message"}, {"$ref": "#/$defs/Launch"}, {"$ref": "#/$defs/LaunchVariant"}, {"$ref": "#/$defs/LaunchDecision"}, {"$ref": "#/$defs/LaunchApproval"}, {"$ref": "#/$defs/Mission"}, {"$ref": "#/$defs/Work"}, {"$ref": "#/$defs/Agent"}, {"$ref": "#/$defs/Runtime"}, {"$ref": "#/$defs/Observer"}, {"$ref": "#/$defs/Subscription"}, {"$ref": "#/$defs/Lane"}, {"$ref": "#/$defs/Machine"}, {"$ref": "#/$defs/Device"}, {"$ref": "#/$defs/Operation"}, {"$ref": "#/$defs/History"}, {"$ref": "#/$defs/Session"}, {"$ref": "#/$defs/Glass"}, {"$ref": "#/$defs/OwnedSet"}, {"$ref": "#/$defs/UnknownResource"}]
+      "oneOf": [{"$ref": "#/$defs/Attention"}, {"$ref": "#/$defs/Message"}, {"$ref": "#/$defs/Launch"}, {"$ref": "#/$defs/LaunchVariant"}, {"$ref": "#/$defs/LaunchDecision"}, {"$ref": "#/$defs/LaunchApproval"}, {"$ref": "#/$defs/Mission"}, {"$ref": "#/$defs/Work"}, {"$ref": "#/$defs/Agent"}, {"$ref": "#/$defs/HarnessState"}, {"$ref": "#/$defs/Runtime"}, {"$ref": "#/$defs/Observer"}, {"$ref": "#/$defs/Subscription"}, {"$ref": "#/$defs/Lane"}, {"$ref": "#/$defs/Machine"}, {"$ref": "#/$defs/Device"}, {"$ref": "#/$defs/Operation"}, {"$ref": "#/$defs/History"}, {"$ref": "#/$defs/Session"}, {"$ref": "#/$defs/Glass"}, {"$ref": "#/$defs/OwnedSet"}, {"$ref": "#/$defs/UnknownResource"}]
     },
     "GoldenResourceSet": {
       "type": "array",
@@ -2246,7 +2293,7 @@
         "details": { "type": "object" }
       }
     },
-    "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses"] },
+    "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses", "harness"] },
     "CollectionCommand": {
       "oneOf": [
         {
@@ -2260,7 +2307,8 @@
             "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
             "person": { "type": ["string", "null"] },
             "actor": { "type": ["string", "null"] },
-            "status": { "type": ["string", "null"] }
+            "status": { "type": ["string", "null"] },
+            "agent": { "oneOf": [{ "$ref": "#/$defs/AgentId" }, { "type": "null" }] }
           }
         },
         {
