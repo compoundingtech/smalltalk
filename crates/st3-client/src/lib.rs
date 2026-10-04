@@ -1138,6 +1138,13 @@ impl Client {
         .await
     }
 
+    pub async fn private_notes_get(
+        &self,
+        uri: &str,
+    ) -> Result<Envelope<PrivateNotesSubject>, ClientError> {
+        self.get(&format!("/v1/client/private-notes/{}", percent_encode(uri)))
+            .await
+    }
     pub async fn host_repositories(
         &self,
         host: &str,
@@ -1821,6 +1828,17 @@ impl Client {
         parameters: TargetParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::pairing_revoke(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn private_notes_write(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PrivateNotesWriteParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::private_notes_write(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }

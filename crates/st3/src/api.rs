@@ -86,6 +86,7 @@ pub struct AppState {
     pub client_relay: Option<crate::peer::ClientRelay>,
     pub native_session_home: Option<std::path::PathBuf>,
     pub planner_default: PlannerSpec,
+    pub private_notes: Arc<crate::private_notes::Authority>,
 }
 
 const CLIENT_API_VERSION: &str = "st3.client.v0";
@@ -245,12 +246,17 @@ impl ApiError {
             | "stale-launch-preview"
             | "fleet-leaving"
             | "glass-deleted"
+            | "stale-fence"
+            | "idempotency-conflict"
+            | "private-notes-carrier-conflict"
             | "glass-limit" => StatusCode::CONFLICT,
             "launch-review-not-authorized"
             | "wrong-message-recipient"
             | "lane-approval-denied"
+            | "forbidden"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
+            "private-notes-unreachable" | "private-notes-indeterminate" => StatusCode::SERVICE_UNAVAILABLE,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -378,6 +384,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/resources", get(client_v0::resources::list))
+        .route("/v1/client/private-notes/{*uri}", get(client_v0::private_notes::detail))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
         .route(
             "/v1/client/agent-workspaces/{*id}",
@@ -1110,6 +1117,9 @@ fn client_error_code(code: Option<&str>) -> String {
         | "validation-failed"
         | "idempotency-conflict"
         | "stale-fence"
+        | "private-notes-unreachable"
+        | "private-notes-carrier-conflict"
+        | "private-notes-indeterminate"
         | "timeline-history-incomplete"
         | "cursor-gap"
         | "page-cursor-expired"
@@ -1497,6 +1507,7 @@ async fn client_capabilities(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<client_v0::ClientSession>,
+    bound: Option<Extension<BoundAgent>>,
 ) -> Json<Value> {
     let cursor = format!("event-cursor/{}/{}", state.node, snapshot.store_index);
     let oldest = state
@@ -1504,7 +1515,7 @@ async fn client_capabilities(
         .event_bounds()
         .map(|(oldest, _)| oldest.saturating_sub(1))
         .unwrap_or_default();
-    let capabilities = client_v0::capabilities(&session);
+    let capabilities = client_v0::capabilities(&state, &session, bound.as_ref().map(|bound| &bound.0));
     Json(json!({
         "kind": "capabilities",
         "machine_version": st_drivers::version::machine_version(),
@@ -4605,6 +4616,11 @@ async fn serve_unix_with_ancestor(
                 .unwrap_or_default(),
                 None => (None, None, None),
             };
+            let notes_principal = match peer_pid {
+                Some(pid) if bind_ancestry && bound_agent.is_none() =>
+                    tokio::task::spawn_blocking(move || notes_principal_ancestor(pid)).await.unwrap_or(false),
+                _ => false,
+            };
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
                 let bound_agent = bound_agent.clone();
@@ -4612,6 +4628,7 @@ async fn serve_unix_with_ancestor(
                 let delivery_peer = delivery_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
+                    if notes_principal { request.extensions_mut().insert(VerifiedNotesPrincipal); }
                     if let Some(peer) = delivery_peer {
                         request.extensions_mut().insert(peer);
                     }
@@ -4695,6 +4712,35 @@ mod gateway_listener_tests {
         drop(listener);
     }
 }
+
+/// A person header is a selector, not notes authority. Only a positively inspected
+/// local OS-owner ancestry can exercise principal notes scopes without a credential.
+#[derive(Clone, Copy)]
+struct VerifiedNotesPrincipal;
+
+#[cfg(target_os = "linux")]
+fn notes_principal_ancestor(mut pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut seen = std::collections::BTreeSet::new();
+    while pid > 1 && seen.insert(pid) {
+        let root = format!("/proc/{pid}");
+        let Ok(metadata) = fs::metadata(&root) else { return false };
+        // SAFETY: getuid has no inputs and no memory safety requirements.
+        if metadata.uid() != unsafe { libc::getuid() } { return true; }
+        let Ok(environment) = fs::read(format!("{root}/environ")) else { return false };
+        if environment.split(|byte| *byte == 0).any(|entry| entry.starts_with(b"ST_AGENT=agent/")) {
+            return false;
+        }
+        let Ok(stat) = fs::read_to_string(format!("{root}/stat")) else { return false };
+        let Some(parent) = stat.rsplit_once(") ").and_then(|(_, fields)| fields.split_whitespace().nth(1))
+            .and_then(|parent| parent.parse().ok()) else { return false };
+        pid = parent;
+    }
+    pid == 1
+}
+
+#[cfg(not(target_os = "linux"))]
+fn notes_principal_ancestor(_pid: u32) -> bool { false }
 
 #[cfg(target_os = "linux")]
 fn harness_ancestor(mut pid: u32) -> Option<String> {
@@ -14418,6 +14464,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
+            private_notes: Default::default(),
         }
     }
 

@@ -23,6 +23,13 @@ pub(super) async fn publish(
     }
     let store = state.store.clone();
     let kind = request.claim.kind.clone();
+    let notes_incarnation = request.runtime_incarnation.clone();
+    let notes_agent = peer.agent.clone();
     let (record, changed) = blocking_action(move || store.append_harness_event(&request)).await?;
+    if let Err(error) = client_v0::private_notes::bind_native(&state, &notes_agent, &notes_incarnation).await {
+        // Optional notes admission never stalls the already committed producer outbox.
+        // Reads reprove realization and source incarnation; no notes are supplied on failure.
+        tracing::warn!(subject = %notes_agent, code = %error.code, "private notes source unavailable");
+    }
     finish_claim_publication(&state, &kind, record, changed).await
 }

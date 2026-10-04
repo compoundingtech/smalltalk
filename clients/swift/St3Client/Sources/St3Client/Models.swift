@@ -356,10 +356,25 @@ public struct ConversationChanges: Codable, Sendable { public let kind: String; 
 public struct ProjectionEvent: Codable, Sendable, Identifiable { public let id: String; public let epoch: String; public let sequence: UInt64; public let previousCursor: String; public let nextCursor: String; public let timestamp: String; public let type: String; public let resourceIDs: [String]; public let snapshotID: String; public let body: [String: JSONValue]; enum CodingKeys: String, CodingKey { case id, epoch, sequence, previousCursor = "previous_cursor", nextCursor = "next_cursor", timestamp, type, resourceIDs = "resource_ids", snapshotID = "snapshot_id", body } }
 public struct EventPage: Codable, Sendable { public let kind: String; public let oldestCursor: String; public let resumeCursor: String; public let items: [ProjectionEvent]; public let hasMore: Bool; enum CodingKeys: String, CodingKey { case kind, oldestCursor = "oldest_cursor", resumeCursor = "resume_cursor", items, hasMore = "has_more" } }
 
+public struct PrivateNotesFence: Codable, Sendable {
+    public var carrierGeneration: String; public var revision: String
+    public init(carrierGeneration: String, revision: String) { self.carrierGeneration = carrierGeneration; self.revision = revision }
+    enum CodingKeys: String, CodingKey { case carrierGeneration = "carrier_generation", revision }
+}
+public struct PrivateNotesData: Codable, Sendable { public let uri: String; public let markdown: String; public let fence: PrivateNotesFence }
+public struct PrivateNotesAction: Codable, Sendable { public let id: String; public let fence: Fence }
+public struct PrivateNotesSubject: Codable, Sendable {
+    public let ref: String; public let family: String; public let schema: String; public let data: PrivateNotesData; public let actions: [PrivateNotesAction]; public let live: JSONValue
+}
+public struct PrivateNotesWriteParameters: Codable, Sendable {
+    public var uri: String; public var markdown: String
+    public init(uri: String, markdown: String) { self.uri = uri; self.markdown = markdown }
+}
+
 public struct Fence: Codable, Sendable {
-    public var snapshotID: String; public var subjectRevisions: [String: String]; public var missionGeneration: String?; public var stepDefinition: String?; public var attempt: UInt?; public var readinessEpoch: UInt64?; public var runtimeIncarnation: String?; public var runtimeDesiredRevision: String?; public var terminalSequence: UInt64?; public var previewToken: String?
+    public var snapshotID: String; public var subjectRevisions: [String: String]; public var missionGeneration: String?; public var stepDefinition: String?; public var attempt: UInt?; public var readinessEpoch: UInt64?; public var runtimeIncarnation: String?; public var runtimeDesiredRevision: String?; public var terminalSequence: UInt64?; public var previewToken: String?; public var privateNotes: PrivateNotesFence?
     public init(snapshotID: String, subjectRevisions: [String: String] = [:]) { self.snapshotID = snapshotID; self.subjectRevisions = subjectRevisions }
-    enum CodingKeys: String, CodingKey { case snapshotID = "snapshot_id", subjectRevisions = "subject_revisions", missionGeneration = "mission_generation", stepDefinition = "step_definition", attempt, readinessEpoch = "readiness_epoch", runtimeIncarnation = "runtime_incarnation", runtimeDesiredRevision = "runtime_desired_revision", terminalSequence = "terminal_sequence", previewToken = "preview_token" }
+    enum CodingKeys: String, CodingKey { case snapshotID = "snapshot_id", subjectRevisions = "subject_revisions", missionGeneration = "mission_generation", stepDefinition = "step_definition", attempt, readinessEpoch = "readiness_epoch", runtimeIncarnation = "runtime_incarnation", runtimeDesiredRevision = "runtime_desired_revision", terminalSequence = "terminal_sequence", previewToken = "preview_token", privateNotes = "private_notes" }
 }
 public struct ActionRequest: Codable, Sendable {
     public let apiVersion: String; public let id: String; public let type: ActionType; public let idempotencyKey: String; public let fence: Fence; public let parameters: [String: JSONValue]
@@ -395,6 +410,7 @@ public struct ActionRequest: Codable, Sendable {
     public static func missionRevise(id: String, idempotencyKey: String, fence: Fence, parameters: MissionReviseParameters) throws -> Self { try .init(id: id, type: .missionRevise, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func missionStart(id: String, idempotencyKey: String, fence: Fence, parameters: MissionStartParameters) throws -> Self { try .init(id: id, type: .missionStart, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func pairingRevoke(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) throws -> Self { try .init(id: id, type: .pairingRevoke, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
+    public static func privateNotesWrite(id: String, idempotencyKey: String, fence: Fence, parameters: PrivateNotesWriteParameters) throws -> Self { try .init(id: id, type: .privateNotesWrite, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func reviewApprove(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) throws -> Self { try .init(id: id, type: .reviewApprove, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func reviewReject(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) throws -> Self { try .init(id: id, type: .reviewReject, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func reviewRequestChanges(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) throws -> Self { try .init(id: id, type: .reviewRequestChanges, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
