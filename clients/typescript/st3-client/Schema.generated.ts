@@ -561,6 +561,23 @@ export const AgentTodo = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentTodo = typeof AgentTodo.Type
 export type AgentTodoEncoded = typeof AgentTodo.Encoded
 
+/** A named edge from a seat or mission declaration to an ordinary resource subject in the graph. */
+export const DeclaredResource = /*#__PURE__*/ (() => Schema.Struct({
+  /** Whether the edge was authored with uri= or subject=. */
+  "kind": Schema.Literals(["uri","subject"]).annotate({ description: "Whether the edge was authored with uri= or subject=." }),
+  /** Unique within the declaration. */
+  "name": Schema.String.annotate({ description: "Unique within the declaration." }),
+  "reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  /** URI locator availability. Subject references use not-applicable; this is not a subject existence check. */
+  "resolution": Schema.Literals(["resolved","unresolved","not-applicable"]).annotate({ description: "URI locator availability. Subject references use not-applicable; this is not a subject existence check." }),
+  /** The ordinary resource subject targeted by this edge. URI references use resource/uri/SHA256 of the exact URI. */
+  "subject": Id,
+  /** The exact absolute URI, any scheme. Present only for resolved URI references. */
+  "uri": optionalKey(Schema.String).annotate({ description: "The exact absolute URI, any scheme. Present only for resolved URI references." })
+}).annotate({ identifier: "DeclaredResource", description: "A named edge from a seat or mission declaration to an ordinary resource subject in the graph." }))()
+export type DeclaredResource = typeof DeclaredResource.Type
+export type DeclaredResourceEncoded = typeof DeclaredResource.Encoded
+
 export const HostId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:host)/[^\\s]+$", "u"), "host").annotate({ identifier: "HostId" }))()
 export type HostId = typeof HostId.Type
 export type HostIdEncoded = typeof HostId.Encoded
@@ -672,6 +689,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "reachability": AgentReachability,
   /** Diagnostic harness reason, not a machine-readable verdict. */
   "reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Diagnostic harness reason, not a machine-readable verdict." }),
+  /** The resources the seat's current declaration names, in authored order. Read-only. An older daemon omits the field. */
+  "resources": optionalKey(Schema.Array(DeclaredResource)).annotate({ description: "The resources the seat's current declaration names, in authored order. Read-only. An older daemon omits the field." }),
   "revision": Revision,
   /** Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons. */
   "rollout": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE).annotate({ description: "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." }),
@@ -1348,6 +1367,8 @@ export const Mission = /*#__PURE__*/ (() => Schema.Struct({
   "mission_revision": Revision,
   "must_act": optionalKey(MustAct),
   "operational": optionalKey(Operational),
+  /** The resources the current published revision names, in authored order. Read-only. An older daemon omits the field. */
+  "resources": optionalKey(Schema.Array(DeclaredResource)).annotate({ description: "The resources the current published revision names, in authored order. Read-only. An older daemon omits the field." }),
   "revision": Revision,
   "run_counts": optionalKey(Schema.Record(Schema.String, Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))),
   "run_details": optionalKey(Schema.Array(MissionRunSummary)),
