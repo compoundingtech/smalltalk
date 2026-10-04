@@ -562,6 +562,33 @@
         "limits": { "type": "array", "items": { "$ref": "#/$defs/UsageLimit" } }
       }
     },
+    "ClientConnections": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "member", "items"],
+      "properties": {
+        "kind": { "const": "client-connections" },
+        "member": { "type": "string" },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/ClientConnection" } }
+      }
+    },
+    "ClientConnection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["actor", "person", "member", "via", "connected", "streams", "since", "last_seen", "follows"],
+      "properties": {
+        "actor": { "type": "string" },
+        "person": { "type": "string" },
+        "client": { "type": ["string", "null"] },
+        "device_id": { "type": "string" },
+        "device_name": { "type": "string" },
+        "member": { "type": "string" },
+        "via": { "enum": ["local", "gateway", "tailscale"] },
+        "connected": { "type": "boolean" },
+        "streams": { "type": "integer", "minimum": 0 },
+        "since": { "$ref": "#/$defs/Timestamp" },
+        "last_seen": { "$ref": "#/$defs/Timestamp" },
+        "follows": { "type": "array", "items": { "type": "string" } }
+      }
+    },
     "UsageLimit": {
       "type": "object", "additionalProperties": false,
       "required": ["account", "driver", "measured_at_unix_ms", "measured_by", "host", "seats"],

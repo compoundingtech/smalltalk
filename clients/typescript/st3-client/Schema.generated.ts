@@ -867,6 +867,31 @@ export const Capabilities = /*#__PURE__*/ (() => Schema.Struct({
 export type Capabilities = typeof Capabilities.Type
 export type CapabilitiesEncoded = typeof Capabilities.Encoded
 
+export const ClientConnection = /*#__PURE__*/ (() => Schema.Struct({
+  "actor": Schema.String,
+  "client": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "connected": Schema.Boolean,
+  "device_id": optionalKey(Schema.String),
+  "device_name": optionalKey(Schema.String),
+  "follows": Schema.Array(Schema.String),
+  "last_seen": Timestamp,
+  "member": Schema.String,
+  "person": Schema.String,
+  "since": Timestamp,
+  "streams": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "via": Schema.Literals(["local","gateway","tailscale"])
+}).annotate({ identifier: "ClientConnection" }))()
+export type ClientConnection = typeof ClientConnection.Type
+export type ClientConnectionEncoded = typeof ClientConnection.Encoded
+
+export const ClientConnections = /*#__PURE__*/ (() => Schema.Struct({
+  "items": Schema.Array(ClientConnection),
+  "kind": Schema.Literal("client-connections"),
+  "member": Schema.String
+}).annotate({ identifier: "ClientConnections" }))()
+export type ClientConnections = typeof ClientConnections.Type
+export type ClientConnectionsEncoded = typeof ClientConnections.Encoded
+
 export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","attention","agents","work","glasses"]).annotate({ identifier: "CollectionName" }))()
 export type CollectionName = typeof CollectionName.Type
 export type CollectionNameEncoded = typeof CollectionName.Encoded

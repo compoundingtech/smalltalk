@@ -3,7 +3,7 @@ import { API_VERSION } from './Models.generated';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    SubjectDefinition, UsagePeriod, CollectionName, CollectionFrame, HostRepositories,
+    SubjectDefinition, UsagePeriod, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated';
@@ -15,6 +15,9 @@ export type ClientOptions = {
     baseUrl: string;
     credential?: () => string | undefined | Promise<string | undefined>;
     fetchImpl?: typeof fetch;
+    /** The app's name and build, sent as `x-st3-client` ("smalltalk-ios 1.0 (42)"). st lists it as
+     * reported (clients.list); it is never identity or authority. */
+    client?: string;
 };
 
 export const TERMINAL_SUBPROTOCOL = 'st3.client.terminal.v0';
@@ -118,12 +121,14 @@ function bounded(value: number | undefined, maximum: number, name: string): void
 export class St3Client {
     private readonly baseUrl: string;
     private readonly credential?: ClientOptions['credential'];
+    private readonly client?: string;
     private readonly fetchImpl: typeof fetch;
     private discovered?: EnvelopeOf<Capabilities>;
 
     constructor(options: ClientOptions) {
         this.baseUrl = options.baseUrl.replace(/\/+$/, '');
         this.credential = options.credential;
+        this.client = options.client;
         this.fetchImpl = options.fetchImpl ?? fetch;
     }
 
@@ -142,6 +147,7 @@ export class St3Client {
         const headers: Record<string, string> = { Accept: 'application/json' };
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
         if (credential) headers.Authorization = `Bearer ${credential}`;
+        if (this.client) headers['x-st3-client'] = this.client;
         if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
         const response = await this.fetchImpl(this.baseUrl + path, {
             method, headers, body: body === undefined ? undefined : raw ? (body as BodyInit) : JSON.stringify(body),
@@ -240,6 +246,7 @@ export class St3Client {
         if (options.incarnation) url.searchParams.set('incarnation', options.incarnation);
         const headers: Record<string, string> = {};
         if (credential) headers.Authorization = `Bearer ${credential}`;
+        if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [TERMINAL_SUBPROTOCOL, `st3.cap.${options.streamCapability}`], headers);
         let ended = false;
         const stop = () => { ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
@@ -266,6 +273,7 @@ export class St3Client {
         if (options.after) url.searchParams.set('after', options.after);
         const headers: Record<string, string> = {};
         if (credential) headers.Authorization = `Bearer ${credential}`;
+        if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [CONVERSATION_SUBPROTOCOL], headers);
         let ended = false;
         const end = (error?: Error) => { if (ended) return; ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; options.onEnd?.(error); };
@@ -290,6 +298,7 @@ export class St3Client {
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         const headers: Record<string, string> = {};
         if (credential) headers.Authorization = `Bearer ${credential}`;
+        if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);
         let ended = false, open = false;
         const waiting: string[] = [];
@@ -329,6 +338,7 @@ export class St3Client {
     async documentGet(name: string): Promise<EnvelopeOf<DocumentContent>> { return this.get('/v1/client/documents/content' + query({ name })); }
     async subjectDefinition(subject: string, showEnvValues = false): Promise<EnvelopeOf<SubjectDefinition>> { return this.get('/v1/client/subject-definition' + query({ subject, show_env_values: showEnvValues })); }
     async usagePeriod(options: { since_ms?: number; until_ms?: number } = {}): Promise<EnvelopeOf<UsagePeriod>> { return this.get('/v1/client/usage' + query(options)); }
+    async clientsList(): Promise<EnvelopeOf<ClientConnections>> { return this.get('/v1/client/clients'); }
     async nowList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/now' + query(options)); }
     async machinesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/machines' + query(options)); }
     async devicesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/devices' + query(options)); }

@@ -211,6 +211,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn subject_definition(&self, subject: &str, show_env_values: bool) -> Result<Envelope<SubjectDefinition>, ClientError> {{ self.get(&format!(\"/v1/client/subject-definition?subject={{}}&show_env_values={{show_env_values}}\", percent_encode(subject))).await }}"
             )?;
+        } else if id == "clients.list" {
+            writeln!(
+                out,
+                "    pub async fn clients_list(&self) -> Result<Envelope<ClientConnections>, ClientError> {{ self.get(\"/v1/client/clients\").await }}"
+            )?;
         } else if id == "usage.period" {
             writeln!(
                 out,
@@ -325,6 +330,11 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func conversationSearch(text: String, agent: String? = nil, since: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ConversationSearch> {{ var query: [URLQueryItem] = [.init(name: \"text\", value: text)]; for (name, value) in [(\"agent\", agent), (\"since\", since), (\"cursor\", cursor)] {{ if let value {{ query.append(.init(name: name, value: value)) }} }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/conversations/search\", query: query) }}"
+            )?;
+        } else if id == "clients.list" {
+            writeln!(
+                out,
+                "    public func clientsList() async throws -> Envelope<ClientConnections> {{ try await get(\"v1/client/clients\") }}"
             )?;
         } else if id == "usage.period" {
             writeln!(
@@ -568,6 +578,8 @@ fn validate_surfaces(
         "SubjectDefinition",
         "UsagePeriod",
         "UsageRow",
+        "ClientConnections",
+        "ClientConnection",
         "UsageLimit",
         "LaunchPreview",
         "MissionRunSummary",
@@ -1090,6 +1102,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
+            )?;
+        } else if id == "clients.list" {
+            writeln!(
+                out,
+                "    async {method}(): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}'); }}"
             )?;
         } else if id == "usage.period" {
             writeln!(

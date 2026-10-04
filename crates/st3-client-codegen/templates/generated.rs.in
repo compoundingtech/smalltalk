@@ -326,6 +326,40 @@ pub struct DocumentContent {
     pub bytes: Vec<u8>,
 }
 
+/// The clients connected to one member now and those seen in the last few minutes, newest first.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ClientConnections {
+    pub kind: String,
+    pub member: String,
+    pub items: Vec<ClientConnection>,
+}
+/// One client, person or agent, and way in: what it says it is, as it said it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ClientConnection {
+    /// The session acting: `person/NAME`, `person/NAME/session/ID` for a paired device, or an agent.
+    pub actor: String,
+    /// The person or agent whose authority the session uses.
+    pub person: String,
+    /// The client's own `x-st3-client` name and build; absent when it sent none.
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    pub member: String,
+    /// `local`, `gateway` (a paired device over Tailscale or Fabric) or `tailscale`.
+    pub via: String,
+    /// An open stream right now.
+    pub connected: bool,
+    pub streams: u64,
+    pub since: String,
+    pub last_seen: String,
+    /// Windows, `conversation:ID` and `terminal:ID` it follows.
+    #[serde(default)]
+    pub follows: Vec<String>,
+}
+
 /// Token spend over a period, one row per agent, mission run, step, model, account and host.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsagePeriod {

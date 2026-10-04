@@ -87,9 +87,10 @@ pub(super) async fn collection_stream(
             "the collection WebSocket requires exactly st3.client.collections.v0",
         ));
     }
+    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
     Ok(websocket
         .protocols([COLLECTION_SUBPROTOCOL])
-        .on_upgrade(move |socket| collection_stream_socket(socket, state, session)))
+        .on_upgrade(move |socket| collection_stream_socket(socket, state, session, presence)))
 }
 
 /// Read one bounded window. The whole read sees one SQLite snapshot, and the fence names
@@ -558,11 +559,17 @@ impl Drop for ConversationFollowers {
     }
 }
 
-async fn collection_stream_socket(socket: WebSocket, state: AppState, session: ClientSession) {
+async fn collection_stream_socket(
+    socket: WebSocket,
+    state: AppState,
+    session: ClientSession,
+    presence: super::client_presence::StreamGuard,
+) {
     collection_stream_socket_with_reader(
         socket,
         state,
         session,
+        Some(presence),
         |state, session, request| async move { collection_items(&state, &session, &request).await },
     )
     .await;
@@ -572,6 +579,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     mut socket: WebSocket,
     state: AppState,
     session: ClientSession,
+    presence: Option<super::client_presence::StreamGuard>,
     read: F,
 ) where
     F: Fn(AppState, ClientSession, CollectionSubscribe) -> Fut + Clone + Send + 'static,
@@ -616,6 +624,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             break 'command;
                         };
                         if request.kind == "unsubscribe" {
+                            if let Some(presence) = &presence { presence.unfollow(&request.id); }
                             subscriptions.remove(&request.id);
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
@@ -625,6 +634,14 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() + conversations.0.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
                             if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
                             break 'command;
+                        }
+                        // What this client follows, for clients.list.
+                        if let Some(presence) = &presence {
+                            presence.follow(&request.id, match request.collection.as_str() {
+                                "conversation" => format!("conversation:{}", request.conversation.as_deref().unwrap_or_default()),
+                                "terminal" => format!("terminal:{}", request.terminal.as_deref().unwrap_or_default()),
+                                other => other.to_owned(),
+                            });
                         }
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
@@ -1087,6 +1104,16 @@ pub(super) struct ClientSession {
 }
 
 impl ClientSession {
+    #[cfg(test)]
+    pub(super) fn for_tests(actor: &str, authority_actor: &str, transport: &'static str) -> Self {
+        Self {
+            actor: actor.into(),
+            authority_actor: authority_actor.into(),
+            transport,
+            scopes: std::collections::BTreeSet::new(),
+        }
+    }
+
     fn local(person: Option<&str>) -> Result<Self, ApiError> {
         if person.is_some_and(|person| {
             !(person.starts_with("person/") && person.matches('/').count() == 1
@@ -3217,6 +3244,43 @@ fn device_resources(
     Ok(resources)
 }
 
+/// The clients connected to this member now and those seen in the last few minutes, newest
+/// first, with the paired device each person's session belongs to. Visibility only.
+pub(super) async fn clients_list(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let mut items = super::client_presence::list(&state.node, super::client_now_ms());
+    // A paired phone acts as person/NAME/session/ID: name its device.
+    let people = items
+        .iter()
+        .filter(|item| item["actor"].as_str().is_some_and(|actor| actor.contains("/session/")))
+        .filter_map(|item| item["person"].as_str().map(str::to_owned))
+        .filter(|person| person.starts_with("person/"))
+        .collect::<BTreeSet<_>>();
+    let mut devices = BTreeMap::<String, (Value, Value)>::new();
+    for person in people {
+        for device in device_resources(&state, &snapshot, &person)? {
+            if let Some(actor) = device["session_actor"].as_str() {
+                devices.insert(actor.to_owned(), (device["id"].clone(), device["name"].clone()));
+            }
+        }
+    }
+    for item in &mut items {
+        if let Some((id, name)) = item["actor"].as_str().and_then(|actor| devices.get(actor)) {
+            item["device_id"] = id.clone();
+            item["device_name"] = name.clone();
+        }
+    }
+    Ok(Json(json!({
+        "kind": "client-connections",
+        "member": super::client_host_id(&state.node),
+        "items": items,
+    })))
+}
+
 pub(super) async fn devices(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -4864,10 +4928,13 @@ pub(super) async fn conversation_stream(
     } else {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
     }
+    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    presence.follow("conversation", format!("conversation:{id}"));
     Ok(websocket
         .protocols([CONVERSATION_SUBPROTOCOL])
-        .on_upgrade(move |socket| {
-            conversation_stream_socket(socket, state, session, session_id, query.after, remote)
+        .on_upgrade(move |socket| async move {
+            let _presence = presence;
+            conversation_stream_socket(socket, state, session, session_id, query.after, remote).await
         }))
 }
 
@@ -5888,9 +5955,14 @@ pub(super) async fn terminal_stream(
         query.incarnation.as_deref(),
         stream_capability,
     )?;
+    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    presence.follow("terminal", format!("terminal:{id}"));
     Ok(websocket
         .protocols([TERMINAL_SUBPROTOCOL])
-        .on_upgrade(move |socket| follow.run(state, TerminalSink::Socket(Box::new(socket)))))
+        .on_upgrade(move |socket| async move {
+            let _presence = presence;
+            follow.run(state, TerminalSink::Socket(Box::new(socket))).await
+        }))
 }
 
 /// A terminal viewer, checked and holding its consumed attachment, ready to follow.
@@ -8882,6 +8954,7 @@ mod tests {
                             socket,
                             state,
                             ClientSession::local(None).unwrap(),
+                            None,
                             move |state, session, request| {
                                 let reads = reads.clone();
                                 async move {
