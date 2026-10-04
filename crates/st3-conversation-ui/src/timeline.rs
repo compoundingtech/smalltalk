@@ -1,4 +1,4 @@
-use st3_client::TimelineEntry;
+use st3_client::{TimelineBody, TimelineEntry};
 
 /// Metadata and entries from a native conversation frame, preserved at the UI boundary.
 #[derive(Clone, Debug, Default)]
@@ -51,10 +51,13 @@ impl Timeline {
         if frame.replace {
             // A new window keeps the pages read before it, unless it no longer meets them:
             // entries could be missing between the two, and a gap must never look whole.
-            let meets = frame
-                .items
-                .iter()
-                .any(|item| self.items.iter().any(|held| held.id == item.id));
+            // Session-stable availability notices cannot establish history continuity.
+            let meets = frame.items.iter().any(|item| {
+                !matches!(&item.body, TimelineBody::Error(error)
+                    if matches!(error.code.as_str(),
+                        "timeline-query-limited" | "timeline-history-incomplete"))
+                    && self.items.iter().any(|held| held.id == item.id)
+            });
             let oldest = frame
                 .items
                 .first()
