@@ -510,7 +510,7 @@ impl Store {
     ) -> Result<Self> {
         // Opening cannot seal recent work: the caller has not loaded its signing keys yet.
         // Resume at the first batch still needing an envelope, so a restart seals it with
-        // the same person/agent keys instead of permanently losing its delegation signatures.
+        // the same person and agent keys instead of permanently losing its delegation signatures.
         let seeded_batch_rowid = connection.query_row(
             "SELECT COALESCE(
                 (SELECT MIN(batches.rowid)-1 FROM batches WHERE NOT EXISTS (
@@ -1270,7 +1270,7 @@ impl Store {
         if let Some(key) = &key {
             self.set_node_key(key.clone())?;
         }
-        // Load the node signer before sealing recent standalone work. Its person/agent keys
+        // Load the node signer before sealing recent standalone work. Its person and agent keys
         // must likewise have been restored by the caller before this step.
         self.replication_snapshot()?;
         *self
