@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 
 sys.dont_write_bytecode = True
 root = Path(__file__).resolve().parent.parent
@@ -24,20 +25,95 @@ assert module.trusted(run)
 for field, value in [('head_branch', 'example-branch'), ('conclusion', 'failure'),
                      ('event', 'pull_request'), ('path', '.github/workflows/fleet.yml')]:
     assert not module.trusted(dict(run, **{field: value}))
+assert module.trusted_snapshot(dict(run, conclusion='failure'))
+assert not module.trusted_snapshot(dict(run, conclusion='cancelled'))
 assert module.valid_report(report)
 for field, value in [('scale', 0.1), ('claims', 0), ('seconds', 5), ('long_poll_seats', 1),
                      ('paths', {}), ('paths', []), ('daemon_cores', float('nan')),
                      ('daemon_cores', True), ('seconds', None)]:
     assert not module.valid_report(dict(report, **{field: value}))
 assert not module.valid_report([]) and not module.valid_report(None)
+
+with tempfile.TemporaryDirectory() as tmp:
+    temp = Path(tmp)
+    os.environ.update(RUNNER_TEMP=str(temp), GITHUB_OUTPUT=str(temp / 'output'))
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert module.check_report() == 1
+    (temp / 'perf').mkdir()
+    (temp / 'perf/load.json').write_text(json.dumps(dict(report, seconds=5)))
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert module.check_report() == 1
+    assert not (temp / 'output').exists()
+    # Latency failure preserves caches, but never turns the failed report into a baseline.
+    (temp / 'perf/load.json').write_text(json.dumps(dict(report, failed={'mail': True})))
+    assert module.check_report() == 0
+    assert (temp / 'output').read_text() == 'publish=true\n'
+
+with tempfile.TemporaryDirectory() as tmp:
+    temp = Path(tmp)
+    work = temp / 'work'
+    (work / 'src').mkdir(parents=True)
+    source = work / 'src/main.rs'
+    source.write_text('fn main() {}\n')
+    (work / '.gitignore').write_text('target/\n')
+    def git_command(*args):
+        module.subprocess.run(['git', '-C', str(work), *args], check=True,
+                              stdout=module.subprocess.DEVNULL, stderr=module.subprocess.DEVNULL)
+    git_command('init', '-b', 'main')
+    git_command('add', '.')
+    git_command('-c', 'user.name=Example Builder', '-c', 'user.email=builder@example.invalid',
+                '-c', 'commit.gpgSign=false', 'commit', '-m', 'initial fixture')
+    os.environ.update(GITHUB_WORKSPACE=str(work), RUNNER_TEMP=str(temp))
+    (temp / 'st-ci-cache').mkdir()
+    module.remember_sources()
+    checkpoint = temp / 'st-ci-cache/perf-source-state.json'
+    checkpoint.write_bytes((temp / 'perf-source-state.json').read_bytes())
+    before = source.stat().st_mtime_ns
+    source.touch()
+    (work / '.git/index').touch()
+    index_after = (work / '.git/index').stat().st_mtime_ns
+    module.restore_sources()
+    assert source.stat().st_mtime_ns == before
+    assert (work / '.git/index').stat().st_mtime_ns == index_after, 'never rewrite Git metadata'
+    # A dirty tree or another real revision must never borrow old compilation timestamps.
+    source.write_text('fn main() { println!("changed"); }\n')
+    dirty_mtime = source.stat().st_mtime_ns
+    module.restore_sources()
+    assert source.stat().st_mtime_ns == dirty_mtime
+    git_command('add', '.')
+    git_command('-c', 'user.name=Example Builder', '-c', 'user.email=builder@example.invalid',
+                '-c', 'commit.gpgSign=false', 'commit', '-m', 'changed fixture')
+    module.restore_sources()
+    assert source.stat().st_mtime_ns == dirty_mtime
+    module.remember_sources()
+    state = json.loads((temp / 'perf-source-state.json').read_text())
+    state['mtimes']['../outside'] = 1
+    checkpoint.write_text(json.dumps(state))
+    try:
+        module.restore_sources()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('timestamp checkpoint may only address the checkout inputs')
+    for name in ('cargo-home/registry', 'cargo-home/git', 'perf-sccache', 'st-bench'):
+        (temp / name).mkdir(parents=True)
+    (work / 'target').mkdir()
+    module.remember_sources()
+    module.pack()
+    assert json.loads(checkpoint.read_text())['head'] == module.git(work, 'rev-parse', 'HEAD')
+    (work / 'untracked-source').write_text('changed during the test')
+    module.pack()
+    assert not checkpoint.exists(), 'a dirty build must not retain an older clean checkpoint'
+
 pr_run = dict(run, id=10, event='pull_request', head_branch='example-branch',
               head_repository=dict(full_name='example/project'), head_sha='b' * 40,
               pull_requests=[])
 commits = {'b' * 40}
+assert module.own_pr(dict(pr_run, conclusion='failure'), 1, 'example/project', 'example-branch', commits)
 assert module.own_pr(pr_run, 1, 'example/project', 'example-branch', commits)
 for field, value in [('head_branch', 'other-branch'), ('head_sha', 'c' * 40),
                      ('head_repository', dict(full_name='example/fork')),
-                     ('head_repository', None), ('conclusion', 'failure'),
+                     ('head_repository', None), ('conclusion', 'cancelled'),
                      ('pull_requests', [dict(number=2)])]:
     assert not module.own_pr(dict(pr_run, **{field: value}), 1, 'example/project', 'example-branch', commits)
 
@@ -58,6 +134,8 @@ with tempfile.TemporaryDirectory() as tmp:
         (directory / 'sample').write_text(name)
     (work / 'target').mkdir()
     (work / 'target/sample').write_text('build output')
+    precise_mtime = 1720000000123456789
+    os.utime(work / 'target/sample', ns=(precise_mtime, precise_mtime))
     module.pack()
     extracted = temp / 'extracted'
     extracted.mkdir()
@@ -65,12 +143,16 @@ with tempfile.TemporaryDirectory() as tmp:
                   ('target', 'cargo-home', 'perf-sccache', 'st-ci-cache'))
     module.unpack(temp / 'perf-snapshots/stores.tar.zst', extracted, ('st-bench',))
     assert (extracted / 'target/sample').read_text() == 'build output'
+    assert (extracted / 'target/sample').stat().st_mtime_ns == precise_mtime
     assert (extracted / 'st-bench/sample').read_text() == 'st-bench'
     # API ordering includes untrusted entries: none may supply caches or a baseline.
     runs = [dict(run, id=9, event='pull_request')] + [dict(run, id=i) for i in range(8, 0, -1)]
     downloads = []
     candidates = []
     previous = pr_run
+    missing_previous_artifacts = False
+    overlap_probe = True
+    archive_downloads = threading.Barrier(2)
 
     def api(path):
         if '/pulls/1/commits?' in path:
@@ -82,14 +164,19 @@ with tempfile.TemporaryDirectory() as tmp:
         if '/workflows/' in path:
             return dict(workflow_runs=runs)
         assert '/runs/9/' not in path
+        if missing_previous_artifacts and '/runs/10/' in path:
+            return dict(artifacts=[])
         return dict(artifacts=[dict(name=name, expired=False) for name in
                               ('build-recipe', 'stores-recipe', 'perf-load-logs')])
 
     def download(repo, selected, name, dest):
         assert repo == 'example/project'
-        assert module.trusted(selected) or module.own_pr(selected, 1, repo, 'example-branch', commits)
+        assert module.trusted_snapshot(selected) or module.own_pr(selected, 1, repo, 'example-branch', commits)
         if name == 'perf-load-logs':
             assert module.trusted(selected), 'PR reports must never become baselines'
+        elif overlap_probe:
+            # Both archives must be in flight before either can finish downloading.
+            archive_downloads.wait(timeout=5)
         downloads.append((selected['id'], name))
         dest.mkdir(parents=True)
         if name == 'perf-load-logs':
@@ -104,6 +191,7 @@ with tempfile.TemporaryDirectory() as tmp:
     module.unpack = unpack
     with contextlib.redirect_stdout(io.StringIO()):
         module.restore()
+    overlap_probe = False
     assert len(downloads) == 7  # two snapshots, five newest real reports
     assert sorted(p.name for p in (temp / 'perf-baseline').iterdir()) == [f'load-{i}.json' for i in range(4, 9)]
     assert (work / 'target/cached').read_text() == 'snapshot'
@@ -113,8 +201,33 @@ with tempfile.TemporaryDirectory() as tmp:
     downloads.clear()
     with contextlib.redirect_stdout(io.StringIO()):
         module.restore()
-    assert downloads[:2] == [(10, 'build-recipe'), (10, 'stores-recipe')]
+    assert set(downloads[:2]) == {(10, 'build-recipe'), (10, 'stores-recipe')}
     assert downloads[2:] == [(i, 'perf-load-logs') for i in range(8, 3, -1)]
+    previous = dict(pr_run, conclusion='failure')
+    downloads.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.restore()
+    assert set(downloads[:2]) == {(10, 'build-recipe'), (10, 'stores-recipe')}
+    assert downloads[2:] == [(i, 'perf-load-logs') for i in range(8, 3, -1)]
+    previous = pr_run
+    # GitHub can expose the successful attempt while hiding all of its artifacts on rerun.
+    # That must restore main's snapshots and actual main reports, rather than become cold.
+    missing_previous_artifacts = True
+    downloads.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.restore()
+    assert set(downloads[:2]) == {(8, 'build-recipe'), (8, 'stores-recipe')}
+    assert downloads[2:] == [(i, 'perf-load-logs') for i in range(8, 3, -1)]
+    missing_previous_artifacts = False
+    runs.insert(0, dict(run, id=11, conclusion='failure'))
+    missing_previous_artifacts = True
+    downloads.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.restore()
+    assert set(downloads[:2]) == {(11, 'build-recipe'), (11, 'stores-recipe')}
+    assert downloads[2:] == [(i, 'perf-load-logs') for i in range(8, 3, -1)]
+    runs.pop(0)
+    missing_previous_artifacts = False
     # Main must not promote PR snapshots, even when a same-PR cache exists.
     os.environ['GITHUB_EVENT_NAME'] = 'push'
     candidates.append(pr_run)

@@ -354,14 +354,32 @@ unchanged.
 
 Performance uses the small `.#perf` Nix shell and the opt-in `perf_load` test target (feature
 `perf-load`), which imports the same `daemon_load` and `daemon_bench` modules without compiling
-all integration fixtures. Successful main runs retain seven-day build snapshots containing
+all integration fixtures. Completed main and PR runs retain seven-day build snapshots containing
 Cargo outputs, registry/git sources, a local sccache, and a signed Nix binary cache including the
 small shell closure. The build recipe includes the lockfiles, shell, manifests and Cargo config.
-Generated-store snapshots have a separate exact generator/schema key. PRs prefer their own
-successful snapshots, then fall back to trusted main artifacts. A PR snapshot must match the head
+Generated-store snapshots have a separate exact generator/schema key. Publication requires a
+complete real workload report, proving compilation and store generation finished; a missed latency
+budget still retains these valid caches. Cancelled and incomplete runs do not publish. Failed
+reports never become main baselines. PRs prefer their own published snapshots, then fall back to
+trusted main artifacts. A PR snapshot must match the head
 repository and branch and a commit in the current PR; it cannot supply main's caches or anyone's
-baseline. A rerun verifies the previous successful attempt explicitly, since the current run is
-in progress. Cargo and sccache validate source changes, preserving each build's real source identity.
+baseline. A rerun checks the previous completed attempt explicitly, since the current run is
+in progress, but GitHub may no longer expose that attempt's artifacts. If they are unavailable,
+restore another published snapshot of the same PR or main's snapshots. Main snapshots are the durable
+fallback; retrying the only PR seed before main has published can still be cold.
+Prefer `gh run rerun RUN_ID --job JOB_ID` for retrying only Performance (use the API job ID).
+The measured targeted retry retained its preceding artifacts; the full workflow retry did not.
+Cargo and sccache validate source changes, preserving each build's real source identity.
+Build and store archives download and extract concurrently; the log records each one's timing.
+Snapshots also retain the input timestamps from before compilation. Restore those timestamps
+only for the exact saved Git SHA with a clean checkout, so a retry does not rebuild and relink
+unchanged sources merely because checkout refreshed their timestamps. Changed or dirty sources
+still take Cargo's normal validation path; the embedded source revision remains real.
+For a clean checkout Performance passes its actual full SHA as `AGENT_SPEC_REVISION`.
+The source-identity and shared CLI-version build scripts track that explicit value instead
+of unrelated Git index/ref timestamps. The CLI stamp still derives its real revision and
+commit time from Git.
+Dirty checkouts continue to derive their identity from Git.
 PR snapshots also remain for seven days, outside the shared dependency-cache pool.
 The compiler-cache server stays alive during cold store generation; publication does not require
 stopping it after the workload has finished writing compiler outputs.

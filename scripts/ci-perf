@@ -54,6 +54,15 @@ case "$stage" in
     ;;
   load)
     rm -f "$out/load.json"
+    # Record the inputs before Cargo runs. Only an exact clean source SHA may restore
+    # these timestamps, avoiding needless rebuilds after a fresh checkout on retries.
+    python3 scripts/ci-perf-cache remember-sources
+    unset AGENT_SPEC_REVISION
+    if [ -s "$RUNNER_TEMP/perf-source-state.json" ]; then
+      # The checkpoint exists only for a clean checkout. Use its actual full source SHA,
+      # so index/refs timestamps do not invalidate an unchanged build on retries.
+      export AGENT_SPEC_REVISION="$(git rev-parse HEAD)"
+    fi
     # Main's last reports, newest first; the test compares with the worst of them.
     ST_LOAD_GATE=1 ST_LOAD_REPORT="$out/load.json" ST_LOAD_BASELINE="$RUNNER_TEMP/perf-baseline" \
       cargo test --release -p st3 --features perf-load --test perf_load --locked daemon_load:: -- --nocapture \
