@@ -10,11 +10,11 @@ checks for that PR; macOS checks on PRs require the `macos-ci` label.
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
 execution. The required checks on `main` are `linux-gate`, `isolation-vm`, `genie-freshness` and
-`typescript-client` (apply the fourth check only after its first successful main run),
+`typescript-client`,
 and `main` lands through GitHub's merge queue (see [Merge queue](#merge-queue)).
 
-Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM and the
-freshness check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
+Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM, the
+freshness check and the TypeScript client check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
 the required checks for each queued entry.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
 head: it tests that head merged with the current base. Strict branch protection also requires
@@ -169,17 +169,20 @@ records the KVM probe and each phase's elapsed time.
 ### TypeScript client
 
 `typescript-client` runs on every PR, merge-group entry and main push. It installs Node 24.18.0
-(the workspace uses Node 24), TypeScript 6.0.3 from the iOS lockfile and the client's pinned
-`effect@4.0.0-rc.118` development dependency. Both `node_modules` directories are cached together,
-keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
+(the workspace uses Node 24), the client's pinned TypeScript 6.0.3 and
+`effect@4.0.0-rc.118` development dependencies from its own lockfile. Both `node_modules`
+directories are cached together, keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
 The lockfile fingerprint uses `sha256sum` in Bash so ci1's Nix runner needs no Node 20
 `hashFiles` helper when it evaluates the cache key.
 
-`bash scripts/ci-typescript-client` runs the client's contract and schema tests with `node --test`,
-the README's strict raw-client and rich-schema typechecks, and `tsc --noEmit -p apps/ios`.
+The client package's `npm test` runs the contract and schema tests with `node --test`;
+`npm run typecheck` runs its strict compiler checks. CI installs and checks the client before
+installing the iOS dependencies for the separate project typecheck.
+`bash scripts/ci-typescript-client` runs the client commands and `tsc --noEmit -p apps/ios` locally
+when both packages' dependencies are installed.
 The iOS project allows explicit TypeScript import extensions for generated-client consumers.
-The job starts non-required. The generated repository settings stage its promotion; an administrator
-must apply that fourth check to the live main ruleset only after a successful main run.
+The main ruleset requires `typescript-client`. It was enabled after the new job passed on main
+in [#1256](https://github.com/compoundingtech/smalltalk/pull/1256).
 
 ### macOS
 
