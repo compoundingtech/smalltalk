@@ -459,6 +459,8 @@ impl Store {
     }
 
     /// Open a new store in shared memory, as tests and short-lived tools use.
+    /// Shared-cache read/write contention returns `SQLITE_LOCKED` immediately;
+    /// concurrent server tests should use the file-backed [`Self::open`] instead.
     pub fn open_memory(origin: impl Into<String>, runtime: Arc<dyn Runtime>) -> Result<Self> {
         let origin = origin.into();
         let uri = PathBuf::from(format!(

@@ -2289,6 +2289,9 @@ impl Store {
         Ok(Self { graph, smalltalk })
     }
 
+    /// Open a shared-memory store for sequential fixtures and short-lived tools.
+    /// Concurrent server tests should use [`Self::open`]: shared-cache read/write
+    /// contention returns `SQLITE_LOCKED` immediately instead of waiting.
     pub fn open_memory(origin: impl Into<String>) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::default());
         #[cfg_attr(not(test), allow(unused_mut))]
