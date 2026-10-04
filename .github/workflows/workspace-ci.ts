@@ -103,11 +103,11 @@ export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG
 export const cargoCacheStep = {
   name: 'Restore the Cargo target and registry',
   id: 'cargo-cache',
-  if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+  if: "env.CI_LOCAL_CACHES != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ github.workspace }}/target\n${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git',
-    key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
+    key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}",
     'restore-keys': 'cargo-${{ github.job }}-${{ runner.os }}-',
   },
 } as const
@@ -115,11 +115,11 @@ export const cargoCacheStep = {
 export const nixCacheStep = {
   name: 'Restore the local Nix cache',
   id: 'nix-cache',
-  if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+  if: "env.CI_LOCAL_CACHES != '1'",
   uses: 'actions/cache@v4',
   with: {
     path: '${{ runner.temp }}/st-ci-cache',
-    key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
+    key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
     'restore-keys': 'nix4-${{ github.job }}-${{ runner.os }}-',
   },
 } as const
@@ -155,7 +155,7 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
   },
   {
     name: 'Use the cached Nix outputs',
-    if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+    if: "env.CI_LOCAL_CACHES != '1'",
     run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"',
   },
 ]

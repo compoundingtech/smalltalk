@@ -1,7 +1,8 @@
+import { auditCaches } from './cache-audit.ts'
 import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
 // Preserve release triggers, source verification and publishing permissions.
-export default githubWorkflow({
+export default githubWorkflow(auditCaches({
   actionlint: defaultActionlintConfig,
   "name": "Publish portable st2 source",
   "on": {
@@ -43,6 +44,11 @@ export default githubWorkflow({
           "uses": "dtolnay/rust-toolchain@stable"
         },
         {
+          name: 'Restore portable Cargo dependencies',
+          uses: 'Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6',
+          with: { key: 'portable-linux-x86-64', 'cache-on-failure': true },
+        },
+        {
           "name": "Verify accepted immutable source",
           "run": "set -euo pipefail\ntest -n \"$SOURCE_SHA\"\ntest \"$(git rev-parse HEAD)\" = \"$SOURCE_SHA\"\ngit merge-base --is-ancestor \"$SOURCE_SHA\" origin/main\ntest -z \"$(git status --porcelain)\"\nSHORT_SHA=\"$(git rev-parse --short=7 HEAD)\"\necho \"SHORT_SHA=$SHORT_SHA\" >> \"$GITHUB_ENV\"\n"
         },
@@ -71,4 +77,4 @@ export default githubWorkflow({
       ]
     }
   }
-})
+}, {}))

@@ -1,9 +1,10 @@
+import { auditCaches } from './cache-audit.ts'
 import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
 // Preserve release triggers, source verification and publishing permissions. Every commit on main
 // also builds and verifies both archives and keeps them as short-lived artifacts, so release
 // breakage fails on main instead of at tag time (the daily release publishes those artifacts).
-export default githubWorkflow({
+export default githubWorkflow(auditCaches({
   actionlint: defaultActionlintConfig,
   "name": "Smalltalk tag release",
   "on": {
@@ -113,9 +114,19 @@ export default githubWorkflow({
           }
         },
         {
+          name: 'Restore the stable Zig object cache',
+          uses: 'actions/cache@v4',
+          with: {
+            path: '~/.cache/zig\n~/Library/Caches/zig\n.zig-cache',
+            key: "zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
+            'restore-keys': 'zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-',
+          },
+        },
+        {
           "uses": "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
           "with": {
-            "version": "0.15.2"
+            "version": "0.15.2",
+            "use-cache": false
           }
         },
         {
@@ -212,4 +223,4 @@ export default githubWorkflow({
       ]
     }
   }
-})
+}, {"installer": "Runs isolated installer fixtures without downloads or compilation.", "assemble": "Downloads verified build artifacts; builds nothing.", "publish": "Publishes verified assembled artifacts; builds nothing."}))

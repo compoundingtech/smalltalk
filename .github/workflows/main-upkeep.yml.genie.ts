@@ -1,3 +1,4 @@
+import { auditCaches } from './cache-audit.ts'
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep } from '../../repos/effect-utils/genie/external.ts'
 import {
   buildEnv,
@@ -50,7 +51,7 @@ fi`,
   ],
 })
 
-export default githubWorkflow({
+export default githubWorkflow(auditCaches({
   name: 'Main upkeep',
   on: { push: { branches: ['main'] }, workflow_dispatch: {} },
   permissions: { contents: 'read' },
@@ -69,6 +70,17 @@ export default githubWorkflow({
       steps: [
         { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
         { name: 'Confirm main retains the queue checks', env: { GH_TOKEN: '${{ github.token }}' }, run: 'python3 scripts/check-main-ci' },
+      ],
+    },
+    'cache-maintenance': {
+      name: 'cache-maintenance',
+      needs: ['main-checks'],
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 5,
+      permissions: { contents: 'read', actions: 'write', 'pull-requests': 'read' },
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+        { name: 'Prune closed-PR and redundant Zig caches', env: { GH_TOKEN: '${{ github.token }}' }, run: 'python3 scripts/ci-cache-prune' },
       ],
     },
     // Keep these IDs: commonSetupSteps keys the existing caches with github.job.
@@ -108,4 +120,4 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       before: [perfStoresCache('cost')],
     }),
   },
-})
+}, {"main-checks": "Verifies exact queue checks through the API and builds nothing.", "cache-maintenance": "Cache maintenance uses live API data and builds nothing."}))

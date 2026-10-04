@@ -47,6 +47,12 @@ jobs:
           scripts/install-release-test
           python3 scripts/install-macos-test
 
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_REASON: Runs isolated installer fixtures without downloads or compilation.
+        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
   build:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.deleted == false) || github.event_name == 'pull_request' }}
     name: "release-build (${{ matrix.target }})"
@@ -72,9 +78,21 @@ jobs:
         with:
           key: "release-${{ matrix.target }}"
           cache-on-failure: true
+        id: cache-2
+      - name: Restore the stable Zig object cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            ~/Library/Caches/zig
+            .zig-cache
+          key: "zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
+          restore-keys: "zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-0.15.2-"
+        id: cache-3
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
         with:
           version: 0.15.2
+          use-cache: false
       - name: Test installer
         run: |
           scripts/install-release-test
@@ -89,6 +107,12 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_ENTRIES: '[{"name":"Cargo release","outcome":"${{ steps.cache-2.outcome }}","hit":"${{ steps.cache-2.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false},{"name":"Restore the stable Zig object cache","outcome":"${{ steps.cache-3.outcome }}","hit":"${{ steps.cache-3.outputs.cache-hit }}","matched":"","opaqueFallback":true,"lookup":false}]'
+        run: python3 scripts/ci-cache-audit
   assemble:
     name: release-assemble
     needs: [build, installer]
@@ -120,6 +144,12 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_REASON: Downloads verified build artifacts; builds nothing.
+        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
   publish:
     name: release-publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.event.deleted == false
@@ -153,3 +183,10 @@ jobs:
           gh release create "$TAG" --verify-tag --draft --title "Smalltalk $TAG" \
             --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json
           gh release edit "$TAG" --draft=false
+
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_REASON: Publishes verified assembled artifacts; builds nothing.
+        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""

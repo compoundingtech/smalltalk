@@ -402,6 +402,33 @@ cargo test -p st3 --test integration daemon_cost:: -- --nocapture --test-threads
 ST_LOAD_GATE=1 nix develop .#perf -c cargo test --release -p st3 --features perf-load --test perf_load daemon_load:: -- --nocapture
 ```
 
+### Cache coverage across workflows
+
+Every job declares its cache coverage. Jobs that select runners, collect checks, run
+standard-library guards or consume verified release artifacts have no build cache and say
+why. The other jobs report exact hits, lookup-only hits, fallback restores, misses and
+failed lookups separately. A missing exact key or failed restore emits a P0 warning in
+both the log and the job summary; a skipped archive on ci1 is identified as a persistent
+runner store, rather than called an archive hit.
+
+Cargo keys include the lockfiles, workspace manifests and linker configuration. Nix keys
+include the flake, Nix expressions and compatibility pins. Both cover macOS as well as
+Linux, with isolated Cargo and Nix-cache directories. Genie freshness and isolation have
+job-specific caches; portable builds use the same pinned Rust cache action as native
+releases. Native releases retain Zig objects under a dependency key rather than making
+another cache entry for every run.
+
+Main upkeep removes cache entries belonging to closed PRs and redundant old Zig snapshots.
+It retains open PR entries, current main recipes and one legacy Zig snapshot per platform
+while the new cache is seeded. This maintains the shared cache quota without removing
+active work. Native Nix verification probes real output paths before building and still
+proves its repeat with downloads and builds disabled. Performance retains its separate
+durable snapshots and successful-main-only baselines.
+
+The macOS workflow was manually disabled when this audit ran. Its cache configuration is
+maintained without changing that repository setting. Portable publishing permissions and
+accepted-source verification remain in place.
+
 ## Generated files and existing workflows
 
 All workflow YAML and `.github/repo-settings.json` are generated from neighboring `.genie.ts`

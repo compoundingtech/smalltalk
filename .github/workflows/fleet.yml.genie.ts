@@ -1,9 +1,8 @@
+import { auditCaches } from './cache-audit.ts'
 import {
   defaultActionlintConfig,
   githubWorkflow,
   nixDevelopStep,
-  plainFlakeJob,
-  plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
 import {
   afterPickRunner,
@@ -17,7 +16,6 @@ import {
   perfStoresCache,
   pickRunnerJob,
   pickRunnerJobId,
-  readOnlyBinaryCaches,
   workspacePreparationSteps,
 } from './workspace-ci.ts'
 
@@ -88,7 +86,7 @@ const linuxStageJob = ({
 })
 
 // Required gate. Label events belong to macos.yml so they never restart or cancel this workflow.
-export default githubWorkflow({
+export default githubWorkflow(auditCaches({
   name: 'Workspace CI',
   on: {
     pull_request: {},
@@ -141,14 +139,17 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
         },
       ],
     },
-    'genie-freshness': plainFlakeJob({
+    'genie-freshness': {
       name: 'genie-freshness',
       ...afterPickRunner,
-      runsOn: linuxRunsOn,
+      'runs-on': linuxRunsOn,
       'timeout-minutes': 20,
-      nix: { binaryCaches: readOnlyBinaryCaches },
-      step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && genie --check'] }),
-    }),
+      steps: [
+        ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
+        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
+        { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
+      ],
+    },
     // Check the shared client and its iOS consumer before merge.
     'typescript-client': {
       name: 'typescript-client',
@@ -272,9 +273,9 @@ done`,
       defaults: { run: { shell: 'bash' } },
       env: buildEnv,
       steps: [
-        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+        commonSetupSteps[0],
         { name: 'Probe KVM', run: kvmProbe },
-        ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+        ...commonSetupSteps.slice(1),
         {
           name: 'Archive the st2 integration test binary',
           run: `start=$SECONDS
@@ -300,7 +301,8 @@ mkdir -p "$RUNNER_TEMP/vm-out"
 jq -r '"| VM boot | \\(.boot_seconds)s |\\n| systemd-scope tests in VM (extract and run) | \\(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
 printf '| VM test driver total | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
+        { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
       ],
     },
   },
-})
+}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing."}))

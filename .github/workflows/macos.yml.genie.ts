@@ -1,3 +1,4 @@
+import { auditCaches } from './cache-audit.ts'
 import {
   defaultActionlintConfig,
   githubWorkflow,
@@ -7,7 +8,7 @@ import { buildEnv, macosRunner, workspacePreparationSteps } from './workspace-ci
 
 // Optional on PRs and never required. A separate workflow lets label changes start macOS without
 // restarting the required Linux gate.
-export default githubWorkflow({
+export default githubWorkflow(auditCaches({
   name: 'macOS CI',
   on: {
     pull_request: { types: ['opened', 'synchronize', 'reopened', 'labeled'] },
@@ -35,7 +36,8 @@ export default githubWorkflow({
           'timeout-minutes': 25,
         },
         nixDevelopStep({ name: 'Cargo clippy', command: ['cargo', 'clippy', '--workspace', '--all-targets', '--locked'] }),
+        { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
       ],
     },
   },
-})
+}, {}))
