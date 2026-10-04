@@ -1,5 +1,6 @@
 use super::*;
 use st3_client::{HarnessInventory, HarnessInventoryItem, HarnessInventoryQuery, PageInfo};
+use hmac::Mac as _;
 
 const CURSOR_TTL_MS: u128 = 60_000;
 #[derive(Deserialize, Serialize)]
@@ -11,6 +12,41 @@ struct Cursor {
     revision: String,
     after: String,
     expires_at: u128,
+}
+
+fn cursor_mac(state: &AppState, payload: &[u8]) -> Result<hmac::Hmac<Sha256>, ApiError> {
+    let key = terminal_capability_key(state)?;
+    let mut mac = <hmac::Hmac<Sha256>>::new_from_slice(&key).map_err(ApiError::internal)?;
+    mac.update(b"st3.harness-inventory.cursor.v1\0");
+    mac.update(payload);
+    Ok(mac)
+}
+
+fn encode_cursor(state: &AppState, cursor: &Cursor) -> Result<String, ApiError> {
+    let payload = serde_json::to_vec(cursor).map_err(ApiError::internal)?;
+    let signature = cursor_mac(state, &payload)?.finalize().into_bytes();
+    let encoding = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    Ok(format!("inventory-page/{}.{}", encoding.encode(payload), encoding.encode(signature)))
+}
+
+fn decode_cursor(state: &AppState, encoded: &str) -> Result<Cursor, ApiError> {
+    let malformed = || validation("malformed or unauthenticated inventory cursor");
+    let (payload, signature) = encoded.strip_prefix("inventory-page/")
+        .and_then(|body| body.split_once('.')).ok_or_else(malformed)?;
+    let encoding = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let payload = encoding.decode(payload).map_err(|_| malformed())?;
+    let signature = encoding.decode(signature).map_err(|_| malformed())?;
+    cursor_mac(state, &payload)?.verify_slice(&signature).map_err(|_| malformed())?;
+    serde_json::from_slice(&payload).map_err(|_| malformed())
+}
+
+fn validate_cursor_binding(cursor: &Cursor, actor: &str, agent: &str,
+    query: &HarnessInventoryQuery, now: u128) -> Result<(), ApiError> {
+    if cursor.actor != actor || cursor.agent != agent || &cursor.query != query
+        || cursor.expires_at < now || cursor.expires_at > now.saturating_add(CURSOR_TTL_MS) {
+        return Err(client_page_expired("inventory cursor expired or its binding changed"));
+    }
+    Ok(())
 }
 
 pub(in crate::api) async fn read(
@@ -105,14 +141,8 @@ fn local_read(state: &AppState, actor: &str, agent: &str, mut query: HarnessInve
     let now = client_now_ms();
     let mut expires_at = now.saturating_add(CURSOR_TTL_MS);
     let cursor = encoded.as_ref().map(|encoded| {
-        let malformed = || validation("malformed inventory cursor");
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(
-            encoded.strip_prefix("inventory-page/").ok_or_else(malformed)?).map_err(|_| malformed())?;
-        let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
-        if cursor.actor != actor || cursor.agent != agent || cursor.query != query
-            || cursor.expires_at < now || cursor.expires_at > expires_at {
-            return Err(client_page_expired("inventory cursor expired or its binding changed"));
-        }
+        let cursor = decode_cursor(state, encoded)?;
+        validate_cursor_binding(&cursor, actor, agent, &query, now)?;
         Ok(cursor)
     }).transpose()?;
     let mut result = HarnessInventory {
@@ -133,8 +163,8 @@ fn local_read(state: &AppState, actor: &str, agent: &str, mut query: HarnessInve
     revision.update(evidence_revision.as_bytes());
     match query.collection.as_str() {
         "files" => {
-            if let Some(root) = snapshot.workspace.as_deref() {
-                let listing = crate::file_inventory::list(Path::new(root), &query.directory, &query.prefix)
+            if let (Some(root), Some(identity)) = (snapshot.workspace.as_deref(), snapshot.workspace_identity.as_ref()) {
+                let listing = crate::file_inventory::list(Path::new(root), identity, &query.directory, &query.prefix)
                     .map_err(|error| match error {
                         crate::file_inventory::Error::InvalidDirectory | crate::file_inventory::Error::InvalidPrefix => validation("file inventory requires a visible root-relative directory and name prefix"),
                         crate::file_inventory::Error::Changed => client_page_expired("directory changed during inventory read"),
@@ -155,7 +185,7 @@ fn local_read(state: &AppState, actor: &str, agent: &str, mut query: HarnessInve
                 }
                 result.status = "supported".into(); result.coverage = "native-workspace".into();
                 result.full_inventory = true; result.reason = None;
-            } else { result.reason = Some("native session workspace has not been supplied".into()); }
+            } else { result.reason = Some("native process workspace identity has not been supplied".into()); }
         }
         "skills" => { result.reason = Some("OMP does not expose full loaded skills through the interactive extension API".into()); }
         "skill-commands" | "slash-commands" => {
@@ -195,8 +225,7 @@ fn local_read(state: &AppState, actor: &str, agent: &str, mut query: HarnessInve
     if result.page.has_more {
         let cursor = Cursor { actor: actor.into(), agent: agent.into(), query, revision,
             after: result.items.last().expect("nonempty bounded inventory page").name.clone(), expires_at };
-        result.page.next_cursor = Some(format!("inventory-page/{}", base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&cursor).map_err(ApiError::internal)?)));
+        result.page.next_cursor = Some(encode_cursor(state, &cursor)?);
         result.page.cursor_expires_at = Some(client_timestamp(expires_at));
     }
     serde_json::to_value(result).map_err(ApiError::internal)
@@ -226,8 +255,11 @@ mod tests {
         st_drivers::omp_session::confirm_channel_binding(&owner.join("sessions/omp"), &observations,
             "example/inventory", "example/inventory", "provider-one", seq, "native-one", None).unwrap();
         observer.observe(&json!({"type":"ready", "sessionId":"native-one"})).unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = workspace.metadata().unwrap();
         observer.observe(&json!({"type":"inventory", "session_id":"native-one",
             "workspace":workspace.to_str().unwrap(), "observed_at":"2026-10-04T12:00:00Z",
+            "workspace_identity":{"device":metadata.dev().to_string(), "inode":metadata.ino().to_string()},
             "dynamic_commands":"supported", "commands":[
                 {"name":"inspect","source":"extension"}, {"name":"skill:review","source":"skill"}
             ]})).unwrap();
@@ -310,5 +342,35 @@ mod tests {
         assert_eq!(call(&state, query("slash-commands")).await.unwrap_err().code, "stale-fence");
         st_drivers::harness_state::claim(&owner.join("observations"), "example/inventory", "omp", "provider-two").unwrap();
         assert_eq!(call(&state, query("files")).await.unwrap_err().code, "stale-fence");
+    }
+    #[tokio::test]
+    async fn issued_cursor_cannot_be_renewed_or_rebound_by_editing_its_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] { std::fs::write(workspace.path().join(name), "").unwrap(); }
+        let state = fixture(root.path(), workspace.path());
+        let page = call(&state, query("files")).await.unwrap();
+        let encoded = page["page"]["next_cursor"].as_str().unwrap();
+        let mut expired = decode_cursor(&state, encoded).unwrap();
+        expired.expires_at = 0;
+        let expired = encode_cursor(&state, &expired).unwrap();
+        let mut continuation = query("files");
+        continuation.cursor = Some(expired.clone());
+        assert_eq!(call(&state, continuation).await.unwrap_err().code, "page-cursor-expired");
+        let (payload, signature) = expired.strip_prefix("inventory-page/").unwrap().split_once('.').unwrap();
+        let encoding = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let original: Value = serde_json::from_slice(&encoding.decode(payload).unwrap()).unwrap();
+        for field in ["expires_at", "actor", "limit"] {
+            let mut forged = original.clone();
+            let mut continuation = query("files");
+            match field {
+                "expires_at" => forged["expires_at"] = json!(client_now_ms() + 50_000),
+                "actor" => forged["actor"] = "person/mallory".into(),
+                _ => { forged["query"]["limit"] = 2.into(); continuation.limit = Some(2); },
+            }
+            continuation.cursor = Some(format!("inventory-page/{}.{}", encoding.encode(
+                serde_json::to_vec(&forged).unwrap()), signature));
+            assert_eq!(call(&state, continuation).await.unwrap_err().code, "validation-failed");
+        }
     }
 }

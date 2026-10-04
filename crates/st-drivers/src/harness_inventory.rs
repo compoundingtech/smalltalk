@@ -17,6 +17,14 @@ pub struct Command {
     pub source: Source,
 }
 
+/// Decimal strings preserve native 64-bit filesystem identities across JSON/JavaScript.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceIdentity {
+    pub device: String,
+    pub inode: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Availability { Supported, Unsupported, Unavailable }
@@ -30,6 +38,7 @@ pub struct Snapshot {
     pub observed_at: String,
     /// Local owner evidence only. Never publish the absolute root in a claim/client response.
     pub workspace: Option<String>,
+    pub workspace_identity: Option<WorkspaceIdentity>,
     pub dynamic_commands: Availability,
     pub commands: Vec<Command>,
 }
@@ -42,6 +51,12 @@ pub fn observation(frame: &Value, driver: &str, native_session: Option<&str>, ru
     let workspace = frame["workspace"].as_str().filter(|path| {
         !path.is_empty() && path.len() <= 4096 && !path.contains('\0') && std::path::Path::new(path).is_absolute()
     }).map(str::to_owned);
+    let workspace_identity: Option<WorkspaceIdentity> = serde_json::from_value(
+        frame.get("workspace_identity").cloned().unwrap_or(Value::Null))?;
+    anyhow::ensure!(workspace_identity.as_ref().is_none_or(|identity|
+        [&identity.device, &identity.inode].iter().all(|value|
+            !value.is_empty() && value.len() <= 20 && value.bytes().all(|byte| byte.is_ascii_digit())
+                && value.parse::<u64>().is_ok())), "invalid native workspace identity");
     let dynamic_commands: Availability = serde_json::from_value(frame["dynamic_commands"].clone())?;
     anyhow::ensure!(frame["commands"].as_array().is_some_and(|commands| commands.len() <= MAX_COMMANDS),
         "inventory command bound exceeded");
@@ -56,7 +71,7 @@ pub fn observation(frame: &Value, driver: &str, native_session: Option<&str>, ru
     let observed_at = frame["observed_at"].as_str().context("inventory has no native observation timestamp")?;
     anyhow::ensure!(observed_at.len() <= 64, "inventory timestamp bound exceeded");
     let snapshot = Snapshot { harness: "omp".into(), session_id: bound.into(), incarnation_id: runtime.into(),
-        observed_at: observed_at.into(), workspace, dynamic_commands, commands };
+        observed_at: observed_at.into(), workspace, workspace_identity, dynamic_commands, commands };
     anyhow::ensure!(serde_json::to_vec(&snapshot)?.len() <= MAX_SNAPSHOT_BYTES, "inventory serialized bound exceeded");
     Ok(Some(snapshot))
 }

@@ -17478,6 +17478,7 @@ impl NativeObservations {
                         serde_json::from_value(event.payload.clone())?;
                     fields.remove("incarnation");
                     fields.remove("workspace");
+                    fields.remove("workspace_identity");
                     fields.insert("incarnation_id".into(), event.runtime_incarnation.clone().into());
                     let _: ClaimRecord = publisher.post(
                         "/v1/claims",

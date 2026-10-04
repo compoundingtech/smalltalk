@@ -42,15 +42,33 @@ impl From<io::Error> for Error {
 /// Enumerate a single directory. Hidden entries, symlinks and special files are never returned.
 /// The caller owns actor/session fences and pagination; this function never accepts a new root
 /// from an HTTP request and never opens or reads an entry's contents.
-pub fn list(root: &Path, directory: &str, prefix: &str) -> Result<Listing, Error> {
+pub fn list(root: &Path, identity: &st_drivers::harness_inventory::WorkspaceIdentity,
+    directory: &str, prefix: &str) -> Result<Listing, Error> {
     if directory.len() > 4096 || Path::new(directory).is_absolute() {
         return Err(Error::InvalidDirectory);
     }
     if prefix.len() > 255 || prefix.contains(['/', '\0']) || prefix.starts_with('.') {
         return Err(Error::InvalidPrefix);
     }
+    if !root.is_absolute() { return Err(Error::InvalidDirectory) }
     let mut handle = OpenOptions::new().read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(root)?;
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open("/")?;
+    for component in root.components() {
+        match component {
+            Component::RootDir => {},
+            Component::Normal(name) => {
+                use std::os::unix::ffi::OsStrExt as _;
+                let name = CString::new(name.as_bytes()).map_err(|_| Error::InvalidDirectory)?;
+                handle = open_directory(&handle, &name)?;
+            },
+            _ => return Err(Error::InvalidDirectory),
+        }
+    }
+    let root_metadata = handle.metadata()?;
+    if identity.device.parse::<u64>().ok() != Some(root_metadata.dev())
+        || identity.inode.parse::<u64>().ok() != Some(root_metadata.ino()) {
+        return Err(Error::Changed);
+    }
     for component in Path::new(directory).components() {
         let Component::Normal(name) = component else { return Err(Error::InvalidDirectory) };
         let Some(name) = name.to_str() else { return Err(Error::InvalidDirectory) };
@@ -165,6 +183,12 @@ unsafe fn errno_location() -> *mut libc::c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn identity(root: &Path) -> st_drivers::harness_inventory::WorkspaceIdentity {
+        let metadata = std::fs::metadata(root).unwrap();
+        st_drivers::harness_inventory::WorkspaceIdentity {
+            device: metadata.dev().to_string(), inode: metadata.ino().to_string(),
+        }
+    }
     #[test]
     fn root_visible_metadata_is_filtered_without_following_external_links() {
         let root = tempfile::tempdir().unwrap();
@@ -177,17 +201,17 @@ mod tests {
         std::fs::write(outside.path().join("outside.rs"), "never read").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("external")).unwrap();
         std::os::unix::fs::symlink(outside.path().join("outside.rs"), root.path().join("external.rs")).unwrap();
-        assert_eq!(list(root.path(), "", "").unwrap().entries, vec![
+        assert_eq!(list(root.path(), &identity(root.path()), "", "").unwrap().entries, vec![
             Entry { name: "alpha-dir".into(), directory: true },
             Entry { name: "alpha.rs".into(), directory: false },
             Entry { name: "beta.rs".into(), directory: false },
         ]);
-        assert_eq!(list(root.path(), "", "alpha.").unwrap().entries,
+        assert_eq!(list(root.path(), &identity(root.path()), "", "alpha.").unwrap().entries,
             vec![Entry { name: "alpha.rs".into(), directory: false }]);
-        assert!(matches!(list(root.path(), "../", ""), Err(Error::InvalidDirectory)));
-        assert!(matches!(list(root.path(), "/absolute", ""), Err(Error::InvalidDirectory)));
-        assert!(matches!(list(root.path(), ".state", ""), Err(Error::InvalidDirectory)));
-        assert!(matches!(list(root.path(), "external", ""), Err(Error::Io(_))));
+        assert!(matches!(list(root.path(), &identity(root.path()), "../", ""), Err(Error::InvalidDirectory)));
+        assert!(matches!(list(root.path(), &identity(root.path()), "/absolute", ""), Err(Error::InvalidDirectory)));
+        assert!(matches!(list(root.path(), &identity(root.path()), ".state", ""), Err(Error::InvalidDirectory)));
+        assert!(matches!(list(root.path(), &identity(root.path()), "external", ""), Err(Error::Io(_))));
     }
     #[test]
     fn scan_ceiling_counts_hidden_entries_even_when_filter_matches_nothing() {
@@ -195,6 +219,23 @@ mod tests {
         for index in 0..=MAX_ENTRIES {
             std::fs::write(root.path().join(format!(".hidden-{index}")), "").unwrap();
         }
-        assert!(matches!(list(root.path(), "", "missing"), Err(Error::ScanLimit)));
+        assert!(matches!(list(root.path(), &identity(root.path()), "", "missing"), Err(Error::ScanLimit)));
+    }
+    #[test]
+    fn replaced_root_or_symlink_ancestor_cannot_substitute_an_outside_workspace() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = base.path().join("parent");
+        let root = parent.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(outside.path().join("workspace")).unwrap();
+        std::fs::write(outside.path().join("workspace/private"), "never enumerate").unwrap();
+        let native = identity(&root);
+        std::fs::rename(&parent, base.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+        assert!(matches!(list(&root, &native, "", ""), Err(Error::Io(_))));
+        std::fs::remove_file(&parent).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(matches!(list(&root, &native, "", ""), Err(Error::Changed)));
     }
 }

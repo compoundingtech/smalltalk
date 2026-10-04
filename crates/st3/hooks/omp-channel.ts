@@ -14,6 +14,7 @@
 // a slow channel starts the session
 // without restored context rather than hanging it.
 import childProcess from "node:child_process";
+import fs from "node:fs";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -715,6 +716,15 @@ export default function (pi: ExtensionAPI) {
     const session = ctx.sessionManager.getSessionId();
     const workspace = typeof ctx.cwd === "string" && ctx.cwd.startsWith("/") && ctx.cwd.length <= 4096
       ? ctx.cwd : null;
+    let workspaceIdentity: { device: string; inode: string } | null = null;
+    try {
+      // "." names the native process's held cwd, not a path whose ancestors can be replaced.
+      // If the harness context is a different cwd, withhold file capability rather than guess.
+      if (workspace === process.cwd()) {
+        const root = fs.statSync(".", { bigint: true });
+        if (root.isDirectory()) workspaceIdentity = { device: root.dev.toString(), inode: root.ino.toString() };
+      }
+    } catch { /* A renamed/unreachable cwd is not usable native root evidence. */ }
     let dynamicCommands: "supported" | "unsupported" | "unavailable" = "unsupported";
     let commands: { name: string; source: "extension" | "prompt" | "skill" }[] = [];
     if (typeof pi.getCommands === "function") {
@@ -740,7 +750,8 @@ export default function (pi: ExtensionAPI) {
         dynamicCommands = "unavailable";
       }
     }
-    const reading = { session_id: session, workspace, dynamic_commands: dynamicCommands, commands };
+    const reading = { session_id: session, workspace, workspace_identity: workspaceIdentity,
+      dynamic_commands: dynamicCommands, commands };
     const fingerprint = JSON.stringify(reading);
     if (!force && inventoryFingerprint === fingerprint) return;
     sendFrame({ type: "inventory", observed_at: new Date().toISOString(), ...reading });
