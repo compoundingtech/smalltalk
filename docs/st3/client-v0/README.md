@@ -304,11 +304,19 @@ cost: the harness's own figure when it reports one, else st's pricing table, nam
 `reported_cost_microusd` (the part the harness reported) and `unpriced_tokens` (tokens neither
 could price, which a client shows as unknown cost, never as free). An identity st does not know,
 such as the mission run of a standing seat, is absent from the row. A period whose start is after
-its end is `validation-failed`. `limits` lists each account's freshest limits reading: `account`
+its end is `validation-failed`. `limits` lists each account's selected limits reading: `account`
 (a label such as `claude/<digest>`, or `DRIVER/unknown`), `driver`, optional `plan`,
 `five_hour_percent`, `weekly_percent` and their `*_resets_at_unix_ms`, when and by which seat and
 host it was measured, and the seats whose newest reading names the account. A harness that does
-not report a value leaves it out. The Rust method is `Client::usage_period(since_ms, until_ms)`;
+not report a value leaves it out. Selection uses quota observation time, independently of
+context refresh and publication time. Within an hour of the account's freshest observation,
+the highest weekly reading in the latest reported reset window wins; ties use source time
+and seat identity. A new reset window can lower the reading, and an older high reading
+outside the hour cannot override it. This same selection serves `st usage`, stui, iOS,
+account pools and the limits policy. The policy tests freshness against the selected source
+time, so a recent low publication cannot freshen an old high observation. Claim kinds and
+client fields remain compatible with older clients.
+The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
 
 ### Clients connected now

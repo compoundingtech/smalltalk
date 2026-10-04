@@ -1,17 +1,65 @@
-//! Account limits: the freshest reading of each paying account's 5-hour and weekly limits, and
+//! Account limits: a recent reading of each paying account's 5-hour and weekly limits, and
 //! the policy that stops an account's seats as it nears its weekly limit.
 //!
 //! A harness reports its account's limits with every status refresh, so every seat on an account
 //! repeats them, and an idle seat keeps its last reading. An account's limits are therefore the
-//! reading measured most recently across all reporting seats, even after they switch away, labelled
-//! with when and by which seat it was measured. Readings never cross accounts or providers: a
-//! harness that names no account reads as `PROVIDER/unknown`.
+//! highest weekly reading within an hour of the freshest source observation, in the latest reset
+//! window, even after seats switch away, labelled with its original time and measuring seat.
+//! This also protects readers from older producers that re-stamp cached limits. Readings never
+//! cross accounts or providers: a harness that names no account reads as `PROVIDER/unknown`.
 
 use super::*;
 use serde::Deserialize;
 
 /// The actor st records for what its limits policy does.
 pub const LIMITS_ACTOR: &str = "daemon/limits";
+
+const ACCOUNT_READING_WINDOW_MS: u64 = 3_600_000;
+
+fn select_account_reading(readings: Vec<AccountLimit>) -> AccountLimit {
+    let latest = readings
+        .iter()
+        .map(|limit| limit.measured_at_unix_ms)
+        .max()
+        .unwrap();
+    let since = latest.saturating_sub(ACCOUNT_READING_WINDOW_MS);
+    // Reset advancement beats percentage: an old window must not resurrect exhaustion after
+    // a reset, even when an older producer publishes that window again with a fresh stamp.
+    let reset = readings
+        .iter()
+        .filter(|limit| limit.measured_at_unix_ms >= since)
+        .filter_map(|limit| limit.weekly_resets_at_unix_ms)
+        .max();
+    readings
+        .into_iter()
+        .filter(|limit| {
+            limit.measured_at_unix_ms >= since && limit.weekly_resets_at_unix_ms == reset
+        })
+        .max_by(|left, right| {
+            left.weekly_percent
+                .partial_cmp(&right.weekly_percent)
+                .unwrap()
+                .then_with(|| {
+                    // Providers that report only a five-hour window use that window's level.
+                    if left.weekly_percent.is_none() && right.weekly_percent.is_none() {
+                        left.five_hour_resets_at_unix_ms
+                            .cmp(&right.five_hour_resets_at_unix_ms)
+                            .then_with(|| {
+                                left.five_hour_percent
+                                    .partial_cmp(&right.five_hour_percent)
+                                    .unwrap()
+                            })
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .then_with(|| {
+                    (left.measured_at_unix_ms, &left.measured_by)
+                        .cmp(&(right.measured_at_unix_ms, &right.measured_by))
+                })
+        })
+        .expect("the latest reset has a recent reading")
+}
 
 /// Bound accounts remain distinct even when an older producer reports a generic provider label.
 pub(super) fn episode_account(limit: &AccountLimit) -> String {
@@ -98,7 +146,7 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
          ORDER BY CANONICAL_ASC(claims)",
     ))?;
     let mut newest = BTreeMap::<String, (String, Option<String>)>::new();
-    let mut accounts = BTreeMap::<(String, Option<String>), AccountLimit>::new();
+    let mut readings = BTreeMap::<(String, Option<String>), Vec<AccountLimit>>::new();
     for row in statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -112,17 +160,15 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
             limit.measured_by = subject.clone();
             let key = (limit.account.clone(), limit.account_ref.clone());
             newest.insert(subject, key.clone());
-            let entry = accounts.entry(key).or_insert_with(|| limit.clone());
             // Keep the last reading even after the account's last seat switches away. Otherwise
             // the exhausted account would immediately look unused to the next pool choice.
-            // A later observation from the same measuring seat also wins an exact timestamp tie.
-            if (limit.measured_at_unix_ms, &limit.measured_by)
-                >= (entry.measured_at_unix_ms, &entry.measured_by)
-            {
-                *entry = limit;
-            }
+            readings.entry(key).or_default().push(limit);
         }
     }
+    let mut accounts = readings
+        .into_iter()
+        .map(|(key, readings)| (key, select_account_reading(readings)))
+        .collect::<BTreeMap<_, _>>();
     for (seat, key) in newest {
         accounts
             .get_mut(&key)
@@ -153,7 +199,7 @@ fn utc(unix_ms: u64) -> String {
 }
 
 impl Store {
-    /// The freshest limits reading of every account, in account order.
+    /// The highest recent weekly reading in each account's latest reset window, in account order.
     pub fn account_limits(&self) -> Result<Vec<AccountLimit>> {
         account_limits_at(&self.readers.get())
     }
@@ -437,6 +483,37 @@ mod tests {
 
     fn live(store: &Store, seat: &str) -> bool {
         seat_host(&store.readers.get(), seat).unwrap().is_some()
+    }
+
+    #[test]
+    fn recent_maximum_expires_and_does_not_cross_weekly_reset_windows() {
+        let store = Store::open_memory("alder").unwrap();
+        let now = now_ms();
+        let busy = "agent/alder.busy";
+        let stale = "agent/alder.stale";
+        read(&store, busy, Some("claude/aaaa"), 97.0, now);
+        read(&store, stale, Some("claude/aaaa"), 45.0, now + 1);
+        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(97.0));
+        // Arrival order cannot override source time, even outside the maximum's window.
+        read(&store, stale, Some("claude/aaaa"), 8.0, now - 2 * HOUR);
+        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(97.0));
+        read(&store, stale, Some("claude/aaaa"), 46.0, now + HOUR + 1);
+        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(46.0));
+
+        let mut next = store.latest_claim(busy, Some("harness.limits")).unwrap().unwrap();
+        next.body["fields"]["weekly_resets_at_unix_ms"] = json!(1_800_600_000_000_u64);
+        next.body["fields"]["weekly_percent"] = json!(2.0);
+        next.body["fields"]["measured_at_unix_ms"] = json!((now + HOUR + 2) as u64);
+        store.append_claim(&ClaimInput {
+            subject: busy.into(), kind: "harness.limits".into(), actor: Some(busy.into()),
+            fields: serde_json::from_value(next.body["fields"].clone()).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        // An old producer re-publishes the previous reset with an even newer timestamp.
+        read(&store, stale, Some("claude/aaaa"), 99.0, now + HOUR + 3);
+        let limit = &store.account_limits().unwrap()[0];
+        assert_eq!(limit.weekly_percent, Some(2.0));
+        assert_eq!(limit.measured_by, busy);
     }
 
     #[test]

@@ -177,6 +177,14 @@ Field rules:
   harnesses must read the `harness` discriminator first.
 - `rateLimits` is harness-reported and account-scoped (HC-T06). It repeats
   across every agent runtime sharing an account. Absent windows are `null`.
+  Its optional `observedAtMs` records the quota observation independently of
+  context occupancy. Claude's status line repeats an in-memory quota snapshot
+  without a fetch timestamp: the writer preserves the snapshot's first observation
+  time until its values, resets or account change. Codex records the time of its
+  `account/rateLimits/updated` notification and preserves it through later token
+  readings. Compaction and context heartbeats preserve this time too. Older
+  records fall back to the outer `observedAtMs`; the first upgraded write preserves
+  that old time when the limits are unchanged.
 - `lastCompactionTrigger` is a closed union, additive-tolerant on read: an
   unrecognized future word decodes as `unknown`, never as a definite trigger.
   `unknown` is a legitimate v1 value for three of the five harnesses.

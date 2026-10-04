@@ -1611,6 +1611,9 @@ pub fn statusline_reading(payload: &serde_json::Value) -> Reading {
         // every render — a worse answer than none (HC-R16).
         session_total_tokens: None,
         rate_limits: RateLimits {
+            // The status-line payload supplies cached windows without their fetch time.
+            // Writer preserves their first observation until the windows or account change.
+            observed_at_ms: None,
             five_hour: payload
                 .pointer("/rate_limits/five_hour/used_percentage")
                 .and_then(serde_json::Value::as_f64),

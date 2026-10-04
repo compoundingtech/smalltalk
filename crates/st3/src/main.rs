@@ -8110,7 +8110,7 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
         output.push('\n');
         let _ = writeln!(
             output,
-            "LIMITS  {} · the freshest reading of each account",
+            "LIMITS  {} · the highest recent weekly reading of each account",
             limits.len()
         );
         let _ = writeln!(output, "WEEKLY  5-HOUR  WEEKLY RESET  MEASURED  account");
@@ -16645,7 +16645,7 @@ async fn publish_harness_limits(
         ("incarnation_id".into(), Value::String(incarnation.into())),
         (
             "measured_at_unix_ms".into(),
-            Value::from(observed.observed_at_ms),
+            Value::from(limits.observed_at_ms.unwrap_or(observed.observed_at_ms)),
         ),
     ]);
     for (name, value) in [("account", &observed.account), ("plan", &observed.plan)] {

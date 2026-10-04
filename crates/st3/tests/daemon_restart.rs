@@ -595,7 +595,7 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
         "schema":"st.harness-context.v1", "agent":"drain-accounts", "harness":"omp",
         "incarnation":"account-producer", "observedAtMs":now, "writtenAtMs":now,
         "sessionTotalTokens":123, "account":"omp/provider-account",
-        "rateLimits":{"fiveHour":37,"sevenDay":41},
+        "rateLimits":{"fiveHour":37,"sevenDay":41,"observedAtMs":now - 120_000},
     })).unwrap()).unwrap();
     let mut timeline = st_drivers::harness_timeline::Writer::new(&dir, "omp", "account-producer");
     timeline.append("account-response", st_drivers::harness_timeline::Role::System,
@@ -622,6 +622,7 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
     assert_eq!(limits.body.pointer("/fields/account").and_then(Value::as_str), Some(account.as_str()));
     assert_eq!(limits.body.pointer("/fields/account_ref").and_then(Value::as_str), captured.as_deref());
     assert_eq!(limits.body.pointer("/fields/five_hour_percent").and_then(Value::as_f64), Some(37.0));
+    assert_eq!(limits.body.pointer("/fields/measured_at_unix_ms").and_then(Value::as_u64), Some(now - 120_000));
     assert_eq!(cumulative.body.pointer("/fields/total_tokens").and_then(Value::as_u64), Some(123));
     assert_eq!(cumulative.body.pointer("/fields/account").and_then(Value::as_str),
         captured.as_ref().map(|_| account.as_str()));

@@ -20,7 +20,9 @@ use smallclaims::store::checkpoint_agreement::*;
 /// graph and execution timing, so older builds seal different rules rather than publishing an
 /// incompatible one-time graph or reader verification under the same terms. Version 7 selects
 /// one initial definition when members independently create the same scheduled occurrence.
-pub const RULES_VERSION: u32 = 7;
+/// Version 8 preserves quota source observations: a later claim can report an older or lower
+/// reading, so it no longer witnesses the reading the account fold selects.
+pub const RULES_VERSION: u32 = 8;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -69,7 +71,7 @@ runtime.action.deadline-reached actor=null slot=subject,action,incarnation_id,op
 harness.usage semantics=response_rollup slot=subject,incarnation_id,model,account,owner_run,owner_step,host keep=newest,last-of-each-utc-hour-by-observed_at-within-7d-before-cut,newest-before-that
 harness.usage semantics=session_cumulative slot=subject,incarnation_id keep=newest,largest-total_tokens
 harness.usage semantics=context_occupancy slot=subject,incarnation_id keep=newest
-harness.limits slot=subject keep=newest
+harness.limits keep=all-source-observations
 resource.observed actor=null observer=set slot=subject keep=newest
 render.applied slot=subject keep=newest min-age-before-cut=5d
 runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
@@ -157,8 +159,9 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         "render.applied" | "runtime.readiness-deadline-reached" => {
             Some((Rule::NewestAged, slot(&[])))
         }
-        // Limits are read as each seat's newest reading.
-        "harness.limits" => Some((Rule::Newest, slot(&[]))),
+        // The account fold compares source times and percentages across reset windows. A later
+        // claim does not replace every use of an earlier reading (including a switched account).
+        "harness.limits" => None,
         "harness.todo.observed" => Some((Rule::Newest, slot(&[]))),
         // An observer records a resource's complete facts in every observation, so its newest
         // observation replaces the older ones. A repository observer records each item as its
