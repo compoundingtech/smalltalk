@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { ANSWERS, isRequest, report, spaced, yesNo } from './requestView.ts';
+import { ANSWERS, isRequest, report, spaced, yesNo } from '@smalltalk/st3-views/requestView';
 
 // The same report stui's test reads (crates/stui/src/ui/screens.rs).
 const text = 'The deploy finished: {"status":"failed","error":"unit st3.service did not start","commit":"8821eced","host":"willow","attempt":2,"log":"/var/log/x","duration_ms":1234,"members":["maple","cedar"],"plan":{"a":1},"notes":"long\\nnotes"}';
@@ -28,7 +28,7 @@ assert.equal(spaced('The release run on the Linux runner failed: mold is missing
 // Words answer a structured request the way it takes them (Nathan, 2026-10-03: words on a custom
 // choice were sent as a bare summary, refused, and the item stayed on Home).
 {
-  const { personAnswer } = await import('./requestView.ts');
+  const { personAnswer } = await import('@smalltalk/st3-views/requestView');
   const options = [{ id: 'works' }, { id: 'broken' }];
   assert.deepEqual(personAnswer({ type: 'choice', custom: true, answers: options }, undefined, ' it works '), { text: 'it works' });
   assert.deepEqual(personAnswer({ type: 'choice', custom: true, answers: options }, 'works', 'Works'), { id: 'works' });

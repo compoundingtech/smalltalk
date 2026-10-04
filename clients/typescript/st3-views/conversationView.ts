@@ -1,4 +1,4 @@
-import type { TimelineEntry } from '../../clients/typescript/st3-client';
+import type { TimelineEntry } from '@smalltalk/st3-client';
 
 // A conversation drawn the way stui draws it (crates/stui/src/ui/adapt.rs conversation and
 // from_harness, conversation.rs): the person's turns as tinted blocks, replies as markdown, tool

@@ -5,4 +5,8 @@ cd "$(dirname "$0")/.."
 client=clients/typescript/st3-client
 npm test --prefix "$client"
 npm run typecheck --prefix "$client"
+views=clients/typescript/st3-views
+npm test --prefix "$views"
+npm run typecheck --prefix "$views"
 apps/ios/node_modules/.bin/tsc --noEmit -p apps/ios
+npm test --prefix apps/ios

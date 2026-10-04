@@ -14,7 +14,7 @@ npm run typecheck --prefix clients/typescript/st3-client
 
 The client package pins TypeScript 6.0.3 and Effect 4.0.0-rc.118 in its own development dependencies and lockfile. These commands need only the client installation. `npm test` runs the contract and schema tests; `npm run typecheck` checks the raw client, its type fixtures and the rich schemas with the strict compiler options declared in `package.json`.
 
-To verify generated files against the Rust generator, also run `cargo run -p st3-client-codegen -- --check`. CI runs the client commands above before installing the iOS dependencies for `tsc --noEmit -p apps/ios`. To run both sets of checks locally, install the locked iOS dependencies and run `bash scripts/ci-typescript-client`.
+To verify generated files against the Rust generator, also run `cargo run -p st3-client-codegen -- --check`. The sibling [`st3-views`](../st3-views/README.md) package shares the phone's view models with other TypeScript clients. CI checks the generated client, shared views and iOS consumers together. To run these checks locally, install the locked dependencies in this package, `clients/typescript/st3-views` and `apps/ios`, then run `bash scripts/ci-typescript-client`.
 
 ## Rich Effect schemas
 

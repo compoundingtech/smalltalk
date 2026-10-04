@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { bundleId, simplify } from './conversationSimple.ts';
+import { bundleId, simplify } from '@smalltalk/st3-views/conversationSimple';
 
 // The same conversation st3-conversation-ui's simplified test draws.
 const entry = (id, body) => ({ id, at: '09:00', body });

@@ -1,3 +1,5 @@
+import { ago } from '@smalltalk/st3-views';
+export { ago } from '@smalltalk/st3-views';
 import type { Agent, Attention, Device, Mission, MissionStep, WorkState } from '../../clients/typescript/st3-client';
 
 // The daemon annotates every resource with its operational layer. It is not part of the
@@ -12,16 +14,6 @@ export function words(slug: string): string {
   return slug.split('-').map(word => acronyms[word.toLowerCase()] ?? word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
 }
 function titleCase(text: string): string { return text.charAt(0).toUpperCase() + text.slice(1); }
-
-export function ago(iso: string, now = Date.now()): string {
-  const at = Date.parse(iso);
-  if (!Number.isFinite(at)) return 'unknown';
-  const seconds = Math.max(0, Math.floor((now - at) / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86_400) return `${Math.floor(seconds / 3600)}h`;
-  return `${Math.floor(seconds / 86_400)}d`;
-}
 
 export function attentionHeadline({ count, loaded, error }: { count: number; loaded: boolean; error?: string }): { text: string; warning: boolean } {
   if (error) return count ? { text: `${count} actionable items from the last load · refresh failed: ${error}`, warning: true } : { text: `Attention could not be loaded: ${error}`, warning: true };

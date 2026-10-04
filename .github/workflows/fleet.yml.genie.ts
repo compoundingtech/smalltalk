@@ -165,7 +165,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
           name: 'Fingerprint the locked dependencies',
           id: 'lockfiles',
           // ci1's Nix runner lacks the Node 20 helper used by GitHub's hashFiles expression.
-          run: `lockfiles_hash=$(sha256sum apps/ios/package-lock.json clients/typescript/st3-client/package-lock.json | sha256sum | cut -d ' ' -f1)
+          run: `lockfiles_hash=$(sha256sum apps/ios/package-lock.json clients/typescript/st3-client/package-lock.json clients/typescript/st3-views/package-lock.json | sha256sum | cut -d ' ' -f1)
 printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         },
         {
@@ -173,7 +173,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
           id: 'typescript-cache',
           uses: 'actions/cache@v5',
           with: {
-            path: 'apps/ios/node_modules\nclients/typescript/st3-client/node_modules',
+            path: 'apps/ios/node_modules\nclients/typescript/st3-client/node_modules\nclients/typescript/st3-views/node_modules',
             key: 'typescript-client-${{ runner.os }}-node24.18.0-${{ steps.lockfiles.outputs.hash }}',
           },
         },
@@ -187,11 +187,16 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
           run: 'npm test --prefix clients/typescript/st3-client\nnpm run typecheck --prefix clients/typescript/st3-client',
         },
         {
+          name: 'Install locked view dependencies',
+          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
+          run: 'npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund',
+        },
+        {
           name: 'Install locked iOS dependencies',
           if: "steps.typescript-cache.outputs.cache-hit != 'true'",
           run: 'npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund',
         },
-        { name: 'Typecheck the iOS project', run: 'apps/ios/node_modules/.bin/tsc --noEmit -p apps/ios' },
+        { name: 'Check shared views, fixtures and iOS consumers', run: 'npm test --prefix clients/typescript/st3-views\nnpm run typecheck --prefix clients/typescript/st3-views\napps/ios/node_modules/.bin/tsc --noEmit -p apps/ios\nnpm test --prefix apps/ios' },
       ],
     },
     // The Linux gate runs as three jobs on separate runners, each with its own caches.

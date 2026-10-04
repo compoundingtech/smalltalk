@@ -1,8 +1,8 @@
-// Device signing, version 1 (docs/st3/device-signing.md): the bytes a paired phone signs for each
+// Device signing, version 1 (docs/st3/device-signing.md): the bytes a paired device signs for each
 // message it sends, and the `signature` parameter that carries the result. The key itself lives in
-// the native module (modules/st-device-key); everything here is plain data, checked by
-// deviceSigning.test.mjs against fixtures/clients/device-signing-v1.json.
-import type { DeviceSignature } from '../../clients/typescript/st3-client';
+// the caller's platform key store; everything here is plain data, checked by
+// tests/deviceSigning.test.mjs against fixtures/clients/device-signing-v1.json.
+import type { DeviceSignature } from '@smalltalk/st3-client';
 
 export const SIGNED_FIELDS = ['content', 'from', 'in_reply_to', 'session_id', 'tags', 'title', 'to'] as const;
 
@@ -17,7 +17,7 @@ export type SignedFields = {
   to: string;
 };
 
-/** What a paired phone keeps beside its key: who it signs as and the grants that enroll the key. */
+/** What a paired device keeps beside its key: who it signs as and the grants that enroll the key. */
 export type DeviceKey = { key: string; storage: 'secure-enclave' | 'software'; person: string; chain: string[] };
 
 /**
@@ -89,14 +89,14 @@ export function base64url(bytes: Uint8Array): string {
 }
 
 /** A refused signature, in words a person reads (and what to do about it). */
-export function signatureRefusal(code: string): string | null {
+export function signatureRefusal(code: string, device = 'device'): string | null {
   switch (code) {
     case 'device-signature-replayed': return 'st already has a message signed with this one-time number; send it again as a new message';
     case 'device-signature-noncanonical': return 'the recipient must be named in full (agent/… or person/…) for a signed message';
-    case 'device-signature-stale': return "this phone's clock is more than 15 minutes off; set the time automatically and send again";
-    case 'device-key-not-enrolled': return "st does not know this phone's signing key; pair the phone again";
-    case 'device-signature-invalid': return "st could not verify this phone's signature on the message";
-    case 'device-signature-signer': return 'this phone signs as a different person than it is paired as; pair it again';
+    case 'device-signature-stale': return `this ${device}'s clock is more than 15 minutes off; set the time automatically and send again`;
+    case 'device-key-not-enrolled': return `st does not know this ${device}'s signing key; pair the ${device} again`;
+    case 'device-signature-invalid': return `st could not verify this ${device}'s signature on the message`;
+    case 'device-signature-signer': return `this ${device} signs as a different person than it is paired as; pair it again`;
     case 'device-signature-format': return 'st expects a different signature format; this app or st needs an update';
     default: return null;
   }
