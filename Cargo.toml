@@ -3,6 +3,7 @@
 # build, and a virtual root has no `[package]` to read.
 [workspace]
 members = [
+  "examples/client-tui",
   "components/github-issue",
   "components/github-pr",
   "components/pty-stats",
@@ -27,6 +28,7 @@ members = [
   "crates/stui",
 ]
 default-members = [
+  "examples/client-tui",
   ".",
   "crates/agent-spec",
   "crates/smallclaims",

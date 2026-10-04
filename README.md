@@ -17,6 +17,9 @@ harness, daemon, and machine restarts. One daemon runs on each machine; machines
 
 ### Shared UI models
 
+[Build your own client](docs/clients/build-your-own.md) maps the Rust and TypeScript pieces
+and includes a small [example TUI](examples/client-tui/) built and tested in CI.
+
 `crates/st3-ui-model` provides renderer-independent UI semantics without a ratatui dependency.
 Its broad name is intentional; initially it contains only stui's mission model (`Word`,
 `StepState`, `Mission`, `Step`) and mission derivation. stui consumes that same model.
