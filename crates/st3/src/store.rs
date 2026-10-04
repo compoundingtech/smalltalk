@@ -19041,6 +19041,7 @@ fn current_harness_fold_at(
             input_buffer: None,
             exit: None,
             claim,
+            since_unix_ms: observed_at.parse()?,
             observed_at_unix_ms: observed_at.parse()?,
         }));
     }
@@ -46332,7 +46333,7 @@ message "human-attention" {
             ]),
         );
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
-        append(
+        let refusal = append(
             "harness.diagnostic",
             BTreeMap::from([
                 ("code".into(), json!("harness-admission-failed")),
@@ -46354,6 +46355,7 @@ message "human-attention" {
         let refused = store.current_harness(subject).unwrap().unwrap();
         assert!(!refused.is_ready());
         assert_eq!(refused.state, "indeterminate");
+        assert_eq!(refused.since_unix_ms, refusal.accepted_at_unix_ms);
         assert!(refused.reason.unwrap().contains("admissionLifecycle"));
         append(
             "runtime.observed",
@@ -46362,15 +46364,9 @@ message "human-attention" {
                 ("incarnation_id".into(), json!("first")),
             ]),
         );
-        assert!(
-            store
-                .current_harness(subject)
-                .unwrap()
-                .unwrap()
-                .reason
-                .unwrap()
-                .contains("admissionLifecycle")
-        );
+        let exited = store.current_harness(subject).unwrap().unwrap();
+        assert!(exited.reason.unwrap().contains("admissionLifecycle"));
+        assert_eq!(exited.since_unix_ms, refusal.accepted_at_unix_ms);
         append(
             "runtime.observed",
             BTreeMap::from([
