@@ -396,7 +396,7 @@ export default function (pi: ExtensionAPI) {
         if (child.stdin.destroyed) return;
         child.stdin.write(JSON.stringify(frame) + "\n");
       };
-      send({ type: "session", sessionId: nativeSessionId });
+      send({ type: "session", sessionId: nativeSessionId, sessionFile: ctx.sessionManager.getSessionFile() });
 
       const handle = async (line: string) => {
         let frame: Frame;
@@ -419,7 +419,7 @@ export default function (pi: ExtensionAPI) {
             return;
           }
           state.reconnectAttempt = 0;
-          send({ type: "ready", sessionId: nativeSessionId });
+          send({ type: "ready", sessionId: nativeSessionId, sessionFile: ctx.sessionManager.getSessionFile() });
           // Every fresh channel needs the provider's idle proof, including reconnects
           // during an idle session where no further turn boundary will arrive.
           watchSettle(ctx);

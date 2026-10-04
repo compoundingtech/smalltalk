@@ -653,7 +653,7 @@ fn claude_session_of_driver_process(
 
 /// The kernel start time of `pid` in clock ticks since boot, as `/proc/<pid>/stat` reports it.
 #[cfg(target_os = "linux")]
-fn linux_process_start_ticks(pid: u32) -> Option<String> {
+pub(crate) fn linux_process_start_ticks(pid: u32) -> Option<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let end_name = stat.rfind(") ")?;
     stat[end_name + 2..]
@@ -663,7 +663,7 @@ fn linux_process_start_ticks(pid: u32) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_started_at_ms(pid: u32) -> Option<u128> {
+pub(crate) fn linux_process_started_at_ms(pid: u32) -> Option<u128> {
     let ticks = linux_process_start_ticks(pid)?.parse::<u128>().ok()?;
     let boot_seconds = fs::read_to_string("/proc/stat")
         .ok()?
@@ -682,7 +682,7 @@ fn linux_process_started_at_ms(pid: u32) -> Option<u128> {
 /// launches its provider from a worker thread; a kernel without those lists falls back to a scan
 /// of every process's parent.
 #[cfg(target_os = "linux")]
-fn linux_child_processes(pid: u32) -> BTreeSet<u32> {
+pub(crate) fn linux_child_processes(pid: u32) -> BTreeSet<u32> {
     let mut children = BTreeSet::new();
     let mut listed = false;
     if let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) {

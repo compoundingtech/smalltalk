@@ -249,6 +249,112 @@ fn pi_family_header_id(path: &Path) -> Option<String> {
     None
 }
 
+/// Verify the exact transcript path reported by a pi-family harness, including an externally
+/// resumed file. The header, not the filename or directory, must name `id`. Return the canonical
+/// path for binding; never search for a substitute if the reported file is missing or foreign.
+pub fn pi_family_reported_transcript(path: &Path, id: &str) -> Option<PathBuf> {
+    valid_id(id).ok()?;
+    let path = fs::canonicalize(path).ok()?;
+    (path.is_file() && pi_family_header_id(&path).as_deref() == Some(id)).then_some(path)
+}
+
+/// Recover an explicit OMP launch path for an older loaded hook that reports only its current ID.
+/// The incarnation must still name this seat's live runtime, its own driver and direct provider.
+/// Launch argv alone is not current-session evidence: the caller supplies the hook's native ID,
+/// and the exact file must still name it. No session directory or unrelated process is searched.
+#[cfg(target_os = "linux")]
+pub fn omp_process_transcript(
+    subject: &str,
+    incarnation: &str,
+    current_native_id: &str,
+    account: Option<&str>,
+) -> Option<PathBuf> {
+    use crate::external_sessions::{
+        linux_child_processes, linux_process_start_ticks, linux_process_started_at_ms,
+    };
+    fn arguments(pid: u32) -> Option<Vec<String>> {
+        fs::read(format!("/proc/{pid}/cmdline")).ok()?
+            .split(|byte| *byte == 0).filter(|value| !value.is_empty())
+            .map(|value| String::from_utf8(value.to_vec()).ok()).collect()
+    }
+    fn account_matches(pid: u32, expected: Option<&str>) -> bool {
+        let Ok(environment) = fs::read(format!("/proc/{pid}/environ")) else { return false; };
+        let account = environment.split(|byte| *byte == 0)
+            .find_map(|value| value.strip_prefix(b"ST3_ACCOUNT="))
+            .and_then(|value| std::str::from_utf8(value).ok()).filter(|value| !value.is_empty());
+        account == expected
+    }
+    fn own_driver(argv: &[String], subject: &str) -> bool {
+        let options = argv.iter().position(|value| value == "--").map_or(argv, |end| &argv[..end]);
+        options.windows(2).any(|pair| pair[0] == "driver" && pair[1] == "omp")
+            && (options.windows(2).any(|pair| pair[0] == "--subject" && pair[1] == subject)
+                || options.iter().any(|value| value.strip_prefix("--subject=") == Some(subject)))
+    }
+    fn resume_path(argv: &[String]) -> Option<PathBuf> {
+        if Path::new(argv.first()?).file_name()?.to_str()? != "omp" { return None; }
+        let mut options = argv.iter().skip(1).take_while(|value| value.as_str() != "--");
+        let mut path = None;
+        while let Some(value) = options.next() {
+            let selected = if matches!(value.as_str(), "--resume" | "-r") {
+                Some(options.next()?.as_str())
+            } else {
+                value.strip_prefix("--resume=")
+            };
+            if let Some(selected) = selected {
+                if path.is_some() || !Path::new(selected).is_absolute() { return None; }
+                path = Some(PathBuf::from(selected));
+            }
+        }
+        path
+    }
+    valid_id(current_native_id).ok()?;
+    let (pid, started_at) = incarnation.split_once(':')?;
+    let pid = pid.parse::<u32>().ok()?;
+    let expected_start = chrono::DateTime::parse_from_rfc3339(started_at).ok()?.timestamp_millis();
+    let expected_start = u128::try_from(expected_start).ok()?;
+    let runtime_start = linux_process_start_ticks(pid)?;
+    if linux_process_started_at_ms(pid)?.abs_diff(expected_start) > 2_000 { return None; }
+    let runtime_argv = arguments(pid)?;
+    let drivers = if own_driver(&runtime_argv, subject) {
+        std::collections::BTreeSet::from([pid])
+    } else {
+        if Path::new(runtime_argv.first()?).file_name()?.to_str()? != "pty"
+            || runtime_argv.get(1).map(String::as_str) != Some("__daemon") { return None; }
+        linux_child_processes(pid)
+    };
+    let mut found = None;
+    for driver in drivers {
+        let Some(driver_start) = linux_process_start_ticks(driver) else { continue; };
+        let Some(driver_argv) = arguments(driver) else { continue; };
+        if !own_driver(&driver_argv, subject) || !account_matches(driver, account) { continue; }
+        for provider in linux_child_processes(driver) {
+            let Some(provider_start) = linux_process_start_ticks(provider) else { continue; };
+            let Some(provider_argv) = arguments(provider) else { continue; };
+            if !account_matches(provider, account) { continue; }
+            let Some(path) = resume_path(&provider_argv)
+                .and_then(|path| pi_family_reported_transcript(&path, current_native_id)) else { continue; };
+            if linux_process_start_ticks(provider).as_deref() != Some(&provider_start)
+                || linux_process_start_ticks(driver).as_deref() != Some(&driver_start)
+                || linux_process_start_ticks(pid).as_deref() != Some(&runtime_start)
+                || !linux_child_processes(driver).contains(&provider)
+                || (driver != pid && !linux_child_processes(pid).contains(&driver)) { return None; }
+            if found.is_some() { return None; }
+            found = Some(path);
+        }
+    }
+    found
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn omp_process_transcript(
+    _subject: &str,
+    _incarnation: &str,
+    _current_native_id: &str,
+    _account: Option<&str>,
+) -> Option<PathBuf> {
+    None
+}
+
 /// The seat's own transcript of pi-family session `id`: `<time>_<id>.jsonl` in its private
 /// session directory `sessions`, whose header names the same session.
 pub fn pi_family_transcript(sessions: &Path, id: &str) -> Option<PathBuf> {
@@ -267,13 +373,14 @@ pub fn pi_family_transcript(sessions: &Path, id: &str) -> Option<PathBuf> {
         .find(|path| pi_family_header_id(path).as_deref() == Some(id))
 }
 
-/// pi resumes by transcript path, omp by session ID. pi silently starts a new session at a
-/// path that does not exist, so both check the transcript first.
+/// pi resumes by transcript path; omp accepts a managed session ID or an explicit transcript.
+/// An explicit binding is authoritative: verify it and refuse rather than finding a substitute.
 pub fn pi_family_argv(
     driver: &str,
     argv: Vec<String>,
     sessions: &Path,
     id: &str,
+    reported_path: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
     refuse_authored(
@@ -289,14 +396,19 @@ pub fn pi_family_argv(
             "--no-session",
         ],
     )?;
-    let transcript = pi_family_transcript(sessions, id).ok_or_else(|| {
+    let transcript = match reported_path {
+        Some(path) => pi_family_reported_transcript(path, id),
+        None => pi_family_transcript(sessions, id),
+    }
+    .ok_or_else(|| {
         Refusal::new(
             "transcript-missing",
-            format!("{driver} session {id} has no transcript in {}", sessions.display()),
+            format!("{driver} session {id} has no matching readable transcript"),
         )
     })?;
     Ok(match driver {
-        "omp" => insert_after_program(argv, &["--resume", id]),
+        "omp" if reported_path.is_none() => insert_after_program(argv, &["--resume", id]),
+        "omp" => insert_after_program(argv, &["--resume", &transcript.to_string_lossy()]),
         _ => insert_after_program(argv, &["--session", &transcript.to_string_lossy()]),
     })
 }
@@ -461,7 +573,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi"]), &sessions, "one")
+            pi_family_argv("pi", argv(&["pi"]), &sessions, "one", None)
                 .unwrap_err()
                 .code,
             "transcript-missing"
@@ -473,19 +585,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two").unwrap(),
+            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two", None).unwrap(),
             argv(&["pi", "--session", &path.to_string_lossy(), "-e", "x"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp"]), &sessions, "two").unwrap(),
+            pi_family_argv("omp", argv(&["omp"]), &sessions, "two", None).unwrap(),
             argv(&["omp", "--resume", "two"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two")
+            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two", None)
                 .unwrap_err()
                 .code,
             "authored-session-selection"
         );
+    }
+
+    #[test]
+    fn pi_family_reports_verify_the_exact_external_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("external.jsonl");
+        assert_eq!(pi_family_reported_transcript(&path, "one"), None);
+        fs::write(&path, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
+        assert_eq!(pi_family_reported_transcript(&path, "one"), None);
+        fs::write(&path, "{}\n").unwrap();
+        assert_eq!(pi_family_reported_transcript(&path, "one"), None);
+        fs::write(&path, "{\"type\":\"title\"}\n{\"type\":\"session\",\"id\":\"one\"}\n").unwrap();
+        assert_eq!(
+            pi_family_reported_transcript(&path, "one"),
+            Some(fs::canonicalize(&path).unwrap())
+        );
+        assert_eq!(pi_family_reported_transcript(root.path(), "one"), None);
+        assert_eq!(pi_family_reported_transcript(&path, "../one"), None);
+    }
+
+    #[test]
+    fn pi_family_restores_the_exact_external_binding_without_managed_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("provider-sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let managed = sessions.join("time_one.jsonl");
+        fs::write(&managed, "{\"type\":\"session\",\"id\":\"one\"}\n").unwrap();
+        let external = root.path().join("external.jsonl");
+        fs::write(&external, "{\"type\":\"session\",\"id\":\"one\"}\n").unwrap();
+        for (driver, selector) in [("pi", "--session"), ("omp", "--resume")] {
+            assert_eq!(
+                pi_family_argv(driver, argv(&[driver]), &sessions, "one", Some(&external)).unwrap(),
+                argv(&[driver, selector, &fs::canonicalize(&external).unwrap().to_string_lossy()])
+            );
+            fs::write(&external, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
+            assert_eq!(
+                pi_family_argv(driver, argv(&[driver]), &sessions, "one", Some(&external))
+                    .unwrap_err().code,
+                "transcript-missing"
+            );
+            fs::remove_file(&external).unwrap();
+            assert_eq!(
+                pi_family_argv(driver, argv(&[driver]), &sessions, "one", Some(&external))
+                    .unwrap_err().code,
+                "transcript-missing"
+            );
+            fs::write(&external, "{\"type\":\"session\",\"id\":\"one\"}\n").unwrap();
+        }
     }
 
     #[test]

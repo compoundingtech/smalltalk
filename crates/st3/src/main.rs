@@ -15534,7 +15534,7 @@ async fn run_st2_native_driver(
         )
     })
     .await?;
-    let select = |argv: Vec<String>, session: &str| -> Result<_> {
+    let select = |argv: Vec<String>, session: &str, path: Option<&Path>| -> Result<_> {
         Ok(match driver {
             "claude" => st3::native_resume::claude_argv(
                 argv,
@@ -15547,6 +15547,7 @@ async fn run_st2_native_driver(
                 argv,
                 &paths.session_dir.join("provider-sessions"),
                 session,
+                path,
             ),
             "opencode" => st3::native_resume::opencode_argv(
                 argv,
@@ -15580,7 +15581,8 @@ async fn run_st2_native_driver(
                 .await);
             }
         }
-        match select(argv, &session)? {
+        let path = std::env::var_os(st3::rollout::RESUME_PATH_ENV).map(PathBuf::from);
+        match select(argv, &session, path.as_deref())? {
             Ok(argv) => {
                 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
                 selected_session = Some(session);
@@ -15603,7 +15605,7 @@ async fn run_st2_native_driver(
                 path.as_deref(),
             );
         }
-        match select(argv.clone(), &session)? {
+        match select(argv.clone(), &session, path.as_deref())? {
             Ok(argv) => {
                 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
                 selected_session = Some(session);
@@ -18554,18 +18556,42 @@ impl PiFamilyReports {
         // It stays pending and goes again with the next report. A session is reported only once
         // its transcript exists, because only then can a resume find it: pi writes nothing until
         // its first turn.
-        let resumable = |native: &str| {
-            std::env::var_os(st_drivers::driver_paths::SESSION_DIR_ENV).is_none_or(|dir| {
-                st3::native_resume::pi_family_transcript(
-                    &PathBuf::from(dir).join("provider-sessions"),
-                    native,
-                )
-                .is_some()
-            })
-        };
-        if let Some((native, path)) = self.native_session.clone()
-            && resumable(&native)
-        {
+        if let Some((native, path)) = self.native_session.clone() {
+            let path = match path {
+                Some(path) => {
+                    let Some(verified) = st3::native_resume::pi_family_reported_transcript(
+                        Path::new(&path),
+                        &native,
+                    ) else {
+                        return Ok(());
+                    };
+                    Some(verified)
+                }
+                None => {
+                    let recovered = if driver == "omp" {
+                        st3::native_resume::omp_process_transcript(
+                            subject,
+                            incarnation,
+                            &native,
+                            std::env::var("ST3_ACCOUNT").ok().filter(|value| !value.is_empty()).as_deref(),
+                        )
+                    } else {
+                        None
+                    };
+                    if recovered.is_none()
+                        && std::env::var_os(st_drivers::driver_paths::SESSION_DIR_ENV).is_some_and(|dir| {
+                            st3::native_resume::pi_family_transcript(
+                                &PathBuf::from(dir).join("provider-sessions"),
+                                &native,
+                            )
+                            .is_none()
+                        })
+                    {
+                        return Ok(());
+                    }
+                    recovered
+                }
+            };
             let reported: Result<ClaimRecord> = client
                 .post(
                     "/v1/agents/native-session",

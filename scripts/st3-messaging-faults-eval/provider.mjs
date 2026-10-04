@@ -73,7 +73,7 @@ const post = (path, body) => new Promise((resolve, reject) => {
 });
 const ctx = {
   isIdle: () => true,
-  sessionManager: { getSessionId: () => `fault-provider-${process.pid}`, getEntries: () => [] },
+  sessionManager: { getSessionId: () => `fault-provider-${process.pid}`, getSessionFile: () => undefined, getEntries: () => [] },
   ui: { notify: (message, level) => record({ event: 'notification', message, level }) },
 };
 let acknowledgements = Promise.resolve();

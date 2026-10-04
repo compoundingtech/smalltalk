@@ -120,7 +120,7 @@ for (const name of ["message_end", "turn_end", "session_compact"]) {
 const bareCtx = {
   isIdle: () => true,
   ui: { notify: () => {} },
-  sessionManager: { getSessionId: () => "session-smoke" },
+  sessionManager: { getSessionId: () => "session-smoke", getSessionFile: () => path.join(dir, "session-smoke.jsonl") },
 };
 // A ctx carrying the surfaces measured on omp 18.0.9 (and reproduced on 18.0.3). `tokens` is the
 // prompt figure — deliberately not this message's `totalTokens`. Without this ctx the producer's
@@ -132,6 +132,7 @@ const fullCtx = {
   getContextUsage: () => ({ tokens: 22500, contextWindow: 4000, percent: 562.5 }),
   sessionManager: {
     getSessionId: () => "session-smoke",
+    getSessionFile: () => path.join(dir, "session-smoke.jsonl"),
     getEntries: () => [{ type: "message" }, { type: "compaction" }],
   },
 };
@@ -147,6 +148,7 @@ const throwingCtx = {
   },
   sessionManager: {
     getSessionId: () => "session-smoke",
+    getSessionFile: () => path.join(dir, "session-smoke.jsonl"),
     getEntries: () => {
       throw new Error("smoke: entries are not readable");
     },
@@ -527,7 +529,7 @@ const subCtx = {
   ...fullCtx,
   isIdle: () => false,
   agent: { kind: "sub", id: "0-Review", name: "task", depth: 1, parentId: "Main" },
-  sessionManager: { getSessionId: () => "session-subagent", getEntries: () => [] },
+  sessionManager: { getSessionId: () => "session-subagent", getSessionFile: () => undefined, getEntries: () => [] },
 };
 const pidsBeforeSubagent = fs.readFileSync(pidPath, "utf8");
 const framesBeforeSubagent = readFrames().length;
@@ -586,6 +588,7 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
     ...bareCtx,
     sessionManager: {
       getSessionId: () => nativeSession,
+      getSessionFile: () => path.join(dir, `${nativeSession}.jsonl`),
       getLeafId: () => branch.at(-1)?.id ?? null,
       getBranch: () => { branchReads++; return branch; },
       // A newer result on a different branch MUST NOT seed this binding.
