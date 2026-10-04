@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use st3::client::Client;
 use st3::model::ClaimInput;
 
-const ST3: &str = env!("CARGO_BIN_EXE_st3");
+const ST3: &str = env!("CARGO_BIN_EXE_st3-fixture");
 const PERSON: &str = "person/fleet-tester";
 const NOTE: &str = "custom.fleet-test.note";
 
@@ -112,7 +112,7 @@ impl Node {
                 .map(|argument| (*argument).to_owned())
                 .collect(),
         );
-        let mut command = Command::new(&self.binary);
+        let mut command = st3::test_support::command(&self.binary);
         command
             .args(arguments)
             .current_dir(&self.root)
@@ -1684,6 +1684,125 @@ async fn leave_drains_everything_before_it_leaves() {
     assert!(b.state_dir().join("left-fleet.json").exists());
     // While leaving, b refused new writes; now it accepts them again, locally.
     b.note("local-after-leave").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "orchard").await;
+    let b = joined(root.path(), &a, "meadow", &[]).await;
+    let mut c = joined(root.path(), &a, "grove", &[]).await;
+    c.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    c.note("before-leave").await;
+    let before = BTreeSet::from(["custom/fleet-test/before-leave".to_owned()]);
+    wait_for_notes(&a, &before, 60, &[&a, &b, &c]).await;
+    wait_for_notes(&b, &before, 60, &[&a, &b, &c]).await;
+
+    c.st_ok(&[
+        "fleet",
+        "leave",
+        "--no-service",
+        "--wait",
+        "2m",
+        "--as",
+        PERSON,
+    ]);
+    c.restart().await;
+    // The same local store accepts writes after leaving; its old incarnation has ended.
+    c.note("after-leave-one").await;
+    c.note("after-leave-two").await;
+    c.stop();
+    c.name = "grove-returned".into();
+    fs::write(
+        c.root.join("config/st3/config.toml"),
+        format!("node = \"{}\"\nperson = \"{PERSON}\"\n", c.name),
+    )
+    .unwrap();
+    let code = a.invite(&c.name, &[]);
+    let joined = c.join(&code, &[]);
+    assert!(
+        joined.status.success(),
+        "rejoin failed: {}{}",
+        String::from_utf8_lossy(&joined.stdout),
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    c.start().await;
+    wait_until(
+        "both peers fence the old writer's post-leave envelopes",
+        90,
+        || async {
+            a.st_json(&["replication", "status"])["fenced_envelopes"]
+                .as_u64()
+                .is_some_and(|count| count >= 2)
+                && b.st_json(&["replication", "status"])["fenced_envelopes"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 2)
+        },
+    )
+    .await;
+    // Equal envelope inventories do not imply equal admitted claims. The old local history
+    // remains on the rejoining node; reporting must not delete it to manufacture equality.
+    let after = BTreeSet::from([
+        "custom/fleet-test/after-leave-one".to_owned(),
+        "custom/fleet-test/after-leave-two".to_owned(),
+    ]);
+    assert!(after.is_subset(&c.notes().await));
+    assert!(after.is_disjoint(&a.notes().await));
+    assert!(after.is_disjoint(&b.notes().await));
+    wait_until(
+        "rejoining node compares the common envelope inventory",
+        90,
+        || async {
+            let diff = c.st_json(&["replication", "diff", "orchard"]);
+            diff["authority"]["equal"] == true && diff["status"] == "up"
+        },
+    )
+    .await;
+    let diff = c.st_json(&["replication", "diff", "orchard"]);
+    let doctor = c.st(&["--json", "doctor"]);
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let admission = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "fleet-admission")
+        .unwrap();
+    let waited = c.st(&["fleet", "wait", "--timeout", "5s"]);
+    eprintln!(
+        "rejoin receipt: {}",
+        json!({
+            "diff": diff,
+            "admission": admission,
+            "wait_success": waited.status.success(),
+            "wait_stdout": String::from_utf8_lossy(&waited.stdout),
+            "wait_stderr": String::from_utf8_lossy(&waited.stderr),
+        })
+    );
+    assert_eq!(diff["graph"]["equal"], false, "{diff}");
+    assert!(
+        diff["differing_tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|table| table == "claim_sources"),
+        "{diff}"
+    );
+    assert!(
+        admission["message"]
+            .as_str()
+            .unwrap()
+            .contains("admitted beyond high water"),
+        "{admission}"
+    );
+    assert!(
+        !waited.status.success(),
+        "fleet wait accepted retained fenced history"
+    );
+    assert!(
+        String::from_utf8_lossy(&waited.stderr).contains("projects a different graph"),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

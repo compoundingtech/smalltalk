@@ -61,12 +61,12 @@ use crate::store::Store;
 mod client_blobs;
 mod client_presence;
 mod client_v0;
-mod owned_sets;
 mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
 mod mailbox;
+mod owned_sets;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
@@ -460,6 +460,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
+        .route("/v1/agents/rollout", post(rollout_agent))
         .route("/v1/agents/start", post(start_mission_seat))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
@@ -2230,6 +2231,7 @@ fn client_agent_resources_uncached(
                 })).collect::<Vec<_>>(),
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
+                "rollout": store.rollout(&subject.subject)?,
             });
             Ok((name, value))
         })
@@ -4373,6 +4375,12 @@ async fn serve_unix_with_ancestor(
     bind_harness: bool,
     ancestor: fn(u32) -> Option<String>,
 ) -> anyhow::Result<()> {
+    // Only st3-fixture initializes this process-local state. Disable host ancestry while
+    // retaining native-driver identification, which mailbox subscriptions require.
+    #[cfg(feature = "test-support")]
+    let bind_ancestry = bind_harness && crate::test_support::login_shell().is_none();
+    #[cfg(not(feature = "test-support"))]
+    let bind_ancestry = bind_harness;
     crate::config::validate_unix_socket_path(socket, "--socket or --client-gateway-socket")?;
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
@@ -4413,7 +4421,7 @@ async fn serve_unix_with_ancestor(
             // out of the accept loop so a slow lookup delays only this peer.
             let (bound_agent, caller, delivery_peer) = match peer_pid {
                 Some(pid) => tokio::task::spawn_blocking(move || {
-                    let bound_agent = bind_harness.then(|| ancestor(pid)).flatten();
+                    let bound_agent = bind_ancestry.then(|| ancestor(pid)).flatten();
                     let caller = Some(crate::profile::Caller::of_command(
                         local_process_arguments(pid).map(|(arguments, _)| arguments),
                         bound_agent.as_deref(),
@@ -4760,6 +4768,7 @@ async fn guard_bound_request(
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
         "/v1/agents/restart",
+        "/v1/agents/rollout",
         "/v1/agents/start",
         "/v1/agents/suspend",
         "/v1/agents/resume",
@@ -4821,7 +4830,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
-        "features": {"owned_sets":1},
+        "features": {"owned_sets":1,"seat_rollout":1},
     })))
 }
 
@@ -8491,6 +8500,56 @@ async fn publication_refusals(
 }
 
 #[derive(Deserialize)]
+struct AgentRolloutRequest {
+    subject: String,
+    actor: String,
+    expected_desired: String,
+    expected_incarnation: String,
+    policy: crate::rollout::Policy,
+    idempotency_key: String,
+}
+async fn rollout_agent(
+    State(state): State<AppState>,
+    Json(request): Json<AgentRolloutRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "invalid-rollout-actor")?;
+    let subject = agent_subject(request.subject);
+    let old =
+        crate::rollout::launched_member(&state.store, &subject, &request.expected_incarnation)
+            .map_err(ApiError::internal)?
+            .map(|(_, member)| member)
+            .or_else(|| {
+                state
+                    .store
+                    .rollout(&subject)
+                    .ok()
+                    .flatten()
+                    .filter(|o| o.old_incarnation == request.expected_incarnation)
+                    .map(|o| o.old_member)
+            })
+            .ok_or_else(|| {
+                ApiError::bad(St3Error::new(
+                    "rollout-launch-unknown",
+                    "the named incarnation has no original launch receipt",
+                ))
+            })?;
+    let response = state
+        .store
+        .request_rollout(
+            &subject,
+            &request.expected_desired,
+            &old,
+            &request.expected_incarnation,
+            &actor,
+            &request.policy,
+            &format!("seat-rollout-retry:{subject}:{}", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
 struct AgentRestartRequest {
     subject: String,
     actor: String,
@@ -8515,6 +8574,17 @@ async fn restart_agent(
         .map_err(ApiError::internal)?
     {
         return Ok(Json(prior));
+    }
+    if state
+        .store
+        .rollout(&subject)
+        .map_err(ApiError::bad)?
+        .is_some_and(|o| o.holds_seat())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "rollout-in-progress",
+            "the seat has a rollout; inspect it or retry with st agents rollout",
+        )));
     }
     if crate::suspension::current(&state.store, &subject)
         .map_err(ApiError::internal)?
@@ -8654,7 +8724,21 @@ fn suspension_target(
     ),
     ApiError,
 > {
-    state.store.owned_member_guard(subject).map_err(ApiError::bad)?;
+    state
+        .store
+        .owned_member_guard(subject)
+        .map_err(ApiError::bad)?;
+    if state
+        .store
+        .rollout(subject)
+        .map_err(ApiError::bad)?
+        .is_some_and(|o| o.holds_seat())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "rollout-in-progress",
+            "the seat has a rollout; inspect it or retry with st agents rollout",
+        )));
+    }
     let status = state
         .store
         .status(Some(subject))
@@ -13216,6 +13300,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
             "/v1/agents/restart",
+            "/v1/agents/rollout",
             "/v1/agents/start",
             "/v1/agents/suspend",
             "/v1/agents/resume",
@@ -16057,7 +16142,7 @@ mission "work" state="ready" {
                 std::fs::write(workspace.path().join("tracked"), "original\n").unwrap();
             }
             assert!(
-                std::process::Command::new("git")
+                crate::test_support::git()
                     .args(args)
                     .current_dir(workspace.path())
                     .status()

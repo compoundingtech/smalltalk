@@ -1635,11 +1635,21 @@ enum MissionViewCommand {
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
     /// Publish exact authored mission KDL after preview, once its exec gates pass a check.
+    ///
+    /// Goals, constraints and named documents encode every known rule and decision.
+    /// `depends-on` orders steps; `missions start --after` orders runs without reports.
+    /// A final step assigned to the author, depending on the last real step, reaches the
+    /// author once when work is done. Review gates mark decisions only a person can make.
     Publish(MissionPublishArgs),
     /// Run each exec gate in a mission file once, now, the way a run would, and report its
     /// answer: pass (exit 0), not yet (exit 1), broken (anything else), or unchecked.
     Check(MissionCheckArgs),
     /// Start one run from the current ready mission revision.
+    ///
+    /// Goals, constraints and named documents encode every known rule and decision.
+    /// `depends-on` orders steps; `--after` orders runs without reports.
+    /// A final step assigned to the author, depending on the last real step, reaches the
+    /// author once when work is done. Review gates mark decisions only a person can make.
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
@@ -2630,6 +2640,8 @@ enum AgentsCommand {
     Stop(AgentStopArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
     Restart(AgentRestartArgs),
+    /// Retry a published owned-seat cutover with fresh desired and incarnation fences.
+    Rollout(AgentRolloutArgs),
     /// Stop a quiet seat at a clean boundary, keeping its native session to resume.
     ///
     /// The seat must be idle, with no pending ask or unsent input, no claimed step and no
@@ -2835,6 +2847,14 @@ struct OwnedSetApplyArgs {
     expect_set: String,
     #[arg(long)]
     dry_run: bool,
+    /// Drain changed and retiring seats, then resume their native conversation.
+    #[arg(long, value_parser = ["when-idle"])]
+    rollout: Option<String>,
+    #[arg(long, default_value = "30m", requires = "rollout")]
+    rollout_deadline: String,
+    /// Interrupt busy work at the deadline; identity and session fences still apply.
+    #[arg(long, requires = "rollout")]
+    force_after_deadline: bool,
     #[arg(long = "adopt")]
     adopt: Vec<String>,
     #[arg(long)]
@@ -2902,6 +2922,14 @@ async fn run_owned_set_apply(
             sequence: args.source_sequence,
         },
         expected_set: args.expect_set,
+        rollout: args
+            .rollout
+            .map(|_| {
+                st3::graph::parse_duration(&args.rollout_deadline, true).map(|duration| {
+                    st3::rollout::Policy::when_idle(duration, args.force_after_deadline)
+                })
+            })
+            .transpose()?,
         adopt: args.adopt.into_iter().collect(),
         allow_empty: args.allow_empty,
         confirm_retire: args.confirm_retire,
@@ -3048,6 +3076,18 @@ struct AgentStopArgs {
     /// Print the exact stop KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+}
+
+#[derive(Args)]
+struct AgentRolloutArgs {
+    #[arg(value_parser = parse_agent_start_identity)]
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT", value_parser = parse_publication_actor)]
+    actor: String,
+    #[arg(long, default_value = "30m")]
+    deadline: String,
+    #[arg(long)]
+    force_after_deadline: bool,
 }
 
 #[derive(Args)]
@@ -3328,6 +3368,8 @@ struct AttentionWithdrawArgs {
 #[derive(Subcommand)]
 enum WorkCommand {
     /// Ask a person through a runtime step owned by live work.
+    ///
+    /// Puts a structured request on the person's home.
     Ask(WorkAskArgs),
     /// Bring a person information they asked for. Nothing waits on it; it clears once read.
     Update(WorkUpdateArgs),
@@ -3366,6 +3408,8 @@ enum WorkCommand {
     /// Extend the live lease for work this incarnation still owns.
     Renew(WorkActionArgs),
     /// Record a material progress update without changing ownership.
+    ///
+    /// Records progress in the graph at no cost to anyone; people read it in stui.
     Progress(WorkActionArgs),
     /// Add time to the execution budget of claimed work that ran out of it.
     Extend(WorkExtendArgs),
@@ -3382,6 +3426,11 @@ enum WorkCommand {
     /// Publish the exact ready mission produced by one claimed step.
     PublishMission(WorkPublishMissionArgs),
     /// Propose a fenced revision to the mission that owns this work.
+    ///
+    /// Goals, constraints and named documents encode every known rule and decision.
+    /// `depends-on` orders steps; `missions start --after` orders runs without reports.
+    /// A final step assigned to the author, depending on the last real step, reaches the
+    /// author once when work is done. Review gates mark decisions only a person can make.
     Revise(WorkReviseArgs),
     /// Inspect or decide one mission revision proposal and its generations.
     Revision {
@@ -3571,6 +3620,9 @@ enum MessageCommand {
     },
 
     /// Send one durable normalized message to a person or agent.
+    ///
+    /// A message is a direct connection: it wakes the recipient agent for a full turn,
+    /// which rereads its context.
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
@@ -3580,6 +3632,9 @@ enum MessageCommand {
     /// Read exact messages and optionally mark them read or archived.
     Read(MessageReadArgs),
     /// Reply to one canonical message ID while preserving its thread.
+    ///
+    /// A message is a direct connection: it wakes the recipient agent for a full turn,
+    /// which rereads its context.
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
@@ -3824,6 +3879,11 @@ fn main() -> ExitCode {
     {
         return run_driver_hook();
     }
+    // Cargo bakes the target name into each executable. The installed st3 binary cannot
+    // enable this with an argument, environment variable, or a different filename.
+    #[cfg(feature = "test-support")]
+    let _fixture_shell = (env!("CARGO_BIN_NAME") == "st3-fixture")
+        .then(st3::test_support::initialize_fixture);
     // SAFETY: no other thread exists yet; the async runtime starts after this returns.
     unsafe { st_drivers::reexec::take_resume_environment() };
     if st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV).is_some() {
@@ -3889,21 +3949,23 @@ fn run_driver_hook() -> ExitCode {
         return ExitCode::from(2);
     };
     let env = st3::driver_hook::ProcessEnv;
-    let run = || st3::driver_hook::run(
-        name,
-        rest,
-        &env,
-        // Unlocked: the status-line tee reads stdin itself, and a held lock would deadlock it.
-        &mut std::io::stdin(),
-        &mut |diagnostic| {
-            if let Err(error) = st3::driver_hook::post_diagnostic(&env, &diagnostic) {
-                eprintln!(
-                    "st: could not record the {} diagnostic: {error:#}",
-                    diagnostic.code
-                );
-            }
-        },
-    );
+    let run = || {
+        st3::driver_hook::run(
+            name,
+            rest,
+            &env,
+            // Unlocked: the status-line tee reads stdin itself, and a held lock would deadlock it.
+            &mut std::io::stdin(),
+            &mut |diagnostic| {
+                if let Err(error) = st3::driver_hook::post_diagnostic(&env, &diagnostic) {
+                    eprintln!(
+                        "st: could not record the {} diagnostic: {error:#}",
+                        diagnostic.code
+                    );
+                }
+            },
+        )
+    };
     let code = if name == "claude-observe" {
         st3::telemetry::hook(&env, run)
     } else {
@@ -4334,6 +4396,7 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Start(args) => Some(args.actor.as_str()),
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
             AgentsCommand::Restart(args) => Some(args.actor.as_str()),
+            AgentsCommand::Rollout(args) => Some(args.actor.as_str()),
             AgentsCommand::Suspend(args) => Some(args.actor.as_str()),
             AgentsCommand::Resume(args) => Some(args.actor.as_str()),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
@@ -4815,7 +4878,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
         kind: "daemon.started".into(),
         actor: None,
         fields: BTreeMap::from([
-            ("features".into(), serde_json::json!({"owned_sets":1})),
+            (
+                "features".into(),
+                serde_json::json!({"owned_sets":1,"seat_rollout":1}),
+            ),
             ("status".into(), Value::String("running".into())),
             ("pid".into(), Value::from(std::process::id())),
             (
@@ -9920,7 +9986,11 @@ fn normalize_member_subject(subject: &str, namespace: &str) -> String {
 /// The identity an attachment command acts as: the one named, the seat's, or the configured person.
 fn blob_actor(named: Option<String>, configured_person: Option<&str>) -> Result<String> {
     let actor = named
-        .or_else(|| std::env::var("ST_AGENT").ok().filter(|agent| !agent.is_empty()))
+        .or_else(|| {
+            std::env::var("ST_AGENT")
+                .ok()
+                .filter(|agent| !agent.is_empty())
+        })
         .or_else(|| configured_person.map(str::to_owned))
         .context("name who acts with --as, or run inside a seat or with a configured person")?;
     reject_foreign_agent_actor(&actor)?;
@@ -9951,12 +10021,7 @@ async fn upload_attachment(
     let media_type = media_type
         .map(str::to_owned)
         .or_else(|| st3::blobs::sniff_media_type(&bytes).map(str::to_owned))
-        .with_context(|| {
-            format!(
-                "{} is not a PNG, JPEG, GIF or WebP image",
-                file.display()
-            )
-        })?;
+        .with_context(|| format!("{} is not a PNG, JPEG, GIF or WebP image", file.display()))?;
     let uploaded = generated_client(endpoint, Some(actor))?
         .upload_blob(bytes, &media_type)
         .await
@@ -10723,6 +10788,27 @@ async fn run_agents(
                 Ok(())
             }
         }
+        AgentsCommand::Rollout(args) => {
+            let subject = format!("agent/{}", args.subject);
+            let client = cli_client(endpoint);
+            let status = status_for(&client, &subject).await?;
+            let current = status
+                .subjects
+                .iter()
+                .find(|item| item.subject == subject)
+                .context("no declared seat")?;
+            let incarnation = current
+                .actual
+                .as_ref()
+                .and_then(|value| value.get("incarnation_id"))
+                .and_then(Value::as_str)
+                .context("no recorded incarnation")?;
+            let response: Value = client.post("/v1/agents/rollout",&json!({"subject":subject,"actor":args.actor,
+                "expected_desired":current.desired_token,"expected_incarnation":incarnation,
+                "policy":st3::rollout::Policy::when_idle(st3::graph::parse_duration(&args.deadline,true)?,args.force_after_deadline),
+                "idempotency_key":uuid::Uuid::now_v7().to_string()})).await?;
+            return print_value(&response, json_output);
+        }
         AgentsCommand::Restart(args) => {
             let timeout = st3::graph::parse_duration(&args.timeout, false)?;
             let subject = format!("agent/{}", args.subject);
@@ -11464,6 +11550,7 @@ async fn run_agent_inspection(
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
+        | AgentsCommand::Rollout(_)
         | AgentsCommand::Restart(_)
         | AgentsCommand::Suspend(_)
         | AgentsCommand::Resume(_)
@@ -12298,6 +12385,40 @@ fn render_client_agent(
             "SUSPENSION   {} {}{session}{failure}",
             suspension.action, suspension.phase
         );
+    }
+    if let Some(rollout) = &agent.rollout {
+        let phase = rollout["phase"].as_str().unwrap_or("unknown");
+        let id = rollout["id"].as_str().unwrap_or("unknown");
+        let forced = if rollout["forced"].as_bool() == Some(true) {
+            " · forced"
+        } else {
+            ""
+        };
+        let _ = writeln!(output, "ROLLOUT      {phase}{forced} · {id}");
+        if let Some(blockers) = rollout["blocking"]
+            .as_array()
+            .filter(|items| !items.is_empty())
+        {
+            let _ = writeln!(
+                output,
+                "BLOCKERS     {}",
+                blockers
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if let Some(reason) = rollout["reason"].as_str() {
+            let _ = writeln!(output, "ROLLOUT WHY  {reason}");
+        }
+        if matches!(phase, "held" | "failed" | "blocked") {
+            let _ = writeln!(
+                output,
+                "RETRY        st agents rollout {} --as ACTOR",
+                agent.header.id
+            );
+        }
     }
     if let Some(delivery) = &agent.delivery {
         match delivery.reason.as_deref() {
@@ -14982,6 +15103,24 @@ async fn run_st2_native_driver(
     // A resumed seat relaunches its harness on the session it suspended on, or not at all. Any
     // other relaunch continues the seat's last session when the harness can, or starts anew.
     let argv = if let Some(session) = st3::native_resume::requested() {
+        if driver == "claude" {
+            let path = std::env::var_os(st3::rollout::RESUME_PATH_ENV).map(PathBuf::from);
+            if let Err(refusal) = st3::native_resume::claude_carry_transcript(
+                &session,
+                &std::env::current_dir()?,
+                st3::native_resume::claude_home().as_deref(),
+                path.as_deref(),
+            ) {
+                return Err(refuse_native_resume(
+                    client,
+                    subject,
+                    &incarnation,
+                    driver,
+                    st3::native_resume::Refusal::new("transcript-copy-failed", refusal.to_string()),
+                )
+                .await);
+            }
+        }
         match select(argv, &session)? {
             Ok(argv) => argv,
             Err(refusal) => {
@@ -16322,6 +16461,7 @@ async fn publish_harness_activity(
             Value::String(observed.blocked_on.as_str().into()),
         ),
         ("ask".into(), Value::String(observed.ask.as_str().into())),
+        ("background_jobs".into(), observed.background_jobs.map(Value::from).unwrap_or(Value::Null)),
         (
             "input_buffer".into(),
             Value::String(observed.input_buffer.as_str().into()),
@@ -17201,6 +17341,9 @@ async fn run_pi_channel(
                         state.failed_diagnostics.retain(|message| active.contains(message));
                         pushed_messages = messages;
                     },
+                    Some(st3::mailbox::Frame::Drain { operation }) => {
+                        if let Some(subscription) = &subscription { subscription.acknowledge_drain(operation); }
+                    },
                     Some(st3::mailbox::Frame::Seat { seat }) => {
                         let frame = json!({"type":"seat", "seat":seat});
                         stdout.write_all(format!("{}\n", serde_json::to_string(&frame)?).as_bytes()).await?;
@@ -17572,6 +17715,7 @@ impl PiChannelResume {
                 };
                 self.frame_sequence = self.frame_sequence.saturating_add(1);
                 self.pending.state = Some((status.to_owned(), self.frame_sequence));
+                self.pending.background_jobs = frame.get("backgroundJobs").and_then(Value::as_u64);
                 self.pending.blocked_on = frame
                     .get("blockedOn")
                     .and_then(Value::as_str)
@@ -17681,6 +17825,8 @@ struct PiFamilyReports {
     #[serde(default)]
     blocked_on: Option<String>,
     #[serde(default)]
+    background_jobs: Option<u64>,
+    #[serde(default)]
     ask: Option<String>,
     #[serde(default)]
     reason: Option<String>,
@@ -17737,6 +17883,7 @@ impl PiFamilyReports {
                                     .map(Value::String)
                                     .unwrap_or(Value::Null),
                             ),
+                            ("background_jobs".into(), self.background_jobs.map(Value::from).unwrap_or(Value::Null)),
                             ("input_buffer".into(), Value::Null),
                             ("exit".into(), Value::Null),
                         ])),
@@ -17758,13 +17905,28 @@ impl PiFamilyReports {
             self.acknowledgements.remove(&message);
         }
         while let Some(message) = self.reads.first().cloned() {
-            if let Some(fence) = &self.fence {
-                mailbox_receipt(client, fence, &message, "read").await?;
-                use tokio::io::AsyncWriteExt as _;
-                let mut stdout = tokio::io::stdout();
-                stdout.write_all(format!("{}\n", json!({"type":"settled","meta":{"messageId":message}})).as_bytes()).await?;
-                stdout.flush().await?;
+            match &self.fence {
+                Some(fence) => mailbox_receipt(client, fence, &message, "read").await?,
+                None => {
+                    let _: ClaimRecord = client.post(
+                        &format!("/v1/messages/{}/claims", urlencoding::encode(message.trim_start_matches("message/"))),
+                        &MessageLifecycleRequest {
+                            lifecycle: "read".into(),
+                            actor: Some(subject.into()),
+                            transport: None,
+                            runtime_id: None,
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: format!("pi-read:{subject}:{message}"),
+                        },
+                    ).await?;
+                }
             }
+            // Both transports retain the native receipt until the graph acknowledges it.
+            use tokio::io::AsyncWriteExt as _;
+            let mut stdout = tokio::io::stdout();
+            stdout.write_all(format!("{}\n", json!({"type":"settled","meta":{"messageId":message}})).as_bytes()).await?;
+            stdout.flush().await?;
             self.reads.remove(&message);
         }
         // Last, and never fatal: a report the daemon does not take must not hold back delivery.
@@ -19013,6 +19175,12 @@ impl NativeMailbox {
     }
     fn accept(&mut self, frame: Option<st3::mailbox::Frame>, runtime_id: &str) -> Result<()> {
         match frame {
+            Some(st3::mailbox::Frame::Drain { operation }) => {
+                if let Some(subscription) = &self.subscription {
+                    subscription.acknowledge_drain(operation);
+                }
+                Ok(())
+            }
             Some(st3::mailbox::Frame::Seat { seat }) => {
                 if let Err(error) = update_native_title(&seat, runtime_id) {
                     eprintln!("st: could not update seat title: {error:#}");
@@ -19110,7 +19278,9 @@ impl NativeMailbox {
         }
         // Keep uncertain handoffs in the native ledger until their read acknowledgement lands.
         let mut queued: Vec<_> = self.queued.values().cloned().collect();
-        queued.sort_by(|left, right| (left.ts_ms, &left.filename).cmp(&(right.ts_ms, &right.filename)));
+        queued.sort_by(|left, right| {
+            (left.ts_ms, &left.filename).cmp(&(right.ts_ms, &right.filename))
+        });
         st_drivers::push_mailbox::replace_active(agent_dir, queued, active);
         if let Some(error) = first_error {
             return Err(error);
@@ -20643,83 +20813,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pi_family_pending_read_survives_daemon_outage_and_reexec_under_its_fence() {
+    async fn pi_family_pending_read_survives_daemon_outage_and_reexec_across_both_transports() {
         use axum::{Json, Router, routing::post};
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("daemon.sock");
-        let client = Client::new(st3::client::Endpoint::Unix(path.clone()));
-        let mut fence = st3::mailbox::Fence::new("agent/eval.worker", "session-1", "delivery");
-        fence.epoch = 7; // The daemon's already-allocated binding, carried through exec.
-        let mut state = PiChannelResume {
-            incarnation: "session-1".into(),
-            session: "native-session".into(),
-            pending: PiFamilyReports {
-                fence: Some(fence.clone()),
+        for fenced in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("daemon.sock");
+            let client = Client::new(st3::client::Endpoint::Unix(path.clone()));
+            let mut fence = st3::mailbox::Fence::new("agent/eval.worker", "session-1", "delivery");
+            fence.epoch = 7; // The daemon's already-allocated binding, carried through exec.
+            let mut state = PiChannelResume {
+                incarnation: "session-1".into(),
+                session: "native-session".into(),
+                pending: PiFamilyReports {
+                    fence: fenced.then_some(fence.clone()),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        state.accept_frame(r#"{"type":"read","meta":{"messageId":"message/native"}}"#);
-        assert!(
-            state
-                .pending
-                .publish(
-                    &client,
-                    &fence.subject,
-                    "omp",
-                    &fence.incarnation,
-                    "native-session"
-                )
-                .await
-                .is_err()
-        );
-        assert!(state.pending.reads.contains("message/native"));
-        assert!(state.pending.acknowledgements.contains("message/native"));
-        let resume_path =
-            st_drivers::reexec::write_state(root.path(), "channel-resume", &state).unwrap();
-        let mut resumed: PiChannelResume = st_drivers::reexec::read_state(&resume_path).unwrap();
-        assert_eq!(
-            serde_json::to_value(resumed.pending.fence.as_ref().unwrap()).unwrap(),
-            serde_json::to_value(&fence).unwrap()
-        );
-        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured = received.clone();
-        let expected = serde_json::to_value(&fence).unwrap();
-        let store = std::sync::Arc::new(
-            st3::store::Store::open(&root.path().join("graph.db"), "node").unwrap(),
-        );
-        store
-            .append_claim(&ClaimInput {
-                subject: "message/native".into(),
-                kind: "message.sent".into(),
-                actor: Some("person/eval".into()),
-                fields: BTreeMap::from([
-                    ("status".into(), json!("sent")),
-                    ("from".into(), json!("person/eval")),
-                    ("to".into(), json!(fence.subject)),
-                    ("content".into(), json!("QUARTZ SIGNAL")),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("read-resume-send".into()),
-            })
-            .unwrap();
-        let graph = store.clone();
-        let app = Router::new().route(
-            "/v1/mailbox/receipts",
-            post(move |Json(receipt): Json<st3::mailbox::Receipt>| {
+            };
+            state.accept_frame(r#"{"type":"read","meta":{"messageId":"message/native"}}"#);
+            assert!(
+                state
+                    .pending
+                    .publish(
+                        &client,
+                        &fence.subject,
+                        "omp",
+                        &fence.incarnation,
+                        "native-session"
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(state.pending.reads.contains("message/native"));
+            assert!(state.pending.acknowledgements.contains("message/native"));
+            let resume_path =
+                st_drivers::reexec::write_state(root.path(), "channel-resume", &state).unwrap();
+            let mut resumed: PiChannelResume = st_drivers::reexec::read_state(&resume_path).unwrap();
+            assert_eq!(
+                serde_json::to_value(&resumed.pending.fence).unwrap(),
+                serde_json::to_value(fenced.then_some(&fence)).unwrap()
+            );
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = received.clone();
+            let expected = serde_json::to_value(&fence).unwrap();
+            let store = std::sync::Arc::new(
+                st3::store::Store::open(&root.path().join("graph.db"), "node").unwrap(),
+            );
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/native".into(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/eval".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), json!("sent")),
+                        ("from".into(), json!("person/eval")),
+                        ("to".into(), json!(fence.subject)),
+                        ("content".into(), json!("QUARTZ SIGNAL")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some("read-resume-send".into()),
+                })
+                .unwrap();
+            let graph = store.clone();
+            let handler = post(move |Json(receipt): Json<Value>| {
                 let received = captured.clone();
                 let expected = expected.clone();
                 let store = graph.clone();
                 async move {
-                    assert_eq!(serde_json::to_value(&receipt.fence).unwrap(), expected);
-                    received.lock().unwrap().push(receipt.lifecycle.clone());
+                    let lifecycle = receipt["lifecycle"].as_str().unwrap().to_owned();
+                    let (message, actor) = if fenced {
+                        let receipt: st3::mailbox::Receipt = serde_json::from_value(receipt).unwrap();
+                        assert_eq!(serde_json::to_value(&receipt.fence).unwrap(), expected);
+                        (receipt.message, receipt.fence.subject)
+                    } else {
+                        assert_eq!(receipt["actor"], "agent/eval.worker");
+                        ("message/native".into(), "agent/eval.worker".into())
+                    };
+                    received.lock().unwrap().push(lifecycle.clone());
                     let record = store
                         .append_claim(&ClaimInput {
-                            subject: receipt.message,
-                            kind: format!("message.{}", receipt.lifecycle),
-                            actor: Some(receipt.fence.subject),
-                            fields: BTreeMap::from([("status".into(), json!(receipt.lifecycle))]),
+                            subject: message,
+                            kind: format!("message.{lifecycle}"),
+                            actor: Some(actor),
+                            fields: BTreeMap::from([("status".into(), json!(lifecycle))]),
                             evidence: Vec::new(),
                             expected_subject: None,
                             idempotency_key: None,
@@ -20727,38 +20904,41 @@ mod tests {
                         .unwrap();
                     Json(json!({"api_version":"st3.v1", "value":record}))
                 }
-            }),
-        );
-        let server_path = path.clone();
-        let server = tokio::spawn(async move {
-            st3::api::serve_unix(&server_path, app).await.unwrap();
-        });
-        for _ in 0..100 {
-            if path.exists() {
-                break;
+            });
+            let app = Router::new()
+                .route("/v1/mailbox/receipts", handler.clone())
+                .route("/v1/messages/{message_id}/claims", handler);
+            let server_path = path.clone();
+            let server = tokio::spawn(async move {
+                st3::api::serve_unix(&server_path, app).await.unwrap();
+            });
+            for _ in 0..100 {
+                if path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            resumed
+                .pending
+                .publish(
+                    &client,
+                    &fence.subject,
+                    "omp",
+                    &fence.incarnation,
+                    "native-session",
+                )
+                .await
+                .unwrap();
+            assert!(resumed.pending.reads.is_empty());
+            assert!(resumed.pending.acknowledgements.is_empty());
+            assert_eq!(*received.lock().unwrap(), vec!["delivered", "read"]);
+            assert_eq!(
+                store.message("message/native").unwrap().unwrap().status,
+                "read"
+            );
+            assert!(!root.path().join("resources").exists());
+            server.abort();
         }
-        resumed
-            .pending
-            .publish(
-                &client,
-                &fence.subject,
-                "omp",
-                &fence.incarnation,
-                "native-session",
-            )
-            .await
-            .unwrap();
-        assert!(resumed.pending.reads.is_empty());
-        assert!(resumed.pending.acknowledgements.is_empty());
-        assert_eq!(*received.lock().unwrap(), vec!["delivered", "read"]);
-        assert_eq!(
-            store.message("message/native").unwrap().unwrap().status,
-            "read"
-        );
-        assert!(!root.path().join("resources").exists());
-        server.abort();
     }
     #[test]
     fn a_human_ask_survives_channel_replacement_until_an_answered_state_frame() {

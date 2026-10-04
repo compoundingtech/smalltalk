@@ -7,6 +7,10 @@ license = "MIT"
 # Most tests share one binary; descriptor-limit fault injection needs its own process.
 autotests = false
 
+[features]
+# Enabled through the self dev-dependency during tests, never by a production build.
+test-support = []
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["json", "ws"] }
@@ -59,6 +63,7 @@ uuid = { version = "1", features = ["v7"] }
 walkdir = "2"
 
 [dev-dependencies]
+st3 = { path = ".", features = ["test-support"] }
 smallclaims = { path = "../smallclaims", features = ["test-support"] }
 tokio = { version = "1", features = ["test-util"] }
 agent-spec = { path = "../agent-spec" }
@@ -71,6 +76,14 @@ proptest = "1"
 [[bin]]
 name = "st3"
 path = "src/main.rs"
+
+[[bin]]
+name = "st3-fixture"
+path = "src/fixture.rs"
+required-features = ["test-support"]
+test = false
+bench = false
+doc = false
 
 [[test]]
 name = "integration"

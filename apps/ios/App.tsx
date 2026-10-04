@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Linking, StatusBar, View } from 'react-native';
 import { DarkTheme, NavigationContainer, getFocusedRouteNameFromRoute, type RouteProp } from '@react-navigation/native';
 import { createNativeStackNavigator, type NativeStackNavigationOptions } from '@react-navigation/native-stack';
@@ -25,6 +25,8 @@ import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from '.
 import { SelectTextScreen } from './screens/SelectText';
 import { TerminalScreen } from './screens/Terminal';
 import { GlassesScreen, SpaceScreen } from './screens/Glasses';
+import { FabricProofScreen } from './screens/FabricProof';
+import { parseFabricProofLink, type FabricProofInput } from './fabricProof';
 
 // The chrome is native: one UITabBarController (react-native-screens' tabs, through
 // @react-navigation/bottom-tabs' native navigator) holding a UINavigationController per tab
@@ -85,6 +87,7 @@ function tabBarHidden(route: RouteProp<TabParams>): boolean {
 }
 
 function Main() {
+  const [fabricProof, setFabricProof] = useState<FabricProofInput | null>(null);
   const { credential, url, order, data, caps, actions, setTreeView, requestScroll, glassesOn } = useStore();
   const homeCount = homeRows(data.attention, caps?.session_actor).length;
   const paired = !!url && !!credential;
@@ -95,6 +98,8 @@ function Main() {
     let lastPair = '';
     const handle = (link: string | null) => {
       if (!link) return;
+      const proof = parseFabricProofLink(link);
+      if (proof) { setFabricProof(proof); return; }
       const parsed = parseDevLink(link);
       if (!parsed) return;
       if (parsed.kind === 'pair') { if (lastPair !== link) { lastPair = link; void actions.pairFromLink(parsed.gateway, parsed.id, parsed.code); } return; }
@@ -111,6 +116,7 @@ function Main() {
       }
     };
     void Linking.getInitialURL().then(handle);
+    handle(process.env.EXPO_PUBLIC_ST3_FABRIC_PROOF_LINK ?? null);
     handle(process.env.EXPO_PUBLIC_ST3_TEST_PAIR_LINK ?? null);
     // Links to follow at launch, six seconds apart, for headless screenshots: the simulator asks
     // before opening each link it is handed, and nobody is there to answer.
@@ -119,6 +125,7 @@ function Main() {
     return () => subscription.remove();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  if (__DEV__ && fabricProof) return <FabricProofScreen input={fabricProof} onClose={() => setFabricProof(null)} />;
   if (!paired) {
     return <Stack.Navigator screenOptions={stackOptions}>
       <Stack.Screen name="HomeRoot" component={PairScreen} options={{ title: 'Pair this device' }} />

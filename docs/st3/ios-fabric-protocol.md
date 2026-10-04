@@ -129,10 +129,18 @@ applies to this generic gateway exposure. Format 2’s generated `allow_shell` a
 At this pin, a `PeerBook::load` failure clears the in-memory peer book and
 transport allow-list. A later `SyncBook` validation failure occurs before the
 new book is installed. Do not infer successful admission from an edited file.
-`reload-peers` does not close already attached connections or sessions. Removing
+At the pinned v0.2.30, `reload-peers` does not close already attached connections or sessions. Removing
 the grant prevents new connections and resumes, but does not cut an already
 admitted stream. Close the app’s active carrier sessions as part of proof cleanup;
 verify detached sessions drain, expire, or are evicted on the isolated daemon.
+
+Since [v0.2.31](https://github.com/compoundingtech/fabric/blob/v0.2.31/docs/tunnel-wire.md#trust-after-admission),
+a successful peer reload ends attached and detached sessions that the new policy
+no longer permits. Direct connections close with code 403 and the same admission
+reason: `not permitted for service` for a removed grant, or
+`node is not in fabric allow-list` for a removed peer. Treat these as refusals,
+not transport losses; a failed reload ends no sessions. The wire bytes are
+unchanged. This behavior note does not advance the isolated proof's v0.2.30 pin.
 
 After fabric admits the stream, **st still checks pairing and client scopes**.
 Fabric does not synthesize a person, device grant, or bearer credential. Complete

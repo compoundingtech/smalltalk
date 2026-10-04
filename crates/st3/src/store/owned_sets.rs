@@ -19,6 +19,8 @@ pub struct Member {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Revision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<crate::rollout::Policy>,
     pub previous: Option<String>,
     pub source: Source,
     pub bundle_digest: String,
@@ -33,6 +35,8 @@ pub struct Options {
     pub source: Source,
     /// `absent` creates a set; otherwise an exact content revision is required.
     pub expected_set: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<crate::rollout::Policy>,
     #[serde(default)]
     pub adopt: BTreeSet<String>,
     #[serde(default)]
@@ -53,11 +57,15 @@ pub struct Request {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Preview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<crate::rollout::Policy>,
     pub set: String,
     pub previous: Option<String>,
     pub source: Source,
     pub changes: BTreeMap<String, String>,
     pub effects: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rollouts: BTreeMap<String, Value>,
     pub expected_subjects: BTreeMap<String, Vec<String>>,
     pub digest: String,
     pub mass_retirement: bool,
@@ -191,7 +199,7 @@ fn stop_declaration(subject: &str) -> Result<DesiredSubject, St3Error> {
 
 /// A complete winning membership also retires subjects learned only from losing branches.
 /// Such retirement is derived from the winning set claim until the next apply authors a stop.
-fn effective_members(
+pub(super) fn effective_members(
     connection: &Connection,
     view: &View,
     at: Option<u64>,
@@ -246,7 +254,7 @@ fn claim(
     ).optional().map_err(internal)
 }
 
-fn selected(connection: &Connection, at: Option<u64>) -> Result<Vec<View>, St3Error> {
+pub(super) fn selected(connection: &Connection, at: Option<u64>) -> Result<Vec<View>, St3Error> {
     let rows = rows(connection, at)?;
     let references: BTreeMap<_, _> = rows.iter().map(|v| (reference(v), v)).collect();
     let mut winners: BTreeMap<String, View> = BTreeMap::new();
@@ -451,6 +459,11 @@ pub(super) fn plan_tx(
     options: &Options,
 ) -> Result<Plan, St3Error> {
     let set = subject(&options.set)?;
+    if let Some(policy) = &options.rollout {
+        policy
+            .validate()
+            .map_err(|e| St3Error::new("invalid-rollout-policy", e.to_string()))?;
+    }
     if options.source.repository.split('/').count() != 2
         || options.source.repository.split('/').any(str::is_empty)
         || !options.source.r#ref.starts_with("refs/heads/")
@@ -493,7 +506,9 @@ pub(super) fn plan_tx(
     };
     let bundle_digest = canonical_hash(&(&input.subjects, &input.missions)).map_err(internal)?;
     let noop = old.as_ref().is_some_and(|v| {
-        v.receipt.source == options.source && v.receipt.bundle_digest == bundle_digest
+        v.receipt.source == options.source
+            && v.receipt.bundle_digest == bundle_digest
+            && v.receipt.rollout == options.rollout
     });
     let mut blockers = Vec::new();
     let membership = fleet_membership_tx(transaction).map_err(internal)?;
@@ -502,6 +517,18 @@ pub(super) fn plan_tx(
             "SELECT json_extract(body,'$.fields.features.owned_sets')=1 FROM claims
              WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
             params![format!("daemon/{}",member.name),member.name],|row|row.get(0)).optional().map_err(internal)?.flatten();
+        if options.rollout.is_some() {
+            let rollout_supported: Option<bool> = transaction.query_row(&canonical_sql(
+                "SELECT json_extract(body,'$.fields.features.seat_rollout')=1 FROM claims
+                 WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                params![format!("daemon/{}",member.name),member.name],|row|row.get(0)).optional().map_err(internal)?.flatten();
+            if rollout_supported != Some(true) {
+                blockers.push(format!(
+                    "host/{} has not advertised seat-rollout support; upgrade before activation",
+                    member.name
+                ));
+            }
+        }
         if supported != Some(true) {
             blockers.push(format!(
                 "host/{} has not advertised owned-set support; upgrade before activation",
@@ -590,19 +617,49 @@ pub(super) fn plan_tx(
             } else if s.starts_with("schedule/") {
                 "update future occurrences; retain created runs".to_owned()
             } else if let Some(prior) = existing {
-                let old_member = claim(transaction, &prior.claim, None)?
-                    .and_then(|c| serde_json::from_value::<DesiredSubject>(c.body).ok())
-                    .and_then(|d| d.member);
+                let old_subject = claim(transaction, &prior.claim, None)?
+                    .and_then(|c| serde_json::from_value::<DesiredSubject>(c.body).ok());
+                let old_member = old_subject.as_ref().and_then(|d| d.member.clone());
                 match (
                     input.subjects.get(s).and_then(|d| d.member.as_ref()),
                     old_member,
                 ) {
                     (Some(new), Some(old)) => {
                         let changed = new.launch_changes(&old);
+                        if options.rollout.is_some() && !changed.is_empty() {
+                            if old_subject.as_ref().and_then(|d| crate::accounts::harness_binding(&d.desired))
+                                != input.subjects.get(s).and_then(|d| crate::accounts::harness_binding(&d.desired)) {
+                                blockers.push(format!("{s}: when-idle requires the same native account binding"));
+                            }
+                            if let Err(refusal) = crate::native_resume::rollout_support(new) {
+                                blockers.push(format!("{s}: {}", refusal.reason));
+                            }
+                            if new.host != old.host || new.driver != old.driver {
+                                blockers.push(format!(
+                                    "{s}: when-idle requires the same host and harness family"
+                                ));
+                            }
+                            if !matches!(
+                                new.driver.as_deref(),
+                                Some("claude" | "codex" | "opencode" | "pi" | "omp")
+                            ) {
+                                blockers.push(format!(
+                                    "{s}: when-idle requires a supported native harness"
+                                ));
+                            }
+                        }
                         if changed.is_empty() {
                             "update declaration; launch unchanged".into()
                         } else {
-                            format!("restart runtime: {}", changed.join(", "))
+                            format!(
+                                "{}: {}",
+                                if options.rollout.is_some() {
+                                    "drain and resume native session"
+                                } else {
+                                    "restart runtime"
+                                },
+                                changed.join(", ")
+                            )
                         }
                     }
                     _ => "start runtime".into(),
@@ -633,6 +690,19 @@ pub(super) fn plan_tx(
             if live.contains_key(s) {
                 continue;
             }
+            if options.rollout.is_some() && m.kind == "agent" {
+                let old_member = claim(transaction, &m.claim, None)?
+                    .and_then(|c| serde_json::from_value::<DesiredSubject>(c.body).ok())
+                    .and_then(|d| d.member);
+                if old_member
+                    .as_ref()
+                    .is_none_or(|member| crate::native_resume::rollout_support(member).is_err())
+                {
+                    blockers.push(format!(
+                        "{s}: when-idle retirement requires a supported native harness"
+                    ));
+                }
+            }
             changes.insert(s.clone(), "retiring".into());
             if m.kind == "mission" {
                 let c = claim(transaction, &m.claim, None)?.ok_or_else(|| {
@@ -658,7 +728,11 @@ pub(super) fn plan_tx(
                     if m.kind == "schedule" {
                         "stop future occurrences; retain runs"
                     } else {
-                        "stop runtime; retain conversation and history"
+                        if options.rollout.is_some() {
+                            "drain and retire runtime; retain conversation and history"
+                        } else {
+                            "stop runtime; retain conversation and history"
+                        }
                     }
                     .into(),
                 );
@@ -681,14 +755,17 @@ pub(super) fn plan_tx(
         &changes,
         &options.adopt,
         options.allow_empty,
+        &options.rollout,
     ))
     .map_err(internal)?;
     let preview = Preview {
+        rollout: options.rollout.clone(),
         set,
         previous,
         source: options.source.clone(),
         changes,
         effects,
+        rollouts: BTreeMap::new(),
         expected_subjects: heads,
         digest,
         mass_retirement: mass,
@@ -787,6 +864,7 @@ pub(super) fn commit_tx(
         }
     }
     let revision = Revision {
+        rollout: plan.preview.rollout.clone(),
         previous: plan.preview.previous.clone(),
         source: plan.preview.source.clone(),
         bundle_digest: plan.bundle_digest.clone(),

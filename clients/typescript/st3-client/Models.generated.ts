@@ -49,6 +49,9 @@ export type Agent = ResourceHeader & {
   queued_work_count?: number;
   reachability: AgentReachability;
   reason?: string | null;
+  rollout?: {
+
+} | null;
   runtime_ids: Array<RuntimeId>;
   silent_since?: (Timestamp | null);
   state: AgentState;

@@ -1,3 +1,5 @@
+#[path = "reconcile_rollout.rs"]
+mod rollouts;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::panic::AssertUnwindSafe;
@@ -279,6 +281,27 @@ pub trait RuntimeControl: Send + Sync + 'static {
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>>;
     fn observe_exec(&self, runtime_id: &str) -> Result<Option<RuntimeObservation>>;
     fn start(&self, member: &MemberSpec) -> Result<()>;
+    fn start_guarded(&self, member: &MemberSpec, guard: &dyn Fn() -> Result<()>) -> Result<()> {
+        guard()?;
+        self.start(member)
+    }
+    /// Physical launch provenance, if the runtime persists it independently of daemon receipts.
+    fn rollout_operation(&self, _runtime_id: &str, _incarnation: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+    fn rollout_exited(&self, runtime_id: &str, terminal: bool, incarnation: &str) -> Result<bool> {
+        let observed = if terminal {
+            self.snapshot_ptys()?
+                .into_iter()
+                .find(|o| o.runtime_id == runtime_id)
+        } else {
+            self.observe_exec(runtime_id)?
+        };
+        Ok(observed.is_some_and(|o| {
+            o.incarnation_id.as_deref() == Some(incarnation)
+                && matches!(o.status.as_str(), "exited" | "stopped" | "vanished")
+        }))
+    }
     fn stop(
         &self,
         runtime_id: &str,
@@ -439,61 +462,61 @@ impl RuntimeControl for NativeRuntime {
             }))
     }
 
+    fn rollout_exited(&self, runtime_id: &str, terminal: bool, incarnation: &str) -> Result<bool> {
+        if !terminal {
+            return Ok(self.observe_exec(runtime_id)?.is_some_and(|o| {
+                o.incarnation_id.as_deref() == Some(incarnation) && o.status == "exited"
+            }));
+        }
+        let Some((pid, created)) = incarnation.split_once(':') else {
+            return Ok(false);
+        };
+        let observed = self
+            .pty()?
+            .snapshot()?
+            .into_iter()
+            .find(|o| o.name == runtime_id);
+        if let Some(observed) = observed {
+            return Ok(
+                matches!(observed.status.as_str(), "exited" | "stopped" | "vanished")
+                    && observed.created_at.as_deref() == Some(created)
+                    && observed
+                        .pid
+                        .is_none_or(|observed| pid.parse::<u32>().ok() == Some(observed)),
+            );
+        }
+        let Some(pid) = pid.parse::<i32>().ok().filter(|pid| *pid > 0) else {
+            return Ok(false);
+        };
+        #[cfg(unix)]
+        {
+            return Ok(unsafe { libc::kill(pid, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
+    fn rollout_operation(&self, runtime_id: &str, incarnation: &str) -> Result<Option<String>> {
+        Ok(self
+            .pty()?
+            .snapshot()?
+            .into_iter()
+            .find(|item| {
+                item.name == runtime_id
+                    && item
+                        .pid
+                        .zip(item.created_at.as_ref())
+                        .is_some_and(|(pid, at)| format!("{pid}:{at}") == incarnation)
+            })
+            .and_then(|item| item.tags.get("st3.rollout").cloned()))
+    }
     fn start(&self, member: &MemberSpec) -> Result<()> {
-        let executable = launch_executable()?;
-        let environment =
-            member_environment(&member.environment, &executable, self.recorder.as_deref())?;
-        let mut launch = st_runtime::Launch::from(&member.launch);
-        match &mut launch {
-            st_runtime::Launch::Shell(source) => {
-                st_runtime::expand_path_placeholder(source, &environment);
-            }
-            st_runtime::Launch::Argv(argv) => {
-                for value in argv {
-                    st_runtime::expand_path_placeholder(value, &environment);
-                }
-            }
-        }
-        // Resolve before crossing the PTY/isolation boundary; service-manager PATH is
-        // unrelated to the environment captured from the account's login shell.
-        match &mut launch {
-            st_runtime::Launch::Shell(source) => {
-                launch = st_runtime::Launch::Argv(vec![
-                    st_runtime::resolve_executable("sh", &environment)?
-                        .to_string_lossy()
-                        .into_owned(),
-                    "-c".into(),
-                    source.clone(),
-                ]);
-            }
-            st_runtime::Launch::Argv(argv) => {
-                let program = argv
-                    .first_mut()
-                    .context("an argv launch must contain a program")?;
-                *program = st_runtime::resolve_executable(program, &environment)?
-                    .to_string_lossy()
-                    .into_owned();
-            }
-        }
-        let cwd = PathBuf::from(&member.cwd);
-        if member.terminal {
-            let pty_binary = st_runtime::resolve_executable("pty", &environment)?;
-            self.pty()?
-                .clone()
-                .with_binary(pty_binary.to_string_lossy())
-                .spawn(
-                    &member.runtime_id,
-                    &launch,
-                    &cwd,
-                    &environment,
-                    member.display_name.as_deref(),
-                    &member.tags,
-                )
-        } else {
-            self.exec
-                .spawn(&member.runtime_id, &launch, &cwd, &environment)
-                .map(|_| ())
-        }
+        self.start_checked(member, None)
+    }
+    fn start_guarded(&self, member: &MemberSpec, guard: &dyn Fn() -> Result<()>) -> Result<()> {
+        self.start_checked(member, Some(guard))
     }
 
     fn stop(
@@ -556,6 +579,101 @@ impl RuntimeControl for NativeRuntime {
             self.pty.end_leftovers_later(runtime_id);
         } else {
             self.exec.end_leftovers_later(runtime_id);
+        }
+    }
+}
+
+impl NativeRuntime {
+    fn start_checked(
+        &self,
+        member: &MemberSpec,
+        guard: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<()> {
+        let executable = launch_executable()?;
+        let environment =
+            member_environment(&member.environment, &executable, self.recorder.as_deref())?;
+        let mut launch = st_runtime::Launch::from(&member.launch);
+        match &mut launch {
+            st_runtime::Launch::Shell(source) => {
+                st_runtime::expand_path_placeholder(source, &environment);
+            }
+            st_runtime::Launch::Argv(argv) => {
+                for value in argv {
+                    st_runtime::expand_path_placeholder(value, &environment);
+                }
+            }
+        }
+        // Resolve before crossing the PTY/isolation boundary; service-manager PATH is
+        // unrelated to the environment captured from the account's login shell.
+        match &mut launch {
+            st_runtime::Launch::Shell(source) => {
+                launch = st_runtime::Launch::Argv(vec![
+                    st_runtime::resolve_executable("sh", &environment)?
+                        .to_string_lossy()
+                        .into_owned(),
+                    "-c".into(),
+                    source.clone(),
+                ]);
+            }
+            st_runtime::Launch::Argv(argv) => {
+                let program = argv
+                    .first_mut()
+                    .context("an argv launch must contain a program")?;
+                *program = st_runtime::resolve_executable(program, &environment)?
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+        let cwd = PathBuf::from(&member.cwd);
+        if member.terminal {
+            let pty_binary = st_runtime::resolve_executable("pty", &environment)?;
+            let runtime = self
+                .pty()?
+                .clone()
+                .with_binary(pty_binary.to_string_lossy());
+            if let Some(operation) = member.environment.get(crate::rollout::OPERATION_ENV) {
+                let predecessor = member
+                    .environment
+                    .get(crate::rollout::PREDECESSOR_ENV)
+                    .context("rollout launch needs its predecessor fence")?;
+                if let Some(guard) = guard {
+                    runtime.spawn_after_checked(
+                        &member.runtime_id,
+                        &launch,
+                        &cwd,
+                        &environment,
+                        member.display_name.as_deref(),
+                        &member.tags,
+                        predecessor,
+                        operation,
+                        guard,
+                    )
+                } else {
+                    runtime.spawn_after(
+                        &member.runtime_id,
+                        &launch,
+                        &cwd,
+                        &environment,
+                        member.display_name.as_deref(),
+                        &member.tags,
+                        predecessor,
+                        operation,
+                    )
+                }
+            } else {
+                runtime.spawn(
+                    &member.runtime_id,
+                    &launch,
+                    &cwd,
+                    &environment,
+                    member.display_name.as_deref(),
+                    &member.tags,
+                )
+            }
+        } else {
+            self.exec
+                .spawn(&member.runtime_id, &launch, &cwd, &environment)
+                .map(|_| ())
         }
     }
 }
@@ -1797,7 +1915,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         let (rendered, render_reads) = if render_needed {
             smallclaims::touched::record(|| {
                 std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    crate::render::apply_all(&self.store, &renderable, &self.host)
+                    crate::render::apply_all_checked(
+                        &self.store,
+                        &renderable,
+                        &self.host,
+                        &|declaration| self.rollout_render_guard(declaration),
+                    )
                 }))
             })
         } else {
@@ -2008,6 +2131,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                             });
                             self.runtime.observe_exec(&member.runtime_id)?
                         };
+                        if self.reconcile_rollout(subject, observed.as_ref(), blocked.as_ref())? {
+                            return Ok(());
+                        }
                         if subject.kind == "agent"
                             && let Some(suspension) =
                                 crate::suspension::current(&self.store, &subject.subject)?
@@ -3530,7 +3656,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             .observations_for(subject, "runtime.action.succeeded")?
             .iter()
             .rev()
-            .find_map(|claim| claim.body.pointer("/fields/desired_token").and_then(Value::as_str))
+            .find_map(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/desired_token")
+                    .and_then(Value::as_str)
+            })
             .is_some_and(|token| lineage.iter().any(|candidate| candidate == token)))
     }
 
@@ -3733,6 +3864,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
             self.runtime.observe_exec(runtime_id)?
         };
+        if self.reconcile_rollout(subject, observation.as_ref(), None)? {
+            return Ok(());
+        }
         // A stopped projection is only a record of the last observation. The same
         // runtime ID can be live again (or a stop can have raced with a restart),
         // so fence the observed process before allowing run cleanup to finish.
@@ -4268,6 +4402,20 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .or_insert_with(|| value.clone());
         }
         self.bind_account(subject, member, &mut launch_member)?;
+        if let Some(id) = member.environment.get(crate::rollout::OPERATION_ENV) {
+            let operation = self.store.rollout(&subject.subject)?.context("rollout disappeared before account selection")?;
+            anyhow::ensure!(operation.id == *id && operation.native_account.as_deref() == launch_member.environment.get("ST3_ACCOUNT").map(String::as_str),
+                "strict rollout cannot carry a conversation between native login accounts");
+        }
+        for variable in [
+            crate::rollout::OPERATION_ENV,
+            crate::rollout::PREDECESSOR_ENV,
+            crate::rollout::RESUME_PATH_ENV,
+        ] {
+            if !member.environment.contains_key(variable) {
+                launch_member.environment.remove(variable);
+            }
+        }
         // Only a resume names a native session. A daemon started inside a resumed seat inherits
         // that seat's, and must not hand it to every seat it launches.
         if !member
@@ -4373,9 +4521,29 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         self.store.owned_desired_guard(subject)?;
+        if let Some(operation) = member.environment.get(crate::rollout::OPERATION_ENV) {
+            anyhow::ensure!(
+                self.store
+                    .rollout(&subject.subject)?
+                    .is_some_and(|o| o.id == *operation && o.phase == "starting"),
+                "rollout target or policy changed before start"
+            );
+        }
         // Capture the token before starting; a publication during start must not relabel the launch.
         let desired_token = self.launch_token(&subject.subject)?;
-        if let Err(error) = self.runtime.start(&launch_member) {
+        let guard = || -> Result<()> {
+            self.store.owned_desired_guard(subject)?;
+            if let Some(operation) = member.environment.get(crate::rollout::OPERATION_ENV) {
+                anyhow::ensure!(
+                    self.store
+                        .rollout(&subject.subject)?
+                        .is_some_and(|o| o.id == *operation && o.phase == "starting"),
+                    "rollout target or policy changed at spawn boundary"
+                );
+            }
+            Ok(())
+        };
+        if let Err(error) = self.runtime.start_guarded(&launch_member, &guard) {
             let reason = error.to_string();
             let prior_failures = self.start_failures(&subject.subject, &desired_token)?;
             self.store.append_claim(&ClaimInput {
@@ -4417,6 +4585,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             ("runtime_id".into(), Value::String(member.runtime_id.clone())),
             ("reason".into(), Value::String(reason.into())),
         ]);
+        if let Some(operation) = member.environment.get(crate::rollout::OPERATION_ENV) {
+            fields.insert("rollout_operation".into(), serde_json::json!(operation));
+        }
         if let Some(incarnation) = incarnation {
             fields.insert("incarnation_id".into(), Value::String(incarnation));
         }
@@ -10603,6 +10774,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         if requests.is_empty() {
             return Ok(());
         }
+        let mut latest_ref_requests = BTreeMap::new();
+        for resource in requests.iter().filter_map(|request|
+            request.body.pointer("/fields/resource").and_then(Value::as_str)).collect::<BTreeSet<_>>() {
+            if self.store.latest_actual_value(resource)?.is_some_and(|actual|
+                actual["kind"] == "vcs.ref" && actual["facts"]["head"].is_string()) {
+                if let Some(request) = requests.iter().rev().find(|request|
+                    request.body.pointer("/fields/resource").and_then(Value::as_str) == Some(resource)) {
+                    latest_ref_requests.insert(resource.to_owned(), request.id.clone());
+                }
+            }
+        }
         let is_held = |request: &crate::model::ClaimRecord| {
             request
                 .body
@@ -10658,6 +10840,20 @@ impl<R: RuntimeControl> Reconciler<R> {
                         "subscription-stale-pull-request:{}",
                         request.id
                     )),
+                })?;
+                continue;
+            }
+            if let Some((resource, discovery)) = request.body.pointer("/fields/resource").and_then(Value::as_str)
+                .zip(request.body.pointer("/fields/discovery").and_then(Value::as_str))
+                && let Some(reason) = match latest_ref_requests.get(resource) {
+                    Some(newest) if newest != &request.id => Some(format!("newer ref delivery {newest} supersedes this queued request")),
+                    _ => self.store.stale_ref_request(resource, discovery)?,
+                } {
+                self.store.append_claim(&ClaimInput {
+                    subject: item.subject.clone(), kind: "subscription.mission-request-cancelled".into(), actor: None,
+                    fields: BTreeMap::from([("request".into(), Value::String(request.id.clone())), ("reason".into(), Value::String(reason))]),
+                    evidence: vec![request.id.clone()], expected_subject: None,
+                    idempotency_key: Some(format!("subscription-stale-ref:{}", request.id)),
                 })?;
                 continue;
             }
@@ -10756,26 +10952,25 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .collect(),
                 idempotency_key: format!("subscription-mission:{}", request.id),
             };
-            let created = match &item.owner_run {
+            let parent = match &item.owner_run {
                 Some(owner) => match self.store.mission_run(owner)? {
-                    Some(parent) => self.store.create_child_mission_run(
-                        &request_value,
-                        &parent,
-                        &item.subject,
-                        None,
-                    ),
-                    None => {
-                        waiting.push(format!(
-                            "request {}: its owner run {owner} is not stored here yet",
-                            request.id
-                        ));
-                        continue;
-                    }
+                    Some(parent) => Some(parent),
+                    None => { waiting.push(format!("request {}: its owner run {owner} is not stored here yet", request.id)); continue; }
                 },
-                None => self.store.create_mission_run(&request_value),
+                None => None,
             };
+            let created = self.store.create_subscription_mission_run(&request_value, parent.as_ref(), &item.subject, resource, discovery);
             let run = match created {
                 Ok(run) => run,
+                Err(error) if error.code == "stale-ref-head" => {
+                    self.store.append_claim(&ClaimInput {
+                        subject: item.subject.clone(), kind: "subscription.mission-request-cancelled".into(), actor: None,
+                        fields: BTreeMap::from([("request".into(), Value::String(request.id.clone())), ("reason".into(), Value::String(error.message))]),
+                        evidence: vec![request.id.clone()], expected_subject: None,
+                        idempotency_key: Some(format!("subscription-stale-ref:{}", request.id)),
+                    })?;
+                    continue;
+                }
                 Err(error) if error.code == "mission-run-capacity" => {
                     capacity_waiting.insert(mission.to_owned());
                     let attempt =
@@ -11150,6 +11345,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         );
         spec.fields.sort();
         spec.fields.dedup();
+        // A live subscription is a watch of this ref. Keep explicit faster intervals,
+        // and use conditional reads every thirty seconds while anyone watches it.
+        let watched_ref = spec.provider == "github.ref" && selected.iter().any(|(_, subscription)|
+            subscription.observer == observer.subject && !subscription.stopped);
+        if watched_ref {
+            spec.every_ms = Some(spec.every_ms.unwrap_or(300_000).min(crate::resource::GITHUB_REF_WATCH_MS));
+        }
         let Some(revision) = self.store.selected_desired_revision(&observer.subject)? else {
             return Ok(());
         };
@@ -11172,7 +11374,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         let deadline_key = format!("{}:{revision}", observer.subject);
-        let next_check = refresh_attempt
+        let mut next_check = refresh_attempt
             .as_ref()
             .map(|_| now_ms())
             .unwrap_or_else(|| {
@@ -11190,18 +11392,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                     })
                     .unwrap_or_else(now_ms)
             });
-        let operation = format!(
-            "{}:{revision}:{}",
-            observer.subject,
-            refresh_attempt.as_deref().unwrap_or("scheduled")
-        );
-        if !self
-            .armed_observers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(operation.clone())
+        // A changed cadence retires the old sleeping poll; its result cannot overwrite
+        // a newer watcher observation if it was already in flight.
+        if watched_ref && refresh_attempt.is_none() && observer_actual.as_ref().is_none_or(|actual|
+            actual["error_code"] != "rate-limited") {
+            next_check = next_check.min(now_ms().saturating_add(u128::from(spec.every_ms.unwrap())));
+        }
+        let operation_prefix = format!("{}:{revision}:{}:", observer.subject,
+            refresh_attempt.as_deref().unwrap_or("scheduled"));
+        let cadence_prefix = format!("{operation_prefix}{}:", spec.every_ms.map_or("default".into(), |ms| ms.to_string()));
+        let operation = format!("{cadence_prefix}{}", uuid::Uuid::now_v7());
         {
-            return Ok(());
+            let mut armed = self.armed_observers.lock().unwrap_or_else(PoisonError::into_inner);
+            armed.retain(|key| !key.starts_with(&operation_prefix) || key.starts_with(&cadence_prefix));
+            if armed.iter().any(|key| key.starts_with(&cadence_prefix)) { return Ok(()); }
+            armed.insert(operation.clone());
         }
         let store = self.store.clone();
         let provider = self.resource_provider.clone();
@@ -11256,6 +11461,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     signal_changed(&notify, &event_notify);
                     return;
                 }
+                if !armed.lock().unwrap_or_else(PoisonError::into_inner).contains(&operation) { return; }
                 let request = ObservationRequest {
                     provider: spec.provider.clone(),
                     locator: spec.locator.clone(),
@@ -11268,6 +11474,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let observed =
                     crate::resource::spend_as(observer_subject.clone(), provider.observe(request))
                         .await;
+                let mut active = armed.lock().unwrap_or_else(PoisonError::into_inner);
+                if !active.contains(&operation)
+                    || store.selected_desired_revision(&observer_subject).ok().flatten().as_deref() != Some(revision.as_str()) {
+                    active.remove(&operation);
+                    signal_changed(&notify, &event_notify);
+                    return;
+                }
                 match observed {
                     Ok(mut observation) => {
                         if spec.provider == "github.repository" {
@@ -11413,10 +11626,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         }
                     }
                 }
-                armed
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&operation);
+                active.remove(&operation);
+                drop(active);
                 signal_changed(&notify, &event_notify);
             });
         } else {
@@ -14108,6 +14319,8 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     mod differential;
+    mod rollout_tests;
+    mod ref_watch_tests;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};
@@ -17318,7 +17531,7 @@ mission "feedback-review" state="ready" {
     fn a_repository_owned_st3_directory_is_kept_and_the_agent_starts() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
@@ -17329,7 +17542,7 @@ mission "feedback-review" state="ready" {
             "repository-owned boot text\n",
         )
         .unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["add", ".st3/boot.md"])
             .current_dir(workspace.path())
             .status()
@@ -17365,14 +17578,14 @@ mission "feedback-review" state="ready" {
     fn a_failed_render_isolated_from_healthy_members_and_clears_on_recovery() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
             .unwrap();
         fs::create_dir(workspace.path().join(".claude")).unwrap();
         fs::write(workspace.path().join(".claude/settings.local.json"), "{}\n").unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["add", ".claude/settings.local.json"])
             .current_dir(workspace.path())
             .status()
@@ -17446,14 +17659,14 @@ agent "bad" {{ workspace {:?}; command "true" }}
     fn a_running_seat_whose_render_fails_is_still_watched_and_woken_but_never_restarted() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
             .unwrap();
         fs::create_dir(workspace.path().join(".claude")).unwrap();
         fs::write(workspace.path().join(".claude/settings.local.json"), "{}\n").unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["add", ".claude/settings.local.json"])
             .current_dir(workspace.path())
             .status()
@@ -17555,7 +17768,7 @@ mission "task" state="ready" {{
     fn a_render_conflict_faults_only_the_member_that_would_change_the_file() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
@@ -22632,7 +22845,7 @@ mission "orchid/timeout" state="ready" timeout="1ms" {
         })
         .await
         .expect("the worker did not start");
-        let branch = std::process::Command::new("git")
+        let branch = crate::test_support::git()
             .arg("-C")
             .arg(&workspace)
             .args(["branch", "--show-current"])

@@ -371,6 +371,17 @@ const seatLabel = (label: string): string => {
 
 export default function (pi: ExtensionAPI) {
   const state = stash();
+  let jobContext: ExtensionContext | undefined;
+  let lastStateFrame: Record<string, unknown> | undefined;
+  let lastBackgroundJobs: number | null | undefined;
+  const backgroundJobs = (): number | null => {
+    try {
+      const snapshot = (jobContext as ExtensionContext & {
+        getAsyncJobSnapshot?: () => { running?: unknown } | null;
+      } | undefined)?.getAsyncJobSnapshot?.();
+      return Array.isArray(snapshot?.running) ? snapshot.running.length : null;
+    } catch { return null; }
+  };
   const applyLabel = async (ctx: ExtensionContext) => {
     if (!state.label) return;
     try { await pi.setSessionName(state.label); }
@@ -445,6 +456,8 @@ export default function (pi: ExtensionAPI) {
       state.pendingAskToolCallId = undefined;
       state.pendingApproval = false;
       resetHold();
+      lastStateFrame = undefined;
+      lastBackgroundJobs = undefined;
     }
 
     cancelSettle();
@@ -509,6 +522,7 @@ export default function (pi: ExtensionAPI) {
           if (keepalive !== undefined) clearInterval(keepalive);
           return;
         }
+        if (lastStateFrame && backgroundJobs() !== lastBackgroundJobs) sendFrame(lastStateFrame);
         if (legacyChannel) send({ type: "keepalive" });
         if (state.todoReady) observeTodoBranch(ctx, false, true);
       }, 1000);
@@ -634,6 +648,11 @@ export default function (pi: ExtensionAPI) {
   const sendFrame = (frame: Record<string, unknown>) => {
     const child = state.child;
     if (!child || !child.stdin || child.stdin.destroyed) return;
+    if (frame.type === "state") {
+      lastStateFrame = frame;
+      lastBackgroundJobs = backgroundJobs();
+      frame = { ...frame, backgroundJobs: lastBackgroundJobs };
+    }
     child.stdin.write(JSON.stringify(frame) + "\n");
   };
   const emitTodo = (ctx: ExtensionContext, snapshot: TodoSnapshot, observedAt: string, sourceOp: string, force = false) => {
@@ -982,7 +1001,11 @@ export default function (pi: ExtensionAPI) {
   const onWidened = (
     event: string,
     handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
-  ) => register(event, (payload, ctx) => isSubagent(ctx) ? undefined : handler(payload, ctx));
+  ) => register(event, (payload, ctx) => {
+    if (isSubagent(ctx)) return;
+    jobContext = ctx;
+    return handler(payload, ctx);
+  });
 
   // Registered only now that every helper above is initialized: a use-before-declaration in this
   // file is the defect class that once shipped green through the type gate.

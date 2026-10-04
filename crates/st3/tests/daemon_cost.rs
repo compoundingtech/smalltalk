@@ -61,8 +61,6 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
     ("GET /v1/client/missions/{*id}", 18.0),
     // Checkpoint status walks the sealed set (9.8x).
     ("GET /v1/checkpoint/status", 15.0),
-    // Device inventory reads every principal claim (9.8x).
-    ("GET /v1/client/devices", 15.0),
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
     ("GET /v1/client/runtimes", 6.0),
     ("GET /v1/client/runtimes/{*id}", 14.0),
@@ -234,6 +232,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
     // Writes that need a live runtime or a person's approval the generated store lacks.
     ("POST /v1/agents/rename", "renames a declared agent"),
     ("POST /v1/agents/restart", "restarts a live seat"),
+    (
+        "POST /v1/agents/rollout",
+        "requires a running source-fenced native seat",
+    ),
     ("POST /v1/agents/start", "starts a seat"),
     ("POST /v1/agents/suspend", "suspends a live seat"),
     ("POST /v1/agents/resume", "resumes a live seat"),

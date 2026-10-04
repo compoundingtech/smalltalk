@@ -586,6 +586,7 @@ mod tests {
             ownership_sequence: None,
             transition_sequence: None,
             evidence_incarnation: None,
+            background_jobs: None,
             exit: None,
             reason: None,
         });
@@ -611,6 +612,7 @@ mod tests {
             ownership_sequence: None,
             transition_sequence: None,
             evidence_incarnation: None,
+            background_jobs: None,
             exit: None,
             reason: Some("session-dead".to_string()),
         });
@@ -638,6 +640,7 @@ mod tests {
             ownership_sequence: None,
             transition_sequence: None,
             evidence_incarnation: None,
+            background_jobs: None,
             exit: None,
             reason: Some("session-dead".to_string()),
         });
@@ -744,6 +747,7 @@ mod tests {
             ownership_sequence: None,
             transition_sequence: None,
             evidence_incarnation: None,
+            background_jobs: None,
             exit: None,
             reason: None,
         });

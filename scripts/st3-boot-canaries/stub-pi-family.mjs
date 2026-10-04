@@ -74,6 +74,7 @@ const events = new Map();
 let title = '';
 const ctx = {
   isIdle: () => true,
+  getAsyncJobSnapshot: () => ({ running: [] }),
   sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile, getEntries: () => [] },
   ui: { notify: (message, level) => record('notification', { message, level }) },
 };

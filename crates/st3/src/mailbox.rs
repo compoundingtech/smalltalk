@@ -40,8 +40,9 @@ impl Fence {
                     return Ok(());
                 }
                 Err(error)
-                    if crate::client::api_error_code(&error)
-                        .is_some_and(|code| !matches!(code, "internal" | "mailbox-session-starting")) =>
+                    if crate::client::api_error_code(&error).is_some_and(|code| {
+                        !matches!(code, "internal" | "mailbox-session-starting")
+                    }) =>
                 {
                     return Err(error);
                 }
@@ -77,9 +78,19 @@ pub fn seat_label(seat: &DesiredSubject, persona_short: Option<&str>) -> String 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Frame {
-    Seat { seat: Box<DesiredSubject> },
-    Mailbox { messages: Vec<MessageView> },
-    Fenced { reason: String },
+    Seat {
+        seat: Box<DesiredSubject>,
+    },
+    Mailbox {
+        messages: Vec<MessageView>,
+    },
+    Fenced {
+        reason: String,
+    },
+    /// Ordered after the gated mailbox snapshot. The delivery loop acknowledges consumption.
+    Drain {
+        operation: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -151,7 +162,13 @@ impl Subscription {
             task,
         }
     }
-    pub fn report(&self, value: Value) {
+    pub fn acknowledge_drain(&self, operation: Option<String>) {
+        self.report.send_modify(|report| {
+            report["drain_operation"] = serde_json::json!(operation);
+        });
+    }
+    pub fn report(&self, mut value: Value) {
+        value["drain_operation"] = self.report.borrow()["drain_operation"].clone();
         self.report.send_replace(value);
     }
 }

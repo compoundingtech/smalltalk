@@ -123,6 +123,7 @@ async fn request(daemon: &Daemon, sequence: u64, kdl: String) -> Request {
             source_name: None,
         },
         options: Options {
+            rollout: None,
             set: "garden".into(),
             source: Source {
                 repository: "acme/garden".into(),
@@ -325,7 +326,7 @@ async fn disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirm
         let socket = amber.client.socket_path().unwrap().to_path_buf();
         let previous = previous.clone();
         tokio::task::spawn_blocking(move || {
-            let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"));
+            let mut command = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
             command
                 .env_remove("ST_AGENT")
                 .env_remove("ST_MISSION_RUN")
@@ -499,7 +500,7 @@ async fn disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirm
     ] {
         let socket = root.path().join("amber/st3.sock");
         let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+            st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
                 .env_remove("ST_AGENT")
                 .env_remove("ST_MISSION_RUN")
                 .args(["--json", "--endpoint"])

@@ -637,6 +637,7 @@ fn state_observation(frame: &Value) -> Option<harness_state::Observation> {
     };
     let mut observation =
         harness_state::Observation::new(state, blocked_on, harness_state::InputBuffer::Unknown);
+    observation.background_jobs = frame.get("backgroundJobs").and_then(Value::as_u64);
     if blocked_on == harness_state::BlockedOn::Human
         && let Some(ask) = frame.get("ask").and_then(Value::as_str)
     {
@@ -1992,5 +1993,18 @@ mod tests {
             driver_diagnostic::read(&driver_diagnostic::path(agent_dir)),
             driver_diagnostic::Observed::Absent
         );
+    }
+}
+
+#[cfg(test)]
+mod background_job_tests {
+    use super::*;
+
+    #[test]
+    fn background_job_wire_count_is_positive_evidence_and_unknown_is_not_zero() {
+        for (value, expected) in [(json!(2), Some(2)), (json!(0), Some(0)), (Value::Null, None), (json!(-1), None), (json!("0"), None)] {
+            let frame = json!({"type":"state","state":"idle","backgroundJobs":value});
+            assert_eq!(state_observation(&frame).unwrap().background_jobs, expected);
+        }
     }
 }

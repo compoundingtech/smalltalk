@@ -3,6 +3,7 @@ pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
 mod resources;
+mod rollouts;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -1192,6 +1193,16 @@ struct ChildMissionContext {
     default_selector: Option<WorkSelector>,
 }
 
+fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str) -> Result<Option<String>> {
+    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim|
+        claim.subject == resource && claim.body.pointer("/fields/kind").and_then(Value::as_str) == Some("vcs.ref")) else { return Ok(None); };
+    let Some(current) = latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned()) else { return Ok(None); };
+    let requested_head = requested.body.pointer("/fields/facts/head").and_then(Value::as_str);
+    if let Some((requested, current)) = requested_head.zip(current.get("head").and_then(Value::as_str))
+        && requested != current { return Ok(Some(format!("ref {resource} moved from head {requested} to {current}"))); }
+    Ok(None)
+}
+
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0 || version == 13 || version == 14 || version == 15 {
@@ -2278,6 +2289,9 @@ impl Store {
         Ok(Self { graph, smalltalk })
     }
 
+    /// Open a shared-memory store for sequential fixtures and short-lived tools.
+    /// Concurrent server tests should use [`Self::open`]: shared-cache read/write
+    /// contention returns `SQLITE_LOCKED` immediately instead of waiting.
     pub fn open_memory(origin: impl Into<String>) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::default());
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -3105,7 +3119,7 @@ impl Store {
         &self,
         request: &MissionRunRequest,
     ) -> Result<MissionRunView, St3Error> {
-        self.create_mission_run_inner(request, None, None)
+        self.create_mission_run_inner(request, None, None, None)
     }
 
     pub fn mission_run_subject_for_idempotency_key(&self, idempotency_key: &str) -> String {
@@ -3136,6 +3150,7 @@ impl Store {
                 parent_step_run: normalize_step_run(parent_step_run),
                 default_selector: default_selector.cloned(),
             }),
+            None,
             None,
         )
     }
@@ -3171,7 +3186,18 @@ impl Store {
             parent_step_run: normalize_step_run(schedule),
             default_selector: None,
         });
-        self.create_mission_run_inner(request, child, Some(&subject))
+        self.create_mission_run_inner(request, child, Some(&subject), None)
+    }
+
+    pub fn create_subscription_mission_run(&self, request: &MissionRunRequest,
+        parent: Option<&MissionRunView>, subscription: &str, resource: &str, discovery: &str,
+    ) -> Result<MissionRunView, St3Error> {
+        let child = parent.map(|parent| ChildMissionContext {
+            root_revision: parent.root_revision.clone(),
+            root_run_id: parent.root_mission_run.trim_start_matches("mission-run/").into(),
+            parent_step_run: normalize_step_run(subscription), default_selector: None,
+        });
+        self.create_mission_run_inner(request, child, None, Some((resource, discovery)))
     }
 
     fn create_mission_run_inner(
@@ -3179,6 +3205,7 @@ impl Store {
         request: &MissionRunRequest,
         child: Option<ChildMissionContext>,
         occurrence_subject: Option<&str>,
+        latest_ref: Option<(&str, &str)>,
     ) -> Result<MissionRunView, St3Error> {
         let mission_id = request
             .mission
@@ -3258,6 +3285,10 @@ impl Store {
         }
         let transaction = connection.transaction().map_err(internal)?;
         owned_sets::guard_mission_start(&transaction, mission_id)?;
+        if let Some((resource, discovery)) = latest_ref
+            && let Some(reason) = stale_ref_request_tx(&transaction, resource, discovery).map_err(internal)? {
+            return Err(St3Error::new("stale-ref-head", reason));
+        }
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
         enforce_mission_run_capacity(&transaction, &mission)?;
         let subject = occurrence_subject.map(str::to_owned).unwrap_or_else(|| {
@@ -6633,6 +6664,9 @@ impl Store {
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
+                if action == "claim" && rollouts::intake_held(transaction, &actor, &subject)? {
+                    return Err(St3Error::new("seat-rollout-draining", "the seat holds new work intake while its rollout drains; existing work may finish"));
+                }
                 let current = transaction
                     .query_row(
                         "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
@@ -7604,7 +7638,9 @@ impl Store {
                     .as_ref()
                     .filter(|row| row.kind == "agent")
                     .and_then(|row| row.member.as_deref())
-                    .and_then(|launched| serde_json::from_str::<crate::model::MemberSpec>(launched).ok())
+                    .and_then(|launched| {
+                        serde_json::from_str::<crate::model::MemberSpec>(launched).ok()
+                    })
                     .map(|launched| member.launch_changes(&launched))
                     .unwrap_or_default();
                 actions.push(if changes.is_empty() {
@@ -13077,6 +13113,12 @@ impl Store {
         Ok(None)
     }
 
+    /// Unstarted ref deliveries collapse to the latest observed head. Running missions
+    /// retain their pinned discovery and exact CI gate, even when the ref moves again.
+    pub fn stale_ref_request(&self, resource: &str, discovery: &str) -> Result<Option<String>> {
+        stale_ref_request_tx(&self.readers.get(), resource, discovery)
+    }
+
     pub fn authoring_review_owner(&self, discovery: &str) -> Result<Option<String>> {
         let Some(claim) = self.claim_by_id(discovery)? else {
             return Ok(None);
@@ -18202,7 +18244,9 @@ fn message_view_tx(
         attachments: actual
             .get("attachments")
             .cloned()
-            .and_then(|value| serde_json::from_value::<Vec<crate::model::MessageAttachment>>(value).ok())
+            .and_then(|value| {
+                serde_json::from_value::<Vec<crate::model::MessageAttachment>>(value).ok()
+            })
             .unwrap_or_default()
             .into_iter()
             .filter(|attachment| {
@@ -46402,6 +46446,9 @@ fn append_claim_with_fences(
                 let message = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
                 if message.to != fence.subject || input.actor.as_deref() != Some(&fence.subject) {
                     return Err(St3Error::new("wrong-message-recipient", "receipt belongs to another seat"));
+                }
+                if input.kind == "message.staged" && !rollouts::message_allowed(transaction, &message)? {
+                    return Err(St3Error::new("seat-rollout-draining", "new independent delivery waits for the seat rollout"));
                 }
                 matches!((input.kind.as_str(), message.status.as_str()),
                     ("message.staged", "delivered" | "read" | "closed") | ("message.delivered", "read" | "closed") | ("message.read", "closed"))
