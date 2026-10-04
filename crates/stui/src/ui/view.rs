@@ -245,6 +245,9 @@ impl Harness {
 pub enum AgentState {
     /// Waiting on the person.
     NeedsYou,
+    /// Its harness is not logged in to its provider: someone has to log it in on its host.
+    /// It clears by itself once st sees the harness signed in; no restart is needed.
+    NeedsLogin,
     Fault,
     Working,
     Idle,

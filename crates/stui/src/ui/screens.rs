@@ -64,6 +64,7 @@ fn state_of<T>(load: &Load<Vec<T>>, loading: &'static str, empty: &'static str) 
 pub fn agent_glyph(state: AgentState, spinner: &'static str) -> (&'static str, Color) {
     match state {
         AgentState::NeedsYou => ("◆", theme::PERSON),
+        AgentState::NeedsLogin => ("⚿", theme::PERSON),
         AgentState::Fault => ("✕", theme::FAULT),
         AgentState::Working => (spinner, theme::WORKING),
         AgentState::Idle => ("●", theme::IDLE),
@@ -76,6 +77,7 @@ pub fn agent_glyph(state: AgentState, spinner: &'static str) -> (&'static str, C
 pub fn agent_word(state: AgentState) -> &'static str {
     match state {
         AgentState::NeedsYou => "needs you",
+        AgentState::NeedsLogin => "needs login",
         AgentState::Fault => "broken",
         AgentState::Working => "working",
         AgentState::Idle => "idle",
@@ -1297,6 +1299,7 @@ fn agent_group(agent: &Agent) -> &'static str {
     }
     match agent.state {
         AgentState::NeedsYou => "waiting on you",
+        AgentState::NeedsLogin => "needs login",
         AgentState::Fault => "broken",
         AgentState::Working => "working",
         AgentState::Idle | AgentState::Starting => "idle",
@@ -1349,7 +1352,9 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
             items.push(Item::Header {
                 title: group.into(),
                 count,
-                color: if agent.state == AgentState::NeedsYou && !agent.unmanaged {
+                color: if matches!(agent.state, AgentState::NeedsYou | AgentState::NeedsLogin)
+                    && !agent.unmanaged
+                {
                     theme::PERSON
                 } else {
                     theme::OVERLAY1
@@ -1395,6 +1400,25 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
 }
 
 /// The header strip above an agent's conversation.
+/// What a person does for an agent whose harness is signed out of its provider. st clears the
+/// state once the harness is signed in again, on the same run: no restart (Nathan, 2026-10-04).
+pub fn login_guidance(agent: &Agent) -> String {
+    let how = match agent.harness {
+        Harness::Claude => "open its terminal (ctrl+]) and run /login".to_owned(),
+        Harness::Codex => format!("run `codex login` on {} (or in its terminal)", agent.host),
+        _ => "open its terminal (ctrl+]) and log it in".to_owned(),
+    };
+    let provider = match agent.harness {
+        Harness::Claude => "Claude",
+        Harness::Codex => "Codex",
+        _ => "Its provider",
+    };
+    format!(
+        "{provider} login required on {}: {how}. Messages wait until it is signed in; it carries on without a restart.",
+        agent.host
+    )
+}
+
 pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'static str) -> Doc {
     let mut doc = Doc::new();
     let (glyph, color) = agent_glyph(agent.state, spinner);
@@ -1420,6 +1444,15 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
         second.push(span(format!("  ·  {tree}"), theme::dim()));
     }
     doc.line(Line::from(second));
+    if agent.state == AgentState::NeedsLogin {
+        doc.lines(text::wrap(
+            &text::inline(&login_guidance(agent), theme::fg(theme::PERSON)),
+            width,
+            &[text::run("   ⚿ ", theme::fg(theme::PERSON))],
+            &[text::run("     ", theme::dim())],
+            None,
+        ));
+    }
     if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
         let title = world
             .missions
@@ -2449,6 +2482,15 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         let mut inner = Doc::new();
         inner.wrap(&text::inline(fault, theme::text()), width.saturating_sub(4));
         doc.card("broken", theme::FAULT, true, inner, width);
+        doc.blank();
+    }
+    if agent.state == AgentState::NeedsLogin {
+        let mut inner = Doc::new();
+        inner.wrap(
+            &text::inline(&login_guidance(agent), theme::text()),
+            width.saturating_sub(4),
+        );
+        doc.card("needs login", theme::PERSON, true, inner, width);
         doc.blank();
     }
     doc.section("now", None, width);

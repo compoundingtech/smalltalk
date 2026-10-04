@@ -680,7 +680,11 @@ impl Ui {
                 1,
                 screens::agent_glyph(agent.state, spinner),
                 agent.name.clone(),
-                format!("{} · {}", agent.harness.name(), agent.host),
+                if agent.state == AgentState::NeedsLogin {
+                    format!("{} · {} · needs login", agent.harness.name(), agent.host)
+                } else {
+                    format!("{} · {}", agent.harness.name(), agent.host)
+                },
                 Pane::Agent(Some(agent.id.clone())),
             );
         }
@@ -2108,7 +2112,10 @@ impl Ui {
                 .agents
                 .items()
                 .iter()
-                .any(|agent| &agent.id == id && agent.state == AgentState::NeedsYou),
+                .any(|agent| {
+                    &agent.id == id
+                        && matches!(agent.state, AgentState::NeedsYou | AgentState::NeedsLogin)
+                }),
             Pane::Mission(Some(id)) => self.mission_decision(id).is_some(),
             _ => false,
         }
