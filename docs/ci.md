@@ -46,8 +46,7 @@ limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
 as P0 and fills the missing entries with builds only: selected test executables, Clippy artifacts,
-or the fleet baseline and integration binary. Workspace tests and the isolation VM run only in
-the queue. The TypeScript dependency cache is also kept on main without repeating its tests.
+or the fleet baseline and integration binary. Workspace tests and the isolation VM are not repeated on main. The TypeScript dependency cache is also kept on main without repeating its tests.
 Merge-group and PR caches have their own ref scope; they cannot replace these main-scope saves,
 which all PRs and Namespace overflow runs can restore. Manual Workspace CI dispatch on main
 remains available for a full run. Release and deployment workflows keep their own push triggers.
@@ -333,8 +332,8 @@ with `opt-level = 1` only to generate the stores faster.
   work per deleted row grew 7.3 times, its full-scan steps 9.3 times).
 
 `perf-load` runs `daemon_load::` in a release build, in its own `Performance` workflow
-(`perf.yml`): nightly on `main`, on pull requests that change the daemon or the store, and on
-dispatch. It serves a store the size of a busy host's (scale 1, about 240,000 claims) to the
+(`perf.yml`): on relevant `main` pushes and pull requests, nightly on `main`, and on dispatch.
+It always uses Namespace, including when Workspace CI picks ci1. It serves a store the size of a busy host's (scale 1, about 240,000 claims) to the
 request mix and rates that host's daemon reported in its busiest five-minute window (30 requests a
 second: harness events, mailbox pages, claims, desired state, delivery holds, replication rounds,
 renewals, status and work reads, and a person's reads), with the reconciler running and 30
@@ -343,25 +342,39 @@ concurrent seat event long-polls. Quiet polls have a 31-second budget for their 
 It fails when
 a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
 main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a
-regression is what passes several. Main's successful runs add their report
-(`perf-load-baseline-*` in the Actions cache). Relative latency comparisons start once five
+regression is what passes several. Each run downloads the newest five real reports from successful
+main runs' `perf-load-logs` artifacts. PR runs never supply baselines. Relative latency comparisons start once five
 main reports exist; until then every path still checks its absolute p99 budget and every request
 error fails. CPU compares as soon as one main report exists, because it averages the whole run.
 Relative latency tolerates 5 ms of noise, or 50 ms when either path has fewer than 50 samples:
 those sparse p99s are effectively observed maxima. This bounded tolerance still catches large
-regressions on rare paths. CPU tolerates 0.05 cores. A run without any baseline checks only the
-absolute budgets and errors. It is
-not in Workspace CI because with warm caches it takes as long as `linux-tests`, and twice as long
-when its stores must generate.
+regressions on rare paths. CPU tolerates 0.05 cores. A PR without a main baseline fails as P0;
+a main bootstrap may check only absolute budgets and errors. The workload and its budgets are
+unchanged.
 
-Both jobs keep their generated stores in the Actions cache, keyed by the generator and
-`docs/st3/schema.md`, so a store from an older generator is never measured.
+Performance uses the small `.#perf` Nix shell and the opt-in `perf_load` test target (feature
+`perf-load`), which imports the same `daemon_load` and `daemon_bench` modules without compiling
+all integration fixtures. Successful main runs retain seven-day build snapshots containing
+Cargo outputs, registry/git sources, a local sccache, and a signed Nix binary cache including the
+small shell closure. The build recipe includes the lockfiles, shell, manifests and Cargo config.
+Generated-store snapshots have a separate exact generator/schema key. PRs restore these trusted
+main artifacts, then let Cargo and sccache validate source changes. They never upload cache copies.
+Main report artifacts remain for thirty days. `scripts/ci-perf-cache-test` checks provenance,
+workload compatibility, report selection and required PR baselines.
+
+These snapshots avoid the repository's shared dependency-cache eviction: on 2026-10-04 the
+10 GB pool had already evicted main's just-saved Performance build and stores. A cold PR took
+25m21s, including 837s generating stores; a cache-hit PR still took about eleven minutes, including
+5m16s compiling the whole integration target and almost three minutes setting up unrelated tools.
+Every missing snapshot is flagged P0. A new store recipe generates its source stores on RAM-backed
+scratch space; the harness copies them to ordinary runner disk before measuring. `perf-cost`
+continues using the Actions cache with the same generator/schema keys.
 
 Run either locally with `TMPDIR=/var/tmp`; `ST_BENCH_DIR` keeps the generated stores between runs:
 
 ```sh
 cargo test -p st3 --test integration daemon_cost:: -- --nocapture --test-threads 1
-ST_LOAD_GATE=1 cargo test --release -p st3 --test integration daemon_load:: -- --nocapture
+ST_LOAD_GATE=1 nix develop .#perf -c cargo test --release -p st3 --features perf-load --test perf_load daemon_load:: -- --nocapture
 ```
 
 ## Generated files and existing workflows

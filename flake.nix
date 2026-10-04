@@ -1084,6 +1084,24 @@
           ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
           RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
         };
+        # The in-process load test uses a stand-in PTY and needs no collector or harness tools.
+        devShells.perf = pkgs.mkShell {
+          packages = [
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.git
+            pkgs.sccache
+            pkgs.pkg-config
+            pkgs.jq
+            libghosttyVT
+          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.mold ];
+          RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+          # build.rs embeds the fixture PATH. Runner-specific directories would invalidate
+          # st3's compiler cache even when its sources have not changed.
+          shellHook = ''
+            export PATH="$(printf '%s' "$PATH" | tr ':' '\n' | sed -n '\|^/nix/store/|p' | paste -sd:):/usr/bin:/bin"
+          '';
+        };
         # Configuration generation must not realize the Rust/PTY/collector shell.
         devShells.genie = pkgs.mkShell {
           packages = [ effect-utils.packages.${system}.genie ];

@@ -25,6 +25,7 @@ pub struct Selection {
     pub receipt: String,
     pub source: Source,
     pub policy: Policy,
+    pub manual: bool,
     pub desired_token: String,
     pub target: String,
     pub desired: DesiredSubject,
@@ -40,6 +41,8 @@ pub struct Operation {
     pub desired_token: String,
     pub target: String,
     pub publication_policy: Policy,
+    #[serde(default)]
+    pub publication_manual: bool,
     pub policy: Policy,
     pub old_incarnation: String,
     pub old_member: MemberSpec,
@@ -70,6 +73,41 @@ impl Operation {
     pub fn holds_seat(&self) -> bool {
         self.holds_intake() || self.phase == "held"
     }
+}
+
+/// The authored policy stays in canonical declaration bytes and therefore in receipt digests.
+pub fn manual(desired: &DesiredSubject) -> bool {
+    desired.desired["children"]
+        .as_array()
+        .is_some_and(|children| {
+            children
+                .iter()
+                .any(|child| child["name"] == "rollout" && child["arguments"][0] == "manual")
+        })
+}
+
+/// Pending manual publication is informational: it holds neither messages nor work intake.
+pub fn status(store: &Store, subject: &str) -> Result<Option<serde_json::Value>> {
+    let operation = store.rollout(subject)?;
+    if let Some(operation) = &operation
+        && operation.phase != "superseded"
+    {
+        return Ok(Some(serde_json::to_value(operation)?));
+    }
+    let Some(selection) = store.rollout_selection(subject)? else {
+        return Ok(None);
+    };
+    if selection.manual && hold_render(store, &selection.desired)? {
+        return Ok(Some(
+            json!({"phase":"pending", "mode":"manual", "publication":"published",
+            "status":"published, rollout pending (manual)", "set":selection.set,
+            "receipt":selection.receipt, "desired_token":selection.desired_token}),
+        ));
+    }
+    operation
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(Into::into)
 }
 
 pub fn target(desired: &DesiredSubject) -> Result<String> {
@@ -132,7 +170,13 @@ pub fn hold_render(store: &Store, desired: &DesiredSubject) -> Result<bool> {
     let Some(incarnation) = actual["incarnation_id"].as_str() else {
         return Ok(false);
     };
-    if actual["status"] != "running" {
+    if actual["status"] != "running"
+        && !(selection.manual
+            && matches!(
+                actual["status"].as_str(),
+                Some("stopped" | "exited" | "vanished")
+            ))
+    {
         return Ok(false);
     }
     let old = launched_member(store, &desired.subject, incarnation)?;

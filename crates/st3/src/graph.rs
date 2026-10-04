@@ -1232,6 +1232,15 @@ fn parse_agent(
         )
     })?;
     validate_agent_body(children, &node_name)?;
+    if let Some(policy) = unique_child(children, "rollout")? {
+        ensure_no_properties(policy)?;
+        if one_string(policy)? != "manual" {
+            return Err(St3Error::new(
+                "invalid-seat-rollout",
+                "seat rollout must be manual",
+            ));
+        }
+    }
     let fresh_context = unique_child(children, "fresh-context")?
         .map(|child| ensure_bare(child))
         .transpose()?
@@ -2693,6 +2702,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "checkout",
         "under",
         "restart",
+        "rollout",
         "shutdown-timeout",
         "command",
         "argv",
@@ -2731,6 +2741,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "host",
         "workspace",
         "checkout",
+        "rollout",
         "shutdown-timeout",
         "command",
         "argv",
@@ -6499,6 +6510,33 @@ schedule "daily" {
         }
     }
 
+    #[test]
+    fn manual_rollout_is_a_strict_declaration_field_and_changes_the_digest() {
+        let source = "version 2\nagent \"garden/orchard\" { rollout \"manual\"; harness \"claude\" { model \"example-model\"; } }";
+        let parsed = parse_owned_set_intent(source, "amber").unwrap();
+        assert!(crate::rollout::manual(
+            &parsed.subjects["agent/garden/orchard"]
+        ));
+        let automatic =
+            parse_owned_set_intent(&source.replace("rollout \"manual\";", ""), "amber").unwrap();
+        assert_ne!(
+            smallclaims::hash::canonical_hash(&parsed.subjects).unwrap(),
+            smallclaims::hash::canonical_hash(&automatic.subjects).unwrap()
+        );
+        for field in [
+            "rollout \"automatic\";",
+            "rollout 1;",
+            "rollout \"manual\"; rollout \"manual\";",
+            "rollout \"manual\" { ignored; }",
+            "rollout \"manual\" ignored=\"value\";",
+        ] {
+            assert!(
+                parse_owned_set_intent(&source.replace("rollout \"manual\";", field), "amber")
+                    .is_err(),
+                "{field}"
+            );
+        }
+    }
 
     #[test]
     fn strict_grammar_rejects_unknown_children_and_properties() {

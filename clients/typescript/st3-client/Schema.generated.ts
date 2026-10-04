@@ -443,6 +443,17 @@ export const AgentDelivery = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentDelivery = typeof AgentDelivery.Type
 export type AgentDeliveryEncoded = typeof AgentDelivery.Encoded
 
+export const AgentHandoff = /*#__PURE__*/ (() => Schema.Struct({
+  "desired_token": Schema.String,
+  "destination": Schema.String,
+  "overridden_sources": optionalKey(Schema.Array(Schema.String)),
+  "pending_sources": Schema.Array(Schema.String),
+  "phase": Schema.Literals(["stopping-source","waiting-for-destination","starting","running"]),
+  "sources": Schema.Array(Schema.String)
+}).annotate({ identifier: "AgentHandoff" }))()
+export type AgentHandoff = typeof AgentHandoff.Type
+export type AgentHandoffEncoded = typeof AgentHandoff.Encoded
+
 export const AgentId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:agent)/[^\\s]+$", "u"), "agent").annotate({ identifier: "AgentId" }))()
 export type AgentId = typeof AgentId.Type
 export type AgentIdEncoded = typeof AgentId.Encoded
@@ -641,6 +652,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "driver": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   /** Current member reconcile failure; cleared by a successful pass. */
   "fault": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Current member reconcile failure; cleared by a successful pass." }),
+  /** Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes. */
+  "handoff": Schema.OptionFromOptionalNullOr(AgentHandoff, NULL_NONE).annotate({ description: "Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes." }),
   "harness_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "host_id": Schema.OptionFromOptionalNullOr(HostId, NULL_NONE),
   "id": AgentId,

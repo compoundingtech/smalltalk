@@ -168,6 +168,25 @@ unspecified restart, launch, environment, and other settings remain intact. A ru
 workspace, harness, model, effort or arguments change this way restarts on the new declaration and
 continues its harness's last native session. A placement override
 does not rename an existing seat: pass its complete subject when moving it to another host.
+
+Changing a running seat's host is a fenced handoff, whether through `agents start --host`
+or authored KDL. Each former host stops its local runtime and records a fleet-visible
+`runtime.observed status=stopped reason=placed-elsewhere` acknowledgement before the destination
+launches. A termination request alone does not release the fence. A confirmed explicit stop can
+satisfy a later move while its source is offline. The handoff phase appears in `agents start`
+and `agents show`: `stopping-source`, `waiting-for-destination`, `starting`, then `running`.
+While a move is pending, the source incarnation is not reported as the destination's incarnation.
+
+A move waits when its source is unreachable. Once the operator knows the source is offline,
+`agents start SEAT --host DESTINATION --source-offline --as ACTOR` explicitly releases the
+pending sources for that placement. The actor, destination, sources and exact declaration token
+are recorded in a durable `agent.placement.source-offline` claim. `agents show` and start output
+display the recorded exception. It does not prove the source process exited: the operator must
+ensure it cannot keep running during the move. The source still stops its old runtime when it
+returns and learns the new placement. The exception does not carry over to another placement.
+For a handoff already declared through KDL or a mission, omit `--host` to override its pending
+sources without changing its destination.
+
 `--model`, `--effort`, and `--arg` require a typed `harness` block and are refused for
 `command`/`argv` declarations. `--harness` alone can explicitly switch the launch style.
 After a stop, start restores the unambiguous prior agent declaration. If none is available,

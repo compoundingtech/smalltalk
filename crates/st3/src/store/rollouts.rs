@@ -9,11 +9,20 @@ fn selection(connection: &Connection, subject: &str) -> Result<Option<Selection>
     let desired = connection.query_row("SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
         [subject],desired_from_row).map_err(internal)?;
     for view in owned_sets::selected(connection, None)? {
-        if !owned_sets::effective_members(connection, &view, None)?.contains_key(subject) {
+        let members = owned_sets::effective_members(connection, &view, None)?;
+        let Some((member, _, _)) = members.get(subject) else {
             continue;
-        }
-        let Some(policy) = view.receipt.rollout.clone() else {
-            return Ok(None);
+        };
+        // Retirement keeps the last authored seat policy even though its desired node is stop.
+        let manual = if desired.kind == "stop" {
+            owned_sets::manual_member(connection, member)?
+        } else {
+            crate::rollout::manual(&desired)
+        };
+        let policy = match view.receipt.rollout.clone() {
+            Some(policy) => policy,
+            None if manual => Policy::when_idle(30 * 60 * 1000, false),
+            None => return Ok(None),
         };
         let actor = claim_by_id_tx(connection, &view.claim)
             .map_err(internal)?
@@ -24,6 +33,7 @@ fn selection(connection: &Connection, subject: &str) -> Result<Option<Selection>
             receipt: view.claim,
             source: view.receipt.source,
             policy,
+            manual,
             desired_token: row.claim_id,
             target,
             desired,
@@ -142,14 +152,16 @@ fn operation(connection: &Connection, subject: &str) -> Result<Option<Operation>
     }
     if selected.set == operation.set
         && selected.target == operation.target
-        && selected.policy != operation.publication_policy
+        && (selected.policy != operation.publication_policy
+            || selected.manual != operation.publication_manual)
         && matches!(operation.phase.as_str(), "running" | "retired")
     {
         return Ok(None);
     }
     if selected.set != operation.set
         || selected.target != operation.target
-        || selected.policy != operation.publication_policy
+        || (selected.policy != operation.publication_policy
+            || selected.manual != operation.publication_manual)
     {
         operation.phase = "superseded".into();
     }
@@ -329,7 +341,7 @@ impl Store {
                 }
                 return Ok(prior);
             }
-            let selected = selection(tx, subject)?.ok_or_else(|| St3Error::new("rollout-not-enabled", "publish an owned set with --rollout when-idle first"))?;
+            let selected = selection(tx, subject)?.ok_or_else(|| St3Error::new("rollout-not-enabled", "publish an owned set with --rollout when-idle or a rollout manual seat first"))?;
             if selected.desired_token != expected_token {
                 return Err(St3Error::new("stale-rollout-target", "selected declaration changed; read it again"));
             }
@@ -338,7 +350,20 @@ impl Store {
             let ended = matches!(actual["status"].as_str(),Some("stopped"|"exited"|"vanished"));
             let carry = prior.as_ref().filter(|o| o.native_session_id.is_some()
                 && (o.old_incarnation == incarnation || o.replacement_incarnation.as_deref() == Some(incarnation)));
-            if actual["incarnation_id"].as_str() != Some(incarnation) || (actual["status"] != "running" && !(ended && carry.is_some())) {
+            // A pending manual publication can outlive its incumbent. Capture its exact
+            // native binding in this transaction; an explicit request still requires positive
+            // runtime exit before replacement and never falls back to a fresh conversation.
+            let ended_binding = if selected.manual && ended && carry.is_none() {
+                tx.query_row(&canonical_sql("SELECT body FROM claims WHERE subject=?1 AND kind='harness.session-file'
+                    AND json_extract(body,'$.fields.incarnation_id')=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                    params![subject,incarnation], |row| row.get::<_,String>(0)).optional().map_err(internal)?
+                    .map(|body| serde_json::from_str::<Value>(&body)).transpose().map_err(internal)?
+            } else { None };
+            let ended_binding = ended_binding.as_ref().map(|body| &body["fields"])
+                .filter(|fields| fields["harness"].as_str() == old.driver.as_deref());
+            let ended_session = ended_binding.and_then(|fields| fields["session_id"].as_str())
+                .filter(|session| !session.trim().is_empty());
+            if actual["incarnation_id"].as_str() != Some(incarnation) || (actual["status"] != "running" && !(ended && (carry.is_some() || ended_session.is_some()))) {
                 return Err(St3Error::new("stale-rollout-incarnation", "rollout needs the exact running incarnation"));
             }
             if old.host != self.origin() || selected.desired.member.as_ref().is_some_and(|new| new.host != old.host || new.driver != old.driver)
@@ -354,10 +379,12 @@ impl Store {
                 .collect::<Result<BTreeMap<_,_>,_>>().map_err(internal)?;
             let operation = Operation { id: String::new(), set: selected.set, receipt: selected.receipt,
                 source: selected.source, desired_token: selected.desired_token, target: selected.target,
-                policy: policy.clone(), publication_policy: selected.policy, old_incarnation: incarnation.into(),
+                policy: policy.clone(), publication_policy: selected.policy, publication_manual: selected.manual, old_incarnation: incarnation.into(),
                 old_member: old.clone(), deadline_unix_ms: now.saturating_add(policy.deadline_ms.into()),
                 requested_by: Some(actor.into()), requested_at_unix_ms: now, phase: if ended { "stopping" } else { "draining" }.into(),
-                phase_at_unix_ms: now, drain_ack: None, start_attempted: false, allowed_work, native_session_id: carry.and_then(|o|o.native_session_id.clone()), native_path: carry.and_then(|o|o.native_path.clone()), native_account: carry.and_then(|o|o.native_account.clone()), replacement_incarnation: None,
+                phase_at_unix_ms: now, drain_ack: None, start_attempted: false, allowed_work, native_session_id: carry.and_then(|o|o.native_session_id.clone()).or_else(|| ended_session.map(str::to_owned)),
+                native_path: carry.and_then(|o|o.native_path.clone()).or_else(|| ended_binding.and_then(|f|f["path"].as_str()).map(str::to_owned)),
+                native_account: carry.and_then(|o|o.native_account.clone()).or_else(|| ended_binding.and_then(|f|f["account_ref"].as_str()).map(str::to_owned)), replacement_incarnation: None,
                 forced: false, blocking: Vec::new(), reason: None };
             let claim = append_claim_tx(tx, self.origin(), subject, "runtime.action.requested", Some(actor),
                 &json!({"fields":{"action":"rollout","operation":key,"rollout":operation},"evidence":[expected_token]}),

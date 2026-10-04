@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Durable Performance snapshots and real baselines from successful main runs only."""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def api(path):
+    return json.loads(subprocess.check_output(['gh', 'api', path], text=True))
+
+
+def trusted(run):
+    return (run.get('head_branch') == 'main' and run.get('conclusion') == 'success'
+            and run.get('event') in ('push', 'schedule', 'workflow_dispatch')
+            and run.get('path') == '.github/workflows/perf.yml')
+
+
+def valid_report(report):
+    # Never substitute tiny fixture reports or measurements with a different workload.
+    return (report.get('scale') == 1 and report.get('seconds', 0) >= 120
+            and report.get('claims', 0) > 0 and report.get('long_poll_seats') == 30
+            and isinstance(report.get('daemon_cores'), (int, float))
+            and bool(report.get('paths')) and isinstance(report.get('failed'), dict)
+            and all(isinstance(path, dict) and all(key in path for key in
+                    ('count', 'p50_ms', 'p99_ms', 'max_ms', 'budget_ms'))
+                    for path in report['paths'].values()))
+
+
+def download(repo, run, name, dest):
+    subprocess.run(['gh', 'run', 'download', str(run['id']), '--repo', repo,
+                    '--name', name, '--dir', str(dest)], check=True)
+
+
+def unpack(archive, destination, names):
+    # These are main's own archives, but refuse unexpected roots before extracting.
+    listing = subprocess.check_output(['tar', '--zstd', '-tf', str(archive)], text=True)
+    for name in listing.splitlines():
+        path = Path(name)
+        if path.is_absolute() or '..' in path.parts or path.parts[0] not in names:
+            raise ValueError('unexpected snapshot path')
+    subprocess.run(['tar', '--zstd', '-xf', str(archive), '-C', str(destination)], check=True)
+
+
+def restore():
+    repo = os.environ['GITHUB_REPOSITORY']
+    work = Path(os.environ['GITHUB_WORKSPACE'])
+    temp = Path(os.environ['RUNNER_TEMP'])
+    baseline = temp / 'perf-baseline'
+    baseline.mkdir(exist_ok=True)
+    for report in baseline.glob('load-*.json'):
+        report.unlink()
+    wanted = {'build': os.environ['PERF_BUILD_SNAPSHOT'],
+              'stores': os.environ['PERF_STORES_SNAPSHOT']}
+    found = set()
+    reports = 0
+    # Bound discovery; seven days of snapshots and thirty days of reports fit comfortably.
+    runs = api(f'repos/{repo}/actions/workflows/perf.yml/runs?branch=main&status=success&per_page=100')
+    for run in runs['workflow_runs']:
+        if not trusted(run):
+            continue
+        artifacts = api(f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100")
+        names = {item['name'] for item in artifacts['artifacts'] if not item['expired']}
+        with tempfile.TemporaryDirectory(dir=temp) as tmp:
+            dest = Path(tmp)
+            for kind, name in wanted.items():
+                if kind in found or name not in names:
+                    continue
+                download(repo, run, name, dest / kind)
+                roots = ('target', 'cargo-home', 'perf-sccache', 'st-ci-cache') if kind == 'build' else ('st-bench',)
+                unpack(dest / kind / f'{kind}.tar.zst', dest, roots)
+                for root in roots:
+                    source = dest / root
+                    if source.exists():
+                        target = (work if root == 'target' else temp) / root
+                        shutil.rmtree(target, ignore_errors=True)
+                        shutil.move(source, target)
+                found.add(kind)
+                print(f"Performance {kind} cache HIT: main run {run['id']}", flush=True)
+            if reports < 5 and 'perf-load-logs' in names:
+                download(repo, run, 'perf-load-logs', dest / 'report')
+                files = list((dest / 'report').rglob('load.json'))
+                if len(files) != 1:
+                    raise ValueError('successful main run is missing its load report')
+                report = json.loads(files[0].read_text())
+                if not valid_report(report):
+                    raise ValueError('main load report has an incompatible workload')
+                shutil.copyfile(files[0], baseline / f"load-{run['id']}.json")
+                reports += 1
+        if len(found) == 2 and reports == 5:
+            break
+    for kind in wanted.keys() - found:
+        print(f'::warning::P0: Performance {kind} cache MISS; seed this recipe on main', flush=True)
+    if reports == 0 and os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
+        raise ValueError('P0: every PR requires a saved main baseline; run Performance on main first')
+    print(f'Performance baseline: {reports} real successful main reports', flush=True)
+    with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+        summary.write(f'Performance caches: build **{"HIT" if "build" in found else "MISS (P0)"}**, '
+                      f'stores **{"HIT" if "stores" in found else "MISS (P0)"}**; '
+                      f'baseline: **{reports} successful main reports**.\n')
+
+
+def pack():
+    work = Path(os.environ['GITHUB_WORKSPACE'])
+    temp = Path(os.environ['RUNNER_TEMP'])
+    output = temp / 'perf-snapshots'
+    output.mkdir(exist_ok=True)
+    # Registry source/config files contain no runner credentials; never archive all of CARGO_HOME.
+    subprocess.run(['tar', '-I', 'zstd -1 -T2', '-cf', str(output / 'build.tar.zst'),
+                    '-C', str(work), 'target', '-C', str(temp),
+                    'cargo-home/registry', 'cargo-home/git', 'perf-sccache', 'st-ci-cache'], check=True)
+    subprocess.run(['tar', '-I', 'zstd -1 -T2', '-cf', str(output / 'stores.tar.zst'),
+                    '-C', str(temp), 'st-bench'], check=True)
+
+
+def main():
+    try:
+        {'restore': restore, 'pack': pack}[sys.argv[1]]()
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        print(f'::error::P0: Performance cache/baseline operation failed: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
