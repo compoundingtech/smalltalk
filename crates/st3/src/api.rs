@@ -397,6 +397,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
         .route("/v1/client/status-history/{*id}", get(client_v0::status_history))
+        .route("/v1/client/harness-inventory/{*id}", get(client_v0::inventory::read))
         .route("/v1/client/lanes", get(client_v0::lanes))
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))

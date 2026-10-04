@@ -1079,6 +1079,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "harness.inventory.observed",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
+        (
             "agent.account",
             &["agent"],
             WritePolicy::SameSubjectActor,
@@ -2382,7 +2391,7 @@ fn claim_retention(kind: &str) -> Retention {
         | "runtime.action.deadline-reached" => Retention::SystemLocal,
         // Other nodes read the current harness state and usage: step readiness is judged on
         // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
-        "harness.observed" | "harness.usage" | "harness.todo.observed" | "workspace.observed" => {
+        "harness.observed" | "harness.usage" | "harness.todo.observed" | "harness.inventory.observed" | "workspace.observed" => {
             Retention::Latest
         }
         _ => Retention::Durable,
@@ -2405,6 +2414,14 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("phases", required_array()),
             ("totals", required_object()),
             ("truncated", required_boolean()),
+        ],
+        "harness.inventory.observed" => &[
+            ("harness", required_enum(&["omp"])),
+            ("session_id", required_string()),
+            ("incarnation_id", required_string()),
+            ("observed_at", required_string()),
+            ("dynamic_commands", required_enum(&["supported", "unsupported", "unavailable"])),
+            ("commands", required_array()),
         ],
         "agent.account" => &[("account", required_reference_to(&["account"]))],
         "attention.requested" => &[

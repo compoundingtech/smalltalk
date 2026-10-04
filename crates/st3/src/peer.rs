@@ -109,6 +109,10 @@ pub enum ClientReadOperation {
     AgentWorkspace {
         identity: String,
     },
+    HarnessInventory {
+        agent_id: String,
+        query: st3_client::HarnessInventoryQuery,
+    },
     /// Up to 512 KiB of an attachment from `offset`, from the member that took the upload. The
     /// answer is base64 in JSON with the file's size; the reader asks again until it has it all.
     Blob {
@@ -1156,6 +1160,10 @@ async fn receive_client_read(
                     crate::client::api_error_code(&error).unwrap_or("remote-unavailable"),
                     StatusCode::CONFLICT, format!("{error:#}")
                 ).into())
+            }
+            ClientReadOperation::HarnessInventory { agent_id, query } => {
+                let value = client.harness_inventory_get(&agent_id, &query).await?.value;
+                Ok(serde_json::to_value(value)?)
             }
             ClientReadOperation::AgentWorkspace { identity } => {
                 let workspace =

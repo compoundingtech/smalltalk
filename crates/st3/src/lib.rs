@@ -19,6 +19,7 @@ pub mod delivery_hold;
 pub mod driver_hook;
 pub mod environment;
 pub(crate) mod external_sessions;
+pub(crate) mod file_inventory;
 pub mod fleet;
 /// `st missions check`: run a mission file's exec gates once, now, the way a run would.
 pub mod gate_check;

@@ -2426,6 +2426,50 @@
         }
       ]
     },
+    "HarnessInventoryQuery": {
+      "type": "object", "additionalProperties": false,
+      "required": ["owner_host_id", "session_id", "native_session_id", "runtime_incarnation", "collection"],
+      "properties": {
+        "owner_host_id": {"type": "string"},
+        "session_id": {"type": "string"},
+        "native_session_id": {"type": "string"},
+        "runtime_incarnation": {"type": "string"},
+        "collection": {"enum": ["files", "skills", "skill-commands", "slash-commands"]},
+        "directory": {"type": "string", "maxLength": 1024},
+        "prefix": {"type": "string", "maxLength": 160},
+        "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 200},
+        "cursor": {"type": ["string", "null"], "maxLength": 8192}
+      }
+    },
+    "HarnessInventoryItem": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "kind", "source"],
+      "properties": {
+        "name": {"type": "string"},
+        "kind": {"enum": ["file", "directory", "skill-command", "slash-command"]},
+        "source": {"enum": ["extension", "prompt", "skill", null]}
+      }
+    },
+    "HarnessInventory": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "agent_id", "owner_host_id", "session_id", "native_session_id", "runtime_incarnation", "collection", "status", "coverage", "full_inventory", "reason", "observed_at", "items", "page"],
+      "properties": {
+        "kind": {"const": "harness-inventory"},
+        "agent_id": {"type": "string"},
+        "owner_host_id": {"type": "string"},
+        "session_id": {"type": "string"},
+        "native_session_id": {"type": ["string", "null"]},
+        "runtime_incarnation": {"type": "string"},
+        "collection": {"enum": ["files", "skills", "skill-commands", "slash-commands"]},
+        "status": {"enum": ["supported", "unsupported", "unavailable"]},
+        "coverage": {"enum": ["none", "native-workspace", "enabled-skill-commands", "dynamic-commands"]},
+        "full_inventory": {"type": "boolean"},
+        "reason": {"type": ["string", "null"]},
+        "observed_at": {"type": ["string", "null"]},
+        "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/HarnessInventoryItem"}},
+        "page": {"$ref": "#/$defs/PageInfo"}
+      }
+    },
     "CollectionFrame": {
       "oneOf": [
         {

@@ -576,6 +576,15 @@ impl EventObserver {
             self.native_session = frame["sessionId"].as_str()
                 .filter(|id| !id.is_empty()).map(str::to_owned);
         }
+        if let Some(inventory) = crate::harness_inventory::observation(
+            frame, self.driver, self.native_session.as_deref(), &self.runtime,
+        )? {
+            let mut payload = serde_json::to_value(inventory)?;
+            payload["incarnation"] = Value::String(self.owner.clone());
+            crate::harness_events::write_snapshot(
+                &self.agent_dir, "harness-inventory", &serde_json::to_vec(&payload)?,
+            )?;
+        }
         if let Some(fields) = todo_observation(
             frame, self.driver, self.native_session.as_deref(), &self.runtime,
         ) {

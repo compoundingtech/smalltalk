@@ -82,6 +82,33 @@ subagent is part of its agent, not a resource of its own, and has no actions. Th
 per request, so a lease that runs out leaves it at the next read without a new claim. A daemon
 older than the field omits it; clients read a missing list as empty.
 
+### Native harness inventory
+
+`GET /v1/client/harness-inventory/{agent}` uses `read.projections` and requires
+`owner_host_id`, `session_id`, `native_session_id`, `runtime_incarnation`, and `collection`.
+Signed owner reads preserve the authenticated actor and every fence. A stale owner, managed/native
+session or incarnation is refused; evidence is checked again after the read.
+
+Collections are `files`, `skills`, `skill-commands`, and `slash-commands`. Responses distinguish
+`supported`, `unsupported`, and `unavailable`, with explicit `coverage`, `full_inventory`, reason,
+native observation time, and bounded items. An unobserved source does not assert a native session.
+The OMP interactive source exposes enabled skill commands and dynamic extension/prompt commands,
+not complete loaded skills or builtins. Thus `skills` is unsupported; `skill-commands` and
+`slash-commands` never claim full inventory. Items contain only native invocation names, kinds and
+source categories: no descriptions, source paths, prompt/skill bodies, or credentials.
+
+File inventory lists one visible directory relative to the native session's observed workspace.
+It never follows directory or entry symlinks, descends into hidden directories, reads file contents,
+or returns absolute paths. Dot-prefixed entries, special files and non-UTF-8 names are omitted.
+The scan is bounded at 10,000 directory entries, including hidden/nonmatching entries; exceeding
+that bound is unavailable rather than a truncated complete listing.
+
+Optional `directory` applies only to files; `prefix` matches names. Pages default to 50 items and
+accept 1–200. A continuation cursor expires after 60 seconds and binds actor, all session/owner
+fences, filters, limit and source revision; directory mutation or changed native evidence expires
+it. The producer observes native startup/session/turn boundaries and publishes changed snapshots,
+not keepalives. It has no complete-registry reload subscription or instantaneous freshness promise.
+
 ## Boundary and transport
 
 The client API is a projection and command gateway, not a graph replica. Its version is

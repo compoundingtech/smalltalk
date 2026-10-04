@@ -95,6 +95,7 @@ pub const READ_OPERATIONS: &[(&str, &str)] = &[
     ("agent-declaration.get", "/v1/client/agent-declarations/{id}"),
     ("status-history.get", "/v1/client/status-history/{id}"),
     ("agent-queue.get", "/v1/client/agent-queues/{id}"),
+    ("harness-inventory.get", "/v1/client/harness-inventory/{id}"),
     ("runtimes.list", "/v1/client/runtimes"),
     ("runtimes.get", "/v1/client/runtimes/{id}"),
     ("observers.list", "/v1/client/observers"),

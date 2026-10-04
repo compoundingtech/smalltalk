@@ -630,6 +630,41 @@ export type GlassTab = {
 
 export type GoldenResourceSet = Array<Resource>;
 
+export type HarnessInventory = {
+  agent_id: string;
+  collection: "files" | "skills" | "skill-commands" | "slash-commands";
+  coverage: "none" | "native-workspace" | "enabled-skill-commands" | "dynamic-commands";
+  full_inventory: boolean;
+  items: Array<HarnessInventoryItem>;
+  kind: "harness-inventory";
+  native_session_id: string | null;
+  observed_at: string | null;
+  owner_host_id: string;
+  page: PageInfo;
+  reason: string | null;
+  runtime_incarnation: string;
+  session_id: string;
+  status: "supported" | "unsupported" | "unavailable";
+};
+
+export type HarnessInventoryItem = {
+  kind: "file" | "directory" | "skill-command" | "slash-command";
+  name: string;
+  source: "extension" | "prompt" | "skill" | null;
+};
+
+export type HarnessInventoryQuery = {
+  collection: "files" | "skills" | "skill-commands" | "slash-commands";
+  cursor?: string | null;
+  directory?: string;
+  limit?: number | null;
+  native_session_id: string;
+  owner_host_id: string;
+  prefix?: string;
+  runtime_incarnation: string;
+  session_id: string;
+};
+
 export type HarnessPhase = {
   name: string;
   tasks: Array<HarnessTask>;

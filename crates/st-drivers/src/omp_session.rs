@@ -288,6 +288,25 @@ fn load_binding(
     load_binding_file(&state_dir.join(BINDING_FILE), agent, runtime_id)
 }
 
+/// Current, ready native session for an owner read. A pending switch is not a read authority.
+pub fn bound_native_session(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    runtime_incarnation: &str,
+) -> Result<Option<String>> {
+    let Some(binding) = load_binding(state_dir, agent, runtime_id)? else { return Ok(None) };
+    if !binding.ready || binding.runtime_incarnation != runtime_incarnation {
+        return Ok(None);
+    }
+    if let Some(pending) = load_pending_binding(state_dir, agent, runtime_id)?
+        && pending.runtime_incarnation == runtime_incarnation
+        && pending.native_session_id != binding.native_session_id {
+        return Ok(None);
+    }
+    Ok(Some(binding.native_session_id))
+}
+
 fn load_pending_binding(
     state_dir: &Path,
     agent: &str,

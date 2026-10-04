@@ -17473,6 +17473,27 @@ impl NativeObservations {
                     )
                     .await?;
                 }
+                "harness-inventory" => {
+                    let mut fields: BTreeMap<String, Value> =
+                        serde_json::from_value(event.payload.clone())?;
+                    fields.remove("incarnation");
+                    fields.remove("workspace");
+                    fields.insert("incarnation_id".into(), event.runtime_incarnation.clone().into());
+                    let _: ClaimRecord = publisher.post(
+                        "/v1/claims",
+                        &ClaimInput {
+                            subject: subject.into(),
+                            kind: "harness.inventory.observed".into(),
+                            actor: Some(subject.into()),
+                            fields,
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(format!(
+                                "harness-inventory:{subject}:{}:{}", event.runtime_incarnation, event.sequence,
+                            )),
+                        },
+                    ).await?;
+                }
                 "harness-todo" => {
                     let mut fields: BTreeMap<String, Value> =
                         serde_json::from_value(event.payload.clone())?;

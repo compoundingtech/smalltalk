@@ -399,6 +399,7 @@ export default function (pi: ExtensionAPI) {
   let jobContext: ExtensionContext | undefined;
   let lastStateFrame: Record<string, unknown> | undefined;
   let lastBackgroundJobs: number | null | undefined;
+  let inventoryFingerprint: string | undefined;
   const backgroundJobs = (): number | null => {
     try {
       const snapshot = (jobContext as ExtensionContext & {
@@ -608,6 +609,7 @@ export default function (pi: ExtensionAPI) {
           send({ type: "ready", sessionId: nativeSessionId });
           state.todoReady = true;
           observeTodoBranch(ctx, true);
+          observeInventory(ctx, true);
           // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
           if (state.restoringAsk) {
             state.restoringAsk.ready = true;
@@ -703,6 +705,46 @@ export default function (pi: ExtensionAPI) {
       frame = { ...frame, backgroundJobs: lastBackgroundJobs };
     }
     child.stdin.write(JSON.stringify(frame) + "\n");
+  };
+
+  // Only native metadata is admitted. getCommands excludes builtins and disabled skill
+  // commands; it is not a full skill/command registry. Descriptions can derive from prompt
+  // bodies, so neither descriptions nor source paths cross this observation boundary.
+  const observeInventory = (ctx: ExtensionContext, force = false) => {
+    if (!state.todoReady || !state.child || state.child.stdin?.destroyed) return;
+    const session = ctx.sessionManager.getSessionId();
+    const workspace = typeof ctx.cwd === "string" && ctx.cwd.startsWith("/") && ctx.cwd.length <= 4096
+      ? ctx.cwd : null;
+    let dynamicCommands: "supported" | "unsupported" | "unavailable" = "unsupported";
+    let commands: { name: string; source: "extension" | "prompt" | "skill" }[] = [];
+    if (typeof pi.getCommands === "function") {
+      try {
+        const native = pi.getCommands();
+        if (!Array.isArray(native) || native.length > 2000) throw new Error("inventory bound");
+        commands = native.map((command) => {
+          if (typeof command.name !== "string" || command.name.length === 0 ||
+              Buffer.byteLength(command.name, "utf8") > 160 || /\p{Cc}/u.test(command.name) ||
+              !["extension", "prompt", "skill"].includes(command.source)) {
+            throw new Error("inventory descriptor");
+          }
+          return { name: command.name, source: command.source };
+        });
+        commands.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+        if (commands.some((command, index) => index > 0 && commands[index - 1].name === command.name) ||
+            Buffer.byteLength(JSON.stringify(commands), "utf8") > 56 * 1024) {
+          throw new Error("inventory bound");
+        }
+        dynamicCommands = "supported";
+      } catch {
+        commands = [];
+        dynamicCommands = "unavailable";
+      }
+    }
+    const reading = { session_id: session, workspace, dynamic_commands: dynamicCommands, commands };
+    const fingerprint = JSON.stringify(reading);
+    if (!force && inventoryFingerprint === fingerprint) return;
+    sendFrame({ type: "inventory", observed_at: new Date().toISOString(), ...reading });
+    inventoryFingerprint = fingerprint;
   };
   const emitTodo = (ctx: ExtensionContext, snapshot: TodoSnapshot, observedAt: string, sourceOp: string, force = false) => {
     if (!state.todoReady || !state.child || state.child.stdin?.destroyed) return;
@@ -1108,15 +1150,17 @@ export default function (pi: ExtensionAPI) {
 
   // Registered only now that every helper above is initialized: a use-before-declaration in this
   // file is the defect class that once shipped green through the type gate.
-  onWidened("agent_start", async () => {
+  onWidened("agent_start", async (_event, ctx) => {
     cancelSettle();
     state.running = true;
     toolCallsInFlight().clear();
     sendFrame({ type: "state", state: "active" });
+    observeInventory(ctx);
   });
   onWidened("agent_end", async (event, ctx) => {
     captureCost(event);
     sendContext(ctx);
+    observeInventory(ctx);
     const end = event as AgentEndFrame;
     if (end.willContinue !== true) {
       state.running = false;
@@ -1331,6 +1375,7 @@ export default function (pi: ExtensionAPI) {
   for (const event of ["session_tree", "session_branch"]) {
     onWidened(event, async (_event, ctx) => {
       observeTodoBranch(ctx, true);
+      observeInventory(ctx);
     });
   }
   onWidened("session_start", async (_event, ctx) => {

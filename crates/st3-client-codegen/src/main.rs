@@ -257,6 +257,8 @@ fn rust_operation_methods(
             )?;
         } else if id == "status-history.get" {
             writeln!(out, "    pub async fn status_history_get(&self, id: &str) -> Result<Envelope<StatusHistory>, ClientError> {{ self.get(&format!(\"/v1/client/status-history/{{}}\", percent_encode(id))).await }}")?;
+        } else if id == "harness-inventory.get" {
+            writeln!(out, "    pub async fn harness_inventory_get(&self, agent_id: &str, query: &HarnessInventoryQuery) -> Result<Envelope<HarnessInventory>, ClientError> {{ let mut fields = vec![format!(\"owner_host_id={{}}\", percent_encode(&query.owner_host_id)), format!(\"session_id={{}}\", percent_encode(&query.session_id)), format!(\"native_session_id={{}}\", percent_encode(&query.native_session_id)), format!(\"runtime_incarnation={{}}\", percent_encode(&query.runtime_incarnation)), format!(\"collection={{}}\", percent_encode(&query.collection)), format!(\"directory={{}}\", percent_encode(&query.directory)), format!(\"prefix={{}}\", percent_encode(&query.prefix))]; if let Some(limit) = query.limit {{ fields.push(format!(\"limit={{limit}}\")); }} if let Some(cursor) = &query.cursor {{ fields.push(format!(\"cursor={{}}\", percent_encode(cursor))); }} self.get(&format!(\"/v1/client/harness-inventory/{{}}?{{}}\", percent_encode(agent_id), fields.join(\"&\"))).await }}")?;
         } else if id == "agent-queue.get" {
             writeln!(
                 out,
@@ -400,6 +402,8 @@ fn swift_operation_methods(
                 out,
                 "    public func customSubjectsList(kind: String? = nil, version: Int? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<Page> {{ var query: [URLQueryItem] = []; if let kind {{ query.append(.init(name: \"kind\", value: kind)) }}; if let version {{ query.append(.init(name: \"version\", value: String(version))) }}; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/custom-subjects\", query: query) }}"
             )?;
+        } else if id == "harness-inventory.get" {
+            writeln!(out, "    public func harnessInventoryGet(id: String, options: HarnessInventoryQuery) async throws -> Envelope<HarnessInventory> {{ var query: [URLQueryItem] = [.init(name: \"owner_host_id\", value: options.ownerHostID), .init(name: \"session_id\", value: options.sessionID), .init(name: \"native_session_id\", value: options.nativeSessionID), .init(name: \"runtime_incarnation\", value: options.runtimeIncarnation), .init(name: \"collection\", value: options.collection)]; if let directory = options.directory {{ query.append(.init(name: \"directory\", value: directory)) }}; if let prefix = options.prefix {{ query.append(.init(name: \"prefix\", value: prefix)) }}; if let limit = options.limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; if let cursor = options.cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; return try await get(\"v1/client/harness-inventory/\\(id)\", query: query) }}")?;
         } else if id == "resources.list" {
             writeln!(
                 out,
@@ -1176,6 +1180,8 @@ fn typescript_operation_methods(
                 out,
                 "    async customSubjectsList(options: PageOptions & {{ kind?: string; version?: number }} = {{}}): Promise<EnvelopeOf<Page>> {{ return this.get('{route}' + query(options)); }}"
             )?;
+        } else if id == "harness-inventory.get" {
+            writeln!(out, "    async {method}(id: string, options: HarnessInventoryQuery): Promise<EnvelopeOf<HarnessInventory>> {{ return this.get(`{route}` + query({{ ...options, limit: options.limit ?? undefined, cursor: options.cursor ?? undefined }})); }}")?;
         } else if id == "resources.list" {
             writeln!(
                 out,

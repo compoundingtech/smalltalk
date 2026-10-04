@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -256,10 +256,10 @@ fn current_token(connection: &Connection) -> Result<Option<String>> {
 
 pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     anyhow::ensure!(
-        matches!(kind, "harness-state" | "harness-context" | "harness-todo"),
+        matches!(kind, "harness-state" | "harness-context" | "harness-todo" | "harness-inventory"),
         "unsupported observation kind"
     );
-    let value: Value = serde_json::from_slice(body)?;
+    let mut value: Value = serde_json::from_slice(body)?;
     anyhow::ensure!(
         value["incarnation"]
             .as_str()
@@ -280,12 +280,23 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     }
     // Context writers used to have no ownership fence. Refuse a delayed predecessor now that
     // its snapshot and event are admitted in the same transaction as the ownership check.
-    if matches!(kind, "harness-context" | "harness-todo") {
+    if matches!(kind, "harness-context" | "harness-todo" | "harness-inventory") {
         anyhow::ensure!(
             current_token(&tx)?.as_deref() == value["incarnation"].as_str(),
             "harness observation owner was superseded"
         );
     }
+    let inventory_bytes;
+    let body = if kind == "harness-inventory" {
+        let token = value["incarnation"].as_str().context("inventory has no owner")?;
+        let runtime: String = tx.query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [format!("provider-runtime:{token}")], |row| row.get(0),
+        )?;
+        value["incarnation_id"] = runtime.into();
+        inventory_bytes = serde_json::to_vec(&value)?;
+        inventory_bytes.as_slice()
+    } else { body };
     tx.execute(
         "INSERT INTO snapshots VALUES (?1,?2)
         ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
