@@ -46,6 +46,43 @@ It keeps sampling through slow final unwind rather than abandoning the idle edge
 timeout. New activity, session replacement, or channel replacement retires the old sampler;
 an outstanding human ask or approval keeps its blocking observation, including on reconnect.
 
+## Native control adapter
+
+The channel's control helper accepts only the current driver's desired revision and incarnation,
+the exact native session, and its observed turn binding. The turn is initially `null`; a new
+identifier is minted only on the native `agent_start` event.
+
+Input uses a displayable, user-attributed native custom message with an operation ID, actor, and
+entry ID in its details. Idle input starts a turn; busy input keeps native steer or follow-up
+semantics. Neither the void extension return nor matching text proves acceptance: only the exact
+native `message_start` or `message_end` details settle the operation. Identical text with distinct
+operation IDs remains distinct.
+
+Native session switch, branch, and tree transitions are refused while an input admission or model
+mutation remains unresolved. There is no timeout that releases this fence. If another extension
+cancels a transition after its before-event, controls stay unavailable until a native after-event
+proves the current binding. Shutdown without a settled operation reports `indeterminate`.
+
+Model selection awaits native `setModel`, then observes the effective model and effort. Model and
+effort changes are **not atomic**. Unsupported effort choices are rejected before mutation; configured
+effort remains explicitly unknown when the extension API exposes only the effective value. Live
+approval response is unsupported because there is no native extension approval-resolution API.
+
+Receipt replay is process-local channel recovery, not durable native deduplication. The driver must
+not blindly replay an operation after a process replacement or an indeterminate result.
+
+The isolated native smoke uses a local zero-cost provider and the actual native RPC executable:
+
+```sh
+OMP_NATIVE_BIN=/path/to/native/omp bun scripts/st3-omp-harness-control-smoke/main.ts
+```
+
+It covers effective effort changes, exact receipts for identical input text with different IDs,
+stale session and turn refusal, real branch/switch cancellation during admission, receipt loss
+and replay, stale bindings after a completed branch, and a pending model's native shutdown result.
+This proof was exercised with OMP 18.4.10. It does not use the managed-seat launcher or a remote
+provider account.
+
 ## Channel telemetry
 
 The managed channel forwards `timeline` and `context` frames to the shared pi-family

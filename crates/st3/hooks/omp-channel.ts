@@ -18,6 +18,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { createHarnessControl } from "./omp-harness-control.ts";
 
 const PROTOCOL = 2;
 
@@ -561,6 +562,7 @@ export default function (pi: ExtensionAPI) {
         if (lastStateFrame && backgroundJobs() !== lastBackgroundJobs) sendFrame(lastStateFrame);
         if (legacyChannel) send({ type: "keepalive" });
         if (state.todoReady) observeTodoBranch(ctx, false, true);
+        harnessControl.observe();
       }, 1000);
       keepalive.unref?.();
 
@@ -572,6 +574,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (state.child !== child) return;
+        if (harnessControl.handle(frame, ctx)) return;
         if (frame.type === "settled" && typeof frame.meta?.messageId === "string") {
           // The daemon acknowledged read; the graph can no longer replay this native handoff.
           state.accepted?.delete(frame.meta.messageId);
@@ -704,6 +707,7 @@ export default function (pi: ExtensionAPI) {
     }
     child.stdin.write(JSON.stringify(frame) + "\n");
   };
+  const harnessControl = createHarnessControl(pi, sendFrame);
   const emitTodo = (ctx: ExtensionContext, snapshot: TodoSnapshot, observedAt: string, sourceOp: string, force = false) => {
     if (!state.todoReady || !state.child || state.child.stdin?.destroyed) return;
     const nativeSession = ctx.sessionManager.getSessionId();
