@@ -103,7 +103,7 @@ public actor St3Client {
             }
         }
     }
-    public func arrangementsStream(person: String, subscriptionID: String = "arrangements", limit: Int = 100) -> AsyncThrowingStream<ArrangementCollectionFrame, Error> {
+    public func arrangementsStream(person: String, subscriptionID: String = "arrangements", limit: Int = 100, subject: String? = nil) -> AsyncThrowingStream<ArrangementCollectionFrame, Error> {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
         var request = URLRequest(url: components.url!); request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
@@ -113,7 +113,9 @@ public actor St3Client {
             task.resume()
             Task {
                 do {
-                    let command = try JSONSerialization.data(withJSONObject: ["kind":"subscribe", "id":subscriptionID, "collection":"arrangements", "person":person, "limit":limit])
+                    var subscription: [String: Any] = ["kind":"subscribe", "id":subscriptionID, "collection":"arrangements", "person":person, "limit":limit]
+                    if let subject { subscription["subject"] = subject }
+                    let command = try JSONSerialization.data(withJSONObject: subscription)
                     try await task.send(.string(String(decoding: command, as: UTF8.self)))
                     while true {
                         let data = try Self.websocketData(from: try await task.receive())

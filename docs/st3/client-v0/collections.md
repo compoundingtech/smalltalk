@@ -20,6 +20,19 @@ owner. Each read checks `read.arrangements` and the selected person's access. Fo
 {"kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":100}
 ```
 
+To follow one selected arrangement, add optional `subject: ArrangementId`:
+
+```json
+{"kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","subject":"arrangement/person/ada/019a0000-0000-7000-8000-000000000002"}
+```
+
+The subject must belong to `person`; a mismatched owner is refused. This window
+contains only that subject (zero or one items), independent of the owner's
+subject-ordered count/byte prefix. It receives a snapshot, full-resource upserts
+and the normal retirement removal, with `has_more: false`. An absent or retired
+subject starts empty. Individual resource byte bounds still apply. Omitting
+`subject` retains the existing owner-wide bounded window.
+
 Arrangement snapshots and changes carry full typed arrangement resources. Folder or
 placement changes are full resource upserts; retirement sends the arrangement ID in
 `removes`. Glass privacy and its person-only selection are unchanged.

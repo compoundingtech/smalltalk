@@ -32,6 +32,8 @@ struct CollectionSubscribe {
     collection: String,
     limit: Option<usize>,
     person: Option<String>,
+    /// Follow one arrangement instead of the owner's bounded prefix window.
+    subject: Option<String>,
     actor: Option<String>,
     status: Option<String>,
     /// A terminal subscription names the terminal, the incarnation `terminal.attach` fenced,
@@ -118,6 +120,9 @@ async fn collection_items(
     if request.status.is_some() && request.collection != "agents" {
         return Err(validation("status filters are supported for agents only"));
     }
+    if request.subject.is_some() && request.collection != "arrangements" {
+        return Err(validation("subject filters are supported for arrangements only"));
+    }
     let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
         return Err(validation("collection limit must be 1 through 200"));
@@ -132,7 +137,15 @@ async fn collection_items(
             return Err(validation("arrangements select an explicit person, not an actor"));
         }
         let current_session = revalidate_session(state, session)?;
-        Some(arrangements::person(&current_session, request.person.as_deref(), false)?)
+        let person = arrangements::person(&current_session, request.person.as_deref(), false)?;
+        if let Some(subject) = &request.subject {
+            let owner = st3_schema::arrangements::owner(subject)
+                .map_err(|error| validation(error.message))?;
+            if owner != person {
+                return Err(validation("selected arrangement owner must match person"));
+            }
+        }
+        Some(person)
     } else if request.collection == "attention" {
         person_filter(session, request.person.as_deref())?
     } else {
@@ -140,6 +153,7 @@ async fn collection_items(
     };
     let state = state.clone();
     let actor = request.actor.clone();
+    let subject = request.subject.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
@@ -164,7 +178,11 @@ async fn collection_items(
                     store.glasses(person.as_deref().expect("authenticated glass owner"), index)?
                 }
                 "arrangements" => {
-                    store.arrangements(person.as_deref().expect("explicit arrangement owner"), index)?
+                    if let Some(subject) = &subject {
+                        store.arrangement(subject, index)?.into_iter().collect()
+                    } else {
+                        store.arrangements(person.as_deref().expect("explicit arrangement owner"), index)?
+                    }
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
                 "agents" => client_agent_resources(&store, false, &at, index)?,

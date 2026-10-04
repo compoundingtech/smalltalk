@@ -1256,6 +1256,9 @@ be refreshed after refusal, and accepted retries replay before fence validation.
 Changing other input with the same key returns `idempotency-conflict`. A completed
 result's `affected_ids` names only the arrangement and `arrangement_revision` identifies
 the accepted claim, not a promise that its registers will remain winners.
+A second `create` for an existing arrangement under a different idempotency key returns
+typed `arrangement-exists` with `retryable: false`; clients can distinguish a create
+race from an internal failure. Exact retries of the original create return its receipt.
 
 `arrangement.edited` claims are durable. Each register uses canonical maximum
 `(accepted_at_unix_ms, batch origin, replica_sequence, batch_id, record position, claim_id)`,
@@ -1280,6 +1283,11 @@ Subscribe on `st3.client.collections.v0` with
 Person is required and grants are checked on every read. Bounded authoritative snapshots,
 full resource upserts, removed IDs, complete order, and reconnect snapshots follow the
 ordinary collection contract.
+An optional `subject: ArrangementId` selects only that arrangement (zero or one items,
+`has_more: false`), so a selected Sidebar cannot fall outside a busy owner's byte/count
+window. Its owner must equal `person`; mismatches are refused. Snapshots, upserts and
+retirement removals retain the ordinary collection semantics. Omitting the filter
+keeps owner-wide prefix windows unchanged.
 Arrangement list and stream windows also fit a byte budget: the 1,048,576-byte response
 ceiling reserves 128,000 bytes for the envelope. A byte-shortened window sets `has_more`
 and retains full resources, not truncated registers or placements. A replicated full
@@ -1293,6 +1301,9 @@ Generated Rust exposes `arrangements_list`, `arrangements_get`, `arrangement_edi
 `arrangementsGet`, `arrangementEdit`, and `CollectionStream.subscribeArrangements`;
 Swift exposes `arrangementsList`, `arrangementsGet`, `arrangementEdit`, and
 `arrangementsStream`. Detail methods take the person name and UUID separately.
+All three arrangements stream helpers accept an optional `subject`; Rust takes
+`subject: Option<&str>` after `limit`, TypeScript takes `subject?: ArrangementId`
+after `limit`, and Swift takes `subject: String? = nil`.
 Rust operations reuse `st3_schema::arrangements::Operation`; TypeScript and Swift have
 typed operation unions, not arbitrary JSON bodies. Regenerate all clients with
 `cargo run -p st3-client-codegen`; verify freshness with

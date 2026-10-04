@@ -1118,6 +1118,14 @@ fn client_error_envelope(status: StatusCode, raw: &Value, request_id: &str) -> V
 }
 
 fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
+    if matches!(code, Some(
+        "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired"
+        | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle"
+        | "arrangement-body-too-large" | "arrangement-owner-forbidden"
+        | "invalid-arrangement-subject" | "invalid-arrangement-action"
+        | "invalid-arrangement-operations" | "invalid-arrangement-folder"
+        | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference"
+    )) { return false; }
     matches!(
         code,
         Some(
@@ -1146,6 +1154,21 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unsupported-capability"
         | "validation-failed"
         | "idempotency-conflict"
+        | "arrangement-exists"
+        | "arrangement-folder-exists"
+        | "arrangement-retired"
+        | "arrangement-limit"
+        | "arrangement-folder-deleted"
+        | "arrangement-cycle"
+        | "arrangement-body-too-large"
+        | "arrangement-owner-forbidden"
+        | "invalid-arrangement-subject"
+        | "invalid-arrangement-action"
+        | "invalid-arrangement-operations"
+        | "invalid-arrangement-folder"
+        | "invalid-arrangement-name"
+        | "invalid-arrangement-key"
+        | "invalid-subject-reference"
         | "stale-fence"
         | "timeline-history-incomplete"
         | "cursor-gap"

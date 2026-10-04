@@ -3,7 +3,7 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    Arrangement, ArrangementPage,
+    Arrangement, ArrangementId, ArrangementPage,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
@@ -64,7 +64,7 @@ export type CollectionStreamOptions = {
 export type CollectionStream = {
     /** Hold a window of up to `limit` (1–200) current items. A held ID is replaced. */
     subscribeGlasses(id: string): void;
-    subscribeArrangements(id: string, person: string, limit?: number): void;
+    subscribeArrangements(id: string, person: string, limit?: number, subject?: ArrangementId): void;
     subscribe(id: string, collection: Exclude<CollectionName, 'arrangements'>, limit?: number, filters?: CollectionFilters): void;
     /** Follow a terminal with the incarnation and single-use capability `terminal.attach` returned. */
     subscribeTerminal(id: string, terminal: string, incarnation: string | null | undefined, capability: string): void;
@@ -322,7 +322,7 @@ export class St3Client {
         socket.onerror = () => end(new Error('The collections socket failed'));
         return {
             subscribeGlasses: id => send({kind: 'subscribe', id, collection: 'glasses', limit: 100}),
-            subscribeArrangements: (id, person, limit = 100) => send({kind: 'subscribe', id, collection: 'arrangements', person, limit}),
+            subscribeArrangements: (id, person, limit = 100, subject) => send({kind: 'subscribe', id, collection: 'arrangements', person, limit, ...(subject === undefined ? {} : {subject})}),
             subscribe: (id, collection, limit, filters = {}) => send({ kind: 'subscribe', id, collection, ...(limit === undefined ? {} : { limit }), ...filters }),
             subscribeTerminal: (id, terminal, incarnation, capability) => send({ kind: 'subscribe', id, collection: 'terminal', terminal, incarnation, capability }),
             subscribeConversation: (id, conversation) => send({ kind: 'subscribe', id, collection: 'conversation', conversation }),
