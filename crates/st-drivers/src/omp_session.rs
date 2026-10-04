@@ -7,8 +7,8 @@
 //!
 //! Unlike pi, the wrapper hard-gates the provider version (OMP-R05): the delivery-critical
 //! surface — event names, the sampled idle edge, the approval events — is versioned behavior, not
-//! an API contract, so an unverified MINOR stays refused until the admission checks are repeated.
-//! Patches inside an admitted minor launch without new evidence (decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate).
+//! an API contract: an installed build stays refused until its isolated admission checks pass.
+//! Every unseen exact producer/extension identity needs its own measured evidence.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,6 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::harness_version;
 use crate::pi_family_session::{self, HarnessKind};
 
 /// The extension file inside this binary's immutable hook set.
@@ -75,33 +74,15 @@ pub struct OmpResidencyCheckpoint {
     binding: OmpSessionBinding,
 }
 
-/// The omp MINORS verified against the admission checks in `docs/vrs/06-omp-driver/spec.md`.
-///
-/// 18.0 was measured twice: at 18.0.3 on 2026-08-25 and again at 18.0.9 on 2026-08-28.
-/// 18.1 was measured at 18.1.2 on 2026-09-02.
-/// 18.3 was measured at 18.3.0 on 2026-09-24.
-/// 18.4 was measured at 18.4.2 on 2026-09-29.
-///
-/// Admission is per minor, per decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate ("hard version gate on the minor, 18.x initially")
-/// and OMP-R05 ("a later minor stays rejected"). Any patch inside an admitted minor launches
-/// without new evidence: omp releases near-daily, so gating patches blocked the fleet on changes
-/// the capture already covered — 18.0.10 shipped within hours of 18.0.9 being admitted. A new
-/// MINOR still costs the five OMP-R05 probes.
-const SUPPORTED_OMP_MINORS: [(u32, u32); 4] = [(18, 0), (18, 1), (18, 3), (18, 4)];
-
 /// The omp builds the harness-context producer's arithmetic was measured against (HC-R13, HC-T03).
 ///
-/// This is a different question from the launch gate above and the two must not be collapsed. The
-/// gate admits a MINOR SERIES, because a patch inside an admitted minor costs no new evidence; the
-/// fixture pins the EXACT BUILDS a number's meaning was measured on, because omp's `tokens` being
-/// prompt-only input is a property of a specific build and not of any documented contract. Both
-/// builds were probed on 2026-08-29 and agree, which is what makes the minor gate defensible here.
-/// `the_measured_context_builds_are_admitted_by_this_gate` keeps them from drifting apart.
+/// Context arithmetic remains evidence for these exact builds, separate from admission of the
+/// delivery contract. A passing launch probe cannot certify token semantics or pricing.
 pub const MEASURED_CONTEXT_VERSIONS: [&str; 2] = ["18.0.9", "18.0.3"];
 
 /// omp's half of the pi-family launch fork. The version gate rides on the descriptor so the shared
 /// body runs it where omp has always run it: after the empty-argv check and before the ownership
-/// claim, so an unadmitted minor fails without claiming the seat.
+/// claim, so a failed admission leaves live ownership unchanged.
 pub(crate) const OMP_KIND: HarnessKind = HarnessKind {
     label: "omp",
     extension: EXTENSION,
@@ -490,36 +471,25 @@ fn run_with_required_resume(
     )
 }
 
-/// Refuse any provider whose MINOR this binary was not verified against. Failing loudly at launch
-/// is the point (OMP-R05): a silently degraded observed state or delivery path would read as
-/// healthy. Patches inside an admitted minor pass, because the admission unit is the minor.
-fn verify_supported_version(binary: &str) -> Result<()> {
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("running {binary} --version for the omp version gate"))?;
-    anyhow::ensure!(output.status.success(), "{binary} --version failed");
-    // omp prefixes its banner ("omp/18.0.3"), so scan every whitespace-separated token for the
-    // first MAJOR.MINOR.PATCH release rather than trusting line order.
-    let printed = String::from_utf8_lossy(&output.stdout);
-    let (version, release) = harness_version::find_release(&printed, "omp").with_context(|| {
-        format!("{binary} --version reported no unambiguous omp release: '{printed}'")
-    })?;
-    anyhow::ensure!(
-        SUPPORTED_OMP_MINORS.contains(&release.series()),
-        "omp {version} is unverified (admitted minors: {}); repeat the docs/vrs/06-omp-driver \
-         admission checks before extending the gate",
-        harness_version::series_display(&SUPPORTED_OMP_MINORS)
+/// Measure the installed producer and exact shipped extension before claiming the live seat.
+fn verify_supported_version(binary: &str, agent_dir: &Path, extension: &Path) -> Result<()> {
+    use crate::driver_diagnostic::{Driver, Publisher};
+    let admission = crate::harness_admission::admit(binary, Driver::Omp, Some(extension));
+    let mut publisher = Publisher::new(
+        agent_dir,
+        Driver::Omp,
+        admission.version.clone(),
+        admission.support(),
     );
+    admission.publish(&mut publisher);
+    anyhow::ensure!(admission.passed(), "{}", admission.explanation(Driver::Omp));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
-    use std::sync::Barrier;
 
     struct FakeExecutable {
         _directory: tempfile::TempDir,
@@ -561,202 +531,6 @@ mod tests {
         crate::harness_state::claim(agent_dir, "h.worker", "omp", incarnation).unwrap()
     }
 
-    /// Pins the admitted set itself — the intent carried over from the exact-version gate.
-    /// Iterating the constant cannot catch a minor that was added without measuring it, so the
-    /// set is asserted literally: widening has to be a deliberate edit here, next to the
-    /// `.experiments/` capture that justifies it.
-    #[test]
-    fn admitted_minors_are_exactly_the_measured_set() {
-        assert_eq!(SUPPORTED_OMP_MINORS, [(18, 0), (18, 1), (18, 3), (18, 4)]);
-    }
-
-    /// Every exact build that admitted a minor must still launch. Keeping the literals here makes
-    /// each OMP-R05 capture a deliberate part of the gate rather than inferring evidence from the
-    /// admitted series.
-    #[test]
-    fn version_gate_admits_every_admission_capture() {
-        for version in ["18.0.3", "18.0.9", "18.1.2", "18.3.0", "18.4.2"] {
-            let fake = FakeExecutable::new(&format!(
-                "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
-            ));
-            verify_supported_version(fake.path().to_str().unwrap())
-                .unwrap_or_else(|error| panic!("{version} must be admitted: {error}"));
-        }
-    }
-
-    /// The launch gate and the harness-context fixture answer different questions — a minor series
-    /// versus the exact builds a number's meaning was measured on — and they are allowed to differ.
-    /// What they may not do is drift apart silently: a build the fixture claims to have measured
-    /// but this gate would refuse to launch is evidence for a version the fleet can never run, and
-    /// that is exactly the shape HC-T03 asks the gate discipline to bound.
-    #[test]
-    fn the_measured_context_builds_are_admitted_by_this_gate() {
-        for version in MEASURED_CONTEXT_VERSIONS {
-            let release = harness_version::parse_release(version)
-                .unwrap_or_else(|| panic!("{version} must be a parseable release"));
-            assert!(
-                SUPPORTED_OMP_MINORS.contains(&release.series()),
-                "the harness-context fixture measured {version}, a build this gate refuses to \
-                 launch (admitted minors: {})",
-                harness_version::series_display(&SUPPORTED_OMP_MINORS)
-            );
-        }
-    }
-
-    /// A pre-release must not be admitted as its base release, even when its base minor is
-    /// admitted: it is not the build any capture measured.
-    #[test]
-    fn version_gate_refuses_a_prerelease_inside_an_admitted_minor() {
-        for version in [
-            "18.0.9-rc1",
-            "18.0.9+meta",
-            "18.1.2-rc1",
-            "18.1.2+meta",
-            "18.3.0-rc1",
-            "18.3.0+meta",
-        ] {
-            let fake = FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
-            assert!(
-                verify_supported_version(fake.path().to_str().unwrap()).is_err(),
-                "{version} must not be admitted as its base release"
-            );
-        }
-    }
-
-    /// A banner mentioning some other version must not bind the gate to it. Reported in review of
-    /// #370: `runtime 18.0.0 omp/18.2.0` would otherwise admit on the unrelated `18.0.0` and then
-    /// launch an unverified 18.2 provider. The provider's own label decides; an unlabelled banner
-    /// carrying two different releases fails closed.
-    #[test]
-    fn a_stray_version_in_the_banner_cannot_admit_an_unverified_provider() {
-        let fake = FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 omp/18.2.0\\n'\n");
-        let error = verify_supported_version(fake.path().to_str().unwrap())
-            .expect_err("the omp-labelled 18.2.0 must decide, not the stray 18.0.0")
-            .to_string();
-        assert!(
-            error.contains("18.2.0"),
-            "must name the provider's own release: {error}"
-        );
-
-        let ambiguous = FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 18.2.0\\n'\n");
-        assert!(
-            verify_supported_version(ambiguous.path().to_str().unwrap()).is_err(),
-            "an unlabelled banner with two different releases must fail closed"
-        );
-    }
-
-    /// The refusal must survive omp naming itself with something unreadable. Found by independent
-    /// verification of #370 (mutation S6): deleting the labelled fall-through left the suite
-    /// byte-identical, and driving this gate with `omp/18.1.0-rc1 18.0.9` ADMITTED the launch,
-    /// bound to the stray token rather than to the release omp reported for itself. Latent while
-    /// the shipped binary prints one token, but DQ-OMP-5 is open on precisely the update banner
-    /// that would add a second.
-    #[test]
-    fn an_unreadable_own_label_cannot_be_rescued_by_a_stray_admitted_version() {
-        let fake = FakeExecutable::new("#!/bin/sh\nprintf 'omp/18.1.0-rc1 18.0.9\\n'\n");
-        let error = verify_supported_version(fake.path().to_str().unwrap())
-            .expect_err("an unreadable own label must not admit on a stray 18.0.9")
-            .to_string();
-        assert!(
-            error.contains("no unambiguous omp release"),
-            "the refusal must say the banner named no release it could read: {error}"
-        );
-    }
-
-    /// Minors are compared as numbers. `18.10` must not pass on the strength of admitted `18.1`,
-    /// which is how a minor gate would decay into "accept anything that starts with 18".
-    #[test]
-    fn version_gate_refuses_a_neighbouring_minor_that_shares_a_prefix() {
-        for version in ["18.10.0", "18.2.0"] {
-            let fake = FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
-            let error = verify_supported_version(fake.path().to_str().unwrap())
-                .expect_err(version)
-                .to_string();
-            assert!(error.contains("unverified"), "{version}: {error}");
-        }
-    }
-
-    /// THE assertion this lane exists for: a patch inside an already-admitted minor must launch
-    /// without a new capture (decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate gates on the minor). Fails against the exact-version
-    /// allowlist; passes once the gate keys on MAJOR.MINOR.
-    #[test]
-    fn a_patch_inside_an_admitted_minor_is_accepted_without_new_evidence() {
-        for version in ["18.0.11", "18.1.99"] {
-            let fake = FakeExecutable::new(&format!(
-                "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
-            ));
-            verify_supported_version(fake.path().to_str().unwrap())
-                .unwrap_or_else(|error| panic!("{version} is inside an admitted minor: {error}"));
-        }
-    }
-
-    #[test]
-    fn version_gate_refuses_an_unverified_minor() {
-        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.2.0\\n'\n");
-        let error = verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
-        assert!(error.to_string().contains("unverified"), "{error}");
-    }
-
-    #[test]
-    fn version_gate_refuses_an_unverified_major() {
-        let fake = FakeExecutable::new("#!/bin/sh\nprintf '19.0.1\\n'\n");
-        let error = verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
-        assert!(error.to_string().contains("unverified"), "{error}");
-    }
-
-    #[test]
-    fn version_gate_refuses_garbled_output() {
-        let fake = FakeExecutable::new("#!/bin/sh\nprintf 'not-a-version\\n'\n");
-        assert!(verify_supported_version(fake.path().to_str().unwrap()).is_err());
-    }
-
-    #[test]
-    fn version_gate_fixtures_are_parallel_safe() {
-        const WORKERS: usize = 8;
-        const ROUNDS: usize = 16;
-
-        let barrier = Barrier::new(WORKERS);
-        let paths = std::thread::scope(|scope| {
-            let mut workers = Vec::with_capacity(WORKERS);
-            for _ in 0..WORKERS {
-                let barrier = &barrier;
-                workers.push(scope.spawn(move || {
-                    let mut paths = Vec::with_capacity(ROUNDS);
-                    barrier.wait();
-                    for _ in 0..ROUNDS {
-                        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.2.0\\n'\n");
-                        paths.push(fake.path().to_path_buf());
-                        let error =
-                            verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
-                        assert!(error.to_string().contains("unverified"), "{error}");
-                    }
-                    paths
-                }));
-            }
-            workers
-                .into_iter()
-                .flat_map(|worker| worker.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(paths.iter().collect::<HashSet<_>>().len(), paths.len());
-    }
-
-    /// The gate must run before the wrapper claims the seat: an unadmitted minor that took
-    /// ownership would leave the seat's record owned by a session that never launched.
-    #[test]
-    fn the_version_gate_is_wired_into_the_shared_launch_fork() {
-        assert!(
-            OMP_KIND.verify_version.is_some(),
-            "omp must carry a launch-time version gate"
-        );
-        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.2.0\\n'\n");
-        let gate = OMP_KIND.verify_version.unwrap();
-        assert!(
-            gate(fake.path().to_str().unwrap()).is_err(),
-            "the descriptor's gate must be the refusing one"
-        );
-    }
-
     #[test]
     fn ordinary_launch_clears_inherited_resume_fences() {
         const CHILD_ROOT: &str = "ST2_TEST_OMP_ORDINARY_CHILD_ROOT";
@@ -785,13 +559,7 @@ mod tests {
         )
         .unwrap();
         let marker = temp.path().join("provider-env");
-        let fake = FakeExecutable::new(&format!(
-            "#!/bin/sh\n\
-             if [ \"$1\" = \"--version\" ]; then printf 'omp v18.1.7\\n'; exit 0; fi\n\
-             printf '%s|%s\\n' \"${{ST_OMP_CHANNEL_EXPECTED_NATIVE_SESSION-unset}}\" \
-             \"${{ST_OMP_CHANNEL_RESUME_GENERATION-unset}}\" > '{}'\n",
-            marker.display()
-        ));
+        let fake = crate::harness_admission::tests::fake_omp(temp.path());
         let hooks = temp.path().join("hooks");
         crate::hooks::install_at(&hooks, false).unwrap();
 
@@ -802,7 +570,7 @@ mod tests {
                 "--nocapture",
             ])
             .env(CHILD_ROOT, temp.path())
-            .env(CHILD_PROVIDER, fake.path())
+            .env(CHILD_PROVIDER, &fake)
             .env("ST_HOOKS", hooks)
             .env("XDG_STATE_HOME", temp.path().join("state"))
             .env(CHANNEL_EXPECTED_NATIVE_SESSION, "ambient-session")
@@ -816,6 +584,59 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "unset|unset\n");
+    }
+
+    #[test]
+    fn failed_admission_diagnoses_without_claiming_or_launching_the_live_seat() {
+        const CHILD: &str = "ST_TEST_ADMISSION_REFUSAL_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let agent_dir = root.join("catalog/agent");
+            let state = crate::harness_state::harness_state_path(&agent_dir);
+            claim_omp(&agent_dir, "predecessor");
+            let before = std::fs::read(&state).unwrap();
+            let error = run(&root.join("catalog"), "worker".into(), "worker".into(),
+                vec![root.join("omp").display().to_string()]).unwrap_err();
+            assert!(error.to_string().contains("admissionNativeConsumption"), "{error:#}");
+            assert_eq!(std::fs::read(&state).unwrap(), before);
+            assert!(!root.join("provider-env").exists());
+            let observed = crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir));
+            assert!(matches!(observed, crate::driver_diagnostic::Observed::Failure(failure)
+                if failure.reason == crate::driver_diagnostic::Reason::AdmissionNativeConsumption));
+            assert!(error.to_string().contains("st admission override omp"));
+            // A person's exact-build exception permits the real launch path without replacing
+            // the refused measurement. This exercises the shipped asset and selected state root.
+            let hooks = crate::hooks::verify_installed().unwrap();
+            let cache = crate::run::harness_state_root().join("harness-admission");
+            crate::harness_admission::override_build(
+                root.join("omp").to_str().unwrap(),
+                crate::driver_diagnostic::Driver::Omp,
+                Some(&hooks.join("omp-channel.ts")),
+                &cache,
+                "isolated regression operator exception",
+            ).unwrap();
+            run(&root.join("catalog"), "worker".into(), "worker".into(),
+                vec![root.join("omp").display().to_string()]).unwrap();
+            assert!(root.join("provider-env").exists(), "overridden omp seat launches");
+            assert_ne!(std::fs::read(&state).unwrap(), before);
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("catalog/agent")).unwrap();
+        let host = crate::run::detect_host();
+        std::fs::write(root.path().join("catalog/agent/agent.kdl"),
+            format!(r#"agent "worker" {{ host "{host}"; command "true" }}"#)).unwrap();
+        crate::harness_admission::tests::fake_omp(root.path());
+        let mut fixture = crate::harness_admission::tests::measured_omp();
+        crate::harness_admission::tests::fail_omp(&mut fixture, crate::harness_admission::Check::NativeConsumption);
+        std::fs::write(root.path().join("capture.json"), serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let hooks = root.path().join("hooks");
+        crate::hooks::install_at(&hooks, false).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "omp_session::tests::failed_admission_diagnoses_without_claiming_or_launching_the_live_seat", "--nocapture"])
+            .env(CHILD, root.path()).env("ST_HOOKS", hooks)
+            .env("XDG_STATE_HOME", root.path().join("state")).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 
     #[test]

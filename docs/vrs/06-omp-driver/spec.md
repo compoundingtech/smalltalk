@@ -8,7 +8,7 @@ measured surface in
 ## Status
 
 Implemented in this change set: the `omp` driver block and expansion, the
-`omp-session` wrapper with the hard 18.x gate, the `omp-channel.ts` asset (type-checked and
+`omp-session` wrapper with measured exact-build admission, the `omp-channel.ts` asset (type-checked and
 smoke-driven under `checks.pi-extension-types`), and the shared channel loop's blocked-frame
 parsing. The driver-level decisions are recorded in
 [decision 0007](../.decisions/0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate.md).
@@ -39,7 +39,7 @@ kebab-case, mirroring `PiDriver`. omp has no effort flag; its analog is `--think
 Expansion prepends `--model` and `--thinking` when set; extra args ride the existing driver
 args escape.
 
-## Wrapper (`src/omp_session.rs`)
+## Wrapper (`crates/st-drivers/src/omp_session.rs`)
 
 Shape of `pi_session.rs`:
 
@@ -49,21 +49,20 @@ Shape of `pi_session.rs`:
   provider checkpoint and rejects every authored session selector before starting even that
   diagnostic child. A missing, corrupt, foreign, stale, or changed binding fails closed. The
   validated native session ID is injected as `omp --resume <id>`; there is no fresh-session
-  fallback. The version gate parses a strict `MAJOR.MINOR.PATCH` release, admits only a MINOR
-  already measured (`SUPPORTED_OMP_MINORS`), and fails loudly with the measured-checks message,
-  per OMP-R05 and decision
-  0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate. Admission is per
-  minor: a patch inside an admitted minor launches without new evidence, and a later *minor*
-  stays rejected until the checks are repeated against it. The parse is what keeps "per minor"
-  from decaying into "starts with 18" — minors are compared numerically (`18.10` is not `18.1`),
-  exactly three components are required, and a pre-release or build-metadata suffix
-  (`18.0.9-rc1`) does not parse at all, so it is never admitted as its base release.
-  Which token the release is read FROM matters as much as how it parses: an `omp/<release>`
-  token is omp naming itself and the first one decides outright, and if what it named cannot be
-  parsed the gate refuses rather than reading some other token in the banner. Otherwise `omp/18.1.0-rc1
-  18.0.9` would launch an unverified provider on the strength of a version omp never claimed —
-  which is the shape DQ-OMP-5's update banner could produce. With no own label, every parseable
-  release in the banner must agree.
+  fallback. Admission parses the producer's own unambiguous strict `MAJOR.MINOR.PATCH`
+  release, then measures its exact executable/installation/interpreter identity and the shipped
+  extension bytes. An `omp/<release>` label decides; an unreadable own label cannot be rescued
+  by another banner token. Prereleases and build metadata are not silently admitted as their
+  base release. There is no minor allowlist.
+  The first unseen identity runs the five checks below in a disposable RPC session with empty
+  HOME/XDG/credential/workspace/PTY roots and a local model fixture. Successful and failed
+  results are atomically stored under the harness state root's `harness-admission/` directory,
+  including probe and adapter implementation identity. Concurrent starts share a bounded lock.
+  A failure names the check and refuses launch before ownership; st3 projects that durable
+  diagnostic into the current incarnation's harness state and doctor. Removing a refused record
+  after repairing the producer/adapter contract requests another measurement.
+  A person can explicitly override admission for an exact installed build as described below;
+  this is retained as an exception, never as passing measured evidence.
 - Injects the channel extension from the verified hook set (`with_channel_extension` shape —
   resolved from this binary's immutable asset, never a catalog-pinned path).
 - Applies offline defaults (`PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`) unless the operator's
@@ -170,22 +169,81 @@ what carries a rejection across a channel restart. `ChannelKind` is what keeps t
 channel: pi's extension has no classification field to forward, so `diagnostic_driver` is `None`
 there and the same loop publishes no credential verdict for it.
 
-## Admission evidence required for a new minor
+## Automatic admission evidence for an exact installed build
 
-Per OMP-R05 and decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate, admitting a new omp MINOR requires re-running: extension-load
-probe, lifecycle event inventory, idle-edge sampling, approval-event capture, live delivery
-loop — updating the `.experiments/` capture and `SUPPORTED_OMP_MINORS` together. Each probe must
-record measured output; a minor that was not measured is not admitted, so the admitted set is
-asserted literally in the wrapper's tests.
+OMP-R05 and revised decision `0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate`
+require all five checks before admitting an unseen identity:
 
-Patches inside an admitted minor cost nothing: omp releases near-daily, and gating them blocked
-the fleet on changes the capture already covered — 18.0.10 shipped within hours of 18.0.9 being
-admitted. The evidence a minor is admitted on is a measurement of *some* release in that minor,
-and the risk accepted is that a patch could move delivery-critical behavior within it. That has
-been observed once and absorbed: between 18.0.3 and 18.0.9 the idle edge moved from ~251 ms to
-~25 ms. The generation- and channel-fenced sampling rule (OMP-R03) also handles final unwind
-that takes longer: sampling continues until positive idle proof or a superseding event,
-and never publishes idle while a human ask or approval is pending.
+1. Load the shipped extension and companion recorder through the installed producer. Require
+   the extension API calls and a real native channel `ready` binding.
+2. Observe `session_start`, `agent_start`, `turn_start`, `message_start`, `message_end`,
+   `turn_end` and terminal `agent_end` in the disposable session.
+3. Observe a positive `ctx.isIdle()` sample after terminal `agent_end`, plus the shipped
+   channel's active-to-idle transition.
+4. Correlate `tool_approval_requested` and `tool_approval_resolved` by session, tool name and
+   tool-call ID. The local model requests an empty fixture tool; the RPC peer denies only
+   that fixture approval. Require the shipped channel's human/permission observation.
+5. Send a fresh nonce through the shipped channel, require exactly one transport acknowledgement,
+   and prove consumption with both the fixture model's native prompt and tool continuation
+   and the harness's completed user/assistant messages containing the nonce.
+
+A passed exact build never admits a different patch merely because its minor matches.
+Executable, interpreter, npm installation, extension or probe replacement triggers remeasurement.
+All subprocesses use disposable roots and are reaped by process group on success, refusal,
+timeout or malformed evidence. Version probing, model requests and cache locking are bounded.
+The startup probe does not certify context arithmetic, provider/model matrices, pricing,
+interactive UI modes or every steer/modal case; their existing measured evidence stays separate.
+
+### Rejection and a person's explicit exception
+
+Admission runs on a new provider launch, including restart and residency resume. It does not
+retroactively stop an already-running provider, and driver re-execution that adopts the existing
+provider does not repeat admission. A refused omp build does not start a new provider or claim
+the live session. There is no rollback to an older executable. OpenCode starts its installed
+server with native delivery disabled; a waiting message remains queued. Both policies name the
+failed boundary in the current incarnation and `st doctor`.
+
+If a person's own machine cannot run the isolated probe, they may allow that exact installed
+build from their terminal, outside an agent seat:
+
+```sh
+st admission override omp --binary /path/to/omp --reason 'Probe cannot run in this offline installation'
+```
+
+Use `opencode` for OpenCode. `--binary` must identify the executable the affected seat uses;
+omitting it selects the harness on that terminal's PATH. `--state-dir` selects a nondefault
+daemon state directory; otherwise the command uses the person's local st configuration.
+Run the command on the host and as the operating-system user that owns the seats, then restart
+only the affected seat. The command works without a daemon, probe child or model credentials.
+It records the reason, time and exact executable/interpreter/installation and shipped-extension
+identity in a separate user-local `*.override.json` record. It bypasses even scratch `--version`;
+it neither replaces failed measurements nor certifies the contract. The driver logs that a
+person's exception is active and does not label its support as measured passing. An executable,
+dependency, interpreter or shipped-extension replacement needs a new exception. Other builds
+retain normal measured admission. The exception persists across st updates with the same
+producer and extension. Revocation restores retained measured results on the next launch:
+
+```sh
+st admission revoke omp --binary /path/to/omp
+```
+
+The st fixture requires loopback sockets and writable temporary/state directories. It sends its
+model/API requests only to loopback, uses dummy fixture keys, clears inherited credentials,
+disables update/model/plugin fetches where the producer supports those switches, and adds no
+separate Bun/Node/Python runtime requirement. The installed producer must still have its own
+normal interpreter/dependencies; omp's fixture channel uses POSIX `sh`. A producer may attempt
+to bootstrap a missing plugin/package in an empty scratch cache; such an offline failure is a
+refusal, not evidence of broken live delivery. The exception permits normal launch in that case.
+It cannot supply a missing runtime or repair a genuinely incompatible producer/extension.
+
+The 2026-10-02 deterministic installed-producer captures are retained under
+[`crates/st-drivers/tests/fixtures/harness-admission/`](../../../crates/st-drivers/tests/fixtures/harness-admission/):
+omp 18.1.22 (all five checks, denied empty tool) and OpenCode 1.18.34 (API/SSE/permission and
+completed consumption, approved harmless `printf`). Tests replay these measured captures and
+run fake unseen exact versions through the production admission path, with one failure per check.
+The generation- and channel-fenced sampling rule (OMP-R03) handles slow final unwind:
+sampling continues until positive idle proof or a superseding event, and never publishes
+idle while a human ask or approval is pending.
 
 Captures, per measured release:
 
@@ -196,9 +254,10 @@ Captures, per measured release:
 - 18.3.0 — [`2026-09-24-omp-18-3-0-admission.md`](./.experiments/2026-09-24-omp-18-3-0-admission.md).
 - 18.4.2 — [`2026-09-29-omp-18-4-2-admission.md`](./.experiments/2026-09-29-omp-18-4-2-admission.md).
 
-The `18.2` minor is not admitted: no release in that minor has been measured.
+Historical captures are evidence for their exact measured builds; automatic admission decides
+the currently installed identity independently of those release lists.
 
-Behavioral captures that are not minor admissions:
+Behavioral captures outside the automatic admission contract:
 
 - provider-credential classification (18.1.7) —
   [`2026-09-05-omp-provider-credential-rejection.md`](./.experiments/2026-09-05-omp-provider-credential-rejection.md),

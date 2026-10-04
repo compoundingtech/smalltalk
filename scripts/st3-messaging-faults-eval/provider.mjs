@@ -9,6 +9,10 @@ if (process.argv.includes('--version')) {
   console.log('omp v18.4.4');
   process.exit(0);
 }
+if (process.env.ST_ADMISSION_TRACE) {
+  const { admit } = await import('../st3-boot-canaries/admission-omp.mjs');
+  await admit();
+} else {
 const directory = process.cwd();
 // Exercise an actual historical channel with today's daemon/driver/extension,
 // avoiding unrelated historical daemon startup and prompt contracts.
@@ -127,3 +131,4 @@ for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, async () => {
   clearInterval(keepalive);
   process.exit(0);
 });
+}

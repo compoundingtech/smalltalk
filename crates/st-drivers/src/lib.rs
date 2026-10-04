@@ -40,6 +40,7 @@ mod flock;
 /// Atomic filesystem publication shared with the root st2 request API.
 #[doc(hidden)]
 pub mod fsatomic;
+pub mod harness_admission;
 pub mod harness_context;
 pub mod harness_events;
 pub mod harness_state;

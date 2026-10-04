@@ -10,10 +10,14 @@ import { pathToFileURL } from 'node:url';
 
 const harness = process.env.STUB_HARNESS;
 if (process.argv.includes('--version')) {
-  // omp's launcher admits only some releases; pi has no version gate.
+  // omp measures this exact installed stand-in; pi has no admission gate.
   console.log(harness === 'omp' ? 'omp v18.4.4' : 'pi 0.0.0-stub');
   process.exit(0);
 }
+if (process.env.ST_ADMISSION_TRACE) {
+  const { admit } = await import('./admission-omp.mjs');
+  await admit();
+} else {
 const agent = process.env.ST_AGENT ?? 'unknown';
 const receiptPath = `${process.cwd()}/receipts-${agent.replace(/[^A-Za-z0-9]/g, '-')}.jsonl`;
 const record = (event, fields = {}) => fs.appendFileSync(receiptPath,
@@ -103,4 +107,5 @@ for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
     clearInterval(keepalive);
     process.exit(0);
   });
+}
 }
