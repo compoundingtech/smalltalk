@@ -1220,6 +1220,47 @@ fn client_page(
     client_page_read(state, snapshot, collection, items, query, false)
 }
 
+/// Preserve complete timeline entries while reserving the existing page-envelope budget.
+fn client_timeline_page_end(
+    items: &[Value],
+    offset: usize,
+    limit: usize,
+) -> Result<usize, ApiError> {
+    struct EncodedSize(usize);
+    impl std::io::Write for EncodedSize {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Match mission-card paging's reserve for the response, cursor and fleet notice.
+    let budget = CLIENT_MAX_RESPONSE_BYTES - 128_000;
+    let mut used = 0usize;
+    let mut end = offset.min(items.len());
+    for item in items.iter().skip(offset).take(limit) {
+        let mut encoded = EncodedSize(0);
+        serde_json::to_writer(&mut encoded, item).map_err(ApiError::internal)?;
+        let bytes = encoded.0.saturating_add(1);
+        if used.saturating_add(bytes) > budget {
+            if end == offset {
+                return Err(ApiError::bad(St3Error::new(
+                    "validation-failed",
+                    "a timeline entry exceeds the client response limit",
+                )));
+            }
+            break;
+        }
+        used += bytes;
+        end += 1;
+    }
+    Ok(end)
+}
+
 /// A page of `items`, or of the cached first page a cursor continues. `pinned` says the items
 /// were read in `snapshot` itself, so a commit since then cannot have torn them; otherwise a
 /// first page is refused once the store has moved past the snapshot.
@@ -1303,7 +1344,11 @@ fn client_page_read(
         });
         (items, items_digest, 0, requested_limit, expires_at_unix_ms)
     };
-    let end = offset.saturating_add(limit).min(items.len());
+    let end = if collection.starts_with("timeline/") {
+        client_timeline_page_end(&items, offset, limit)?
+    } else {
+        offset.saturating_add(limit).min(items.len())
+    };
     let page_items = items.get(offset..end).unwrap_or_default().to_vec();
     let has_more = end < items.len();
     if query.cursor.is_none() && has_more {
@@ -15064,6 +15109,45 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 .code,
             "page-cursor-expired"
         );
+    }
+
+    #[test]
+    fn timeline_pages_preserve_large_envelopes_and_advance_by_returned_count() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let snapshot = new_client_snapshot(&state);
+        let expected_ids: Vec<_> = (0..100).map(|id| format!("native/{id}")).collect();
+        let items = expected_ids.iter().map(|id| {
+            let envelope = json!({
+                "_tag":"OmpEvent", "version":1, "kind":"irc:incoming", "attribution":"agent",
+                "content":"x".repeat(8000),
+                "details":{"from":"worker","message":"x".repeat(8000)}
+            });
+            json!({"id":id,"body":{"media_type":"application/vnd.omp.event+json","text":envelope.to_string()}})
+        }).collect();
+        let mut query = ClientListQuery {
+            limit: Some(100),
+            ..ClientListQuery::default()
+        };
+        let mut page = client_page(&state, &snapshot, "timeline/session/smoke", items, &query).unwrap();
+        let mut received_ids = Vec::new();
+        loop {
+            assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES - 1024);
+            for item in &page.items {
+                received_ids.push(item["id"].as_str().unwrap().to_owned());
+                let envelope: Value = serde_json::from_str(item["body"]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(envelope["content"], "x".repeat(8000));
+                assert_eq!(envelope["details"]["message"], "x".repeat(8000));
+            }
+            let Some(cursor) = page.page.next_cursor else {
+                assert!(!page.page.has_more);
+                break;
+            };
+            assert!(page.page.has_more);
+            query.cursor = Some(cursor);
+            page = client_page(&state, &snapshot, "timeline/session/smoke", Vec::new(), &query).unwrap();
+        }
+        assert_eq!(received_ids, expected_ids);
     }
 
     #[test]
