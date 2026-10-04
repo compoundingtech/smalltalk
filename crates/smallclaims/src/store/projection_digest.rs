@@ -103,7 +103,7 @@ pub fn row_sql(columns: &[String], prefix: &str) -> String {
         .iter()
         .map(|column| {
             // SQLite JSON does not accept blobs; their complete bytes are shared data.
-            if matches!(column.as_str(), "bytes" | "binding_key") {
+            if matches!(column.as_str(), "bytes" | "binding_key" | "winner") {
                 format!("hex({prefix}{column})")
             } else {
                 // JSON functions attach a transient subtype to TEXT. NEW values can retain

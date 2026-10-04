@@ -10,8 +10,19 @@ Send one JSON command per subscription:
 {"kind":"subscribe","id":"missions-tab","collection":"missions","limit":50}
 ```
 
-Collections are `missions`, `attention`, `agents`, and `work`, plus `terminal` (below). The optional
-`actor` filter applies to work, `person` to attention, and `status` to agents.
+Collections are `missions`, `attention`, `agents`, `work`, `glasses`, and `arrangements`,
+plus `terminal` and `conversation` (below). The optional `actor` filter applies to work,
+`person` to attention, and `status` to agents. For `arrangements`, `person: "person/NAME"`
+is required: agents explicitly select a fleet person's collection, never an inferred
+owner. Each read checks `read.arrangements` and the selected person's access. For example:
+
+```json
+{"kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/alice","limit":100}
+```
+
+Arrangement snapshots and changes carry full typed arrangement resources. Folder or
+placement changes are full resource upserts; retirement sends the arrangement ID in
+`removes`. Glass privacy and its person-only selection are unchanged.
 A window contains 1–200 current items. History remains on the
 corresponding paged HTTP reads. Send `{"kind":"unsubscribe","id":"missions-tab"}`
 to remove a subscription. IDs are chosen by the client and unique on the socket.

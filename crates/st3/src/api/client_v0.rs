@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
+pub(super) mod arrangements;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -63,6 +64,10 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
     if collection == "glasses" { return !kind.starts_with("glass."); }
+    if collection == "arrangements" {
+        return !kind.starts_with("arrangement.")
+            && !matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked");
+    }
     matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
@@ -101,7 +106,7 @@ async fn collection_items(
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
-        "missions" | "attention" | "agents" | "work" | "glasses"
+        "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements"
     ) {
         return Err(validation("unknown collection subscription"));
     }
@@ -117,6 +122,12 @@ async fn collection_items(
             return Err(validation("glasses select the session person"));
         }
         Some(glass_person(session, false)?)
+    } else if request.collection == "arrangements" {
+        if request.actor.is_some() {
+            return Err(validation("arrangements select an explicit person, not an actor"));
+        }
+        let current_session = revalidate_session(state, session)?;
+        Some(arrangements::person(&current_session, request.person.as_deref(), false)?)
     } else if request.collection == "attention" {
         person_filter(session, request.person.as_deref())?
     } else {
@@ -126,7 +137,7 @@ async fn collection_items(
     let actor = request.actor.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
-    let (snapshot, mut items, has_more) = super::blocking_store(move || {
+    let (snapshot, mut items, mut has_more) = super::blocking_store(move || {
         let store = state.store.clone();
         store.read_snapshot(|index| {
             let snapshot = client_snapshot_at(&state, index);
@@ -143,6 +154,9 @@ async fn collection_items(
                 }
                 "glasses" => {
                     store.glasses(person.as_deref().expect("authenticated glass owner"), index)?
+                }
+                "arrangements" => {
+                    store.arrangements(person.as_deref().expect("explicit arrangement owner"), index)?
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
                 "agents" => client_agent_resources(&store, false, &at, index)?,
@@ -164,6 +178,11 @@ async fn collection_items(
     })
     .await?;
     items.truncate(limit);
+    if request.collection == "arrangements" {
+        let end = arrangements::window_end(&items, 0, items.len())?;
+        has_more |= end < items.len();
+        items.truncate(end);
+    }
     Ok((snapshot, items, has_more))
 }
 
@@ -673,7 +692,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
                     let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                    let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
+                    reread_due |= glasses_changed || arrangements_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
                         claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
                     });
                     weighed = index;
@@ -684,8 +704,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
                 refresh.extend(subscriptions.keys().cloned());
             }
-            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "attention") => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "attention").map(|(id, _)| id.clone()));
+            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "arrangements")) => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "arrangements")).map(|(id, _)| id.clone()));
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -952,6 +972,8 @@ const ALL_SCOPES: &[&str] = &[
     "read.declarations",
     "read.glasses",
     "control.glasses",
+    "read.arrangements",
+    "control.arrangements",
     "terminal.read",
     "terminal.control",
     "control.attention",
@@ -966,11 +988,14 @@ const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "read.projections",
     "read.glasses",
     "control.glasses",
+    "read.arrangements",
+    "control.arrangements",
     "terminal.read",
     "control.attention",
     "control.launches",
 ];
 const ACTIONS: &[&str] = &[
+    "arrangement.edit",
     "attention.resolve",
     "review.approve",
     "review.reject",
@@ -1025,6 +1050,7 @@ const ACTIONS: &[&str] = &[
     "pairing.revoke",
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
+    "arrangement.edit",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -1162,6 +1188,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         .collect::<Vec<_>>();
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
+    capabilities.push(json!({"id":"arrangements", "version":1, "state":if session.allows("read.arrangements") && acting_party(session) { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
@@ -1258,54 +1285,7 @@ pub(super) fn authenticate(
     let Some(paired) = paired else {
         return Err(forbidden("the client credential is unknown or expired"));
     };
-    let revoked = state
-        .store
-        .claims_for_subject_kind_at(
-            &paired.subject,
-            "custom.client.pairing-revoked",
-            None,
-            true,
-            1,
-        )
-        .map_err(ApiError::internal)?
-        .claims
-        .first()
-        .is_some_and(|claim| claim.store_index > paired.store_index);
-    let expires_at = paired
-        .body
-        .pointer("/fields/expires_at_unix_ms")
-        .and_then(Value::as_u64)
-        .map(u128::from)
-        .unwrap_or_default();
-    if revoked || expires_at <= client_now_ms() {
-        return Err(forbidden("the client credential was revoked or expired"));
-    }
-    let actor = paired
-        .body
-        .pointer("/fields/session_actor")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::internal("a paired client has no derived actor"))?;
-    let authority_actor = paired
-        .body
-        .pointer("/fields/person_id")
-        .and_then(Value::as_str)
-        .filter(|actor| actor.starts_with("person/") && actor.matches('/').count() == 1)
-        .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
-    let scopes = paired
-        .body
-        .pointer("/fields/scopes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect();
-    let session = ClientSession {
-        actor: actor.into(),
-        authority_actor: authority_actor.into(),
-        transport,
-        scopes,
-    };
+    let session = paired_client_session(state, paired, transport)?;
     if request.method() == axum::http::Method::GET {
         let scope = if request
             .uri()
@@ -1321,6 +1301,49 @@ pub(super) fn authenticate(
         require_scope(&session, scope)?;
     }
     Ok(session)
+}
+
+fn paired_client_session(
+    state: &AppState,
+    paired: &ClaimRecord,
+    transport: &'static str,
+) -> Result<ClientSession, ApiError> {
+    let revoked = state.store.claims_for_subject_kind_at(
+        &paired.subject, "custom.client.pairing-revoked", None, true, 1,
+    ).map_err(ApiError::internal)?.claims.first()
+        .is_some_and(|claim| claim.store_index > paired.store_index);
+    let expires_at = paired.body.pointer("/fields/expires_at_unix_ms")
+        .and_then(Value::as_u64).map(u128::from).unwrap_or_default();
+    if revoked || expires_at <= client_now_ms() {
+        return Err(forbidden("the client credential was revoked or expired"));
+    }
+    let actor = paired.body.pointer("/fields/session_actor").and_then(Value::as_str)
+        .ok_or_else(|| ApiError::internal("a paired client has no derived actor"))?;
+    let authority_actor = paired.body.pointer("/fields/person_id").and_then(Value::as_str)
+        .filter(|actor| actor.starts_with("person/") && actor.matches('/').count() == 1)
+        .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
+    let scopes = paired.body.pointer("/fields/scopes").and_then(Value::as_array)
+        .into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+    Ok(ClientSession { actor: actor.into(), authority_actor: authority_actor.into(), transport, scopes })
+}
+
+/// Held collection sockets carry no bearer secret. Re-resolve their session grant at each
+/// arrangement read, using the same expiration/revocation checks as HTTP authentication.
+fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<ClientSession, ApiError> {
+    if session.transport == "unix" && acting_party(session) {
+        return Ok(session.clone());
+    }
+    let pairings = state.store.claims_for_kind_at(
+        "custom.client.pairing-completed", None, true, 10_000,
+    ).map_err(ApiError::internal)?;
+    let paired = pairings.claims.iter().find(|claim| {
+        claim.body.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
+    }).ok_or_else(|| forbidden("the client session grant is absent"))?;
+    let current = paired_client_session(state, paired, session.transport)?;
+    if current.authority_actor != session.authority_actor {
+        return Err(forbidden("the client session authority changed"));
+    }
+    Ok(current)
 }
 
 pub(super) fn require_scope(session: &ClientSession, scope: &str) -> Result<(), ApiError> {
@@ -6788,6 +6811,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
             }
         }
         "pairing" => "control.pairing",
+        "arrangement" => "control.arrangements",
         _ => return None,
     })
 }
@@ -8556,7 +8580,16 @@ pub(super) async fn action(
         }
     }
     let mut reconciled_attachment = None;
-    let fence_result = validate_fence(&state, &request.fence);
+    let mut checked_fence = request.fence.clone();
+    if request.action_type == "arrangement.edit" {
+        // Layout revisions merge. Graph/launch identity revisions are checked in the writer
+        // transaction; attention episodes and external filesystem sessions keep their existing
+        // projected preflight semantics (external state is not governed by SQLite).
+        checked_fence.subject_revisions.retain(|subject, _| {
+            subject.starts_with("attention/") || subject.starts_with("session/external-")
+        });
+    }
+    let fence_result = validate_fence(&state, &checked_fence);
     if let Err(error) = fence_result {
         if request.action_type == "terminal.attach" {
             reconciled_attachment =
@@ -8615,6 +8648,11 @@ pub(super) async fn action(
     } else {
         None
     };
+    let arrangement_claim = if request.action_type == "arrangement.edit" {
+        Some(arrangements::edit(&state, &session, &request).await?)
+    } else {
+        None
+    };
     let affected = if let Some(attachment) = &terminal_attachment {
         vec![
             attachment["attachment_id"]
@@ -8622,6 +8660,8 @@ pub(super) async fn action(
                 .ok_or_else(|| ApiError::internal("terminal attachment has no ID"))?
                 .to_owned(),
         ]
+    } else if let Some(claim) = &arrangement_claim {
+        vec![claim.subject.clone()]
     } else {
         dispatch_action(&state, &snapshot, &session, &request).await?
     };
@@ -8629,6 +8669,9 @@ pub(super) async fn action(
     let mut result = json!({ "kind": "action-result", "action_id": request.id, "operation_id": operation_id, "status": "completed", "affected_ids": affected });
     if let Some(attachment) = terminal_attachment {
         result["terminal_attachment"] = attachment;
+    }
+    if let Some(claim) = arrangement_claim {
+        result["arrangement_revision"] = json!(claim.id);
     }
     let mut persisted_result = result.clone();
     persisted_result
@@ -9280,7 +9323,7 @@ mod tests {
         assert!(!report.to_string().contains("person/operator"));
     }
 
-    fn test_state_named(root: &Path, node: &str) -> AppState {
+    pub(super) fn test_state_named(root: &Path, node: &str) -> AppState {
         AppState {
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(Notify::new()),

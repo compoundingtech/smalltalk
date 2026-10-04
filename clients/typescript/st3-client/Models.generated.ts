@@ -11,12 +11,13 @@ export type ActionCommon = {
   parameters: {
 
 };
-  type: "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
+  type: "arrangement.edit" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
 };
 
 export type ActionResult = {
   action_id: Id;
   affected_ids: Array<Id>;
+  arrangement_revision?: Revision;
   kind: "action-result";
   operation_id: Id;
   snapshot_id: Id;
@@ -195,6 +196,133 @@ export type AgentTodo = {
   stale: boolean;
 };
 
+export type Arrangement = ResourceHeader & {
+  body: ArrangementBody;
+  deleted: false;
+  kind: "arrangement";
+  owner: ArrangementPerson;
+  resolved?: ArrangementResolved;
+};
+
+export type ArrangementBody = {
+  folders: {
+  [key: string]: ArrangementFolder;
+};
+  name: ArrangementNameRegister;
+  placements: {
+  [key: string]: ArrangementPlacementRegister;
+};
+  version: 1;
+};
+
+export type ArrangementEditParameters = {
+  operations: Array<ArrangementOperation>;
+  owner: ArrangementPerson;
+  subject: ArrangementId;
+};
+
+export type ArrangementFolder = {
+  name: ArrangementNameRegister;
+  position: ArrangementPositionRegister;
+  tombstone: (ArrangementTombstoneRegister | null);
+};
+
+export type ArrangementFolderId = string;
+
+export type ArrangementId = string;
+
+export type ArrangementKey = string;
+
+export type ArrangementName = string;
+
+export type ArrangementNameRegister = {
+  revision: Revision;
+  value: ArrangementName;
+};
+
+export type ArrangementOperation = ({
+  name: ArrangementName;
+  op: "create";
+} | {
+  name: ArrangementName;
+  op: "rename";
+} | {
+  id: ArrangementFolderId;
+  key: ArrangementKey;
+  name: ArrangementName;
+  op: "folder.create";
+  parent: (ArrangementFolderId | null);
+} | {
+  id: ArrangementFolderId;
+  name: ArrangementName;
+  op: "folder.rename";
+} | {
+  id: ArrangementFolderId;
+  key: ArrangementKey;
+  op: "folder.move";
+  parent: (ArrangementFolderId | null);
+} | {
+  id: ArrangementFolderId;
+  op: "folder.delete";
+} | {
+  folder: (ArrangementFolderId | null);
+  key: ArrangementKey;
+  op: "subject.place";
+  subject: ArrangementSubject;
+} | {
+  op: "retire";
+});
+
+export type ArrangementPage = {
+  collection: "arrangements";
+  filters: {
+  [key: string]: string;
+};
+  items: Array<Arrangement>;
+  kind: "page";
+  page: PageInfo;
+  replicated?: ReplicatedNotice;
+  sync?: SyncNotice;
+};
+
+export type ArrangementPerson = string;
+
+export type ArrangementPlacement = {
+  folder: (ArrangementFolderId | null);
+  key: ArrangementKey;
+};
+
+export type ArrangementPlacementRegister = {
+  revision: Revision;
+  value: ArrangementPlacement;
+};
+
+export type ArrangementPosition = {
+  key: ArrangementKey;
+  parent: (ArrangementFolderId | null);
+};
+
+export type ArrangementPositionRegister = {
+  revision: Revision;
+  value: ArrangementPosition;
+};
+
+export type ArrangementResolved = {
+  folders: {
+  [key: string]: (ArrangementFolderId | null);
+};
+  parents: {
+  [key: string]: (ArrangementFolderId | null);
+};
+};
+
+export type ArrangementSubject = string;
+
+export type ArrangementTombstoneRegister = {
+  revision: Revision;
+  value: true;
+};
+
 export type Attachment = {
   blob: string;
   media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
@@ -281,6 +409,14 @@ export type Capabilities = {
   event_cursor: Cursor;
   kind: "capabilities";
   limits: {
+  max_arrangement_body_bytes?: number;
+  max_arrangement_folders?: number;
+  max_arrangement_key_bytes?: number;
+  max_arrangement_name_bytes?: number;
+  max_arrangement_operations?: number;
+  max_arrangement_placements?: number;
+  max_arrangement_resource_bytes?: number;
+  max_arrangements?: number;
   max_event_items: number;
   max_glass_body_bytes?: number;
   max_glass_depth?: number;
@@ -305,12 +441,18 @@ export type Capability = {
 
 export type CollectionCommand = ({
   actor?: string | null;
-  collection: CollectionName;
+  collection: "missions" | "attention" | "agents" | "work" | "glasses";
   id: string;
   kind: "subscribe";
   limit?: number;
   person?: string | null;
   status?: string | null;
+} | {
+  collection: "arrangements";
+  id: string;
+  kind: "subscribe";
+  limit?: number;
+  person: ArrangementPerson;
 } | {
   capability: string;
   collection: "terminal";
@@ -375,7 +517,7 @@ export type CollectionFrame = ({
   retryable?: boolean;
 });
 
-export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses";
+export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements";
 
 export type ConversationChanges = {
   items: Array<TimelineEntry>;
@@ -1038,11 +1180,11 @@ export type RequestSubject = {
   url?: string;
 };
 
-export type Resource = (Attention | Message | Launch | LaunchVariant | LaunchDecision | LaunchApproval | Mission | Work | Agent | Runtime | Observer | Subscription | Lane | Machine | Device | Operation | History | Session | Glass | OwnedSet);
+export type Resource = (Attention | Message | Launch | LaunchVariant | LaunchDecision | LaunchApproval | Mission | Work | Agent | Runtime | Observer | Subscription | Lane | Machine | Device | Operation | History | Session | Glass | Arrangement | OwnedSet);
 
 export type ResourceHeader = {
   id: Id;
-  kind: ("attention" | "message" | "launch" | "launch-variant" | "launch-decision" | "launch-approval" | "mission" | "work" | "agent" | "runtime" | "observer" | "subscription" | "lane" | "machine" | "device" | "operation" | "history" | "session" | "glass" | string);
+  kind: ("attention" | "message" | "launch" | "launch-variant" | "launch-decision" | "launch-approval" | "mission" | "work" | "agent" | "runtime" | "observer" | "subscription" | "lane" | "machine" | "device" | "operation" | "history" | "session" | "glass" | "arrangement" | string);
   operational?: Operational;
   revision: Revision;
   updated_at: Timestamp;
@@ -1626,6 +1768,7 @@ export type ActionRequest =
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.start'; parameters: AgentStartParameters; fence: Fence & Required<Pick<Fence, 'runtime_desired_revision'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.stop'; parameters: AgentStopParameters; fence: Fence & Required<Pick<Fence, 'runtime_desired_revision'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.suspend'; parameters: AgentSuspendParameters; fence: Fence & Required<Pick<Fence, 'runtime_incarnation' | 'runtime_desired_revision'>> }) |
+  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'arrangement.edit'; parameters: ArrangementEditParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'attention.resolve'; parameters: {
   attention_id: Id;
   outcome: string;

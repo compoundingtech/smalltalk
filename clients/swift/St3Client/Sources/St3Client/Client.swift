@@ -99,6 +99,29 @@ public actor St3Client {
             }
         }
     }
+    public func arrangementsStream(person: String, subscriptionID: String = "arrangements", limit: Int = 100) -> AsyncThrowingStream<ArrangementCollectionFrame, Error> {
+        var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
+        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        var request = URLRequest(url: components.url!); request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        let task = session.webSocketTask(with: request)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
+            task.resume()
+            Task {
+                do {
+                    let command = try JSONSerialization.data(withJSONObject: ["kind":"subscribe", "id":subscriptionID, "collection":"arrangements", "person":person, "limit":limit])
+                    try await task.send(.string(String(decoding: command, as: UTF8.self)))
+                    while true {
+                        let data = try Self.websocketData(from: try await task.receive())
+                        let frame = try JSONDecoder().decode(ArrangementCollectionFrame.self, from: data)
+                        if frame.kind == "error" { throw NSError(domain: "St3Client", code: 0, userInfo: [NSLocalizedDescriptionKey: frame.message ?? "Arrangement subscription failed"]) }
+                        if frame.kind == "resync" { try await task.send(.string(String(decoding: command, as: UTF8.self))); continue }
+                        continuation.yield(frame)
+                    }
+                } catch { continuation.finish(throwing: task.closeCode == .normalClosure ? nil : error); task.cancel(with: .normalClosure, reason: nil) }
+            }
+        }
+    }
     /// Keep one image (PNG, JPEG, GIF or WebP, at most 10 MiB) on the member this client talks to. Name the answer's `blob` in a `message.send` attachment.
     public func uploadBlob(_ bytes: Data, mediaType: String) async throws -> Envelope<BlobUpload> { try await request("v1/client/blobs", query: [], method: "POST", body: bytes, contentType: mediaType) }
     /// Up to 512 KiB of an attachment from `offset`, base64 in `data`.
@@ -160,6 +183,8 @@ public actor St3Client {
     public func sessionsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("sessions", cursor: cursor, limit: limit, history: history) }
     public func sessionsGet(id: String) async throws -> Envelope<Resource> { try await resource("sessions", id: id) }
     public func conversationSearch(text: String, agent: String? = nil, since: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ConversationSearch> { var query: [URLQueryItem] = [.init(name: "text", value: text)]; for (name, value) in [("agent", agent), ("since", since), ("cursor", cursor)] { if let value { query.append(.init(name: name, value: value)) } }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/conversations/search", query: query) }
+    public func arrangementsList(person: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ArrangementPage> { var query: [URLQueryItem] = [.init(name: "person", value: person)]; if let cursor { query.append(.init(name: "cursor", value: cursor)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/arrangements", query: query) }
+    public func arrangementsGet(personName: String, uuid: String) async throws -> Envelope<Arrangement> { try await get("v1/client/arrangements/\(Self.routedSessionID(personName))/\(Self.routedSessionID(uuid))") }
     public func glassesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("glasses", cursor: cursor, limit: limit, history: history) }
     public func glassesGet(id: String) async throws -> Envelope<Resource> { try await resource("glasses", id: id) }
     public func agentCreate(id: String, idempotencyKey: String, fence: Fence, parameters: AgentCreateParameters) async throws -> Envelope<ActionResult> { try await submit(try .agentCreate(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
@@ -168,6 +193,7 @@ public actor St3Client {
     public func agentStart(id: String, idempotencyKey: String, fence: Fence, parameters: AgentStartParameters) async throws -> Envelope<ActionResult> { try await submit(try .agentStart(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func agentStop(id: String, idempotencyKey: String, fence: Fence, parameters: AgentStopParameters) async throws -> Envelope<ActionResult> { try await submit(try .agentStop(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func agentSuspend(id: String, idempotencyKey: String, fence: Fence, parameters: AgentSuspendParameters) async throws -> Envelope<ActionResult> { try await submit(try .agentSuspend(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
+    public func arrangementEdit(id: String, idempotencyKey: String, fence: Fence, parameters: ArrangementEditParameters) async throws -> Envelope<ActionResult> { try await submit(try .arrangementEdit(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func attentionResolve(id: String, idempotencyKey: String, fence: Fence, parameters: AttentionResolveParameters) async throws -> Envelope<ActionResult> { try await submit(try .attentionResolve(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func laneApprove(id: String, idempotencyKey: String, fence: Fence, parameters: LaneChangeParameters) async throws -> Envelope<ActionResult> { try await submit(try .laneApprove(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func laneJoin(id: String, idempotencyKey: String, fence: Fence, parameters: LaneChangeParameters) async throws -> Envelope<ActionResult> { try await submit(try .laneJoin(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
