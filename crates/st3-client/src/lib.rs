@@ -947,6 +947,15 @@ impl Client {
         };
         self.get(&format!("/v1/client/{collection}/{id}")).await
     }
+    /// Read one seat, including its retained history when requested.
+    pub async fn agents_get_with_history(
+        &self,
+        id: &str,
+        history: bool,
+    ) -> Result<Envelope<Resource>, ClientError> {
+        let query = if history { "?history=true" } else { "" };
+        self.get(&format!("/v1/client/agents/{id}{query}")).await
+    }
     pub async fn launch_variants(
         &self,
         launch_id: &str,

@@ -41,6 +41,35 @@ st agents resume agent/garden/worker --as person/ada
 
 Suspend refuses a busy seat with its blockers: a turn, claimed work, pending question, unsent input, or running subagent. A new harness may need one turn before it has a saved native session. Mail waits while suspended; it does not wake the seat. Resume verifies the same session on the same host. See [suspend/resume](st3/suspend.md) for failure reasons and limits.
 
+## One-shot seats
+
+Declare `one-shot` on a seat that should finish when its process exits:
+
+```kdl
+version 2
+agent "garden/interactive" {
+  workspace "/work/garden"
+  harness "omp" {}
+  one-shot
+}
+```
+
+The daemon retires the seat after its process exits, including an unsuccessful exit or a
+process it discovers has vanished. It disappears from `st agents ls`; `st agents ls --all`,
+`st agents show agent/garden/interactive --all`, and subject history retain it. No launcher or
+post-exit wrapper needs to stay alive. Retirement takes precedence over the declaration's
+restart policy. A seat without `one-shot`, including one with `restart "never"`, keeps its
+usual lifecycle.
+
+`st agents start garden/interactive --as person/ada` restores the same declaration and native
+session. Explicit restart, launch-setting changes, and suspend/resume still work while the
+seat is live. A one-shot mission seat stays retired for its current generation until explicitly
+started; a later generation can declare it again.
+
+A one-shot member of an owned set retires without changing its source bundle or ownership.
+Publish a new declaration through that set to start it again; ordinary `agents start` continues
+to respect the set's ownership.
+
 ## Bring an existing native session under st
 
 A session started directly in a harness can be imported. Find it and inspect the exact identity and workspace before importing:
