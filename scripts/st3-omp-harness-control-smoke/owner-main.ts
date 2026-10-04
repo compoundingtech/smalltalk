@@ -40,8 +40,8 @@ try {
  for(const [key,mutation] of [['move',{type:'move',entry_id:cid,before_id:bid}],['replace',{type:'replace',entry_id:bid,content:'replacement text'}],['cancel-a',{type:'cancel',entry_id:aid}],['promote',{type:'promote',entry_id:bid}],['cancel-c',{type:'cancel',entry_id:cid}]]){const r=await action(key,mutation);if(r.status!==200||r.value.status!=='applied')throw Error(JSON.stringify(r));}
  const q=await read();const stale=await action('stale-turn',{type:'enqueue',content:'stale',lane:'steer'},{...q.native.binding,turn_id:'stale-turn'});if(stale.status<400)throw Error('Stale native turn admitted');
  const badRevision=await action('stale-revision',{type:'enqueue',content:'stale',lane:'steer'},undefined,0);if(badRevision.status<400)throw Error('Stale queue revision admitted');
- const applied=await poll(async()=>{const entry=(await read()).queue.entries.find(e=>e.id===bid);return entry?.status==='applied'?entry:false;},'exact native admitted receipt');
- if(!['message_start','message_end'].includes(applied.result?.native_event)||applied.content!=='replacement text')throw Error('Native proof not exact');
+ const applied=await poll(async()=>{const r=await receipt(b.value.operation_id);return r.status==='applied'?r:false;},'exact native admitted receipt');
+ if(!['message_start','message_end'].includes(applied.result?.native_event)||applied.entry_id!==bid)throw Error('Native proof not exact');
  const durable=await receipt(b.value.operation_id);if(durable.status!=='applied'||durable.entry_id!==bid||durable.result?.native_event!==applied.result.native_event)throw Error('Queue receipt GET lost proof');
  const wrongSubject=await request('/v1/client/harness-control-receipts/'+encodeURIComponent(b.value.operation_id)+'?subject=agent%2Fmissing');if(wrongSubject.status!==404)throw Error('Receipt read crossed subject scope');
  const replay=await request('/v1/client/actions',b.body);if(replay.status!==200||replay.value.status!=='applied')throw Error('Response-loss replay not frozen');
@@ -49,7 +49,7 @@ try {
  await poll(async()=>(await read()).native.idle,'native idle');delay=10000;native.stdin.write(JSON.stringify({type:'prompt',id:'busy-loss',message:'busy for process loss'})+'\n');native.stdin.flush();await poll(async()=>!(await read()).native.idle,'native process-loss busy');
  const lost=await action('lost',{type:'enqueue',content:'must not resend',lane:'steer'});if(lost.status!==200)throw Error(JSON.stringify(lost));const lostId=lost.value.harness_control.entry_id;
  await poll(async()=>(await read()).queue.entries.find(e=>e.id===lostId)?.status==='dispatched','owner dispatch reservation');native.kill('SIGKILL');await native.exited;await out;await err;
- const uncertain=await poll(async()=>{const entry=(await read()).queue.entries.find(e=>e.id===lostId);return entry?.status==='indeterminate'?entry:false;},'native loss indeterminate');
+ const uncertain=await poll(async()=>{const r=await receipt(lost.value.operation_id);return r.status==='indeterminate'?r:false;},'native loss indeterminate');
  const frozen=await request('/v1/client/actions',lost.body);if(frozen.status!==200||frozen.value.status!=='indeterminate')throw Error('Lost response retry attempted resend');
  console.log('OWNER_CONTROL_SUCCESS '+JSON.stringify({owner_queue:'stable-id move/replace/cancel/promote',native_applied:applied,durable_queue:durable,durable_model:modelReceipt,uncertain,receipt_replay:'frozen',unauthorized:unauthorized.status,stale_turn:stale.status,stale_queue_revision:badRevision.status,approval:(await read()).native.approval}));console.log('OWNER_DRIVER_STDERR '+driverErrors);
 } finally {clearTimeout(deadline);native?.kill();d.kill();await d.exited;console.log('OWNER_DAEMON_STDERR '+await daemonError);server.stop();await rm(root,{recursive:true,force:true});}
