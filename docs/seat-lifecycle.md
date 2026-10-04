@@ -41,6 +41,20 @@ st agents resume agent/garden/worker --as person/ada
 
 Suspend refuses a busy seat with its blockers: a turn, claimed work, pending question, unsent input, or running subagent. A new harness may need one turn before it has a saved native session. Mail waits while suspended; it does not wake the seat. Resume verifies the same session on the same host. See [suspend/resume](st3/suspend.md) for failure reasons and limits.
 
+## Client end reasons
+
+Client-v0 agent rows optionally carry `end_reason`: a derived terminal classification,
+not a new lifecycle write. Its `kind` distinguishes clean completion, a stop requested
+by a person or agent, a crash, a diagnostic harness exit, a lost host, and retirement.
+`ended_at` identifies the observed boundary; available actor, reason, exit code/signal,
+and diagnostic accompany it.
+
+Missing evidence remains absent. A clean exit is completion only with an explicit
+current ended harness, exit 0, no signal, and no stop request. Unknown actors are not
+guessed. Owned-set retirement and explicit stop/suspend requests take precedence over
+an otherwise clean exit. Consumers must preserve stale/missing observation states
+instead of displaying retained completion evidence as current success.
+
 ## One-shot seats
 
 Declare `one-shot` on a seat that should finish when its process exits:
