@@ -54,6 +54,7 @@ export type Agent = ResourceHeader & {
   queued_work_count?: number;
   reachability: AgentReachability;
   reason?: string | null;
+  resources?: Array<DeclaredResource>;
   rollout?: {
 
 } | null;
@@ -683,6 +684,15 @@ export type DecisionResponse = ({
   value: Array<string>;
 });
 
+export type DeclaredResource = {
+  kind: "uri" | "subject";
+  name: string;
+  reason?: string | null;
+  resolution: "resolved" | "unresolved" | "not-applicable";
+  subject: Id;
+  uri?: string;
+};
+
 export type Device = ResourceHeader & {
   expires_at: Timestamp;
   kind: "device";
@@ -1031,6 +1041,7 @@ export type Mission = ResourceHeader & {
   kind: "mission";
   mission_revision: Revision;
   must_act?: MustAct;
+  resources?: Array<DeclaredResource>;
   run_counts?: {
   [key: string]: number;
 };
