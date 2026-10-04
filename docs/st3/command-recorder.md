@@ -149,18 +149,25 @@ exits, a stalled consumer cannot hold up the command's exit status: undeliverabl
 is abandoned and the incomplete capture produces no receipt.
 
 The shim never contacts the daemon. The daemon consumes the spool asynchronously and publishes
-the resource's `opened_by` and `opened_by_run` facts, preserving an opener already named. Duplicate
-receipts for the same URL and actor collapse through an idempotency key. A receipt-born resource
-does not replace a GitHub observation: its first observed state still triggers issue or review
-delivery normally.
+the resource's `opened_by` and `opened_by_run` facts. When either opener field is already recorded,
+it consumes the receipt without appending a claim, including a capture by another agent.
+Duplicate receipts for the same URL and actor also collapse through an idempotency key.
 
-Receipt claims contain attribution and required resource identity fields only, never the daemon's
-previous observer snapshot. The spool directory is mode 0700 (including after reinstall).
+Receipts use the existing `resource.observed` claim with `attribution_only: true`. They contain
+attribution and required resource identity fields only, never the daemon's previous observer
+snapshot. The projection merges only the opener into observed facts; a receipt cannot replace
+state, head, title, checks, or the observation's timestamp. Before any observation, it establishes
+identity and attribution. The first real observation retains that opener and still triggers
+issue or review delivery normally, including when the observation arrives through replication.
+The spool directory is mode 0700 (including after reinstall).
 Filesystem notifications wake ingestion immediately; a fallback scan backs off from two seconds
 to at most sixty seconds while idle and returns to one second after ingestion. Failed appends
-retain their retry count in the filename across daemon restarts. After five failures the receipt
-becomes a `.dead-letter` file, is logged once, and is no longer retried. To retry after correcting
-the cause, rename it to a fresh `.json` name. Abandoned `.tmp` files older than one hour are removed;
+retain their retry count in `.attempt-N.json` filenames and a not-before deadline in the file's
+modification time across daemon restarts. The deadline is set before renaming; each scan ignores
+pending retries even when filesystem notifications wake it. Retries wait at least one, two, four,
+then eight seconds; fallback scans may add delay. After five actual failures the receipt becomes
+a `.dead-letter` file, is logged once, and is no longer retried. To retry after correcting the
+cause, rename it to a fresh `.json` name. Abandoned `.tmp` files older than one hour are removed;
 fresh temporary files are left alone so an active publisher can finish.
 
 ## Limits

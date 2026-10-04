@@ -12274,7 +12274,7 @@ impl Store {
                                 &canonical_sql(
                                     "SELECT accepted_at_unix_ms FROM claims
                                      WHERE subject=?1 AND kind='resource.observed'
-                                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                                     ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1",
                                 ),
                                 [&subject],
                                 |row| row.get::<_, String>(0),
@@ -16333,7 +16333,7 @@ fn resolve_mission_run_inputs(
                 } else {
                     transaction
                         .query_row(
-                            &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                            &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1"),
                             [subject],
                             |row| row.get(0),
                         )
@@ -16882,23 +16882,10 @@ fn normalize_resource_observation(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| previous.as_object().cloned().unwrap_or_default());
-        // Receipts publish attribution and identity only, never a local observer snapshot:
-        // this writer may be behind on replication when the receipt arrives.
-        if input
-            .idempotency_key
-            .as_deref()
-            .is_some_and(|key| key.starts_with("receipt:"))
-            && matches!(kind.as_str(), "vcs.issue" | "vcs.pull-request")
-        {
-            if previous.contains_key("opened_by") || previous.contains_key("opened_by_run") {
-                facts.remove("opened_by");
-                facts.remove("opened_by_run");
-            }
-        }
         // Issue and pull request attribution belongs to its publisher, not to the latest
         // observer or fixer. Keep each named field, including a mission-run-only opener, across
         // observations, so a partial snapshot such as a merge never erases it.
-        if carries_opener(&kind) {
+        if carries_opener(&kind) && input.fields.get("attribution_only") != Some(&Value::Bool(true)) {
             for name in ["opened_by", "opened_by_run"] {
                 if let Some(value) = previous.get(name) {
                     facts.insert(name.into(), value.clone());
@@ -16961,6 +16948,7 @@ fn resource_facts(fields: &BTreeMap<String, Value>) -> Result<BTreeMap<String, V
         "observer",
         "baseline",
         "changed_fields",
+        "attribution_only",
     ];
     Ok(fields
         .iter()
@@ -18806,6 +18794,10 @@ fn latest_actual_at(
         let value: Value = serde_json::from_str(&body)?;
         let source = value.get("fields").unwrap_or(&value);
         if let Some(fields) = source.as_object() {
+            if kind == "resource.observed" {
+                resources::merge_observation(&mut merged, fields);
+                continue;
+            }
             if registry
                 .claim(&kind)
                 .is_some_and(|spec| spec.cardinality == st3_schema::Cardinality::StateTransition)
@@ -20241,7 +20233,7 @@ fn pull_request_state_tx(connection: &Connection, target: &str) -> Result<Option
             &canonical_sql(
                 "SELECT json_extract(body, '$.fields'), accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind='resource.observed'
-             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+             ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1",
             ),
             [subject],
             |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
@@ -44406,6 +44398,51 @@ mission "review-guardrail" state="ready" {
     }
 
     #[test]
+    fn late_receipt_preserves_observation_and_next_head_push_delivers() {
+        let store = Store::open_memory("node").unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        let repository = "resource/github/acme/demo";
+        let subject = format!("{repository}/pull-request/9");
+        let observed = json!({
+            "number": 9, "state": "open", "title": "Ready", "draft": false,
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "checks": [{"name": "build", "conclusion": "success"}]
+        });
+        store.append_claim(&ClaimInput {
+            subject: subject.clone(), kind: "resource.observed".into(), actor: None,
+            fields: BTreeMap::from([
+                ("kind".into(), json!("vcs.pull-request")),
+                ("facts".into(), observed.clone()),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        std::fs::write(spool.path().join("1.json"), serde_json::to_vec(&crate::recorder::Receipt {
+            schema: "st3.recorder.receipt.v1".into(),
+            url: "https://github.com/acme/demo/pull/9".into(),
+            actor: "agent/node.builder".into(), mission_run: Some("created".into()),
+            exit_code: Some(0), at: "2026-10-03T12:00:00Z".into(),
+        }).unwrap()).unwrap();
+        assert_eq!(crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(), 1);
+        let recorded = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
+        let previous = json!({"pull_requests": [{
+            "number": 9, "state": "open", "draft": false
+        }]});
+        let current = json!({"pull_requests": [{
+            "number": 9, "new": false, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }]});
+        let items = discovered_collection_items(
+            repository, "pull_requests", Some(&previous), &current,
+            &mut |_| Some(recorded.clone()),
+        );
+        assert!(items[0].deliver, "a late receipt must not lose the next head's review");
+        for field in ["state", "title", "head_sha", "checks"] {
+            assert_eq!(recorded[field], observed[field], "{field}");
+        }
+        assert_eq!(recorded["opened_by"], "agent/node.builder");
+        let projected = store.resource_collection_page(None, None, Some(&subject), None, 10).unwrap();
+        assert_eq!(projected[0]["facts"], recorded);
+    }
+
+    #[test]
     fn receipt_born_resources_receive_first_observer_issue_and_review_delivery() {
         let store = Store::open_memory("node").unwrap();
         let spool = tempfile::tempdir().unwrap();
@@ -47087,6 +47124,18 @@ fn append_claim_with_fences(
                     return Err(St3Error::new("stale-placement",
                         "placement changed; read the current handoff before overriding its sources"));
                 }
+            }
+            // Check under the writer lock: concurrent captures must not append a second opener
+            // or replace an existing observation with another attribution-only claim.
+            if input.kind == "resource.observed"
+                && input.fields.get("attribution_only") == Some(&Value::Bool(true))
+                && let Some(previous) = latest_actual(transaction, &input.subject).map_err(internal)?
+                && previous.get("facts").unwrap_or(&previous).as_object().is_some_and(|facts| {
+                    facts.contains_key("opened_by") || facts.contains_key("opened_by_run")
+                })
+                && let Some(existing) = latest_claim_of_kind_tx(transaction, &input.subject, "resource.observed")?
+            {
+                return Ok((existing, false));
             }
             let mut stored_fields = custom::prepare(transaction, input)?;
             if let Some(fields) = normalize_resource_observation(transaction, input)? {
