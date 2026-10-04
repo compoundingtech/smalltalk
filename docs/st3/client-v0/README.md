@@ -681,6 +681,8 @@ The notice remains in the newest page and does not invent an omitted sequence in
 Conversation changes carry these projection notices when managed history changes, including
 the first operation that crosses the bound. An updated entry outside the materialized window
 causes the ordinary cursor-gap/newest-page refresh instead of an incomplete revision delta.
+Changes to typed truncation entries also refresh the authoritative newest page, clearing an
+obsolete prefix-unavailable notice when an interval establishes complete prefix coverage.
 
 When the physical retained prefix starts after sequence one without a covering typed truncation
 interval, a non-retryable `timeline-history-incomplete` system error entry explains that earlier

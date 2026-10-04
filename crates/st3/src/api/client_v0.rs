@@ -4664,6 +4664,7 @@ fn conversation_read_now(
     let mut changed_indexes = BTreeSet::new();
     let mut explicit_ids = BTreeSet::new();
     let mut message_indexes = BTreeSet::new();
+    let mut retention_changed = false;
     if let Some((store_index, local_position, _)) = position {
         let owner = super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
@@ -4677,6 +4678,8 @@ fn conversation_read_now(
             {
                 changed_indexes.insert(claim.store_index);
                 if claim.kind == "harness.timeline" {
+                    retention_changed |= claim.body.pointer("/fields/entry_type")
+                        .and_then(Value::as_str) == Some("truncation");
                     if let Some(id) = claim
                         .body
                         .pointer("/fields/entry_id")
@@ -4716,6 +4719,8 @@ fn conversation_read_now(
             if claim.subject == owner.as_deref().unwrap_or_default()
                 && claim.kind == "harness.timeline"
             {
+                retention_changed |= claim.body.pointer("/fields/entry_type")
+                    .and_then(Value::as_str) == Some("truncation");
                 if let Some(id) = claim
                     .body
                     .pointer("/fields/entry_id")
@@ -4725,6 +4730,18 @@ fn conversation_read_now(
                 }
             }
         }
+    }
+    if retention_changed {
+        // A covering interval can remove a projection-only availability notice.
+        // The delta protocol cannot delete it: send an authoritative page instead.
+        return Err(ApiError {
+            status: StatusCode::GONE,
+            code: "cursor-gap".into(),
+            message: "transcript retention changed; refresh the newest conversation page".into(),
+            details: Box::new(serde_json::Map::from_iter([(
+                "full_resync".into(), Value::Bool(true),
+            )])),
+        });
     }
     let mut items = all
         .iter()
@@ -13978,9 +13995,18 @@ mission "example/zero-run" state="ready" {
             "reason":"producer-retention", "omitted_from_sequence":1, "omitted_to_sequence":1,
         })));
         assert!(unavailable(&read()));
+        let snapshot = new_client_snapshot(&state);
+        let id = client_session_resources(&state.store, true, &snapshot.created_at,
+            snapshot.store_index, None, false).unwrap()[0]["id"].as_str().unwrap().to_owned();
+        let followed = conversation_read_now(&state, &session, &id, None).unwrap();
         append("harness.timeline", entry(5, "truncation", json!({
             "reason":"producer-retention", "omitted_from_sequence":1, "omitted_to_sequence":2,
         })));
+        let refresh = conversation_read_now(
+            &state, &session, &id, followed["next_cursor"].as_str(),
+        ).unwrap_err();
+        assert_eq!(refresh.code, "cursor-gap");
+        assert_eq!(refresh.details["full_resync"], true);
         assert!(!unavailable(&read()));
     }
 
