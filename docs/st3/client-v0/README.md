@@ -672,11 +672,20 @@ to another authenticated scope, or precedes retention, the server returns the ve
 snapshot pages, and resumes from the capabilities response's `event_cursor`. It must not infer
 missing mutations or request graph replication.
 
-A timeline whose retained claims omit an entry's append, or omit older history without a typed
-truncation interval, reports `timeline-history-incomplete` with `retryable: false`, `full_resync: false` and
-`retained_history_incomplete: true`. Its message explains that the retained transcript start is
-incomplete. Retrying a fresh snapshot cannot restore those missing claims; clients show the
-reason and stop automatic retries. Ordinary expired stream cursors remain retryable.
+Claim-backed timelines project at most the newest 4,096 operations. A store query's continuation
+means older rows still exist, not that retention deleted them. A non-retryable
+`timeline-query-limited` system error entry explains this projection bound, including entries
+whose retained append precedes the window and whose updates therefore cannot be projected
+coherently. Page cursors reach only the materialized window, not those omitted store rows.
+The notice remains in the newest page and does not invent an omitted sequence interval.
+
+When the physical retained prefix starts after sequence one without a covering typed truncation
+interval, a non-retryable `timeline-history-incomplete` system error entry explains that earlier
+history is unavailable while complete retained entries remain readable. This notice does not
+claim what the missing prefix contained. An update whose append is genuinely absent still
+reports HTTP `timeline-history-incomplete` with `retryable: false`, `full_resync: false` and
+`retained_history_incomplete: true`; a query bound does not excuse it. Retrying a fresh snapshot
+cannot restore missing claims. Ordinary expired stream cursors remain retryable.
 
 ## Pairing and remote access
 
