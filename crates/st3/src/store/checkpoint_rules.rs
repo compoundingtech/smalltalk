@@ -432,7 +432,7 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
             // A restored prompt exposes the most recent underlying harness state. Its source
             // can be hidden while the prompt is active, but still witnesses this transition.
             let source = sources[position];
-            if source.kind == "harness.diagnostic" && field_str(source, "code") == Some("provider-auth-restored")
+            if source.kind == "harness.diagnostic" && matches!(field_str(source, "code"), Some("provider-auth-restored" | "provider-update-restored"))
                 && let Some(dependency) = sources[..position].iter().rposition(|claim| {
                     claim.kind == "harness.observed"
                         && field_str(claim, "incarnation_id") == field_str(source, "incarnation_id")

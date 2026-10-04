@@ -28,6 +28,7 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
     let mut incarnation: Option<&str> = None;
     let mut harness: Option<&str> = None;
     let mut prompt: Option<&str> = None;
+    let mut update_prompt = false;
     let mut state: Option<&str> = None;
     let mut entries = Vec::new();
     for (position, claim) in claims.iter().enumerate() {
@@ -43,6 +44,7 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
                     incarnation = Some(next_incarnation);
                     harness = None;
                     prompt = None;
+                    update_prompt = false;
                     state = None;
                 }
                 continue;
@@ -53,6 +55,7 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
                 };
                 if reset {
                     prompt = None;
+                    update_prompt = false;
                 }
                 harness = Some(next_state);
             }
@@ -60,17 +63,24 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
                 Some("provider-auth-expired") => prompt = Some("unauthenticated"),
                 Some("provider-trust-prompt") => prompt = Some("blocked"),
                 Some("provider-auth-restored") => prompt = None,
+                Some("provider-update-prompt") => update_prompt = true,
+                Some("provider-update-restored") => update_prompt = false,
                 _ => continue,
             },
             _ => continue,
         }
-        let next = prompt.or(harness);
+        let next = if update_prompt {
+            Some("blocked")
+        } else {
+            prompt.or(harness)
+        };
         // False marks server-authored same-state observations, so an older source's removal
         // does not turn a heartbeat into an invented transition.
         let same_state_observation = claim.kind == "harness.observed"
             && fields.get("status_transition").and_then(Value::as_bool) == Some(false);
         let recorded_transition = claim.kind == "harness.observed"
             && prompt.is_none()
+            && !update_prompt
             && fields.get("status_transition").and_then(Value::as_bool) == Some(true);
         if (reset || state != next || recorded_transition) && !same_state_observation {
             entries.push((position, next.map(str::to_owned), reset));
@@ -146,7 +156,7 @@ pub(super) fn enrich_harness(
     let has_prompt: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='harness.diagnostic'
          AND store_index<=?2 AND json_extract(body,'$.fields.incarnation_id')=?3
-         AND json_extract(body,'$.fields.code') IN ('provider-auth-expired','provider-trust-prompt','provider-auth-restored'))",
+         AND json_extract(body,'$.fields.code') IN ('provider-auth-expired','provider-trust-prompt','provider-auth-restored','provider-update-prompt','provider-update-restored'))",
         params![subject, index, view.incarnation_id], |row| row.get(0),
     )?;
     if has_prompt {
@@ -205,7 +215,7 @@ impl Store {
             .as_ref()
             .map_or(harness.observed_at_unix_ms, observation_time);
         let prompt_query = newest_claims_of_kind_query("claims.accepted_at_unix_ms", "harness.diagnostic")
-            .replace(" ORDER BY", " AND json_extract(claims.body,'$.fields.incarnation_id')=?3 AND json_extract(claims.body,'$.fields.code') IN ('provider-auth-expired','provider-trust-prompt','provider-auth-restored') ORDER BY") + " LIMIT 1";
+            .replace(" ORDER BY", " AND json_extract(claims.body,'$.fields.incarnation_id')=?3 AND json_extract(claims.body,'$.fields.code') IN ('provider-auth-expired','provider-trust-prompt','provider-auth-restored','provider-update-prompt','provider-update-restored') ORDER BY") + " LIMIT 1";
         let prompt: Option<String> = connection
             .prepare_cached(&prompt_query)?
             .query_row(params![subject, index, harness.incarnation_id], |row| {
@@ -505,6 +515,38 @@ mod tests {
             first.body["fields"]["observed_since_ms"]
         );
     }
+    #[test]
+    fn status_update_prompt_has_priority_and_preserves_since_until_restored() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        observe(&store, "one", "idle", now_ms(), "ready");
+        let diagnostic = |code| {
+            store.append_claim(&input("harness.diagnostic", json!({
+            "incarnation_id":"one", "code":code, "driver":"codex", "reason":"fixture", "severity":"warning"
+        }))).unwrap()
+        };
+        diagnostic("provider-auth-expired");
+        let prompt = diagnostic("provider-update-prompt");
+        diagnostic("provider-update-prompt");
+        diagnostic("provider-auth-restored");
+        observe(&store, "one", "idle", now_ms(), "parallel channel");
+        let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(blocked.state, "blocked");
+        assert_eq!(blocked.since_unix_ms, prompt.accepted_at_unix_ms);
+        let restored = diagnostic("provider-update-restored");
+        let idle = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(idle.state, "idle");
+        assert_eq!(idle.since_unix_ms, restored.accepted_at_unix_ms);
+        let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
+        let states = history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["state"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["idle", "unauthenticated", "blocked", "idle"]);
+    }
+
     #[test]
     fn status_prompt_transitions_and_repeats_agree_with_current_since() {
         let store = Store::open_memory("cedar").unwrap();

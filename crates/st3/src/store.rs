@@ -18907,6 +18907,7 @@ fn update_prompt_fence(
         input_buffer: None,
         exit: None,
         claim,
+        since_unix_ms: at.parse()?,
         observed_at_unix_ms: at.parse()?,
     }))
 }
