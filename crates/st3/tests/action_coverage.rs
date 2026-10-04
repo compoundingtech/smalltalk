@@ -3054,7 +3054,6 @@ async fn cli_subscription_release_and_cancel_survive_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_replication_inspection_and_repair_survive_restart() {
-    use base64::Engine;
     const FLEET: &str = "5e3c1a9b-2d4f-4b6e-8a7c-0f1e2d3c4b5a";
     let mut daemon = Daemon::new().await;
     daemon.store().bind_fleet(FLEET).unwrap();
@@ -3075,11 +3074,9 @@ async fn cli_replication_inspection_and_repair_survive_restart() {
         .export_replication_exchange(FLEET, &daemon.store().replication_inventory().unwrap())
         .unwrap();
     let original = exchange.envelopes[0].clone();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&original.payload)
-        .unwrap();
+    let bytes = original.payload.bytes().unwrap();
     let mut payload: smallclaims::claim::ReplicaEnvelopePayload =
-        ciborium::from_reader(bytes.as_slice()).unwrap();
+        ciborium::from_reader(bytes).unwrap();
     let claim = &mut payload.batch.claims[0];
     claim.body["fields"]["unexpected"] = json!(true);
     claim.id = smallclaims::hash::claim_hash(
@@ -3102,7 +3099,7 @@ async fn cli_replication_inspection_and_repair_survive_restart() {
             original.accepted_at_unix_ms,
             &bytes,
         ),
-        payload: base64::engine::general_purpose::STANDARD.encode(bytes),
+        payload: bytes.into(),
         ..original.clone()
     };
     exchange.envelopes = vec![original, broken];

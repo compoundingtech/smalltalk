@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
-use base64::Engine as _;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,6 +36,8 @@ use crate::sqlite::{
     STATEMENT_CACHE_CAPACITY, WriterConnection,
 };
 
+mod binary_payloads;
+pub use binary_payloads::PayloadConversion;
 pub mod canonical;
 pub mod checkpoint;
 pub mod checkpoint_agreement;
@@ -348,7 +349,7 @@ ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 "#;
 
 /// The store's schema version, set once the graph's and the runtime's tables exist.
-pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 15;";
+pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 16;";
 
 /// The graph half of a store. A runtime's store wraps it and derefs to it, so the runtime's
 /// projections read and write through the same connections.
@@ -1051,11 +1052,11 @@ pub fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=15),
+        table_count == 0 || matches!(version, 10..=16),
         "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15),
+        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15 | 16),
         "this database uses unsupported st schema version {version}"
     );
     Ok(())
@@ -2609,7 +2610,7 @@ pub fn record_invalid_replica_envelope(
             envelope.writer,
             envelope.sequence,
             envelope.hash,
-            envelope.payload,
+            envelope.payload.base64(),
             error.code,
             error.message,
             now_ms().to_string(),
@@ -2755,7 +2756,6 @@ fn seed_replica_envelopes_signed_tx(
             accepted_at.parse().unwrap_or_default(),
             &payload,
         );
-        let encoded_payload = base64::engine::general_purpose::STANDARD.encode(&payload);
         transaction.execute(
             "INSERT OR IGNORE INTO replica_envelopes(
                  writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms,
@@ -2767,7 +2767,7 @@ fn seed_replica_envelopes_signed_tx(
                 envelope_hash,
                 previous_hash,
                 accepted_at,
-                encoded_payload,
+                payload,
                 id,
                 relay
             ],
@@ -3799,20 +3799,18 @@ pub fn validate_and_admit_envelope_tx(
     outcome: &mut ReplicationAdmission,
 ) -> Result<(), St3Error> {
     let started = std::time::Instant::now();
-    let payload_bytes = base64::engine::general_purpose::STANDARD
-        .decode(envelope.payload.as_bytes())
-        .map_err(|error| {
-            St3Error::new(
-                "invalid-envelope-payload",
-                format!("the envelope payload is not valid base64: {error}"),
-            )
-        })?;
+    let payload_bytes = envelope.payload.bytes().map_err(|error| {
+        St3Error::new(
+            "invalid-envelope-payload",
+            format!("the envelope payload is not valid base64: {error}"),
+        )
+    })?;
     let expected_hash = replica_envelope_hash(
         &envelope.writer,
         envelope.sequence,
         envelope.previous_hash.as_deref(),
         envelope.accepted_at_unix_ms,
-        &payload_bytes,
+        payload_bytes,
     );
     if expected_hash != envelope.hash {
         return Err(St3Error::new(
@@ -3821,7 +3819,7 @@ pub fn validate_and_admit_envelope_tx(
         ));
     }
     let payload: ReplicaEnvelopePayload =
-        ciborium::from_reader(payload_bytes.as_slice()).map_err(|error| {
+        ciborium::from_reader(payload_bytes).map_err(|error| {
             St3Error::new(
                 "invalid-envelope-payload",
                 format!("the envelope payload is not valid CBOR: {error}"),

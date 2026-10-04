@@ -6,6 +6,7 @@
 mod action_coverage;
 mod agents_restart;
 mod backup;
+mod binary_payloads;
 mod boot_canaries;
 mod broken_gates;
 mod client_creation;

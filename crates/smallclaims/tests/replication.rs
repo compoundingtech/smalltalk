@@ -87,7 +87,7 @@ fn a_claim_whose_content_does_not_match_its_id_is_never_admitted() {
         .unwrap();
     // Swap the envelope's payload for one that carries a different body under the same claim ID.
     let envelope = exchange.envelopes.first_mut().unwrap();
-    envelope.payload = envelope.payload.replace('A', "B");
+    envelope.payload = envelope.payload.base64().replace('A', "B").into();
     grace
         .receive_replication_exchange("ada-laptop", FLEET, &exchange)
         .unwrap();

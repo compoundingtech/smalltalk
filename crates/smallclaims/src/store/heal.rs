@@ -611,9 +611,7 @@ impl Store {
             let transaction = connection.transaction()?;
             let now = now_ms().to_string();
             for envelope in envelopes {
-                let Ok(bytes) =
-                    base64::engine::general_purpose::STANDARD.decode(envelope.payload.as_bytes())
-                else {
+                let Ok(bytes) = envelope.payload.bytes() else {
                     continue;
                 };
                 let hash = replica_envelope_hash(
@@ -621,7 +619,7 @@ impl Store {
                     envelope.sequence,
                     envelope.previous_hash.as_deref(),
                     envelope.accepted_at_unix_ms,
-                    &bytes,
+                    bytes,
                 );
                 if hash != envelope.hash {
                     continue;
