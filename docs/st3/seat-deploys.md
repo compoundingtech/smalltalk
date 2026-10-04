@@ -64,6 +64,7 @@ Seat updates carry `desired.display_name` and the member record, including the p
 They update the PTY title and pi/omp session name on reconnect, `session_start`, and `session_switch`.
 OMP compares the declared label with its current session name before writing it, so replaying an
 unchanged Seat on reconnect does not append a title change or rewrite the saved title timestamp.
+Older OMP releases without `getSessionName` still apply the declared label without that comparison.
 Claude's status line reads the same graph authority on each render and chains the existing renderer.
 Native `/rename` is temporary: the next authority update restores the declared name.
 

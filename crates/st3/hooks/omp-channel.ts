@@ -386,7 +386,9 @@ export default function (pi: ExtensionAPI) {
     if (!state.label) return;
     // Seat replay after reconnect must not append another title change to the session.
     try {
-      if (pi.getSessionName() !== state.label) await pi.setSessionName(state.label);
+      if (typeof pi.getSessionName !== "function" || pi.getSessionName() !== state.label) {
+        await pi.setSessionName(state.label);
+      }
     }
     catch { ctx.ui?.notify?.("st: could not update the session name", "warning"); }
   };

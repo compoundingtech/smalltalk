@@ -62,6 +62,11 @@ send({type:"message",content:"QUARTZ SIGNAL",meta});
 await until(()=>read().some(frame=>frame.type==="delivered"&&frame.meta?.messageId===meta.messageId));
 if (driver === "omp") {
   assert.equal(titleChanges.length,titleChangesBeforeReplay,"replaying the same Seat twice must not rewrite the session name");
+  delete api.getSessionName;
+  api.setSessionName("Native rename without getter");
+  send({type:"seat",seat:{subject:"agent/eval.worker",desired:{display_name:"Quartz"}}});
+  await until(()=>title==="Quartz[gen]");
+  api.getSessionName=()=>title;
 }
 assert.equal(read().filter(frame=>frame.type==="read").length,0,"native queue acceptance is not read evidence");
 await events.get("context")({messages:[{role:"user",content:"QUARTZ SIGNAL"}]},ctx);
