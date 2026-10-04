@@ -7268,7 +7268,7 @@ pub(super) struct ActionRequest {
 fn action_scope(action: &str) -> Option<&'static str> {
     if action == "harness.model.set" { return Some("control.runtimes"); }
     if action == "harness.queue.mutate" {
-        return Some("control.messages");
+        return Some("control.runtimes");
     }
     if matches!(
         action,

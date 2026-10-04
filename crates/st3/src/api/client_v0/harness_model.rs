@@ -176,7 +176,8 @@ pub(in crate::api) async fn models(
             "this runtime has not reported a native model catalogue",
         )))?;
     if cursor.as_ref().is_some_and(|cursor| {
-        cursor.binding.desired_revision != native.binding.desired_revision
+        !native.models.available
+            || cursor.binding.desired_revision != native.binding.desired_revision
             || cursor.binding.incarnation_id != native.binding.incarnation_id
             || cursor.binding.session_id != native.binding.session_id
             || cursor.model_revision != native.models.revision
@@ -376,12 +377,24 @@ mod tests {
                 expected_subject: None,
                 idempotency_key: None,
             }).unwrap();
-            let (status, response) = submit(
-                app.clone(),
-                &request(&state),
-                ("authorization", &format!("Bearer {credential}")),
-            ).await;
-            assert_eq!(status, expected, "{response}");
+            for queue in [false, true] {
+                let mut action = request(&state);
+                if queue {
+                    action["type"] = json!("harness.queue.mutate");
+                    action["parameters"] = json!({
+                        "subject": "agent/model-worker",
+                        "binding": action["parameters"]["binding"],
+                        "queue_revision": 0,
+                        "mutation": {"type":"enqueue", "content":"scope boundary", "lane":"follow_up"},
+                    });
+                }
+                let (status, response) = submit(
+                    app.clone(),
+                    &action,
+                    ("authorization", &format!("Bearer {credential}")),
+                ).await;
+                assert_eq!(status, expected, "{response}");
+            }
         }
     }
 
@@ -513,6 +526,26 @@ mod tests {
         native.models.revision = "models-two".into();
         state.store.observe_harness_control(&native, &fence).unwrap();
         let (status, expired) = read(format!("{path}?cursor={}", urlencoding::encode(cursor))).await;
+        assert_eq!(status, StatusCode::GONE, "{expired}");
+        assert_eq!(expired["code"], "page-cursor-expired");
+        let (status, current) = read(format!("{path}?limit=1")).await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        let current_cursor = current["value"]["cursor"].as_str().unwrap();
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/model-worker".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/model-worker".into()),
+            fields: BTreeMap::from([
+                ("runtime_id".into(), json!("native-runtime")),
+                ("incarnation_id".into(), json!("incarnation-one")),
+                ("status".into(), json!("stopped")),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let (status, ended) = read(path.into()).await;
+        assert_eq!(status, StatusCode::OK, "{ended}");
+        assert_eq!(ended["value"]["available"], false);
+        let (status, expired) = read(format!("{path}?cursor={}", urlencoding::encode(current_cursor))).await;
         assert_eq!(status, StatusCode::GONE, "{expired}");
         assert_eq!(expired["code"], "page-cursor-expired");
     }

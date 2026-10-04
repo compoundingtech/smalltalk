@@ -110,7 +110,10 @@ impl Store {
         self.connection.batched(|tx| -> Result<Queue, St3Error> { reconcile_runtime(tx, subject)?; queue_tx(tx, subject) }).map_err(|error| St3Error::new("internal", error))?
     }
     pub fn harness_control_state(&self, subject: &str) -> Result<Option<NativeState>, St3Error> {
-        state_tx(&self.readers.get(), subject)
+        self.connection.batched(|tx| -> Result<Option<NativeState>, St3Error> {
+            reconcile_runtime(tx, subject)?;
+            state_tx(tx, subject)
+        }).map_err(|error| St3Error::new("internal", error))?
     }
     pub fn harness_control_desired_revision(&self, fence: &crate::mailbox::Fence) -> Result<String, St3Error> {
         let connection = self.readers.get();
