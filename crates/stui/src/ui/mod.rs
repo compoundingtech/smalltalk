@@ -113,6 +113,31 @@ struct Demo {
 const UPDATE_READ_AFTER: Duration = Duration::from_secs(3);
 
 /// A request the live loop sends to st. The demo never produces these.
+/// What the agent actions menu does to a seat; each is st's own agent action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentControl {
+    /// A new process for the same seat: stop, then start on its declaration.
+    Restart,
+    /// Stop it and take it off the lists; start brings it back.
+    Retire,
+    Start,
+    /// Stop at a quiet moment, keeping its native session.
+    Suspend,
+    Resume,
+}
+
+impl AgentControl {
+    pub fn verb(self) -> &'static str {
+        match self {
+            AgentControl::Restart => "Restart",
+            AgentControl::Retire => "Retire",
+            AgentControl::Start => "Start",
+            AgentControl::Suspend => "Suspend",
+            AgentControl::Resume => "Resume",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Read an image a message carries from st, keep it here, and show it.
@@ -172,6 +197,11 @@ pub enum Effect {
     /// Interrupt an agent's turn, as Esc does in its harness's own TUI.
     StopAgent {
         agent: String,
+    },
+    /// Restart, retire (stop), start, suspend or resume an agent's seat, from its actions menu.
+    AgentControl {
+        agent: String,
+        control: AgentControl,
     },
     /// Start a new agent; its first message is what the person asked of it.
     /// Start a plain shell for the person; it opens in a new tab.
@@ -256,6 +286,8 @@ pub struct Ui {
     cache: conversation::Cache,
     editing: bool,
     confirm: Option<char>,
+    /// What an agent's actions menu will do once y confirms it.
+    pending_control: Option<(String, AgentControl)>,
     flash: Option<(String, Instant)>,
     tick: u64,
     help: bool,
@@ -379,6 +411,7 @@ impl Ui {
             cache: conversation::Cache::default(),
             editing: false,
             confirm: None,
+            pending_control: None,
             flash: None,
             tick: 0,
             help: false,
@@ -2230,9 +2263,16 @@ impl Ui {
     /// A floating card for one graph subject, with a way to go to it.
     fn draw_popover(&self, buf: &mut Buffer, area: Rect, subject: &str) {
         let width = 72.min(area.width.saturating_sub(4));
-        let inner = screens::peek(&self.world, subject, width as usize - 4, self.spinner());
+        let menu_for = subject.strip_prefix("actions:").and_then(|id| {
+            self.world.agents.items().iter().find(|agent| agent.id == id)
+        });
+        let inner = match menu_for {
+            Some(agent) => screens::agent_actions_doc(agent, width as usize - 4, self.spinner()),
+            None => screens::peek(&self.world, subject, width as usize - 4, self.spinner()),
+        };
         let mut doc = Doc::new();
         let title = match subject.split('/').next().unwrap_or("") {
+            _ if menu_for.is_some() => "actions",
             "agent" | "session" => "agent",
             "mission" => "mission",
             "attention" => "needs you",
@@ -2657,6 +2697,10 @@ impl Ui {
                 ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
                 ("end", "jump to the newest message and follow it"),
                 ("ctrl+f", "find in this conversation"),
+                (
+                    "ctrl+a",
+                    "the agent's actions: restart, suspend, retire, terminal…",
+                ),
                 ("ctrl+e", "expand or collapse tool output"),
                 (
                     "ctrl+p",
@@ -3072,6 +3116,12 @@ impl Ui {
         }
         if let Some(subject) = self.popover.clone() {
             self.popover = None;
+            if let Some(agent) = subject.strip_prefix("actions:") {
+                if let KeyCode::Char(letter) = key.code {
+                    self.agent_action(agent.to_owned(), letter);
+                }
+                return;
+            }
             match key.code {
                 KeyCode::Char('g') | KeyCode::Enter => self.open(&subject),
                 KeyCode::Char('t') if subject.starts_with("agent/") => {
@@ -4051,7 +4101,82 @@ impl Ui {
             .map(|agent| agent.name.clone())
     }
 
+    /// A key from an agent's actions menu. What changes the seat asks y first; Esc keeps it.
+    fn agent_action(&mut self, agent: String, key: char) {
+        let name = self
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|candidate| candidate.id == agent)
+            .map(|candidate| candidate.name.clone())
+            .unwrap_or_else(|| agent.trim_start_matches("agent/").to_owned());
+        let control = match key {
+            'r' => Some(AgentControl::Restart),
+            'p' => Some(AgentControl::Suspend),
+            'x' => Some(AgentControl::Retire),
+            's' => Some(AgentControl::Start),
+            'u' => Some(AgentControl::Resume),
+            _ => None,
+        };
+        match (key, control) {
+            (_, Some(control @ (AgentControl::Start | AgentControl::Resume))) => {
+                self.control_agent(agent, control, &name)
+            }
+            (_, Some(control)) => {
+                self.flash(format!(
+                    "{} {name}? y to {} · Esc keeps it",
+                    control.verb(),
+                    control.verb().to_lowercase()
+                ));
+                self.pending_control = Some((agent, control));
+                self.confirm = Some('A');
+            }
+            ('i', None) => {
+                if self.live {
+                    self.effects.push(Effect::StopAgent { agent });
+                    self.flash("Interrupting…");
+                } else {
+                    self.flash("Interrupted · demo: nothing was sent");
+                }
+            }
+            ('t', None) => {
+                self.open(&agent);
+                self.open_terminal();
+            }
+            ('d', None) => {
+                self.open(&agent);
+                self.toggle_details();
+            }
+            ('f', None) => {
+                self.open(&agent);
+                self.find_in(&agent, "");
+            }
+            ('c', None) => {
+                copy(&agent);
+                self.flash(format!("Copied {agent}"));
+            }
+            _ => {}
+        }
+    }
+
+    fn control_agent(&mut self, agent: String, control: AgentControl, name: &str) {
+        if self.live {
+            self.effects.push(Effect::AgentControl { agent, control });
+            self.flash(format!("{} {name}…", control.verb()));
+        } else {
+            self.flash(format!("{} {name} · demo: nothing was sent", control.verb()));
+        }
+    }
+
     fn act(&mut self, action: char) {
+        if action == 'A' {
+            if let Some((agent, control)) = self.pending_control.take() {
+                let name = agent.trim_start_matches("agent/").to_owned();
+                self.control_agent(agent, control, &name);
+            }
+            return;
+        }
         if action == 's' {
             // Stop the agent's turn: its harness gets Esc, as in its own TUI.
             let Some(agent) = self.selected_id().filter(|_| self.tab == 1) else {
@@ -4456,6 +4581,17 @@ impl Ui {
                     glasses.sidebar.section = section;
                     glasses.sidebar.focused = true;
                 }
+            }
+            Hit::Actions(agent) => self.popover = Some(format!("actions:{agent}")),
+            Hit::Key(key)
+                if self
+                    .popover
+                    .as_deref()
+                    .is_some_and(|subject| subject.starts_with("actions:")) =>
+            {
+                let subject = self.popover.take().unwrap_or_default();
+                let agent = subject.trim_start_matches("actions:").to_owned();
+                self.agent_action(agent, key);
             }
             Hit::Key(key) if self.popover.is_some() => {
                 let subject = self.popover.take().unwrap_or_default();
