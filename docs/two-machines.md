@@ -2,9 +2,9 @@
 
 Your machines can share one fleet: each daemon keeps a local replica of the graph and catches up when it reconnects. This connects **your own machines**; each person currently runs their own fleet.
 
-Finish [getting started](getting-started.md) on the first machine. Install Small Talk, set `person = "person/ada"`, and start its user service on the second machine too. Harnesses and their logins are needed only on machines that will run seats.
+If either machine has a populated v0.3.4 store, preserve its raw state and keys and follow the [founder signing audit](st3/founder-signing-audit.md) before installation, doctor, restart, or fleet creation/join. The v0.3.4 rehearsal found [unsigned grants](https://github.com/compoundingtech/smalltalk/issues/1228) after standalone restart. v0.3.5's source contains the prevention fix; upgrading cannot repair already-sealed unsigned history.
 
-The v0.3.4 fresh-machine rehearsal found [invalid claim-signature warnings](https://github.com/compoundingtech/smalltalk/issues/1228): a standalone restart can seal grants unsigned, and later fleet claims depend on them. For a suspected affected store, [capture a bounded read-only audit before founding, joining, doctor or restart operations](st3/founder-signing-audit.md). The prevention fix is included in v0.3.5's source, but upgrading does not repair already-sealed unsigned history; the guide preserves that distinction and the existing rehearsal's limits.
+Finish [getting started](getting-started.md) on the first machine. Install Small Talk, set `person = "person/ada"`, and start its user service on the second machine too. Harnesses and their logins are needed only on machines that will run seats.
 
 ## Join over SSH
 

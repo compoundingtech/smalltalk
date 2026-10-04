@@ -117,7 +117,7 @@ The detailed real-seat Ubuntu rehearsal used private candidates from
   IDs, bodies and signatures.
 - A preserved-unsealed v0.3.4 upgrade retained all 61 prior claim IDs/body bytes and held keys,
   verified its original grant, and finished with 97 signed/Verified claims.
-- A distinct optimized same-source candidate met the ordinary installer deadline. Earlier debug
+- A distinct optimized same-source candidate met the ordinary installer deadline. Earlier dev-profile
   candidate timeouts and partial schemas were preserved; single samples do not establish the
   cause of the timing difference.
 
