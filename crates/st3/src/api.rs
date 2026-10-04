@@ -16100,6 +16100,58 @@ agent "good" {{ workspace {:?}; command "true" }}
     }
 
     #[tokio::test]
+    async fn publication_accepts_a_step_assigned_to_an_undeclared_person() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let kdl = r#"version 2
+mission "review" state="ready" {
+  goal "Review the candidate."
+  step "review" { assigned-to "person/reviewer" }
+}"#;
+
+        let (preview, status, applied) = preview_and_apply(app, kdl).await;
+        assert_eq!(preview["blockers"], json!([]));
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(
+            store.unresolved_graph_references().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_accepts_available_work_for_a_person_and_an_existing_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let (_, status, applied) = preview_and_apply(
+            app.clone(),
+            r#"version 2
+agent "example/worker" { workspace "/tmp"; command "true" }"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        let kdl = r#"version 2
+mission "review" state="ready" {
+  goal "Review the candidate."
+  step "review" {
+    available-to "person/reviewer"
+    available-to "agent/example/worker"
+  }
+}"#;
+
+        let (preview, status, applied) = preview_and_apply(app, kdl).await;
+        assert_eq!(preview["blockers"], json!([]));
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(
+            store.unresolved_graph_references().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
     async fn publication_refuses_a_reference_that_does_not_resolve_without_a_write() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -16117,6 +16169,17 @@ mission "work" state="ready" {
         let (preview, status, error) = preview_and_apply(app.clone(), kdl).await;
         assert_eq!(preview["blockers"], json!([refusal]));
         assert_eq!(preview["warnings"], json!([]));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], "unresolved-reference");
+        assert_eq!(error["details"]["refusals"], json!([refusal]));
+        assert_eq!(store.index().unwrap(), before);
+
+        let available = kdl.replace(
+            "assigned-to \"agent/example/nobody\"",
+            "available-to \"person/reviewer\"; available-to \"agent/example/nobody\"",
+        );
+        let (preview, status, error) = preview_and_apply(app.clone(), &available).await;
+        assert_eq!(preview["blockers"], json!([refusal]));
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
         assert_eq!(error["code"], "unresolved-reference");
         assert_eq!(error["details"]["refusals"], json!([refusal]));
