@@ -139,7 +139,9 @@
           {
             label,
             prefixes,
-            flags ? [ ],
+            # These prefixes belong to st2's integration binary. Without an explicit package,
+            # Cargo also builds workspace default members and their native test dependencies.
+            flags ? [ "-p" "st2" ],
             testFlags ? [ ],
           }:
           ''
