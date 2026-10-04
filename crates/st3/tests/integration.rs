@@ -6,6 +6,7 @@
 mod action_coverage;
 mod adhoc_work;
 mod agents_restart;
+mod authored_resume;
 mod backup;
 mod binary_payloads;
 mod boot_canaries;
