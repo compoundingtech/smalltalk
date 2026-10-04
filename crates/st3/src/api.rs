@@ -9528,10 +9528,9 @@ async fn report_native_session(
             fields,
             evidence: Vec::new(),
             expected_subject: None,
-            idempotency_key: Some(format!(
-                "native-session:{subject}:{}:{}",
-                request.incarnation_id, request.session_id
-            )),
+            // Binding observations may revisit a session within one incarnation. The writer
+            // deduplicates only an unchanged current binding, not every prior use of its ID.
+            idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
     signal_changed(&state);
@@ -14121,6 +14120,67 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(body["code"], "already-suspended");
         let (_, body) = ask("/v1/agents/restart", "restart").await;
         assert_eq!(body["code"], "restart-suspended");
+    }
+
+    #[tokio::test]
+    async fn native_session_revisit_rebinds_todos_and_deduplicates_current_reports() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let subject = "agent/test/todo-seat";
+        let incarnation = "4242:2026-10-04T20:00:00.000Z";
+        let app = router(state.clone());
+        let report = |session: &str| {
+            json!({"subject": subject, "actor": subject, "incarnation_id": incarnation,
+                   "harness": "omp", "session_id": session})
+        };
+        let (status, first) = json_request(
+            app.clone(), "/v1/agents/native-session", report("native-a"),
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let (status, other) = json_request(
+            app.clone(), "/v1/agents/native-session", report("native-b"),
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{other}");
+        let (status, revisited) = json_request(
+            app.clone(), "/v1/agents/native-session", report("native-a"),
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{revisited}");
+        assert_ne!(first["id"], revisited["id"]);
+        let current = state.store.latest_claim(subject, Some("harness.session-file"))
+            .unwrap().unwrap();
+        assert_eq!(current.id, revisited["id"].as_str().unwrap());
+        let todo = state.store.append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: "harness.todo.observed".into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({
+                "harness":"omp", "session_id":"native-a", "incarnation_id":incarnation,
+                "observed_at":"2026-10-04T20:00:00Z", "source_op":"hydrate",
+                "phases":[{"name":"Current", "tasks":[{"content":"Native task", "status":"pending"}]}],
+                "totals":{"pending":1,"in_progress":0,"completed":0,"blocked":0,"abandoned":0},
+                "truncated":false
+            })).unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
+        assert_eq!(client_v0::agent_todo_value(
+            Some(&todo), Some(&current), Some(incarnation),
+        )["stale"], false);
+        let mut repeats = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let app = app.clone();
+            let request = report("native-a");
+            repeats.spawn(async move {
+                json_request(app, "/v1/agents/native-session", request).await
+            });
+        }
+        while let Some(response) = repeats.join_next().await {
+            let (status, repeated) = response.unwrap();
+            assert_eq!(status, StatusCode::OK, "{repeated}");
+            assert_eq!(repeated["id"], revisited["id"]);
+        }
+        assert_eq!(state.store.claims_for(subject, Some("harness.session-file")).unwrap().len(), 3);
     }
 
     #[test]
