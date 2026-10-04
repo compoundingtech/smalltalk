@@ -76,6 +76,26 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
             text: (*line).to_owned(),
         });
     }
+    if driver == "claude" && lines.contains(&"Login") && lines.contains(&"Esc to cancel") {
+        let opening = lines
+            .iter()
+            .any(|line| line.ends_with("Opening browser to sign in…"));
+        let browser = lines
+            .iter()
+            .find(|line| line.starts_with("Browser didn't open? Use the url below to sign in"));
+        let code_prompt = lines
+            .iter()
+            .any(|line| line.starts_with("Paste code here if prompted >"));
+        if opening || (browser.is_some() && code_prompt) {
+            return Some(BlockingScreen {
+                code: "provider-auth-expired",
+                // Never include an OAuth URL, state/challenge, or a pasted code in a diagnostic.
+                text: browser
+                    .map_or("Opening browser to sign in…", |line| *line)
+                    .into(),
+            });
+        }
+    }
     if driver == "claude"
         && lines.contains(&"Select login method:")
         && lines.iter().any(|line| {
@@ -150,6 +170,16 @@ mod tests {
             (
                 "claude",
                 include_str!("../tests/fixtures/blocking-screens/claude-login.txt"),
+                "provider-auth-expired",
+            ),
+            (
+                "claude",
+                include_str!("../tests/fixtures/blocking-screens/claude-authenticating.txt"),
+                "provider-auth-expired",
+            ),
+            (
+                "claude",
+                include_str!("../tests/fixtures/blocking-screens/claude-code-prompt.txt"),
                 "provider-auth-expired",
             ),
             (

@@ -14,3 +14,7 @@ provider, so that title alone is not evidence of a logged-out seat.
 claude-wide-footer.txt: same isolated Claude capture resized to 160 columns.
 The permissions footer and login message share a line; the previous starts-with
 matcher missed this layout. No production terminal input was sent.
+
+claude-authenticating.txt, claude-code-prompt.txt: isolated Claude /login flow,
+browser opening disabled and no credentials entered. The OAuth URL (including
+state and challenge) is replaced with https://example.invalid/oauth/authorize.

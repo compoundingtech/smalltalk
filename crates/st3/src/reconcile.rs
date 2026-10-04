@@ -32049,6 +32049,43 @@ version 2
             );
             assert!(runtime.keys.lock().unwrap().is_empty());
 
+            if driver == "claude" {
+                for login_screen in [
+                    include_str!(
+                        "../../st-drivers/tests/fixtures/blocking-screens/claude-login.txt"
+                    ),
+                    include_str!(
+                        "../../st-drivers/tests/fixtures/blocking-screens/claude-authenticating.txt"
+                    ),
+                    include_str!(
+                        "../../st-drivers/tests/fixtures/blocking-screens/claude-code-prompt.txt"
+                    ),
+                ] {
+                    runtime
+                        .screens
+                        .lock()
+                        .unwrap()
+                        .insert("node.seat".into(), login_screen.into());
+                    reconciler.reconcile_once().unwrap();
+                    assert_eq!(
+                        store
+                            .current_harness("agent/node.seat")
+                            .unwrap()
+                            .unwrap()
+                            .state,
+                        "unauthenticated"
+                    );
+                    assert_eq!(store.fault_items(None).unwrap().len(), 1);
+                    assert_eq!(
+                        store
+                            .claims_for("agent/node.seat", Some("harness.diagnostic"))
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                }
+            }
+
             // A failed read cannot clear a known prompt.
             *runtime.screen_error.lock().unwrap() = true;
             reconciler.reconcile_once().unwrap();
