@@ -857,7 +857,10 @@ pub fn run(context: Context) -> Result<()> {
                     // What st already said of the agent: its terminal is named after it, and its
                     // incarnation is the one running, so the attach needs no runtime read first.
                     let known = found.and_then(|candidate| {
-                        let name = candidate.runtime_ids.first()?.trim_start_matches("runtime/");
+                        let name = candidate
+                            .runtime_ids
+                            .first()?
+                            .trim_start_matches("runtime/");
                         candidate.incarnation_id.clone().map(|incarnation| {
                             (name.to_owned(), format!("terminal/{agent}"), incarnation)
                         })
