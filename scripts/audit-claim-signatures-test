@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Exercise stored-evidence classification and read-only failure boundaries."""
+
+import base64
+import hashlib
+import json
+import runpy
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+audit = runpy.run_path(str(Path(__file__).with_name("audit-claim-signatures")))["audit"]
+
+
+class AuditTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "claims.sqlite3"
+        self.db = sqlite3.connect(self.path)
+        self.addCleanup(self.db.close)
+        self.db.executescript("""
+            CREATE TABLE claims(id TEXT PRIMARY KEY, batch_id TEXT, kind TEXT, store_index INTEGER);
+            CREATE INDEX claims_kind ON claims(kind, store_index);
+            CREATE TABLE claim_signatures(claim_id TEXT PRIMARY KEY, signature TEXT);
+            CREATE TABLE claim_verdicts(claim_id TEXT PRIMARY KEY, verdict TEXT, reason TEXT);
+            CREATE INDEX verdict_index ON claim_verdicts(verdict);
+            CREATE TABLE replica_envelopes(batch_id TEXT, payload TEXT);
+            CREATE INDEX envelope_batch ON replica_envelopes(batch_id);
+        """)
+
+    def grant(self, index, sealed=False, stored=None, payload_signature=None, absent=False):
+        claim = str(index)
+        self.db.execute("INSERT INTO claims VALUES(?,?,'principal.key-granted',?)", (claim, claim, index))
+        if stored is not None:
+            self.db.execute("INSERT INTO claim_signatures VALUES(?,?)", (claim, json.dumps(stored)))
+        if sealed:
+            import cbor2
+            payload = {"batch": {"claims": [] if absent else [{"id": claim}]},
+                       "claim_signatures": {} if payload_signature is None else {claim: payload_signature}}
+            encoded = base64.b64encode(cbor2.dumps(payload)).decode()
+            self.db.execute("INSERT INTO replica_envelopes VALUES(?,?)", (claim, encoded))
+        self.db.commit()
+
+    @unittest.skipUnless(audit.__globals__["cbor2"], "requires optional cbor2 payload decoder")
+    def test_classifies_original_payloads_without_mutating_evidence(self):
+        good = {"signer": "person/ada", "signature": "fixture"}
+        self.grant(1, sealed=True)  # immutable unsigned delegation
+        self.grant(2)  # preserved pending delegation
+        self.grant(3, sealed=True, stored=good, payload_signature=good)
+        self.grant(4, sealed=True, stored=good)  # row cannot substitute for missing payload signature
+        self.grant(5, sealed=True, stored=good, payload_signature={"signature": "other"})
+        self.grant(6, sealed=True, stored=good, payload_signature=good, absent=True)
+        self.db.executemany("INSERT INTO claim_verdicts VALUES(?,?,?)", [
+            ("first", "invalid", "delegation fixture is unsigned"),
+            ("second", "invalid", "another invalid reason"),
+            ("third", "verified", None),
+        ])
+        self.db.commit()
+        before = hashlib.sha256(self.path.read_bytes()).digest()
+        result = audit(self.path)
+        self.assertTrue(result["complete"], result)
+        self.assertEqual((result["sealed_without_stored_signature"],
+                          result["unsealed_without_stored_signature"]), (1, 1))
+        self.assertEqual((result["cached_invalid_observed"],
+                          result["unsigned_delegation_errors_observed"]), (2, 1))
+        payload = result["sealed_payloads"]
+        self.assertEqual(payload["envelopes_checked"], 5)
+        self.assertEqual(payload["grant_signature_absent_from_payload"], 2)
+        self.assertEqual(payload["payload_signature_differs_from_stored"], 2)
+        self.assertEqual(payload["grant_absent_from_payload"], 1)
+        self.assertEqual(hashlib.sha256(self.path.read_bytes()).digest(), before)
+
+    def test_missing_database_is_not_created(self):
+        missing = self.path.with_name("missing.sqlite3")
+        self.assertFalse(audit(missing)["complete"])
+        self.assertFalse(missing.exists())
+
+    def test_row_cap_does_not_claim_complete_counts(self):
+        self.db.executemany("INSERT INTO claims VALUES(?,?,'principal.key-granted',?)",
+                            ((str(n), str(n), n) for n in range(5001)))
+        self.db.commit()
+        result = audit(self.path)
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["grant_query_truncated"])
+        self.assertEqual(result["grants_observed"], 5000)
+
+    def test_missing_decoder_is_explicit(self):
+        decoder = audit.__globals__["cbor2"]
+        try:
+            audit.__globals__["cbor2"] = None
+            self.grant(1)
+            result = audit(self.path)
+        finally:
+            audit.__globals__["cbor2"] = decoder
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["payload_decoder_available"])
+        self.assertEqual(result["unsealed_without_stored_signature"], 1)
+
+    @unittest.skipUnless(audit.__globals__["cbor2"], "requires optional cbor2 payload decoder")
+    def test_malformed_payload_is_incomplete_without_leaking_content(self):
+        self.grant(1)
+        self.db.execute("INSERT INTO replica_envelopes VALUES('1','PRIVATE malformed payload')")
+        self.db.commit()
+        result = audit(self.path)
+        self.assertFalse(result["complete"])
+        self.assertNotIn("PRIVATE", json.dumps(result))
+
+    @unittest.skipUnless(audit.__globals__["cbor2"], "requires optional cbor2 payload decoder")
+    def test_payload_byte_cap_retains_partial_result_as_incomplete(self):
+        self.grant(1, sealed=True)
+        limit = audit.__globals__["TOTAL_PAYLOAD_LIMIT"]
+        try:
+            audit.__globals__["TOTAL_PAYLOAD_LIMIT"] = 1
+            result = audit(self.path)
+        finally:
+            audit.__globals__["TOTAL_PAYLOAD_LIMIT"] = limit
+        self.assertFalse(result["complete"])
+        self.assertIn("total payload byte cap reached", result["limitations"])
+        self.assertEqual(result["grants_observed"], 1)
+        self.assertEqual(result["sealed_payloads"]["envelopes_checked"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

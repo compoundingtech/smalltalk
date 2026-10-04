@@ -36,6 +36,8 @@ pub enum Hit {
     Open(String),
     /// Show a popover card for a graph subject.
     Peek(String),
+    /// Open the actions menu for an agent.
+    Actions(String),
     /// Focus a field of a form.
     Field(usize),
     /// Revoke a paired device (after a confirmation).
