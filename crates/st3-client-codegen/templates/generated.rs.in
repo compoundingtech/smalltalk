@@ -912,6 +912,8 @@ pub struct Agent {
     /// The seat's latest suspend or resume and its phase. An older daemon omits it.
     #[serde(default)]
     pub suspension: Option<AgentSuspension>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<Value>,
 }
 /// The latest accepted harness todo observation, including its provenance and freshness.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

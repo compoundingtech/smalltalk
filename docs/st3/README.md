@@ -8,6 +8,7 @@ Use these documents for implementation details:
 - [Mission graph runtime](mission-graph-runtime.md) defines the KDL language and execution model.
 - [KDL lifecycle](kdl-lifecycle.md) defines day-to-day publication and revision workflows.
 - [Owned sets](owned-sets.md) defines complete membership publication, source ordering and retirement.
+- [Seat rollout](owned-seat-cutover.md) defines idle cutover, strict native-session continuity and source status.
 - [Free mode](kdl-lifecycle.md#free-mode): within a fleet, an agent may do anything the person who
   runs the fleet may do, as itself, until principals and grants land.
 - [Schema registry](schema.md) lists the generated public subject, resource, and claim vocabulary.

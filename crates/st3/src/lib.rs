@@ -56,6 +56,7 @@ pub(crate) mod references;
 pub mod remote_terminal;
 pub mod render;
 pub mod resource;
+pub mod rollout;
 pub mod seat_queue;
 pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.

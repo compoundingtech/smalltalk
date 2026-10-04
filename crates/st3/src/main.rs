@@ -2627,6 +2627,8 @@ enum AgentsCommand {
     Stop(AgentStopArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
     Restart(AgentRestartArgs),
+    /// Retry a published owned-seat cutover with fresh desired and incarnation fences.
+    Rollout(AgentRolloutArgs),
     /// Stop a quiet seat at a clean boundary, keeping its native session to resume.
     ///
     /// The seat must be idle, with no pending ask or unsent input, no claimed step and no
@@ -2832,6 +2834,14 @@ struct OwnedSetApplyArgs {
     expect_set: String,
     #[arg(long)]
     dry_run: bool,
+    /// Drain changed and retiring seats, then resume their native conversation.
+    #[arg(long, value_parser = ["when-idle"])]
+    rollout: Option<String>,
+    #[arg(long, default_value = "30m", requires = "rollout")]
+    rollout_deadline: String,
+    /// Interrupt busy work at the deadline; identity and session fences still apply.
+    #[arg(long, requires = "rollout")]
+    force_after_deadline: bool,
     #[arg(long = "adopt")]
     adopt: Vec<String>,
     #[arg(long)]
@@ -2899,6 +2909,14 @@ async fn run_owned_set_apply(
             sequence: args.source_sequence,
         },
         expected_set: args.expect_set,
+        rollout: args
+            .rollout
+            .map(|_| {
+                st3::graph::parse_duration(&args.rollout_deadline, true).map(|duration| {
+                    st3::rollout::Policy::when_idle(duration, args.force_after_deadline)
+                })
+            })
+            .transpose()?,
         adopt: args.adopt.into_iter().collect(),
         allow_empty: args.allow_empty,
         confirm_retire: args.confirm_retire,
@@ -3045,6 +3063,18 @@ struct AgentStopArgs {
     /// Print the exact stop KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+}
+
+#[derive(Args)]
+struct AgentRolloutArgs {
+    #[arg(value_parser = parse_agent_start_identity)]
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT", value_parser = parse_publication_actor)]
+    actor: String,
+    #[arg(long, default_value = "30m")]
+    deadline: String,
+    #[arg(long)]
+    force_after_deadline: bool,
 }
 
 #[derive(Args)]
@@ -3884,21 +3914,23 @@ fn run_driver_hook() -> ExitCode {
         return ExitCode::from(2);
     };
     let env = st3::driver_hook::ProcessEnv;
-    let run = || st3::driver_hook::run(
-        name,
-        rest,
-        &env,
-        // Unlocked: the status-line tee reads stdin itself, and a held lock would deadlock it.
-        &mut std::io::stdin(),
-        &mut |diagnostic| {
-            if let Err(error) = st3::driver_hook::post_diagnostic(&env, &diagnostic) {
-                eprintln!(
-                    "st: could not record the {} diagnostic: {error:#}",
-                    diagnostic.code
-                );
-            }
-        },
-    );
+    let run = || {
+        st3::driver_hook::run(
+            name,
+            rest,
+            &env,
+            // Unlocked: the status-line tee reads stdin itself, and a held lock would deadlock it.
+            &mut std::io::stdin(),
+            &mut |diagnostic| {
+                if let Err(error) = st3::driver_hook::post_diagnostic(&env, &diagnostic) {
+                    eprintln!(
+                        "st: could not record the {} diagnostic: {error:#}",
+                        diagnostic.code
+                    );
+                }
+            },
+        )
+    };
     let code = if name == "claude-observe" {
         st3::telemetry::hook(&env, run)
     } else {
@@ -4328,6 +4360,7 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Start(args) => Some(args.actor.as_str()),
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
             AgentsCommand::Restart(args) => Some(args.actor.as_str()),
+            AgentsCommand::Rollout(args) => Some(args.actor.as_str()),
             AgentsCommand::Suspend(args) => Some(args.actor.as_str()),
             AgentsCommand::Resume(args) => Some(args.actor.as_str()),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
@@ -4809,7 +4842,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
         kind: "daemon.started".into(),
         actor: None,
         fields: BTreeMap::from([
-            ("features".into(), serde_json::json!({"owned_sets":1})),
+            (
+                "features".into(),
+                serde_json::json!({"owned_sets":1,"seat_rollout":1}),
+            ),
             ("status".into(), Value::String("running".into())),
             ("pid".into(), Value::from(std::process::id())),
             (
@@ -9811,7 +9847,11 @@ fn normalize_member_subject(subject: &str, namespace: &str) -> String {
 /// The identity an attachment command acts as: the one named, the seat's, or the configured person.
 fn blob_actor(named: Option<String>, configured_person: Option<&str>) -> Result<String> {
     let actor = named
-        .or_else(|| std::env::var("ST_AGENT").ok().filter(|agent| !agent.is_empty()))
+        .or_else(|| {
+            std::env::var("ST_AGENT")
+                .ok()
+                .filter(|agent| !agent.is_empty())
+        })
         .or_else(|| configured_person.map(str::to_owned))
         .context("name who acts with --as, or run inside a seat or with a configured person")?;
     reject_foreign_agent_actor(&actor)?;
@@ -9842,12 +9882,7 @@ async fn upload_attachment(
     let media_type = media_type
         .map(str::to_owned)
         .or_else(|| st3::blobs::sniff_media_type(&bytes).map(str::to_owned))
-        .with_context(|| {
-            format!(
-                "{} is not a PNG, JPEG, GIF or WebP image",
-                file.display()
-            )
-        })?;
+        .with_context(|| format!("{} is not a PNG, JPEG, GIF or WebP image", file.display()))?;
     let uploaded = generated_client(endpoint, Some(actor))?
         .upload_blob(bytes, &media_type)
         .await
@@ -10614,6 +10649,27 @@ async fn run_agents(
                 Ok(())
             }
         }
+        AgentsCommand::Rollout(args) => {
+            let subject = format!("agent/{}", args.subject);
+            let client = cli_client(endpoint);
+            let status = status_for(&client, &subject).await?;
+            let current = status
+                .subjects
+                .iter()
+                .find(|item| item.subject == subject)
+                .context("no declared seat")?;
+            let incarnation = current
+                .actual
+                .as_ref()
+                .and_then(|value| value.get("incarnation_id"))
+                .and_then(Value::as_str)
+                .context("no recorded incarnation")?;
+            let response: Value = client.post("/v1/agents/rollout",&json!({"subject":subject,"actor":args.actor,
+                "expected_desired":current.desired_token,"expected_incarnation":incarnation,
+                "policy":st3::rollout::Policy::when_idle(st3::graph::parse_duration(&args.deadline,true)?,args.force_after_deadline),
+                "idempotency_key":uuid::Uuid::now_v7().to_string()})).await?;
+            return print_value(&response, json_output);
+        }
         AgentsCommand::Restart(args) => {
             let timeout = st3::graph::parse_duration(&args.timeout, false)?;
             let subject = format!("agent/{}", args.subject);
@@ -11355,6 +11411,7 @@ async fn run_agent_inspection(
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
+        | AgentsCommand::Rollout(_)
         | AgentsCommand::Restart(_)
         | AgentsCommand::Suspend(_)
         | AgentsCommand::Resume(_)
@@ -12189,6 +12246,40 @@ fn render_client_agent(
             "SUSPENSION   {} {}{session}{failure}",
             suspension.action, suspension.phase
         );
+    }
+    if let Some(rollout) = &agent.rollout {
+        let phase = rollout["phase"].as_str().unwrap_or("unknown");
+        let id = rollout["id"].as_str().unwrap_or("unknown");
+        let forced = if rollout["forced"].as_bool() == Some(true) {
+            " · forced"
+        } else {
+            ""
+        };
+        let _ = writeln!(output, "ROLLOUT      {phase}{forced} · {id}");
+        if let Some(blockers) = rollout["blocking"]
+            .as_array()
+            .filter(|items| !items.is_empty())
+        {
+            let _ = writeln!(
+                output,
+                "BLOCKERS     {}",
+                blockers
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if let Some(reason) = rollout["reason"].as_str() {
+            let _ = writeln!(output, "ROLLOUT WHY  {reason}");
+        }
+        if matches!(phase, "held" | "failed" | "blocked") {
+            let _ = writeln!(
+                output,
+                "RETRY        st agents rollout {} --as ACTOR",
+                agent.header.id
+            );
+        }
     }
     if let Some(delivery) = &agent.delivery {
         match delivery.reason.as_deref() {
@@ -14873,6 +14964,24 @@ async fn run_st2_native_driver(
     // A resumed seat relaunches its harness on the session it suspended on, or not at all. Any
     // other relaunch continues the seat's last session when the harness can, or starts anew.
     let argv = if let Some(session) = st3::native_resume::requested() {
+        if driver == "claude" {
+            let path = std::env::var_os(st3::rollout::RESUME_PATH_ENV).map(PathBuf::from);
+            if let Err(refusal) = st3::native_resume::claude_carry_transcript(
+                &session,
+                &std::env::current_dir()?,
+                st3::native_resume::claude_home().as_deref(),
+                path.as_deref(),
+            ) {
+                return Err(refuse_native_resume(
+                    client,
+                    subject,
+                    &incarnation,
+                    driver,
+                    st3::native_resume::Refusal::new("transcript-copy-failed", refusal.to_string()),
+                )
+                .await);
+            }
+        }
         match select(argv, &session)? {
             Ok(argv) => argv,
             Err(refusal) => {
@@ -16213,6 +16322,7 @@ async fn publish_harness_activity(
             Value::String(observed.blocked_on.as_str().into()),
         ),
         ("ask".into(), Value::String(observed.ask.as_str().into())),
+        ("background_jobs".into(), observed.background_jobs.map(Value::from).unwrap_or(Value::Null)),
         (
             "input_buffer".into(),
             Value::String(observed.input_buffer.as_str().into()),
@@ -17092,6 +17202,9 @@ async fn run_pi_channel(
                         state.failed_diagnostics.retain(|message| active.contains(message));
                         pushed_messages = messages;
                     },
+                    Some(st3::mailbox::Frame::Drain { operation }) => {
+                        if let Some(subscription) = &subscription { subscription.acknowledge_drain(operation); }
+                    },
                     Some(st3::mailbox::Frame::Seat { seat }) => {
                         let frame = json!({"type":"seat", "seat":seat});
                         stdout.write_all(format!("{}\n", serde_json::to_string(&frame)?).as_bytes()).await?;
@@ -17463,6 +17576,7 @@ impl PiChannelResume {
                 };
                 self.frame_sequence = self.frame_sequence.saturating_add(1);
                 self.pending.state = Some((status.to_owned(), self.frame_sequence));
+                self.pending.background_jobs = frame.get("backgroundJobs").and_then(Value::as_u64);
                 self.pending.blocked_on = frame
                     .get("blockedOn")
                     .and_then(Value::as_str)
@@ -17572,6 +17686,8 @@ struct PiFamilyReports {
     #[serde(default)]
     blocked_on: Option<String>,
     #[serde(default)]
+    background_jobs: Option<u64>,
+    #[serde(default)]
     ask: Option<String>,
     #[serde(default)]
     reason: Option<String>,
@@ -17628,6 +17744,7 @@ impl PiFamilyReports {
                                     .map(Value::String)
                                     .unwrap_or(Value::Null),
                             ),
+                            ("background_jobs".into(), self.background_jobs.map(Value::from).unwrap_or(Value::Null)),
                             ("input_buffer".into(), Value::Null),
                             ("exit".into(), Value::Null),
                         ])),
@@ -18904,6 +19021,12 @@ impl NativeMailbox {
     }
     fn accept(&mut self, frame: Option<st3::mailbox::Frame>, runtime_id: &str) -> Result<()> {
         match frame {
+            Some(st3::mailbox::Frame::Drain { operation }) => {
+                if let Some(subscription) = &self.subscription {
+                    subscription.acknowledge_drain(operation);
+                }
+                Ok(())
+            }
             Some(st3::mailbox::Frame::Seat { seat }) => {
                 if let Err(error) = update_native_title(&seat, runtime_id) {
                     eprintln!("st: could not update seat title: {error:#}");
@@ -19001,7 +19124,9 @@ impl NativeMailbox {
         }
         // Keep uncertain handoffs in the native ledger until their read acknowledgement lands.
         let mut queued: Vec<_> = self.queued.values().cloned().collect();
-        queued.sort_by(|left, right| (left.ts_ms, &left.filename).cmp(&(right.ts_ms, &right.filename)));
+        queued.sort_by(|left, right| {
+            (left.ts_ms, &left.filename).cmp(&(right.ts_ms, &right.filename))
+        });
         st_drivers::push_mailbox::replace_active(agent_dir, queued, active);
         if let Some(error) = first_error {
             return Err(error);

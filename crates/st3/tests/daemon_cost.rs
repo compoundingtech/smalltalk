@@ -234,6 +234,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
     // Writes that need a live runtime or a person's approval the generated store lacks.
     ("POST /v1/agents/rename", "renames a declared agent"),
     ("POST /v1/agents/restart", "restarts a live seat"),
+    (
+        "POST /v1/agents/rollout",
+        "requires a running source-fenced native seat",
+    ),
     ("POST /v1/agents/start", "starts a seat"),
     ("POST /v1/agents/suspend", "suspends a live seat"),
     ("POST /v1/agents/resume", "resumes a live seat"),

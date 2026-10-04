@@ -310,6 +310,15 @@ pub fn apply_all(
     desired: &[&DesiredSubject],
     host: &str,
 ) -> BTreeMap<String, Result<RenderResult>> {
+    apply_all_checked(store, desired, host, &|_| Ok(()))
+}
+
+pub(crate) fn apply_all_checked(
+    store: &Store,
+    desired: &[&DesiredSubject],
+    host: &str,
+    guard: &dyn Fn(&DesiredSubject) -> Result<()>,
+) -> BTreeMap<String, Result<RenderResult>> {
     let mut plans = BTreeMap::new();
     let mut results = BTreeMap::new();
     for subject in desired {
@@ -423,6 +432,31 @@ pub fn apply_all(
         if let Some(declaration) = desired.iter().find(|d| d.subject == subject)
             && let Err(error) = store.owned_desired_guard(declaration) {
             results.insert(subject, Err(error.into()));
+            continue;
+        }
+        if let Some(declaration) = desired.iter().find(|d| d.subject == subject) {
+            match crate::rollout::hold_render(store, declaration) {
+                Ok(true) => {
+                    results.insert(
+                        subject,
+                        Ok(RenderResult {
+                            warnings,
+                            receipts: Vec::new(),
+                        }),
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    results.insert(subject, Err(error));
+                    continue;
+                }
+            }
+        }
+        if let Some(declaration) = desired.iter().find(|d| d.subject == subject)
+            && let Err(error) = guard(declaration)
+        {
+            results.insert(subject, Err(error));
             continue;
         }
         if let Some(workspace) = native_workspaces.get(subject.as_str()) {

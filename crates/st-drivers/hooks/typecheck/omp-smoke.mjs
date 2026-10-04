@@ -59,6 +59,9 @@ process.env.ST_OMP_CHANNEL_SEQ = "1";
 const mod = await import(process.argv[2] ?? "./smoke-out/omp-channel.mjs");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");
 
+const expectedState = state => ({ type: "state", state,
+  ...(process.argv[2]?.includes("st-omp") ? { backgroundJobs: null } : {}),
+});
 const handlers = new Map();
 // Every message the extension hands to omp, with the options it chose.
 const handedOver = [];
@@ -174,8 +177,7 @@ let askStates = readFrames()
   .slice(beforeAsk);
 assert.deepStrictEqual(askStates, [
   {
-    type: "state",
-    state: "active",
+    ...expectedState("active"),
     blockedOn: "human",
     ask: "question",
     reason: "Which deployment target?",
@@ -184,7 +186,7 @@ assert.deepStrictEqual(askStates, [
 await handlers.get("tool_result")({ toolName: "ask", toolCallId: "ask-1" }, activeCtx);
 await new Promise((resolve) => setTimeout(resolve, 50));
 askStates = readFrames().filter((frame) => frame.type === "state").slice(beforeAsk);
-assert.deepStrictEqual(askStates.at(-1), { type: "state", state: "active" });
+assert.deepStrictEqual(askStates.at(-1), expectedState("active"));
 
 // Every poll is generation-fenced. New activity, an automatic continuation, and a terminal error
 // each retire an older settle poll before it can publish a stale idle frame.
@@ -201,7 +203,7 @@ settleIdle = true;
 await new Promise((resolve) => setTimeout(resolve, 250));
 assert.deepStrictEqual(
   readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
-  [{ type: "state", state: "active" }],
+  [expectedState("active")],
   "new activity must cancel the older settle poll",
 );
 
@@ -281,7 +283,7 @@ settleIdle = true;
 await new Promise((resolve) => setTimeout(resolve, 250));
 assert.deepStrictEqual(
   readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
-  [{ type: "state", state: "idle" }],
+  [expectedState("idle")],
   "native idle after a slow unwind must replace working without another turn",
 );
 
@@ -475,7 +477,7 @@ for (const modal of ["ask", "approval"]) {
   await pause(50);
   assert.deepStrictEqual(
     readFrames().filter((frame) => frame.type === "state").at(-1),
-    { type: "state", state: "idle" },
+    expectedState("idle"),
     `${modal} resolution permits a positive idle observation`,
   );
 }
@@ -532,7 +534,7 @@ const mainCtx = { ...fullCtx, agent: { kind: "main", id: "Main", name: "main", d
 const framesBeforeMain = readFrames().length;
 await handlers.get("agent_start")({}, mainCtx);
 await pause(50);
-assert.deepStrictEqual(readFrames().slice(framesBeforeMain), [{ type: "state", state: "active" }]);
+assert.deepStrictEqual(readFrames().slice(framesBeforeMain), [expectedState("active")]);
 await handlers.get("agent_end")(successfulEnd, mainCtx);
 fs.rmSync(outboxPath, { force: true });
 
@@ -724,6 +726,24 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
   assert.deepStrictEqual(todos().at(-1).totals, totals());
   assert.strictEqual(todos().at(-1).truncated, false);
   await handlers.get("session_shutdown")({}, todoCtx);
+}
+
+// An idle model turn does not prove that the native session owns no jobs.
+if (process.argv[2]?.includes("st-omp")) {
+  let jobs = [{ id: "bg-fixture" }];
+  const jobCtx = { ...fullCtx, getAsyncJobSnapshot: () => ({ running: jobs }) };
+  await handlers.get("session_start")({}, jobCtx);
+  await handlers.get("agent_end")({}, jobCtx);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.ok(readFrames().some(frame => frame.type === "state" && frame.state === "idle" && frame.backgroundJobs === 1));
+  jobs = [];
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  assert.strictEqual(readFrames().filter(frame => frame.type === "state").at(-1).backgroundJobs, 0);
+  const unknownCtx = { ...fullCtx, getAsyncJobSnapshot: () => { throw new Error("unavailable"); } };
+  await handlers.get("agent_end")({}, unknownCtx);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.strictEqual(readFrames().filter(frame => frame.type === "state").at(-1).backgroundJobs, null);
+  await handlers.get("session_shutdown")({}, unknownCtx);
 }
 
 // `session_shutdown` has no reason field upstream and always denotes process exit. Closing must

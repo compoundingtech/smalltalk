@@ -123,6 +123,7 @@ async fn request(daemon: &Daemon, sequence: u64, kdl: String) -> Request {
             source_name: None,
         },
         options: Options {
+            rollout: None,
             set: "garden".into(),
             source: Source {
                 repository: "acme/garden".into(),

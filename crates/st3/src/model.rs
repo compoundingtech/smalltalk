@@ -161,7 +161,7 @@ impl MemberSpec {
 
 /// A launch without the arguments st puts right after a typed harness's program, past the
 /// wrapper's `--`: its channel and its hook settings, which follow st's build, not the author.
-fn authored_launch(launch: &LaunchSpec) -> Vec<&str> {
+pub(crate) fn authored_launch(launch: &LaunchSpec) -> Vec<&str> {
     let argv = match launch {
         LaunchSpec::Shell(source) => return vec![source.as_str()],
         LaunchSpec::Argv(argv) => argv,
