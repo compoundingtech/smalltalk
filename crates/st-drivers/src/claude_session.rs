@@ -1359,11 +1359,16 @@ fn observe_payload(
         .or_else(|| wrapperless_token(&payload))
         .unwrap_or_else(|| format!("unattributed:{}", runtime_id.unwrap_or(identity)));
     let mut timeline =
-        crate::harness_timeline::Writer::new(agent_dir, "claude", timeline_incarnation);
+        crate::harness_timeline::Writer::new(agent_dir, "claude", timeline_incarnation.clone());
     if let Err(error) = crate::harness_timeline::observe_claude(&mut timeline, event, &payload) {
         // Timeline observability is fail-open just like state/context publication: a record fault
         // must not hold up the hook process Claude is waiting on.
         tracing::warn!("st claude-observe: harness-timeline write failed: {error:#}");
+    }
+    if let Err(error) =
+        crate::harness_tasks::observe_claude(agent_dir, event, &payload, &timeline_incarnation)
+    {
+        tracing::warn!("st claude-observe: harness-todo write failed: {error:#}");
     }
     // The seat's driver records each subagent from this ledger. Fail-open like the timeline.
     if let Err(error) = crate::subagents::observe_claude(agent_dir, event, &payload) {

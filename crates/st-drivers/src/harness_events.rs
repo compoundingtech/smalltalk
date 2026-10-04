@@ -256,7 +256,7 @@ fn current_token(connection: &Connection) -> Result<Option<String>> {
 
 pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     anyhow::ensure!(
-        matches!(kind, "harness-state" | "harness-context" | "harness-todo"),
+        matches!(kind, "harness-state" | "harness-context" | "harness-todo" | "harness-plan"),
         "unsupported observation kind"
     );
     let value: Value = serde_json::from_slice(body)?;
@@ -280,7 +280,7 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     }
     // Context writers used to have no ownership fence. Refuse a delayed predecessor now that
     // its snapshot and event are admitted in the same transaction as the ownership check.
-    if matches!(kind, "harness-context" | "harness-todo") {
+    if matches!(kind, "harness-context" | "harness-todo" | "harness-plan") {
         anyhow::ensure!(
             current_token(&tx)?.as_deref() == value["incarnation"].as_str(),
             "harness observation owner was superseded"
