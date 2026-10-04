@@ -206,10 +206,10 @@ The collection WebSocket accepts a W3C `traceparent` URL query parameter (and su
 commands may supply their own `traceparent`) to correlate gateway delivery with browser
 traces. A retryable first collection read retains its trace parent until delivery completes
 or the subscription ends. Terminal viewers opened by a collection subscription end on
-unsubscribe or socket closure; closing one viewer does not end the shared terminal or revoke
-an attachment lease used by another browser viewer. The gateway explicitly detaches a
-projected-screen lease when its last active browser viewer closes. Local Unix clients keep
-the lease until explicit detach or expiry.
+unsubscribe or socket closure; closing a viewer does not end the shared terminal or revoke
+its projected-screen attachment. All transports, including paired native and browser clients,
+keep the reusable lease until explicit `terminal.detach`, expiry, or runtime incarnation change.
+Raw-terminal capabilities remain single-use and their viewer guard detaches them on closure.
 
 Each collection socket holds up to 64 subscriptions by default. Set the top-level
 `client_subscription_limit` in `config.toml` to a positive integer to change the limit.

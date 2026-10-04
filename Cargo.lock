@@ -4585,7 +4585,6 @@ dependencies = [
  "libghostty-vt-sys",
  "lol_html",
  "notify",
- "parking_lot",
  "portable-pty",
  "predicates",
  "proptest",
