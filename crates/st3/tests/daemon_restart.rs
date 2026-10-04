@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use st3::api::AppState;
-use st3::model::{ClaimInput, IntentInput};
+use st3::model::ClaimInput;
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
@@ -787,17 +787,19 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             let graph = root.join("graph.db");
             let mut daemon = Daemon::new(root);
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
-            let source = "version 2\nagent \"receipt-worker\" { workspace \"/tmp\"; command \"true\"; }\n";
-            let intent = st3::graph::parse_test_intent(source, "restart-node").unwrap();
-            let plan = daemon.store.mission(&intent, IntentInput {
-                kdl: source.into(), source_name: None,
-            }).unwrap();
-            daemon.store.apply(&intent, &plan.subject_tokens, "receipt-seat").unwrap();
             daemon.observe_running(seat, "same-incarnation");
             daemon.start_with_binding(true).await;
 
             let socket = daemon.socket.clone();
-            let open_channel = || {
+            daemon.send("message/ready-probe", seat, "READINESS PROBE");
+            for lifecycle in ["delivered", "read", "closed"] {
+                daemon.store.append_claim(&ClaimInput {
+                    subject: "message/ready-probe".into(), kind: format!("message.{lifecycle}"),
+                    actor: Some(seat.into()), fields: BTreeMap::from([("status".into(), json!(lifecycle))]),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }
+            let open_channel = || async {
                 let mut channel = seat_command(root, &socket)
                     .env("ST_AGENT", seat)
                     .env("ST3_MAILBOX_TRANSPORT", transport)
@@ -829,19 +831,23 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
                     received.recv_timeout(Duration::from_secs(10)).unwrap()["type"],
                     "hello"
                 );
-                if transport == "push" {
-                    // The seat frame proves the push stream has established its live boundary.
-                    loop {
-                        if received.recv_timeout(Duration::from_secs(10)).unwrap()["type"] == "seat" {
-                            break;
-                        }
-                    }
-                }
                 writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
                 input.flush().unwrap();
+                let client = st3::client::Client::new(st3::client::Endpoint::Unix(socket.clone()));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let status: Value = client.get("/v1/messages/delivery/ready-probe").await.unwrap();
+                    let delivery = &status["delivery"]["recipient_delivery"];
+                    let ready = matches!(delivery["state"].as_str(), Some("current" | "outdated" | "legacy"));
+                    let own_pid = delivery["state"] == "current" || delivery["reason"].as_str()
+                        .is_some_and(|reason| reason.contains(&format!("pid {}", channel.id())));
+                    if ready && own_pid { break; }
+                    assert!(Instant::now() < deadline, "{driver}/{transport}: channel not ready: {status}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 (channel, input, received)
             };
-            let (channel, mut input, received) = open_channel();
+            let (channel, mut input, received) = open_channel().await;
             daemon.send("message/consumed", seat, "CONSUMED SIGNAL");
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
@@ -884,7 +890,7 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             daemon.stop().await;
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
             daemon.start_with_binding(true).await;
-            let (channel, _input, received) = open_channel();
+            let (channel, _input, received) = open_channel().await;
             daemon.send("message/unread", seat, "UNREAD SIGNAL");
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut offered = Vec::new();
