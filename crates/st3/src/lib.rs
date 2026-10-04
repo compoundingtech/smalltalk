@@ -66,6 +66,8 @@ pub mod subagents;
 /// Suspends a quiet seat and resumes its own native session.
 pub mod suspension;
 pub mod telemetry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;
 

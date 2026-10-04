@@ -4430,6 +4430,7 @@ dependencies = [
  "smallclaims",
  "st-drivers",
  "st-runtime",
+ "st3",
  "st3-client",
  "st3-conversation-ui",
  "st3-schema",

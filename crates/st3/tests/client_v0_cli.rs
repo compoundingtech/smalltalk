@@ -38,11 +38,11 @@ async fn run_cli_human(socket: &Path, args: &[&str]) -> Output {
 }
 
 async fn run_cli_mode(socket: &Path, json: bool, args: &[&str]) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        let mut command = std::process::Command::new(binary);
+        let mut command = st3::test_support::command(binary);
         // These are operator commands. A harness running the suite must not lend its own seat
         // identity, which scopes `work ls` and fences agent actors.
         command
@@ -60,12 +60,12 @@ async fn run_cli_mode(socket: &Path, json: bool, args: &[&str]) -> Output {
 }
 
 async fn run_cli_with_agent_env(socket: &Path, agent: &str, args: &[&str]) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let agent = agent.to_owned();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new(binary)
+        st3::test_support::command(binary)
             .arg("--endpoint")
             .arg(socket)
             .arg("--json")
@@ -392,7 +392,7 @@ async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance(
             .unwrap()
             .iter()
             .any(
-                |row| row["client"].as_str().unwrap().contains("st3 missions")
+                |row| row["client"].as_str().unwrap().contains("st3-fixture missions")
                     && row["count"].as_u64().unwrap() > 0
             ),
         "{report:#}"
@@ -477,7 +477,7 @@ async fn agent_declaration_cli_redacts_environment_unless_explicitly_requested()
 
 #[test]
 fn service_permissions_honors_global_json_flag() {
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .args(["--json", "service", "permissions"])
         .output()
         .unwrap();
@@ -1463,12 +1463,12 @@ mission "cli/child" state="ready" {
 }
 
 async fn run_queue_cli(socket: &Path, config_home: &Path, json: bool, args: &[&str]) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let config_home = config_home.to_path_buf();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        let mut command = std::process::Command::new(binary);
+        let mut command = st3::test_support::command(binary);
         // Queue operator commands use the fixture's person, not the invoking harness seat.
         command
             .env_remove("ST_AGENT")
@@ -2086,13 +2086,13 @@ async fn run_lane_cli(
     json: bool,
     args: &[&str],
 ) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let config_home = config_home.to_path_buf();
     let agent = agent.map(str::to_owned);
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        let mut command = std::process::Command::new(binary);
+        let mut command = st3::test_support::command(binary);
         command
             .env_remove("ST_AGENT")
             .env_remove("ST_MISSION_RUN")
@@ -2483,7 +2483,7 @@ mission "example/merge-train" state="ready" {
 #[test]
 fn help_starts_with_examples_and_keeps_plumbing_reachable() {
     let help = |args: &[&str]| {
-        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
             .args(args)
             .output()
             .unwrap();
@@ -2522,7 +2522,7 @@ fn help_starts_with_examples_and_keeps_plumbing_reachable() {
         nested.insert(1, "help");
         assert_eq!(help(&flag), help(&nested));
     }
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
         .args(["help", "missing-command"])
         .output()
         .unwrap();

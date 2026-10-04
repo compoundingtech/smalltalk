@@ -11,7 +11,7 @@ mod process;
 mod pty;
 
 pub use environment::{
-    ShellStartupTimeout, expand_path_placeholder, is_shell_startup_timeout, login_environment,
+    ShellStartupTimeout, expand_path_placeholder, is_shell_startup_timeout, login_environment, login_environment_from,
     login_environment_within, materialize_environment, overlay_environment, resolve_executable,
 };
 pub use isolate::{

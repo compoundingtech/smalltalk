@@ -17531,7 +17531,7 @@ mission "feedback-review" state="ready" {
     fn a_repository_owned_st3_directory_is_kept_and_the_agent_starts() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
@@ -17542,7 +17542,7 @@ mission "feedback-review" state="ready" {
             "repository-owned boot text\n",
         )
         .unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["add", ".st3/boot.md"])
             .current_dir(workspace.path())
             .status()
@@ -17578,14 +17578,14 @@ mission "feedback-review" state="ready" {
     fn a_failed_render_isolated_from_healthy_members_and_clears_on_recovery() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
             .unwrap();
         fs::create_dir(workspace.path().join(".claude")).unwrap();
         fs::write(workspace.path().join(".claude/settings.local.json"), "{}\n").unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["add", ".claude/settings.local.json"])
             .current_dir(workspace.path())
             .status()
@@ -17659,14 +17659,14 @@ agent "bad" {{ workspace {:?}; command "true" }}
     fn a_running_seat_whose_render_fails_is_still_watched_and_woken_but_never_restarted() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
             .unwrap();
         fs::create_dir(workspace.path().join(".claude")).unwrap();
         fs::write(workspace.path().join(".claude/settings.local.json"), "{}\n").unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["add", ".claude/settings.local.json"])
             .current_dir(workspace.path())
             .status()
@@ -17768,7 +17768,7 @@ mission "task" state="ready" {{
     fn a_render_conflict_faults_only_the_member_that_would_change_the_file() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
+        crate::test_support::git()
             .args(["init", "-q"])
             .current_dir(workspace.path())
             .status()
@@ -22845,7 +22845,7 @@ mission "orchid/timeout" state="ready" timeout="1ms" {
         })
         .await
         .expect("the worker did not start");
-        let branch = std::process::Command::new("git")
+        let branch = crate::test_support::git()
             .arg("-C")
             .arg(&workspace)
             .args(["branch", "--show-current"])
