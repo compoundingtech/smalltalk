@@ -1,77 +1,109 @@
-import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
-import { commonSetupSteps, linuxStageJob, linuxStageRunner, perfStoresCache } from './workspace-ci.ts'
+import { defaultActionlintConfig, githubWorkflow, nixDevelopStep, plainFlakeSetupSteps } from '../../repos/effect-utils/genie/external.ts'
+import { buildEnv, linuxStageRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
 
-const baseline = '${{ runner.temp }}/perf-baseline'
 const onMain = "success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'"
+const paths = [
+  'crates/smallclaims/**',
+  'crates/st3/src/**',
+  'crates/st3/tests/daemon_*.rs',
+  'crates/st3/tests/perf_load.rs',
+  'crates/st3/Cargo.toml',
+  'Cargo.toml',
+  'Cargo.lock',
+  '.cargo/config.toml',
+  'flake.nix',
+  'flake.lock',
+  'docs/st3/schema.md',
+  'scripts/ci-perf*',
+  'scripts/ci-nix-cache',
+  '.github/workflows/perf.yml',
+]
 
-// The load test is as long as linux-tests when its caches are warm and twice as long when its
-// stores must generate, so it runs nightly on main and on pull requests that change the daemon or
-// the store, never in Workspace CI (docs/ci.md, Performance gate).
+// Performance always stays on Namespace. Main's successful runs seed durable snapshots and
+// real baseline reports; PRs read them without adding branch copies to the dependency-cache pool.
 export default githubWorkflow({
   name: 'Performance',
   on: {
+    push: { branches: ['main'], paths },
     schedule: [{ cron: '23 2 * * *' }],
-    pull_request: {
-      paths: [
-        'crates/smallclaims/**',
-        'crates/st3/src/**',
-        'crates/st3/tests/daemon_*.rs',
-        'crates/st3/Cargo.toml',
-        'Cargo.toml',
-        'Cargo.lock',
-        'scripts/ci-perf',
-        '.github/workflows/perf.yml',
-      ],
-    },
+    pull_request: { paths },
     workflow_dispatch: {},
   },
-  permissions: { contents: 'read' },
+  permissions: { contents: 'read', actions: 'read' },
   concurrency: {
     group: 'perf-${{ github.event.pull_request.number || github.run_id }}',
     'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
   },
-  // actionlint must know the Namespace shape label the job uses.
   actionlint: {
     ...defaultActionlintConfig,
     selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
   },
   jobs: {
-    // A production-sized generated store under a busy host's request mix, compared with the worst
-    // of main's last five reports. Main's successful runs add theirs.
-    'perf-load': linuxStageJob({
+    'perf-load': {
       name: 'perf-load',
-      stage: 'load',
-      setup: commonSetupSteps,
-      description: 'Run the load test',
-      command: ['bash', 'scripts/ci-perf', 'load'],
-      extraLogs: '${{ runner.temp }}/perf/',
-      before: [
-        perfStoresCache('load'),
+      'runs-on': linuxStageRunner,
+      'timeout-minutes': 30,
+      defaults: { run: { shell: 'bash' } },
+      env: buildEnv,
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
         {
-          name: "Restore main's load test reports",
-          uses: 'actions/cache/restore@v4',
-          with: {
-            path: baseline,
-            key: 'perf-load-baseline-${{ github.run_id }}',
-            'restore-keys': 'perf-load-baseline-',
+          name: 'Name compatible snapshot recipes',
+          env: {
+            PERF_BUILD_SNAPSHOT: "perf-load-build-v1-${{ hashFiles('Cargo.lock', 'flake.lock', 'flake.nix', 'Cargo.toml', 'crates/st3/Cargo.toml', '.cargo/config.toml') }}",
+            PERF_STORES_SNAPSHOT: "perf-load-stores-v1-${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}",
           },
-        },
-      ],
-      after: [
-        {
-          name: "Keep this report among main's last five",
-          if: onMain,
-          run: `mkdir -p "${baseline}"
-cp "$RUNNER_TEMP/perf/load.json" "${baseline}/load-\${{ github.run_id }}.json"
-ls -1 "${baseline}"/load-*.json | sort -V -r | tail -n +6 | xargs -r rm --`,
+          run: 'printf "PERF_BUILD_SNAPSHOT=%s\\nPERF_STORES_SNAPSHOT=%s\\n" "$PERF_BUILD_SNAPSHOT" "$PERF_STORES_SNAPSHOT" >> "$GITHUB_ENV"',
         },
         {
-          name: 'Save the reports',
+          name: 'Restore main build, Nix, stores and baseline snapshots',
+          env: { GH_TOKEN: '${{ github.token }}' },
+          run: 'python3 scripts/ci-perf-cache restore',
+        },
+        ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+        {
+          name: 'Isolate test state and keep the compiler cache',
+          run: `home="$RUNNER_TEMP/test-home"
+mkdir -p "$home"/{.config,.cache,.local/state} "$RUNNER_TEMP/cargo-home"/{registry,git} "$RUNNER_TEMP/perf-sccache"
+printf 'CARGO_HOME=%s\\nCI_CACHE_DIR=%s\\nSCCACHE_DIR=%s\\nSCCACHE_CACHE_SIZE=1G\\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" "$RUNNER_TEMP/perf-sccache" >> "$GITHUB_ENV"
+printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_STATE_HOME=%s/.local/state\\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"`,
+        },
+        { name: 'Use the cached Nix outputs', run: 'bash scripts/ci-nix-cache use' },
+        {
+          name: 'Prepare fast scratch space for a new store recipe',
+          // The generator already prefers RAM when enough is available. Its source stores are
+          // copied to RUNNER_TEMP before measuring: measurements still use the normal disk.
+          run: 'if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi',
+        },
+        nixDevelopStep({ name: 'Run the release load test', flake: '.#perf', command: ['bash', 'scripts/ci-perf', 'load'] }),
+        {
+          name: 'Save main build and Nix snapshots',
           if: onMain,
-          uses: 'actions/cache/save@v4',
-          with: { path: baseline, key: 'perf-load-baseline-${{ github.run_id }}' },
+          run: `nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
+nix develop .#perf -c sccache --show-stats
+nix develop .#perf -c sccache --stop-server
+CI_PERF_SHELL_ROOT="$RUNNER_TEMP/perf-shell" bash scripts/ci-nix-cache save
+python3 scripts/ci-perf-cache pack`,
+        },
+        {
+          name: 'Retain the main build and Nix cache',
+          if: onMain,
+          uses: 'actions/upload-artifact@v4',
+          with: { name: '${{ env.PERF_BUILD_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/build.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error' },
+        },
+        {
+          name: 'Retain the main generated stores',
+          if: onMain,
+          uses: 'actions/upload-artifact@v4',
+          with: { name: '${{ env.PERF_STORES_SNAPSHOT }}', path: '${{ runner.temp }}/perf-snapshots/stores.tar.zst', 'compression-level': 0, 'retention-days': 7, 'if-no-files-found': 'error' },
+        },
+        {
+          name: 'Retain the load report, log and timing',
+          uses: 'actions/upload-artifact@v4',
+          if: 'always()',
+          with: { name: 'perf-load-logs', path: '${{ runner.temp }}/perf/', 'retention-days': 30, 'if-no-files-found': 'ignore' },
         },
       ],
-    }),
+    },
   },
 })

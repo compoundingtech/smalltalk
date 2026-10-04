@@ -147,7 +147,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       runsOn: linuxRunsOn,
       'timeout-minutes': 20,
       nix: { binaryCaches: readOnlyBinaryCaches },
-      step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && genie --check'] }),
+      step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && genie --check'] }),
     }),
     // Check the shared client and its iOS consumer before merge.
     'typescript-client': {

@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Main provenance, workload validation, snapshot layout and required PR baseline."""
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader('ci_perf_cache', str(root / 'scripts/ci-perf-cache'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+run = dict(id=1, head_branch='main', conclusion='success', event='schedule', path='.github/workflows/perf.yml')
+report = dict(scale=1, claims=1000, seconds=135, daemon_cores=1, long_poll_seats=30,
+              failed={}, paths={'mail': dict(count=100, p50_ms=1, p99_ms=2, max_ms=3, budget_ms=100)})
+assert module.trusted(run)
+for field, value in [('head_branch', 'example-branch'), ('conclusion', 'failure'),
+                     ('event', 'pull_request'), ('path', '.github/workflows/fleet.yml')]:
+    assert not module.trusted(dict(run, **{field: value}))
+assert module.valid_report(report)
+for field, value in [('scale', 0.1), ('claims', 0), ('seconds', 5), ('long_poll_seats', 1), ('paths', {})]:
+    assert not module.valid_report(dict(report, **{field: value}))
+
+with tempfile.TemporaryDirectory() as tmp:
+    temp = Path(tmp)
+    work = temp / 'work'
+    work.mkdir()
+    os.environ.update(GITHUB_REPOSITORY='example/project', GITHUB_EVENT_NAME='pull_request',
+                      GITHUB_WORKSPACE=str(work), RUNNER_TEMP=str(temp),
+                      GITHUB_STEP_SUMMARY=str(temp / 'summary'),
+                      PERF_BUILD_SNAPSHOT='build-recipe', PERF_STORES_SNAPSHOT='stores-recipe')
+    # Exercise real archives: both workspace outputs and temp caches survive a round trip.
+    for name in ('cargo-home/registry', 'cargo-home/git', 'perf-sccache', 'st-ci-cache', 'st-bench'):
+        directory = temp / name
+        directory.mkdir(parents=True)
+        (directory / 'sample').write_text(name)
+    (work / 'target').mkdir()
+    (work / 'target/sample').write_text('build output')
+    module.pack()
+    extracted = temp / 'extracted'
+    extracted.mkdir()
+    module.unpack(temp / 'perf-snapshots/build.tar.zst', extracted,
+                  ('target', 'cargo-home', 'perf-sccache', 'st-ci-cache'))
+    module.unpack(temp / 'perf-snapshots/stores.tar.zst', extracted, ('st-bench',))
+    assert (extracted / 'target/sample').read_text() == 'build output'
+    assert (extracted / 'st-bench/sample').read_text() == 'st-bench'
+    # API ordering includes untrusted entries: none may supply caches or a baseline.
+    runs = [dict(run, id=9, event='pull_request')] + [dict(run, id=i) for i in range(8, 0, -1)]
+    downloads = []
+
+    def api(path):
+        if '/workflows/' in path:
+            return dict(workflow_runs=runs)
+        assert '/runs/9/' not in path
+        return dict(artifacts=[dict(name=name, expired=False) for name in
+                              ('build-recipe', 'stores-recipe', 'perf-load-logs')])
+
+    def download(repo, selected, name, dest):
+        assert repo == 'example/project' and module.trusted(selected)
+        downloads.append((selected['id'], name))
+        dest.mkdir(parents=True)
+        if name == 'perf-load-logs':
+            (dest / 'load.json').write_text(json.dumps(report))
+
+    def unpack(archive, destination, names):
+        for name in names:
+            (destination / name).mkdir()
+            (destination / name / 'cached').write_text('snapshot')
+
+    module.api, module.download, original_unpack = api, download, module.unpack
+    module.unpack = unpack
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.restore()
+    assert len(downloads) == 7  # two snapshots, five newest real reports
+    assert sorted(p.name for p in (temp / 'perf-baseline').iterdir()) == [f'load-{i}.json' for i in range(4, 9)]
+    assert (work / 'target/cached').read_text() == 'snapshot'
+    assert (temp / 'st-ci-cache/cached').exists() and (temp / 'st-bench/cached').exists()
+    runs.clear()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.restore()
+    except ValueError as error:
+        assert 'every PR requires' in str(error)
+    else:
+        raise AssertionError('PR without a real main baseline must fail')
+    assert list((temp / 'perf-baseline').iterdir()) == []
+
+    # Validate archive roots before extraction, including traversal and absolute paths.
+    module.unpack = original_unpack
+    def output(cmd, text):
+        assert cmd[:3] == ['tar', '--zstd', '-tf']
+        return bad
+    module.subprocess.check_output = output
+    for bad in ('/target/file', 'target/../file', 'other/file'):
+        try:
+            module.unpack(temp / 'build.tar.zst', temp, ('target',))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('unexpected archive root accepted')
+
+print('Performance cache tests passed: trusted main, five real reports, PR baseline required, snapshot paths')

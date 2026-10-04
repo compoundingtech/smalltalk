@@ -4,6 +4,23 @@
 name: Performance
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - crates/smallclaims/**
+      - crates/st3/src/**
+      - crates/st3/tests/daemon_*.rs
+      - crates/st3/tests/perf_load.rs
+      - crates/st3/Cargo.toml
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/config.toml
+      - flake.nix
+      - flake.lock
+      - docs/st3/schema.md
+      - scripts/ci-perf*
+      - scripts/ci-nix-cache
+      - .github/workflows/perf.yml
   schedule:
     - cron: 23 2 * * *
   pull_request:
@@ -11,15 +28,22 @@ on:
       - crates/smallclaims/**
       - crates/st3/src/**
       - crates/st3/tests/daemon_*.rs
+      - crates/st3/tests/perf_load.rs
       - crates/st3/Cargo.toml
       - Cargo.toml
       - Cargo.lock
-      - scripts/ci-perf
+      - .cargo/config.toml
+      - flake.nix
+      - flake.lock
+      - docs/st3/schema.md
+      - scripts/ci-perf*
+      - scripts/ci-nix-cache
       - .github/workflows/perf.yml
   workflow_dispatch: {}
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: "perf-${{ github.event.pull_request.number || github.run_id }}"
@@ -29,7 +53,7 @@ jobs:
   perf-load:
     name: perf-load
     runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
-    timeout-minutes: 120
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
@@ -42,27 +66,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Use the runner's own caches
-        run: 'if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi'
-      - name: Restore the Cargo target and registry
-        id: cargo-cache
-        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ github.workspace }}/target
-            ${{ runner.temp }}/cargo-home/registry
-            ${{ runner.temp }}/cargo-home/git
-          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
-          restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
-      - name: Restore the local Nix cache
-        id: nix-cache
-        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
-        uses: actions/cache@v4
-        with:
-          path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
-          restore-keys: "nix4-${{ github.job }}-${{ runner.os }}-"
+      - name: Name compatible snapshot recipes
+        env:
+          PERF_BUILD_SNAPSHOT: "perf-load-build-v1-${{ hashFiles('Cargo.lock', 'flake.lock', 'flake.nix', 'Cargo.toml', 'crates/st3/Cargo.toml', '.cargo/config.toml') }}"
+          PERF_STORES_SNAPSHOT: "perf-load-stores-v1-${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}"
+        run: printf "PERF_BUILD_SNAPSHOT=%s\nPERF_STORES_SNAPSHOT=%s\n" "$PERF_BUILD_SNAPSHOT" "$PERF_STORES_SNAPSHOT" >> "$GITHUB_ENV"
+      - name: Restore main build, Nix, stores and baseline snapshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-perf-cache restore
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -75,54 +87,50 @@ jobs:
             extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
             access-tokens = github.com=${{ github.token }}
           summarize: true
-      - name: Isolate test home and XDG state
+      - name: Isolate test state and keep the compiler cache
         run: |
-          # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
-          # and actions/cache expands a leading tilde against the HOME of the step that runs it.
-          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
-          mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+          mkdir -p "$home"/{.config,.cache,.local/state} "$RUNNER_TEMP/cargo-home"/{registry,git} "$RUNNER_TEMP/perf-sccache"
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\nSCCACHE_DIR=%s\nSCCACHE_CACHE_SIZE=1G\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" "$RUNNER_TEMP/perf-sccache" >> "$GITHUB_ENV"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
       - name: Use the cached Nix outputs
-        if: runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'
-        run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
-      - name: Summarize tested revision
-        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
-      - name: Restore the generated stores
-        uses: actions/cache@v4
-        with:
-          path: "${{ runner.temp }}/st-bench"
-          key: "perf-load-stores-${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}"
-      - name: Restore main's load test reports
-        uses: actions/cache/restore@v4
-        with:
-          path: "${{ runner.temp }}/perf-baseline"
-          key: "perf-load-baseline-${{ github.run_id }}"
-          restore-keys: perf-load-baseline-
-      - name: Run the load test
+        run: bash scripts/ci-nix-cache use
+      - name: Prepare fast scratch space for a new store recipe
+        run: if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi
+      - name: Run the release load test
         shell: bash
-        run: nix develop -c bash scripts/ci-perf load
-      - name: Keep this report among main's last five
+        run: "nix develop '.#perf' -c bash scripts/ci-perf load"
+      - name: Save main build and Nix snapshots
         if: success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: |
-          mkdir -p "${{ runner.temp }}/perf-baseline"
-          cp "$RUNNER_TEMP/perf/load.json" "${{ runner.temp }}/perf-baseline/load-${{ github.run_id }}.json"
-          ls -1 "${{ runner.temp }}/perf-baseline"/load-*.json | sort -V -r | tail -n +6 | xargs -r rm --
-      - name: Save the reports
+          nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
+          nix develop .#perf -c sccache --show-stats
+          nix develop .#perf -c sccache --stop-server
+          CI_PERF_SHELL_ROOT="$RUNNER_TEMP/perf-shell" bash scripts/ci-nix-cache save
+          python3 scripts/ci-perf-cache pack
+      - name: Retain the main build and Nix cache
         if: success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        uses: actions/cache/save@v4
+        uses: actions/upload-artifact@v4
         with:
-          path: "${{ runner.temp }}/perf-baseline"
-          key: "perf-load-baseline-${{ github.run_id }}"
-      - name: Save Nix outputs to the local Nix cache
-        if: success()
-        run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
-      - name: Retain stage logs and timings
+          name: ${{ env.PERF_BUILD_SNAPSHOT }}
+          path: "${{ runner.temp }}/perf-snapshots/build.tar.zst"
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain the main generated stores
+        if: success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PERF_STORES_SNAPSHOT }}
+          path: "${{ runner.temp }}/perf-snapshots/stores.tar.zst"
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain the load report, log and timing
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: perf-load-logs
-          path: |
-            ${{ runner.temp }}/ci-logs/
-            ${{ runner.temp }}/perf/
+          path: "${{ runner.temp }}/perf/"
+          retention-days: 30
           if-no-files-found: ignore
