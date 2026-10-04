@@ -5,7 +5,7 @@ import type {
     ResourcesFilter, ResourcesPage,
     SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
-    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
+    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TerminalInputData, TimelinePage,
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };

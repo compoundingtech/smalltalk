@@ -218,7 +218,7 @@ impl CollectionStream {
         self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status})).await
     }
     /// Follow a terminal on this socket. `terminal.attach` returns the incarnation and the
-    /// single-use capability; screens then arrive as [`CollectionEvent::Screen`], the latest
+    /// reusable projected-screen lease; screens then arrive as [`CollectionEvent::Screen`], the latest
     /// only, and a `stale-fence` error ends only this subscription.
     pub async fn subscribe_terminal(
         &mut self,
@@ -240,6 +240,25 @@ impl CollectionStream {
     }
     pub async fn unsubscribe(&mut self, id: &str) -> Result<(), ClientError> {
         self.send(&serde_json::json!({"kind":"unsubscribe", "id":id}))
+            .await
+    }
+    /// Open connection-local input on a held terminal follow. Reconnect never rearms input.
+    pub async fn open_input(&mut self, id: &str, follow: &str) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"input-open", "id":id, "follow":follow}))
+            .await
+    }
+    /// Send fresh bytes at the next sequence; never replay an uncertain batch after reconnect.
+    pub async fn send_input(
+        &mut self,
+        id: &str,
+        seq: u64,
+        data: &TerminalInputData,
+    ) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"input", "id":id, "seq":seq, "data":data}))
+            .await
+    }
+    pub async fn close_input(&mut self, id: &str) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"input-close", "id":id}))
             .await
     }
     /// The next frame, typed. `None` means the socket closed; subscribe again on a new one.
@@ -344,6 +363,20 @@ pub enum CollectionEvent {
         code: Option<ErrorCode>,
         message: String,
     },
+    /// Input authority opened on this connection, with its first sequence.
+    InputOpened {
+        id: String,
+        follow: String,
+        next_seq: u64,
+    },
+    /// This batch was accepted; a repeated sequence is acknowledged without another write.
+    InputAck { id: String, seq: u64 },
+    /// The input ended. Its outstanding bytes must not be replayed.
+    InputClosed {
+        id: String,
+        reason: TerminalInputClosedReason,
+        message: String,
+    },
 }
 
 impl CollectionEvent {
@@ -388,6 +421,20 @@ impl CollectionEvent {
                 replace: field(&frame, "replace")?,
                 items: field(&frame, "items")?,
                 has_more: field::<Option<bool>>(&frame, "has_more")?.unwrap_or(false),
+                id,
+            }),
+            Some("input-opened") => Ok(Self::InputOpened {
+                follow: field(&frame, "follow")?,
+                next_seq: field(&frame, "next_seq")?,
+                id,
+            }),
+            Some("input-ack") => Ok(Self::InputAck {
+                seq: field(&frame, "seq")?,
+                id,
+            }),
+            Some("input-closed") => Ok(Self::InputClosed {
+                reason: field(&frame, "reason")?,
+                message: field(&frame, "message")?,
                 id,
             }),
             Some("resync") => Ok(Self::Resync {
