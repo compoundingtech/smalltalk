@@ -32113,10 +32113,6 @@ version 2
                 "provider-auth",
             )
             .unwrap();
-        assert!(
-            store.fault_items(None).unwrap().is_empty(),
-            "the derived login item replaces the retained agent fault"
-        );
 
         reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
@@ -32127,6 +32123,10 @@ version 2
                 .unwrap()
                 .state,
             "needs-login"
+        );
+        assert!(
+            store.fault_items(None).unwrap().is_empty(),
+            "the derived login item replaces the retained agent fault"
         );
         assert_eq!(
             store.attention_items(Some("person/avery")).unwrap().len(),
