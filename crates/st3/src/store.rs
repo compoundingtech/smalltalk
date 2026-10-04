@@ -22991,7 +22991,7 @@ fn classify_replicated_claim_with_registry(
             ),
         )
     })?;
-    if let Err(error) = registry.validate_claim(&claim.subject, &claim.kind, &fields) {
+    if let Err(error) = registry.validate_replicated_claim(&claim.subject, &claim.kind, &fields) {
         // A peer may already publish a field introduced by a newer schema. Keep
         // that authenticated record retryable so an upgrade can admit the
         // original claim without replacing or rewriting it.
@@ -35440,6 +35440,100 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             unresolved[0].error_code.as_deref(),
             Some("unknown-claim-field")
         );
+    }
+
+    #[test]
+    fn future_arrangement_vocabulary_waits_on_replication_but_is_refused_locally() {
+        let subject = "arrangement/person/ada/019a0000-0000-7000-8000-000000000001";
+        for (operation, code) in [
+            (json!({"op":"future.rename","name":"new"}), "invalid-arrangement-operations"),
+            (json!({"op":"subject.place","subject":"future/item","folder":null,"key":"a0"}), "invalid-subject-reference"),
+        ] {
+            let source = Store::open_memory("source").unwrap();
+            let mut input = ClaimInput {
+                subject: subject.into(), kind: "arrangement.edited".into(),
+                actor: Some("person/ada".into()),
+                fields: BTreeMap::from([
+                    ("owner".into(), json!("person/ada")),
+                    ("operations".into(), json!([{"op":"create","name":"original"}])),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            };
+            source.append_claim(&input).unwrap();
+            input.fields.insert("operations".into(), json!([operation.clone()]));
+            assert_eq!(source.append_claim(&input).unwrap_err().code, code);
+            let mut exchange = exchange_from(&source, &ReplicationInventory::default());
+            let candidate = rewrite_envelope(&exchange.envelopes[0], |payload| {
+                let claim = &mut payload.batch.claims[0];
+                claim.body["fields"]["operations"] = json!([operation]);
+                claim.id = claim_hash(&claim.batch_id, &claim.subject, &claim.kind,
+                    &claim.origin, claim.actor.as_deref(), &claim.body, &claim.predecessors).unwrap();
+            });
+            exchange.envelopes = vec![candidate.clone()];
+            exchange.inventory.envelopes = vec![ReplicaEnvelopeId {
+                writer: candidate.writer.clone(), sequence: candidate.sequence, hash: candidate.hash.clone(),
+            }];
+            let target = Store::open_memory("target").unwrap();
+            let admission = receive_and_project(&target, "source", &exchange);
+            assert_eq!((admission.valid, admission.unknown, admission.invalid), (0, 1, 0));
+            let records = target.replica_records(true).unwrap();
+            assert_eq!(records[0].state, "unknown");
+            assert_eq!(records[0].error_code.as_deref(), Some("unknown-claim-field"));
+            assert!(target.latest_claim(subject, None).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn arrangement_vocabulary_upgrade_applies_the_original_waiting_claim() {
+        let subject = "arrangement/person/ada/019a0000-0000-7000-8000-000000000001";
+        for operation in [
+            json!({"op":"rename","name":"upgraded"}),
+            json!({"op":"subject.place","subject":"mission/future","folder":null,"key":"a0"}),
+        ] {
+            let source = Store::open_memory("source").unwrap();
+            let mut input = ClaimInput {
+                subject: subject.into(), kind: "arrangement.edited".into(), actor: Some("person/ada".into()),
+                fields: BTreeMap::from([("owner".into(), json!("person/ada")),
+                    ("operations".into(), json!([{"op":"create","name":"original"}]))]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            };
+            source.append_claim(&input).unwrap();
+            input.fields.insert("operations".into(), json!([operation.clone()]));
+            let claim = source.append_claim(&input).unwrap();
+            let exchange = exchange_from(&source, &ReplicationInventory::default());
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claims.sqlite3");
+            let older = Store::open(&path, "target").unwrap();
+            let mut registry = st3_schema::registry().clone();
+            if operation["op"] == "rename" {
+                registry.arrangement_operations.retain(|tag| tag != "rename");
+            } else {
+                registry.subjects.remove("mission").unwrap();
+            }
+            older.set_claim_registry(registry);
+            let admission = receive_and_project(&older, "source", &exchange);
+            assert_eq!((admission.valid, admission.unknown, admission.invalid), (1, 1, 0));
+            let records = older.replica_records(true).unwrap();
+            assert_eq!(records[0].state, "unknown");
+            assert_eq!(records[0].claim_id.as_deref(), Some(claim.id.as_str()));
+            assert_eq!(records[0].error_code.as_deref(), Some("unknown-claim-field"));
+            drop(older);
+
+            let upgraded = Store::open(&path, "target").unwrap();
+            let admission = upgraded.validate_replication_backlog().unwrap();
+            assert_eq!(admission.invalid, 0);
+            assert!(upgraded.replica_records(true).unwrap().is_empty());
+            upgraded.rebuild_claim_projections().unwrap();
+            let resource = upgraded.arrangement(subject, upgraded.index().unwrap()).unwrap().unwrap();
+            if operation["op"] == "rename" {
+                assert_eq!(resource["body"]["name"]["value"], "upgraded");
+                assert_eq!(resource["body"]["name"]["revision"], claim.id);
+            } else {
+                assert_eq!(resource["body"]["placements"]["mission/future"]["value"]["key"], "a0");
+                assert_eq!(resource["body"]["placements"]["mission/future"]["revision"], claim.id);
+            }
+            assert_eq!(upgraded.latest_claim(subject, None).unwrap().unwrap().id, claim.id);
+        }
     }
 
     #[test]

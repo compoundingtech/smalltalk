@@ -79,6 +79,13 @@ not know remain in the original envelope and in retryable `unknown` receipt reco
 claims in that envelope and later envelopes from the same writer continue to project. An
 unknown claim alone does not degrade its envelope or mark a projection unhealthy.
 
+For `arrangement.edited`, an unfamiliar operation tag or placement subject family also waits
+as `unknown-claim-field`. Admission uses the receiving member's operation vocabulary and subject
+registry; upgrading admits the original immutable edit and projects its original revisions.
+Malformed known operations and references remain invalid. Local client edits do not use this
+leniency: they refuse unknown tags with `invalid-arrangement-operations` and unknown placement
+families with `invalid-subject-reference`.
+
 `st replication status` reports `waiting` claims; JSON exposes `waiting_claims` and retains
 `unknown_records` for existing readers. Doctor reports the waiting count without treating it
 as a fault. At daemon startup, admission retries those original records using the upgraded
