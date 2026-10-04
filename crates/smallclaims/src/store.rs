@@ -444,7 +444,6 @@ impl Store {
         {
             let transaction = connection.transaction()?;
             runtime.open_projections(&transaction, false)?;
-            seed_replica_envelopes_tx(&transaction, &origin, None)?;
             transaction.commit()?;
         }
         let readers = ReadPool::new(path, false)?;
@@ -480,7 +479,6 @@ impl Store {
         {
             let transaction = connection.transaction()?;
             runtime.open_projections(&transaction, true)?;
-            seed_replica_envelopes_tx(&transaction, &origin, None)?;
             transaction.commit()?;
         }
         let readers = ReadPool::new(&uri, true)?;
@@ -512,7 +510,17 @@ impl Store {
         shared_memory: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Result<Self> {
-        let seeded_batch_rowid = max_batch_rowid(&connection)?;
+        // Opening cannot seal recent work: the caller has not loaded its signing keys yet.
+        // Resume at the first batch still needing an envelope, so a restart seals it with
+        // the same person and agent keys instead of permanently losing its delegation signatures.
+        let seeded_batch_rowid = connection.query_row(
+            "SELECT COALESCE(
+                (SELECT MIN(batches.rowid)-1 FROM batches WHERE NOT EXISTS (
+                    SELECT 1 FROM replica_envelopes WHERE batch_id=batches.id)),
+                (SELECT MAX(rowid) FROM batches), 0)",
+            [],
+            |row| row.get(0),
+        )?;
         let index = current_index(&connection)?;
         // Older stores have no admission watermark. Startup recovery projects this index
         // before serving; subsequent admission chunks update it in their own transaction.
@@ -1261,11 +1269,12 @@ impl Store {
                 .unwrap_or_else(PoisonError::into_inner) = None;
             return Ok(0);
         }
-        // Seed envelopes for any local batch first, so the full pass below sees all of them.
-        self.replication_snapshot()?;
         if let Some(key) = &key {
             self.set_node_key(key.clone())?;
         }
+        // Load the node signer before sealing recent standalone work. Its person and agent keys
+        // must likewise have been restored by the caller before this step.
+        self.replication_snapshot()?;
         *self
             .member_key
             .write()

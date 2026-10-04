@@ -389,6 +389,10 @@ impl Node {
     }
 
     async fn note(&self, text: &str) -> String {
+        self.note_as(text, PERSON).await
+    }
+
+    async fn note_as(&self, text: &str, actor: &str) -> String {
         let claim: Value = self
             .client()
             .post(
@@ -396,7 +400,7 @@ impl Node {
                 &ClaimInput {
                     subject: format!("custom/fleet-test/{text}"),
                     kind: NOTE.into(),
-                    actor: Some(PERSON.into()),
+                    actor: Some(actor.into()),
                     fields: [("text".to_owned(), Value::String(text.into()))]
                         .into_iter()
                         .collect(),
@@ -755,6 +759,92 @@ fn authority_digest(node: &Node) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_agent_claims() {
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Node::new(root.path(), "studio");
+    a.start().await;
+    wait_until(
+        "the initial standalone checkpoint is sealed",
+        30,
+        || async {
+            a.claims()
+                .await
+                .iter()
+                .any(|claim| claim["kind"] == "checkpoint.sealed")
+        },
+    )
+    .await;
+    let agent = "agent/garden/worker";
+    let mut claims = vec![
+        a.note("person-before-founding").await,
+        a.note_as("agent-before-founding", agent).await,
+    ];
+    // No doctor, replication exchange or later checkpoint may seal the grants first.
+    let pending: u64 = rusqlite::Connection::open_with_flags(
+        a.state_dir().join("claims.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT COUNT(*) FROM claims WHERE kind='principal.key-granted'
+         AND NOT EXISTS (SELECT 1 FROM replica_envelopes WHERE batch_id=claims.batch_id)",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert!(
+        pending > 0,
+        "the regression needs unsealed delegation history"
+    );
+    a.stop();
+    a.create();
+    a.start().await;
+    claims.push(a.note("person-after-founding").await);
+    claims.push(a.note_as("agent-after-founding", agent).await);
+    a.restart().await;
+    claims.push(a.note_as("agent-after-another-restart", agent).await);
+    a.wait_listening().await;
+    let b = joined(root.path(), &a, "beacon", &[]).await;
+    b.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    wait_until(
+        "the peer receives every person and agent claim",
+        60,
+        || async {
+            let received = b.claims().await;
+            claims
+                .iter()
+                .all(|id| received.iter().any(|claim| claim["id"] == id.as_str()))
+        },
+    )
+    .await;
+    for node in [&a, &b] {
+        let doctor = node.st_json(&["doctor"]);
+        let signatures = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "claim-signatures")
+            .unwrap();
+        assert_eq!(signatures["status"], "pass", "{}: {signatures}", node.name);
+        let connection = rusqlite::Connection::open_with_flags(
+            node.state_dir().join("claims.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for id in &claims {
+            let (verdict, reason): (String, Option<String>) = connection
+                .query_row(
+                    "SELECT verdict, reason FROM claim_verdicts WHERE claim_id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(verdict, "verified", "{} claim {id}: {reason:?}", node.name);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
