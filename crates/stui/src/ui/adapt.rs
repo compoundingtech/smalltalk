@@ -1725,11 +1725,41 @@ mod tests {
         assert!(text.contains("CONNECTED CLIENTS"), "{text}");
         assert!(text.contains("stui 0.1.0+1ecae71"), "{text}");
         assert!(text.contains("person/robin · Robin's phone"), "{text}");
+        // The follows list may wrap, so its words are checked apart.
+        assert!(text.contains("follows now,"), "{text}");
         assert!(
-            text.contains("follows now, terminal:terminal/agent/lark/planner"),
+            text.contains("terminal:terminal/agent/lark/planner"),
             "{text}"
         );
         assert!(text.contains("seen 3m ago"), "{text}");
         assert_eq!(text.matches("older than this member").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn the_clients_card_wraps_a_long_client_instead_of_clipping_it() {
+        let world = crate::ui::demo::world();
+        let doc = crate::ui::screens::clients_card(&world, 44);
+        let lines: Vec<String> = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        for line in &lines {
+            assert!(
+                crate::ui::text::width(line) <= 44,
+                "clipped at the card's edge: {line:?}"
+            );
+        }
+        let text = lines.join("\n");
+        assert!(text.contains("smalltalk-ios 1.0 (42)"), "{text}");
+        assert!(
+            text.contains("terminal:terminal/agent/lark/planner"),
+            "{text}"
+        );
     }
 }
