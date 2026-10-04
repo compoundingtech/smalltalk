@@ -1392,6 +1392,7 @@ mission "garden/workspace" state="ready" {
             idempotency_key: "workspace-run".into(),
         })
         .unwrap();
+    materialize_run_declarations(&state.store);
     let seat = state
         .store
         .desired_subjects_for_owner_run(&run.subject)
