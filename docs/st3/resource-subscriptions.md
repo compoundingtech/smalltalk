@@ -25,7 +25,7 @@ latest state. The repository resource keeps only its own facts, such as `reposit
 | Data type | Facts on each item |
 |---|---|
 | `pull_requests` | `number`, `url`, `title`, `author`, `created_at`, `state`, `merged` once closed, `draft`, `head_sha`, `branch`, `base_branch`, `checks_state`, `checks` (each `name`, `status`, `conclusion`), `required_checks` (`state`, `source`, `checks`, `failed`), `review_decision`, `reviews` (each reviewer's latest `state` and `commit`), `merge_queue` (`state`, `position`) while queued, and `opened_by`/`opened_by_run` |
-| `issues` | `number`, `url`, `title`, `author`, `created_at`, `state`, `state_reason` |
+| `issues` | `number`, `url`, `title`, `author`, `created_at`, `state`, `state_reason`, and optional `opened_by`/`opened_by_run` |
 | `comments` | `comments` (the count), `last_comment` (`id`, `author`, `url`, `created_at`, `updated_at`, `body_digest`), and `recent_comments`: the newest 20 conversation comments and submitted reviews, oldest first, each `kind` (`comment` or `review`), `id`, `author`, `at`, and a review's `state` |
 | `reactions` | `reactions` (each reaction's count), and `last_comment.reactions` |
 | `mentions` | `mentions`: the newest mention of each GitHub login in the item's body or comments (`login`, `by`, `url`, `at`), up to 50 |
@@ -58,7 +58,9 @@ item at the baseline. Only a change records an observation: an unchanged item re
 an observation that read only some facts, such as a new comment, keeps the others.
 
 Agents open pull requests with a shared GitHub identity, so the author login cannot say which agent
-opened one. When a pull request appears or moves to a new head, the observing host looks for the
+opened one. [Command-recorder receipts](command-recorder.md#creation-receipts) publish the exact
+agent and mission run for non-TTY `gh issue create` and `gh pr create` calls. When a pull request
+appears or moves to a new head without an opener, the observing host looks for the
 agent on that host whose workspace has the pull request's branch checked out. When exactly one
 agent has it, the listing records that agent as `opened_by` and its mission run as `opened_by_run`.
 A pull request keeps an opener once named, so a reviewer or fixer that later checks out the branch
@@ -70,8 +72,10 @@ the pull request resource: a publisher's partial snapshot such as `{state: merge
 mission routes its findings to that agent or run.
 
 An issue resource accepts the same optional `opened_by` and `opened_by_run` facts from its
-publisher, such as the seat that opened it. st does not infer an issue opener. Each attribution
-fact, once named, stays across later publisher writes and issue or repository observations.
+publisher. The command recorder supplies these from the creating seat's environment, without
+inferring an opener from the shared GitHub login. Each attribution fact, once named, stays across
+later publisher writes and issue or repository observations. Receipt resources initially have no
+observed state; their first GitHub observation still participates in new-issue and review delivery.
 
 The local file provider supports `status`, `path`, `content_hash`, `size`, `mode`, and `reason`. It never returns file content.
 
