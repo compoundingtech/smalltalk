@@ -550,6 +550,11 @@ fn agents(model: &Model) -> Vec<Agent> {
                     queued: agent.queued_work_count,
                     harness_state: agent.harness_state.clone(),
                     runtime: None,
+                    model: agent
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.context.as_ref())
+                        .and_then(|context| context.model.clone()),
                     fault: agent.fault.clone(),
                     under: agent.under.first().map(|relation| {
                         model
@@ -1561,5 +1566,32 @@ mod tests {
         );
         assert_eq!(agent.details.queue, ["fleet/harbor · Audit › report"]);
         assert_eq!(world.host, "harbor");
+    }
+
+    #[test]
+    fn the_agent_header_names_the_model_beside_the_harness() {
+        let world = crate::ui::demo::world();
+        let mut agent = world.agents.items()[0].clone();
+        assert_eq!(agent.details.model.as_deref(), Some("claude-sonnet-5-5"));
+        let line = |agent: &Agent| -> String {
+            let doc = crate::ui::screens::agent_header(&world, agent, 100, "⠋");
+            doc.lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let with = line(&agent);
+        assert!(
+            with.contains(&format!("{} · claude-sonnet-5-5 · ", agent.harness.name())),
+            "{with}"
+        );
+        agent.details.model = None;
+        let without = line(&agent);
+        assert!(!without.contains("sonnet"), "{without}");
+        assert!(
+            without.contains(&format!("{} · {} ", agent.harness.name(), agent.host)),
+            "{without}"
+        );
     }
 }

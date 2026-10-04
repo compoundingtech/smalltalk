@@ -609,6 +609,7 @@ fn agents() -> Vec<Agent> {
             runtime: Some(s("running · incarnation 3")),
             fault: None,
             under: None,
+            model: Some(s("claude-sonnet-5-5")),
         };
     list[0].details = detail(
         "Cut over to the new store once a person approves.",
@@ -634,6 +635,7 @@ fn agents() -> Vec<Agent> {
         runtime: Some(s("restarts paused")),
         fault: Some(s("401 Unauthorized: the API key expired at 08:40.")),
         under: None,
+        model: Some(s("gpt-5.5-codex")),
     };
     list[3].details = detail(
         "Keep Robin's fleet moving; answer questions.",

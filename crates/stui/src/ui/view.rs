@@ -314,6 +314,8 @@ pub struct AgentDetails {
     pub runtime: Option<String>,
     pub fault: Option<String>,
     pub under: Option<String>,
+    /// The model its harness last reported using, as reported ("claude-sonnet-5-5").
+    pub model: Option<String>,
 }
 
 // ---------------------------------------------------------------- fleet, trees
