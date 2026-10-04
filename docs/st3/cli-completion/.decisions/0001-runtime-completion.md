@@ -24,6 +24,12 @@ question with its options and evidence.
 | q8 | Short-name rule | four-step ladder with ambiguity errors |
 | q9 | TAB deadline | 300 ms |
 
+Review revision (2026-10-04): q7 uses the PATH-resolved `st` so manually installed stubs survive
+garbage collection. q8 applies the ladder against all subjects, not completion-filtered ones;
+destructive verbs use only its exact steps. Bare-word attach shares the existing 1 s attach budget
+and fails fast when resolution cannot finish. These revisions supersede the original q7/q8
+choices below.
+
 ## Options
 
 | Handle | Rejected option | Why rejected |

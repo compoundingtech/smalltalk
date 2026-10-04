@@ -6,6 +6,7 @@
 //! the daemon and never prints: any failure yields no candidates.
 
 use std::ffi::OsStr;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -81,7 +82,7 @@ pub enum WorkFilter {
 }
 
 /// One entity a person can pick: its exact subject and a one-line description.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Candidate {
     pub subject: String,
     pub description: String,
@@ -110,14 +111,48 @@ impl ValueCompleter for Complete {
 /// Lists candidates on a private current-thread runtime, bounded by [`DEADLINE`].
 fn fetch_blocking(entity: Entity) -> Option<Vec<Candidate>> {
     let target = LocalTarget::discover(&completion_words())?;
+    // The terminal join otherwise repeats two paginated lists on every TAB. Cache only shell
+    // suggestions for one second; command resolution always reads fresh, unfiltered subjects.
+    let cache = (entity == Entity::Terminal)
+        .then(|| terminal_cache(&target))
+        .flatten();
+    if let Some(path) = &cache
+        && std::fs::metadata(path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < Duration::from_secs(1))
+        && let Ok(bytes) = std::fs::read(path)
+        && let Ok(candidates) = serde_json::from_slice(&bytes)
+    {
+        return Some(candidates);
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
-    runtime
+    let found = runtime
         .block_on(async { tokio::time::timeout(deadline(), candidates(&target, entity)).await })
         .ok()?
-        .ok()
+        .ok()?;
+    if let Some(path) = cache
+        && let Ok(bytes) = serde_json::to_vec(&found)
+    {
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        if std::fs::write(&temporary, bytes).is_ok() {
+            let _ = std::fs::rename(&temporary, &path);
+            let _ = std::fs::remove_file(temporary);
+        }
+    }
+    Some(found)
+}
+
+fn terminal_cache(target: &LocalTarget) -> Option<PathBuf> {
+    let root = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("st3-completion-v1");
+    std::fs::create_dir_all(&root).ok()?;
+    let mut key = std::collections::hash_map::DefaultHasher::new();
+    format!("{target:?}").hash(&mut key);
+    Some(root.join(format!("{:016x}.json", key.finish())))
 }
 
 /// [`DEADLINE`], unless `ST3_COMPLETION_DEADLINE_MS` names another bound in milliseconds, as tests
@@ -197,10 +232,21 @@ fn endpoint_word(words: &[String]) -> Option<String> {
 }
 
 /// Follows a collection's pages until it ends or [`MAX_ITEMS`] are read.
-async fn all_items<F, Fut>(mut page: F) -> Result<Vec<Resource>, ClientError>
+async fn all_items<F, Fut>(page: F) -> Result<Vec<Resource>, ClientError>
 where
     F: FnMut(Option<String>) -> Fut,
-    Fut: std::future::Future<Output = Result<Envelope<Page>, ClientError>>,
+    Fut: Future<Output = Result<Envelope<Page>, ClientError>>,
+{
+    all_items_with_limit(MAX_ITEMS, page).await
+}
+
+async fn all_items_with_limit<F, Fut>(
+    max_items: usize,
+    mut page: F,
+) -> Result<Vec<Resource>, ClientError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Envelope<Page>, ClientError>>,
 {
     let mut items = Vec::new();
     let mut cursor = None;
@@ -208,7 +254,7 @@ where
         let response = page(cursor.take()).await?.value;
         items.extend(response.items);
         match response.page.next_cursor {
-            Some(next) if response.page.has_more && items.len() < MAX_ITEMS => cursor = Some(next),
+            Some(next) if response.page.has_more && items.len() < max_items => cursor = Some(next),
             _ => return Ok(items),
         }
     }
@@ -229,11 +275,48 @@ pub async fn candidates(
     target: &LocalTarget,
     entity: Entity,
 ) -> Result<Vec<Candidate>, ClientError> {
-    let listed = list(target, entity).await?;
+    let listed = list(target, entity, true).await?;
     Ok(select(entity, &listed, target, chrono::Utc::now()))
 }
 
-async fn joined<F: std::future::Future<Output = Result<Vec<Resource>, ClientError>>>(
+/// Resolution sees every subject, not just the ones a TAB suggests. It does not need joins.
+pub async fn resolution_candidates(
+    target: &LocalTarget,
+    entity: Entity,
+) -> Result<Vec<Candidate>, ClientError> {
+    let listed = list(target, entity, false).await?;
+    if matches!(entity, Entity::Terminal | Entity::Attention) {
+        return Ok(listed
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Resource::Runtime(runtime) if entity == Entity::Terminal => Some(Candidate::new(
+                    runtime.owner_id.clone(),
+                    vec![runtime.state.clone()],
+                )),
+                Resource::Attention(attention) if entity == Entity::Attention => {
+                    Some(Candidate::new(
+                        attention.header.id.clone(),
+                        vec![quote(&attention.title), attention.state.clone()],
+                    ))
+                }
+                _ => None,
+            })
+            .collect());
+    }
+    let entity = match entity {
+        Entity::Agent { .. } => Entity::Agent {
+            running_only: false,
+        },
+        Entity::MissionRun { .. } => Entity::MissionRun {
+            unfinished_only: false,
+        },
+        other => other,
+    };
+    Ok(select(entity, &listed, target, chrono::Utc::now()))
+}
+
+async fn joined<F: Future<Output = Result<Vec<Resource>, ClientError>>>(
     join: F,
 ) -> Vec<Resource> {
     tokio::time::timeout(JOIN_DEADLINE, join)
@@ -243,10 +326,12 @@ async fn joined<F: std::future::Future<Output = Result<Vec<Resource>, ClientErro
         .unwrap_or_default()
 }
 
-async fn list(target: &LocalTarget, entity: Entity) -> Result<Listed, ClientError> {
+async fn list(target: &LocalTarget, entity: Entity, enrich: bool) -> Result<Listed, ClientError> {
     let client = &target.client();
+    // Never decide ambiguity from a truncated resolution list. The caller's timeout bounds it.
+    let max_items = if enrich { MAX_ITEMS } else { usize::MAX };
     let agents = || {
-        all_items(|cursor| async move {
+        all_items_with_limit(max_items, |cursor| async move {
             client
                 .agents_list(cursor.as_deref(), Some(LIST_LIMIT), false)
                 .await
@@ -267,7 +352,7 @@ async fn list(target: &LocalTarget, entity: Entity) -> Result<Listed, ClientErro
     };
     macro_rules! items {
         ($method:ident $(, $argument:expr)*) => {
-            all_items(|cursor| async move {
+            all_items_with_limit(max_items, |cursor| async move {
                 client.$method($($argument,)* cursor.as_deref(), Some(LIST_LIMIT), false).await
             })
             .await?
@@ -277,12 +362,18 @@ async fn list(target: &LocalTarget, entity: Entity) -> Result<Listed, ClientErro
     match entity {
         Entity::Terminal => {
             let (terminals, agents) = tokio::join!(
-                all_items(|cursor| async move {
+                all_items_with_limit(max_items, |cursor| async move {
                     client
                         .terminals_list(cursor.as_deref(), Some(LIST_LIMIT), false)
                         .await
                 }),
-                joined(agents()),
+                async {
+                    if enrich {
+                        joined(agents()).await
+                    } else {
+                        Vec::new()
+                    }
+                },
             );
             listed.items = terminals?;
             // The agent join adds harness and activity; a terminal still completes without it.
@@ -671,31 +762,42 @@ pub enum Resolution {
     Unmatched,
 }
 
+/// Destructive commands permit only exact names; navigation also permits fuzzy matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Matching {
+    Exact,
+    Fuzzy,
+}
+
 /// Resolves a bare word against a command's candidates (spec: short-name ladder).
 ///
 /// Input containing `/` is a full subject and is never resolved. Steps, first match wins:
 /// exact `<namespace>/<word>`, exact last path segment, unique last-segment prefix, unique
 /// substring of the subject. A step with several matches is ambiguous.
-pub fn resolve(word: &str, namespace: &str, candidates: &[Candidate]) -> Resolution {
+pub fn resolve(
+    word: &str,
+    namespace: &str,
+    candidates: &[Candidate],
+    matching: Matching,
+) -> Resolution {
     if word.contains('/') {
         return Resolution::Subject(word.to_owned());
     }
     let literal = format!("{namespace}/{word}");
-    let last = |candidate: &Candidate| {
-        candidate
-            .subject
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .to_owned()
-    };
     let steps: [&dyn Fn(&Candidate) -> bool; 4] = [
         &|candidate| candidate.subject == literal,
-        &|candidate| last(candidate) == word,
-        &|candidate| last(candidate).starts_with(word),
+        &|candidate| candidate.subject.rsplit('/').next() == Some(word),
+        &|candidate| {
+            candidate
+                .subject
+                .rsplit('/')
+                .next()
+                .is_some_and(|last| last.starts_with(word))
+        },
         &|candidate| candidate.subject.contains(word),
     ];
-    for step in steps {
+    let count = if matching == Matching::Exact { 2 } else { 4 };
+    for step in &steps[..count] {
         let matched: Vec<Candidate> = candidates
             .iter()
             .filter(|candidate| step(candidate))
@@ -735,7 +837,7 @@ mod tests {
     #[test]
     fn resolution_ladder() {
         let fleet = fleet();
-        let subject = |word| match resolve(word, "agent", &fleet) {
+        let subject = |word| match resolve(word, "agent", &fleet, Matching::Fuzzy) {
             Resolution::Subject(subject) => subject,
             other => panic!("{word}: {other:?}"),
         };
@@ -745,11 +847,15 @@ mod tests {
         assert_eq!(subject("agent/other"), "agent/other");
         // Step 3 wins before step 4: `host-a` prefixes one last segment.
         assert_eq!(subject("host-a"), "agent/host-a.ci-watcher");
-        let Resolution::Ambiguous(matches) = resolve("interactive", "agent", &fleet) else {
+        let Resolution::Ambiguous(matches) = resolve("interactive", "agent", &fleet, Matching::Fuzzy)
+        else {
             panic!("interactive names two subjects");
         };
         assert_eq!(matches.len(), 2);
-        assert_eq!(resolve("nothing", "agent", &fleet), Resolution::Unmatched);
+        assert_eq!(
+            resolve("nothing", "agent", &fleet, Matching::Fuzzy),
+            Resolution::Unmatched
+        );
     }
 
     #[test]
@@ -759,9 +865,26 @@ mod tests {
             candidate("agent/project/steward"),
         ];
         assert_eq!(
-            resolve("steward", "pty", &fleet),
+            resolve("steward", "pty", &fleet, Matching::Fuzzy),
             Resolution::Subject("pty/steward".into())
         );
+    }
+
+    #[test]
+    fn destructive_matching_never_uses_prefixes_or_substrings() {
+        for namespace in ["agent", "pty", "mission-run"] {
+            let subjects = vec![candidate(&format!("{namespace}/project/worker-2"))];
+            for word in ["worker", "project", "orker"] {
+                assert_eq!(
+                    resolve(word, namespace, &subjects, Matching::Exact),
+                    Resolution::Unmatched
+                );
+            }
+            assert_eq!(
+                resolve("worker-2", namespace, &subjects, Matching::Exact),
+                Resolution::Subject(format!("{namespace}/project/worker-2"))
+            );
+        }
     }
 
     #[test]

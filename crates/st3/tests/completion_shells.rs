@@ -65,6 +65,7 @@ fn environment(command: &mut Command, root: &Path, socket: &Path) {
     command
         .env_remove("ST_AGENT")
         .env_remove("ST_MISSION_RUN")
+        .env_remove("PTY_SESSION")
         .env_remove("COMPLETE")
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_STATE_HOME", root.join("state"))
@@ -73,6 +74,17 @@ fn environment(command: &mut Command, root: &Path, socket: &Path) {
         // A debug daemon in this process can miss the 300 ms TAB deadline on a loaded host; the
         // silent-daemon test sets its own bound.
         .env("ST3_COMPLETION_DEADLINE_MS", "10000");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let st = bin.join("st");
+    if !st.exists() {
+        std::os::unix::fs::symlink(st3(), &st).unwrap();
+    }
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    command.env("PATH", std::env::join_paths(paths).unwrap());
 }
 
 /// One completion request through the fish protocol, the one with values and descriptions.
@@ -322,4 +334,227 @@ exit 1
     })
     .await
     .unwrap();
+}
+
+async fn command(root: &Path, socket: &Path, args: &[&str]) -> (Output, Duration) {
+    let mut command = Command::new(st3());
+    environment(&mut command, root, socket);
+    command.args(args);
+    tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        (command.output().unwrap(), started.elapsed())
+    })
+    .await
+    .unwrap()
+}
+
+fn declare_agents(store: &Store, names: &[&str]) {
+    let source = format!(
+        "version 2\n{}",
+        names
+            .iter()
+            .map(|name| {
+                format!("agent {name:?} {{ command \"sleep 1000\"; workspace \"/tmp\"; }}\n")
+            })
+            .collect::<String>()
+    );
+    let intent = st3::parse_intent(&source, "completion-test").unwrap();
+    let preview = store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source,
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply_as(
+            &intent,
+            &preview.subject_tokens,
+            "declare",
+            Some("person/avery"),
+        )
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_name_stop_twice_never_stops_the_prefix_neighbor() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let store = state.store.clone();
+    declare_agents(&store, &["worker", "worker-2"]);
+    observe(&store, "agent/worker", "running");
+    observe(&store, "agent/worker-2", "running");
+    let socket = root.path().join("st3.sock");
+    let server = serve_unix(state, &socket).await;
+    for status in ["running", "stopped"] {
+        observe(&store, "agent/worker", status);
+        let (output, _) = command(
+            root.path(),
+            &socket,
+            &["agents", "stop", "worker", "--as", "person/avery"],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stops = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .filter(|desired| desired.kind == "stop")
+            .map(|desired| desired.subject)
+            .collect::<Vec<_>>();
+        assert!(stops.contains(&"agent/worker".to_owned()), "{stops:?}");
+        assert!(!stops.contains(&"agent/worker-2".to_owned()), "{stops:?}");
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_non_running_last_segment_still_resolves() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    declare_agents(&state.store, &["example/worker", "example/worker-2"]);
+    observe(&state.store, "agent/example/worker", "stopped");
+    observe(&state.store, "agent/example/worker-2", "running");
+    let socket = root.path().join("st3.sock");
+    let server = serve_unix(state, &socket).await;
+    let (output, _) = command(
+        root.path(),
+        &socket,
+        &["agents", "stop", "worker", "--as", "person/avery", "--print-kdl"],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8(output.stdout).unwrap();
+    assert!(printed.contains("stop \"agent/example/worker\""), "{printed}");
+    assert!(!printed.contains("worker-2"), "{printed}");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambiguous_short_name_exits_two_without_stopping_anyone() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let store = state.store.clone();
+    declare_agents(&store, &["first/worker", "second/worker"]);
+    observe(&store, "agent/first/worker", "stopped");
+    observe(&store, "agent/second/worker", "running");
+    let socket = root.path().join("st3.sock");
+    let server = serve_unix(state, &socket).await;
+    let (output, _) = command(
+        root.path(),
+        &socket,
+        &["agents", "stop", "worker", "--as", "person/avery"],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("agent/first/worker") && stderr.contains("agent/second/worker"),
+        "{stderr}"
+    );
+    assert!(
+        !store
+            .desired_subjects()
+            .unwrap()
+            .iter()
+            .any(|desired| desired.kind == "stop")
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_attach_fails_within_its_one_second_budget_on_a_silent_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("silent.sock");
+    let silent = SilentDaemon::unix(&socket);
+    let (output, elapsed) = command(root.path(), &socket, &["terminals", "attach", "worker"]).await;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("short-name resolution did not answer within 1 s"),
+        "{stderr}"
+    );
+    // Account for process startup without allowing the old extra 2 s plus request timeout.
+    assert!(elapsed < Duration::from_millis(1500), "attach took {elapsed:?}");
+    assert!(silent.stop() > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successive_tabs_reuse_terminal_lists_but_commands_do_not_use_the_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    observe(&state.store, "agent/example/worker", "running");
+    let socket = root.path().join("st3.sock");
+    let server = serve_unix(state, &socket).await;
+    let root_path = root.path().to_owned();
+    let socket_path = socket.clone();
+    let (first, _) = tokio::task::spawn_blocking(move || {
+        complete(&root_path, &socket_path, &["terminals", "attach", "agent/"])
+    })
+    .await
+    .unwrap();
+    assert!(
+        lines(&first)
+            .iter()
+            .any(|line| line.starts_with("agent/example/worker\t"))
+    );
+    server.abort();
+    let root_path = root.path().to_owned();
+    let socket_path = socket.clone();
+    let (cached, _) = tokio::task::spawn_blocking(move || {
+        complete(&root_path, &socket_path, &["terminals", "attach", "agent/"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(cached.stdout, first.stdout);
+    let (output, _) = command(root.path(), &socket, &["terminals", "signal", "worker"]).await;
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("agent/example/worker"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_consultation_only_gets_the_budget_left_after_resolution() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    observe(&state.store, "agent/example/worker", "running");
+    let socket = root.path().join("st3.sock");
+    let app = st3::api::router(state).layer(axum::middleware::from_fn(
+        |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            if request.uri().path().starts_with("/v1/sessions/") {
+                return std::future::pending::<axum::response::Response>().await;
+            }
+            if request.uri().path() == "/v1/client/terminals" {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+            next.run(request).await
+        },
+    ));
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, app).await.unwrap();
+    });
+    let ready = Instant::now() + Duration::from_secs(5);
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        assert!(Instant::now() < ready);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let (output, elapsed) = command(root.path(), &socket, &["terminals", "attach", "worker"]).await;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no local PTY session matches `agent/example/worker`"),
+        "{stderr}"
+    );
+    assert!(elapsed < Duration::from_millis(1500), "attach took {elapsed:?}");
+    server.abort();
 }

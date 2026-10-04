@@ -136,8 +136,10 @@ differently per shell.
 
 `terminals attach, peek, send, signal`, `agents stop`, `missions cancel`, and `attention show`
 resolve their subject before they act. A word that contains `/` is used as typed. For a bare word,
-st lists the argument's entity kind (with the same filter as completion) and applies these steps
-in order. The first step that matches anything decides:
+st lists **all subjects of the kind**, without completion's running/unfinished filters or
+description joins. `agents stop`, `terminals send/signal`, and `missions cancel` use only steps
+1–2 below: destructive commands never accept prefix or substring matches. `attach`, `peek`, and
+`show` use all four steps. The first step that matches anything decides:
 
 1. The subject equals `<namespace>/<word>` (the previous literal meaning).
 2. The last path segment of the subject equals the word.
@@ -146,7 +148,10 @@ in order. The first step that matches anything decides:
 
 One match resolves to that subject. Several matches fail with exit status 2 and list each subject
 with its description. No match, a daemon that does not answer within 2 s, or a non-Unix endpoint
-keeps `<namespace>/<word>` (R10), so a local attach works while the daemon is down.
+keeps `<namespace>/<word>` (R10). Bare-word attach instead shares the existing 1 s consultation
+budget with resolution; if resolution times out it fails immediately and asks for the full
+subject. Consultation gets only the remaining budget and either attaches a local registry
+session or fails when no such session exists. Full subjects retain offline attach behavior.
 
 ```
 $ st terminals attach ci-w         → agent/host-a.ci-watcher
@@ -161,6 +166,10 @@ st: `interactive` matches 9 subjects; name one exactly:
 - The completion client uses no outage wait, so an unreachable socket fails at once.
 - All list calls of one TAB, joins included, share one 300 ms deadline.
   `ST3_COMPLETION_DEADLINE_MS` replaces it; the integration tests use it against a debug daemon.
+- Successful terminal suggestions are cached for 1 s under `XDG_RUNTIME_DIR/st3-completion-v1`,
+  keyed by endpoint and identities. Consecutive TABs reuse both paginated lists. Cache failures
+  are silent, unavailable `XDG_RUNTIME_DIR` disables caching, and command resolution never reads
+  this cache.
 - A join (agents for `Terminal` and `Actor`; attention items and devices for `Person`) only
   enriches candidates. It has its own 200 ms deadline, and a join that fails or runs out is dropped:
   terminals keep their terminal facts, and `Person` and `Actor` still offer the configured person
@@ -173,10 +182,10 @@ st: `interactive` matches 9 subjects; name one exactly:
 
 ## Installation (R11, R12)
 
-`st completions <shell>` writes clap_complete's registration stub for `st`, bound to the absolute
-path of the running executable. The Nix package runs it at build time for bash, zsh, and fish
-(`flake.nix` `postInstall`) and installs the results with `installShellCompletion`, so the stub
-calls the store path of the installed package.
+`st completions <shell>` writes clap_complete's registration stub for the PATH-resolved `st`.
+It never embeds the generating executable's store path, so manual installations survive package
+upgrades and garbage collection. The Nix package runs it at build time for bash, zsh, and fish
+(`flake.nix` `postInstall`) and installs the results with `installShellCompletion`.
 
 ## Verification
 
@@ -190,6 +199,9 @@ calls the store path of the installed package.
   terminal in real fish (`complete -C`), bash (the stub's completion function), and zsh (TAB in an
   interactive zsh under `zpty`). The shells come from `nativeCheckInputs` and the dev shell; a
   missing shell fails the test.
-- `checks.st3-help` runs `scripts/check-installed-completions` against the built package: each
-  installed stub names the package's `st3`, fish and bash complete a subcommand through it, zsh
-  registers it, and with no daemon no entity is offered.
+- `checks.st3-help` runs `scripts/check-installed-completions` against the built package with its
+  `bin` directory on PATH: fish and bash complete a subcommand through `st`, zsh registers it,
+  and with no daemon no entity is offered.
+- Regression scenarios in `completion_shells.rs` cover stopping the same bare name twice without
+  targeting a prefix neighbor, non-running exact targets, ambiguity status 2, the bare attach
+  deadline, and reuse of terminal suggestions without caching command targets.

@@ -2,7 +2,7 @@
 # Usage: check-installed-completions ST3_PACKAGE
 #
 # Checks the completion stubs an installed st3 package ships (docs/st3/cli-completion/spec.md,
-# R11): each one calls back into that package's own st3, and completes through it in its shell.
+# R11): each one resolves st through PATH and completes through it in its shell.
 # No daemon runs here, so subcommands complete and entity arguments offer nothing.
 set -euo pipefail
 
@@ -13,16 +13,13 @@ fish_stub=$package/share/fish/vendor_completions.d/st.fish
 
 for stub in "$bash_stub" "$zsh_stub" "$fish_stub"; do
   test -s "$stub"
-  grep -qF "$package/bin/st3" "$stub" || {
-    echo "$stub does not call $package/bin/st3" >&2
-    exit 1
-  }
 done
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 export HOME=$scratch XDG_CONFIG_HOME=$scratch/config XDG_STATE_HOME=$scratch/state
 export ST3_ENDPOINT=$scratch/absent.sock
+export PATH="$package/bin:$PATH"
 unset ST_AGENT COMPLETE
 
 fish_out=$(fish --no-config -c "source '$fish_stub'; complete -C 'st terminals att'")

@@ -4565,7 +4565,6 @@ async fn run(cli: Cli) -> Result<()> {
                 CompletionShell::Zsh => "zsh",
                 CompletionShell::Fish => "fish",
             };
-            let completer = std::env::current_exe().context("find this st executable")?;
             clap_complete::env::Shells::builtins()
                 .completer(shell)
                 .context("clap_complete lacks a built-in shell")?
@@ -4573,7 +4572,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "COMPLETE",
                     "st",
                     "st",
-                    &completer.to_string_lossy(),
+                    "st",
                     &mut std::io::stdout(),
                 )?;
             Ok(())
@@ -6095,6 +6094,7 @@ async fn cancel_mission_run(
         Entity::MissionRun {
             unfinished_only: true,
         },
+        completion::Matching::Exact,
     )
     .await?;
     let run: MissionRunView = client
@@ -6722,17 +6722,40 @@ async fn run_pty(
             )
         }
         PtyCommand::Attach(args) => {
-            let subject =
-                resolve_member_subject(endpoint, &args.subject, "pty", Entity::Terminal).await?;
+            let budget = (!args.subject.contains('/'))
+                .then(|| tokio::time::Instant::now() + LOCAL_ATTACH_CONSULT);
+            let resolution = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "pty",
+                Entity::Terminal,
+                completion::Matching::Fuzzy,
+            );
+            let subject = if let Some(deadline) = budget {
+                tokio::time::timeout_at(deadline, resolution)
+                    .await
+                    .context("st terminals attach: short-name resolution did not answer within 1 s; name the full subject to attach without the daemon")??
+            } else {
+                resolution.await?
+            };
             let person = args.person.as_deref().or(configured_person);
-            attach_terminal(client, endpoint, pty_root, person, &subject, args.force).await
+            attach_terminal(
+                client, endpoint, pty_root, person, &subject, args.force, budget,
+            )
+            .await
         }
         PtyCommand::ExposeFabric(_) | PtyCommand::ServeFabric(_) => {
             unreachable!("handled before any daemon client")
         }
         PtyCommand::Peek(args) => {
-            let subject =
-                resolve_member_subject(endpoint, &args.subject, "pty", Entity::Terminal).await?;
+            let subject = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "pty",
+                Entity::Terminal,
+                completion::Matching::Fuzzy,
+            )
+            .await?;
             let screen: SessionScreen = client
                 .get(&format!(
                     "/v1/sessions/screen/{}",
@@ -6885,8 +6908,14 @@ async fn run_pty(
             print_client_value(&response, json_output)
         }
         PtyCommand::Send(args) => {
-            let subject =
-                resolve_member_subject(endpoint, &args.subject, "pty", Entity::Terminal).await?;
+            let subject = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "pty",
+                Entity::Terminal,
+                completion::Matching::Exact,
+            )
+            .await?;
             let incarnation = session_incarnation(client, &subject).await?;
             let mode = if args.raw {
                 SessionInputMode::Raw
@@ -6914,8 +6943,14 @@ async fn run_pty(
             print_value(&response, json_output)
         }
         PtyCommand::Signal(args) => {
-            let subject =
-                resolve_member_subject(endpoint, &args.subject, "pty", Entity::Terminal).await?;
+            let subject = resolve_member_subject(
+                endpoint,
+                &args.subject,
+                "pty",
+                Entity::Terminal,
+                completion::Matching::Exact,
+            )
+            .await?;
             let response: SessionControlResponse = client
                 .post(
                     &format!("/v1/sessions/{}/signal", urlencoding::encode(&subject)),
@@ -6977,6 +7012,7 @@ async fn attach_terminal(
     person: Option<&str>,
     subject: &str,
     force: bool,
+    budget: Option<tokio::time::Instant>,
 ) -> Result<()> {
     if !force
         && let Ok(outer) = std::env::var("PTY_SESSION")
@@ -6994,7 +7030,8 @@ async fn attach_terminal(
         .filter(|(_, sessions)| !sessions.is_empty());
     let daemon = format!("st daemon at {}", endpoint_label(endpoint));
     let mut consult = std::pin::pin!(consult_attach(client, subject));
-    let answer = match tokio::time::timeout(LOCAL_ATTACH_CONSULT, consult.as_mut()).await {
+    let deadline = budget.unwrap_or_else(|| tokio::time::Instant::now() + LOCAL_ATTACH_CONSULT);
+    let answer = match tokio::time::timeout_at(deadline, consult.as_mut()).await {
         Ok(answer) => answer,
         Err(_) => match (&local, pty_root) {
             (Some((root, sessions)), _) => {
@@ -7004,6 +7041,9 @@ async fn attach_terminal(
                 );
                 let code = attach_unconsulted(root, subject, sessions, &waited).await?;
                 return terminal_exit(code);
+            }
+            (None, _) if budget.is_some() => {
+                anyhow::bail!("st terminals attach: daemon did not answer within 1 s and no local PTY session matches `{subject}`");
             }
             (None, Some(root)) => {
                 eprintln!(
@@ -10244,15 +10284,14 @@ async fn session_incarnation(client: &Client, subject: &str) -> Result<String> {
         .with_context(|| format!("subject `{subject}` has no live incarnation"))
 }
 
-/// Resolves a short name such as `steward` to one exact subject of `entity` through the
-/// short-name ladder (docs/st3/cli-completion/spec.md). A word the ladder cannot match, or any
-/// word while the daemon does not answer within the deadline, keeps the literal
-/// `<namespace>/<word>` meaning, so commands that work without the daemon still do.
+/// Resolves against all subjects of the kind. Destructive verbs use exact matching only;
+/// navigation permits the fuzzy ladder. Unreachable lists retain the literal interpretation.
 async fn resolve_member_subject(
     endpoint: &Endpoint,
     subject: &str,
     namespace: &str,
     entity: Entity,
+    matching: completion::Matching,
 ) -> Result<String> {
     let literal = normalize_member_subject(subject, namespace);
     if subject.contains('/') {
@@ -10269,13 +10308,13 @@ async fn resolve_member_subject(
     };
     let listed = tokio::time::timeout(
         completion::RESOLVE_DEADLINE,
-        completion::candidates(&target, entity),
+        completion::resolution_candidates(&target, entity),
     )
     .await;
     let Ok(Ok(candidates)) = listed else {
         return Ok(literal);
     };
-    match completion::resolve(subject, namespace, &candidates) {
+    match completion::resolve(subject, namespace, &candidates, matching) {
         completion::Resolution::Subject(subject) => Ok(subject),
         completion::Resolution::Unmatched => Ok(literal),
         completion::Resolution::Ambiguous(matches) => {
@@ -10284,10 +10323,11 @@ async fn resolve_member_subject(
                 .map(|candidate| format!("  {}  {}", candidate.subject, candidate.description))
                 .collect::<Vec<_>>()
                 .join("\n");
-            anyhow::bail!(
-                "`{subject}` matches {} subjects; name one exactly:\n{listing}",
+            eprintln!(
+                "st: `{subject}` matches {} subjects; name one exactly:\n{listing}",
                 matches.len()
-            )
+            );
+            Err(CommandExit(2).into())
         }
     }
 }
@@ -11254,6 +11294,7 @@ async fn run_agents(
                 &args.subject,
                 "agent",
                 Entity::Agent { running_only: true },
+                completion::Matching::Exact,
             )
             .await?;
             let kdl = publication_document(kdl_node("stop", [subject.as_str()]));
@@ -11726,7 +11767,7 @@ async fn run_agent_new(
     }
     if args.attach {
         // The daemon has just answered for the new agent, so there is no registry fallback to name.
-        attach_terminal(&client, endpoint, None, person, &subject, false).await?;
+        attach_terminal(&client, endpoint, None, person, &subject, false, None).await?;
     }
     Ok(())
 }
@@ -13340,8 +13381,14 @@ async fn run_attention(
         }
         AttentionCommand::Show { subject, actor } => {
             let actor = configured_human(actor.as_deref(), configured_person, "attention")?;
-            let normalized =
-                resolve_member_subject(endpoint, &subject, "attention", Entity::Attention).await?;
+            let normalized = resolve_member_subject(
+                endpoint,
+                &subject,
+                "attention",
+                Entity::Attention,
+                completion::Matching::Fuzzy,
+            )
+            .await?;
             let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
             let item = client
                 .get::<Vec<AttentionItemView>>(&path)

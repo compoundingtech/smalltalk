@@ -42,20 +42,23 @@
 - **R06 Bounded latency:** One TAB finishes its daemon requests within 300 ms, or offers no
   entity candidates.
 - **R07 Silent failure:** When the daemon is unreachable, slow, or fails, completion offers no
-  entity candidates and writes nothing to the terminal.
+  fresh entity candidates and writes nothing to the terminal. A successful terminal suggestion
+  cache may be reused for at most 1 s.
 
 ### Must accept short names
 
 - **R08 Prefix matching:** Completion matches typed text against the start of the full subject in
   every shell.
 - **R09 Short-name resolution:** A command that takes a terminal, agent, mission run, or attention
-  item accepts a unique short name (for example `st terminals attach steward`). A short name that
-  matches several subjects fails and lists them.
+  item accepts a unique short name (for example `st terminals attach steward`). Resolution sees
+  all subjects of the kind. Destructive verbs accept only exact namespace or last-segment names.
+  A short name that matches several subjects fails with status 2 and lists them.
 - **R10 Literal compatibility:** A word that resolves to nothing, or any word while the daemon does
-  not answer, keeps its previous meaning.
+  not answer, keeps its previous meaning. Bare-word attach must resolve and consult within the
+  existing 1 s budget or fail fast; a full subject preserves offline attachment.
 
 ### Must install with st
 
 - **R11 Installed stubs:** An installed st package ships zsh, fish, and bash completion that call
-  back into that package's st executable.
-- **R12 Printable stub:** `st completions <shell>` prints the same stub for manual installation.
+  back into the PATH-resolved `st` executable.
+- **R12 Printable stub:** `st completions <shell>` prints the same PATH-based stub for manual installation.
