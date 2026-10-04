@@ -466,6 +466,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/agents/source-offline", post(override_placement_source))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
+        .route("/v1/internal/seat-snapshot", post(seat_snapshot_chunk))
         .route("/v1/agents/native-session", post(report_native_session))
         .route("/v1/missions/{id}", get(get_mission))
         .route("/v1/missions/{id}/retire", post(retire_mission))
@@ -1944,6 +1945,8 @@ fn client_suspension(suspension: &crate::suspension::Suspension) -> Value {
         "code": suspension.code,
         "reason": suspension.reason,
         "blocking": suspension.blocking,
+        "source_host": suspension.source_host,
+        "host": suspension.host,
     })
 }
 
@@ -2173,7 +2176,7 @@ fn client_agent_resources_uncached(
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
                 Some("suspended") if fault.is_none() => "suspended",
-                Some("snapshotting" | "restoring") if state == "stopped" => "suspended",
+                Some("snapshotting" | "fencing-source" | "transferring" | "restoring") if state == "stopped" => "suspended",
                 _ => state,
             };
             let runtime_id = fields
@@ -8884,6 +8887,8 @@ async fn start_mission_seat(
 
 #[derive(Deserialize)]
 pub(crate) struct AgentSuspensionRequest {
+    #[serde(default)]
+    pub host: Option<String>,
     pub subject: String,
     pub actor: String,
     pub idempotency_key: String,
@@ -9094,6 +9099,63 @@ pub(crate) fn request_suspend(
     Ok(claim)
 }
 
+#[derive(Deserialize, Serialize)]
+pub(crate) struct SnapshotReadRequest {
+    pub subject: String,
+    pub suspend_operation: String,
+    pub resume_operation: String,
+    pub actor: String,
+    pub offset: u64,
+}
+
+async fn seat_snapshot_chunk(
+    State(state): State<AppState>,
+    Json(request): Json<SnapshotReadRequest>,
+) -> Result<Json<Value>, ApiError> {
+    person_or_agent_actor(&request.actor, "invalid-resume-actor")?;
+    let suspension = crate::suspension::current(&state.store, &request.subject)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("no suspension"))?;
+    if suspension.operation_id != request.resume_operation
+        || suspension.suspend_operation_id.as_deref() != Some(&request.suspend_operation)
+        || suspension.source_host.as_deref() != Some(&state.node)
+        || suspension.requested_by.as_deref() != Some(&request.actor)
+        || !matches!(suspension.phase.as_str(), "fencing-source" | "transferring")
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-fence",
+            "snapshot read does not name the current move",
+        )));
+    }
+    let completed = state
+        .store
+        .operation_claim(&crate::suspension::suspend_completed_key(
+            &request.suspend_operation,
+        ))
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("source is not suspended"))?;
+    if completed.origin != state.node {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-fence",
+            "snapshot belongs to another source",
+        )));
+    }
+    let sources = crate::placement::latest_by_origin(&state.store, &request.subject, u64::MAX)
+        .map_err(ApiError::internal)?;
+    if !sources
+        .get(&state.node)
+        .is_some_and(|claim| crate::placement::field(claim, "status") == Some("stopped"))
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-fence",
+            "source runtime has not acknowledged its stop",
+        )));
+    }
+    crate::seat_snapshot::chunk(&state.state_dir, &request.suspend_operation, request.offset)
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
 /// Ask the seat's owner to resume a suspended seat on the native session it suspended.
 async fn resume_agent(
     State(state): State<AppState>,
@@ -9128,19 +9190,50 @@ pub(crate) fn request_resume(
     let suspend = suspension.suspend_operation_id.clone().ok_or_else(|| {
         ApiError::internal(anyhow::anyhow!("a suspension without its suspend request"))
     })?;
+    let host = request.host.unwrap_or_else(|| member.host.clone());
+    if host.is_empty() || host.contains('/') {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-host",
+            "resume needs a host name",
+        )));
+    }
+    let mut fields = BTreeMap::from([
+        ("action".into(), Value::String("resume".into())),
+        (
+            "runtime_id".into(),
+            Value::String(member.runtime_id.clone()),
+        ),
+    ]);
+    if host != member.host {
+        let membership = state.store.fleet_membership().map_err(ApiError::internal)?;
+        if host != state.node
+            && !state.configured_peers.contains(&host)
+            && !matches!(
+                membership.state(&host),
+                crate::fleet::MemberState::Current(_)
+            )
+        {
+            return Err(ApiError::bad(St3Error::new(
+                "unknown-host",
+                "the resume target is not a current fleet member",
+            )));
+        }
+        if !matches!(suspension.harness.as_deref(), Some("pi" | "omp")) {
+            return Err(ApiError::bad(St3Error::new(
+                "snapshot-harness-unsupported",
+                "cross-host resume currently supports pi and omp portable transcripts",
+            )));
+        }
+        fields.insert("host".into(), Value::String(host));
+        fields.insert("source_host".into(), Value::String(member.host.clone()));
+    }
     let claim = state
         .store
         .append_claim(&ClaimInput {
             subject,
             kind: "runtime.action.requested".into(),
             actor: Some(actor),
-            fields: BTreeMap::from([
-                ("action".into(), Value::String("resume".into())),
-                (
-                    "runtime_id".into(),
-                    Value::String(member.runtime_id.clone()),
-                ),
-            ]),
+            fields,
             evidence: vec![token, suspend],
             expected_subject: None,
             idempotency_key: Some(key),

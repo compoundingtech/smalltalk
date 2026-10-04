@@ -1017,6 +1017,10 @@ pub struct HarnessTodoTotals {
 /// Where a seat's latest suspend or resume stands.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentSuspension {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub source_host: Option<String>,
     /// `suspend` or `resume`.
     pub action: String,
     /// suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running).
@@ -2946,6 +2950,8 @@ pub struct AgentSuspendParameters {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResumeParameters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub agent: String,
 }
 

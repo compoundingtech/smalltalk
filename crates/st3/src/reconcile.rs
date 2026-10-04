@@ -707,6 +707,8 @@ pub struct Reconciler<R = NativeRuntime> {
     host: String,
     endpoint: String,
     driver_state_dir: PathBuf,
+    client_relay: Option<crate::peer::ClientRelay>,
+    incoming_resumes: Arc<Mutex<BTreeSet<String>>>,
     /// The `ST3_BIN` members get; see [`st_binary_link`]. Without one they get the executable.
     st_binary: Option<PathBuf>,
     runtime_environment: BTreeMap<String, String>,
@@ -840,6 +842,8 @@ impl Reconciler<NativeRuntime> {
             host,
             endpoint,
             driver_state_dir: state_dir.join("drivers"),
+            client_relay: None,
+            incoming_resumes: Arc::default(),
             st_binary: Some(publish_st_binary(state_dir)?),
             runtime_environment: BTreeMap::from([
                 (
@@ -916,6 +920,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             host,
             endpoint: "unused-test-endpoint".into(),
             driver_state_dir: std::env::temp_dir().join("st3-test-drivers"),
+            client_relay: None,
+            incoming_resumes: Arc::default(),
             st_binary: None,
             runtime_environment: BTreeMap::new(),
             notify,
@@ -969,6 +975,96 @@ impl<R: RuntimeControl> Reconciler<R> {
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
         }
+    }
+
+    pub fn with_client_relay(mut self, relay: Option<crate::peer::ClientRelay>) -> Self {
+        self.client_relay = relay;
+        self
+    }
+
+    fn incoming_resumes(&self, desired: &[DesiredSubject]) -> Result<()> {
+        for subject in desired {
+            let Some(member) = &subject.member else {
+                continue;
+            };
+            if member.host == self.host {
+                continue;
+            }
+            let Some(suspension) = crate::suspension::current(&self.store, &subject.subject)?
+            else {
+                continue;
+            };
+            if suspension.host.as_deref() != Some(&self.host)
+                || !matches!(suspension.phase.as_str(), "fencing-source" | "transferring")
+            {
+                continue;
+            }
+            let Some(relay) = self.client_relay.clone() else {
+                self.fail_suspension(
+                    &subject.subject,
+                    &suspension,
+                    "source-unavailable",
+                    "this host has no peer client-read route".into(),
+                    Vec::new(),
+                )?;
+                continue;
+            };
+            let mut incoming = self
+                .incoming_resumes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !incoming.insert(suspension.operation_id.clone()) {
+                continue;
+            }
+            let store = self.store.clone();
+            let subject = subject.clone();
+            let state = self
+                .driver_state_dir
+                .parent()
+                .context("drivers have no state directory")?
+                .to_path_buf();
+            let notify = self.notify.clone();
+            let events = self.event_notify.clone();
+            let incoming = self.incoming_resumes.clone();
+            tokio::spawn(async move {
+                let result = crate::seat_snapshot::transfer(
+                    store.clone(),
+                    relay,
+                    state.clone(),
+                    subject.clone(),
+                    suspension.clone(),
+                )
+                .await;
+                if let Err(error) = result {
+                    let _ = store.append_claim(&ClaimInput {
+                        subject: subject.subject,
+                        kind: "runtime.action.failed".into(),
+                        actor: suspension.requested_by.clone(),
+                        fields: BTreeMap::from([
+                            ("action".into(), "resume".into()),
+                            ("code".into(), crate::seat_snapshot::code(&error).into()),
+                            ("reason".into(), format!("{error:#}").into()),
+                        ]),
+                        evidence: vec![suspension.operation_id.clone()],
+                        expected_subject: None,
+                        idempotency_key: Some(crate::suspension::resume_failed_key(
+                            &suspension.operation_id,
+                        )),
+                    });
+                }
+                incoming
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&suspension.operation_id);
+                notify.notify_one();
+                events.send_modify(|n| *n = n.saturating_add(1));
+                let _ = std::fs::write(
+                    state.join("replication.wake"),
+                    uuid::Uuid::now_v7().to_string(),
+                );
+            });
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -1794,6 +1890,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         drop(_runners_span);
         let desired_span = crate::profile::span("pass/desired");
         let mut desired = self.store.desired_subjects()?;
+        self.incoming_resumes(&desired)?;
         let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
         drop(desired_span);
         for subject in &mut desired {
@@ -4946,6 +5043,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                 else {
                     unreachable!("blockers require a bound native session");
                 };
+                if let Err(error) = crate::seat_snapshot::workspace(self.driver_state_dir.parent().unwrap(), agent, &suspension.operation_id, member) {
+                    return self.fail_suspension(agent, suspension, crate::seat_snapshot::code(&error), format!("{error:#}"), Vec::new());
+                }
+                let blocking = suspended::blockers(&self.store, agent, incarnation)?;
+                if !blocking.is_empty() {
+                    return self.fail_suspension(agent, suspension, "not-quiescent", "the seat became active while its workspace was captured".into(), blocking);
+                }
                 self.record_suspension_phase(
                     agent,
                     suspension,
@@ -4957,6 +5061,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             Value::String("snapshotting".into()),
                         ),
                         ("harness".into(), Value::String(harness)),
+                        ("source_host".into(), Value::String(self.host.clone())),
                         ("native_session_id".into(), Value::String(session)),
                         ("incarnation_id".into(), Value::String(incarnation.into())),
                         (
@@ -4988,6 +5093,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                     member.shutdown_timeout_ms,
                     None,
                 )?;
+                // A missing portable transcript does not discard single-host continuity.
+                // Cross-host fetch will refuse until a complete archive exists.
+                let _ = crate::seat_snapshot::seal(self.driver_state_dir.parent().unwrap(), &self.store, agent, member, suspension);
                 self.record_suspension_phase(
                     agent,
                     suspension,
@@ -5012,7 +5120,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ]),
                 )
             }
-            "suspended" => {
+            "suspended" | "fencing-source" | "transferring" => {
                 // A resume that failed after its launch leaves a process to end.
                 if let Some(observation) = running {
                     self.record_member(subject, observation, true)?;
@@ -5030,6 +5138,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 Ok(())
             }
             "restoring" => {
+                if suspension.host.as_deref().is_some_and(|host| host != self.host) { return Ok(()); }
+                if suspension.host.is_some()
+                    && let Some(token) = self.store.selected_desired_token(agent)?
+                    && let Some(handoff) = crate::placement::handoff(&self.store, agent, &token, u64::MAX)?
+                    && !handoff.pending_sources.is_empty()
+                { return Ok(()); }
                 if running.is_some() || !ended {
                     // A launch from an earlier pass is already under way; verify it.
                     return self.record_suspension_phase(

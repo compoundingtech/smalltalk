@@ -85,6 +85,7 @@ const api = {
   // The native handoff: the provider takes the text as a user turn, raises `context` with it, and
   // the model answers. Delivered and read evidence come from the extension, not from here.
   sendUserMessage: async (content) => {
+    fs.appendFileSync(sessionFile, JSON.stringify({ type: 'message', message: { role: 'user', content: [{ type: 'text', text: content }] } }) + '\n');
     record('turn', { text: content });
     await events.get('context')?.({ messages: [{ role: 'user', content }] }, ctx);
     setTimeout(() => act(content), 0);

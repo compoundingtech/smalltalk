@@ -259,7 +259,10 @@ stayed held.
 
 `agents suspend` is a mutation. Suspend only a seat we agreed to stop. Check that a busy seat is
 refused with its reasons, that a quiet one shows `suspended` with its native session in `agents
-show`, and that `agents resume` reports the same session.
+show`, and that `agents resume` reports the same session. `agents resume --host HOST` carries a pi
+or omp snapshot to another fleet host under the same seat identity. The target needs the same
+absolute workspace path, unoccupied; non-Git workspaces refuse suspend. Follow `suspension.phase`
+and the typed refusal reason in `agents show`.
 
 `agents new --print-kdl` shows the seat declaration without applying it. Check that its workspace is
 a new directory below that host's home and that the harness defaults match the fleet's existing

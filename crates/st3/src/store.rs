@@ -11891,6 +11891,48 @@ impl Store {
         launch_lineage_tx(&connection, subject)
     }
 
+    /// Commit one restored move against the exact declaration its resume request named.
+    /// The evidence keeps that suspension alive across this one placement change.
+    pub(crate) fn place_resumed_seat(
+        &self,
+        subject: &str,
+        expected: &str,
+        operation: &str,
+        host: &str,
+        actor: &str,
+    ) -> Result<ClaimRecord, St3Error> {
+        self.connection.batched(|transaction| {
+            let current = current_desired_row_tx(transaction, subject).map_err(internal)?
+                .ok_or_else(|| St3Error::new("stale-fence", "seat declaration disappeared"))?;
+            let current_claim = claim_by_id_tx(transaction, &current.claim_id).map_err(internal)?.unwrap();
+            if current_claim.body["evidence"].as_array().is_some_and(|items| items.iter().any(|id| id.as_str() == Some(operation))) {
+                return Ok(current_claim);
+            }
+            if current.claim_id != expected { return Err(St3Error::new("stale-fence", "seat declaration changed during transfer")); }
+            let latest: String = transaction.query_row(
+                &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='runtime.action.requested' AND json_extract(body,'$.fields.action') IN ('suspend','resume') ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                [subject], |row| row.get(0)).map_err(internal)?;
+            if latest != operation { return Err(St3Error::new("stale-fence", "another suspension request replaced this move")); }
+            let mut desired: DesiredSubject = serde_json::from_value(current_claim.body.clone()).map_err(internal)?;
+            let member = desired.member.as_mut().ok_or_else(|| St3Error::new("stale-fence", "seat has no member"))?;
+            member.host = host.into();
+            let children = desired.desired["children"].as_array_mut().ok_or_else(|| St3Error::new("invalid-agent-declaration", "seat has no body"))?;
+            if let Some(child) = children.iter_mut().find(|child| child["name"] == "host") {
+                child["arguments"] = json!([host]);
+            } else { children.push(json!({"name": "host", "arguments": [host]})); }
+            let identity = subject.strip_prefix("agent/").unwrap_or(subject);
+            if let Some(child) = children.iter_mut().find(|child| child["name"] == "identity") {
+                child["arguments"] = json!([identity]);
+            } else { children.push(json!({"name": "identity", "arguments": [identity]})); }
+            let mut body = serde_json::to_value(&desired).map_err(internal)?;
+            body["evidence"] = json!([operation]);
+            let predecessors = intent_leaves_tx(transaction, subject).map_err(internal)?;
+            let claim = append_claim_tx(transaction, &self.origin, subject, "intent.desired", Some(actor), &body, &predecessors, None).map_err(internal)?;
+            select_replicated_desired(transaction, &claim, &desired)?;
+            Ok(claim)
+        }).map_err(|error| St3Error::new("internal", error))?
+    }
+
     /// `selected_desired_token` of each of `subjects` that has a declaration, in one statement.
     pub fn selected_desired_tokens(&self, subjects: &[&str]) -> Result<BTreeMap<String, String>> {
         let connection = self.readers.get();

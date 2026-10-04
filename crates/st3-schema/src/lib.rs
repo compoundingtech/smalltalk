@@ -2787,6 +2787,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "runtime.action.requested" => &[
             ("action", string()),
+            ("host", string()),
+            ("source_host", string()),
             ("rollout", object()),
             ("operation", string()),
             ("runtime_id", string()),
@@ -2800,6 +2802,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         | "runtime.action.failed"
         | "runtime.action.deadline-reached" => &[
             ("action", string()),
+            ("source_host", string()),
             ("rollout", object()),
             ("operation", string()),
             ("runtime_id", string()),

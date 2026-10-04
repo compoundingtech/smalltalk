@@ -157,6 +157,7 @@ export type AgentRepository = {
 
 export type AgentResumeParameters = {
   agent: Id;
+  host?: string;
 };
 
 export type AgentStartParameters = {
@@ -191,11 +192,13 @@ export type AgentSuspension = {
   blocking: Array<string>;
   code?: string | null;
   harness?: string | null;
+  host?: string | null;
   incarnation_id?: string | null;
   native_session_id?: string | null;
   operation_id: string;
-  phase: "quiescing" | "snapshotting" | "suspended" | "failed" | "restoring" | "verifying" | "resumed";
+  phase: "quiescing" | "snapshotting" | "suspended" | "failed" | "fencing-source" | "transferring" | "restoring" | "verifying" | "resumed";
   reason?: string | null;
+  source_host?: string | null;
   suspended_at?: (Timestamp | null);
   updated_at: Timestamp;
 };

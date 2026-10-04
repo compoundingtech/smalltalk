@@ -8258,6 +8258,7 @@ async fn dispatch_action(
                 actor: authority_actor.clone(),
                 idempotency_key: request.idempotency_key.clone(),
                 reason,
+                host: if action == "agent.resume" { p.get("host").and_then(Value::as_str).map(str::to_owned) } else { None },
             };
             let fence = super::SuspensionFence {
                 incarnation,
