@@ -1144,12 +1144,18 @@ pub(crate) struct MessageCacheEntry {
 
 #[cfg(test)]
 impl Store {
-    /// Hold more read connections than the pool keeps idle, as a burst of long reads does.
+    /// Hold every read connection the pool has, as a burst of long reads does, so a read
+    /// inside has to open another.
     pub(crate) fn hold_read_connections_for_test(&self, hold: impl FnOnce()) {
-        let _guards: Vec<_> = (0..IDLE_READ_CONNECTIONS + 4)
-            .map(|_| self.readers.get())
-            .collect();
+        let idle_count = self
+            .readers
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let guards: Vec<_> = (0..idle_count).map(|_| self.readers.get()).collect();
         hold();
+        drop(guards);
     }
 
     pub(crate) fn hold_writer_for_test(&self, hold: impl FnOnce()) {
@@ -28596,8 +28602,10 @@ agent "test/empty" { command "true" }
         }
         release.send(()).unwrap();
         holder.join().unwrap();
-        // The pool keeps only so many between reads; the rest closed.
-        assert!(store.readers.idle.lock().unwrap().len() <= IDLE_READ_CONNECTIONS);
+        // Idle retention does not bound concurrently open connections.
+        assert!(
+            store.readers.idle.lock().unwrap().len() <= max_idle_read_connections()
+        );
     }
 
     #[test]
