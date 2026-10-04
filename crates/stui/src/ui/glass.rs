@@ -1854,10 +1854,10 @@ impl Ui {
             format!("{glyph} {word}"),
             bar(theme::fg(color)),
         ));
-        if let Load::Ready(backlog) = &self.world.mail_backlog {
-            if backlog.count > 0 {
-                spans.push(Span::styled(format!(" · {} undelivered >1h", backlog.count), bar(theme::fg(theme::YELLOW))));
-            }
+        if let Load::Ready(backlog) = &self.world.mail_backlog
+            && backlog.count > 0
+        {
+            spans.push(Span::styled(format!(" · {} undelivered >1h", backlog.count), bar(theme::fg(theme::YELLOW))));
         }
         if let Load::Failed(_) = &self.world.mail_backlog {
             spans.push(Span::styled(" · mail backlog unavailable", bar(theme::fg(theme::YELLOW))));
