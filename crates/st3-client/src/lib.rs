@@ -2,6 +2,7 @@
 //! Typed `st3.client.v0` client. This crate never parses CLI or harness output.
 
 mod contract;
+pub mod device;
 mod generated;
 pub use contract::*;
 pub use generated::*;
@@ -124,6 +125,7 @@ pub struct Client {
     endpoint: Endpoint,
     credential: Option<String>,
     local_person: Option<String>,
+    signing_device: Option<Arc<device::Device>>,
     http: reqwest::Client,
     max_response_bytes: Arc<AtomicUsize>,
     outage_wait: Duration,
@@ -665,6 +667,7 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: None,
             local_person: None,
+            signing_device: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -677,6 +680,7 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: None,
             local_person: Some(person_id.into()),
+            signing_device: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -692,6 +696,7 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: Some(credential.into()),
             local_person: None,
+            signing_device: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -706,6 +711,7 @@ impl Client {
             endpoint: Endpoint::FabricLoopback(base_url.into().trim_end_matches('/').to_owned()),
             credential: None,
             local_person: None,
+            signing_device: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -718,6 +724,7 @@ impl Client {
             endpoint: Endpoint::FabricLoopback(base_url.into().trim_end_matches('/').to_owned()),
             credential: Some(credential.into()),
             local_person: None,
+            signing_device: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -1737,8 +1744,18 @@ impl Client {
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
         fence: Fence,
-        parameters: MessageSendParameters,
+        mut parameters: MessageSendParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
+        let idempotency_key = idempotency_key.into();
+        if parameters.signature.is_none()
+            && let Some(device) = &self.signing_device
+        {
+            parameters.signature = Some(
+                device
+                    .sign_message(&idempotency_key, &parameters)
+                    .map_err(|error| ClientError::Protocol(error.to_string()))?,
+            );
+        }
         let request = ActionRequest::message_send(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await

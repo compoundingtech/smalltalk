@@ -131,6 +131,310 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[tokio::test]
+async fn shared_completion_persists_both_key_types_and_preserves_a_working_device_on_failure() {
+    use st3_client::device::{KeyAlgorithm, Profile, SigningKey, complete};
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    // Admit the signer through a pinned fleet anchor, just as an authenticated joining peer
+    // learns it. A bare transport copy is insufficient evidence of signature acceptance.
+    let anchor = Arc::new(smallclaims::fleet::MemberKey::generate().unwrap().0);
+    state.store.pin_fleet_anchor(anchor.public()).unwrap();
+    state.store.set_member_key(Some(anchor.clone())).unwrap();
+    state.store.append_claim(&st3::model::ClaimInput {
+        subject: "host/signing-node".into(), kind: "fleet.member-admitted".into(), actor: None,
+        fields: serde_json::from_value(json!({ "fleet_id": FLEET, "member_key": anchor.public(), "via": "anchor", "mode": "listening" })).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let gateway = st3::api::fabric_router(state.clone());
+    let http_server = tokio::spawn(async move { axum::serve(listener, gateway).await });
+    let path = root.path().join("client/devices.json");
+    for algorithm in [KeyAlgorithm::Ed25519, KeyAlgorithm::P256] {
+        for import in [false, true] {
+            let key = if import {
+                let document = match algorithm {
+                    KeyAlgorithm::Ed25519 => {
+                        ring::signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                            .unwrap()
+                    }
+                    KeyAlgorithm::P256 => EcdsaKeyPair::generate_pkcs8(
+                        &ECDSA_P256_SHA256_FIXED_SIGNING,
+                        &SystemRandom::new(),
+                    )
+                    .unwrap(),
+                };
+                let key_path = root.path().join("import.der");
+                std::fs::write(&key_path, document.as_ref()).unwrap();
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                SigningKey::import(algorithm, &key_path).unwrap()
+            } else {
+                SigningKey::generate(algorithm).unwrap()
+            };
+            let public = key.public_key().unwrap();
+            let challenge = local
+                .pairing_begin(&PairingBegin {
+                    api_version: st3_client::API_VERSION.into(),
+                    device_name: "CLI device".into(),
+                    person_id: PERSON.into(),
+                    full_control: Some(true),
+                    scopes: None,
+                })
+                .await
+                .unwrap()
+                .value;
+            let previous = std::fs::read(&path).ok();
+            let wrong = complete(
+                &path,
+                &base,
+                &challenge.pairing_id,
+                "wrong-code",
+                key.clone(),
+            )
+            .await;
+            assert!(wrong.is_err());
+            assert_eq!(std::fs::read(&path).ok(), previous);
+            // A concurrent writer must fail before consuming this still-usable code.
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path.with_extension("lock"))
+                .unwrap();
+            lock.try_lock().unwrap();
+            assert!(
+                complete(
+                    &path,
+                    &base,
+                    &challenge.pairing_id,
+                    &challenge.code,
+                    key.clone()
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).ok(), previous);
+            drop(lock);
+            let device = complete(
+                &path,
+                &base,
+                &challenge.pairing_id,
+                &challenge.code,
+                key.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(device.session.person_id, PERSON);
+            assert_eq!(device.session.device_key_chain.len(), 2);
+            // This fixture has no background daemon sealing loop; seal before querying cached verdicts.
+            state.store.replication_snapshot().unwrap();
+            for grant in &device.session.device_key_chain {
+                assert_eq!(state.store.claim_verdict(grant).unwrap(), Verdict::Verified);
+            }
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            let saved = std::fs::read(&path).unwrap();
+            assert!(
+                complete(&path, &base, &challenge.pairing_id, &challenge.code, key)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            let loaded = Profile::load(&path).unwrap().unwrap();
+            assert_eq!(
+                loaded.devices[0]
+                    .signing_key
+                    .as_ref()
+                    .unwrap()
+                    .public_key()
+                    .unwrap(),
+                public
+            );
+            let client = loaded.clients().pop().unwrap();
+            let idem = format!("shared-completion-{algorithm:?}-{import}");
+            let snapshot = client.capabilities().await.unwrap().snapshot.id;
+            let result = client
+                .message_send(
+                    format!("action/{idem}"),
+                    &idem,
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    MessageSendParameters {
+                        to: "agent/alder".into(),
+                        content: "a/b \"quoted\"\nhello Ω".into(),
+                        title: Some("CLI proof".into()),
+                        in_reply_to: None,
+                        session_id: None,
+                        tags: vec!["zeta".into(), "alpha".into()],
+                        attachments: vec![],
+                        signature: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                result
+                    .value
+                    .affected_ids
+                    .iter()
+                    .any(|id| id == &message_subject(&idem))
+            );
+            let claim = state
+                .store
+                .latest_claim(&message_subject(&idem), Some("message.sent"))
+                .unwrap()
+                .unwrap();
+            state.store.replication_snapshot().unwrap();
+            assert_eq!(claim.actor.as_deref(), Some(PERSON));
+            assert_eq!(
+                state.store.claim_signature(&claim.id).unwrap().unwrap().key,
+                public
+            );
+            assert_eq!(
+                state.store.claim_verdict(&claim.id).unwrap(),
+                Verdict::Verified
+            );
+            let member = Store::open_memory("peer").unwrap();
+            member.bind_fleet(FLEET).unwrap();
+            member.pin_fleet_anchor(anchor.public()).unwrap();
+            let exchange = state
+                .store
+                .export_replication_exchange(FLEET, &member.replication_inventory().unwrap())
+                .unwrap();
+            member
+                .receive_replication_exchange("signing-node", FLEET, &exchange)
+                .unwrap();
+            member.validate_replication_backlog().unwrap();
+            member.project_replication_backlog().unwrap();
+            member.judge_claims(true).unwrap();
+            assert_eq!(member.claim_verdict(&claim.id).unwrap(), Verdict::Verified);
+        }
+    }
+    // A local commit failure after remote success must retain the previous key and credential.
+    // The member's consumed code is a separate outcome, not a client-side rollback.
+    let saved = std::fs::read(&path).unwrap();
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Unwritable device".into(),
+            person_id: PERSON.into(),
+            full_control: Some(true),
+            scopes: None,
+        })
+        .await
+        .unwrap()
+        .value;
+    let directory = path.parent().unwrap().to_owned();
+    let write_failure =
+        axum::middleware::map_response(move |response: axum::response::Response| {
+            let directory = directory.clone();
+            async move {
+                if response.status().is_success() {
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o500))
+                        .unwrap();
+                }
+                response
+            }
+        });
+    let app = st3::api::fabric_router(state.clone()).layer(write_failure);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let blocked_base = format!("http://{}", listener.local_addr().unwrap());
+    let blocked_server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let result = complete(
+        &path,
+        &blocked_base,
+        &challenge.pairing_id,
+        &challenge.code,
+        SigningKey::generate(KeyAlgorithm::P256).unwrap(),
+    )
+    .await;
+    std::fs::set_permissions(
+        path.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(result.unwrap_err().to_string().contains("not writable"));
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+    assert!(
+        Profile::load(&path).unwrap().unwrap().clients()[0]
+            .capabilities()
+            .await
+            .is_ok()
+    );
+    assert!(
+        complete(
+            &path,
+            &base,
+            &challenge.pairing_id,
+            &challenge.code,
+            SigningKey::generate(KeyAlgorithm::P256).unwrap()
+        )
+        .await
+        .is_err()
+    );
+    blocked_server.abort();
+    let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+    let public = key.public_key().unwrap();
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Hall display".into(),
+            person_id: PERSON.into(),
+            full_control: None,
+            scopes: Some(vec![
+                "read.projections".into(),
+                "read.glasses".into(),
+                "terminal.read".into(),
+            ]),
+        })
+        .await
+        .unwrap()
+        .value;
+    let device = complete(&path, &base, &challenge.pairing_id, &challenge.code, key)
+        .await
+        .unwrap();
+    assert!(device.signing_key.is_none());
+    assert!(device.session.device_key_chain.is_empty());
+    assert!(
+        Profile::load(&path).unwrap().unwrap().devices[0]
+            .signing_key
+            .is_none()
+    );
+    assert!(
+        state
+            .store
+            .claims_for(PERSON, Some(smallclaims::principal::KEY_GRANTED))
+            .unwrap()
+            .iter()
+            .all(|grant| grant.body["fields"]["key"] != public)
+    );
+    local_server.abort();
+    http_server.abort();
+}
+
 fn state(root: &Path) -> AppState {
     let store = Store::open_memory("signing-node").unwrap();
     store.bind_fleet(FLEET).unwrap();

@@ -40,6 +40,44 @@ Every client's tests check against that file.
    Anything that key signs after the revocation is invalid on every member. What it signed
    before stays verified.
 
+## CLI and stui pairing
+
+On the trusted machine, begin a pairing as the person:
+
+```sh
+st devices pair cli-device --as person/avery --full-control
+```
+
+On the device, complete it using the member gateway's HTTP or HTTPS origin and the returned
+pairing ID. The command prompts privately for the single-use code, or reads it from stdin:
+
+```sh
+st devices complete https://member.example pairing/PAIRING_ID
+```
+
+The default generates a P-256 software key. Use `--algorithm ed25519` for Ed25519. To import
+an existing private key, add `--key-file /absolute/path/device.der` and select its algorithm;
+the file must contain DER PKCS#8, belong to your user, and have private permissions (0600).
+The import file is read without following symlinks and is never changed.
+
+The bearer credential, delegation chain and private key are stored together in one mode-0600
+profile, `$XDG_CONFIG_HOME/st3/stui-devices.json` (or `~/.config/st3/stui-devices.json`).
+`--profile /absolute/path/devices.json` selects another profile in a private directory.
+One atomic rename replaces both credential and key together; concurrent updates are refused.
+Wrong or reused codes, invalid keys and failures before that commit leave the existing profile
+unchanged. If a member has consumed the code before a local failure, begin a new pairing to retry.
+Neither ordinary output nor `--json` prints the bearer or private key.
+
+`stui pair https://member.example pairing/PAIRING_ID` uses the same key generation and
+persistence, and paired stui messages are signed using the saved key and chain. Existing legacy
+profiles remain readable. A pairing without `control.messages`, including `--read-only`,
+enrolls no signing key and persists no private signing material.
+
+Completion checks the private key with a local signing self-test before sending the existing
+pairing request. It does not add a server proof-of-possession requirement or send a message.
+The shared signer's integration tests complete both key types, reload their profiles, send real
+signed messages, and check `Verified` verdicts on the accepting member and a receiving peer.
+
 ## Signing a message
 
 The device adds `parameters.signature` to `message.send`. Servers that predate this ignore it.

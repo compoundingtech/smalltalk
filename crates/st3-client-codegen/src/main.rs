@@ -301,10 +301,17 @@ fn rust_operation_methods(
     for (action, definition) in actions {
         let method = action_method(action);
         let parameters = action_parameter(action, definition)?;
-        writeln!(
-            out,
-            "    pub async fn {method}(&self, id: impl Into<String>, idempotency_key: impl Into<String>, fence: Fence, parameters: {parameters}) -> Result<Envelope<ActionResult>, ClientError> {{ let request = ActionRequest::{method}(id, idempotency_key, fence, parameters).map_err(|error| ClientError::Protocol(error.to_string()))?; self.action_internal(&request).await }}"
-        )?;
+        if action == "message.send" {
+            writeln!(
+                out,
+                "    pub async fn {method}(&self, id: impl Into<String>, idempotency_key: impl Into<String>, fence: Fence, mut parameters: {parameters}) -> Result<Envelope<ActionResult>, ClientError> {{ let idempotency_key = idempotency_key.into(); if parameters.signature.is_none() && let Some(device) = &self.signing_device {{ parameters.signature = Some(device.sign_message(&idempotency_key, &parameters).map_err(|error| ClientError::Protocol(error.to_string()))?); }} let request = ActionRequest::{method}(id, idempotency_key, fence, parameters).map_err(|error| ClientError::Protocol(error.to_string()))?; self.action_internal(&request).await }}"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "    pub async fn {method}(&self, id: impl Into<String>, idempotency_key: impl Into<String>, fence: Fence, parameters: {parameters}) -> Result<Envelope<ActionResult>, ClientError> {{ let request = ActionRequest::{method}(id, idempotency_key, fence, parameters).map_err(|error| ClientError::Protocol(error.to_string()))?; self.action_internal(&request).await }}"
+            )?;
+        }
     }
     Ok(out.trim_end().to_owned())
 }

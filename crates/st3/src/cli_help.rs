@@ -238,6 +238,10 @@ pub(super) fn pairing_next_steps(person: &str) -> String {
     next_steps(
         "Waiting for your device — enter the pairing code in its st client before it expires.",
         &[
+            (
+                "Complete on the device",
+                "st devices complete MEMBER_URL PAIRING_ID".to_owned(),
+            ),
             ("Show paired devices", format!("st devices --as {person}")),
             (
                 "Pair again",

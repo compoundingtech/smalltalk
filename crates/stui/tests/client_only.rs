@@ -132,8 +132,11 @@ impl Tui {
 }
 
 fn state(root: &Path, node: &str) -> AppState {
+    let store = Store::open_memory(node).unwrap();
+    // Real pairing now enrolls a key; the member must hold its node authority to grant it.
+    store.set_node_key(Arc::new(smallclaims::fleet::MemberKey::generate().unwrap().0)).unwrap();
     AppState {
-        store: Arc::new(Store::open_memory(node).unwrap()),
+        store: Arc::new(store),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0).0,
         node: node.into(),
@@ -217,6 +220,10 @@ async fn pair(root: &Path, local: &Client, url: &str) {
         .await
         .unwrap()
         .value;
+    complete_challenge(root, url, &challenge).await;
+}
+
+async fn complete_challenge(root: &Path, url: &str, challenge: &st3_client::PairingChallenge) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_stui"))
         .args(["pair", url, &challenge.pairing_id])
         .env_clear()
@@ -240,6 +247,121 @@ async fn pair(root: &Path, local: &Client, url: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains(&challenge.code));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stui_pair_persists_a_real_signing_key_and_leaves_read_only_devices_without_one() {
+    use st3_client::{Fence, MessageSendParameters, device::Profile};
+    use std::os::unix::fs::PermissionsExt as _;
+    let member = tempfile::tempdir().unwrap();
+    let device = tempfile::tempdir().unwrap();
+    let state = state(member.path(), "member");
+    state
+        .store
+        .bind_fleet("3c9a1f2e-8b7d-4e6c-a5f4-1d2e3c4b5a69")
+        .unwrap();
+    state
+        .store
+        .set_node_key(Arc::new(
+            smallclaims::fleet::MemberKey::generate().unwrap().0,
+        ))
+        .unwrap();
+    let trusted = member.path().join("trusted.sock");
+    let app = st3::api::router(state.clone());
+    let served = trusted.clone();
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    let local = Client::unix_as(&trusted, "person/avery");
+    for _ in 0..100 {
+        if local.capabilities().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let http_server = tokio::spawn(async move { axum::serve(listener, app).await });
+    pair(device.path(), &local, &url).await;
+    let path = device.path().join("config/st3/stui-devices.json");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let profile = Profile::load(&path).unwrap().unwrap();
+    let key = profile.devices[0]
+        .signing_key
+        .as_ref()
+        .unwrap()
+        .public_key()
+        .unwrap();
+    assert!(key.starts_with("p256:"));
+    state.store.replication_snapshot().unwrap();
+    for grant in &profile.devices[0].session.device_key_chain {
+        assert_eq!(
+            state.store.claim_verdict(grant).unwrap(),
+            smallclaims::principal::Verdict::Verified
+        );
+    }
+    let client = profile.clients().pop().unwrap();
+    let snapshot = client.capabilities().await.unwrap().snapshot.id;
+    let result = client
+        .message_send(
+            "action/stui-device-pair-proof",
+            "stui-device-pair-proof",
+            Fence {
+                snapshot_id: snapshot,
+                ..Fence::default()
+            },
+            MessageSendParameters {
+                to: "agent/alder".into(),
+                content: "Signed after stui pairing".into(),
+                title: None,
+                in_reply_to: None,
+                session_id: None,
+                tags: vec![],
+                attachments: vec![],
+                signature: None,
+            },
+        )
+        .await
+        .unwrap();
+    let subject = result
+        .value
+        .affected_ids
+        .iter()
+        .find(|id| id.starts_with("message/"))
+        .unwrap();
+    let claim = state
+        .store
+        .latest_claim(subject, Some("message.sent"))
+        .unwrap()
+        .unwrap();
+    state.store.replication_snapshot().unwrap();
+    assert_eq!(
+        state.store.claim_signature(&claim.id).unwrap().unwrap().key,
+        key
+    );
+    assert_eq!(
+        state.store.claim_verdict(&claim.id).unwrap(),
+        smallclaims::principal::Verdict::Verified
+    );
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Display".into(),
+            person_id: "person/avery".into(),
+            full_control: None,
+            scopes: Some(vec!["read.projections".into()]),
+        })
+        .await
+        .unwrap()
+        .value;
+    complete_challenge(device.path(), &url, &challenge).await;
+    let profile = Profile::load(&path).unwrap().unwrap();
+    assert!(profile.devices[0].signing_key.is_none());
+    assert!(profile.devices[0].session.device_key_chain.is_empty());
+    local_server.abort();
+    http_server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
