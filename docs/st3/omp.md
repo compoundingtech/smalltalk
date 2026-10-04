@@ -33,6 +33,9 @@ Relative or missing paths, invalid filenames or headers, non-empty inventories a
 (including dangling) directory links are left untouched; the driver log records a typed
 `authored_resume_link_skipped` reason. A legacy directory may contain several sessions; the channel
 still looks up the reported UUID. This does not backfill an already-running driver's binding.
+Conversation readers use the current incarnation's exact native binding (session ID and path),
+not the newest sibling in that directory. An unreadable bound transcript, or a linked inventory
+without a current binding, stays unavailable rather than displaying another seat's conversation.
 
 Messages delivered during a running turn are held until the current tool batch returns. A tool call
 that runs longer than the hold limit can still be backgrounded. Read the exact graph message with

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use st3::api::AppState;
 use st3::model::{ClaimInput, IntentInput, PlannerSpec};
@@ -23,7 +23,10 @@ async fn authored_omp_resume_publishes_binding_from_an_empty_managed_directory()
     let transcript = legacy.join(format!("2026-10-04_{id}.jsonl"));
     std::fs::write(
         &transcript,
-        format!("{}\n", json!({"type":"session","id":id})),
+        format!("{}\n{}\n",
+            json!({"type":"session","id":id,"timestamp":"2026-09-25T14:00:00Z","cwd":root.path()}),
+            json!({"type":"message","id":"answer-a","message":{"role":"assistant","content":[{"type":"text","text":"Seat A's resumed conversation"}]}})
+        ),
     )
     .unwrap();
     let drivers = root.path().join("drivers");
@@ -155,6 +158,36 @@ agent "garden/worker" {{
     let binding = store
         .latest_claim(subject, Some("harness.session-file"))
         .unwrap();
+    let client = st3::client::Client::unix(socket.clone());
+    let sessions: Value = client.get("/v1/client/sessions").await.unwrap();
+    let session_id = sessions["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["owner_id"] == subject)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let timeline_path = format!(
+        "/v1/client/sessions/{}/timeline",
+        urlencoding::encode(session_id)
+    );
+    let before: Value = client.get(&timeline_path).await.unwrap();
+    assert!(
+        before["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["body"]["text"] == "Seat A's resumed conversation")
+    );
+    // Exercise the actual timeline endpoint after another seat writes a newer sibling.
+    let sibling_id = "9927ab58-9d80-4c97-b92d-0c17f688b331";
+    std::fs::write(legacy.join(format!("2026-10-05_{sibling_id}.jsonl")), format!("{}\n{}\n",
+        json!({"type":"session","id":sibling_id,"timestamp":"2026-10-05T16:00:00Z","cwd":root.path()}),
+        json!({"type":"message","id":"answer-b","message":{"role":"assistant","content":[{"type":"text","text":"Seat B's unrelated conversation"}]}})
+    )).unwrap();
+    let after: Value = client.get(&timeline_path).await.unwrap();
+    assert_eq!(after["items"], before["items"]);
     std::fs::write(&stop, "").unwrap();
     let output = completion.await.unwrap();
     server.abort();
