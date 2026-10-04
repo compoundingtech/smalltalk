@@ -7042,10 +7042,10 @@ impl Store {
                 let last_replicated_expiry = if quiet_renewal {
                     transaction
                         .query_row(
-                            "SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
+                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
                              FROM claims WHERE subject=?1
                                AND kind IN ('work.claimed','work.renewed','work.progress')
-                             ORDER BY store_index DESC LIMIT 1",
+                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                             [&subject],
                             |row| row.get::<_, Option<u64>>(0),
                         )

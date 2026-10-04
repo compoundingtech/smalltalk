@@ -301,7 +301,7 @@ impl Store {
             if view.status != "ready" || step_owner_is_terminal_tx(tx, &subject)? {
                 return Err(St3Error::new("stale-handoff", "this handoff is no longer waiting for acknowledgment"));
             }
-            let seen: Option<String> = tx.query_row("SELECT id FROM claims WHERE subject=?1 AND actor=?2 AND kind IN ('message.read','message.closed') ORDER BY store_index LIMIT 1", params![input.message, input.actor], |row| row.get(0)).optional().map_err(internal)?;
+            let seen: Option<String> = tx.query_row(&canonical_sql("SELECT id FROM claims WHERE subject=?1 AND actor=?2 AND kind IN ('message.read','message.closed') ORDER BY CANONICAL_ASC(claims) LIMIT 1"), params![input.message, input.actor], |row| row.get(0)).optional().map_err(internal)?;
             let receipt = match seen {
                 Some(receipt) => receipt,
                 None => append_claim_tx(tx, &self.origin, &input.message, "message.read", Some(&input.actor), &json!({"fields": {"status": "read"}}), &[], None).map_err(claim_append_error)?.id,

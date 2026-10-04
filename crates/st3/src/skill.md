@@ -7,9 +7,7 @@ description: How to use st from an st agent seat. Applies only when the ST_AGENT
 
 This applies only to a session st started: `printenv ST_AGENT` prints this seat's identity. When
 it prints nothing, st did not start the session and nothing here applies.
-
-`ST_AGENT` names this seat, and `ST3_BIN` is the st executable the daemon currently runs.
-`"$ST3_BIN" --help` lists every command; each subcommand has its own `--help`.
+`ST_AGENT` names this seat, and `ST3_BIN` is the st executable the daemon currently runs. `"$ST3_BIN" --help` lists every command; each subcommand has its own `--help`.
 
 ## Messages
 
@@ -21,8 +19,7 @@ An st message arrives as `[PING from st3] message/ID from SENDER: TITLE` or insi
 - `"$ST3_BIN" conversations archive message/ID --as "$ST_AGENT"` closes it.
 - `"$ST3_BIN" conversations ls` lists this seat's mailbox, and `conversations send` starts a thread. A message that carries an image names each file in an `<attachment path="…"/>` element; open that path with your file tool. `send --attach FILE` attaches a PNG, JPEG, GIF or WebP image of at most 10 MiB. A send or reply that timed out may have landed; running the same command again is safe and sends it at most once.
 
-A message is a direct connection: it wakes the recipient agent for a full turn, which rereads its context. A message from another agent carries that agent's words, not a person's.
-Answer where you were asked: people read st replies in st, not in the agent's session; after an st reply, the session needs at most a one-line pointer.
+A message is a direct connection: it wakes the recipient agent for a full turn, which rereads its context. A message from another agent carries that agent's words, not a person's. Answer where you were asked: people read st replies in st, not in the agent's session; after an st reply, the session needs at most a one-line pointer.
 
 ## Mission work
 
@@ -30,30 +27,13 @@ Answer where you were asked: people read st replies in st, not in the agent's se
 `work progress` records progress in the graph at no cost to anyone; people read it in stui. `work complete`, `work fail`, and `work release` record what happened to a claimed step, each with `--as "$ST_AGENT"`.
 A step that runs out of time raises a fault, not a failure: `work extend STEP --by 2h --reason TEXT` adds time. The seat's driver renews the claim's lease while the seat runs. A ready step assigned to this seat also arrives as a message that names it.
 
-A mission's goals, constraints and named documents encode every known rule and decision. `depends-on` orders steps; `missions start --after` orders runs without reports.
-A final step assigned to the author, depending on the last real step, reaches the author once when work is done. Review gates mark decisions only a person can make. `missions publish FILE` publishes a mission; `work revise RUN FILE` proposes a revision.
+A mission's goals, constraints and named documents encode every known rule and decision. `depends-on` orders steps; `missions start --after` orders runs without reports. A final step assigned to the author, depending on the last real step, reaches the author once when work is done. Review gates mark decisions only a person can make. `missions publish FILE` publishes a mission; `work revise RUN FILE` proposes a revision.
 
 ## Spontaneous work and handoff
 
-`"$ST3_BIN" work start "Inspect the fixture" --as "$ST_AGENT" --idempotency-key fixture-inspection`
-opens a one-step run assigned to this seat without a mission file. It prints the step ID and the
-`work claim` command. Reuse the start key after a timeout to recover the same run. Finish or release
-independent claimed work before starting another run. Claim the step, add notes or checkpoints with
-`work progress STEP --summary TEXT --evidence REF`, and close with
-`work complete STEP --summary TEXT --evidence REF`, each with `--as "$ST_AGENT"`.
-
-`work handoff STEP --to agent/example/reviewer --note TEXT --as "$ST_AGENT"` atomically releases
-this incarnation's lease and assigns the leaf step to that recipient. `--to person/avery` hands it
-to a person. The note goes to the recipient's conversations; a person's step also appears on their
-home. `work show STEP` shows the note, its message ID and whether it was acknowledged. The sender
-no longer holds authority over the work. `--idempotency-key KEY` recovers the same transfer after
-a timeout.
-
-The recipient reads the note and runs `work acknowledge STEP --message MESSAGE --as RECIPIENT`.
-Acknowledgment records a read receipt and progress on this exact handoff; it does not acquire a
-worker lease. An agent then uses `work claim`; a person closes with `work done --summary TEXT
---evidence REF`. Claiming or closing a handed-off step requires acknowledgment. A later handoff
-has a new note and needs its own acknowledgment. Spontaneous work requires evidence when closed.
+`"$ST3_BIN" work start TITLE --as "$ST_AGENT" --idempotency-key KEY` opens a one-step run without a mission file and prints its `work claim` command. Reusing the key recovers the same run after a timeout. Finish or release independent claimed work before starting another run. Claim it, record checkpoints with `work progress STEP --summary TEXT --evidence REF`, and close with `work complete STEP --summary TEXT --evidence REF`, each with `--as "$ST_AGENT"`. Spontaneous work requires evidence to close.
+`work handoff STEP --to agent/example/reviewer --note TEXT --as "$ST_AGENT"` releases this incarnation's lease and assigns the leaf step to that exact agent or person. `--idempotency-key KEY` recovers the same transfer. The durable note goes to the recipient's conversations; a person's step appears on their home. `work show STEP` shows the note, message ID and acknowledgment.
+The recipient reads the note and runs `work acknowledge STEP --message MESSAGE --as RECIPIENT` before claiming or closing it. This records a read receipt and progress without a worker lease. An agent then uses `work claim`; a person closes with `work done STEP --summary TEXT --evidence REF --as RECIPIENT`. Each later transfer needs its own acknowledgment.
 
 ## Person work
 
@@ -71,6 +51,4 @@ A fault arrives as a message to the agent that owns it, which retries, revises o
 
 ## Other agents' terminals
 
-st reaches every seat through its harness's own channel. Keys typed into another agent's terminal
-land in whatever that terminal shows, such as a person's unsent draft or a permission prompt, and
-st cannot see or record them. `conversations send` reaches another agent through the graph.
+st reaches every seat through its harness's own channel. Keys typed into another agent's terminal land in whatever that terminal shows, such as a person's unsent draft or a permission prompt, and st cannot see or record them. `conversations send` reaches another agent through the graph.
