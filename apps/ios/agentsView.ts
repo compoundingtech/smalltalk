@@ -60,7 +60,7 @@ export function agentState(agent: StateAgent): AgentState {
     case 'failed': return 'fault';
     case 'running': return agent.harness_state === 'working' ? 'working' : 'idle';
     // Signed out of its provider: a login on its host fixes it, without a restart (Nathan, 2026-10-04).
-    case 'waiting': return agent.harness_state === 'unauthenticated' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
+    case 'waiting': return agent.harness_state === 'unauthenticated' || agent.harness_state === 'needs-login' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
     case 'starting':
     case 'desired': return 'starting';
     case 'stopped': return 'stopped';

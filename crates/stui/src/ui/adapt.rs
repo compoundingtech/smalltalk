@@ -500,7 +500,7 @@ fn agents(model: &Model) -> Vec<Agent> {
                 ("failed", _) => AgentState::Fault,
                 // Signed out of its provider (Claude "Not logged in · Run /login"): a login on
                 // its host fixes it, not a restart (Nathan, 2026-10-04).
-                ("waiting", Some("unauthenticated")) => AgentState::NeedsLogin,
+                ("waiting", Some("unauthenticated" | "needs-login")) => AgentState::NeedsLogin,
                 ("waiting", _) if agent.reason.as_deref() == Some("providerAuth") => {
                     AgentState::NeedsLogin
                 }
@@ -1469,13 +1469,16 @@ mod tests {
         let mut model = Model::default();
         let resource = |state: &str, harness: &str, reason: Option<&str>| {
             serde_json::json!({
-                "id": "agent/fleet/example/seat", "kind": "agent", "revision": "r1",
-                "updated_at": "2026-10-04T12:00:00Z", "name": "fleet/example/seat",
+                "id": "agent/example/seat", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-04T12:00:00Z", "name": "example/seat",
                 "state": state, "reachability": "local", "harness_state": harness,
                 "blocked_on": "human", "reason": reason, "driver": "claude",
                 "host_id": "host/harbor", "runtime_ids": ["runtime/seat"], "under": [],
             })
         };
+        // st's own word for it (st-drivers' needs-login) reads the same.
+        model.agents = window(vec![resource("waiting", "needs-login", None)]);
+        assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
         model.agents = window(vec![resource("waiting", "unauthenticated", Some("providerAuth"))]);
         let agent = &agents(&model)[0];
         assert_eq!(agent.state, AgentState::NeedsLogin);
