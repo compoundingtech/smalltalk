@@ -6245,7 +6245,7 @@ impl TerminalFollow {
     }
 }
 
-/// Check a viewer's right to follow a terminal and register its gateway lease lifetime.
+/// Check a viewer's right to follow a terminal using its attachment lease.
 fn prepare_terminal_follow(
     state: &AppState,
     session: &ClientSession,
@@ -6893,7 +6893,6 @@ struct TerminalViewer {
     attachment_id: Value,
     raw: bool,
 }
-
 
 impl std::fmt::Debug for TerminalViewer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
