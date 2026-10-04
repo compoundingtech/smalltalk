@@ -1344,6 +1344,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         client_relay: None,
         native_session_home: Some(root.join("home")),
         planner_default: st3::model::PlannerSpec::default(),
+        private_notes: Default::default(),
     };
     let server_socket = socket.clone();
     let server =

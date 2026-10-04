@@ -435,6 +435,7 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
         client_relay: None,
         native_session_home: Some(root.join("home")),
         planner_default: st3::model::PlannerSpec::default(),
+        private_notes: Default::default(),
     };
     // As the daemon does when it starts.
     st3::api::start_operation_report(&state);
@@ -1553,6 +1554,7 @@ async fn send_messages(scratch: &Path, main: &Path, count: usize) {
         client_relay: None,
         native_session_home: None,
         planner_default: st3::model::PlannerSpec::default(),
+        private_notes: Default::default(),
     };
     let server_socket = socket.clone();
     let server =

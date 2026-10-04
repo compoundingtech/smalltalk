@@ -223,6 +223,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn usage_period(&self, since_ms: Option<u64>, until_ms: Option<u64>) -> Result<Envelope<UsagePeriod>, ClientError> {{ let mut query = Vec::new(); if let Some(since_ms) = since_ms {{ query.push(format!(\"since_ms={{since_ms}}\")); }} if let Some(until_ms) = until_ms {{ query.push(format!(\"until_ms={{until_ms}}\")); }} let query = if query.is_empty() {{ String::new() }} else {{ format!(\"?{{}}\", query.join(\"&\")) }}; self.get(&format!(\"/v1/client/usage{{query}}\")).await }}"
             )?;
+        } else if id == "private-notes.get" {
+            writeln!(
+                out,
+                "    pub async fn private_notes_get(&self, uri: &str) -> Result<Envelope<PrivateNotesSubject>, ClientError> {{ self.get(&format!(\"/v1/client/private-notes/{{}}\", percent_encode(uri))).await }}"
+            )?;
         } else if id == "document.get" {
             writeln!(
                 out,
@@ -351,6 +356,11 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func usagePeriod(sinceMS: UInt64? = nil, untilMS: UInt64? = nil) async throws -> Envelope<UsagePeriod> {{ var query: [URLQueryItem] = []; if let sinceMS {{ query.append(.init(name: \"since_ms\", value: String(sinceMS))) }}; if let untilMS {{ query.append(.init(name: \"until_ms\", value: String(untilMS))) }}; return try await get(\"v1/client/usage\", query: query) }}"
+            )?;
+        } else if id == "private-notes.get" {
+            writeln!(
+                out,
+                "    public func privateNotesGet(uri: String) async throws -> Envelope<PrivateNotesSubject> {{ try await get(\"v1/client/private-notes/\\(Self.pathSegment(uri))\") }}"
             )?;
         } else if id == "document.get" {
             writeln!(
@@ -1136,6 +1146,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(options: {{ since_ms?: number; until_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options)); }}"
+            )?;
+        } else if id == "private-notes.get" {
+            writeln!(
+                out,
+                "    async privateNotesGet(uri: string): Promise<EnvelopeOf<PrivateNotesSubject>> {{ return this.get(`/v1/client/private-notes/${{encodeURIComponent(uri)}}`); }}"
             )?;
         } else if id == "document.get" {
             writeln!(
