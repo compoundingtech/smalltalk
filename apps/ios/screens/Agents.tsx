@@ -8,7 +8,7 @@ import { AGENT_LEGEND, agentGlyph, agentRows, agentSections, agentTreeLines, fil
 import { Banners, Empty, StatusLine, useDebugScroll, useListsOnFocus, useRefresh } from '../chrome';
 import { ContextMenu, type MenuAction } from '../menu';
 import type { RootParams } from '../navigation';
-import { sessionDetail } from '../sessionView';
+import { sessionDetail } from '@smalltalk/st3-views';
 import { useStore } from '../store';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Note, Screen, SectionHeader, T } from '../ui';

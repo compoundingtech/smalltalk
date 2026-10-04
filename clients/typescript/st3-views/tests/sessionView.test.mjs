@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, recentTimeline, sessionLabel, timelineText } from './sessionView.ts';
+import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, recentTimeline, sessionLabel, timelineText } from '@smalltalk/st3-views/sessionView';
 
 const managed = { id: 'session/managed', kind: 'session', owner_id: 'agent/one', state: 'running' };
 const exact = { id: 'session/exact', kind: 'session', owner_id: 'external-session/codex/one', state: 'running', managed: false, driver: 'codex', native_session_id: 'one' };

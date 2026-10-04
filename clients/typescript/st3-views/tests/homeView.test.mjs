@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { homeRows, homeSections, onHome } from './homeView.ts';
+import { homeRows, homeSections, onHome } from '@smalltalk/st3-views/homeView';
 
 const now = Date.parse('2026-09-30T12:00:00Z');
 const item = (id, attention_kind, extra = {}) => ({ id: `attention/${id}`, kind: 'attention', attention_kind, title: id, detail: '', priority: 'normal', state: 'open', person_id: 'person/alex', requested_at: '2026-09-30T11:00:00Z', source_id: 'x', actions: [], ...extra });
@@ -40,3 +40,6 @@ const withUpdate = homeRows([
 ], 'person/alex', now);
 assert.deepEqual(withUpdate.map(row => [row.item.id.replace('attention/', ''), row.kind, row.glyph]), [['ask', 'request', '◆'], ['update', 'update', '✦']]);
 assert.deepEqual(homeSections(withUpdate).map(section => section.title), ['somebody is stopped on you', 'when there is time']);
+
+// Renderers choose actual colors; the shared model describes their meaning.
+assert.deepEqual(withUpdate.map(row => row.color), ['person', 'green']);

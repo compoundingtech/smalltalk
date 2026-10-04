@@ -1,6 +1,5 @@
-import type { Attention } from '../../clients/typescript/st3-client';
-import { ago } from './presentation';
-import { theme } from './theme';
+import type { Attention } from '@smalltalk/st3-client';
+import { ago } from './time.ts';
 
 // Home, drawn the way stui draws it (crates/stui/src/ui/screens.rs home_list, adapt.rs
 // attention): the requests and reviews st holds for the person that are not resolved, grouped by
@@ -18,12 +17,14 @@ export function tierTitle(tier: Tier): string {
 }
 
 export type HomeKind = 'review' | 'launch' | 'revision' | 'request' | 'update';
+/** Semantic colors; renderers resolve them through their own palette. */
+export type HomeColor = 'person' | 'green';
 export type HomeRow = {
   item: Attention;
   tier: Tier;
   kind: HomeKind;
   glyph: string;
-  color: string;
+  color: HomeColor;
   title: string;
   /** Who or what is waiting, when st says: `step build`. */
   waiting: string | null;
@@ -44,13 +45,13 @@ export function homeKind(item: Kindish): { tier: Tier; kind: HomeKind } | null {
   }
 }
 
-export function kindGlyph(kind: HomeKind): { glyph: string; color: string } {
-  return kind === 'update' ? { glyph: '✦', color: theme.green } : { glyph: '◆', color: theme.person };
+export function kindGlyph(kind: HomeKind): { glyph: string; color: HomeColor } {
+  return kind === 'update' ? { glyph: '✦', color: 'green' } : { glyph: '◆', color: 'person' };
 }
 
-export const HOME_LEGEND: ReadonlyArray<{ glyph: string; color: string; word: string }> = [
-  { glyph: '◆', color: theme.person, word: 'decide' },
-  { glyph: '✦', color: theme.green, word: 'to read' },
+export const HOME_LEGEND: ReadonlyArray<{ glyph: string; color: HomeColor; word: string }> = [
+  { glyph: '◆', color: 'person', word: 'decide' },
+  { glyph: '✦', color: 'green', word: 'to read' },
 ];
 
 /** Whether Home shows an item: it is not resolved and, when st names a person, it is for this one. */

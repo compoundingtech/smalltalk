@@ -4,7 +4,7 @@ import { agentName } from '../agentsView';
 import { Banners, StatusLine, useDebugScroll, useListsOnFocus, useRefresh } from '../chrome';
 import { gatewayTransport, LAN_HTTP_WARNING } from '../gatewayUrl';
 import { agentHealth, ago, deviceDetail, deviceTitle, queuedWorkSummary } from '../presentation';
-import { isUnmanaged, isUnresolved } from '../sessionView';
+import { isUnmanaged, isUnresolved } from '@smalltalk/st3-views';
 import { useStore } from '../store';
 import { TABS } from '../tabs';
 import { theme } from '../theme';

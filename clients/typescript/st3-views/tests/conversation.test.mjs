@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { applyConversation, applyOlderPage, conversationRows, olderFailed, olderLoading, olderNote, readOlder } from './sessionView.ts';
+import { applyConversation, applyOlderPage, conversationRows, olderFailed, olderLoading, olderNote, readOlder } from '@smalltalk/st3-views/sessionView';
 
 const status = sequence => ({ id: `entry/${sequence}`, revision: 1, sequence, type: 'status', role: 'system', body: { state: 'idle' } });
 const content = (sequence, text) => ({ id: `entry/${sequence}`, revision: 1, sequence, type: 'content', role: 'assistant', body: { media_type: 'text/plain', text } });

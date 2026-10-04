@@ -10,7 +10,7 @@ import { IBMPlexMono_400Regular } from '@expo-google-fonts/ibm-plex-mono/400Regu
 import { IBMPlexMono_400Regular_Italic } from '@expo-google-fonts/ibm-plex-mono/400Regular_Italic';
 import { IBMPlexMono_600SemiBold } from '@expo-google-fonts/ibm-plex-mono/600SemiBold';
 import { IBMPlexMono_700Bold } from '@expo-google-fonts/ibm-plex-mono/700Bold';
-import { homeRows } from './homeView';
+import { homeRows } from '@smalltalk/st3-views';
 import { FULL_SCREEN, navigationRef, ROOTS, type StackParams, type TabParams } from './navigation';
 import { StoreProvider, useStore } from './store';
 import { parseDevLink, tabNamed, type Tab } from './tabs';

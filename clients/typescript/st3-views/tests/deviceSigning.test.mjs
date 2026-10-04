@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes } from './deviceSigning.ts';
+import { base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes } from '@smalltalk/st3-views/deviceSigning';
 
 // The shared vectors every client checks (docs/st3/device-signing.md).
-const vectors = JSON.parse(readFileSync(new URL('../../fixtures/clients/device-signing-v1.json', import.meta.url), 'utf8'));
+const vectors = JSON.parse(readFileSync(new URL('../../../../fixtures/clients/device-signing-v1.json', import.meta.url), 'utf8'));
 assert.equal(vectors.format, 'fields-v1');
 const privateKey = createPrivateKey({ key: Buffer.from(vectors.key_pkcs8_hex, 'hex'), format: 'der', type: 'pkcs8' });
 const publicKey = createPublicKey(privateKey);
@@ -42,5 +42,7 @@ for (const length of [0, 1, 2, 3, 16, 64, 65]) {
 
 // Refusals are said in plain words; other codes are left to the general wording.
 assert.match(signatureRefusal('device-signature-stale'), /clock/);
-assert.match(signatureRefusal('device-key-not-enrolled'), /pair the phone again/);
+assert.match(signatureRefusal('device-key-not-enrolled', 'phone'), /pair the phone again/);
 assert.equal(signatureRefusal('stale-fence'), null);
+
+assert.match(signatureRefusal('device-key-not-enrolled'), /pair the device again/);

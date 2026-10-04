@@ -4,7 +4,7 @@ import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Banners, Empty, StatusLine, useDebugScroll, useRefresh } from '../chrome';
 import { ContextMenu } from '../menu';
-import { HOME_LEGEND, homeRows, homeSections, type HomeRow } from '../homeView';
+import { HOME_LEGEND, homeRows, homeSections, type HomeRow, cleanMessageText, ANSWERS, isRequest, report, spaced, yesNo } from '@smalltalk/st3-views';
 import type { RootParams } from '../navigation';
 import { agentName } from '../agentsView';
 import { attentionActionLabel, attentionKindLabel } from '../presentation';
@@ -13,8 +13,6 @@ import { useStore } from '../store';
 import { randomName } from '../launcher';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
-import { cleanMessageText } from '../conversationView';
-import { ANSWERS, isRequest, report, spaced, yesNo } from '../requestView';
 import type { RootScreen } from '../navigation';
 
 // Home: what needs the person, as stui's Home lists it.
@@ -73,8 +71,8 @@ export function HomeScreen() {
       ]}>
         <ListRow
           glyph={row.glyph}
-          glyphColor={row.color}
-          title={<T numberOfLines={1}><T color={row.color}>{row.kind.padEnd(9)}</T><T bold>{row.title}</T></T>}
+          glyphColor={theme[row.color]}
+          title={<T numberOfLines={1}><T color={theme[row.color]}>{row.kind.padEnd(9)}</T><T bold>{row.title}</T></T>}
           second={`${row.waiting ? `${row.waiting} · ` : ''}waited ${row.age}`}
           onPress={() => navigation.navigate('Attention', { id: row.item.id })}
         />
@@ -84,7 +82,7 @@ export function HomeScreen() {
       ListEmptyComponent={<Empty text={loadErrors.attention ? `Attention could not be loaded: ${loadErrors.attention}` : hasSynced ? 'Nothing needs you.' : 'Checking what needs you…'} />}
       ListFooterComponent={<View>
         {truncated.attention ? <Note tone="warning">More items exist beyond these 200. `st now` lists them all.</Note> : null}
-        <Legend entries={HOME_LEGEND} />
+        <Legend entries={HOME_LEGEND.map(entry => ({ ...entry, color: theme[entry.color] }))} />
       </View>}
       style={{ flex: 1 }}
     />
@@ -116,7 +114,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
     return <Screen>
       <Banners />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
-        <T><T bold color={row.color}>{row.glyph} update</T><T dim>  {row.age} ago</T></T>
+        <T><T bold color={theme[row.color]}>{row.glyph} update</T><T dim>  {row.age} ago</T></T>
         <T bold selectable>{row.title}</T>
         <T><T dim>from  </T><T bold color={theme.person}>{from}</T></T>
         <Markdown text={spaced(cleanMessageText(item.detail || item.update.summary || ''))} color={theme.text} />
@@ -136,7 +134,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
       <Banners />
       {/* Automatic insets keep the end of a long request clear of the floating tab bar. */}
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
-        <T><T bold color={row.color}>{row.glyph} request</T><T dim>  {item.priority} · waited {row.age}</T></T>
+        <T><T bold color={theme[row.color]}>{row.glyph} request</T><T dim>  {item.priority} · waited {row.age}</T></T>
         <T bold selectable>{row.title}</T>
         <T><T dim>asks  </T><T bold color={theme.person}>{from}</T></T>
         {item.request ? <StructuredRequestView item={item} request={item.request} from={from} onAnswered={() => navigation.goBack()} /> : <>
@@ -154,7 +152,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
   return <Screen>
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 6, paddingBottom: 32 }}>
-      <T><T bold color={row.color}>{row.glyph} {row.kind}</T><T dim>  {attentionKindLabel(item.attention_kind)} · {item.priority} · waited {row.age}</T></T>
+      <T><T bold color={theme[row.color]}>{row.glyph} {row.kind}</T><T dim>  {attentionKindLabel(item.attention_kind)} · {item.priority} · waited {row.age}</T></T>
       <T bold selectable>{row.title}</T>
       {item.detail ? <Markdown text={item.detail} color={theme.subtext0} /> : null}
       {item.because ? <T soft>because {item.because}</T> : null}

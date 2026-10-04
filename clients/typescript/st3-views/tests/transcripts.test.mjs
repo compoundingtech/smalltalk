@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { conversationEntries } from './conversationView.ts';
+import { conversationEntries } from '@smalltalk/st3-views';
 
-// Every harness transcript in fixtures/clients/transcripts reads the same on the phone as in stui:
-// stui writes each `*.expected.json` from its own parser (crates/stui/src/ui/contract.rs), and
-// the phone's parser must arrive at the same entries, so the two cannot drift.
-const fixture = name => JSON.parse(readFileSync(new URL(`../../fixtures/clients/transcripts/${name}`, import.meta.url), 'utf8'));
+// Every harness transcript in fixtures/clients/transcripts reads the same in this model as in
+// st3-conversation-ui. Rust's model-only tests (crates/st3-conversation-ui/src/tests.rs) check
+// the same `*.expected.json`, so the two cannot drift.
+const fixture = name => JSON.parse(readFileSync(new URL(`../../../../fixtures/clients/transcripts/${name}`, import.meta.url), 'utf8'));
 
 // The phone's body in stui's shape: `{ kind, value }`, as serde writes stui's `Body`.
 function asStui(body) {

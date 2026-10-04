@@ -1,0 +1,27 @@
+{
+  "name": "@smalltalk/st3-views",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./conversationView": "./conversationView.ts",
+    "./conversationSimple": "./conversationSimple.ts",
+    "./sessionView": "./sessionView.ts",
+    "./homeView": "./homeView.ts",
+    "./requestView": "./requestView.ts",
+    "./deviceSigning": "./deviceSigning.ts",
+    "./clientName": "./clientName.ts",
+    "./time": "./time.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --test tests/*.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@smalltalk/st3-client": "file:../st3-client"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

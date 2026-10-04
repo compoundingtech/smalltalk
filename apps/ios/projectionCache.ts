@@ -1,5 +1,5 @@
 import type { Agent, Attention, Device, Launch, Mission } from '../../clients/typescript/st3-client';
-import type { SessionView } from './sessionView';
+import type { SessionView } from '@smalltalk/st3-views';
 
 export type MachineView = { id: string; kind: 'machine'; name: string; state: string; occupancy: { running_runtimes: number }; capacity: { state: string }; transports: Array<{ protocol: string; status: string }> };
 // The three windows the collections socket holds, and the lists a tab loads when it opens.

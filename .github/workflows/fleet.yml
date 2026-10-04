@@ -133,7 +133,7 @@ jobs:
       - name: Fingerprint the locked dependencies
         id: lockfiles
         run: |
-          lockfiles_hash=$(sha256sum apps/ios/package-lock.json clients/typescript/st3-client/package-lock.json | sha256sum | cut -d ' ' -f1)
+          lockfiles_hash=$(sha256sum apps/ios/package-lock.json clients/typescript/st3-client/package-lock.json clients/typescript/st3-views/package-lock.json | sha256sum | cut -d ' ' -f1)
           printf 'hash=%s\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"
       - name: Cache the locked TypeScript and Effect toolchain
         id: typescript-cache
@@ -142,6 +142,7 @@ jobs:
           path: |
             apps/ios/node_modules
             clients/typescript/st3-client/node_modules
+            clients/typescript/st3-views/node_modules
           key: "typescript-client-${{ runner.os }}-node24.18.0-${{ steps.lockfiles.outputs.hash }}"
       - name: Install locked client dependencies
         if: steps.typescript-cache.outputs.cache-hit != 'true'
@@ -150,11 +151,18 @@ jobs:
         run: |
           npm test --prefix clients/typescript/st3-client
           npm run typecheck --prefix clients/typescript/st3-client
+      - name: Install locked view dependencies
+        if: steps.typescript-cache.outputs.cache-hit != 'true'
+        run: npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund
       - name: Install locked iOS dependencies
         if: steps.typescript-cache.outputs.cache-hit != 'true'
         run: npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund
-      - name: Typecheck the iOS project
-        run: apps/ios/node_modules/.bin/tsc --noEmit -p apps/ios
+      - name: Check shared views, fixtures and iOS consumers
+        run: |
+          npm test --prefix clients/typescript/st3-views
+          npm run typecheck --prefix clients/typescript/st3-views
+          apps/ios/node_modules/.bin/tsc --noEmit -p apps/ios
+          npm test --prefix apps/ios
   linux-tests:
     name: linux-tests
     needs: [pick-runner]

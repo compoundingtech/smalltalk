@@ -2,7 +2,7 @@
 // one line, and a run of calls in a row is one line saying how many and how they went until it
 // is opened. Everything else reads as in full. The phone shows it by default; the choice is the
 // device's own.
-import type { ConversationEntry } from './conversationView';
+import type { ConversationEntry } from './conversationView.ts';
 
 type Tool = Extract<ConversationEntry['body'], { kind: 'tool' }>;
 export type SimpleRow =

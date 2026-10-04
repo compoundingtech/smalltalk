@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle } from './conversationView.ts';
+import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle } from '@smalltalk/st3-views/conversationView';
 
 let sequence = 0;
 const at = minute => `2026-09-30T12:${String(minute).padStart(2, '0')}:00Z`;
@@ -146,7 +146,7 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
 
 // A conversation st is refusing says why, how old what is shown is, and that the phone retries.
 {
-  const { staleLine } = await import('./conversationView.ts');
+  const { staleLine } = await import('@smalltalk/st3-views/conversationView');
   assert.equal(staleLine('the list changed while it was being read', false, null, 0), 'Not loaded yet: the list changed while it was being read. Trying again.');
   assert.equal(staleLine('willow cannot be reached right now', true, 1_000, 76_000), 'willow cannot be reached right now · shown as of 1m ago · trying again');
   assert.equal(staleLine('st asked to slow down for a moment', true, 10_000, 22_000), 'st asked to slow down for a moment · shown as of 12s ago · trying again');
