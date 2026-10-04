@@ -75,8 +75,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             let carry = operation
                 .as_ref()
                 .is_some_and(|o| o.native_session_id.is_some());
-            let Some(observation) =
-                observed.filter(|o| o.status == "running" || (positive_exit && carry))
+            let Some(observation) = observed
+                .filter(|o| o.status == "running" || (positive_exit && (carry || selected.manual)))
             else {
                 return Ok(operation
                     .as_ref()
@@ -114,6 +114,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     true,
                 ),
             )?;
+            if selected.manual {
+                // Keep the incumbent and its files. Only a fenced explicit request starts drain.
+                return Ok(true);
+            }
             let actor = selected
                 .actor
                 .as_deref()

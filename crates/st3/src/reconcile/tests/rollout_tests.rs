@@ -119,6 +119,16 @@ impl Seat {
         self.append("harness.observed",json!({"state":if busy{"working"}else{"idle"},"driver":"claude","incarnation_id":"original-1","quiescent":!busy,"blocking":if busy{vec!["turn-in-flight"]}else{vec![]} }));
     }
     fn publish(&self, sequence: u64, model: &str, policy: Option<Policy>, retire: bool) {
+        self.publish_mode(sequence, model, policy, retire, false);
+    }
+    fn publish_mode(
+        &self,
+        sequence: u64,
+        model: &str,
+        policy: Option<Policy>,
+        retire: bool,
+        manual: bool,
+    ) {
         let source = if retire {
             "version 2".into()
         } else {
@@ -126,6 +136,11 @@ impl Seat {
                 "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; harness \"claude\" {{ model {model:?}; }} }}",
                 self.root.path().display().to_string()
             )
+        };
+        let source = if manual && !retire {
+            source.replacen("{ host", "{ rollout \"manual\"; host", 1)
+        } else {
+            source
         };
         let input = crate::graph::parse_owned_set_intent(&source, "amber").unwrap();
         let mut options = Options {
@@ -892,4 +907,250 @@ fn rollout_refuses_to_move_the_original_conversation_between_login_accounts() {
     assert_eq!(seat.operation().native_account.as_deref(), Some("cloud"));
     assert!(seat.runtime.starts.lock().unwrap().is_empty());
     assert_eq!(*seat.runtime.stops.lock().unwrap(), vec!["original-1"]);
+}
+
+#[test]
+fn manual_rollout_without_set_policy_survives_receipts_reopens_and_idle_passes() {
+    let mut seat = Seat::new();
+    seat.publish_mode(2, "second", None, false, true);
+    seat.busy(false);
+    for _ in 0..3 {
+        seat.step();
+        assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
+        assert_eq!(
+            rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"],
+            "manual"
+        );
+        assert!(rollout::hold_render(&seat.store, &seat.desired()).unwrap());
+        seat.reopen();
+    }
+    seat.publish_mode(3, "second", None, false, true);
+    seat.step();
+    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    // A manual pending publication does not hold ordinary work intake.
+    let run = seat.work();
+    let request = |key: &str| crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()),
+        incarnation: Some("original-1".into()),
+        summary: Some("Finished".into()),
+        reason: None,
+        evidence: Vec::new(),
+        idempotency_key: key.into(),
+    };
+    seat.store
+        .work_action(&run.steps[0].subject, "claim", &request("manual-claim"))
+        .unwrap();
+    seat.store
+        .work_action(
+            &run.steps[0].subject,
+            "complete",
+            &request("manual-complete"),
+        )
+        .unwrap();
+    let selected = seat.store.rollout_selection(SUBJECT).unwrap().unwrap();
+    let (_, old) = rollout::launched_member(&seat.store, SUBJECT, "original-1")
+        .unwrap()
+        .unwrap();
+    seat.store
+        .request_rollout(
+            SUBJECT,
+            &selected.desired_token,
+            &old,
+            "original-1",
+            "person/operator",
+            &Policy::when_idle(1_800_000, false),
+            "manual-request",
+        )
+        .unwrap();
+    seat.step();
+    assert_eq!(seat.operation().phase, "draining");
+    assert!(seat.operation().publication_manual);
+}
+
+#[test]
+fn removing_manual_policy_releases_pending_cutover_to_automatic_rollout() {
+    let seat = Seat::new();
+    let policy = Some(Policy::when_idle(1_800_000, false));
+    seat.publish_mode(2, "second", policy.clone(), false, true);
+    seat.step();
+    assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
+    seat.publish(3, "second", policy, false);
+    seat.step();
+    assert_eq!(seat.operation().phase, "draining");
+    assert!(!seat.operation().publication_manual);
+}
+
+#[test]
+fn adding_manual_policy_supersedes_automatic_drain_without_stopping_incumbent() {
+    let seat = Seat::new();
+    let policy = Some(Policy::when_idle(1_800_000, false));
+    seat.publish(2, "second", policy.clone(), false);
+    seat.step();
+    assert_eq!(seat.operation().phase, "draining");
+    seat.publish_mode(3, "second", policy, false, true);
+    seat.busy(false);
+    seat.step();
+    assert_eq!(seat.operation().phase, "superseded");
+    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert_eq!(
+        rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"],
+        "manual"
+    );
+}
+
+#[test]
+fn omitting_a_manual_seat_keeps_its_incarnation_until_explicit_retirement() {
+    let seat = Seat::new();
+    seat.publish_mode(2, "first", None, false, true);
+    seat.publish(3, "first", None, true);
+    seat.step();
+    assert!(
+        seat.store
+            .rollout_selection(SUBJECT)
+            .unwrap()
+            .unwrap()
+            .manual
+    );
+    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert_eq!(
+        rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"],
+        "manual"
+    );
+    let selected = seat.store.rollout_selection(SUBJECT).unwrap().unwrap();
+    let (_, old) = rollout::launched_member(&seat.store, SUBJECT, "original-1")
+        .unwrap()
+        .unwrap();
+    seat.store
+        .request_rollout(
+            SUBJECT,
+            &selected.desired_token,
+            &old,
+            "original-1",
+            "person/operator",
+            &Policy::when_idle(1_800_000, false),
+            "manual-retire",
+        )
+        .unwrap();
+    seat.ack();
+    seat.busy(false);
+    for _ in 0..4 {
+        if seat.operation().phase == "retired" {
+            break;
+        }
+        seat.step();
+    }
+    assert_eq!(seat.operation().phase, "retired");
+    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+}
+
+#[test]
+fn manual_pending_publication_leaves_independent_mail_deliverable() {
+    let seat = Seat::new();
+    seat.publish_mode(2, "second", None, false, true);
+    seat.step();
+    seat.store.append_claim(&ClaimInput {
+        subject:"message/manual-mail".into(),kind:"message.sent".into(),actor:Some("person/operator".into()),
+        fields:serde_json::from_value(json!({"status":"sent","from":"person/operator","to":SUBJECT,"content":"Continue the current session"})).unwrap(),
+        evidence:Vec::new(),expected_subject:None,idempotency_key:None,
+    }).unwrap();
+    let message = seat.store.message("message/manual-mail").unwrap().unwrap();
+    assert!(seat.store.rollout_message_allowed(&message).unwrap());
+}
+
+#[test]
+fn manual_rollout_keeps_ready_work_wakes_on_the_original_incarnation() {
+    let seat = Seat::new();
+    seat.busy(false);
+    let run = seat.work();
+    seat.publish_mode(2, "second", None, false, true);
+    let reconciler = Reconciler::new(
+        seat.store.clone(),
+        seat.runtime.clone(),
+        "amber".into(),
+        Arc::new(Notify::new()),
+    );
+    reconciler.reconcile_once().unwrap();
+    let wakes = seat
+        .store
+        .work_wake_messages_for_reconcile(SUBJECT)
+        .unwrap();
+    assert!(
+        wakes
+            .iter()
+            .any(|m| work_message_target(m)
+                .is_some_and(|(step, _, _, _)| step == run.steps[0].subject)),
+        "{wakes:?}"
+    );
+    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+}
+
+#[test]
+fn manual_rollout_does_not_apply_a_pending_change_after_incumbent_exit() {
+    let seat = Seat::new();
+    seat.publish_mode(2, "second", None, false, true);
+    seat.runtime
+        .observation
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .status = "exited".into();
+    seat.append("runtime.observed", json!({"status":"exited","runtime_id":seat.desired().member.unwrap().runtime_id,"host":"amber","terminal":true,"incarnation_id":"original-1"}));
+    let reconciler = Reconciler::new(
+        seat.store.clone(),
+        seat.runtime.clone(),
+        "amber".into(),
+        Arc::new(Notify::new()),
+    );
+    reconciler.reconcile_once().unwrap();
+    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert_eq!(
+        rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"],
+        "manual"
+    );
+    assert!(rollout::hold_render(&seat.store, &seat.desired()).unwrap());
+    let selected = seat.store.rollout_selection(SUBJECT).unwrap().unwrap();
+    let (_, old) = rollout::launched_member(&seat.store, SUBJECT, "original-1")
+        .unwrap()
+        .unwrap();
+    seat.binding("original-1", "");
+    assert!(
+        seat.store
+            .request_rollout(
+                SUBJECT,
+                &selected.desired_token,
+                &old,
+                "original-1",
+                "person/operator",
+                &Policy::when_idle(1_800_000, false),
+                "manual-ended-missing-binding",
+            )
+            .is_err()
+    );
+    assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
+    seat.binding("original-1", "native-one");
+    seat.store
+        .request_rollout(
+            SUBJECT,
+            &selected.desired_token,
+            &old,
+            "original-1",
+            "person/operator",
+            &Policy::when_idle(1_800_000, false),
+            "manual-ended",
+        )
+        .unwrap();
+    assert_eq!(
+        seat.operation().native_session_id.as_deref(),
+        Some("native-one")
+    );
+    for _ in 0..4 {
+        seat.step();
+    }
+    seat.binding("replacement-1", "native-one");
+    seat.step();
+    assert_eq!(seat.operation().phase, "running");
+    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
+    assert!(seat.runtime.stops.lock().unwrap().is_empty());
 }
