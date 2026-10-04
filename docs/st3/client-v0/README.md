@@ -39,7 +39,9 @@ Its typed `run_details[].steps[]` includes `loop_round`, `loop_max_rounds`, `loo
 `next_wake_at`, `wake_reason`, `wake`, and `claim_expires_at`. A mission detail already carries
 every run's steps, so these observations extend that contract rather than introduce a second
 run-detail endpoint. The detail uses the same enriched `Store::mission_run` read as the trusted
-`GET /v1/mission-runs/{run}`; mission lists retain their lightweight summary reads.
+`GET /v1/mission-runs/{run}` only for open runs and the latest finished run. Older finished
+runs keep lightweight effective-step summaries. Headers and enrichment share one reader
+snapshot; mission lists retain their lightweight summary reads.
 
 `loop_round` and `loop_max_rounds` belong to the loop attached to that exact step in the current
 generation; they are null for a non-loop step. `loop_reason` is the observed loop-state reason.
@@ -47,11 +49,12 @@ generation; they are null for a non-loop step. `loop_reason` is the observed loo
 or a computed retry estimate. `wake_reason` is the deferral's blocked reason, otherwise the
 observed wake failure. `wake` carries the assignee and its current harness state/incarnation,
 attempt count, last attempt time, acknowledgement basis (`claim`, `consumed`, `delivery`, or
-`turn`), and failure, even when no next wake time is known. `claim_expires_at` is the effective
-claim lease expiry. All timestamps here are
+`turn`), and failure, even when no next wake time is known. It is null for finished runs
+and finished steps. `claim_expires_at` is the effective claim lease expiry. All timestamps here are
 RFC 3339 UTC strings; unknown values are null. Older servers may omit these optional fields.
-Loop and wake enrichment is detail-only; a list's null timing fields are not proof of no loop
-or wake. Clients can render `round N/M · wakes in …` without reading claim envelopes.
+Loop and wake enrichment is detail-only and bounded to open runs plus the latest finish;
+null timing fields on lists or older finished runs are not proof of no loop or wake.
+Clients can render `round N/M · wakes in …` without reading claim envelopes.
 
 ### Agent activity and human blocking
 

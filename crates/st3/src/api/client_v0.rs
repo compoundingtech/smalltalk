@@ -1678,6 +1678,8 @@ fn mission_resources_filtered(
                         store.mission_run(&header.id)?.ok_or_else(|| {
                             anyhow::anyhow!("mission run {} disappeared during detail read", header.id)
                         })?
+                    } else if selected_id.is_some() {
+                        store.with_step_states(header.clone(), true)?
                     } else {
                         header.clone()
                     };
@@ -11197,9 +11199,9 @@ mission "example/looped" state="ready" {
         );
     }
 
-    /// A mission detail and the missions tree agree on effective step state and progress.
+    /// Historical steps stay lightweight; detail enriches only open runs and the latest finish.
     #[test]
-    fn mission_detail_and_the_tree_show_effective_steps() {
+    fn mission_detail_and_the_tree_read_no_step_history() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "steps-node");
         let publish = |source: &str, key: &str| {
@@ -11290,11 +11292,32 @@ mission "example/steps" state="ready" {
             }
             runs.push(view.subject);
         }
+        for run in 2..5 {
+            let view = state.store.create_mission_run(&crate::model::MissionRunRequest {
+                mission: "example/steps".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("steps-{run}"),
+            }).unwrap();
+            state.store.set_mission_run_state(&view.id, "cancelled", "terminal", None).unwrap();
+        }
         let index = state.store.index().unwrap();
 
+        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
         let detail =
             mission_resources(&state.store, index, true, Some("mission/example/steps")).unwrap();
+        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 6);
+        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
         let tree = missions_tree_value(&state.store, "now", index).unwrap();
+        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 0);
+        for run in detail[0]["run_details"].as_array().unwrap() {
+            if run["status"] == "cancelled" {
+                assert!(run["steps"].as_array().unwrap().iter().all(|step| step["wake"].is_null()));
+            }
+        }
 
         let shown = |run: &crate::model::MissionRunView| {
             run.steps
@@ -11325,7 +11348,7 @@ mission "example/steps" state="ready" {
         assert!(claimed.steps.iter().any(|step| step.status == "working"
             && step.progress_summary.as_deref() == Some("Half built.")));
         let details = detail[0]["run_details"].as_array().unwrap();
-        assert_eq!(details.len(), 2);
+        assert_eq!(details.len(), 5);
         let progress = details
             .iter()
             .map(|run| (run["id"].as_str().unwrap(), run["last_progress"].clone()))
