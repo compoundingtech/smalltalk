@@ -102,6 +102,11 @@ Their spend and limits use a stable label derived from the declared name; unboun
 provider's label. Queued observations capture the account at their source, so replay after a
 switch still charges the account that produced them.
 
+A relaunch or a partial five-hour report cannot erase the last weekly observation or give it a
+new timestamp. Weekly selection uses only reports that actually contain a weekly percentage;
+providers with only a five-hour window still show that window. The original observation survives
+a member restart in the durable graph and remains available to other members through replication.
+
 ## At the limit
 
 `[limits]` in the node's config stops an account's seats at its weekly percentage (README). With
@@ -115,7 +120,36 @@ accounts:
 
 The selected account, fenced restart request and handled marker commit in one transaction. An
 interrupted switch can retry without losing its restart request. Enforcement checks the seat's
-current account binding and runtime incarnation before acting on a reading.
+current account binding before acting. A relaunch on the same declared account, including a
+persisted local pool choice, can use that account's fresh quota without waiting for its own quota
+report. A changed account binding cannot use the previous account's quota. Legacy pool seats with
+no persisted choice retain their source incarnation check. A person restarting a seat the policy
+already stopped still overrides the stop for the remainder of that weekly window.
+
+Missing, stale, future-dated, or already-reset weekly evidence is **unknown**, not below the limit.
+The policy leaves those seats running until fresh weekly evidence arrives, preserving `keep` and
+the once-per-window override. It reports the gap in the daemon log on each policy pass using
+`limits.fresh`; `st doctor` reports an `account-limits` warning for active accounts using a one-hour
+freshness bound, even when the policy is disabled. This avoids stopping an account on an old or
+missing number while making the gap visible to operations. An account that has never reported
+quota has no fabricated row in `st usage`; its missing evidence is reported by doctor.
+
+External backstops must read `st --json usage` (`limits`), or the client-v0 usage endpoint, rather
+than scanning driver directories, status-line files, or provider transcripts. Fresh harnesses
+commit observations through a SQLite outbox and need not produce those legacy files; a relaunch
+can remove every source a file collector sees. For each account:
+
+- Use `weekly_percent` alone; a missing `five_hour_percent` does not invalidate weekly evidence.
+- Check `measured_at_unix_ms` against the freshness bound and reject times over a minute ahead.
+  Check `weekly_resets_at_unix_ms` when provided; an elapsed reset needs a new observation.
+- Retain `account` and `account_ref`, the account's `seats`, and the configured exemptions. Evaluate
+  accounts separately and verify the seat's current binding before stopping it.
+- When the account row or weekly evidence is missing or stale, report an operations/attention
+  signal with the reason. Do not silently return an empty stop plan or substitute zero. A failed
+  read or offline peer is also unavailable evidence. Resume threshold evaluation on fresh data.
+
+The graph read preserves the selected source time. A collector must never replace it with the
+time it ran. A fresh real reading at exactly 95% meets a 95% stop rule.
 
 A switch is a fresh start: a harness cannot resume a native session from another account's
 directory, and a seat's work lives in the graph. For that reason a pooled seat cannot declare
