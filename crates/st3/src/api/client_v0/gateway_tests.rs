@@ -160,7 +160,7 @@ mod gateway_tests {
         paired_device(&state, "fallback-secret", "fallback");
         let (address, server) = serve(crate::api::fabric_router(state)).await;
         for fallback in [
-            format!("{BEARER_PROTOCOL_PREFIX}"),
+            BEARER_PROTOCOL_PREFIX.to_owned(),
             format!("{BEARER_PROTOCOL_PREFIX}unknown, {BEARER_PROTOCOL_PREFIX}fallback-secret"),
             format!("{BEARER_PROTOCOL_PREFIX}fallback-secret"),
         ] {
