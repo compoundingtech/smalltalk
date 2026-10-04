@@ -50,6 +50,12 @@ A native harness starts with no prompt. It takes no turn until a person types or
 
 A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`; put the instruction in a step goal or send the seat a message.
 
+An agent may declare the bare `one-shot` flag. Once its process exits or vanishes, the daemon
+records a stop, removes it from default inventory, and retains its declaration and history.
+This takes precedence over automatic restart; explicit restart and launch replacements still
+work. Seats without the flag, including `restart "never"` seats, keep their existing behavior.
+See [one-shot seats](../seat-lifecycle.md#one-shot-seats) for authoring and later start.
+
 st no longer writes a `.st3` directory into a native harness workspace. It removes one that older releases wrote there, unless Git tracks something in it, and removes the `.st3/` line from the Git exclude file once no worktree sharing that file still has a `.st3` directory. A declared `render { git-exclude ".st3/" }` adds nothing.
 
 A declared `render` operation that would change a tracked file fails that member’s complete render transaction, and the agent does not start. Other members continue reconciling; `st agents show` and `st doctor` report the fault.

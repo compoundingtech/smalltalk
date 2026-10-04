@@ -126,6 +126,9 @@ pub struct MemberSpec {
     pub tags: BTreeMap<String, String>,
     pub display_name: Option<String>,
     pub lifecycle: MemberLifecycle,
+    /// Retire this seat when its process finishes, independently of its restart policy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub one_shot: bool,
     pub restart: RestartType,
     pub restart_intensity: RestartIntensity,
     pub shutdown_timeout_ms: u64,
@@ -2685,6 +2688,7 @@ mod launch_change_tests {
         same.environment
             .insert("ST_RUN_GENERATION".into(), "next".into());
         same.restart = super::RestartType::Never;
+        same.one_shot = true;
         assert!(same.launch_changes(&launched).is_empty());
 
         assert_eq!(

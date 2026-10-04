@@ -2309,6 +2309,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     &subject.subject,
                                     &observation,
                                 )?;
+                                if member.one_shot && !recovering {
+                                    self.retire_one_shot(subject, &observation)?;
+                                    return Ok(());
+                                }
                                 if (restart || recovering)
                                     && member.lifecycle == MemberLifecycle::Service
                                 {
@@ -2376,6 +2380,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                                             .map(str::to_owned),
                                     };
                                     self.record_member(subject, &observation, false)?;
+                                    if member.one_shot
+                                        && !self.fresh_context_recovery_stopped(
+                                            &subject.subject,
+                                            &observation,
+                                        )?
+                                        && !self.claude_trust_recovery_stopped(
+                                            &subject.subject,
+                                            &observation,
+                                        )?
+                                    {
+                                        self.retire_one_shot(subject, &observation)?;
+                                        return Ok(());
+                                    }
                                     let restart = match member.restart {
                                         RestartType::Always => true,
                                         RestartType::OnFailure => observation.exit_code != Some(0),
@@ -3726,6 +3743,46 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .and_then(Value::as_str)
             })
             .is_some_and(|token| lineage.iter().any(|candidate| candidate == token)))
+    }
+
+    /// Finish the seat on the exact declaration observed by this pass. A concurrent start or
+    /// edit must not be retired by an old process's exit. The stop retains the predecessor so
+    /// history and a later explicit start recover the original declaration.
+    fn retire_one_shot(
+        &self,
+        subject: &DesiredSubject,
+        observation: &RuntimeObservation,
+    ) -> Result<()> {
+        let Some(token) = self.store.selected_desired_token(&subject.subject)? else {
+            return Ok(());
+        };
+        let Some(claim) = self.store.claim_by_id(&token)? else {
+            return Ok(());
+        };
+        let selected: DesiredSubject = serde_json::from_value(claim.body)?;
+        if selected != *subject {
+            return Ok(());
+        }
+        let intent = crate::graph::parse_internal_intent(
+            &format!("version 2\nstop {:?}\n", subject.subject),
+            &self.host,
+        )?;
+        let result = self.store.apply_as(
+            &intent,
+            &BTreeMap::from([(subject.subject.clone(), vec![token.clone()])]),
+            &format!(
+                "one-shot-retire:{}:{token}:{}",
+                subject.subject,
+                observation.incarnation_id.as_deref().unwrap_or("unknown")
+            ),
+            Some("daemon/runtime"),
+        );
+        match result {
+            Ok(_) => self.signal_changed(),
+            Err(error) if error.code == "stale-subject" => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -7671,6 +7728,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: Some(format!("loop metric {}", metric.name)),
             lifecycle: MemberLifecycle::Service,
+            one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
@@ -12216,6 +12274,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: None,
             lifecycle: MemberLifecycle::Service,
+            one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
@@ -12742,6 +12801,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: None,
             lifecycle: MemberLifecycle::Service,
+            one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
@@ -14674,6 +14734,45 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         screens: Mutex<HashMap<String, String>>,
         keys: Mutex<Vec<String>>,
         leftovers: Mutex<Vec<(String, bool)>>,
+    }
+
+    #[test]
+    fn one_shot_old_exit_cannot_retire_a_newer_declaration() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source =
+            "version 2\nagent \"example/once\" { workspace \"/tmp\"; command \"true\"; one-shot }";
+        apply_source(&store, source, "one-shot-old");
+        let old = store.desired_subjects().unwrap().remove(0);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        apply_source(&store, &source.replace("true", "false"), "one-shot-new");
+        let selected = store.selected_desired_token(&old.subject).unwrap();
+        reconciler
+            .retire_one_shot(
+                &old,
+                &RuntimeObservation {
+                    runtime_id: "example.once".into(),
+                    terminal: true,
+                    status: "exited".into(),
+                    exit_code: Some(0),
+                    incarnation_id: Some("old-incarnation".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.selected_desired_token(&old.subject).unwrap(),
+            selected
+        );
+        assert!(
+            store
+                .declaration_ended_by_stop(&old.subject)
+                .unwrap()
+                .is_none()
+        );
     }
 
     impl RuntimeControl for FakeRuntime {

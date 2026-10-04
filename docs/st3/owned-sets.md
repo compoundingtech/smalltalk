@@ -42,6 +42,11 @@ Omitting a seat declares a stop while keeping its conversations and history. Omi
 prevents new runs, including starts pinned to an older revision, while retaining active runs.
 Omitting a schedule stops future occurrences and retains work already created.
 
+A seat declared `one-shot` also permits its runtime host to retire that exact member after the
+process exits. The daemon records a stop while retaining set ownership and the source bundle.
+A new member declaration published through the set starts it again. Other members still require
+ordinary source publication to retire.
+
 A publication retiring ten or more members, or at least half the previous live membership,
 requires `--confirm-retire DIGEST` from its dry-run preview. The digest binds the exact bundle,
 source, prior set revision, member heads, adoption flags and empty-set flag. Any change requires

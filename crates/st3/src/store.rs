@@ -7890,6 +7890,7 @@ impl Store {
                     return serde_json::from_str(&response).map_err(internal);
                 }
                 let owned_plan = owned.map(|options| owned_sets::plan_tx(transaction, intent, options)).transpose()?;
+                let mut one_shot_sets = BTreeMap::new();
                 if let (Some(plan), Some(options)) = (&owned_plan, owned) {
                     owned_sets::validate_apply(plan, options)?;
                     if plan.preview.noop {
@@ -7901,6 +7902,13 @@ impl Store {
                     }
                 } else {
                     for subject in intent.subjects.keys().chain(intent.missions.values().map(|m| &m.subject)) {
+                        if actor == Some("daemon/runtime")
+                            && let Some(desired) = intent.subjects.get(subject).filter(|d| d.kind == "stop")
+                            && let Some(set) = owned_sets::one_shot_retirement_owner(transaction, desired, &self.origin)?
+                        {
+                            one_shot_sets.insert(subject.clone(), set);
+                            continue;
+                        }
                         owned_sets::refuse_unmanaged(transaction, subject)?;
                     }
                 }
@@ -8288,6 +8296,7 @@ impl Store {
                     let predecessors = intent_leaves_tx(transaction, subject).map_err(internal)?;
                     let mut body = serde_json::to_value(desired).map_err(internal)?;
                     if let Some(plan) = &owned_plan { body["owned_set"] = json!(plan.preview.set); }
+                    if let Some(set) = one_shot_sets.get(subject) { body["owned_set"] = json!(set); }
                     // The claim records its writer as its actor.
                     let claim_id = claim_hash(
                         &batch_id,

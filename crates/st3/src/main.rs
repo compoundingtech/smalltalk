@@ -11635,7 +11635,7 @@ async fn run_agent_inspection(
                 format!("agent/{subject}")
             };
             let response = generated_client(endpoint, None)?
-                .agents_get(&subject)
+                .agents_get_with_history(&subject, all)
                 .await
                 .with_context(|| {
                     if all {
