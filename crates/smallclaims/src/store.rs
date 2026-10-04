@@ -4962,13 +4962,13 @@ impl Store {
         &self,
         missing: Vec<ReplicaEnvelopeId>,
     ) -> Result<Vec<ReplicaEnvelope>> {
+        if missing.is_empty() {
+            return Ok(Vec::new());
+        }
         let connection = self.readers.get();
-        let mut envelopes = Vec::with_capacity(missing.len());
-        for identity in missing {
-            // A trim can delete the payload after the snapshot listed the identity. The
-            // tombstone stays in the inventory and the peer never needs the envelope.
-            let envelope = connection.query_row(
-                "SELECT envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload,
+        // Reuse one preparation for the whole page, including its signature subqueries.
+        let mut statement = connection.prepare_cached(
+            "SELECT envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload,
                         (SELECT member_key FROM replica_envelope_signatures AS signatures
                          WHERE signatures.writer=envelopes.writer
                            AND signatures.sequence=envelopes.sequence
@@ -4981,6 +4981,12 @@ impl Store {
                          ORDER BY member_key LIMIT 1)
                  FROM replica_envelopes AS envelopes
                  WHERE envelopes.writer=?1 AND envelopes.sequence=?2 AND envelopes.envelope_hash=?3",
+        )?;
+        let mut envelopes = Vec::with_capacity(missing.len());
+        for identity in missing {
+            // A trim can delete the payload after the snapshot listed the identity. The
+            // tombstone stays in the inventory and the peer never needs the envelope.
+            let envelope = statement.query_row(
                 params![identity.writer, identity.sequence, identity.hash],
                 |row| {
                     let accepted_at = row.get::<_, String>(1)?;
