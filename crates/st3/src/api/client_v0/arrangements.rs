@@ -214,7 +214,7 @@ mod tests {
         let mut omitted = subscription.clone();
         omitted.person = None;
         assert!(collection_items(&state, &agent, &omitted).await.is_err());
-        let other = ClientSession::local(Some("person/grace")).unwrap();
+        let other = ClientSession::local(Some("person/other")).unwrap();
         assert_eq!(collection_items(&state, &other, &subscription).await.unwrap_err().code, "forbidden");
         assert_eq!(person(&ClientSession::local(None).unwrap(), Some("person/ada"), false).unwrap_err().code, "forbidden");
         let _ = action(State(state.clone()), Extension(new_client_snapshot(&state)), Extension(agent.clone()),

@@ -17,7 +17,7 @@ is required: agents explicitly select a fleet person's collection, never an infe
 owner. Each read checks `read.arrangements` and the selected person's access. For example:
 
 ```json
-{"kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/alice","limit":100}
+{"kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":100}
 ```
 
 Arrangement snapshots and changes carry full typed arrangement resources. Folder or

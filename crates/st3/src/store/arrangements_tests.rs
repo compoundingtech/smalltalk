@@ -33,7 +33,7 @@ fn owner_admission_real_agent_and_atomic_identity_fences() {
     create(&store);
     let before = layout(&store);
     let mut agent = input(json!([{"op":"rename","name":"From agent"}]));
-    agent.actor = Some("agent/fleet/seat".into());
+    agent.actor = Some("agent/fleet/fixture-arrangements/seat".into());
     agent.idempotency_key = Some("session/edit-one".into());
     agent.fields.insert("action_id".into(),json!("action-one"));
     agent.fields.insert("action_digest".into(),json!("0".repeat(64)));
@@ -45,7 +45,7 @@ fn owner_admission_real_agent_and_atomic_identity_fences() {
     fences.insert(authority.subject.clone(),authority.id.clone());
     agent.expected_subject = Some(Some("stale-layout".into()));
     let accepted = store.edit_arrangement(&agent,&fences).unwrap();
-    assert_eq!(accepted.actor.as_deref(),Some("agent/fleet/seat"));
+    assert_eq!(accepted.actor.as_deref(),Some("agent/fleet/fixture-arrangements/seat"));
     assert_eq!(layout(&store)["owner"],"person/ada");
     assert_eq!(layout(&store)["body"]["name"],json!({"value":"From agent","revision":accepted.id}));
     fences.insert(authority.subject.clone(),"now-stale-again".into());
@@ -139,7 +139,7 @@ fn permanent_tombstones_lift_ancestors_and_keep_orphan_placements() {
     assert_eq!(resource["body"]["placements"]["agent/missing/seat"]["value"]["folder"],B);
     assert_eq!(a.append_claim(&input(json!([{"op":"folder.create","id":B,"name":"Reuse","parent":null,"key":"a0"}]))).unwrap_err().code,"arrangement-folder-exists");
     let mut retire = input(json!([{"op":"retire"}]));
-    retire.actor = Some("agent/fleet/seat".into());
+    retire.actor = Some("agent/fleet/fixture-arrangements/seat".into());
     a.append_claim(&retire).unwrap();
     append(&b,json!([{"op":"rename","name":"Offline after retirement"}]));
     sync(&a,&b); sync(&b,&a);
@@ -191,7 +191,7 @@ fn heads_survive_reopen_and_an_upgrade_backfills_once() {
     let store = Store::open(&path,"node").unwrap();
     create(&store);
     let mut edit = input(json!([{"op":"subject.place","subject":"agent/away/seat","folder":A,"key":"a0"}]));
-    edit.actor = Some("agent/fleet/seat".into());
+    edit.actor = Some("agent/fleet/fixture-arrangements/seat".into());
     store.append_claim(&edit).unwrap();
     let before = layout(&store);
     {
@@ -236,12 +236,12 @@ fn first_agent_action_uses_normal_principal_signing_without_changing_person_owne
     let store = Store::open_memory("node").unwrap();
     store.set_node_key(Arc::new(smallclaims::fleet::MemberKey::generate().unwrap().0)).unwrap();
     let mut creation = input(json!([{"op":"create","name":"Agent created"}]));
-    creation.actor = Some("agent/fleet/new-seat".into());
+    creation.actor = Some("agent/fleet/fixture-arrangements/new-seat".into());
     let accepted = store.edit_arrangement(&creation,&BTreeMap::new()).unwrap();
-    assert_eq!(accepted.actor.as_deref(),Some("agent/fleet/new-seat"));
+    assert_eq!(accepted.actor.as_deref(),Some("agent/fleet/fixture-arrangements/new-seat"));
     store.replication_snapshot().unwrap(); // Publishing seals the batch and signs its claims.
     let signature = store.claim_signature(&accepted.id).unwrap().unwrap();
-    assert_eq!(signature.signer,"agent/fleet/new-seat");
+    assert_eq!(signature.signer,"agent/fleet/fixture-arrangements/new-seat");
     assert_eq!(signature.on_behalf,None);
     assert_eq!(layout(&store)["owner"],"person/ada");
 }
@@ -251,7 +251,7 @@ fn checkpoint_retains_superseded_agent_edits_and_proves_rebuilt_head_readers() {
     let store = Store::open_memory("node").unwrap();
     create(&store);
     let mut agent = input(json!([{"op":"rename","name":"Agent's first edit"}]));
-    agent.actor = Some("agent/fleet/seat".into());
+    agent.actor = Some("agent/fleet/fixture-arrangements/seat".into());
     let older = store.append_claim(&agent).unwrap();
     agent.fields.insert("operations".into(),json!([{"op":"rename","name":"Agent's newer edit"},{"op":"subject.place","subject":"agent/away/seat","folder":A,"key":"a0"}]));
     let newer = store.append_claim(&agent).unwrap();
@@ -270,7 +270,7 @@ fn checkpoint_retains_superseded_agent_edits_and_proves_rebuilt_head_readers() {
     let (plan,proof) = store.plan_checkpoint(now_ms()+1,directory.path()).unwrap();
     assert!(proof.passed);
     assert!(plan.claims.iter().all(|claim| claim.kind != "arrangement.edited"));
-    assert_eq!(store.claim_by_id(&older.id).unwrap().unwrap().actor.as_deref(),Some("agent/fleet/seat"));
-    assert_eq!(store.claim_by_id(&newer.id).unwrap().unwrap().actor.as_deref(),Some("agent/fleet/seat"));
+    assert_eq!(store.claim_by_id(&older.id).unwrap().unwrap().actor.as_deref(),Some("agent/fleet/fixture-arrangements/seat"));
+    assert_eq!(store.claim_by_id(&newer.id).unwrap().unwrap().actor.as_deref(),Some("agent/fleet/fixture-arrangements/seat"));
     assert_eq!(layout(&store),before);
 }

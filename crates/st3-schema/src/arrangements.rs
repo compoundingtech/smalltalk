@@ -181,7 +181,7 @@ mod tests {
             let fields = serde_json::from_value(json!({"owner":"person/ada","operations":value})).unwrap();
             assert!(operations(SUBJECT, &fields).is_err());
         }
-        assert!(validate_actor(SUBJECT, Some("agent/fleet/seat")).is_ok());
+        assert!(validate_actor(SUBJECT, Some("agent/fleet/fixture-arrangements/seat")).is_ok());
         assert!(validate_actor(SUBJECT, Some("person/other")).is_err());
         assert!(validate_actor(SUBJECT, None).is_err());
         assert!(owner("arrangement/person/ada/019a0000-0000-4000-8000-000000000001").is_err());
