@@ -13966,6 +13966,48 @@ impl Store {
             .query_row(params![subject, kind], |row| row.get(0))?)
     }
 
+    pub(crate) fn cached_placement_fence(
+        &self,
+        token: &str,
+        build: impl FnOnce() -> Result<Option<crate::placement::Fence>>,
+    ) -> Result<Option<Arc<crate::placement::Fence>>> {
+        if let Some(fence) = self.smalltalk.placement_cache.lock()
+            .unwrap_or_else(PoisonError::into_inner).get(token) {
+            return Ok(fence.clone());
+        }
+        let fence = build()?.map(Arc::new);
+        let mut cache = self.smalltalk.placement_cache.lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if cache.len() >= ACTUAL_CACHE_LIMIT { cache.clear(); }
+        cache.insert(token.to_owned(), fence.clone());
+        Ok(fence)
+    }
+
+    /// Read just the newest runtime body of each origin in canonical order at a snapshot.
+    pub(crate) fn runtime_observations_at(
+        &self, subject: &str, at: u64,
+    ) -> Result<BTreeMap<String, ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject,
+                    claims.kind, claims.origin, claims.actor, claims.body,
+                    claims.predecessors, claims.accepted_at_unix_ms
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='runtime.observed' AND claims.store_index<=?2
+             ORDER BY {CANONICAL_ORDER_DESC}"
+        ))?;
+        let mut rows = statement.query(params![subject, at.min(i64::MAX as u64)])?;
+        let mut latest = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let origin: String = row.get(5)?;
+            if let std::collections::btree_map::Entry::Vacant(entry) = latest.entry(origin) {
+                entry.insert(claim_from_row(row)?);
+            }
+        }
+        Ok(latest)
+    }
+
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
@@ -46507,7 +46549,21 @@ fn append_claim_with_fences(
             }
             let predecessor =
                 latest_claim_id_tx(transaction, &input.subject).map_err(internal)?;
-            let predecessors = predecessor.into_iter().collect::<Vec<_>>();
+            let mut predecessors = predecessor.into_iter().collect::<Vec<_>>();
+            // A placement handoff explicitly cites its local runtime and peer stop proof.
+            // Keep same-subject evidence as causal links even when a newer declaration
+            // displaced the runtime branch from the selected subject head.
+            if input.kind == "runtime.observed" {
+                for evidence in &input.evidence {
+                    if claim_by_id_tx(transaction, evidence).map_err(internal)?
+                        .is_some_and(|claim| claim.subject == input.subject)
+                    {
+                        predecessors.push(evidence.clone());
+                    }
+                }
+                predecessors.sort();
+                predecessors.dedup();
+            }
             let mut body = json!({
                 "fields": stored_fields.as_ref().unwrap_or(&input.fields),
                 "evidence": input.evidence,

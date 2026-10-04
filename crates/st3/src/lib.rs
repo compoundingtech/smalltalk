@@ -39,6 +39,7 @@ pub mod model;
 pub mod native_resume;
 pub mod otlp;
 pub mod peer;
+pub mod placement;
 pub mod person_request;
 pub mod pricing;
 pub use smallclaims::{performance, profile};

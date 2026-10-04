@@ -10469,27 +10469,27 @@ async fn run_agents(
                 )
                 .await?
             };
-            print_value(&response, json_output)?;
-            if !json_output
-                && let Some(subject) = response
-                    .subject_tokens
-                    .keys()
-                    .find(|subject| subject.starts_with("agent/"))
-            {
-                let agent = generated_client(endpoint, None)?
-                    .agents_get(subject)
-                    .await?;
-                if let ClientResource::Agent(agent) = agent.value {
+            let agent = generated_client(endpoint, None)?.agents_get(&subject).await?;
+            let ClientResource::Agent(agent) = agent.value else {
+                anyhow::bail!("`{subject}` is not an agent");
+            };
+            if json_output {
+                let mut value = serde_json::to_value(&response)?;
+                value["handoff"] = serde_json::to_value(&agent.handoff)?;
+                print_value(&value, true)?;
+            } else {
+                print_value(&response, false)?;
+                if let Some(handoff) = &agent.handoff {
+                    println!("{subject}: {} → {}", handoff.phase, handoff.destination);
+                    if !handoff.pending_sources.is_empty() {
+                        println!("Waiting for source stop: {}", handoff.pending_sources.join(", "));
+                    }
+                } else {
                     let state = cli_help::agent_state(
-                        &agent.state,
-                        agent.harness_state.as_deref(),
-                        agent.fault.as_deref(),
-                        &agent.reachability,
+                        &agent.state, agent.harness_state.as_deref(),
+                        agent.fault.as_deref(), &agent.reachability,
                     );
-                    print!(
-                        "{}",
-                        cli_help::agent_next_steps(subject, &args.actor, &state)
-                    );
+                    print!("{}", cli_help::agent_next_steps(&subject, &args.actor, &state));
                 }
             }
             Ok(())
@@ -12105,6 +12105,11 @@ fn render_client_agent(
 
     if let Some(fault) = &agent.fault {
         let _ = writeln!(output, "FAULT        {fault}");
+    }
+    if let Some(handoff) = &agent.handoff {
+        let pending = if handoff.pending_sources.is_empty() { String::new() }
+            else { format!(" · waiting for {}", handoff.pending_sources.join(", ")) };
+        let _ = writeln!(output, "HANDOFF      {} → {}{pending}", handoff.phase, handoff.destination);
     }
     if let Some(suspension) = &agent.suspension {
         let session = match (&suspension.harness, &suspension.native_session_id) {
