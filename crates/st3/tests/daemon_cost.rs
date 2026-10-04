@@ -58,8 +58,9 @@ const SLACK: u64 = 5_000;
 /// much worse unnoticed. Each breaks the daemon's rule that no query's cost grows with the whole
 /// store and is owed a fix. A fixed one fails the check until it leaves this list.
 const KNOWN_GROWTH: &[(&str, f64)] = &[
-    // Attention reads every person ask (11.8x full-scan steps).
+    // Attention and the mission detail read every person ask (11.8x full-scan steps).
     ("GET /v1/attention", 18.0),
+    ("GET /v1/client/missions/{*id}", 18.0),
     // Checkpoint status walks the sealed set (9.8x).
     ("GET /v1/checkpoint/status", 15.0),
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
@@ -1057,6 +1058,85 @@ impl Fixture {
         }
         path
     }
+}
+
+/// Historical runs may grow the answer, but must not repeat the assignee's message scan.
+#[tokio::test]
+async fn mission_detail_many_finished_runs_do_not_repeat_step_history() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), NODE).unwrap());
+    let source = r#"version 2
+mission "cost/history" state="ready" {
+  goal "Bound enrichment of historical runs."
+  step "work" { assigned-to "agent/cost-worker" }
+}"#;
+    let intent = st3::graph::parse_intent(source, NODE).unwrap();
+    let planned = store.mission(&intent, st3::model::IntentInput {
+        kdl: source.into(), source_name: None,
+    }).unwrap();
+    store.apply(&intent, &planned.subject_tokens, "cost-history-definition").unwrap();
+    for message in 0..500 {
+        store.append_claim(&st3::model::ClaimInput {
+            subject: format!("message/cost-history-{message}"),
+            kind: "message.sent".into(),
+            actor: Some("person/cost-operator".into()),
+            fields: BTreeMap::from([
+                ("from".into(), json!("person/cost-operator")),
+                ("to".into(), json!("agent/cost-worker")),
+                ("content".into(), json!("Historical message")),
+                ("status".into(), json!("sent")),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+    let app = st3::api::router(AppState {
+        store: store.clone(),
+        notify: Arc::new(Notify::new()),
+        event_notify: watch::channel(0_u64).0,
+        node: NODE.into(),
+        state_dir: root.path().join("state"),
+        pty_root: root.path().join("pty"),
+        pty_binary: stub_pty(root.path()),
+        fleet_id: None, configured_peers: Vec::new(), client_relay: None,
+        native_session_home: Some(root.path().join("home")),
+        planner_default: st3::model::PlannerSpec::default(),
+    });
+    let mut measurements = Vec::new();
+    for run in 0..100 {
+        let view = store.create_mission_run(&st3::model::MissionRunRequest {
+            mission: "cost/history".into(), revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/cost-operator".into()), mode: None,
+            inputs: BTreeMap::new(), idempotency_key: format!("cost-history-{run}"),
+        }).unwrap();
+        store.set_mission_run_state(&view.id, "cancelled", "terminal", None).unwrap();
+        if matches!(run, 9 | 99) {
+            let mut samples = Vec::new();
+            for _ in 0..4 {
+                let before = work::total();
+                let response = app.clone().oneshot(Request::builder()
+                    .uri("/v1/client/missions/mission%2Fcost%2Fhistory")
+                    .body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["value"]["run_details"].as_array().unwrap().len(), run + 1);
+                samples.push(work::total() - before);
+            }
+            measurements.push(samples.into_iter().skip(1).min_by_key(|work| work.fullscan_steps).unwrap());
+        }
+    }
+    let (small, large) = (measurements[0], measurements[1]);
+    println!("mission detail 10 -> 100 finished runs: {small:?} -> {large:?}");
+    // Allow 400 VM instructions per additional historical row, plus the standard slack.
+    // Current lightweight state/summary reads cost about 316; full enrichment costs about 891.
+    assert!(large.vm_steps <= small.vm_steps + 90 * 400 + SLACK,
+        "historical runs added full work-view enrichment: {small:?} -> {large:?}");
+    assert!(large.fullscan_steps <= small.fullscan_steps * 3 + SLACK,
+        "historical runs repeated the per-step history scans: {small:?} -> {large:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

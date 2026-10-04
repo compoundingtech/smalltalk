@@ -4235,6 +4235,13 @@ mission "timing/run" state="ready" {
     assert_eq!(wake.attempts, 0);
     assert_eq!(wake.last_attempt_at, None);
     assert_eq!(step("improve").wake, None);
+    state.store.set_step_state(ready, "completed", None).unwrap();
+    let (status, finished_step) = client_json(app.clone(), path).await;
+    assert_eq!(status, StatusCode::OK, "{finished_step}");
+    let finished_step = finished_step["value"]["run_details"][0]["steps"]
+        .as_array().unwrap().iter().find(|step| step["path"] == "wake").unwrap();
+    assert_eq!(finished_step["state"], "completed");
+    assert!(finished_step["wake"].is_null());
 
     let (status, missing) = client_json(app, "/v1/client/missions/timing/missing").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
