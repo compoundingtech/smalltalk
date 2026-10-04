@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Fill Namespace's main-scope caches without rerunning the queue's workspace tests.
+set -euo pipefail
+case "${1:?usage: scripts/ci-cache-warm tests|clippy|fleet-compat}" in
+  # workspacePreparationSteps already builds the selected nextest targets.
+  tests) cargo test -p st3-conversation-ui --no-default-features --locked --no-run ;;
+  clippy)
+    cargo clippy --workspace --all-targets --locked
+    cargo clippy -p st3-conversation-ui --no-default-features --all-targets --locked
+    cargo build --locked -p st3-client-codegen
+    ;;
+  fleet-compat)
+    baseline=$(jq -er .commit .github/fleet-compat-baseline.json)
+    for attempt in 1 2 3; do
+      BASELINE="$baseline" nix build --impure --out-link "$RUNNER_TEMP/baseline" --print-build-logs --expr '
+        ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
+          .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })' && break
+      [ "$attempt" -lt 3 ] || exit 1
+    done
+    cargo test -p st3 --locked --test integration --no-run
+    ;;
+  *) exit 2 ;;
+esac

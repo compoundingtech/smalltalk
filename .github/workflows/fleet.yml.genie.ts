@@ -95,7 +95,8 @@ export default githubWorkflow({
     // GitHub's merge queue runs the required checks on each queued entry; without this trigger the
     // queue never receives them and merges freeze.
     merge_group: {},
-    push: { branches: ['main'] },
+    // The queue's successful checks belong to the exact commit that lands on main. Main upkeep
+    // preserves perf-cost and fills missing default-branch caches without repeating this gate.
     workflow_dispatch: {},
   },
   permissions: { contents: 'read' },
@@ -146,7 +147,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       runsOn: linuxRunsOn,
       'timeout-minutes': 20,
       nix: { binaryCaches: readOnlyBinaryCaches },
-      step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && genie --check'] }),
+      step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && genie --check'] }),
     }),
     // Check the shared client and its iOS consumer before merge.
     'typescript-client': {

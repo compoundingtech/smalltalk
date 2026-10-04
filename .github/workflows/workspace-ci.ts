@@ -100,6 +100,30 @@ export const readOnlyBinaryCaches = Object.values(effectUtilsBinaryCaches)
 /** Dev/test builds without debug information or incremental state, as on the fleet runners. */
 export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG: '0', CARGO_INCREMENTAL: '0' }
 
+export const cargoCacheStep = {
+  name: 'Restore the Cargo target and registry',
+  id: 'cargo-cache',
+  if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+  uses: 'actions/cache@v4',
+  with: {
+    path: '${{ github.workspace }}/target\n${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git',
+    key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
+    'restore-keys': 'cargo-${{ github.job }}-${{ runner.os }}-',
+  },
+} as const
+
+export const nixCacheStep = {
+  name: 'Restore the local Nix cache',
+  id: 'nix-cache',
+  if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
+  uses: 'actions/cache@v4',
+  with: {
+    path: '${{ runner.temp }}/st-ci-cache',
+    key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
+    'restore-keys': 'nix4-${{ github.job }}-${{ runner.os }}-',
+  },
+} as const
+
 /**
  * Checkout, the Namespace cache volume, Nix with the read-only effect-utils cache, and an isolated
  * HOME/XDG. `pull_request` checks out GitHub's merge ref: the PR head merged with the latest base.
@@ -117,28 +141,8 @@ export const commonSetupSteps = [
   // Namespace cache volumes are per node and replicate in the background, so a job on another node
   // starts empty. /nix itself cannot be cached (see scripts/ci-nix-cache); RUNNER_TEMP/st-ci-cache holds a
   // local Nix binary cache instead. Linux only: the key names the job, so each stage keeps its own.
-  {
-    name: 'Restore the Cargo target and registry',
-    id: 'cargo-cache',
-    if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
-    uses: 'actions/cache@v4',
-    with: {
-      path: '${{ github.workspace }}/target\n${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git',
-      key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
-      'restore-keys': 'cargo-${{ github.job }}-${{ runner.os }}-',
-    },
-  },
-  {
-    name: 'Restore the local Nix cache',
-    id: 'nix-cache',
-    if: "runner.os == 'Linux' && env.CI_LOCAL_CACHES != '1'",
-    uses: 'actions/cache@v4',
-    with: {
-      path: '${{ runner.temp }}/st-ci-cache',
-      key: "nix4-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
-      'restore-keys': 'nix4-${{ github.job }}-${{ runner.os }}-',
-    },
-  },
+  cargoCacheStep,
+  nixCacheStep,
   ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
   {
     name: 'Isolate test home and XDG state',

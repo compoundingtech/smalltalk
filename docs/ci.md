@@ -2,10 +2,13 @@
 
 ## GitHub Actions on Namespace
 
-Every push to `main` runs both `Workspace CI` and `macOS CI` on Namespace. Each non-PR run
-uses its own `github.run_id` in the concurrency group, so successive pushes can run concurrently
-without cancelling running checks or replacing pending runs. PR updates still cancel stale
-checks for that PR; macOS checks on PRs require the `macos-ci` label.
+Workspace CI runs on pull requests, merge groups and manual dispatch. The merge queue tests the
+exact commit that lands on `main`; its successful checks stay attached to that SHA, so a main push
+does not repeat the workspace gate. `Main upkeep` verifies those four checks, runs `perf-cost`
+(which the queue skips), and fills missing main-scope caches on Namespace. `macOS CI` still runs
+on main pushes. Each non-PR run uses its own `github.run_id` in the concurrency group, so
+successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks;
+macOS checks on PRs require the `macos-ci` label.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's former Linux `st/ci` and optional `st/ci-macos`
@@ -39,6 +42,15 @@ limit of about five runners at once. `scripts/ci-linux STAGE` runs one stage:
 - `linux-fleet-compat`: the fleet compatibility test against `.github/fleet-compat-baseline.json`'s
   pinned older st3. Building that baseline also runs the pinned pty's own unit tests, two of which
   are timing-sensitive, so the build is retried up to three times.
+
+Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
+or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
+as P0 and fills the missing entries with builds only: selected test executables, Clippy artifacts,
+or the fleet baseline and integration binary. Workspace tests and the isolation VM run only in
+the queue. The TypeScript dependency cache is also kept on main without repeating its tests.
+Merge-group and PR caches have their own ref scope; they cannot replace these main-scope saves,
+which all PRs and Namespace overflow runs can restore. Manual Workspace CI dispatch on main
+remains available for a full run. Release and deployment workflows keep their own push triggers.
 
 Each stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
 backend) holding Cargo's registry and the workspace `target/` directory, keyed on `Cargo.lock` and
@@ -219,7 +231,8 @@ records the KVM probe and each phase's elapsed time.
 
 ### TypeScript client
 
-`typescript-client` runs on every PR, merge-group entry and main push. It installs Node 24.18.0
+`typescript-client` runs on every PR and merge-group entry. Main retains the queue check;
+Main upkeep preserves the dependency cache. It installs Node 24.18.0
 (the workspace uses Node 24), the client's pinned TypeScript 6.0.3 and
 `effect@4.0.0-rc.118` development dependencies from its own lockfile. Both `node_modules`
 directories are cached together, keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
@@ -432,7 +445,8 @@ Namespace limits CPU and memory per platform; a workflow run is not a fixed unit
 With the current 8x16 stage runners, a merge-queue Workspace CI group initially starts three
 8-vCPU/16-GiB stage jobs and two 8-vCPU/16-GiB profile jobs: 40 vCPUs and 80 GiB at peak.
 The TypeScript client job follows generator freshness and reuses its runner slot.
-PR and main runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB.
+PR runs also start `perf-cost`, taking their initial peak to 48 vCPUs and 96 GiB. Main upkeep
+runs that check separately; its three cache-fill jobs normally finish after their lookup-only probes.
 Five complete merge-queue groups need 200 vCPUs and 400 GiB, within the Linux pool limit;
 `max_entries_to_build` remains 5 in both the generated and live main rulesets.
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
