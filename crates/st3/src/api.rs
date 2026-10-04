@@ -2777,7 +2777,15 @@ fn client_attention_compatibility(items: &mut [Value], custom_forms: bool) {
             item["attention_kind"] = json!("agent-request");
             item["actions"] = json!([]);
             let p = &item["action_parameters"]["custom.reply"];
-            item["detail"] = json!(format!("{}\n\nReply with st subject reply {} --registration {} --revision {} --episode {} --fields-file REPLY.json --idempotency-key REPLY-KEY --as {}", item["detail"].as_str().unwrap_or_default(), item["source_id"].as_str().unwrap_or_default(), p["registration"].as_str().unwrap_or_default(), p["revision"].as_str().unwrap_or_default(), p["episode"].as_str().unwrap_or_default(), item["person_id"].as_str().unwrap_or_default()));
+            let command = [
+                "st", "subject", "reply", item["source_id"].as_str().unwrap_or_default(),
+                "--registration", p["registration"].as_str().unwrap_or_default(),
+                "--revision", p["revision"].as_str().unwrap_or_default(),
+                "--episode", p["episode"].as_str().unwrap_or_default(),
+                "--fields-file", "REPLY.json", "--idempotency-key", "REPLY-KEY",
+                "--as", item["person_id"].as_str().unwrap_or_default(),
+            ].map(crate::gate_report::shell_quote).join(" ");
+            item["detail"] = json!(format!("{}\n\nReply with {command}", item["detail"].as_str().unwrap_or_default()));
         }
     }
 }
