@@ -33,15 +33,15 @@ pub(crate) fn child_directory(parent: &File, name: &str) -> io::Result<File> {
 }
 
 pub(crate) fn read_regular(parent: &File, name: &str, max_bytes: usize) -> io::Result<Vec<u8>> {
-    let file = open_at(parent, name.as_bytes(), libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-    read_file(file, max_bytes)
+    let mut file = open_at(parent, name.as_bytes(), libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+    read_file(&mut file, max_bytes)
 }
 
-fn read_file(mut file: File, max_bytes: usize) -> io::Result<Vec<u8>> {
+fn read_file(file: &mut File, max_bytes: usize) -> io::Result<Vec<u8>> {
     owner(&file)?;
     if !file.metadata()?.is_file() { return Err(io::Error::other("notes source must be a regular file")); }
     let mut bytes = Vec::new();
-    std::io::Read::by_ref(&mut file).take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+    std::io::Read::by_ref(file).take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes { return Err(io::Error::other("notes source exceeds client limit")); }
     Ok(bytes)
 }
@@ -64,8 +64,8 @@ fn file_revision(file: &File, bytes: &[u8]) -> io::Result<String> {
 
 pub(crate) fn read_carrier(parent: &File, max_bytes: usize) -> io::Result<Snapshot> {
     match open_at(parent, CARRIER.as_bytes(), libc::O_RDONLY | libc::O_NONBLOCK, 0) {
-        Ok(file) => {
-            let bytes = read_file(file.try_clone()?, max_bytes)?;
+        Ok(mut file) => {
+            let bytes = read_file(&mut file, max_bytes)?;
             let revision = file_revision(&file, &bytes)?;
             Ok(Snapshot { bytes: Some(bytes), revision })
         },

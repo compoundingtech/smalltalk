@@ -552,6 +552,9 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
+        | ErrorCode::PrivateNotesCarrierConflict
+        | ErrorCode::PrivateNotesUnreachable
+        | ErrorCode::PrivateNotesIndeterminate
         | ErrorCode::Unknown => message.to_owned(),
     }
 }

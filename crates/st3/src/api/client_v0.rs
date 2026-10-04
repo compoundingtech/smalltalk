@@ -1340,6 +1340,8 @@ pub(super) fn authenticate(
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+        // A replicated pairing is not this node's private-notes entitlement.
+        .filter(|scope| !scope.starts_with("notes.") || paired.origin == state.store.origin())
         .map(str::to_owned)
         .collect();
     let session = ClientSession {
@@ -5605,8 +5607,8 @@ pub(super) async fn pairing_complete(
         Some(_) => return Err(validation("the pairing has invalid delegated scopes")),
     };
     if scopes.iter().any(|scope| scope.starts_with("notes."))
-        && state.private_notes.person.as_deref() != Some(person_id.as_str()) {
-        return Err(forbidden("the notes pairing no longer names this owner node's configured person"));
+        && (state.private_notes.person.as_deref() != Some(person_id.as_str()) || begun.origin != state.store.origin()) {
+        return Err(forbidden("the notes pairing no longer names this owner node's locally authorized configured person"));
     }
     let completed = state.store.append_claim(&ClaimInput {
         subject: begun.subject.clone(),

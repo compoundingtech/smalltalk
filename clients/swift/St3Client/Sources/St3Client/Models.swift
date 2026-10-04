@@ -40,6 +40,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
+    case privateNotesCarrierConflict, privateNotesUnreachable, privateNotesIndeterminate
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
@@ -54,6 +55,8 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
         case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
+        case "private-notes-carrier-conflict": .privateNotesCarrierConflict
+        case "private-notes-unreachable": .privateNotesUnreachable; case "private-notes-indeterminate": .privateNotesIndeterminate
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
         default: .unknown(raw)
         }
@@ -69,6 +72,8 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
         case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
+        case .privateNotesCarrierConflict: "private-notes-carrier-conflict"
+        case .privateNotesUnreachable: "private-notes-unreachable"; case .privateNotesIndeterminate: "private-notes-indeterminate"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
         case .unknown(let value): value
         }
@@ -486,7 +491,7 @@ public enum TerminalInputMode: String, Codable, Sendable { case line, raw, key }
 public struct TerminalInputParameters: Codable, Sendable { public var terminalID: String; public var mode: TerminalInputMode; public var value: String; public init(terminalID: String, mode: TerminalInputMode, value: String) { self.terminalID = terminalID; self.mode = mode; self.value = value }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", mode, value } }
 public struct TerminalResizeParameters: Codable, Sendable { public var terminalID: String; public var rows: UInt16; public var columns: UInt16; public init(terminalID: String, rows: UInt16, columns: UInt16) { self.terminalID = terminalID; self.rows = rows; self.columns = columns }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", rows, columns } }
 public struct TerminalAttachment: Codable, Sendable { public let attachmentID: String; public let terminalID: String; public let runtimeIncarnation: String; public let ownerHostID: String; public let streamURL: String; public let streamCapability: String?; public let state: String; public let expiresAt: String; public let reusable: Bool?; public let ttlS: UInt64?; public let retryHint: String?; enum CodingKeys: String, CodingKey { case attachmentID = "attachment_id", terminalID = "terminal_id", runtimeIncarnation = "runtime_incarnation", ownerHostID = "owner_host_id", streamURL = "stream_url", streamCapability = "stream_capability", state, expiresAt = "expires_at", reusable, ttlS = "ttl_s", retryHint = "retry_hint" } }
-public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment" } }
+public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; public let privateNotes: PrivateNotesFence?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment", privateNotes = "private_notes" } }
 
 public struct PairingBegin: Codable, Sendable { public let apiVersion: String; public let deviceName: String; public let personID: String; public let fullControl: Bool?; public let scopes: [String]?; public init(apiVersion: String, deviceName: String, personID: String, fullControl: Bool? = nil, scopes: [String]? = nil) { self.apiVersion = apiVersion; self.deviceName = deviceName; self.personID = personID; self.fullControl = fullControl; self.scopes = scopes }; enum CodingKeys: String, CodingKey { case apiVersion = "api_version", deviceName = "device_name", personID = "person_id", fullControl = "full_control", scopes } }
 public struct PairingChallenge: Codable, Sendable { public let kind: String; public let pairingID: String; public let code: String; public let expiresAt: String; enum CodingKeys: String, CodingKey { case kind, pairingID = "pairing_id", code, expiresAt = "expires_at" } }

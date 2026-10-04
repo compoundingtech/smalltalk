@@ -58,6 +58,8 @@ access and notes-scope delegation require positively inspected local OS-owner
 process ancestry. This admission currently supports Linux only; other platforms
 fail closed for uncredentialed notes access. Configured-person paired credentials
 with explicit notes scopes remain valid through the authenticated client surface.
+The pairing grant and sealed challenge must originate on that owner node;
+replicated pairings do not acquire another node's notes authority, even for the same person.
 Native agents never write or delegate notes authority. The existing authenticated
 native harness producer binds only its declared self notes source to the current
 runtime incarnation; source failure does not block unrelated observation delivery.
@@ -67,10 +69,15 @@ idempotency key, the canonical URI, and complete Markdown. Supported writers mus
 use this API: writes serialize across daemon processes, compare carrier generation
 and revision, then durably record intent before an atomic owned sibling replacement.
 Exact retries recover the private outcome without overwriting a newer edit.
+The local-only result carries its successor fence as `ActionResult.private_notes`.
+Its `affected_ids` is empty because a canonical notes URI is not a generic graph ID;
+unrelated collection projections do not receive notes invalidations.
 Changed key reuse conflicts; stale editors and replaced carriers are refused.
 An interrupted replacement remains `private-notes-indeterminate` until its exact
 key is reconciled. External filesystem editors are not coordinated writers;
 changes between operations invalidate the next revision fence.
+Markdown must fit the existing 1 MiB encoded response bound, with room reserved
+for URI/fence and snapshot metadata; writes cannot create an unreadable oversized response.
 
 
 ### Agent activity and human blocking
