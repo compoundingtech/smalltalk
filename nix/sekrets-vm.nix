@@ -193,12 +193,14 @@ pkgs.testers.runNixOSTest {
             "--tag st3.scope-unit=st3-seat-web.scope --tag st3.subject=agent/fleet/fixture-example/web "
             "--env ST_AGENT=agent/fleet/fixture-example/web --env XDG_RUNTIME_DIR=/run/user/1000 "
             "--env PATH=/run/current-system/sw/bin:/usr/local/bin "
-            f"-- sh -c {shlex.quote(seat + ' > /srv/people/ada/seat.out 2>&1; echo done >> /srv/people/ada/seat.out; sleep 600')}"
+            f"-- sh -c {shlex.quote('{ ' + seat + '; } > /srv/people/ada/seat.out 2>&1; echo done >> /srv/people/ada/seat.out; sleep 600')}"
         )
     )
     machine.wait_until_succeeds("grep -q '^done' /srv/people/ada/seat.out", timeout=120)
     out = machine.succeed("cat /srv/people/ada/seat.out")
     print(out)
+    print(machine.succeed("journalctl -u st-sekrets.service --no-pager -n 40 2>&1 || true"))
+    print(machine.succeed("journalctl _UID=1000 --no-pager -n 60 -g 'sekrets|attest|st3:' 2>&1 || true"))
     assert "agent/fleet/fixture-example/web, working for person/ada" in out, out
     assert "gh pr create --draft --title Example token=set home=/var/lib/st-sekrets/profiles/ada/agent-gh/home" in out, out
     assert "no allow rule matches `gh auth status`" in out, out
