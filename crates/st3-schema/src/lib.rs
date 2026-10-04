@@ -209,6 +209,8 @@ pub struct Registry {
     pub subjects: BTreeMap<String, SubjectSpec>,
     pub resources: BTreeMap<String, ResourceSpec>,
     pub claims: BTreeMap<String, ClaimSpec>,
+    /// Operation tags understood by this build's arrangement decoder and projector.
+    pub arrangement_operations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -283,6 +285,10 @@ impl Registry {
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
         output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
+        output.push_str("\n## Arrangement operation vocabulary\n\nReplication retains unknown operation tags and unknown placement subject families as retryable `unknown-claim-field` records. Local edits still refuse them with `invalid-arrangement-operations` and `invalid-subject-reference`. Supported operation tags, included in this registry's digest:\n\n");
+        for tag in &self.arrangement_operations {
+            output.push_str(&format!("- `{tag}`\n"));
+        }
         output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
         output.push_str("\nOMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.\n");
         output
@@ -374,6 +380,26 @@ impl Registry {
         kind: &str,
         fields: &BTreeMap<String, Value>,
     ) -> Result<&ClaimSpec, ValidationError> {
+        self.validate_claim_with_mode(subject, kind, fields, false)
+    }
+
+    /// Unknown arrangement vocabulary waits for an upgrade only at replication admission.
+    pub fn validate_replicated_claim(
+        &self,
+        subject: &str,
+        kind: &str,
+        fields: &BTreeMap<String, Value>,
+    ) -> Result<&ClaimSpec, ValidationError> {
+        self.validate_claim_with_mode(subject, kind, fields, true)
+    }
+
+    fn validate_claim_with_mode(
+        &self,
+        subject: &str,
+        kind: &str,
+        fields: &BTreeMap<String, Value>,
+        replicated: bool,
+    ) -> Result<&ClaimSpec, ValidationError> {
         let subject_spec = self.validate_subject(subject)?;
         if is_custom_claim_kind(kind) {
             if subject_spec.family != "custom" {
@@ -454,7 +480,7 @@ impl Registry {
             if kind != "arrangement.edited" {
                 return Err(error("claim-write-forbidden", "an arrangement requires arrangement.edited"));
             }
-            arrangements::operations(subject, fields)?;
+            arrangements::operations_with_registry(subject, fields, self, replicated)?;
         }
         if subject_spec.family == "glass" {
             glasses::owner(subject)?;
@@ -883,6 +909,7 @@ fn build_registry() -> Registry {
         subjects,
         resources,
         claims,
+        arrangement_operations: arrangements::OPERATION_TAGS.iter().map(|tag| (*tag).into()).collect(),
     }
 }
 
